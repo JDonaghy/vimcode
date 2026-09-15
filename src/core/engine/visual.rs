@@ -5,6 +5,64 @@ impl Engine {
     // Visual mode helpers
     // =======================================================================
 
+    /// Length of `line` in characters, **excluding** its trailing newline.
+    ///
+    /// `Rope::line()` includes the `\n`, and every Visual-Block site used to
+    /// count it — which made the block one column too wide at end-of-line and
+    /// made a genuinely-empty short line look one char long (#807).
+    pub(crate) fn line_text_len(&self, line: usize) -> usize {
+        let raw = self.buffer().line_len_chars(line);
+        if raw > 0
+            && self
+                .buffer()
+                .content
+                .line(line)
+                .chars()
+                .last()
+                .map(|c| c == '\n')
+                .unwrap_or(false)
+        {
+            raw - 1
+        } else {
+            raw
+        }
+    }
+
+    /// Inclusive `(start_col, end_col)` of the active Visual-Block selection.
+    ///
+    /// `end_col` is [`usize::MAX`] when `$` extended the block to end-of-line,
+    /// so callers must clamp per line. The moving edge follows
+    /// `visual_block_want` (Vim's `curswant`), not the cursor's clamped
+    /// column — see that field's docs (#807).
+    pub(crate) fn visual_block_cols(&self) -> (usize, usize) {
+        let cursor = self.view().cursor;
+        let anchor = self.visual_anchor.unwrap_or(cursor);
+        if self.visual_dollar {
+            return (anchor.col.min(cursor.col), usize::MAX);
+        }
+        let want = match self.visual_block_want {
+            Some(w) if w != CURSWANT_EOL => w.max(cursor.col),
+            _ => cursor.col,
+        };
+        (anchor.col.min(want), anchor.col.max(want))
+    }
+
+    /// Half-open `[lo, hi)` char range of the block on `line`, or `None` when
+    /// the line is too short to reach the block at all.
+    pub(crate) fn visual_block_span(&self, line: usize) -> Option<(usize, usize)> {
+        let (start_col, end_col) = self.visual_block_cols();
+        let len = self.line_text_len(line);
+        if start_col >= len {
+            return None;
+        }
+        let hi = if end_col == usize::MAX {
+            len
+        } else {
+            (end_col + 1).min(len)
+        };
+        Some((start_col, hi))
+    }
+
     /// Get normalized visual selection range (start, end).
     /// Start is always before or equal to end.
     pub(crate) fn get_visual_selection_range(&self) -> Option<(Cursor, Cursor)> {
@@ -24,8 +82,9 @@ impl Engine {
     }
 
     /// Extract the text from the visual selection.
-    /// Returns (text, is_linewise).
-    pub(crate) fn get_visual_selection_text(&self) -> Option<(String, bool)> {
+    /// Returns `(text, register type)` — Visual-Block yields
+    /// [`RegType::Blockwise`] so a later `p`/`P` re-inserts a rectangle (#807).
+    pub(crate) fn get_visual_selection_text(&self) -> Option<(String, RegType)> {
         let (start, end) = self.get_visual_selection_range()?;
 
         match self.mode {
@@ -52,7 +111,7 @@ impl Engine {
                     format!("{}\n", text)
                 };
 
-                Some((text, true))
+                Some((text, RegType::Linewise))
             }
             Mode::Visual => {
                 // Character mode: extract from start to end (inclusive)
@@ -73,40 +132,27 @@ impl Engine {
                     .slice(start_char..end_char_inclusive)
                     .to_string();
 
-                Some((text, false))
+                Some((text, RegType::Charwise))
             }
             Mode::VisualBlock => {
-                // Block mode: extract rectangular region
-                // Use anchor and cursor columns directly for block selection
-                let anchor = self.visual_anchor?;
-                let cursor = self.view().cursor;
-                let start_col = anchor.col.min(cursor.col);
-                let end_col = anchor.col.max(cursor.col);
-
                 let mut lines = Vec::new();
-
                 for line_idx in start.line..=end.line {
-                    if let Some(line) = self.buffer().content.lines().nth(line_idx) {
-                        let line_str = line.to_string();
-                        let line_chars: Vec<char> = line_str.chars().collect();
-
-                        // Extract the block portion of this line
-                        let block_start = start_col.min(line_chars.len());
-                        let block_end = (end_col + 1).min(line_chars.len());
-
-                        let block_text: String = if block_start < line_chars.len() {
-                            line_chars[block_start..block_end].iter().collect()
-                        } else {
-                            // Line is too short, just use empty string
-                            String::new()
-                        };
-
-                        lines.push(block_text);
-                    }
+                    let block_text: String = match self.visual_block_span(line_idx) {
+                        Some((lo, hi)) => {
+                            let base = self.buffer().line_to_char(line_idx);
+                            self.buffer()
+                                .content
+                                .slice(base + lo..base + hi)
+                                .to_string()
+                        }
+                        // Line too short to reach the block: an empty row, not
+                        // a skipped one — the rectangle keeps its height.
+                        None => String::new(),
+                    };
+                    lines.push(block_text);
                 }
-
                 let text = lines.join("\n");
-                Some((text, false))
+                Some((text, RegType::Blockwise))
             }
             _ => None,
         }
@@ -119,13 +165,16 @@ impl Engine {
             (start, end, is_linewise)
         });
 
-        if let Some((text, is_linewise)) = self.get_visual_selection_text() {
+        if let Some((text, ty)) = self.get_visual_selection_text() {
             // Store in selected register (or unnamed register)
             let reg = self.selected_register.unwrap_or('"');
-            self.set_yank_register(reg, text, is_linewise);
+            self.set_yank_register_typed(reg, text, ty);
 
             self.selected_register = None;
-            self.message = format!("{} yanked", if is_linewise { "Line(s)" } else { "Text" });
+            self.message = format!(
+                "{} yanked",
+                if ty.is_linewise() { "Line(s)" } else { "Text" }
+            );
 
             if let Some((start, end, lw)) = hl_region {
                 self.record_yank_highlight(start, end, lw);
@@ -150,16 +199,33 @@ impl Engine {
     }
 
     pub fn delete_visual_selection(&mut self, changed: &mut bool) {
-        if let Some((text, is_linewise)) = self.get_visual_selection_text() {
+        self.delete_visual_selection_impl(changed, true);
+    }
+
+    /// Shared implementation behind [`delete_visual_selection`](Self::delete_visual_selection).
+    ///
+    /// `finish_group` controls whether the undo group opened for the delete
+    /// is closed here. A plain `d`/`x`/`D` finishes it immediately (this is
+    /// the whole change). `c`/`s`/`C`/`S`/`R` delete then drop straight into
+    /// Insert mode to type the replacement — Vim's `u` afterwards undoes
+    /// *both* the deletion and the typed text as one step, so those callers
+    /// pass `false` and let Insert mode's own `Escape` handler close the
+    /// group once the typing is done (mirrors the Normal-mode `cw`/`ciw`
+    /// "don't finish_undo_group — let insert mode do it" pattern; #887).
+    pub(crate) fn delete_visual_selection_impl(&mut self, changed: &mut bool, finish_group: bool) {
+        if let Some((text, ty)) = self.get_visual_selection_text() {
             // Store in register
             let reg = self.selected_register.unwrap_or('"');
-            self.set_delete_register(reg, text, is_linewise);
+            self.set_delete_register_typed(reg, text, ty);
             self.selected_register = None;
 
             // Delete the selection
             let (start, end) = self.get_visual_selection_range().unwrap();
 
-            self.start_undo_group();
+            // `u` restores the cursor to the start of the deleted selection,
+            // not wherever the (real) cursor was sitting when `d` was
+            // pressed — which, for a forward selection, is the end (#886).
+            self.start_undo_group_at(start);
 
             match self.mode {
                 Mode::VisualLine => {
@@ -173,9 +239,14 @@ impl Engine {
 
                     self.delete_with_undo(start_char, end_char);
 
-                    // Position cursor at start of line
-                    self.view_mut().cursor.line = start.line;
-                    self.view_mut().cursor.col = 0;
+                    // Neovim's 'startofline' is OFF by default, so a linewise
+                    // delete keeps the cursor's column rather than jumping to
+                    // the first non-blank (#807, `vis:Vjd` / `vis:Vd cursor`).
+                    let want = self.view().cursor.col;
+                    let last = self.buffer().len_lines().saturating_sub(1);
+                    self.view_mut().cursor.line = start.line.min(last);
+                    self.view_mut().cursor.col = want;
+                    self.clamp_cursor_col();
                 }
                 Mode::Visual => {
                     // Delete characters
@@ -190,30 +261,25 @@ impl Engine {
 
                     self.delete_with_undo(start_char, end_char.min(self.buffer().len_chars()));
 
-                    // Position cursor at start
-                    self.view_mut().cursor = start;
+                    // Position cursor at start — clamped to the (possibly
+                    // shrunk) line count: a charwise delete that consumes
+                    // every line at or after `start.line` (e.g. `vapd` on
+                    // the buffer's last paragraph) can leave `start.line`
+                    // pointing past the end of the buffer (#887, "vis:v ap
+                    // trailing").
+                    let last = self.buffer().len_lines().saturating_sub(1);
+                    self.view_mut().cursor = Cursor {
+                        line: start.line.min(last),
+                        col: start.col,
+                    };
                 }
                 Mode::VisualBlock => {
                     // Delete rectangular block (work backwards to avoid offset issues)
-                    // Use anchor and cursor columns directly for block selection
-                    let anchor = self.visual_anchor.unwrap();
-                    let cursor = self.view().cursor;
-                    let start_col = anchor.col.min(cursor.col);
-                    let end_col = anchor.col.max(cursor.col);
-
+                    let (start_col, _) = self.visual_block_cols();
                     for line_idx in (start.line..=end.line).rev() {
-                        let line_start_char = self.buffer().line_to_char(line_idx);
-                        if let Some(line) = self.buffer().content.lines().nth(line_idx) {
-                            let line_str = line.to_string();
-                            let line_len = line_str.chars().count();
-
-                            // Only delete if the line is long enough to have characters in the block
-                            if start_col < line_len {
-                                let block_end = (end_col + 1).min(line_len);
-                                let del_start = line_start_char + start_col;
-                                let del_end = line_start_char + block_end;
-                                self.delete_with_undo(del_start, del_end);
-                            }
+                        if let Some((lo, hi)) = self.visual_block_span(line_idx) {
+                            let base = self.buffer().line_to_char(line_idx);
+                            self.delete_with_undo(base + lo, base + hi);
                         }
                     }
 
@@ -224,9 +290,15 @@ impl Engine {
                 _ => {}
             }
 
-            self.finish_undo_group();
+            if finish_group {
+                self.finish_undo_group();
+            }
             *changed = true;
             self.clamp_cursor_col();
+            // Vim collapses `'<`/`'>` onto the start of a Visual delete, so a
+            // later `gv` reselects one character/line rather than the extent
+            // that is no longer there (#807, `vis:gv after Vjd`).
+            self.lock_visual_reselect(start, start);
         }
 
         // Exit visual mode
@@ -235,12 +307,23 @@ impl Engine {
         self.visual_dollar = false;
     }
 
+    /// Pin what a later `gv` will reselect, and stop `handle_key`'s generic
+    /// hook from overwriting it on the way out of Visual mode (#807).
+    pub(crate) fn lock_visual_reselect(&mut self, anchor: Cursor, cursor: Cursor) {
+        self.last_visual_mode = self.mode;
+        self.last_visual_anchor = Some(anchor);
+        self.last_visual_cursor = Some(cursor);
+        self.visual_mark_start = Some((anchor.line, anchor.col));
+        self.visual_mark_end = Some((cursor.line, cursor.col));
+        self.last_visual_locked = true;
+    }
+
     /// Paste over visual selection: replace selected text with register content.
     /// The deleted selection goes into the unnamed register (Vim behavior).
     pub(crate) fn paste_visual_selection(&mut self, changed: &mut bool) {
         // 1. Read the register content BEFORE deleting (delete overwrites unnamed reg)
         let paste_reg = self.active_register();
-        let (paste_content, paste_linewise) = match self.get_register_content(paste_reg) {
+        let (paste_content, paste_type) = match self.get_register_content(paste_reg) {
             Some(pair) => pair,
             None => {
                 self.clear_selected_register();
@@ -249,6 +332,8 @@ impl Engine {
                 return;
             }
         };
+
+        let paste_linewise = paste_type.is_linewise();
 
         // 2. Get the selection text and range before deleting
         let sel_linewise = matches!(self.mode, Mode::VisualLine);
@@ -264,12 +349,30 @@ impl Engine {
             return;
         };
 
+        if paste_type.is_blockwise() {
+            // A blockwise register replaces the selection with a rectangle
+            // anchored at the selection's own start column (#807,
+            // `vb:jjp block over block`).
+            self.view_mut().cursor.line = start.line;
+            self.view_mut().cursor.col = start.col;
+            self.paste_blockwise(&paste_content, 1, false, changed);
+            self.clamp_cursor_col();
+            return;
+        }
+
         self.start_undo_group();
 
-        if sel_linewise || paste_linewise {
-            // Linewise paste: insert on its own line
-            let line = self.view().cursor.line;
-            let line_start = self.buffer().line_to_char(line);
+        if sel_linewise {
+            // Linewise paste: insert on its own line. Anchored on the
+            // selection's own start line, not the cursor — deleting the last
+            // lines of the buffer clamps the cursor upward, and the paste must
+            // still land where the selection was (#807).
+            let line = start.line;
+            let line_start = if line < self.buffer().len_lines() {
+                self.buffer().line_to_char(line)
+            } else {
+                self.buffer().len_chars()
+            };
             // Ensure paste content ends with newline
             let content = if paste_content.ends_with('\n') {
                 paste_content
@@ -278,6 +381,24 @@ impl Engine {
             };
             self.insert_with_undo(line_start, &content);
             self.view_mut().cursor.line = line;
+            self.view_mut().cursor.col = 0;
+        } else if paste_linewise {
+            // A LINEWISE register put over a CHARWISE selection splits the
+            // line in two at the deletion point and drops the register's
+            // lines between the halves — `yyjjvlp` on `a`/`b`/`xyz` gives
+            // `a`/`b`/``/`a`/`z`, with an empty line where `xy` used to be
+            // (#807; before, the two halves were spliced back together).
+            let line = start.line;
+            let col = start.col;
+            let at = self.buffer().line_to_char(line) + col;
+            let content = if paste_content.ends_with('\n') {
+                paste_content
+            } else {
+                format!("{}\n", paste_content)
+            };
+            self.insert_with_undo(at, &format!("\n{content}"));
+            let pasted_lines = content.matches('\n').count();
+            self.view_mut().cursor.line = line + pasted_lines;
             self.view_mut().cursor.col = 0;
         } else {
             // Characterwise paste: insert at the start of the deleted selection
@@ -345,7 +466,10 @@ impl Engine {
                     // on its own (empty) line.
                     self.insert_with_undo(start_char, "\n");
                 }
-                self.finish_undo_group();
+                // Deliberately not finished here: the group stays open so the
+                // Insert-mode typing that follows merges into it, and `u`
+                // undoes the delete and the typed replacement as one step,
+                // same as Normal-mode `cc`/`S` (#887, "vis:vjc then u").
                 *changed = true;
                 self.view_mut().cursor.line = start.line;
                 self.view_mut().cursor.col = 0;
@@ -354,13 +478,44 @@ impl Engine {
             self.visual_anchor = None;
             self.visual_dollar = false;
         } else {
-            // Charwise / blockwise: delete selection normally
-            self.delete_visual_selection(changed);
+            // Charwise / blockwise: delete selection normally. For a
+            // blockwise change, capture the block's row range and left
+            // column *before* the delete clears `visual_anchor`/mode, and
+            // reuse `visual_block_insert_info` — the same mechanism block
+            // `I`/`A` use — so the shared Escape handler applies whatever
+            // gets typed to every row in the block, not just the one the
+            // cursor lands on (Vim: blockwise `c` is a blockwise delete
+            // followed by a blockwise insert at the same column).
+            let block_info = if self.mode == Mode::VisualBlock {
+                self.get_visual_selection_range().map(|(start, end)| {
+                    let (left_col, _) = self.visual_block_cols();
+                    (start.line, end.line, left_col)
+                })
+            } else {
+                None
+            };
+            // `false`: keep the undo group open so the Insert-mode typing
+            // that follows merges into it (#887, "vis:vjc then u").
+            self.delete_visual_selection_impl(changed, false);
+            if let Some((start_line, end_line, left_col)) = block_info {
+                self.visual_block_insert_info =
+                    // `None` park column: a blockwise `c` leaves the cursor
+                    // after the typed text, unlike `I`/`A` (#807).
+                    Some((start_line, end_line, left_col, false, false, None));
+                // `delete_visual_selection` clamps the cursor to the last
+                // *character* of the shortened line, but a blockwise change
+                // must resume typing at the block's own column — which is
+                // legally one past the end in Insert mode (#807, `vb:jlcX`
+                // pasted the typed text at column 0 without this).
+                self.view_mut().cursor.line = start_line;
+                self.view_mut().cursor.col = left_col.min(self.line_text_len(start_line));
+            }
         }
 
-        // The delete already finished the undo group and set mode to Normal
-        // Now start a new undo group for the insert mode typing
-        self.start_undo_group();
+        // The delete above left its undo group open on purpose (see the
+        // comments at each call site) — starting a fresh one here would
+        // immediately close it (`start_undo_group` always finishes whatever
+        // is active first), splitting the change back into two undo steps.
         self.insert_text_buffer.clear();
         self.mode = Mode::Insert;
     }
@@ -421,29 +576,18 @@ impl Engine {
             }
             Mode::VisualBlock => {
                 // Transform rectangular block (work backwards to maintain positions)
-                let anchor = self.visual_anchor.unwrap();
-                let cursor = self.view().cursor;
-                let start_col = anchor.col.min(cursor.col);
-                let end_col = anchor.col.max(cursor.col);
-
+                let (start_col, _) = self.visual_block_cols();
                 for line_idx in (start.line..=end.line).rev() {
-                    let line_start_char = self.buffer().line_to_char(line_idx);
-                    if let Some(line) = self.buffer().content.lines().nth(line_idx) {
-                        let line_str = line.to_string();
-                        let line_chars: Vec<char> = line_str.chars().collect();
-
-                        // Extract and transform the block portion
-                        if start_col < line_chars.len() {
-                            let block_end = (end_col + 1).min(line_chars.len());
-                            let block_text: String =
-                                line_chars[start_col..block_end].iter().collect();
-                            let transformed = transform(&block_text);
-
-                            let del_start = line_start_char + start_col;
-                            let del_end = line_start_char + block_end;
-                            self.delete_with_undo(del_start, del_end);
-                            self.insert_with_undo(del_start, &transformed);
-                        }
+                    if let Some((lo, hi)) = self.visual_block_span(line_idx) {
+                        let base = self.buffer().line_to_char(line_idx);
+                        let block_text = self
+                            .buffer()
+                            .content
+                            .slice(base + lo..base + hi)
+                            .to_string();
+                        let transformed = transform(&block_text);
+                        self.delete_with_undo(base + lo, base + hi);
+                        self.insert_with_undo(base + lo, &transformed);
                     }
                 }
 
@@ -462,6 +606,142 @@ impl Engine {
         self.mode = Mode::Normal;
         self.visual_anchor = None;
         self.visual_dollar = false;
+    }
+
+    /// Visual-Block `>` / `<` — shift the block itself, not the whole line.
+    ///
+    /// `>` inserts `shifts * 'shiftwidth'` spaces at the block's left column;
+    /// `<` removes up to that many white-space characters *starting at* that
+    /// column, which is why `<C-v>j<` with the block on the `a` of `    ab`
+    /// changes nothing (#807).
+    pub(crate) fn block_shift(&mut self, right: bool, shifts: usize, changed: &mut bool) {
+        let Some((start, end)) = self.get_visual_selection_range() else {
+            return;
+        };
+        let (col, _) = self.visual_block_cols();
+        let width = self.effective_shift_width() * shifts;
+        self.mode = Mode::Normal;
+        self.visual_anchor = None;
+        self.visual_dollar = false;
+        self.start_undo_group();
+        for line in start.line..=end.line {
+            if line >= self.buffer().len_lines() {
+                break;
+            }
+            let len = self.line_text_len(line);
+            if col > len {
+                continue;
+            }
+            let base = self.buffer().line_to_char(line);
+            if right {
+                if len == 0 {
+                    continue; // `:h >` — never indent an empty line
+                }
+                self.insert_with_undo(base + col, &" ".repeat(width));
+            } else {
+                let mut n = 0;
+                while n < width
+                    && col + n < len
+                    && matches!(self.buffer().content.char(base + col + n), ' ' | '\t')
+                {
+                    n += 1;
+                }
+                if n > 0 {
+                    self.delete_with_undo(base + col, base + col + n);
+                }
+            }
+        }
+        self.finish_undo_group();
+        self.view_mut().cursor.line = start.line;
+        self.view_mut().cursor.col = col;
+        self.clamp_cursor_col();
+        *changed = true;
+    }
+
+    /// Visual-mode `<C-a>` / `<C-x>` / `g<C-a>` / `g<C-x>` — Vim's `op_addsub()`.
+    ///
+    /// Every line of the selection gets **its first number inside the selection**
+    /// changed; with `g_cmd` the amount grows by `count` for each line that
+    /// actually changed (lines with no number do not advance the counter).  The
+    /// cursor lands on the start of the *first* changed number, not on the last
+    /// line touched (#807).
+    pub(crate) fn visual_addsub(&mut self, sign: i64, g_cmd: bool, changed: &mut bool) {
+        let base = self.take_count().max(1) as i64;
+        let Some((start, end)) = self.get_visual_selection_range() else {
+            return;
+        };
+        let mode = self.mode;
+        let (block_start, block_end) = self.visual_block_cols();
+        let dollar = self.visual_dollar;
+
+        self.mode = Mode::Normal;
+        self.visual_anchor = None;
+        self.visual_dollar = false;
+
+        let mut amount = base;
+        let mut first: Option<(usize, usize)> = None;
+        self.start_undo_group();
+        for line in start.line..=end.line {
+            if line >= self.buffer().len_lines() {
+                break;
+            }
+            let line_len = {
+                let raw = self.buffer().line_len_chars(line);
+                let text: String = self.buffer().content.line(line).chars().collect();
+                if text.ends_with('\n') {
+                    raw - 1
+                } else {
+                    raw
+                }
+            };
+            let (col, len) = match mode {
+                Mode::VisualLine => (0, line_len),
+                Mode::VisualBlock => {
+                    if block_start >= line_len {
+                        continue;
+                    }
+                    let hi = if dollar {
+                        line_len
+                    } else {
+                        (block_end + 1).min(line_len)
+                    };
+                    (block_start, hi.saturating_sub(block_start))
+                }
+                _ => {
+                    let s = if line == start.line { start.col } else { 0 };
+                    let e = if line == end.line && !dollar {
+                        (end.col + 1).min(line_len)
+                    } else {
+                        line_len
+                    };
+                    if e <= s {
+                        continue;
+                    }
+                    (s, e - s)
+                }
+            };
+            if len == 0 {
+                continue;
+            }
+            if let Some(at_col) = self.addsub_on_line(line, col, sign * amount, Some(len)) {
+                if first.is_none() {
+                    first = Some((line, at_col));
+                }
+                *changed = true;
+                if g_cmd {
+                    amount += base;
+                }
+            }
+        }
+        self.finish_undo_group();
+        if let Some((line, col)) = first {
+            self.view_mut().cursor.line = line;
+            self.view_mut().cursor.col = col;
+        } else {
+            self.view_mut().cursor.line = start.line;
+            self.view_mut().cursor.col = start.col;
+        }
+        self.clamp_cursor_col();
     }
 }
 
@@ -723,6 +1003,87 @@ impl Engine {
             .iter()
             .map(|&cidx| self.char_idx_to_cursor(cidx))
             .collect();
+    }
+
+    /// Insert a tabstop-aware indent at every cursor position (primary +
+    /// extra) simultaneously (#804 review). Unlike `mc_insert`, the text
+    /// inserted can differ *per cursor* — each one advances to its own next
+    /// tabstop/shiftwidth stop per `:h smarttab`, mirroring the single-
+    /// cursor `"Tab"` arm in `handle_insert_key` instead of always inserting
+    /// a fixed `tabstop`-width block of spaces regardless of column.
+    ///
+    /// Cursors are processed in ascending char-index order with a running
+    /// offset, same as `mc_insert` — but because the buffer is already
+    /// mutated by every earlier iteration by the time a later cursor is
+    /// processed, `orig + offset` can be fed straight back through
+    /// `char_idx_to_cursor` to recover that cursor's *current* line/col
+    /// (correctly reflecting any earlier same-line insert), with no need to
+    /// separately track a same-line column shift.
+    ///
+    /// Like `mc_insert`, this deliberately does **not** touch
+    /// `insert_text_buffer` — that buffer records one fragment per *logical
+    /// keystroke*, not one per cursor, because on `Escape` it becomes
+    /// `last_inserted_text` for dot-repeat and is replayed verbatim for
+    /// count-prefixed inserts. Pushing each cursor's own (possibly
+    /// differently sized) indent would make `.` insert the concatenation of
+    /// all N cursors' indents. The caller pushes the returned *primary*
+    /// cursor's text exactly once instead (#804 review).
+    pub(crate) fn mc_insert_tab(&mut self) -> String {
+        let extra = self.view().extra_cursors.clone();
+        let primary = *self.cursor();
+
+        let primary_orig = self.buffer().line_to_char(primary.line) + primary.col;
+        let extra_origs: Vec<usize> = extra
+            .iter()
+            .map(|c| self.buffer().line_to_char(c.line) + c.col)
+            .collect();
+
+        let mut all_origs: Vec<usize> = extra_origs.clone();
+        all_origs.push(primary_orig);
+        all_origs.sort_unstable();
+
+        let expand = self.settings.expand_tab;
+        let tabstop = (self.settings.tabstop as usize).max(1);
+
+        let mut offset: usize = 0;
+        let mut new_idx_of: std::collections::HashMap<usize, usize> =
+            std::collections::HashMap::new();
+        let mut primary_text = String::new();
+
+        for &orig in &all_origs {
+            let idx = orig + offset;
+            let cur = self.char_idx_to_cursor(idx);
+            let text = if expand {
+                let line_start = self.buffer().line_to_char(cur.line);
+                let front_of_line = (0..cur.col)
+                    .all(|i| matches!(self.buffer().content.char(line_start + i), ' ' | '\t'));
+                let stop = if front_of_line {
+                    self.effective_shift_width().max(1)
+                } else {
+                    tabstop
+                };
+                let target = (cur.col / stop + 1) * stop;
+                " ".repeat(target - cur.col)
+            } else {
+                "\t".to_string()
+            };
+            self.insert_with_undo(idx, &text);
+            let inserted = text.chars().count();
+            if orig == primary_orig {
+                primary_text = text;
+            }
+            new_idx_of.insert(orig, idx + inserted);
+            offset += inserted;
+        }
+
+        let primary_new = new_idx_of[&primary_orig];
+        self.view_mut().cursor = self.char_idx_to_cursor(primary_new);
+        self.view_mut().extra_cursors = extra_origs
+            .iter()
+            .map(|o| self.char_idx_to_cursor(new_idx_of[o]))
+            .collect();
+
+        primary_text
     }
 
     /// Delete one char before every cursor position with col > 0.

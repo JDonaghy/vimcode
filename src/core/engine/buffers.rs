@@ -1,5 +1,9 @@
 use super::*;
 
+/// `(mark char, absolute character offset)` pairs — see
+/// `Engine::snapshot_marks_as_offsets` / `restore_marks_from_offsets`.
+type MarkOffsets = Vec<(char, usize)>;
+
 impl Engine {
     // =======================================================================
     // Buffer operations
@@ -57,6 +61,19 @@ impl Engine {
     /// Start a new undo group for the active buffer.
     pub fn start_undo_group(&mut self) {
         let cursor = *self.cursor();
+        self.start_undo_group_at(cursor);
+    }
+
+    /// Like [`start_undo_group`](Self::start_undo_group), but records an
+    /// explicit `cursor_before` instead of the engine's current cursor.
+    ///
+    /// Vim restores the cursor to the position of the *first* change an undo
+    /// group reverts, which is not always where the (real, on-screen) cursor
+    /// happened to be when the group started — e.g. a Visual delete restores
+    /// to the start of the selection even though the cursor was sitting at
+    /// the end of it when `d` was pressed (#886). Callers use this to record
+    /// that "correct" position without disturbing the actual view cursor.
+    pub fn start_undo_group_at(&mut self, cursor: Cursor) {
         // Save line state before modification (for U command)
         self.save_line_for_undo();
         // Record the "before" state in the timeline on first edit
@@ -68,12 +85,22 @@ impl Engine {
     }
 
     /// Finish the current undo group for the active buffer.
+    ///
+    /// Only records a g-/g+ timeline snapshot when the group was actually
+    /// non-empty (#804). `record_timeline_snapshot` clones the *entire*
+    /// buffer text (`Vec::remove(0)`-capped, so also O(n) to prune) — cheap
+    /// as a once-per-command cost, but `split_insert_undo_group` calls this
+    /// on every insert-mode cursor movement (arrows/Home/End), which is one
+    /// of the most frequent insert-mode interactions. Gating on "did this
+    /// group actually record an edit" keeps pure cursor movement from paying
+    /// for a full-buffer clone every keystroke.
     pub fn finish_undo_group(&mut self) {
-        self.active_buffer_state_mut().finish_undo_group();
-        // Record timeline snapshot for g-/g+ after each completed edit
-        let cursor = self.view().cursor;
-        self.active_buffer_state_mut()
-            .record_timeline_snapshot(cursor);
+        let committed = self.active_buffer_state_mut().finish_undo_group();
+        if committed {
+            let cursor = self.view().cursor;
+            self.active_buffer_state_mut()
+                .record_timeline_snapshot(cursor);
+        }
     }
 
     /// Return to Normal mode from any mode, performing any necessary cleanup
@@ -102,17 +129,200 @@ impl Engine {
 
     /// Insert text with undo recording.
     pub fn insert_with_undo(&mut self, pos: usize, text: &str) {
+        // Snapshot before the edit — `char_to_line` needs the pre-insert
+        // buffer to know which line `pos` falls on (#806).
+        let at_line = if text.contains('\n') {
+            Some(self.buffer().content.char_to_line(pos))
+        } else {
+            None
+        };
+        // Whether `pos` sits exactly at the start of `at_line` (column 0) —
+        // a whole-line insertion (`O`, a linewise `P`/`:put` landing above
+        // the cursor line, …). When it does, the ENTIRE original content of
+        // `at_line` — including any mark sitting exactly on that line —
+        // slides down by the inserted line count, not just marks strictly
+        // below it (#806 review: a mark on the same line `O` is invoked from
+        // was silently left pointing at the new, blank line otherwise).
+        let at_line_start = at_line.is_some_and(|l| pos == self.buffer().line_to_char(l));
         self.active_buffer_state_mut().record_insert(pos, text);
         self.buffer_mut().insert(pos, text);
+        if let Some(at_line) = at_line {
+            let inserted_lines = text.matches('\n').count();
+            self.shift_marks_for_line_insert(at_line, inserted_lines, at_line_start);
+        }
     }
 
     /// Delete a range with undo recording.
     pub fn delete_with_undo(&mut self, start: usize, end: usize) {
         // Capture the text being deleted before deleting
         let deleted_text: String = self.buffer().content.slice(start..end).chars().collect();
+        // A whole-line-consuming delete (`dd`, `:d`, …) always starts exactly
+        // at a line boundary — see `shift_marks_for_line_delete` for why that
+        // matters and why a mid-line splice (e.g. `J`'s newline removal,
+        // handled separately with precise column tracking) must NOT go
+        // through this path (#806).
+        let at_line = if !self.suppress_mark_line_adjust && deleted_text.contains('\n') {
+            Some(self.buffer().content.char_to_line(start))
+        } else {
+            None
+        };
         self.active_buffer_state_mut()
             .record_delete(start, &deleted_text);
         self.buffer_mut().delete_range(start, end);
+        if let Some(at_line) = at_line {
+            let removed_lines = deleted_text.matches('\n').count();
+            self.shift_marks_for_line_delete(at_line, removed_lines);
+        }
+    }
+
+    /// Shift every mark strictly below `at_line` down by `line_count` —
+    /// real Vim's rule for a full-line insertion (`O`, `o`, `:put`, …): a
+    /// mark's column is left alone (Vim never re-derives it from an edit
+    /// elsewhere on the line — verified against real Vim: deleting text
+    /// earlier on a line leaves a mark's stored column unchanged, even
+    /// though it may now point at a different character), only its line
+    /// number moves (#806, "mark:mark shifts after O", "mark:'a after text
+    /// insert above").
+    pub(crate) fn shift_marks_for_line_insert(
+        &mut self,
+        at_line: usize,
+        line_count: usize,
+        at_line_start: bool,
+    ) {
+        if line_count == 0 {
+            return;
+        }
+        // A whole-line insertion (`at_line_start`) pushes `at_line`'s own
+        // original content down too, so a mark sitting exactly on `at_line`
+        // must shift with it — otherwise it silently points at the new,
+        // inserted (blank) line instead (#806 review).
+        let shifts = |line: usize| line > at_line || (at_line_start && line == at_line);
+        let buffer_id = self.active_window().buffer_id;
+        if let Some(bm) = self.marks.get_mut(&buffer_id) {
+            for cursor in bm.values_mut() {
+                if shifts(cursor.line) {
+                    cursor.line += line_count;
+                }
+            }
+        }
+        let file = self.active_buffer_state().file_path.clone();
+        for (f, line, _) in self.global_marks.values_mut() {
+            if *f == file && shifts(*line) {
+                *line += line_count;
+            }
+        }
+    }
+
+    /// Shift/remove marks for a full-line deletion covering `[at_line,
+    /// at_line + line_count)`. A mark inside the removed range no longer has
+    /// a line to point at and is unset — real Vim removes it too (`:h
+    /// mark-motions`) — rather than left dangling on whatever line happens
+    /// to have slid into its old slot; a mark below the range shifts up
+    /// (#806, "mark:mark on deleted line").
+    pub(crate) fn shift_marks_for_line_delete(&mut self, at_line: usize, line_count: usize) {
+        if line_count == 0 {
+            return;
+        }
+        let buffer_id = self.active_window().buffer_id;
+        if let Some(bm) = self.marks.get_mut(&buffer_id) {
+            bm.retain(|_, cursor| !(cursor.line >= at_line && cursor.line < at_line + line_count));
+            for cursor in bm.values_mut() {
+                if cursor.line >= at_line + line_count {
+                    cursor.line -= line_count;
+                }
+            }
+        }
+        let file = self.active_buffer_state().file_path.clone();
+        self.global_marks.retain(|_, (f, line, _)| {
+            !(*f == file && *line >= at_line && *line < at_line + line_count)
+        });
+        for (f, line, _) in self.global_marks.values_mut() {
+            if *f == file && *line >= at_line + line_count {
+                *line -= line_count;
+            }
+        }
+    }
+
+    /// Read every local mark (active buffer) and global mark (pointing at
+    /// the active buffer's file) as an absolute character offset, using the
+    /// buffer as it exists *right now* — call before mutating it. Paired
+    /// with `restore_marks_from_offsets`, used by `join_lines` for its
+    /// precise column-aware mark fixup (#806).
+    pub(crate) fn snapshot_marks_as_offsets(&self) -> (MarkOffsets, MarkOffsets) {
+        let buffer_id = self.active_window().buffer_id;
+        let local = self
+            .marks
+            .get(&buffer_id)
+            .map(|m| {
+                m.iter()
+                    .map(|(&ch, c)| (ch, self.buffer().line_to_char(c.line) + c.col))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let file = self.active_buffer_state().file_path.clone();
+        let global = self
+            .global_marks
+            .iter()
+            .filter(|(_, (f, _, _))| *f == file)
+            .map(|(&ch, &(_, line, col))| (ch, self.buffer().line_to_char(line) + col))
+            .collect();
+        (local, global)
+    }
+
+    /// Write back offsets captured by `snapshot_marks_as_offsets`, splicing
+    /// them through an edit that removes `del_len` chars at `pos` and
+    /// inserts `ins_len` chars there, then re-deriving (line, col) from the
+    /// buffer as it exists *after* the edit. An offset that landed strictly
+    /// inside the removed span collapses to `pos` (no test exercises this;
+    /// join only ever removes whitespace, never a marked position).
+    pub(crate) fn restore_marks_from_offsets(
+        &mut self,
+        local: MarkOffsets,
+        global: MarkOffsets,
+        pos: usize,
+        del_len: usize,
+        ins_len: usize,
+    ) {
+        let splice = |o: usize| -> usize {
+            if o < pos {
+                o
+            } else if o < pos + del_len {
+                pos
+            } else {
+                o + ins_len - del_len
+            }
+        };
+        let new_local: Vec<(char, Cursor)> = local
+            .into_iter()
+            .map(|(ch, off)| {
+                let new_off = splice(off);
+                let line = self.buffer().content.char_to_line(new_off);
+                let col = new_off - self.buffer().line_to_char(line);
+                (ch, Cursor { line, col })
+            })
+            .collect();
+        let new_global: Vec<(char, usize, usize)> = global
+            .into_iter()
+            .map(|(ch, off)| {
+                let new_off = splice(off);
+                let line = self.buffer().content.char_to_line(new_off);
+                let col = new_off - self.buffer().line_to_char(line);
+                (ch, line, col)
+            })
+            .collect();
+        if !new_local.is_empty() {
+            let buffer_id = self.active_window().buffer_id;
+            let bm = self.marks.entry(buffer_id).or_default();
+            for (ch, cursor) in new_local {
+                bm.insert(ch, cursor);
+            }
+        }
+        if !new_global.is_empty() {
+            let file = self.active_buffer_state().file_path.clone();
+            for (ch, line, col) in new_global {
+                self.global_marks.insert(ch, (file.clone(), line, col));
+            }
+        }
     }
 
     /// Perform undo on the active buffer. Returns true if undo was performed.
@@ -279,9 +489,7 @@ impl Engine {
 
         // Promote preview on save
         let active_id = self.active_buffer_id();
-        if self.preview_buffer_id == Some(active_id) {
-            self.promote_preview(active_id);
-        }
+        self.preview_tab_promote(active_id);
         let state = self.active_buffer_state_mut();
         if let Some(ref path) = state.file_path.clone() {
             match state.save() {
@@ -463,8 +671,16 @@ impl Engine {
         }
 
         // Open in vsplit, then redirect new window to the preview buffer.
+        // Reset cursor/scroll so the inherited view doesn't carry an
+        // out-of-bounds cursor from the (potentially longer) source buffer.
         self.split_window(crate::core::window::SplitDirection::Vertical, None);
-        self.active_window_mut().buffer_id = buf_id;
+        {
+            let win = self.active_window_mut();
+            win.buffer_id = buf_id;
+            win.view.cursor = crate::core::cursor::Cursor::default();
+            win.view.scroll_top = 0;
+            win.view.scroll_left = 0;
+        }
         self.message = format!("[Preview] {title}");
         buf_id
     }
@@ -489,7 +705,14 @@ impl Engine {
 
         self.split_window(crate::core::window::SplitDirection::Vertical, None);
         let preview_win = self.active_window_id();
-        self.active_window_mut().buffer_id = buf_id;
+        // Reset cursor/scroll for the preview window (inherits original view).
+        {
+            let win = self.active_window_mut();
+            win.buffer_id = buf_id;
+            win.view.cursor = crate::core::cursor::Cursor::default();
+            win.view.scroll_top = 0;
+            win.view.scroll_left = 0;
+        }
         self.md_preview_links.insert(buf_id, source_id);
         self.scroll_bind_pairs.push((source_win, preview_win));
         self.message = format!("[Preview] {title}");
@@ -760,8 +983,17 @@ impl Engine {
                 }
                 // Split vertically; the new window (now active) shares the original buffer.
                 // Redirect it to the diff buffer without touching the original.
+                // Reset cursor/scroll: the diff output is not the same length
+                // as the original source file, so the inherited cursor may be
+                // out of bounds.
                 self.split_window(SplitDirection::Vertical, None);
-                self.active_window_mut().buffer_id = buf_id;
+                {
+                    let win = self.active_window_mut();
+                    win.buffer_id = buf_id;
+                    win.view.cursor = crate::core::cursor::Cursor::default();
+                    win.view.scroll_top = 0;
+                    win.view.scroll_left = 0;
+                }
                 self.message = format!("Git diff: {}", path.display());
                 EngineAction::None
             }
@@ -807,6 +1039,7 @@ impl Engine {
             if self.windows.contains_key(&left_win) {
                 let left_buf = self.windows[&left_win].buffer_id;
                 self.windows.remove(&left_win);
+                self.prune_jump_list_windows(&[left_win]);
                 // Remove from layout.
                 let tab = self.active_tab_mut();
                 if let Some(new_layout) = tab.layout.remove(left_win) {
@@ -884,9 +1117,17 @@ impl Engine {
         }
 
         // Split: new window (left) gets HEAD buffer.
+        // Reset cursor/scroll on left_win: it inherits the view from right_win,
+        // but HEAD content may differ in length (lines added/removed since HEAD).
         self.split_window(SplitDirection::Vertical, None);
         let left_win = self.active_window_id();
-        self.active_window_mut().buffer_id = head_buf_id;
+        {
+            let win = self.active_window_mut();
+            win.buffer_id = head_buf_id;
+            win.view.cursor = crate::core::cursor::Cursor::default();
+            win.view.scroll_top = 0;
+            win.view.scroll_left = 0;
+        }
 
         // Focus the right (working copy) window.
         let tab = self.active_tab_mut();
@@ -970,6 +1211,7 @@ impl Engine {
             if self.windows.contains_key(&left_win) {
                 let left_buf = self.windows[&left_win].buffer_id;
                 self.windows.remove(&left_win);
+                self.prune_jump_list_windows(&[left_win]);
                 let tab = self.active_tab_mut();
                 if let Some(new_layout) = tab.layout.remove(left_win) {
                     tab.layout = new_layout;
@@ -1028,9 +1270,16 @@ impl Engine {
         }
 
         // Split: new window (left) gets HEAD buffer.
+        // Reset cursor/scroll for the same reason as cmd_diffsplit above.
         self.split_window(SplitDirection::Vertical, None);
         let left_win = self.active_window_id();
-        self.active_window_mut().buffer_id = head_buf_id;
+        {
+            let win = self.active_window_mut();
+            win.buffer_id = head_buf_id;
+            win.view.cursor = crate::core::cursor::Cursor::default();
+            win.view.scroll_top = 0;
+            win.view.scroll_left = 0;
+        }
 
         // Focus the right (working copy) window.
         let tab = self.active_tab_mut();
@@ -1111,10 +1360,17 @@ impl Engine {
             }
         }
 
-        // Split vertically — new window (left) gets the "before" buffer
+        // Split vertically — new window (left) gets the "before" buffer.
+        // Reset cursor/scroll so the inherited view is valid for left_buf_id.
         self.split_window(SplitDirection::Vertical, None);
         let left_win = self.active_window_id();
-        self.active_window_mut().buffer_id = left_buf_id;
+        {
+            let win = self.active_window_mut();
+            win.buffer_id = left_buf_id;
+            win.view.cursor = crate::core::cursor::Cursor::default();
+            win.view.scroll_top = 0;
+            win.view.scroll_left = 0;
+        }
 
         // Focus the right (after) window
         self.active_tab_mut().active_window = right_win;
@@ -1567,7 +1823,15 @@ impl Engine {
                     state.buffer.content = ropey::Rope::from_str(&text);
                 }
                 self.split_window(SplitDirection::Vertical, None);
-                self.active_window_mut().buffer_id = buf_id;
+                // Reset view so a stale cursor from the original buffer does
+                // not go out-of-bounds in the (typically shorter) status text.
+                {
+                    let win = self.active_window_mut();
+                    win.buffer_id = buf_id;
+                    win.view.cursor = crate::core::cursor::Cursor::default();
+                    win.view.scroll_top = 0;
+                    win.view.scroll_left = 0;
+                }
                 self.message = "Git status".to_string();
                 EngineAction::None
             }
@@ -1715,7 +1979,18 @@ impl Engine {
             state.buffer.content = ropey::Rope::from_str(&text);
         }
         self.split_window(SplitDirection::Vertical, None);
-        self.active_window_mut().buffer_id = buf_id;
+        // Reset cursor/scroll: the new window inherited the previous window's
+        // view (which may have cursor.line > help-buffer line count), but the
+        // help buffer is short.  Without this reset, update_bracket_match and
+        // render code call ropey line_to_char with an out-of-bounds index and
+        // panic.  Fix for #596.
+        {
+            let win = self.active_window_mut();
+            win.buffer_id = buf_id;
+            win.view.cursor = crate::core::cursor::Cursor::default();
+            win.view.scroll_top = 0;
+            win.view.scroll_left = 0;
+        }
         self.message = if topic.is_empty() {
             "Help".to_string()
         } else {
@@ -1814,7 +2089,16 @@ impl Engine {
                 let source_win = self.active_window_id();
                 self.split_window(SplitDirection::Vertical, None);
                 let blame_win = self.active_window_id();
-                self.active_window_mut().buffer_id = buf_id;
+                // Reset cursor/scroll: blame output line count matches the
+                // source file, but cursor may still be beyond the visible
+                // portion after the view copy.  Start at the top.
+                {
+                    let win = self.active_window_mut();
+                    win.buffer_id = buf_id;
+                    win.view.cursor = crate::core::cursor::Cursor::default();
+                    win.view.scroll_top = 0;
+                    win.view.scroll_left = 0;
+                }
                 self.scroll_bind_pairs.push((source_win, blame_win));
                 self.message = format!("Git blame: {}", path.display());
                 EngineAction::None
@@ -2500,17 +2784,35 @@ impl Engine {
         EngineAction::None
     }
 
-    /// Internal: compute the LCS diff between the two diff windows and store
-    /// results in `self.diff_results`.
+    /// Internal: compute the diff between the two diff windows (via
+    /// `quadraui::compute_hunks`) and store results in `self.diff_results`
+    /// / `self.diff_aligned`.
     pub(crate) fn compute_diff(&mut self) {
         let (a_win, b_win) = match self.diff_window_pair {
             Some(pair) => pair,
             None => return,
         };
+        // NOTE: raw `content.lines()` (ropey's `Rope::lines()`) yields one
+        // MORE element than `Buffer::len_lines()` whenever the buffer ends
+        // in '\n' — ropey treats a trailing '\n' as starting a new, empty
+        // final line (see `Buffer::len_lines()`'s doc comment), but that
+        // phantom empty line is not a "real" line anywhere else in the
+        // engine (window rendering, cursor bounds, etc. all key off
+        // `buffer.len_lines()`). We must `.take(len_lines())` here so
+        // `a_lines`/`b_lines` — and therefore the `a_len`/`b_len` passed to
+        // `diff_state_from_hunks` below — match the same logical line count
+        // the rest of the engine uses. Skipping this step used to silently
+        // grow `aligned_a`/`aligned_b` by one phantom entry per file ending
+        // in '\n' (i.e. on almost every real diff).
         let a_lines: Vec<String> = {
             if let Some(w) = self.windows.get(&a_win) {
                 if let Some(s) = self.buffer_manager.get(w.buffer_id) {
-                    s.buffer.content.lines().map(|l| l.to_string()).collect()
+                    s.buffer
+                        .content
+                        .lines()
+                        .take(s.buffer.len_lines())
+                        .map(|l| l.to_string())
+                        .collect()
                 } else {
                     vec![]
                 }
@@ -2521,7 +2823,12 @@ impl Engine {
         let b_lines: Vec<String> = {
             if let Some(w) = self.windows.get(&b_win) {
                 if let Some(s) = self.buffer_manager.get(w.buffer_id) {
-                    s.buffer.content.lines().map(|l| l.to_string()).collect()
+                    s.buffer
+                        .content
+                        .lines()
+                        .take(s.buffer.len_lines())
+                        .map(|l| l.to_string())
+                        .collect()
                 } else {
                     vec![]
                 }
@@ -2529,18 +2836,36 @@ impl Engine {
                 vec![]
             }
         };
-        let a_refs: Vec<&str> = a_lines.iter().map(String::as_str).collect();
-        let b_refs: Vec<&str> = b_lines.iter().map(String::as_str).collect();
-        let (mut da, mut db) = lcs_diff(&a_refs, &b_refs);
+        // `content.lines()` yields each line WITH its trailing '\n' already
+        // included (unlike `str::lines()`), so concatenating with no
+        // separator reproduces the buffer's logical text (the last line's
+        // own trailing '\n', if the buffer has one, is still included).
+        // `compute_hunks` then re-splits on '\n' internally to reproduce the
+        // same line partition — critical for `diff_state_from_hunks` below,
+        // which indexes hunk rows against `a_lines`/`b_lines`. But
+        // `str::split('\n')` (used inside `compute_hunks`) yields one extra
+        // trailing empty-string element whenever the text it's given ends in
+        // '\n'. Since the concatenation above still carries that final '\n'
+        // when the buffer has one, we strip exactly one trailing '\n' here
+        // — mirroring the same adjustment `Buffer::len_lines()` already
+        // makes — so `compute_hunks`'s re-split partition matches
+        // `a_lines.len()` / `b_lines.len()` exactly, with no phantom row.
+        let a_text = a_lines.concat();
+        let b_text = b_lines.concat();
+        let a_text = a_text.strip_suffix('\n').unwrap_or(&a_text);
+        let b_text = b_text.strip_suffix('\n').unwrap_or(&b_text);
+        let hunks = quadraui::compute_hunks(a_text, b_text);
+        let (mut da, mut db, aligned_a, aligned_b) =
+            diff_state_from_hunks(&hunks, a_lines.len(), b_lines.len());
         // Post-process: short runs of Same lines sandwiched between changes
         // (blank lines, common braces, shared imports) fragment what the user
         // perceives as a single edit.  Re-classify runs of up to N Same lines
-        // so the coloured block stays contiguous.
+        // so the coloured block stays contiguous. This is a vimcode-owned
+        // visual preference layered on top of quadraui's hunk classification,
+        // not a re-implementation of the diff algorithm itself.
         merge_short_same_runs(&mut da, DiffLine::Removed);
         merge_short_same_runs(&mut db, DiffLine::Added);
 
-        // Build aligned sequences with padding for visual alignment.
-        let (aligned_a, aligned_b) = build_aligned_diff(&da, &db);
         self.diff_aligned.insert(a_win, aligned_a);
         self.diff_aligned.insert(b_win, aligned_b);
 
@@ -2930,14 +3255,30 @@ impl Engine {
     // Preview mode
     // =======================================================================
 
-    /// Promote a preview buffer to permanent.
-    pub fn promote_preview(&mut self, buffer_id: BufferId) {
-        if let Some(state) = self.buffer_manager.get_mut(buffer_id) {
-            state.preview = false;
+    /// Refresh the cached `preview_buffer_id` mirror from `preview_tab`
+    /// (quadraui#597's shared preview-tab tier), the single source of truth
+    /// for which buffer, if any, is currently the preview. Call after every
+    /// `preview_tab` mutation.
+    pub(super) fn sync_preview_buffer_id(&mut self) {
+        self.preview_buffer_id = self
+            .preview_tab
+            .docs()
+            .iter()
+            .find(|d| self.preview_tab.is_preview(&d.id))
+            .and_then(|d| d.id.parse::<usize>().ok())
+            .map(BufferId);
+    }
+
+    /// Promote `buffer_id` out of preview into a permanent tab via the
+    /// shared preview tier, then sync buffer/tab state to match. A no-op
+    /// when `buffer_id` isn't currently the preview.
+    pub(super) fn preview_tab_promote(&mut self, buffer_id: BufferId) {
+        if self.preview_tab.promote(&buffer_id.to_string()).is_some() {
+            if let Some(state) = self.buffer_manager.get_mut(buffer_id) {
+                state.preview = false;
+            }
         }
-        if self.preview_buffer_id == Some(buffer_id) {
-            self.preview_buffer_id = None;
-        }
+        self.sync_preview_buffer_id();
     }
 
     /// Open a file in the current window with the given mode.
@@ -2965,7 +3306,7 @@ impl Engine {
                 .is_some_and(|s| !s.preview);
 
         // If buffer already exists as permanent, just switch to it
-        if is_already_permanent && self.preview_buffer_id != Some(buffer_id) {
+        if is_already_permanent && !self.preview_tab.is_preview(&buffer_id.to_string()) {
             let current = self.active_buffer_id();
             if current != buffer_id {
                 self.buffer_manager.alternate_buffer = Some(current);
@@ -2978,24 +3319,35 @@ impl Engine {
 
         match mode {
             OpenMode::Preview => {
-                // Close old preview if it's a different buffer
-                if let Some(old_preview) = self.preview_buffer_id {
-                    if old_preview != buffer_id {
-                        // Only close if no other window shows it
-                        let _ = self.delete_buffer(old_preview, true);
+                // Ask the shared preview tier (quadraui#597) to open/replace
+                // the preview slot; it tells us which old preview buffer, if
+                // any, was displaced so we can unload it.
+                let label = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                let events = self
+                    .preview_tab
+                    .open_preview(WorkspaceDoc::new(buffer_id.to_string(), label));
+                for ev in &events {
+                    if let WorkspaceEvent::Closed { id, .. } = ev {
+                        if let Ok(raw) = id.parse::<usize>() {
+                            let old_id = BufferId(raw);
+                            if old_id != buffer_id {
+                                let _ = self.delete_buffer(old_id, true);
+                            }
+                        }
                     }
                 }
                 // Mark as preview
                 if let Some(state) = self.buffer_manager.get_mut(buffer_id) {
                     state.preview = true;
                 }
-                self.preview_buffer_id = Some(buffer_id);
+                self.sync_preview_buffer_id();
             }
             OpenMode::Permanent => {
                 // If it was a preview, promote it
-                if self.preview_buffer_id == Some(buffer_id) {
-                    self.promote_preview(buffer_id);
-                }
+                self.preview_tab_promote(buffer_id);
             }
         }
 

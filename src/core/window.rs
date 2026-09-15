@@ -12,6 +12,80 @@ pub enum SplitDirection {
     Vertical,   // split left/right
 }
 
+/// Map vimcode's `SplitDirection` (`Horizontal` = stacked top/bottom) to
+/// quadraui's `primitives::split_tree::SplitDirection` (`Horizontal` =
+/// side-by-side) — the two crates name the same divider orientation
+/// oppositely (see that module's doc comment). Centralised here so
+/// `WindowLayout`/`GroupLayout`'s `SplitTree` conversion and `render.rs`'s
+/// `divider_to_split` (#818) share one mapping instead of two hand-written
+/// copies of the same 2-arm match drifting apart.
+pub(crate) fn to_quadraui_direction(d: SplitDirection) -> quadraui::SplitDirection {
+    match d {
+        SplitDirection::Vertical => quadraui::SplitDirection::Horizontal,
+        SplitDirection::Horizontal => quadraui::SplitDirection::Vertical,
+    }
+}
+
+/// Inverse of [`to_quadraui_direction`].
+pub(crate) fn from_quadraui_direction(d: quadraui::SplitDirection) -> SplitDirection {
+    match d {
+        quadraui::SplitDirection::Horizontal => SplitDirection::Vertical,
+        quadraui::SplitDirection::Vertical => SplitDirection::Horizontal,
+    }
+}
+
+/// Encode a [`WindowId`] as a `quadraui::WidgetId` for round-tripping
+/// through `quadraui::SplitTree` — the id only ever needs to survive one
+/// `to_split_tree` → `layout` round trip within a single call, never
+/// painted or persisted, so the encoding is an implementation detail.
+fn window_widget_id(id: WindowId) -> quadraui::WidgetId {
+    quadraui::WidgetId::new(format!("w{}", id.0))
+}
+
+/// Panics if `id` isn't a well-formed `"w{usize}"` — the only strings
+/// [`window_widget_id`] ever produces, and the only producer `SplitTree`
+/// ever hands back to this function within a single `to_split_tree` →
+/// `layout` round trip. A parse failure here means `quadraui::SplitTree`
+/// mutated or fabricated a `WidgetId` this code never gave it, which would
+/// otherwise silently resolve to window `0` — a wrong-window bug far harder
+/// to spot than a panic naming the offending id.
+fn window_id_from_widget(id: &quadraui::WidgetId) -> WindowId {
+    WindowId(
+        id.as_str()[1..]
+            .parse()
+            .unwrap_or_else(|e| panic!("malformed window WidgetId {id:?} from SplitTree: {e}")),
+    )
+}
+
+/// See [`window_widget_id`].
+fn group_widget_id(id: GroupId) -> quadraui::WidgetId {
+    quadraui::WidgetId::new(format!("g{}", id.0))
+}
+
+/// See [`window_id_from_widget`] — same contract, for `GroupId`.
+fn group_id_from_widget(id: &quadraui::WidgetId) -> GroupId {
+    GroupId(
+        id.as_str()[1..]
+            .parse()
+            .unwrap_or_else(|e| panic!("malformed group WidgetId {id:?} from SplitTree: {e}")),
+    )
+}
+
+/// Convert a resolved `quadraui::SplitTreeDivider` back into vimcode's
+/// [`GroupDivider`] (f32 → f64, direction re-mapped via
+/// [`from_quadraui_direction`]).
+fn group_divider_from_split_tree(d: &quadraui::SplitTreeDivider) -> GroupDivider {
+    GroupDivider {
+        split_index: d.split_index,
+        direction: from_quadraui_direction(d.direction),
+        position: d.position as f64,
+        axis_start: d.axis_start as f64,
+        axis_size: d.axis_size as f64,
+        cross_start: d.cross_start as f64,
+        cross_size: d.cross_size as f64,
+    }
+}
+
 /// A window is a viewport into a buffer.
 /// Multiple windows can display the same buffer with independent cursors/scroll.
 #[derive(Debug, Clone)]
@@ -205,49 +279,187 @@ impl WindowRect {
     }
 }
 
+impl From<WindowRect> for quadraui::Rect {
+    fn from(r: WindowRect) -> Self {
+        quadraui::Rect::new(r.x as f32, r.y as f32, r.width as f32, r.height as f32)
+    }
+}
+
+impl From<quadraui::Rect> for WindowRect {
+    fn from(r: quadraui::Rect) -> Self {
+        WindowRect::new(r.x as f64, r.y as f64, r.width as f64, r.height as f64)
+    }
+}
+
 impl WindowLayout {
-    /// Calculate the pixel rectangles for each window in the layout.
-    pub fn calculate_rects(&self, bounds: WindowRect) -> Vec<(WindowId, WindowRect)> {
+    /// Convert to a `quadraui::SplitTree` so `calculate_rects`/`dividers`
+    /// can compute leaf rects and divider geometry in `SplitTree::layout`'s
+    /// single recursive pass, rather than two hand-rolled passes over this
+    /// tree that could (and per #582/#452, once did) diverge (#818).
+    fn to_split_tree(&self) -> quadraui::SplitTree {
         match self {
-            WindowLayout::Leaf(id) => vec![(*id, bounds)],
+            WindowLayout::Leaf(id) => quadraui::SplitTree::leaf(window_widget_id(*id)),
             WindowLayout::Split {
                 direction,
                 ratio,
                 first,
                 second,
-            } => {
-                let (first_bounds, second_bounds) = match direction {
-                    SplitDirection::Horizontal => {
-                        let first_height = bounds.height * ratio;
-                        let second_height = bounds.height - first_height;
-                        (
-                            WindowRect::new(bounds.x, bounds.y, bounds.width, first_height),
-                            WindowRect::new(
-                                bounds.x,
-                                bounds.y + first_height,
-                                bounds.width,
-                                second_height,
-                            ),
-                        )
-                    }
-                    SplitDirection::Vertical => {
-                        let first_width = bounds.width * ratio;
-                        let second_width = bounds.width - first_width;
-                        (
-                            WindowRect::new(bounds.x, bounds.y, first_width, bounds.height),
-                            WindowRect::new(
-                                bounds.x + first_width,
-                                bounds.y,
-                                second_width,
-                                bounds.height,
-                            ),
-                        )
-                    }
-                };
+            } => quadraui::SplitTree::split(
+                to_quadraui_direction(*direction),
+                *ratio as f32,
+                first.to_split_tree(),
+                second.to_split_tree(),
+            ),
+        }
+    }
 
-                let mut rects = first.calculate_rects(first_bounds);
-                rects.extend(second.calculate_rects(second_bounds));
-                rects
+    /// Calculate the pixel rectangles for each window in the layout.
+    pub fn calculate_rects(&self, bounds: WindowRect) -> Vec<(WindowId, WindowRect)> {
+        let layout = self
+            .to_split_tree()
+            .layout(bounds.into(), quadraui::SplitTreeMeasure::new(0.0));
+        layout
+            .leaves
+            .into_iter()
+            .map(|(id, rect)| (window_id_from_widget(&id), rect.into()))
+            .collect()
+    }
+
+    /// Collect all split dividers with pre-order `split_index`.
+    ///
+    /// Mirrors `GroupLayout::dividers` (used by editor-group splits) — see
+    /// that method's doc for the field semantics. `GroupDivider` has no
+    /// group-specific fields, so it's reused here for window-split dividers
+    /// too (backends wrap it in `WindowDivider` when they need to know which
+    /// editor group's tab a divider belongs to).
+    ///
+    /// `counter` is only ever called with `&mut 0` by every caller in this
+    /// codebase (a `WindowLayout` is never itself nested inside a larger
+    /// numbered tree) — it is advanced here purely to preserve the pre-#818
+    /// signature for any future caller that does thread a running counter
+    /// through.
+    pub fn dividers(&self, bounds: WindowRect, counter: &mut usize) -> Vec<GroupDivider> {
+        let layout = self
+            .to_split_tree()
+            .layout(bounds.into(), quadraui::SplitTreeMeasure::new(0.0));
+        *counter += layout.dividers.len();
+        layout
+            .dividers
+            .iter()
+            .map(group_divider_from_split_tree)
+            .collect()
+    }
+
+    /// Find the Nth split node in pre-order and set its ratio (clamped to 0.1..0.9).
+    pub fn set_ratio_at_index(&mut self, split_index: usize, ratio: f64) -> bool {
+        self.set_ratio_at_index_impl(split_index, ratio, &mut 0)
+    }
+
+    fn set_ratio_at_index_impl(&mut self, target: usize, ratio: f64, counter: &mut usize) -> bool {
+        match self {
+            WindowLayout::Leaf(_) => false,
+            WindowLayout::Split {
+                ratio: r,
+                first,
+                second,
+                ..
+            } => {
+                let idx = *counter;
+                *counter += 1;
+                if idx == target {
+                    *r = ratio.clamp(0.1, 0.9);
+                    return true;
+                }
+                first.set_ratio_at_index_impl(target, ratio, counter)
+                    || second.set_ratio_at_index_impl(target, ratio, counter)
+            }
+        }
+    }
+
+    /// Find the Nth split node in pre-order and adjust its ratio by delta.
+    pub fn adjust_ratio_at_index(&mut self, split_index: usize, delta: f64) {
+        self.adjust_ratio_at_index_impl(split_index, delta, &mut 0);
+    }
+
+    fn adjust_ratio_at_index_impl(
+        &mut self,
+        target: usize,
+        delta: f64,
+        counter: &mut usize,
+    ) -> bool {
+        match self {
+            WindowLayout::Leaf(_) => false,
+            WindowLayout::Split {
+                ratio,
+                first,
+                second,
+                ..
+            } => {
+                let idx = *counter;
+                *counter += 1;
+                if idx == target {
+                    *ratio = (*ratio + delta).clamp(0.1, 0.9);
+                    return true;
+                }
+                first.adjust_ratio_at_index_impl(target, delta, counter)
+                    || second.adjust_ratio_at_index_impl(target, delta, counter)
+            }
+        }
+    }
+
+    /// Set all split ratios in the tree to the given value (for `Ctrl-W =` equalize).
+    pub fn set_all_ratios(&mut self, ratio: f64) {
+        match self {
+            WindowLayout::Leaf(_) => {}
+            WindowLayout::Split {
+                ratio: r,
+                first,
+                second,
+                ..
+            } => {
+                *r = ratio.clamp(0.1, 0.9);
+                first.set_all_ratios(ratio);
+                second.set_all_ratios(ratio);
+            }
+        }
+    }
+
+    /// Find the parent split of a leaf window. Returns `(split_index, direction, is_first_child)`.
+    pub fn parent_split_of(&self, target: WindowId) -> Option<(usize, SplitDirection, bool)> {
+        self.parent_split_of_impl(target, &mut 0)
+    }
+
+    fn parent_split_of_impl(
+        &self,
+        target: WindowId,
+        counter: &mut usize,
+    ) -> Option<(usize, SplitDirection, bool)> {
+        match self {
+            WindowLayout::Leaf(_) => None,
+            WindowLayout::Split {
+                direction,
+                first,
+                second,
+                ..
+            } => {
+                let idx = *counter;
+                *counter += 1;
+                // Check if target is a direct child
+                if let WindowLayout::Leaf(id) = first.as_ref() {
+                    if *id == target {
+                        return Some((idx, *direction, true));
+                    }
+                }
+                if let WindowLayout::Leaf(id) = second.as_ref() {
+                    if *id == target {
+                        return Some((idx, *direction, false));
+                    }
+                }
+                // Recurse
+                if let Some(result) = first.parent_split_of_impl(target, counter) {
+                    return Some(result);
+                }
+                second.parent_split_of_impl(target, counter)
             }
         }
     }
@@ -275,8 +487,14 @@ pub enum DropZone {
     None,
 }
 
-/// Description of a single split divider in the group layout tree.
+/// Description of a single split divider in a split tree.
 /// Used by backends for hit-testing and drawing divider lines.
+///
+/// Carries no group- or window-specific data, so it's shared by both
+/// `GroupLayout::dividers` (editor-group splits) and `WindowLayout::dividers`
+/// (in-group `:split`/`:vsplit` window splits) — see `WindowDivider` for the
+/// wrapper used when a divider also needs to identify which editor group's
+/// tab it belongs to.
 #[derive(Debug, Clone)]
 pub struct GroupDivider {
     /// Pre-order index of the Split node in the tree (for `set_ratio_at_index`).
@@ -293,6 +511,41 @@ pub struct GroupDivider {
     pub cross_start: f64,
     /// Length of divider line along the cross axis.
     pub cross_size: f64,
+}
+
+/// A [`GroupDivider`] produced by a single editor group's active tab
+/// `WindowLayout`, tagged with the owning `GroupId`.
+///
+/// `WindowLayout::dividers`'s `split_index` is only unique *within one
+/// group's tab tree* — multiple groups can each have their own independent
+/// `:vsplit`s with colliding tree-local indices — so the owning group must
+/// travel with the divider for hit-testing/dragging to know which group's
+/// `WindowLayout` to mutate.
+#[derive(Debug, Clone)]
+pub struct WindowDivider {
+    pub group_id: GroupId,
+    pub split_index: usize,
+    pub direction: SplitDirection,
+    pub position: f64,
+    pub axis_start: f64,
+    pub axis_size: f64,
+    pub cross_start: f64,
+    pub cross_size: f64,
+}
+
+impl WindowDivider {
+    pub(crate) fn from_group_divider(group_id: GroupId, d: GroupDivider) -> Self {
+        Self {
+            group_id,
+            split_index: d.split_index,
+            direction: d.direction,
+            position: d.position,
+            axis_start: d.axis_start,
+            axis_size: d.axis_size,
+            cross_start: d.cross_start,
+            cross_size: d.cross_size,
+        }
+    }
 }
 
 /// Recursive tree structure for editor group layout.
@@ -438,6 +691,25 @@ impl GroupLayout {
         ids.get(n).copied()
     }
 
+    /// Convert to a `quadraui::SplitTree` — see `WindowLayout::to_split_tree`
+    /// for why (#818).
+    fn to_split_tree(&self) -> quadraui::SplitTree {
+        match self {
+            GroupLayout::Leaf(id) => quadraui::SplitTree::leaf(group_widget_id(*id)),
+            GroupLayout::Split {
+                direction,
+                ratio,
+                first,
+                second,
+            } => quadraui::SplitTree::split(
+                to_quadraui_direction(*direction),
+                *ratio as f32,
+                first.to_split_tree(),
+                second.to_split_tree(),
+            ),
+        }
+    }
+
     /// Calculate the pixel rectangles for each group in the layout.
     /// Each leaf gets `y += tab_bar_height, height -= tab_bar_height` to reserve
     /// space for the tab bar drawn at the top of each group.
@@ -446,111 +718,41 @@ impl GroupLayout {
         bounds: WindowRect,
         tab_bar_height: f64,
     ) -> Vec<(GroupId, WindowRect)> {
-        match self {
-            GroupLayout::Leaf(id) => {
-                vec![(
-                    *id,
+        let layout = self
+            .to_split_tree()
+            .layout(bounds.into(), quadraui::SplitTreeMeasure::new(0.0));
+        layout
+            .leaves
+            .into_iter()
+            .map(|(id, rect)| {
+                let r: WindowRect = rect.into();
+                (
+                    group_id_from_widget(&id),
                     WindowRect::new(
-                        bounds.x,
-                        bounds.y + tab_bar_height,
-                        bounds.width,
-                        (bounds.height - tab_bar_height).max(0.0),
+                        r.x,
+                        r.y + tab_bar_height,
+                        r.width,
+                        (r.height - tab_bar_height).max(0.0),
                     ),
-                )]
-            }
-            GroupLayout::Split {
-                direction,
-                ratio,
-                first,
-                second,
-            } => {
-                let (first_bounds, second_bounds) = match direction {
-                    SplitDirection::Horizontal => {
-                        let first_h = bounds.height * ratio;
-                        let second_h = bounds.height - first_h;
-                        (
-                            WindowRect::new(bounds.x, bounds.y, bounds.width, first_h),
-                            WindowRect::new(bounds.x, bounds.y + first_h, bounds.width, second_h),
-                        )
-                    }
-                    SplitDirection::Vertical => {
-                        let first_w = bounds.width * ratio;
-                        let second_w = bounds.width - first_w;
-                        (
-                            WindowRect::new(bounds.x, bounds.y, first_w, bounds.height),
-                            WindowRect::new(bounds.x + first_w, bounds.y, second_w, bounds.height),
-                        )
-                    }
-                };
-                let mut rects = first.calculate_group_rects(first_bounds, tab_bar_height);
-                rects.extend(second.calculate_group_rects(second_bounds, tab_bar_height));
-                rects
-            }
-        }
+                )
+            })
+            .collect()
     }
 
     /// Collect all split dividers with pre-order `split_index`.
+    ///
+    /// See `WindowLayout::dividers`'s doc for why `counter` is only ever
+    /// `&mut 0` in practice.
     pub fn dividers(&self, bounds: WindowRect, counter: &mut usize) -> Vec<GroupDivider> {
-        match self {
-            GroupLayout::Leaf(_) => vec![],
-            GroupLayout::Split {
-                direction,
-                ratio,
-                first,
-                second,
-            } => {
-                let idx = *counter;
-                *counter += 1;
-                let divider = match direction {
-                    SplitDirection::Vertical => {
-                        let pos = bounds.x + bounds.width * ratio;
-                        GroupDivider {
-                            split_index: idx,
-                            direction: *direction,
-                            position: pos,
-                            axis_start: bounds.x,
-                            axis_size: bounds.width,
-                            cross_start: bounds.y,
-                            cross_size: bounds.height,
-                        }
-                    }
-                    SplitDirection::Horizontal => {
-                        let pos = bounds.y + bounds.height * ratio;
-                        GroupDivider {
-                            split_index: idx,
-                            direction: *direction,
-                            position: pos,
-                            axis_start: bounds.y,
-                            axis_size: bounds.height,
-                            cross_start: bounds.x,
-                            cross_size: bounds.width,
-                        }
-                    }
-                };
-                let (first_bounds, second_bounds) = match direction {
-                    SplitDirection::Horizontal => {
-                        let first_h = bounds.height * ratio;
-                        let second_h = bounds.height - first_h;
-                        (
-                            WindowRect::new(bounds.x, bounds.y, bounds.width, first_h),
-                            WindowRect::new(bounds.x, bounds.y + first_h, bounds.width, second_h),
-                        )
-                    }
-                    SplitDirection::Vertical => {
-                        let first_w = bounds.width * ratio;
-                        let second_w = bounds.width - first_w;
-                        (
-                            WindowRect::new(bounds.x, bounds.y, first_w, bounds.height),
-                            WindowRect::new(bounds.x + first_w, bounds.y, second_w, bounds.height),
-                        )
-                    }
-                };
-                let mut divs = vec![divider];
-                divs.extend(first.dividers(first_bounds, counter));
-                divs.extend(second.dividers(second_bounds, counter));
-                divs
-            }
-        }
+        let layout = self
+            .to_split_tree()
+            .layout(bounds.into(), quadraui::SplitTreeMeasure::new(0.0));
+        *counter += layout.dividers.len();
+        layout
+            .dividers
+            .iter()
+            .map(group_divider_from_split_tree)
+            .collect()
     }
 
     /// Find the Nth split node in pre-order and set its ratio (clamped to 0.1..0.9).
@@ -611,6 +813,10 @@ impl GroupLayout {
     }
 
     /// Set all split ratios in the tree to the given value (for equalize).
+    ///
+    /// Restored for #582: still needed as `equalize_splits`'s fallback for
+    /// editor-group-only layouts (`Ctrl-W e`/`E`, no window splits) — see
+    /// `tests/vim_compat_batch.rs::test_ctrl_w_equal_equalize`.
     pub fn set_all_ratios(&mut self, ratio: f64) {
         match self {
             GroupLayout::Leaf(_) => {}
@@ -736,6 +942,94 @@ mod tests {
         // Second window should be right half
         assert!((rects[1].1.width - 400.0).abs() < 0.001);
         assert!((rects[1].1.x - 400.0).abs() < 0.001);
+    }
+
+    // ── WindowLayout divider tests (#582) ────────────────────────────────
+
+    #[test]
+    fn test_window_layout_dividers() {
+        let mut layout = WindowLayout::leaf(WindowId(1));
+        layout.split_at(WindowId(1), SplitDirection::Vertical, WindowId(2), false);
+        layout.split_at(WindowId(1), SplitDirection::Horizontal, WindowId(3), false);
+        let bounds = WindowRect::new(0.0, 0.0, 800.0, 600.0);
+        let dividers = layout.dividers(bounds, &mut 0);
+        // Two splits → two dividers
+        assert_eq!(dividers.len(), 2);
+        // First divider (pre-order 0) is the root vertical split
+        assert_eq!(dividers[0].split_index, 0);
+        assert_eq!(dividers[0].direction, SplitDirection::Vertical);
+        assert!((dividers[0].position - 400.0).abs() < 0.001);
+        // Second divider (pre-order 1) is the nested horizontal split
+        assert_eq!(dividers[1].split_index, 1);
+        assert_eq!(dividers[1].direction, SplitDirection::Horizontal);
+        assert!((dividers[1].position - 300.0).abs() < 0.001); // 600*0.5
+    }
+
+    #[test]
+    fn test_window_layout_no_dividers_when_single_window() {
+        let layout = WindowLayout::leaf(WindowId(1));
+        let bounds = WindowRect::new(0.0, 0.0, 800.0, 600.0);
+        assert!(layout.dividers(bounds, &mut 0).is_empty());
+    }
+
+    #[test]
+    fn test_window_layout_set_ratio() {
+        let mut layout = WindowLayout::leaf(WindowId(1));
+        layout.split_at(WindowId(1), SplitDirection::Vertical, WindowId(2), false);
+        assert!(layout.set_ratio_at_index(0, 0.7));
+        let bounds = WindowRect::new(0.0, 0.0, 1000.0, 600.0);
+        let rects = layout.calculate_rects(bounds);
+        assert!((rects[0].1.width - 700.0).abs() < 0.001);
+        assert!((rects[1].1.width - 300.0).abs() < 0.001);
+        // Clamping
+        assert!(layout.set_ratio_at_index(0, 0.05));
+        let rects = layout.calculate_rects(bounds);
+        assert!((rects[0].1.width - 100.0).abs() < 0.001); // clamped to 0.1
+                                                           // Unknown index is a no-op that returns false
+        assert!(!layout.set_ratio_at_index(99, 0.5));
+    }
+
+    #[test]
+    fn test_window_layout_adjust_ratio() {
+        let mut layout = WindowLayout::leaf(WindowId(1));
+        layout.split_at(WindowId(1), SplitDirection::Vertical, WindowId(2), false);
+        layout.adjust_ratio_at_index(0, 0.2);
+        let bounds = WindowRect::new(0.0, 0.0, 1000.0, 600.0);
+        let rects = layout.calculate_rects(bounds);
+        assert!((rects[0].1.width - 700.0).abs() < 0.001); // 0.5 + 0.2
+    }
+
+    #[test]
+    fn test_window_layout_set_all_ratios() {
+        let mut layout = WindowLayout::leaf(WindowId(1));
+        layout.split_at(WindowId(1), SplitDirection::Vertical, WindowId(2), false);
+        layout.split_at(WindowId(1), SplitDirection::Horizontal, WindowId(3), false);
+        layout.set_ratio_at_index(0, 0.8);
+        layout.set_ratio_at_index(1, 0.8);
+        layout.set_all_ratios(0.5);
+        let bounds = WindowRect::new(0.0, 0.0, 800.0, 600.0);
+        let dividers = layout.dividers(bounds, &mut 0);
+        assert!((dividers[0].position - 400.0).abs() < 0.001);
+        assert!((dividers[1].position - 300.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_window_layout_parent_split_of() {
+        let mut layout = WindowLayout::leaf(WindowId(1));
+        layout.split_at(WindowId(1), SplitDirection::Vertical, WindowId(2), false);
+        // WindowId(2) is the second child of the root vertical split.
+        let (idx, dir, is_first) = layout.parent_split_of(WindowId(2)).unwrap();
+        assert_eq!(idx, 0);
+        assert_eq!(dir, SplitDirection::Vertical);
+        assert!(!is_first);
+        // WindowId(1) is the first child.
+        let (idx, dir, is_first) = layout.parent_split_of(WindowId(1)).unwrap();
+        assert_eq!(idx, 0);
+        assert_eq!(dir, SplitDirection::Vertical);
+        assert!(is_first);
+        // A single-window layout has no parent split.
+        let single = WindowLayout::leaf(WindowId(1));
+        assert_eq!(single.parent_split_of(WindowId(1)), None);
     }
 
     // ── GroupLayout tests ──────────────────────────────────────────────────

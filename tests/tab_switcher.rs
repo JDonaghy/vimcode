@@ -122,7 +122,8 @@ fn tab_mru_order_reflects_access() {
     // Selected=1 means we'd switch to tab2 (second in MRU)
     assert_eq!(e.tab_switcher_selected, 1);
     let entry = e.tab_mru[1];
-    assert_eq!(entry.1, 2, "second MRU entry should be tab 2");
+    let tab2_id = e.active_group().tabs[2].id;
+    assert_eq!(entry.1, tab2_id, "second MRU entry should be tab 2");
 }
 
 #[test]
@@ -164,7 +165,7 @@ fn tab_switcher_confirm_then_reopen_has_correct_mru() {
     // Ctrl+Tab + Return → switch to tab 1 (second MRU entry)
     e.handle_key("Tab", None, true);
     press_key(&mut e, "Return");
-    let switched_to = e.active_group().active_tab;
+    let switched_to_id = e.active_tab().id;
 
     // Now open again — the tab we just left (tab 2) should be at MRU[1]
     e.handle_key("Tab", None, true);
@@ -173,9 +174,9 @@ fn tab_switcher_confirm_then_reopen_has_correct_mru() {
     // The second entry should NOT be the same as where we are now
     assert_ne!(
         second_entry.1,
-        e.active_group().active_tab,
+        e.active_tab().id,
         "second MRU entry should be the previous tab"
     );
     // It should be the tab we just left
-    assert_ne!(second_entry.1, switched_to);
+    assert_ne!(second_entry.1, switched_to_id);
 }

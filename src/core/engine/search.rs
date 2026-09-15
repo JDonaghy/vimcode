@@ -1278,33 +1278,75 @@ impl Engine {
         Some(chars[start..end].iter().collect())
     }
 
-    /// Search forward (*) or backward (#) for the word under cursor with word boundaries.
-    pub(crate) fn search_word_under_cursor(&mut self, forward: bool) {
-        let word = match self.word_under_cursor() {
-            Some(w) => w,
-            None => {
-                self.message = "No word under cursor".to_string();
-                return;
-            }
+    /// Find the "word nearest the cursor" that `*` / `#` / `g*` / `g#` act on.
+    ///
+    /// Vim (`nv_ident`) does *not* require the cursor to already sit on a
+    /// keyword: when it does not, it scans forward on the current line for the
+    /// first keyword character. Returns `(word, start_col)`; the caller moves
+    /// the cursor to `start_col` before searching, exactly as Vim does, so that
+    /// `*` finds the *next* occurrence rather than re-finding this one.
+    pub(crate) fn star_word_under_cursor(&self) -> Option<(String, usize)> {
+        let line = self.view().cursor.line;
+        let col = self.view().cursor.col;
+        let line_content: String = self.buffer().content.line(line).chars().collect();
+        let chars: Vec<char> = line_content.chars().collect();
+
+        let mut i = col;
+        while i < chars.len() && !Self::is_word_char(chars[i]) {
+            i += 1;
+        }
+        if i >= chars.len() {
+            return None;
+        }
+        let start = (0..=i)
+            .rev()
+            .take_while(|&j| Self::is_word_char(chars[j]))
+            .last()
+            .unwrap_or(i);
+        let end = (i..chars.len())
+            .take_while(|&j| Self::is_word_char(chars[j]))
+            .last()
+            .map(|j| j + 1)
+            .unwrap_or(i + 1);
+
+        Some((chars[start..end].iter().collect(), start))
+    }
+
+    /// Shared body of `*` / `#` (`whole_word`) and `g*` / `g#` (not).
+    ///
+    /// The pattern is built as a real Vim pattern (`\<word\>`) and stored in
+    /// `search_query`, so `n`, `N` and a later `:s//repl/` all reuse it — that
+    /// is what `:h :s%5C%5C` calls "the last search pattern".
+    pub(crate) fn search_word_under_cursor_generic(&mut self, forward: bool, whole_word: bool) {
+        let Some((word, start_col)) = self.star_word_under_cursor() else {
+            self.message = "E348: No string under cursor".to_string();
+            return;
         };
 
-        self.search_query = word.clone();
+        // Vim places the cursor on the start of the identified word first.
+        self.view_mut().cursor.col = start_col;
+
+        let escaped = crate::core::vim_regex::escape_vim_literal(&word);
+        self.search_query = if whole_word {
+            format!("\\<{}\\>", escaped)
+        } else {
+            escaped
+        };
+        self.search_offset.clear();
+        // `:h 'smartcase'` — the option applies only to a *typed* pattern.
+        self.search_smartcase_applies = false;
         self.search_direction = if forward {
             SearchDirection::Forward
         } else {
             SearchDirection::Backward
         };
-        self.search_word_bounded = true;
 
-        // Build word-boundary matches manually
-        self.build_word_bounded_matches();
-
+        self.run_search();
         if self.search_matches.is_empty() {
-            self.message = format!("Pattern not found: {}", word);
+            self.message = format!("E486: Pattern not found: {}", word);
             return;
         }
 
-        // Jump to first match in the appropriate direction
         if forward {
             self.search_next();
         } else {
@@ -1312,41 +1354,111 @@ impl Engine {
         }
     }
 
-    /// Like run_search but only keeps matches that are whole words.
-    pub(crate) fn build_word_bounded_matches(&mut self) {
-        self.search_matches.clear();
-        self.search_index = None;
+    /// Search forward (`*`) or backward (`#`) for the whole word under the cursor.
+    pub(crate) fn search_word_under_cursor(&mut self, forward: bool) {
+        self.search_word_under_cursor_generic(forward, true);
+    }
 
-        if self.search_query.is_empty() {
+    /// `gd` — go to local declaration (`:h gd`).
+    ///
+    /// This is a pure motion: it does not touch the language server. Vim's
+    /// documented algorithm is:
+    ///   1. Search backward for the start of the current function, exactly
+    ///      like `[[` (a line whose first character is `{`). If none is
+    ///      found, start at line 1.
+    ///   2. If one *was* found, keep walking further back until a blank
+    ///      line is found (skips attributes/doc-comments above the brace).
+    ///   3. From that position, search forward for the first whole-word
+    ///      match of the identifier under the cursor, like `*`.
+    ///
+    /// After `gd` lands, `n` repeats the same search forward (`:h gd`), so
+    /// this seeds `search_query`/`search_direction` exactly like `*` does.
+    pub(crate) fn cmd_gd(&mut self) {
+        self.take_count(); // no count variant of `gd` is implemented; discard cleanly
+        let Some((word, _start_col)) = self.star_word_under_cursor() else {
+            self.message = "E349: No identifier under cursor".to_string();
             return;
-        }
+        };
 
-        let text = self.buffer().to_string();
-        let query = self.search_query.clone();
-        let mut byte_pos = 0;
+        let cur_line = self.view().cursor.line;
 
-        while let Some(found) = text[byte_pos..].find(&query) {
-            let start_byte = byte_pos + found;
-            let end_byte = start_byte + query.len();
+        // Step 1: search backward, like `[[`, for a line starting with `{`.
+        let func_brace_line = (0..cur_line).rev().find(|&line| {
+            self.buffer().line_len_chars(line) > 0
+                && self.buffer().content.char(self.buffer().line_to_char(line)) == '{'
+        });
 
-            // Check word boundaries
-            let before_ok = start_byte == 0 || {
-                let c = text[..start_byte].chars().last().unwrap_or(' ');
-                !Self::is_word_char(c)
-            };
-            let after_ok = end_byte >= text.len() || {
-                let c = text[end_byte..].chars().next().unwrap_or(' ');
-                !Self::is_word_char(c)
-            };
-
-            if before_ok && after_ok {
-                let start_char = self.buffer().content.byte_to_char(start_byte);
-                let end_char = self.buffer().content.byte_to_char(end_byte);
-                self.search_matches.push((start_char, end_char));
+        // Step 2: if found, keep going back to the nearest blank line above it.
+        let search_start_line = match func_brace_line {
+            Some(brace_line) => {
+                let mut line = brace_line;
+                while line > 0 {
+                    let prev = line - 1;
+                    let is_blank = self
+                        .buffer()
+                        .content
+                        .line(prev)
+                        .chars()
+                        .all(|c| c.is_whitespace());
+                    if is_blank {
+                        break;
+                    }
+                    line = prev;
+                }
+                line
             }
+            None => 0,
+        };
 
-            byte_pos = start_byte + 1;
+        // Step 3: search forward for the first whole-word match.
+        let total_lines = self.buffer().len_lines();
+        for line in search_start_line..total_lines {
+            let line_content: String = self.buffer().content.line(line).chars().collect();
+            if let Some(col) = Self::find_whole_word_col(&line_content, &word) {
+                self.push_jump_location();
+                self.view_mut().cursor.line = line;
+                self.view_mut().cursor.col = col;
+
+                // Seed the search register so `n` continues forward from here.
+                let escaped = crate::core::vim_regex::escape_vim_literal(&word);
+                self.search_query = format!("\\<{}\\>", escaped);
+                self.search_offset.clear();
+                self.search_smartcase_applies = false;
+                self.search_direction = SearchDirection::Forward;
+                self.run_search();
+                let cursor_char = self.buffer().line_to_char(line) + col;
+                self.search_index = self
+                    .search_matches
+                    .iter()
+                    .position(|(start, _)| *start == cursor_char);
+                return;
+            }
         }
+        self.message = format!("E387: Match not found for {}", word);
+    }
+
+    /// First whole-word (`\<word\>`) match of `word` in `line`; returns the
+    /// (char) column of the match start.
+    fn find_whole_word_col(line: &str, word: &str) -> Option<usize> {
+        let chars: Vec<char> = line.chars().collect();
+        let wchars: Vec<char> = word.chars().collect();
+        if wchars.is_empty() || chars.len() < wchars.len() {
+            return None;
+        }
+        'outer: for start in 0..=(chars.len() - wchars.len()) {
+            for (i, &wc) in wchars.iter().enumerate() {
+                if chars[start + i] != wc {
+                    continue 'outer;
+                }
+            }
+            let before_ok = start == 0 || !Self::is_word_char(chars[start - 1]);
+            let end = start + wchars.len();
+            let after_ok = end >= chars.len() || !Self::is_word_char(chars[end]);
+            if before_ok && after_ok {
+                return Some(start);
+            }
+        }
+        None
     }
 
     // ===================================================================
@@ -1446,7 +1558,6 @@ impl Engine {
     pub fn run_find_replace_search(&mut self) {
         self.search_query = self.find_replace_query.clone();
         self.search_direction = SearchDirection::Forward;
-        self.search_word_bounded = false;
         self.search_matches.clear();
         self.search_index = None;
 
@@ -1718,6 +1829,43 @@ impl Engine {
         true
     }
 
+    /// Paste already-resolved clipboard text into the focused find/replace
+    /// field (query or replacement), replacing the selection if any.
+    ///
+    /// Shared by [`handle_find_replace_key`]'s own Ctrl+V arm (which reads
+    /// `self.clipboard_read` itself) and [`Engine::route_paste`] (`keys.rs`)
+    /// — the latter is the one real backends actually reach for Ctrl+V today
+    /// (#946): quadraui#813 intercepts Ctrl+V/Ctrl+Shift+V ahead of
+    /// `AppLogic::handle` on every backend and delivers the resolved text as
+    /// `UiEvent::ClipboardPaste` → `route_paste`, so a raw `KeyPressed`
+    /// Ctrl+V never reaches [`handle_find_replace_key`]'s own arm in
+    /// practice. Before this method existed, `route_paste` had no branch for
+    /// `find_replace_open` at all, so Ctrl+V while the find/replace overlay
+    /// was focused fell through to `route_paste`'s `Mode::Normal` arm and
+    /// pasted into the *editor buffer* instead of the overlay field — a
+    /// live, user-visible bug on both GTK and TUI, not a dead-code gap.
+    ///
+    /// [`handle_find_replace_key`]: Self::handle_find_replace_key
+    pub(crate) fn find_replace_paste(&mut self, clip: &str) {
+        let paste = clip.lines().next().unwrap_or("").to_string();
+        self.fr_delete_selection(); // remove selected text first
+        let (field, is_find) = if self.find_replace_focus == 0 {
+            (&mut self.find_replace_query, true)
+        } else {
+            (&mut self.find_replace_replacement, false)
+        };
+        let byte_idx = field
+            .char_indices()
+            .nth(self.find_replace_cursor)
+            .map(|(i, _)| i)
+            .unwrap_or(field.len());
+        field.insert_str(byte_idx, &paste);
+        self.find_replace_cursor += paste.chars().count();
+        if is_find {
+            self.run_find_replace_search();
+        }
+    }
+
     /// Handle a key press in the find/replace overlay.
     pub(crate) fn handle_find_replace_key(
         &mut self,
@@ -1883,24 +2031,8 @@ impl Engine {
 
                 // Ctrl+V paste (replaces selection if any)
                 if ctrl && key_name == "v" {
-                    if let Some(clip) = Self::clipboard_paste() {
-                        let paste = clip.lines().next().unwrap_or("").to_string();
-                        self.fr_delete_selection(); // remove selected text first
-                        let (field, is_find) = if self.find_replace_focus == 0 {
-                            (&mut self.find_replace_query, true)
-                        } else {
-                            (&mut self.find_replace_replacement, false)
-                        };
-                        let byte_idx = field
-                            .char_indices()
-                            .nth(self.find_replace_cursor)
-                            .map(|(i, _)| i)
-                            .unwrap_or(field.len());
-                        field.insert_str(byte_idx, &paste);
-                        self.find_replace_cursor += paste.chars().count();
-                        if is_find {
-                            self.run_find_replace_search();
-                        }
+                    if let Some(clip) = self.clipboard_read.as_ref().and_then(|cb| cb().ok()) {
+                        self.find_replace_paste(&clip);
                     }
                     return;
                 }

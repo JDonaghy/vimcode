@@ -216,8 +216,8 @@ impl Engine {
     fn vscode_copy(&mut self) {
         if self.visual_anchor.is_some() {
             if let Some((text, is_linewise)) = self.get_visual_selection_text() {
-                self.set_register('+', text.clone(), is_linewise);
-                self.set_register('"', text, is_linewise);
+                self.set_register_typed('+', text.clone(), is_linewise);
+                self.set_register_typed('"', text, is_linewise);
             }
             // Keep selection visible after copy.
         } else {
@@ -244,8 +244,8 @@ impl Engine {
     fn vscode_cut(&mut self, changed: &mut bool) {
         if self.visual_anchor.is_some() {
             if let Some((text, is_linewise)) = self.get_visual_selection_text() {
-                self.set_register('+', text.clone(), is_linewise);
-                self.set_register('"', text, is_linewise);
+                self.set_register_typed('+', text.clone(), is_linewise);
+                self.set_register_typed('"', text, is_linewise);
             }
             self.vscode_delete_selection(changed);
         } else {
@@ -281,8 +281,8 @@ impl Engine {
         if self.visual_anchor.is_some() {
             self.vscode_delete_selection(changed);
         }
-        if let Some((text, is_linewise)) = self.get_register_content('+') {
-            if is_linewise {
+        if let Some((text, reg_type)) = self.get_register_content('+') {
+            if reg_type.is_linewise() {
                 // Linewise: insert before current line.
                 let line = self.view().cursor.line;
                 let line_start = self.buffer().line_to_char(line);
@@ -747,6 +747,14 @@ impl Engine {
     }
 
     /// VSCode Ctrl+] → indent current line or selection.
+    ///
+    /// Passes `reposition_cursor: false` to `indent_lines`/`dedent_lines`
+    /// throughout this function and `vscode_outdent` below — VSCode mode's
+    /// multi-cursor model manages every cursor's column itself right after
+    /// the loop, and the shared helper's Vim-style cursor landing
+    /// (`self.view_mut().cursor.line = start_line` on every call) would
+    /// otherwise stomp every cursor but the last shifted line's onto
+    /// `start_line` (#883 review).
     fn vscode_indent(&mut self, changed: &mut bool) {
         if !self.view().extra_cursors.is_empty() {
             // Collect all unique lines from primary + extra cursors
@@ -758,7 +766,7 @@ impl Engine {
             }
             lines.sort_unstable();
             for &line in &lines {
-                self.indent_lines(line, 1, changed);
+                self.indent_lines(line, 1, changed, false);
             }
             // Adjust cursor columns for indent
             let indent_size = if self.settings.expand_tab {
@@ -773,7 +781,7 @@ impl Engine {
         } else {
             let (start_line, end_line) = self.vscode_affected_lines();
             let count = end_line - start_line + 1;
-            self.indent_lines(start_line, count, changed);
+            self.indent_lines(start_line, count, changed, false);
         }
     }
 
@@ -794,7 +802,7 @@ impl Engine {
                 1
             };
             for &line in &lines {
-                self.dedent_lines(line, 1, changed);
+                self.dedent_lines(line, 1, changed, false);
             }
             // Adjust cursor columns
             self.view_mut().cursor.col = self.view().cursor.col.saturating_sub(indent_size);
@@ -804,7 +812,7 @@ impl Engine {
         } else {
             let (start_line, end_line) = self.vscode_affected_lines();
             let count = end_line - start_line + 1;
-            self.dedent_lines(start_line, count, changed);
+            self.dedent_lines(start_line, count, changed, false);
         }
     }
 
@@ -1021,9 +1029,7 @@ impl Engine {
                 self.set_dirty(true);
                 self.update_syntax();
                 let active_id = self.active_buffer_id();
-                if self.preview_buffer_id == Some(active_id) {
-                    self.promote_preview(active_id);
-                }
+                self.preview_tab_promote(active_id);
                 self.lsp_dirty_buffers.insert(active_id, true);
                 self.swap_mark_dirty();
                 if !self.search_matches.is_empty() {
@@ -1332,7 +1338,7 @@ impl Engine {
                         if col > 0 {
                             // Auto-pair backspace: delete both opener and closer
                             let prev_char = self.buffer().content.char(char_idx - 1);
-                            let next_char_matches = if self.settings.auto_pairs
+                            let next_char_matches = if self.settings.auto_pairs()
                                 && char_idx < self.buffer().len_chars()
                             {
                                 let next = self.buffer().content.char(char_idx);
@@ -1526,14 +1532,14 @@ impl Engine {
                             let col = self.view().cursor.col;
                             let char_idx = self.buffer().line_to_char(line) + col;
                             let closing_pair = auto_pair_closer(ch);
-                            if self.settings.auto_pairs
+                            if self.settings.auto_pairs()
                                 && is_closing_pair(ch)
                                 && char_idx < self.buffer().len_chars()
                                 && self.buffer().content.char(char_idx) == ch
                             {
                                 self.view_mut().cursor.col += 1;
                                 changed = true;
-                            } else if self.settings.auto_pairs && closing_pair.is_some() {
+                            } else if self.settings.auto_pairs() && closing_pair.is_some() {
                                 let closer = closing_pair.unwrap();
                                 let should_pair = if is_quote_char(ch) {
                                     if char_idx == 0 {
@@ -1590,9 +1596,7 @@ impl Engine {
             self.set_dirty(true);
             self.update_syntax();
             let active_id = self.active_buffer_id();
-            if self.preview_buffer_id == Some(active_id) {
-                self.promote_preview(active_id);
-            }
+            self.preview_tab_promote(active_id);
             self.lsp_dirty_buffers.insert(active_id, true);
             self.swap_mark_dirty();
             // Refresh search highlights so they track the new buffer content.

@@ -2,7 +2,7 @@
 
 **[vimcode.org](https://vimcode.org)** | [Documentation](https://github.com/JDonaghy/vimcode/wiki) | [Releases](https://github.com/JDonaghy/vimcode/releases)
 
-A Vim+VSCode hybrid editor written in Rust. 137K lines of code, 5,501 tests, four rendering backends.
+A Vim+VSCode hybrid editor written in Rust. 169K lines of code, 3,873 `#[test]` functions, two rendering backends (GTK4 and terminal).
 
 ### Who’s this for?
 
@@ -17,7 +17,7 @@ Like Neovim, VimCode supports **Lua 5.4** for extensions — but with its own AP
 | Platform | GUI | TUI |
 |----------|-----|-----|
 | **Linux** | GTK4 + Cairo + Pango | ratatui + crossterm |
-| **macOS** | GTK4 via Homebrew | ratatui + crossterm |
+| **macOS** | Native AppKit + Core Graphics + Core Text, or GTK4 via Homebrew | ratatui + crossterm |
 | **Windows** | Native Win32 + Direct2D + DirectWrite (**alpha**) | ratatui + crossterm |
 
 ### Status — Beta
@@ -47,7 +47,7 @@ some test text
 - **First-class Vim mode** — deeply integrated modal editing, not a plugin bolted onto a different editor
 - **Cross-platform** — GTK4 on Linux/macOS, native Win32+Direct2D on Windows, full TUI everywhere
 - **No GPU required** — Cairo/Pango and Direct2D/DirectWrite rendering; hardware compositing when available, software fallback always works (VMs, remote desktops, SSH)
-- **Clean architecture** — platform-agnostic core (`src/core/`), 5,501 tests, zero async runtime dependency
+- **Clean architecture** — platform-agnostic core (`src/core/`), 5,547 tests, zero async runtime dependency
 
 > **Note:** VimCode does not implement VimScript. Extension and scripting is handled via
 > the built-in Lua 5.4 plugin system. The goal is full Vim *keybinding* and *editing*
@@ -110,8 +110,9 @@ Download `vcd-windows-x86_64.exe` from the release page (rename to `vcd.exe` for
 
 ### Prerequisites
 
-some more test text
-The default build produces the **GTK4 GUI** + **TUI** binary. The **native Windows GUI** is built separately with a Cargo feature flag.
+The default build produces the **GTK4 GUI** + **TUI** binary. The **native macOS**
+and **native Windows** GUIs are each built separately behind their own Cargo
+feature flag — neither is part of the default build, and neither needs GTK4.
 
 | Platform | GTK4 GUI deps |
 |---|---|
@@ -123,32 +124,77 @@ The default build produces the **GTK4 GUI** + **TUI** binary. The **native Windo
 
 **Platform notes:**
 - **TUI-only mode** (`--tui` or `-t`) works without GTK4 — only a terminal emulator is needed
+- **macOS native GUI** does not require GTK4; it uses AppKit + Core Graphics + Core Text directly (see below)
 - **Windows native GUI** does not require GTK4; it uses the Win32 API directly (see below)
 - **Nerd Font icons:** VimCode uses Nerd Font icons throughout the UI. **GTK mode** bundles a Nerd Font icon subset and works out of the box. **TUI mode** requires a [Nerd Font](https://www.nerdfonts.com/) (e.g. JetBrainsMono Nerd Font) as your terminal font. If your terminal font lacks Nerd Font glyphs, set `"use_nerd_fonts": false` in `settings.json` (or `:set nonerdfonts`) to switch all icons to ASCII/Unicode fallbacks.
 
 ### Build & run
 
+There are two binaries — `vimcode` (the app) and `vcd` (TUI only) — and no
+`default-run`, so **`--bin` is required on every `cargo run`**. A bare `cargo
+run` does not pick one for you; it fails with *"could not determine which
+binary to run"*.
+
 ```bash
-# Linux / macOS (GTK4 GUI + TUI)
+# Linux / macOS — GTK4 GUI + TUI (the default build)
 cargo build
-cargo run -- <file>                         # GTK window
-cargo run -- --tui <file>                   # Terminal UI (alias: -t)
-cargo run -- --tui --debug /tmp/v.log       # TUI with debug log
-cargo run -- --version                      # Print version and exit (alias: -V)
+cargo run --bin vimcode -- <file>                    # GTK window
+cargo run --bin vimcode -- --tui <file>              # Terminal UI (alias: -t)
+cargo run --bin vimcode -- --tui --debug /tmp/v.log  # TUI with debug log
+cargo run --bin vimcode -- --version                 # Version + backend (alias: -V)
+
+# macOS — Native GUI (AppKit + Core Graphics + Core Text, no GTK4 needed)
+cargo build --release --no-default-features --features macos --bin vimcode
+cargo run --release --no-default-features --features macos --bin vimcode -- <file>
 
 # Windows — Native GUI (Direct2D + DirectWrite, no GTK4 needed)
-cargo build --features win-gui --bin vimcode-win
-cargo run --features win-gui --bin vimcode-win
+cargo build --no-default-features --features win --bin vimcode
+cargo run --no-default-features --features win --bin vimcode -- <file>
 
-# Windows — TUI only (no GTK4 needed)
+# TUI only, any platform (no GTK4 needed)
 cargo build --no-default-features
-cargo run --no-default-features -- <file>
+cargo run --no-default-features --bin vcd -- <file>
 
 # Tests & linting
 cargo test -- --test-threads=1
 cargo clippy -- -D warnings
 cargo fmt
 ```
+
+#### Which backend am I actually running?
+
+The feature flags select the GUI backend **at compile time**, and picking the
+wrong combination does not error — it silently falls back to a different
+backend. `--version` prints which one is compiled in, so use it to confirm
+before concluding a GUI change "had no effect":
+
+```console
+$ cargo run --release --no-default-features --features macos --bin vimcode -- --version
+VimCode 0.10.0 (quadraui dbb3023a904d, macos)
+```
+
+The last field is the backend: `gtk`, `macos`, `win`, or `no-gui`.
+
+| You ran | Backend you get |
+|---|---|
+| `cargo run --bin vimcode` (on macOS) | `gtk` — **not** the native backend; `default = ["gui"]` |
+| `--no-default-features --features macos` (on macOS) | `macos` |
+| `--no-default-features --features win` (on Windows) | `win` |
+| `--no-default-features` alone | `no-gui` — falls back to the terminal UI |
+
+`macos` and `win` deliberately do **not** imply `gui`: the point is a native
+binary with no GTK4 anywhere in the dependency graph. If both are enabled the
+native backend wins, but that combination is untested and unsupported.
+
+> **macOS native currently needs `--release`.** A debug build aborts on its
+> first painted frame — `MacBackend::draw_tab_bar_icons` carries a
+> `debug_assert!` for an unimplemented tab-icon path, and it unwinds across
+> AppKit's Objective-C frame as `libc++abi: terminating due to uncaught foreign
+> exception`. `debug_assert!` is compiled out in release, which paints
+> icon-less tabs instead. Tracked upstream as
+> [quadraui#931](https://github.com/JDonaghy/quadraui/issues/931); drop this
+> note and the `--release` requirement once it lands. To run a debug build
+> before then, set `"use_nerd_fonts": false` in `settings.json`.
 
 ---
 
@@ -723,6 +769,7 @@ Runtime changes are written through to `~/.config/vimcode/settings.json` immedia
 | `smartcase` / `nosmartcase` | `scs` | off | Override `ignorecase` when pattern has uppercase |
 | `scrolloff=N` | `so` | 0 | Lines to keep above/below cursor when scrolling |
 | `cursorline` / `nocursorline` | `cul` | on | Highlight the line the cursor is on |
+| `minimap` / `nominimap` | | on | Code-overview minimap on the right edge of the active editor pane (GTK: scaled glyphs; TUI: braille dots). Click/drag it to scroll. Off hands the width back to the text area |
 | `windowstatusline` / `nowindowstatusline` | `wsl` | on | Per-window status line instead of single global bar (includes layout toggle icons) |
 | `statuslineaboveterminal` / `nostatuslineaboveterminal` | `slat` | on | Show active window's status line above the terminal panel instead of inside each window |
 | `colorcolumn=N` | `cc` | "" | Comma-list of column guides to highlight |
@@ -812,7 +859,7 @@ All state lives in `~/.config/vimcode/`. Open files, cursor positions, command/s
 
 ### Rendering
 
-All three GUI/TUI backends consume the same `ScreenLayout` abstraction from `render.rs` — shared hit-testing, key-binding matching, and scrollbar geometry ensure consistent behavior across platforms.
+Both backends consume the same `ScreenLayout` abstraction from `render.rs` — shared hit-testing, key-binding matching, scrollbar geometry and frame composition ensure consistent behavior across platforms.
 
 **Syntax highlighting** (Tree-sitter, auto-detected by extension)
 - Rust, Python, JavaScript, TypeScript/TSX, Go, C, C++, C#, Java, Ruby, Bash, Lua, JSON, TOML, CSS, YAML, HTML, Markdown, LaTeX, LaTeX
@@ -1179,48 +1226,52 @@ All ex commands support Vim-style abbreviations (e.g., `:j` for `:join`, `:y` fo
 ## Architecture
 
 ```
-src/                  (~137,000 lines total)
-├── main.rs              (~57 lines)  Thin CLI dispatcher → gtk::run() or tui_main::run()
-├── win_gui_bin.rs       (~36 lines)  Windows native GUI entry point → win_gui::run()
-├── gtk/             (~15,760 lines)  GTK4/Relm4 UI backend (Linux + macOS)
-│   ├── mod.rs       (~10,351 lines)  App struct, Msg enum, SimpleComponent, geometry helpers, run()
-│   ├── draw.rs       (~4,198 lines)  All draw_* rendering functions + Pango attrs (shrunk via #446 ScreenLayout migration + #469 popup migration)
-│   ├── click.rs        (~476 lines)  Mouse click/drag/double-click handlers
+src/                  (~168,600 lines total)
+├── lib.rs               (~49 lines)  [lib] vimcode_core — owns every module (#657)
+├── main.rs              (~61 lines)  GTK binary shim → gtk::run()
+├── tui_bin.rs           (~56 lines)  TUI binary shim (`vcd`) → tui_main::run()
+├── gtk/             (~18,537 lines)  GTK4 UI backend (Linux, macOS), behind the `gui` feature
+│   ├── testing.rs    (~8,019 lines)  Headless GtkDriver black-box harness (#646), `test-support` only
+│   ├── mod.rs        (~7,999 lines)  App struct + impl quadraui::ShellApp, event handlers, geometry
+│   ├── click.rs      (~1,634 lines)  pixel_to_click_target, tab-bar hit resolution, mouse entry points
 │   ├── css.rs          (~507 lines)  Theme CSS generation + static CSS
-│   ├── util.rs         (~186 lines)  GTK key mapping, URL/icon helpers, log handler
-│   └── quadraui_gtk.rs  (~23 lines)  Theme adapter + RICH_TEXT_POPUP_SB_* re-exports (most rasterisers now via trait)
-├── tui_main/        (~10,864 lines)  ratatui/crossterm TUI backend (all platforms)
-│   ├── mod.rs        (~3,406 lines)  Structs, event_loop, key translation, clipboard, run()
-│   ├── mouse.rs      (~3,058 lines)  All mouse click/drag/scroll interaction handling
-│   ├── panels.rs     (~2,199 lines)  Activity bar, sidebar, status/command lines, all panel renders
-│   └── render_impl.rs(~1,996 lines)  draw_frame orchestrator, tab bar, editor windows, popups
-├── win_gui/         (~10,877 lines)  Native Windows GUI backend (Win32 + Direct2D + DirectWrite)
-│   ├── mod.rs        (~6,263 lines)  HWND, D2D render target, event loop, DWM title bar, IME, font install
-│   ├── draw.rs       (~4,614 lines)  Direct2D rendering: editor, tabs, sidebar, popups, scrollbar
-│   └── input.rs        (~217 lines)  Keyboard and mouse input translation (if present)
-├── render.rs         (~9,645 lines)  Platform-agnostic ScreenLayout bridge + shared hit-testing geometry
-├── icons.rs           (~160 lines)  Icon registry with Nerd Font + ASCII fallback
-└── core/            (~81,824 lines)  Zero GUI/rendering deps — fully testable in isolation
-    ├── engine/      (~59,947 lines)  Orchestrator: 20 submodules (keys, motions, buffers, tests, …)
-    ├── lsp.rs        (~2,923 lines)  LSP protocol transport + single-server client
-    ├── lsp_manager.rs(~1,105 lines)  Multi-server coordinator + semantic token legends
-    ├── git.rs        (~2,550 lines)  Git subprocesses: diff, blame, stage, worktrees, log, branches
-    ├── settings.rs   (~2,336 lines)  JSON config, :set parsing, key bindings, SETTING_DEFS
-    ├── plugin.rs     (~1,936 lines)  Lua 5.4 plugin manager (vendored; vimcode.* API; panel API)
-    ├── syntax.rs     (~1,854 lines)  Tree-sitter highlighting for 20 languages (incl. LaTeX via vendored grammar)
+│   ├── util.rs         (~349 lines)  URL open, bundled Nerd Font install
+│   └── backend/events/services/explorer.rs  (~29 lines)  Re-export shims (real code in quadraui::gtk)
+├── tui_main/        (~20,296 lines)  ratatui/crossterm TUI backend (all platforms)
+│   ├── shell_app.rs (~11,172 lines)  TuiShellApp — impl ShellApp; this *is* the TUI since #634
+│   ├── mouse.rs      (~3,795 lines)  handle_mouse — click/drag/scroll routing into shared routers
+│   ├── render_impl.rs(~2,620 lines)  Screen bridging, window/separator painting, tab drag overlay
+│   ├── panels.rs     (~1,616 lines)  Activity bar, sidebar, panel renders
+│   ├── mod.rs          (~976 lines)  run(), key translation, clipboard, cell helpers
+│   └── quadraui_tui.rs + shims (~117 lines)
+├── render.rs        (~27,211 lines)  Platform-agnostic ScreenLayout, shared mouse/key routers,
+│                                     FrameOp composition — where cross-backend decisions live
+├── icons.rs            (~382 lines)  Icon registry with Nerd Font + ASCII fallback
+├── quadraui_pin.rs      (~60 lines)  Compile-time assertion on the pinned quadraui rev
+└── core/           (~101,944 lines)  Zero GUI/rendering deps — fully testable in isolation
+    ├── engine/      (~78,559 lines)  Orchestrator: 20 submodules (keys, motions, buffers, tests, …)
+    ├── lsp.rs        (~3,182 lines)  LSP protocol transport + single-server client
+    ├── settings.rs   (~2,702 lines)  JSON config, :set parsing, key bindings, SETTING_DEFS
+    ├── git.rs        (~2,569 lines)  Git subprocesses: diff, blame, stage, worktrees, log, branches
+    ├── plugin.rs     (~2,152 lines)  Lua 5.4 plugin manager (vendored; vimcode.* API; panel API)
+    ├── syntax.rs     (~1,854 lines)  Tree-sitter highlighting for 20 languages (incl. LaTeX)
+    ├── lsp_manager.rs(~1,487 lines)  Multi-server coordinator + semantic token legends
     ├── dap_manager.rs(~1,427 lines)  DAP multi-adapter coordinator + launch.json + tasks.json
-    ├── buffer_manager.rs(~1,018 lines)  Buffer lifecycle, undo/redo stacks, semantic tokens
-    ├── dap.rs          (~719 lines)  DAP protocol transport + event routing
-    ├── markdown.rs     (~705 lines)  Markdown → styled plain text converter (pulldown-cmark)
+    ├── window.rs     (~1,205 lines)  Window/split tree model
+    ├── buffer_manager.rs(~1,113 lines)  Buffer lifecycle, undo/redo stacks, semantic tokens
     ├── session.rs      (~782 lines)  Session state persistence + per-workspace paths
+    ├── markdown.rs     (~760 lines)  Markdown → styled plain text converter (pulldown-cmark)
+    ├── dap.rs          (~719 lines)  DAP protocol transport + event routing
     ├── project_search.rs(~631 lines)  Regex/case/whole-word search + replace (ignore + regex crates)
-    ├── terminal.rs     (~410 lines)  PTY-backed terminal pane (portable-pty + vt100)
+    ├── extensions.rs   (~504 lines)  Extension discovery, manifests, enable/disable
+    ├── comment.rs      (~410 lines)  Comment toggling for 46+ languages
+    ├── spell.rs        (~395 lines)  Spell checker (tree-sitter-aware; LaTeX-aware)
     ├── ai.rs           (~384 lines)  AI provider integration (Anthropic/OpenAI/Ollama)
-    ├── spell.rs        (~379 lines)  Spell checker (Hunspell; tree-sitter-aware; LaTeX-aware)
-    └── window.rs, tab.rs, view.rs, buffer.rs, cursor.rs, mode.rs, … (~2,718 lines)
+    ├── swap.rs         (~326 lines)  Swap-file write + crash recovery
+    └── view.rs, registry.rs, buffer.rs, paths.rs, tab.rs, cursor.rs, terminal.rs, mode.rs, mod.rs (~783 lines)
 ```
 
-**Design rule:** `src/core/` has zero GTK/rendering dependencies and is testable in isolation. All four backends (GTK, TUI, Windows native, future macOS native) consume the same `ScreenLayout` abstraction from `render.rs`.
+**Design rule:** `src/core/` has zero GTK/rendering dependencies and is testable in isolation. Both backends consume the same `ScreenLayout` abstraction from `render.rs`, and since #751–#766 the same mouse/keyboard routers and the same `FrameOp` frame sequence — `src/gtk/mod.rs` alone makes 424 `render::` calls. The Direct2D/Win32 backend was removed on 2026-05-11 (`3e4bcff`) and returns as a thin wrapper when quadraui ships its Windows backend; a native macOS backend is blocked upstream (see [`PLAN.md`](PLAN.md)).
 
 `dictionaries/` — bundled en_US Hunspell dictionary files (`.aff` + `.dic`) compiled into the binary via `include_bytes!`.
 
@@ -1238,10 +1289,10 @@ src/                  (~137,000 lines total)
 | Component | Library |
 |-----------|---------|
 | Language | Rust 2021 |
-| GTK UI | GTK4 + Relm4 (Linux, macOS) |
-| Windows UI | windows-rs + Direct2D + DirectWrite (native Win32) |
+| GTK UI | GTK4 (Linux, macOS) — Relm4 removed in #540 |
+| Shared UI toolkit | [quadraui](https://github.com/JDonaghy/quadraui), pinned by git rev |
 | TUI | ratatui 0.29 + crossterm (all platforms) |
-| Text rendering | Pango + Cairo (GTK), DirectWrite (Windows) |
+| Text rendering | Pango + Cairo (GTK), ratatui cells (TUI) |
 | Text storage | Ropey (rope data structure) |
 | Parsing | Tree-sitter (20 languages incl. LaTeX, Lua, Markdown) |
 | LSP | lsp-types (protocol definitions) |

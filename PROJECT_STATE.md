@@ -1,30 +1,639 @@
 # VimCode Project State
 
-**Last updated:** May 19, 2026 (Session 389 — **Coordinator-driven 3-agent sprint.** 13 issues closed, 10 PRs merged. vimcode: #447 GTK AppShell intermediate (PR #495), #475 TUI key dedup (PR #492), #467 completion popup filtering (PR #498), #483/#485 TUI ext panel fixes (PR #501), #465 breadcrumb symbol picker (PR #502). quadraui: #206 unicode-width (PR #220), #209 rounded chrome (PR #228), #227 drop overlay (PR #229), #230 rich text link advance (PR #231), #222 TextInput primitive (PR #232). Rolled back PR #496 (platform-neutrality violation) → fixed properly via quadraui #230. Filed 7 quadraui pipeline issues (#221–#227), 2 already-implemented, 3 shipped. Unblocked vimcode #479/#480/#481/#488. Next: Server #479 (Settings FormController), Desktop A #488 (hover links — zero-code retest after quadraui pull), Quadraui #223 (ButtonBar). 1994+ lib tests passing.)
+**Last updated:** September 14, 2026 (#522 — Track A foundation: generic external-tool JSON seam, `src/core/tool_client.rs`, no coordinator vocabulary in core). Prior revisions: September 14 (#970 — confirmed the two "failing GTK click-geometry tests" are the already-known/already-documented Darwin font-rasteriser divergence from #926/#933, not a new bug; no code change), September 14 (#950 review fix round — driver-tier pixel test added for the SEARCH_COD→SEARCH glyph change, self-contradictory pure-refactor claim corrected), September 14 (#950 — ShellApp convergence decomposition + cheap wins), September 14 (#949 review fix round — driver-tier test added, macOS/Win-GUI claim corrected), September 14 (#949 — GTK-only settings-reload watcher deleted), September 11 (macOS native-menu audit — #901/#902 filed, milestone #7 reopened), September 10 (#862 — `src/app.rs` no longer needs the `gui` feature to compile), September 5 (#827 correction pass), September 4 (#801), September 3 (platform-neutrality chain drained). Milestone #7 is **2 open** (#901, #902 — 2026-09-11 macOS native-menu audit). **#47 is reopened, in milestone #5** — its blocker (quadraui#699/#704) closed 2026-09-03, and #811 already ported the TUI side onto the new API. See `GOALS.md` for the full correction history.
 
-## Active milestone: Cross-Platform UI Crate
+## #522 — Track A foundation: generic external-tool JSON seam (`tool_client.rs`), no coord in core
 
-**This is the current top priority.** All quadraui primitive migrations must complete before moving to other milestones. The goal is zero bespoke per-backend code — every UI surface paints, scrolls, and handles clicks through quadraui's shared API. A native Windows backend will be re-added as a thin wrapper when the quadraui Win backend ships (quadraui#19–#31).
+#522 is the foundation of Track A (coordinator↔vimcode integration, milestone
+`vimcode-coordinator`, epic #531, `docs/COORDINATOR_INTEGRATION.md` §3/§5/§6). Per the
+2026-09-13 owner decision, vimcode core must not depend on, or even name, `coord` — so the
+seam is **generic**, not coordinator-aware.
 
-**All bespoke paint surfaces are now eliminated.** Every UI surface in both TUI and GTK paints through quadraui primitives. **Scroll dispatch consolidation (#307) is complete** — all scrollable surfaces route through `dispatch_scroll`/`dispatch_click`.
+**New `src/core/tool_client.rs`:** a `ToolClient` trait (`run_json(argv) ->
+Result<serde_json::Value, ToolError>`, blocking — callers thread it the same way
+`Engine::ext_refresh`/`poll_ext_registry` already thread registry fetches), a real
+`SubprocessToolClient` impl (spawns via `core::git::hidden_command`, maps missing-binary /
+non-zero-exit / bad-JSON to typed `ToolError` variants), and a `MockToolClient` test impl.
+`fetch_board_model()` runs an argv and parses stdout into `quadraui::BoardModel` — vimcode's
+board-data contract *is* quadraui's existing `Board` primitive types (`BoardModel`/
+`BoardColumn`/`BoardCard`/`CardBadge`/`BadgeStatus`, quadraui#638, already `Serialize`/
+`Deserialize`), reused directly rather than duplicated.
 
-**Vimcode-side dedup work added to milestone** (#429, #428, #395, #274, #225, #233) **+ TUI convergence backlog** from Session 388 audit (#477, #478, #479, #480, #481 — #475 closed Session 389). **Session 389 unblocked:** #479 (Settings FormController — Form cursor already exists in quadraui), #480 (partially — TextInput primitive shipped as quadraui#222), #481 (scrollbar + drop overlay — both primitives exist). Remaining quadraui pipeline: #223 (ButtonBar), #224 (Palette dual-mode), #225 (Dialog table). **GTK convergence chain:** #447 intermediate step landed (PR #495) → full `run_with_shell()` migration filed as #493 (blocked on quadraui stages 3+4) → #448 (event dispatch → UiEvent) → #449 (click dispatch → FrameHitMap).
+**Extension manifest:** `ExtensionManifest` gained an optional `board: BoardProviderConfig`
+(`refresh_command` argv, `poll_interval_secs`, an `actions` map from `BoardAction` variant
+name to an argv template with `{id}` substitution) — documented in `EXTENSIONS.md`'s new
+`[board]` section. Generic: no particular provider is named.
 
-**#505 landed (ff-merge `ee502f9`):** SC action-button row migrated to `quadraui::Toolbar` (unblocked by quadraui#257/#259). Both hand-painters (TUI `set_cell` + GTK Cairo/Pango) and the bespoke `sc_button_hit_test` deleted; shared `render::sc_button_toolbar` + `draw_sc_button_toolbar` builder, cached `ToolbarLayout` for click/hover hit-test. Commit button now dims + no-ops when the message is empty. Carved out of #480's four chunks. Follow-ups filed: #509 (adopt `SidebarPanel` to consolidate the SC button-row + sections Y-geometry, recomputed across 4 files) and #510 (debug toolbar → `Toolbar`, replacing the faked `StatusBar`).
+**No-coord-in-core gate:** `tests/no_coord_vocabulary_in_core.rs` asserts (not just by
+inspection) that `src/core/` and `src/render.rs` carry no coordinator vocabulary. Fixed in
+review (iteration 1): a plain `\bcoord\b` regex only breaks at non-word characters, so it
+missed "coord" glued to another word via `_` or a case transition — `coord_client`,
+`CoordClient`, `CoordGate` all sailed through undetected, which is exactly the idiomatic-Rust
+naming style a future PR would use to reintroduce coordinator vocabulary. The gate now
+tokenizes each line into identifier-like runs and splits each token into words on `_`
+boundaries and lowercase→uppercase case transitions, flagging any token whose word list
+contains "coord" case-insensitively. "coordinate"/"coordinator" have no internal `_`/case
+transition so they stay single words and keep passing; `coord_client`/`CoordClient`/
+`CoordGate` split into ["coord", ...] and are caught. Confirmed 0 matches on the current tree;
+the tokenizer's own incidental-vs-forbidden split has its own test
+(`line_has_coord_word_distinguishes_incidental_from_forbidden`).
+
+Board panel wiring (engine fields, GTK/TUI activity entry, actual poll_idle integration) and
+the coordinator extension bundle itself are out of scope here — next up is #521. This PR is
+internal-only: `ExtensionManifest` gains an unused-elsewhere `Option<BoardProviderConfig>`
+field and `tool_client.rs`/`fetch_board_model` are not yet called from the engine or either
+backend, so per CLAUDE.md's black-box-coverage rule no driver test is added — there is no
+engine/GTK/TUI codepath yet for one to exercise.
+
+## #970 — the two "failing" GTK click-geometry tests are the #926/#933 Darwin font divergence, already documented; no fix needed
+
+#970 reported `gtk::testing::minimap::minimap_click_at_the_middle_scrolls_to_half_the_file`
+and `gtk::testing::tests::window_split_divider_drag_repaints_the_line_at_the_new_position`
+red on a clean `develop` checkout, on an `aarch64-apple-darwin` host with Homebrew
+gtk4 4.22.4, and asked (a) whether CI (Linux) is also red, and (b) whether this
+is a GTK-side instance of the #967 paint/hit-test `line_height`-disagreement bug
+family.
+
+**Reproduced on this session's Linux host** (`ubuntu`-class WSL2, headless, no
+`DISPLAY`/`WAYLAND_DISPLAY` — matches CI's `runs-on: ubuntu-24.04`, no display,
+default features so `gui` is on): `cargo test --features gui --lib
+gtk::testing::` is **141 passed, 0 failed**, including both named tests, both
+single-threaded and default-parallel, across 5 repeated runs — solidly green,
+not a flake.
+
+**Both open questions are already answered — by #926/#933, which landed two
+days before this issue was filed (2026-09-12, before #970 was reported against
+`adb88bb`):** `docs/PLATFORM_CONFORMANCE.md`'s macOS section names these exact
+two tests (plus a third, `chrome_paint_tests::window_control_buttons_are_visible_against_their_background_in_every_theme`)
+as failing on a real Darwin/Homebrew-gtk4 box and gives the root cause: **on
+Quartz, Pangocairo rasterises via Core Text rather than FreeType, so glyph ink
+and colour compositing differ from the Linux baseline these pixel-probe tests
+were written against.** That is a rendering-*input* difference (which font
+backend paints the glyphs), not a metrics-*disagreement* bug — unlike #967,
+where two code paths computed `line_height` differently for the same paint,
+here every assertion already reads its expected geometry off the same frame
+it's checking (`h.painted_line_height()`, `h.painted_char_width()`, the
+divider's own read-back colour) rather than a hardcoded value, and there is no
+second, disagreeing code path to fix. `scripts/platform-conformance.sh`
+already encodes this as policy: the `gtk` lane is `skipped
+(opt-in on Darwin...)` by default specifically because of this divergence,
+and forcing it with `--lane gtk` reproduces the three failures without "fixing"
+them, by design.
+
+**Conclusion: no code change.** The suite is not broken as a Linux/CI gate for
+GTK click geometry (140→141 passed reflects #950's new glyph test, still 0
+failed) — it only ever fails on the Darwin GTK lane, which was already known,
+already investigated, already documented with the correct root cause, and
+already excluded from the default run before #970 was filed. Nothing under
+`src/gtk/` or `src/core/` needed touching; this PR is documentation only (a
+cross-reference in `PROJECT_STATE.md`), which is why no driver-tier test
+accompanies it.
+
+## #950 — TUI-as-second-ShellApp convergence: decomposition written, cheap wins landed
+
+#950 found `TuiShellApp` (`src/tui_main/shell_app.rs`) is a second, independent
+`impl ShellApp` alongside `App` (`src/app.rs`), and that it converts quadraui
+`UiEvent`s back into crossterm `MouseEvent`s (`events::uievent_to_crossterm`)
+to feed the TUI-private `src/tui_main/mouse.rs` click router instead of the
+shared, already-backend-neutral `src/click.rs` — a direct violation of
+quadraui's portability rule 6. The issue was explicitly scoped as an epic
+("do not attempt a single convergence PR"): write a decomposition, land the
+cheap independent wins, leave the mouse-router convergence to follow-ups.
+
+**Decomposition:** `docs/SHELLAPP_CONVERGENCE.md` — sorts #950's four findings
+into essential (px-vs-cell tick geometry, the TUI-only hamburger panel, TUI's
+`debug_log!`-based panic hook) vs. accidental (the SEARCH_COD/SEARCH icon
+split, the 3× duplicated GTK/macOS/Win-GUI panic hook, the ~12×-inlined
+`CREATE_NO_WINDOW` idiom), and proposes an ordered slice plan for the mouse
+router itself (inventory/parity-test stage, then one panel intercept at a
+time onto `click.rs`, ending when `uievent_to_crossterm` has no TUI callers
+left to delete). No mouse-router code was touched in this PR — see that
+doc's "Why the mouse router is not in this PR" section for why it doesn't
+qualify as a cheap win.
+
+**Cheap wins landed:**
+- One icon table: `crate::icons::SEARCH_COD` deleted, `App::shell_config()`
+  now uses the same `SEARCH` constant `TuiShellApp::shell_config()` always
+  used — the two backends' search icons now match.
+- One panic hook: `core::swap::install_gui_crash_hook()` is new; GTK/macOS/
+  Win-GUI's three byte-identical panic-hook closures now call it instead of
+  each carrying its own copy. TUI's hook is untouched (essential difference
+  — it can't `eprintln!` over raw-mode/alt-screen the way a GUI backend can).
+- One `hidden_command`: every inlined `creation_flags(0x08000000)` in
+  `core/` (`swap.rs`, `lsp_manager.rs` ×3, `dap_manager.rs`,
+  `engine/mod.rs`) now goes through `core::git::hidden_command`; the two
+  LSP/DAP sites needing `CREATE_NEW_PROCESS_GROUP` too go through a new
+  `core::git::hidden_command_new_process_group`; `git_command()` itself now
+  delegates to `hidden_command("git")` instead of re-inlining the flag a
+  third time in the same file.
+
+**Driver-tier test — added, review round 1.** The panic-hook and
+`hidden_command` wins are pure internal refactors (byte-identical behavior,
+just de-duplicated). The icon-table win is not: switching
+`App::shell_config()`'s `"panel:search"` arm from GTK's own `SEARCH_COD`
+(nf-cod-search, `\u{ea6d}`) to the shared `SEARCH` constant (nf-fa-search,
+`\u{f002}`) changes what glyph the GTK activity bar actually paints whenever
+Nerd Fonts are on — a rendered-output change, not a refactor, so claiming
+the pure-refactor exemption for it was wrong (round-1 review caught this).
+The two existing tests cited below are plain unit tests over
+`shell_config()`'s return value (`!p.icon.is_empty()` on the GTK side) and
+would keep passing through a revert to `SEARCH_COD` — they don't cover the
+regression. Added
+`gtk::testing::tests::activity_bar_search_icon_paints_the_shared_glyph_not_the_deleted_cod_variant`
+(`src/gtk/testing.rs`): renders the real `App::shell_config()` activity bar
+through `GtkDriver` twice — once unmodified, once with `"panel:search"`'s
+icon patched back to the deleted `SEARCH_COD` codepoint after
+`build_shell_config` runs — and asserts the two rasterised activity-bar
+columns differ in pixels (per #555, since the icon strip paints straight to
+Cairo and never reaches `painted_texts()`). Verified this fails (0/7000
+sampled pixels differed) with `App::shell_config()`'s `"panel:search"` arm
+hand-reverted to the `\u{ea6d}` literal, confirming the test actually
+catches the regression it names.
+
+The two pre-existing tests (`app::portable_entry_point_tests::
+shell_config_resolves_every_activity_bar_icon_and_reserves_the_title_bar`,
+`tui_main::shell_app::tests::shell_config_registers_every_build_activity_bar_panel`)
+still stand as coverage that every panel resolves *some* non-empty icon —
+just not this specific regression.
+
+## #949 — GTK's `gio::FileMonitor` settings watcher deleted; mtime poll is now the sole reload mechanism
+
+`App::new` built a `gio::FileMonitor` over a hardcoded `$HOME/.config/…`
+path purely to trigger settings.json hot-reload — GTK-only, so hot-reload
+was a documented gap on macOS/Win-GUI. But `Engine::check_settings_reload`
+already polls the settings file's mtime and was already TUI's sole reload
+mechanism (`tui_main/shell_app.rs`'s `tick`, unconditional every tick).
+
+Fixed: deleted the `gio::FileMonitor`, the `settings_monitor` field, the
+`DeferredAction::SettingsFileChanged` variant, and the hardcoded `$HOME`
+path entirely. `App::handle_poll_tick` (shared by every GUI entry point,
+GTK/macOS/Win-GUI alike, since it's called from the portable
+`tick_dispatch`) now calls `settings_file_changed` — and so
+`check_settings_reload` — every tick.
+
+Cadence check (the issue's "confirm first"): quadraui's GTK/macOS idle-poll
+tick fallback is a 250ms ceiling (`runner.rs`'s `ShellApp::tick` doc,
+quadraui#832) — same order of magnitude as the old watcher's near-immediate
+`ChangesDoneHint`, and identical to what TUI has always shipped with no
+complaints. No poll-frequency tightening needed.
+
+**"Closes the macOS/Win-GUI gap for free" — corrected, review round 1.**
+That claim is only half true. quadraui's `AppLogic::tick` doc
+(quadraui#832/#940, `runner.rs`) gives macOS the same 250ms
+`IDLE_POLL_CEILING` idle-poll fallback GTK has, so macOS really is fixed
+for free. **Windows gets no idle-poll fallback at all** — `tick` there
+only runs after native-event batches or an explicit
+`RedrawAfter`/`request_frame_in` ask, and nothing in this diff arranges
+either. A future Win-GUI backend would only pick up an externally-edited
+`settings.json` while the user is actively generating native events, not
+while the app sits idle — not the full fix the original claim implied.
+Not a live regression (no Win-GUI backend exists in this repo yet), but
+whoever builds one (quadraui#19–#31) needs to arrange an explicit
+periodic nudge for hot-reload to work there. Corrected in `src/app.rs`'s
+`new_portable` doc table and here.
+
+**Driver-tier test — added, review round 1.** Round 1 review rightly
+rejected "pure internal mechanism swap... no driver-tier test added" as
+self-contradictory: the PR itself says the change is user-visible
+(hot-reload lag is a UX property), and CLAUDE.md's black-box-coverage bar
+only exempts a *claimed* pure refactor, not a "hard to test" excuse.
+Added `src/app.rs::portable_entry_point_tests::
+handle_poll_tick_reloads_settings_changed_on_disk` — constructs a real
+`App` via `App::new_headless`, points `Settings::settings_file_path()` at
+a private temp file via the new `core::settings::TestSettingsPathGuard`
+(thread-local override, not a `$HOME` mutation — parallel-test-safe,
+unlike env-var mutation would be), calls `handle_poll_tick()` directly
+(the exact call site that changed), and asserts `engine.settings`
+actually picked up the on-disk edit.
+
+That test asserts on engine state, not painted pixels — CLAUDE.md's
+"assert on rendered output, not state" rule (from #587/#592) targets a
+*different* failure mode than applies here: a paint path that populates
+state nothing ever reads. That's not in question for `check_settings_reload`
+— every frame already reads `engine.settings` for colorscheme, the
+line-number gutter, tabstop, etc. — so "did the poll fire" is the only
+open question, and the added test answers it directly. A true
+pixel-level check (repaint via `GtkDriver` after the reload, assert the
+gutter changed) is currently **blocked by a quadraui gap, not a vimcode
+one**: neither `GtkDriver` nor the backend-neutral `ConformanceDriver`
+expose a way to pump `AppLogic::tick` headlessly in this repo's pinned
+quadraui rev (`GtkDriver` has no `tick()`/mutable-`Backend` accessor,
+unlike `quadraui::tui::testing::TuiDriver::tick()` — confirmed by reading
+the pinned rev's `quadraui/src/gtk/testing.rs` and
+`quadraui/src/testing/mod.rs`). Per the Platform-Neutrality Rule, adding
+that pump is quadraui-side test infrastructure, so it belongs in a
+quadraui issue (**not yet filed** — this worker cannot open GitHub issues;
+flagging here for whoever can) rather than a vimcode-side workaround.
+
+Verified: `cargo build`/`cargo clippy -- -D warnings`/`cargo clippy
+--no-default-features -- -D warnings`/`cargo fmt --check` all clean, plus
+the new test passing under `cargo test --lib`.
+
+## #862 — `src/app.rs` compiles without `gui` (prerequisite for #859)
+
+`pub mod app;` in `src/lib.rs` was `#[cfg(feature = "gui")]`-gated even though
+`App`'s trait surface (`impl quadraui::ShellApp for App`) is backend-neutral —
+`cargo check --no-default-features` couldn't even resolve `crate::app`. Fixed:
+
+- The three remaining platform-typed fields (`window`, `css_provider`,
+  `settings_monitor`) are now type-erased: `window`/`css_provider` behind new
+  local traits `PlatformWindowHandle`/`PlatformCssProvider` (same shape as the
+  existing `TextMetricsBackend` and `Engine::clipboard_read`/`clipboard_write`,
+  #417), `settings_monitor` behind a `Box<dyn Any>` drop-guard.
+- The portable majority of `crate::gtk::{click, css, util}` — pixel→click-target
+  resolution, tab-bar pixel-geometry, UI-font helpers, theme CSS text
+  generation, `open_url`/bundled-font install — moved to three new
+  unconditionally-compiled modules: `src/click.rs`, `src/app_support.rs`,
+  `src/css.rs`. `src/gtk/{click,mod,css}.rs` re-export everything so nothing
+  else in `crate::gtk` (or their own tests) had to change.
+- What's left behind inline `#[cfg(feature = "gui")]` *inside* `src/app.rs` is
+  genuinely platform-bound: `App::new`/`App::assemble`'s display-dependent
+  prologue, the `TextMetricsBackend`/`PlatformWindowHandle`/`PlatformCssProvider`
+  impls for the concrete GTK types, window *discovery*
+  (`find_visible_window` — quadraui has no portable equivalent yet), and a
+  handful of literal `gtk4::Settings`/`gio::File` call sites.
+
+Pure refactor, no behavior change — exempt from the black-box test bar per
+CLAUDE.md. Verified: `cargo build`/`cargo check --no-default-features`/
+`cargo clippy -- -D warnings`/`cargo clippy --no-default-features -- -D
+warnings`/`cargo fmt --check` all clean; the 155 `gtk::` tests + `gtk::click`'s
+11 + `gtk::util`'s 4 + `gtk::mod`'s `h_scrollbar`/`shell_config`/`chrome_paint`
+tests (6) + 159 `tui_main::shell_app` tests under `--no-default-features` all
+still pass.
+
+Does **not** pair with the `TextMetricsBackend` de-Pango work (already done,
+#861) — the issue's "don't chain in parallel" warning no longer applies since
+that work landed first. Next: #859 (the vimcode-side adoption this and #861
+were prerequisites for).
+
+## #825 — partially done: click-path scroll-offset table converged + one dead arm deleted; the other four fix items need more design work than mechanical dedup
+
+Issue #825 asked to converge five mouse-apply surfaces (modal overlay, drag,
+mouse-up, chrome click, scroll) plus two dead/shadowed-routing cleanups. This
+pass converged **one piece safely** and found that most of the rest is riskier
+than the issue's framing suggests — documented here so the next session
+doesn't re-walk the same investigation.
+
+**Done:**
+- The click path's `ScrollOffsetChanged` handling (`src/tui_main/mouse.rs`
+  "Scroll-surface click dispatch", `src/app.rs` same-named section) now calls
+  the existing `render::apply_scroll_offset` — the same union table the *drag*
+  path already shares (#756) — instead of each hand-rolling its own arms.
+  Verified **behavior-preserving, not just refactored**: `engine.scroll_surfaces`
+  only ever holds `terminal_scrollback`/`debug_output` (registered by the
+  shared paint code both backends call) plus `explorer:sb`/`ext_panel:sb`
+  (TUI-only, `src/tui_main/panels.rs`) — grepped every push site to confirm.
+  GTK's two old arms (`debug_output`, `terminal_scrollback`) matched
+  `apply_scroll_offset`'s bodies exactly, so its conversion is 1:1. TUI's old
+  table additionally had `tui:settings`/`debug_sidebar:*` (also match exactly)
+  and deliberately **excludes** `terminal_scrollback` from the shared call —
+  a click on it must still fall through to the bottom-panel rung below, which
+  begins a scrollbar *drag* rather than a bare offset-set; folding it in here
+  would silently break continued-drag-after-click on that scrollbar. This is a
+  pure internal refactor (CLAUDE.md's exemption applies — no new black-box
+  test added; all 111 pre-existing mouse/scroll tests across both backends
+  still pass, `cargo build`/`clippy -D warnings`/`clippy --no-default-features
+  -D warnings`/`fmt --check` all clean).
+- Deleted a second, **provably dead** match arm: TUI's wheel-scroll table had
+  a `"tui:editor_viewport"` case (window-aware, variable-step scroll) that
+  `quadraui::dispatch_scroll` can never emit — confirmed against the pinned
+  rev (`quadraui/src/dispatch.rs`) that it only produces an id from either a
+  registered `ScrollSurface` or a `ModalStack` push, and grepped that
+  `"tui:editor_viewport"` is registered as neither, anywhere. The *fallback*
+  below it (unconditionally scrolling the active window, fixed step 3) was
+  already the only path ever taken; its comment claimed otherwise and has
+  been corrected. **Discovered while verifying, not fixed:** this means TUI's
+  mouse-wheel-over-editor has never supported "scroll the pane under the
+  pointer without changing focus" the way GTK's `handle_mouse_scroll_msg`
+  (`hovered_window_id`) does — a real GTK/TUI behavior gap, but a *feature*
+  gap, not a duplication one; out of this issue's scope to fix blind.
+
+**Not done — needs a design decision, not a mechanical swap, before touching:**
+- **Wheel scroll (the rest of item 5).** Deeper than the click path: TUI has
+  an *earlier*, separate direct-dispatch block (`mouse.rs`, the
+  `PANEL_EXPLORER`/`PANEL_GIT`/`PANEL_SEARCH`/`PANEL_SETTINGS` checks ahead of
+  the `dispatch_scroll` block) that returns early for the explorer panel with
+  a **hardcoded ±3** step — meaning the later `"explorer:sb"` arm in the
+  `dispatch_scroll` wheel table can only ever fire when `PANEL_EXPLORER` is
+  *not* active, i.e. never (that surface is only registered when it is
+  active). That arm is dead too, but unlike `tui:editor_viewport` its
+  "shadow" carries different semantics (fixed step vs. proportional-to-delta
+  step) — deciding which is actually wanted is a product call, not cleanup.
+  GTK's own wheel table (`app.rs::handle_mouse_scroll_msg`) only has 3 arms
+  (`editor_hover`, `debug_output`, `terminal_scrollback` — verified pointwise
+  identical to TUI's, safe to share) and never touches
+  explorer/ext-panel/settings scroll via this mechanism at all. A shared
+  `apply_wheel_scroll` is buildable for the 3 common arms; folding in the
+  TUI-only ones needs the shadow above resolved first.
+- **MouseUp sequence (item 3).** Read both `mouse.rs`'s `Up(Left)` arm and
+  `app.rs::handle_mouse_up_msg` in full: real per-backend asymmetry beyond
+  what the issue's "same 8-step sequence" implies — TUI has explorer
+  drag-and-drop finalize (GTK doesn't show it here), GTK clears
+  `debug_button_pressed` and a GTK-only `h_sb_drag_cell` field here (not yet
+  migrated onto the shared `DragState`, unverified whether TUI's equivalent
+  is handled by one of `shell_app.rs`'s ported panel intercepts instead), and
+  the terminal-resize/split finalize math is expressed in different units per
+  backend (rows vs. `cached_char_width`-derived cols, per the issue's own
+  `TerminalPanelResize` note). A shared function needs a host-trait shape
+  (per the issue's own suggestion for item 1) to parameterize these, not a
+  copy-paste.
+- **Modal overlay apply (item 1), drag-route apply (item 2), chrome apply +
+  the `render_window_status_line` dropped-layout root cause (item 4)** — not
+  investigated this session; still exactly as scoped in the issue body
+  (re-verify line numbers first, several of the issue's cited ranges had
+  already drifted by the time this pass started).
+- **Dead/unreachable routing.** The activity-bar arm
+  (`mouse.rs`, `col < ab_width` block): traced quadraui's `ShellAdapter::handle`
+  (pinned rev `4ff2a64`, `quadraui/src/shell_adapter.rs`) and confirmed
+  `AppShell::handle` runs first and short-circuits on
+  `PanelChanged`/`SidebarHidden`/`BottomItemClicked`/etc. before the raw
+  `MouseDown` ever reaches `TuiShellApp::handle_mouse_event` →
+  `mouse::handle_mouse` — matching `shell_app.rs`'s own comment. **Not yet
+  confirmed:** whether the arm's `MenuToggle` target (the hamburger icon, at
+  `bar_row` 0) is itself one of `AppShell`'s registered activity-bar items
+  that this same interception covers, or a TUI-drawn extra that `AppShell`
+  would report `Ignored` for and let fall through to this "unreachable" arm
+  after all — check `build_shell_config`'s activity-bar item registration
+  before deleting; getting this wrong silently breaks the menu-bar toggle.
+  The shadowed debug/explorer routing (`shell_app.rs` intercepts vs.
+  `mouse.rs` ~1976-2043 per the issue) — not investigated this session.
+
+## #824 — partially done: 8 of the 10 named `FrameOp` arms converged; 2 documented as genuinely one-sided
+
+`render_content`'s `FrameOp` match had drifted back to 10 duplicated arms after
+#763–#766 (those slices converged the *composition* — order/gates — not the
+arm *bodies*). This pass adds render.rs's `paint_wildmenu_rung`,
+`paint_global_status_bar_rung`, `paint_find_replace_rung`,
+`paint_command_center_rung`, `paint_picker_rung`, `paint_context_menu_rung`,
+`paint_dialog_rung`, `paint_toast_stack_rung` — one shared body per arm,
+following the `paint_bottom_panel_rung`/`paint_quickfix_rung` precedent
+(rect math stays per backend; only the convert-and-draw body is shared).
+Both `src/app.rs` and `src/tui_main/shell_app.rs` now call these instead of
+transcribing the body twice; the dead TUI-only `render_impl::render_picker_popup`
+duplicate was deleted along with it. Added `gtk::testing::chrome_surfaces::
+toast_stack_overlay_paints` (GTK had no black-box toast coverage at all before
+this — confirmed it goes red against the #587-shape bug of caching a layout
+without painting it, via a temporary swap to `Backend::toast_stack_layout`).
+
+**Two of the ten stayed unconverged, on purpose** (see `render.rs`'s
+"Frame-op rung painters (#824)" section doc comment for the full reasoning):
+
+- **`FrameOp::CommandLine`** — TUI paints the row cell-by-cell
+  (`panels::render_command_line`, cursor + mouse drag-selection inversion
+  baked into the composed cells) instead of through
+  `Backend::draw_command_line`, because that trait method has no
+  selection-range parameter. Converging it needs a quadraui `Backend` trait
+  change first (Platform-Neutrality Rule) — nothing filed yet.
+- **`FrameOp::TabSwitcher`** — GTK feeds `TabSwitcherGeometry::visible_rows`
+  into `tab_switcher_to_quadraui_list_view`; TUI feeds `max_visible` (a
+  different field — see that struct's doc comment). Might be harmless,
+  might be a latent bug; a duplication-convergence pass shouldn't silently
+  pick one for a shared function, so both arms keep their own geometry prep.
+
+The related "same shape" opportunities the issue also named —
+`compose_bottom_band_rungs` and the editor-band composer — are **not**
+touched by this pass; they're a separate slice.
+
+`cargo build` / `cargo clippy -- -D warnings` / `cargo clippy
+--no-default-features -- -D warnings` / `cargo fmt -- --check` all clean.
+Targeted tests (55: every `render_content_paints_*_via_shell_app` plus the
+GTK driver tests for every touched arm, including the new toast test) pass.
+
+## #822 — partially fixed; item 2 blocked on an unfiled quadraui gap (drafted, not yet submitted)
+
+Issue #822 listed three fix items. Item 1 (delete the `compute_tab_bar_hit_regions`
+downconversion shim, migrate both backends to consume `quadraui::TabBarLayout`
+directly) is **done**. Item 3 (a stale doc comment) was already gone before this
+PR's base commit — nothing needed there. Item 2 (adopt `TabGroupController` for
+tab drag/drop, deleting `TabDragState` and the local drop-zone code, ~460 lines)
+is **not done** — it isn't a like-for-like swap, because `TabGroupController` owns
+its own pane/tab model and vimcode would have to mirror `Engine`'s editor-group
+state into it. The upstream gap this implies is fully drafted, ready to file on
+`JDonaghy/quadraui`, in
+[`docs/PENDING_QUADRAUI_ISSUES.md`](docs/PENDING_QUADRAUI_ISSUES.md) — filing it
+needs `gh` access this worker session doesn't have. **Keep #822 open, scoped down
+to item 2, until that issue is filed** (per `GOALS.md`'s milestone-discipline
+rule); once filed, delete the drafted entry and link the real issue number here.
+
+## #820 — blocked on an unfiled quadraui gap (drafted, not yet submitted)
+
+`BottomPanelController` adoption was investigated and correctly declined (a
+single-drawer model can't cover vimcode's five independently-gated bottom
+bands — see `src/render.rs`'s bottom-band module doc). The upstream gap this
+implies ("multi-band bottom chrome") is fully drafted, ready to file on
+`JDonaghy/quadraui` into milestone #9, in
+[`docs/PENDING_QUADRAUI_ISSUES.md`](docs/PENDING_QUADRAUI_ISSUES.md) — filing
+it needs `gh` access this worker session doesn't have. **Keep #820 open until
+that issue is filed** (per `GOALS.md`'s milestone-discipline rule); once
+filed, delete the drafted entry and link the real issue number here.
+
+## Active milestone: #7 Platform-Neutral — **2 open** (#901, #902)
+
+**The north star is [`GOALS.md`](GOALS.md): eliminate all platform-specific code from
+vimcode and lift it into quadraui.** Milestone **#7 Platform-Neutral** is the consume
+side (vimcode adopts a shipped quadraui API and *deletes* its bespoke per-backend code);
+milestone **#5 Cross-Platform UI Crate** is the supply side (building quadraui itself).
+Don't conflate them.
+
+### What landed
+
+The 2026-09-01 audit filed ten issues and queued them in two parallel chains. All ten
+closed, along with the slice chains that #733/#734/#735 turned out to need:
+
+| Convergence | Parent | Slices that did the work |
+|---|---|---|
+| Mouse routing — one precedence ladder, was written twice | #733 | #751 → #756 |
+| Keyboard dispatch — incl. the 19 stale `mirrors mod.rs:NNNN` pointers | #734 | #757 → #762 |
+| Frame composition — `FrameOp` / `compose_frame`, one walk per backend | #735 | #763 → #766 |
+
+Also closed: **#730** (`ai_panel` paint, closing epic #592), **#593** (GTK `Ctrl+V`),
+**#731** (22 permanently-`None` Relm4 handles + ~103 unreachable arms), **#732** (the GTK
+`Msg` bus — 124 variants, 301 sites, a 684-line `dispatch`), **#658** (preview tier),
+**#480**, **#550**, **#551**. **#146** moved out to **#4 Editor Features** as
+recommended — it is an addition, not a deletion, and it was making the burndown mean two
+things.
+
+Two structural landmarks fell with them:
+
+- **#657 shipped `[lib] vimcode_core`** (`eb745e2`). `render`, `tui_main` and `gtk` are
+  promoted out of the `vimcode` / `vcd` binaries into the library, and
+  `tests/acceptance/` is sealed. The oracle loop is available to this repo for the
+  first time — see `tests/acceptance.rs` and `docs/ARCHITECTURE.md`.
+- **#766 deleted `draw_frame`** (`eedebf8`), the last raw-`ratatui::Frame` path. The
+  #735 staging question ("enumerate the raw-`Buffer` residue first") resolved exactly as
+  the previous revision predicted: it was `#[cfg(test)]`-gated and dead in production,
+  and the three test-only helpers went with it.
+
+Still true from earlier in the arc: `fn event_loop` does not exist in `src/`;
+`src/gtk/draw.rs` is deleted; both `ShellApp` migrations (#448, #595) are closed.
+
+### The post-#735 sizing audit — run on `develop @ eedebf8`
+
+Production lines, `#[cfg(test)]` excluded. **All columns measured with the same
+script** (`scripts/prod_lines.py`, added for this audit) so they are comparable:
+
+| | 2026-05-01 | 2026-07-01 | 08-31 `f867817` | **pre-chain** `6875315` | pre-#785 09-03 | **post-#785 @ `ee26268`** |
+|---|---|---|---|---|---|---|
+| `src/gtk/` | 18,969 | 13,675 | 12,526 | 9,765 | 9,650 | **2,607** |
+| `src/tui_main/` | 14,649 | 10,358 | 11,125 | 10,958 | 10,345 | **10,366** |
+| `src/app.rs` (hoisted out of `src/gtk/` by #785) | — | — | — | — | — | **7,131** |
+| **all three files** | 33,618 | 24,033 | 23,651 | 20,723 | 19,995 (2 files) | **20,104** |
+| `src/render.rs` (shared) | 10,574 | 12,807 | 15,009 | 15,558 | 21,405 | **21,405** |
+
+The **pre-chain** column is `6875315`, the last #732 commit — the true point before
+#733/#734/#735 and slices #751–#766 began. Everything between the 08-31 and
+pre-chain columns is **#722–#732**, which was dead-code deletion, not convergence;
+collapsing the two is what produced the −3,656 misattribution. Both columns
+regenerated from `git archive` 2026-09-12.
+
+(#785, "stage 1 of #47," hoisted `struct App` verbatim out of `src/gtk/mod.rs` into
+a new `src/app.rs` — see `GOALS.md`'s post-#735 audit for the full account. The
+`src/gtk/` = 9,650 figure this file previously carried as "now" predates that move;
+regenerated at `ee26268` per #827.)
+
+**Projected vs. actual.** Measured over the chain's *own* range
+(`6875315` → `eedebf8`), not 08-31 → 09-03, which silently includes #722–#732's
+dead-code deletion:
+
+| | projected | actual over the chain | (08-31 → 09-03, for reference) |
+|---|---|---|---|
+| Backends | −8,700 … −9,500, landing near 14,000–15,000 | **−728, landing at 19,995** | −3,656 |
+| `render.rs` | +4,000 … +5,000 | **+5,847** | +6,396 |
+| Net across the three files | ≈ −4,000 | **+5,119** | +2,740 |
+
+**The chain missed its projection by roughly 12×, not 2.4×**, and the net went the
+wrong way by over 5,000 lines. Of the −3,656, **−2,928** is #722–#732 deleting code
+outright (#731 alone `−1,432/+245`; the #732 tranches `−1,837/+83`, `−535/+461`,
+`−529/+485` in `gtk/mod.rs`), leaving **−728** for convergence proper — the two sum
+exactly. Deleting unreachable code and converging duplicated code are different
+activities and must not be pooled.
+
+**The mechanism, visible in the diff:** moving a *decision* into `render.rs` leaves
+every *apply* body in place at its original size, now preceded by a
+`MouseDragState`/`ModalOverlayState` literal (30–60 lines per call site) and a
+"#NNN moved this" comment. The `FrameOp`/`EditorOp`/`BottomOp` machinery added three
+enums, three order constants, three composers, three validators and ~150 lines of
+doc. A 12-variant `match` is not shorter than 12 `if` blocks.
+
+Where the 08-31 → 09-03 reduction came from:
+
+| File | pre-chain | now | Δ |
+|---|---|---|---|
+| `src/gtk/mod.rs` | 10,518 | 7,684 | **−2,834** |
+| `src/tui_main/panels.rs` | 1,554 | 1,208 | −346 |
+| `src/tui_main/mouse.rs` | 3,211 | 2,895 | −316 |
+| `src/tui_main/shell_app.rs` | 4,109 | 3,989 | −120 |
+| `src/gtk/click.rs` | 751 | 696 | −55 |
+| `src/gtk/util.rs` | 303 | 250 | −53 |
+| `src/gtk/css.rs` | 507 | 507 | 0 |
+
+`gtk/mod.rs` is 78% of the entire cut. `tui_main/mouse.rs` — the file #733 was sized
+against at −3,000…−3,500 — lost **316 lines**.
+
+> **Correcting the record.** The `src/gtk/` figure this file previously carried as
+> "12,588 at 2026-09-01" was measured *before* #727/#728/#730 landed; it matches the
+> pre-chain 08-31 column, not the 09-01 tree. The 05-01 and 07-01 figures also differ
+> from the previously recorded ones (by 10–290 lines) for the same reason. That is the
+> whole argument for `scripts/prod_lines.py`: **regenerate, don't re-type.**
+
+### What the chain bought, stated honestly
+
+Every *decision* — which surface was hit, which handler owns a key, what order a frame is
+composed in — is now stated once in `render.rs`, and both backends walk it. Delegation
+density is high: `src/gtk/mod.rs` makes 424 `render::` calls. That is a durable
+correctness win, and it is also *why* the net line count went up — the shared
+op-sequence machinery (`FrameOp`/`compose_frame`, the routers) costs more lines than the
+duplicate pair it replaced.
+
+**It is not "thin event-to-engine wiring."** 19,995 production lines across two backends
+is a long way from the north star, and the remaining gap should not be planned as small.
+
+### What remains — four items, none of them queued
+
+1. ~~**The irreducible surface is recorded but never aggregated.**~~ ✅ **Done
+   2026-09-03, corrected 2026-09-05:
+   [`docs/IRREDUCIBLE_SURFACE.md`](docs/IRREDUCIBLE_SURFACE.md).** The nine
+   verdicts reduce to **three** facts (the folder-picker verdict was wrong and has
+   been struck — `quadraui::compose::FolderPickerController` has existed since
+   2026-05-25), **two** genuinely irreducible. And the sizing answer:
+   **only 246 of 19,429 production lines (1.3%) name a native toolkit type**, so
+   platform-specificity is *not* what keeps the backends large — `src/gtk/mod.rs` and
+   `src/tui_main/shell_app.rs` are two implementations of the same four `ShellApp` entry
+   points. Plan the remainder as duplication, not porting. One verdict
+   (`tui_main/mouse.rs:1620`, command-line selection) turned out to be a **mislabelled
+   supply gap**: `CommandLineLayout::hit_test` does not exist in quadraui and was never
+   filed; **#194** is the open consumer-side symptom.
+2. **The "duplication moved down into quadraui" claim is largely refuted (#827).**
+   quadraui#481/#482 remain open and un-milestoned, but most of the headline numbers
+   don't hold up at the pinned rev: `EventOutcome` is declared once, not twice
+   (quadraui#496); the 1,671-line byte-identical claim was withdrawn by quadraui#481's
+   own correction comment as "idiom coincidence" (real duplication ~85 lines); the
+   UTF-8 fix has been public since 2026-08-15 (quadraui#503); the tree-layout
+   "twins" are both 1-line wrappers over one shared function (quadraui#499); and
+   quadraui#482's eight children (#503–#510) are all closed. See `GOALS.md` §2 for
+   the full table. What's still real: macOS dispatches `WindowResized` undebounced
+   while TUI/GTK share a `ResizeDebouncer`.
+3. **#47's blocker was filed and cleared 2026-09-03** — see below (this used to say
+   "filed nowhere"; it wasn't, within hours of that claim being written).
+4. **The divergence bug class is still ~44 issues deep** (#206, #420, #264, #194, #233
+   and friends), plus milestone #5's cross-backend residue (#149, #167, #168, #233,
+   #294). `GOALS.md`'s thesis is that each is a symptom of a duplicated surface; if the
+   convergence had reached far enough this list would be shrinking. It is the only
+   outcome measure this goal has that isn't a line count — watch it.
+
+### ✅ #47's blocker was filed and cleared — this section was stale (#827)
+
+**Corrected 2026-09-05.** #47 (native macOS GUI) was closed 2026-09-02 with commit
+`44882e9` — *"re-audit at pickup, no code — Backend-trait Rc-handle gap blocks Stage
+1"* — recording the real blocker: `App` called `GtkBackend::modal_stack_handle()` /
+`drag_state_handle()` at **19** call sites (`modal_stack_handle` ×12,
+`drag_state_handle` ×7 — not the "44" this file previously said, which counted every
+use of the `backend` field via `grep -n 'self\.backend\.' src/gtk/mod.rs`, not just
+the two Rc-handle methods) in the drag and modal dispatch paths. Those were
+**inherent methods on the concrete struct, not on the generic `quadraui::Backend`
+trait**, and `MacBackend`'s trait equivalents (`modal_stack_mut`, `drag_and_modal_mut`)
+returned short-lived `&mut` borrows that couldn't be stashed and reused the way `App`
+does. Full findings are in [`PLAN.md`](PLAN.md).
+
+**That blocker was filed — this file just never caught up.** **quadraui#699** was
+filed 2026-09-03 16:38Z (into quadraui milestone #9) and **closed 17:11Z**
+(PR#700/`88345fb`); follow-up **#704** closed 21:41Z. **vimcode#47 was reopened
+16:38Z** and is **open now, in milestone #5**. quadraui#699/#704 gave every backend a
+symmetric Rc-handle API, and vimcode has already started consuming it: **#811**
+bumped the quadraui pin to `4ff2a64` and ported the TUI-side call sites off the
+now-removed `drag_and_modal_mut`. The actual next actionable item is **vimcode#47
+Stage 1** (the GTK-side `App` move), not a re-filing task — see `PLAN.md` and
+`GOALS.md` for the full correction.
+
+### Milestone hygiene
+
+- **#7 is 2 open** (#901 `install_menu_bar`, #902 `show_context_menu` — both macOS
+  native-menu adoption, filed 2026-09-11). #146 moved to #4 Editor Features; #47 sits in #5 Cross-Platform UI
+  Crate, which `GOALS.md` defines as covering the macOS/Windows backends, and is
+  **open** (reopened 2026-09-03).
+- **quadraui milestone #9** ("vimcode Platform-Neutral blockers") is **open** (0
+  open / 7 closed issues) — it held quadraui#699 and does not need re-opening.
+- **Stale Win-GUI issues.** Roughly a dozen open `Win-GUI:` issues (#160–#178, #61,
+  #172, #176) describe a backend **deleted from this repo on 2026-05-11** (`3e4bcff`).
+  Their live counterparts are quadraui#19–#31 / quadraui#580. They should be migrated or
+  closed rather than left to imply `src/win_gui/` still exists.
+
+### A note on line numbers in this file
+
+There are none, deliberately. Locate code by **symbol**, not coordinate:
+`grep -n "impl quadraui::ShellApp for App" src/gtk/mod.rs` and friends. Where a *count*
+appears it is evidence measured on a named revision — regenerate it
+(`python3 scripts/prod_lines.py src/gtk src/tui_main src/render.rs`) rather than trusting
+it. #734 existed in the first place because `src/tui_main/` carried 19
+`mirrors mod.rs:NNNN` comments whose targets had all drifted.
 
 ---
 
-Vimcode at 1994+ lib tests passing.
-
-> Sessions 388 and earlier in **SESSION_HISTORY.md**.
-
-> Feature documentation lives in **README.md**.
-> **Active multi-stage wave:** `quadraui` cross-platform UI crate extraction — see **PLAN.md** for pickup-on-another-machine instructions.
-
-
+> Feature documentation lives in **README.md**. Sessions 389 and earlier in
+> **SESSION_HISTORY.md**. No multi-stage wave is in flight — **PLAN.md** holds the #47
+> re-audit findings and is otherwise history.
 
 ---
-
 ## Testing Policy
 
 **Every new Vim feature and every bug fix MUST have comprehensive integration tests before the work is considered done.** Subtle bugs (register content, cursor position, newline handling, linewise vs. char-mode paste) are only reliably caught by tests. The process is:
@@ -49,14 +658,27 @@ TUI was the reference implementation through Phase C; GTK caught
 up. Numbers update with each Path-A landing — read this to find
 the next slice.
 
-**Status (post #296, 2026-05-02):** **TUI/GTK paint duplication is
-done.** Every entry in the cross-backend coverage table below is ✅
-on both backends. Debug sidebar migrated to `MultiSectionView`
-(#296) — both paint and click consume one cached layout per frame.
-**No bespoke section-walk paint code remains.** Residual convergence
-work (#210/#211/#288-style hit-test/click items) plus
-intrinsic-to-surface divergences (Cairo painter order vs ratatui
-cell coalescence) remain but are tracked separately.
+**Status (2026-09-03):** **Paint duplication is done for every
+surface in the table below** — all ✅ on both backends. The
+GTK-side regression that #540 introduced (surfaces painted only
+by the since-deleted `draw.rs`) was swept by #669–#672, and the
+last holdout, `ai_panel`, was painted on GTK by #730.
+
+No bespoke section-walk paint code remains (debug sidebar moved to
+`MultiSectionView` in #296 — both paint and click consume one cached
+layout per frame). The mouse-routing, keyboard-dispatch and
+frame-composition duplication that this note used to point at as
+"untracked residual" was converged by #751–#766: both backends now
+walk one `FrameOp` sequence built by `render::compose_frame`, and
+`draw_frame` — the last raw-`ratatui::Frame` path — is deleted (#766).
+
+What remains cross-backend is the set of rungs the slices
+**deliberately declined to converge**, each with its verdict recorded
+at the call site (`grep -rn -iE "do not converge|one-sided|intrinsic difference" src/`),
+plus intrinsic-to-surface divergences (Cairo painter order vs ratatui
+cell coalescence, px vs cell units). See "What remains" above — that
+set has never been aggregated into one statement, and doing so is the
+next piece of the north star's own work.
 
 | Surface | Primitive | TUI | GTK | Notes |
 |---|---|---|---|---|
@@ -83,7 +705,7 @@ cell coalescence) remain but are tracked separately.
 | Settings panel chrome (header + search row) | `draw_settings_chrome` | ✅ | ✅ | #278, `fd08db0` |
 | AI sidebar message history | `MessageList` | ✅ | ✅ | #279, `8e55720` |
 | Editor viewport (text + gutter + cursor + selection + diagnostics) | `Editor` | ✅ | ✅ | #276, `5b23718`+ (Phase C Stage 1) |
-| Extension panel | `TreeView` (with `Decoration::Header`) | ✅ | ✅ | #280, `d29d1b4`. Adapter `render::ext_sidebar_to_tree_view`. Click via `TreeViewLayout::hit_test()` on both backends. |
+| Extension panel | `TreeView` (with `Decoration::Header`) | ✅ | ✅ | #280, `d29d1b4`. Adapter `render::ext_sidebar_to_multi_section_view` (paint goes through `render::populate_ext_sidebar_system`; the original `ext_sidebar_to_tree_view` adapter lost its last caller and was deleted in #812). Click via `TreeViewLayout::hit_test()` on both backends. |
 | Debug sidebar (variables tree, breakpoints, watch) | `MultiSectionView` (4 × `TreeView`) | ✅ | ✅ | #296, `285916b`. Adapter `render::debug_sidebar_to_multi_section_view`. Paint caches layout; click reads verbatim. |
 | Source control panel | `SidebarSystem` (4 sections) | ✅ | ✅ | #321/#339/#340. `populate_sc_sidebar_system` + `SidebarSystem.render()`. Unified dispatch via `dispatch_sc_sidebar_key_unified`. Section badges + visibility (quadraui#103). |
 | Bottom panel tabs (Terminal / Debug Output) | `TabBar` | ✅ | ✅ | #304, `5d7fa09`. Adapter `render::build_bottom_panel_tab_bar`. Click via `Engine::handle_bottom_tab_bar_click`. `show_tab_close: false`, `compact: true`. |
@@ -125,10 +747,69 @@ cell coalescence) remain but are tracked separately.
 - ⚠️ **Hit-test glue partially shared** (#210/#344) — screen-level zone detection (tab bar, window, divider, breadcrumb) and window sub-zone detection (gutter, status bar, scrollbar, text area) now shared via `render::screen_zone_hit_test` + `window_zone_hit_test`. GTK caches ScreenLayout from paint (#344). Remaining per-backend: motion-handler → `selected_idx` wiring for primitive surfaces (#210), tab bar inner slot resolution (Pango vs char-cell).
 - ❌ No `Backend::watch_file(path) -> Stream<FileEvent>` trait method — every backend rolls its own watcher (TUI poll, GTK GIO). Suppress decision is shared (#201) but not the watcher invocation.
 - ✅ **Editor viewport lifted** (Phase C Stage 1 / #276). Both backends paint through `quadraui::{tui,gtk}::draw_editor`. The vim-motion-suite vision (PLAN.md) is now unblocked at the paint layer; engine-slice extraction (Phase 2 — `editor_core` crate carving out `keys.rs` + buffer + LSP) remains as a separate multi-month wave.
-- ⏭️ Win-GUI removed (Session 363). Will be re-added as a thin wrapper when quadraui ships its Win backend (quadraui#19–#31).
+- ⏭️ Win-GUI removed from this repo on 2026-05-11 (`3e4bcff`). Will be re-added as a thin wrapper when quadraui ships its Win backend (quadraui#19–#31, quadraui#580). The `Win-GUI:` issues still open on *this* tracker describe that deleted backend — migrate or close them (see Milestone hygiene above).
 
 ---
 
 ## Recent Work
 
 > Sessions 389 and earlier in **SESSION_HISTORY.md**.
+
+**2026-09-04 — #801: `/` and `:s` got a real regex engine.** New
+`src/core/vim_regex.rs` translates Vim patterns (all four magic levels, `\<`/`\>`,
+`\{n,m}`/`\{-}`, `\zs`/`\ze`, `\c`/`\C`, the character classes, `~`) into Rust
+`regex`, and **rejects** what it cannot express instead of falling back to literal
+matching. `run_search` and `:s` both use it; search offsets (`/pat/e`, `/e+1`, `/b+2`,
+`/+1`), `;` chaining, `//` reuse and `3/pat` all work; `*`/`#` now set a real
+`\<word\>` pattern. `parse_ex_address`/`parse_ex_range` implement the full ex address
+grammar, which `:s`, `:g`/`:v`, `:d`, `:y`, `:j`, `:>`, `:<`, `:t`, `:m` and `:normal`
+now all accept. `:s` gained replacement expansion (`& \0 \1 \u \U \L \E \r \t`),
+the `g c e i I n &` flags (`c` errors rather than being silently dropped), `:&`/`:&&`,
+counts and `|` chaining. **`KNOWN_DEVIATIONS` 638 → 465** (−173): the `search`, `sub`
+and `g` conformance categories are clean apart from operator-pending `d/pat` (the next
+issue in the #801 chain), `gd`/`gn`, and `\1` back-references.
+
+**2026-09-03 — the chain drained; #7 closed out; the audit run.** #751–#756 converged
+mouse routing, #757–#762 keyboard dispatch, #763–#766 frame composition (`FrameOp` /
+`compose_frame`, then the deletion of `draw_frame`). #657 promoted `render`/`tui_main`/
+`gtk` into `[lib] vimcode_core` and sealed `tests/acceptance/`. #730/#593/#731/#732/#658/
+#480/#550/#551 all closed; #146 moved to #4. Milestone #7 reached **0 open**. Ran the
+post-#735 sizing audit the previous revision mandated and added `scripts/prod_lines.py`
+so it is reproducible: over the chain's own range backends **−728** against a
+−8,700…−9,500 projection, `render.rs` **+5,847**, net **+5,119**. (The −3,656/+6,396/
++2,740 figures this entry first carried measure 08-31 → 09-03, which pools in
+#722–#732's dead-code deletion — see the corrected section above.) #47 closed having shipped **no code** (`44882e9`) with its
+`Backend`-trait Rc-handle blocker filed nowhere — the top open action. *(Corrected
+2026-09-05, issue #827: that blocker — quadraui#699, at 19 not 44 call sites — was
+filed and closed the same day, 16:38Z–17:11Z, and #47 was reopened 16:38Z. This
+entry's "filed nowhere" was already wrong by the time the revision carrying it was
+written; see the corrected section above.)*
+
+**2026-09-05 — GOALS.md/PLAN.md/PROJECT_STATE.md/IRREDUCIBLE_SURFACE.md corrected
+(#827).** A four-agent audit of `develop @ ee26268` found the planning docs
+materially stale: the #47-blocker-unfiled claim (quadraui#699 had already closed),
+the 44-call-site figure (real count 19), the quadraui#481/#482 "duplication moved
+down a level" claims (mostly refuted at the pinned rev), the `src/gtk/` size-table
+column (predated #785's move), and the `IRREDUCIBLE_SURFACE.md` folder-picker
+verdict (wrong — `FolderPickerController` has existed in quadraui since 05-25).
+Corrected all four docs; no code changed.
+
+**2026-09-01 — platform-neutrality audit, and everything it found is now queued.**
+Filed #730 (`ai_panel`), #731 (orphan handles), #732 (`Msg` bus), #733 (mouse routers),
+#734 (keyboard), #735 (frame composition). Re-scoped #593 (unblocked, `GtkDriver`
+supersedes its smoke plan), #657 (audit run and recorded, fixture list corrected, freeze
+contradiction flagged) and #47 (macOS: thin wrapper, not Core Graphics). Moved #146 out
+of #7. Queued all of it plus quadraui#596/#597 — 16 entries, two parallel chains. #592
+given an audit comment and deliberately **left open** on `ai_panel`. Docs: PRs #729
+(PROJECT_STATE + PLAN) and #736 (GOALS).
+
+**2026-08-26 → 09-01 — the #592 epic and the dedup sweep cleared.** #669/#670/#671/#672
+(GTK live-path paint + `draw.rs` deletion), #676 (Command Center), #673/#674/#677 (tab
+MRU, jump-list pane identity, vacuous-test rewrites), #621/#659/#660/#536 (dedup),
+#691 (quadraui pinned as a git rev instead of a sibling path dep), #693/#694/#695
+(menu-bar paint + hamburger), #699–#705 (VS Code chrome-metrics parity), #35 (minimap
+primitive, both backends), #710/#712 (omnibar + dropdown fonts), #715/#716/#719/#720
+(WM identity, titlebar glyphs, app icon), #722/#723 (per-pane minimap, scroll thumb).
+
+**2026-08-26 — both `ShellApp` migrations closed.** #448 (GTK) and #595 (TUI).
+`fn event_loop` deleted from `src/` (#634).

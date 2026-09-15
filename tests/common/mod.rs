@@ -1,5 +1,5 @@
 #![allow(dead_code)]
-use vimcode_core::{Cursor, Engine, EngineAction, Mode};
+use vimcode_core::{Cursor, Engine, EngineAction, Mode, RegType};
 
 // ── Construction ──────────────────────────────────────────────────────────────
 
@@ -130,13 +130,26 @@ pub fn assert_mode(e: &Engine, mode: Mode) {
     assert_eq!(e.mode, mode, "mode: expected {mode:?}, got {:?}", e.mode);
 }
 
+/// Assert a register's text and charwise/linewise-ness.
+///
+/// Kept boolean for the ~100 existing call sites; use
+/// [`assert_register_typed`] when the case is about blockwise-ness (#807).
+/// A blockwise register fails here whichever bool you pass — that is
+/// deliberate, so a charwise assertion cannot silently pass on a block.
 pub fn assert_register(e: &Engine, reg: char, text: &str, linewise: bool) {
-    let (t, lw) = e
+    assert_register_typed(e, reg, text, RegType::from_linewise(linewise));
+}
+
+/// Assert a register's text and its exact [`RegType`] — including
+/// [`RegType::Blockwise`], which `<C-v>y` must set so a later `p` re-inserts
+/// a rectangle instead of pasting the block's rows as plain lines (#807).
+pub fn assert_register_typed(e: &Engine, reg: char, text: &str, ty: RegType) {
+    let (t, actual) = e
         .registers
         .get(&reg)
         .unwrap_or_else(|| panic!("register '{reg}' not set"));
     assert_eq!(t, text, "register '{reg}' text");
-    assert_eq!(lw, &linewise, "register '{reg}' linewise");
+    assert_eq!(actual, &ty, "register '{reg}' type");
 }
 
 pub fn assert_msg_contains(e: &Engine, substr: &str) {

@@ -121,6 +121,16 @@ scripts = ["my_script.lua"]                 # Filenames of bundled Lua scripts
 line = "//"                                 # Single-line comment prefix
 block_open = "/*"                           # Block comment open
 block_close = "*/"                          # Block comment close
+
+# ── Board panel data provider (#522) ──────────────────────
+[board]
+refresh_command = ["my-tool", "board", "--json"]  # Argv run to refresh the Board panel;
+                                                   # must print a BoardModel JSON document
+                                                   # on stdout and exit zero
+poll_interval_secs = 30                     # Seconds between automatic refreshes
+[board.actions]
+OpenIssue = ["my-tool", "open", "{id}"]     # BoardAction variant name -> argv;
+                                             # "{id}" is replaced with the card id
 ```
 
 ### Field Reference
@@ -166,6 +176,24 @@ Override comment style for languages handled by this extension.
 | `line` | String | Line comment prefix (e.g., `"//"`, `"#"`, `"--"`) |
 | `block_open` | String | Block comment open (e.g., `"/*"`) |
 | `block_close` | String | Block comment close (e.g., `"*/"`) |
+
+#### `[board]` Section (#522)
+
+Declares this extension as a data provider for the Board panel. Generic — no
+particular provider is named or assumed; any external tool that emits
+vimcode's board JSON contract (a `BoardModel`: columns of cards with inline
+status badges, matching quadraui's `Board` component) on stdout works here.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `refresh_command` | String[] | Argv run for a board refresh. `refresh_command[0]` is the binary, the rest are arguments. Must print a `BoardModel` JSON document to stdout and exit zero. |
+| `poll_interval_secs` | Integer | Seconds between automatic background refreshes (default `30`). |
+| `actions` | Table | Maps a `BoardAction` variant name (e.g. `"OpenIssue"`, `"OpenReview"`) to an argv template run when that action fires. The literal token `{id}` in any argument is substituted with the acted-on card's id. Actions with no entry are simply not runnable. |
+
+If no provider extension is installed/configured, the Board panel reports
+"no board provider configured" — every other part of the editor is
+unaffected. A missing or failing provider binary degrades to a message in
+the panel, never a crash.
 
 ---
 

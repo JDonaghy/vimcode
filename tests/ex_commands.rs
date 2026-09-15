@@ -1,6 +1,7 @@
 mod common;
 use common::*;
 use vimcode_core::EngineAction;
+use vimcode_core::RegType;
 
 // ═══════════════════════════════════════════════════════════════════════════════
 //  Group 1: Normalizer abbreviation tests
@@ -230,13 +231,14 @@ fn cmd_yank_linewise() {
     let mut e = engine_with("test line\n");
     exec(&mut e, "y");
     let (_, lw) = e.registers.get(&'"').unwrap();
-    assert!(*lw, "yank should be linewise");
+    assert!(lw.is_linewise(), "yank should be linewise");
 }
 
 #[test]
 fn cmd_put_default_register() {
     let mut e = engine_with("line1\nline2\n");
-    e.registers.insert('"', ("inserted\n".to_string(), true));
+    e.registers
+        .insert('"', ("inserted\n".to_string(), RegType::Linewise));
     exec(&mut e, "put");
     let lines = get_lines(&e);
     assert_eq!(lines[1], "inserted");
@@ -245,7 +247,8 @@ fn cmd_put_default_register() {
 #[test]
 fn cmd_put_named_register() {
     let mut e = engine_with("line1\nline2\n");
-    e.registers.insert('a', ("from_a\n".to_string(), true));
+    e.registers
+        .insert('a', ("from_a\n".to_string(), RegType::Linewise));
     exec(&mut e, "put a");
     let lines = get_lines(&e);
     assert_eq!(lines[1], "from_a");
@@ -434,24 +437,51 @@ fn cmd_retab_tabs_to_spaces() {
     assert_eq!(lines[1], "    world");
 }
 
+/// `:retab!` — and *only* the bang form — rewrites runs of plain spaces
+/// (`:h :retab`). Verified against Neovim 0.12:
+/// `nvim --clean -c 'set noet ts=4' -c 'retab!'` on `"    hello"` yields
+/// `"\thello"`.
 #[test]
-fn cmd_retab_spaces_to_tabs() {
+fn cmd_retab_bang_spaces_to_tabs() {
     let mut e = engine_with("    hello\n    world\n");
     e.settings.expand_tab = false;
     e.settings.tabstop = 4;
-    exec(&mut e, "retab");
+    exec(&mut e, "retab!");
     let lines = get_lines(&e);
     assert_eq!(lines[0], "\thello");
     assert_eq!(lines[1], "\tworld");
 }
 
+/// Without `!`, a whitespace run containing no <Tab> is left completely
+/// alone, even under `'noexpandtab'` with a run exactly one tabstop wide.
+/// Verified against Neovim 0.12: the same buffer under
+/// `-c 'set noet ts=4' -c 'retab'` comes back unchanged.
+#[test]
+fn cmd_retab_without_bang_leaves_spaces_alone() {
+    let mut e = engine_with("    hello\n    world\n");
+    e.settings.expand_tab = false;
+    e.settings.tabstop = 4;
+    exec(&mut e, "retab");
+    let lines = get_lines(&e);
+    assert_eq!(lines[0], "    hello");
+    assert_eq!(lines[1], "    world");
+}
+
+/// `:retab {n}` measures the *existing* whitespace with the old `'tabstop'`
+/// and re-emits that width under the new one — it does not reinterpret the
+/// tab as being `n` columns wide. With the default `ts=4`, `"\thello"` is a
+/// 4-column run, so under `'expandtab'` it becomes four spaces (not two),
+/// while `'tabstop'` itself still ends up as 2. Verified against Neovim
+/// 0.12: `-c 'set et ts=4' -c 'retab 2'` on `"\thello"` yields
+/// `"    hello"`.
 #[test]
 fn cmd_retab_with_tabstop_arg() {
     let mut e = engine_with("\thello\n");
     e.settings.expand_tab = true;
+    assert_eq!(e.settings.tabstop, 4, "test assumes the default tabstop");
     exec(&mut e, "retab 2");
     assert_eq!(e.settings.tabstop, 2);
-    assert_eq!(get_lines(&e)[0], "  hello");
+    assert_eq!(get_lines(&e)[0], "    hello");
 }
 
 #[test]

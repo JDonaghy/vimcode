@@ -3,6 +3,7 @@ mod common;
 use common::*;
 use vimcode_core::core::engine::ContextMenuTarget;
 use vimcode_core::core::window::GroupId;
+use vimcode_core::quadraui;
 use vimcode_core::Engine;
 
 // ── Helper: open N files as tabs ───────────────────────────────────────────────
@@ -1309,7 +1310,9 @@ fn test_editor_context_menu_shortcuts_vim_mode() {
     let cm = e.context_menu.as_ref().unwrap();
 
     // Vim-style shortcuts.
-    assert_eq!(cm.items[0].shortcut, "gd");
+    // `gd` is Vim's local-declaration motion (#889); the LSP go-to-definition
+    // key in Vim mode is the tag jump `Ctrl-]`.
+    assert_eq!(cm.items[0].shortcut, "Ctrl+]");
     assert_eq!(cm.items[1].shortcut, "gr");
     assert_eq!(cm.items[2].shortcut, "<leader>rn");
     assert_eq!(cm.items[3].shortcut, "gD");
@@ -1381,4 +1384,38 @@ fn test_editor_context_menu_first_enabled_selected() {
     let cm = e.context_menu.as_ref().unwrap();
     assert_eq!(cm.selected, 6, "first enabled item should be paste");
     assert_eq!(cm.items[cm.selected].action, "paste");
+}
+
+// ── ModalStack integration (#459) ─────────────────────────────────────────────
+
+/// Regression test: when a context menu is open and its bounds are pushed onto
+/// the ModalStack, hit_test() at the menu centre returns Some(menu_id) and
+/// hit_test() outside the menu returns None. This is the invariant that the
+/// ctx_blocks_event gate in mod.rs relies on.
+#[test]
+fn context_menu_modal_stack_hit_test() {
+    let mut modal_stack = quadraui::ModalStack::new();
+    let menu_id = quadraui::WidgetId::new("context_menu"); // matches step 2's naming
+    let bounds = quadraui::Rect {
+        x: 5.0,
+        y: 3.0,
+        width: 20.0,
+        height: 10.0,
+    };
+
+    assert!(modal_stack.is_empty());
+
+    modal_stack.push(menu_id.clone(), bounds);
+
+    let centre = quadraui::Point { x: 15.0, y: 8.0 };
+    assert_eq!(modal_stack.hit_test(centre), Some(&menu_id));
+
+    let outside = quadraui::Point { x: 0.0, y: 0.0 };
+    assert!(modal_stack.hit_test(outside).is_none());
+
+    modal_stack.pop(&menu_id);
+    assert!(
+        modal_stack.hit_test(centre).is_none(),
+        "after close, centre of former menu bounds should no longer hit"
+    );
 }

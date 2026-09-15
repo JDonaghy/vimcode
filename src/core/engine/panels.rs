@@ -1,5 +1,21 @@
 use super::*;
 
+/// Extract the first non-empty line of LSP server stderr (trimmed) and cap
+/// it at 100 display columns for the status-bar failure message.
+///
+/// `stderr` is arbitrary, uncontrolled subprocess output — a byte-indexed
+/// slice (`&s[..100]`) can land mid-codepoint and panic if a multibyte
+/// character straddles byte offset 100. `quadraui::truncate_to_width`
+/// always cuts on a char boundary. See vimcode#620 / quadraui#472.
+fn lsp_stderr_snippet(stderr: &str) -> &str {
+    let snippet = stderr
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("no output")
+        .trim();
+    quadraui::tui::truncate_to_width(snippet, 100)
+}
+
 impl Engine {
     // ─── Dialog system ─────────────────────────────────────────────────
 
@@ -113,6 +129,26 @@ impl Engine {
         };
         self.dialog = None;
         self.process_dialog_result(&tag, &action, input_value.as_deref())
+    }
+
+    /// Cancel the currently-open dialog — the same outcome as pressing
+    /// Escape on the in-canvas dialog (`handle_dialog_key`'s `"Escape"`
+    /// arm): looks up the dialog's tag, clears it, and runs
+    /// `process_dialog_result(tag, "cancel", ..)`, the single function that
+    /// owns what "cancel" means for a given dialog tag.
+    ///
+    /// Used by the GTK native-message-dialog path (#727) when
+    /// `PlatformServices::show_message_dialog` returns `None` — the native
+    /// alert was dismissed (Escape, close box) without a button choice, the
+    /// same event the in-canvas dialog's Escape key produces. Returns
+    /// `EngineAction::None` if no dialog is open.
+    pub fn dialog_cancel(&mut self) -> EngineAction {
+        let (tag, input_value) = match self.dialog.as_ref() {
+            Some(d) => (d.tag.clone(), d.input.as_ref().map(|i| i.value.clone())),
+            None => return EngineAction::None,
+        };
+        self.dialog = None;
+        self.process_dialog_result(&tag, "cancel", input_value.as_deref())
     }
 
     /// Handle a key press when a dialog is open.
@@ -1041,16 +1077,7 @@ impl Engine {
                     if was_initialized {
                         self.message = format!("LSP {} exited", desc);
                     } else {
-                        let snippet = stderr
-                            .lines()
-                            .find(|l| !l.trim().is_empty())
-                            .unwrap_or("no output")
-                            .trim();
-                        let snippet = if snippet.len() > 100 {
-                            &snippet[..100]
-                        } else {
-                            snippet
-                        };
+                        let snippet = lsp_stderr_snippet(&stderr);
                         self.message = format!("LSP {} failed to start: {}", desc, snippet);
                     }
                     redraw = true;
@@ -1506,7 +1533,9 @@ impl Engine {
             return result;
         };
         if mgr.server_supports(&path, "definitionProvider") {
-            result.push(("Definition", "gd", "command:definition"));
+            // `gd` is Vim's local-declaration motion, not this LSP command
+            // (:h gd) — the tag-jump `Ctrl-]` is what invokes the server.
+            result.push(("Definition", "Ctrl+]", "command:definition"));
         }
         if mgr.server_supports(&path, "typeDefinitionProvider") {
             result.push(("Type Definition", "gy", "command:type_definition"));
@@ -1520,73 +1549,10 @@ impl Engine {
         result
     }
 
-    /// Extract clickable links from rendered markdown.
-    ///
-    /// Two sources of click regions are handled:
-    ///
-    /// 1. **Markdown links** — each `Link` span (the label text) is paired with
-    ///    the following `LinkUrl` span on the same line.  The click region covers
-    ///    the label; the URL drives dispatch.  Command URIs displayed as
-    ///    `:Name?args` are restored to `command:Name?args`.
-    ///
-    /// 2. **Bare URLs** — standalone `LinkUrl` spans (emitted by `render_markdown`
-    ///    for plain `http://` / `https://` text) become their own click regions.
-    ///    The span text is the URL itself, so no reconstruction is needed beyond
-    ///    the same `:` → `command:` prefix check used for markdown link URLs.
-    pub(crate) fn extract_hover_links(
-        rendered: &crate::core::markdown::MdRendered,
-    ) -> Vec<(usize, usize, usize, String)> {
-        use crate::core::markdown::MdStyle;
-        let mut links = Vec::new();
-        for (line_idx, line_spans) in rendered.spans.iter().enumerate() {
-            let Some(line) = rendered.lines.get(line_idx) else {
-                continue;
-            };
-            // Walk every span on this line.
-            let mut span_iter = line_spans.iter().peekable();
-            while let Some(span) = span_iter.next() {
-                if span.style == MdStyle::Link {
-                    // Paired markdown link: look for the following LinkUrl span.
-                    let url = span_iter
-                        .peek()
-                        .filter(|next| next.style == MdStyle::LinkUrl)
-                        .and_then(|next| {
-                            if next.end_byte <= line.len() {
-                                Some(&line[next.start_byte..next.end_byte])
-                            } else {
-                                None
-                            }
-                        });
-                    if let Some(url_text) = url {
-                        // Command URIs display as ":Name?args" — restore prefix.
-                        let url = if url_text.starts_with(':') {
-                            format!("command{}", url_text)
-                        } else {
-                            url_text.to_string()
-                        };
-                        if is_safe_url(&url) {
-                            // Click region = the Link label span.
-                            links.push((line_idx, span.start_byte, span.end_byte, url));
-                        }
-                    }
-                } else if span.style == MdStyle::LinkUrl && span.end_byte <= line.len() {
-                    // Standalone LinkUrl span (bare URL or the URL display of a
-                    // markdown link).  Make the span itself clickable.
-                    let url_text = &line[span.start_byte..span.end_byte];
-                    // Restore command: prefix if displayed as ":Name?args".
-                    let url = if url_text.starts_with(':') {
-                        format!("command{}", url_text)
-                    } else {
-                        url_text.to_string()
-                    };
-                    if is_safe_url(&url) {
-                        links.push((line_idx, span.start_byte, span.end_byte, url));
-                    }
-                }
-            }
-        }
-        links
-    }
+    // Link extraction from hover markdown moved to
+    // `core::markdown::hover_markdown_structure` (#821 — hover popups adopt
+    // quadraui's `render_markdown_to_styled`, which resolves link ranges
+    // itself instead of vimcode re-pairing `Link`/`LinkUrl` spans).
 
     /// Execute an LSP navigation command from a hover popup link.
     /// Moves the cursor to the given position before invoking the LSP request.
@@ -2164,5 +2130,48 @@ impl Engine {
             .filter(|d| d.severity == DiagnosticSeverity::Warning)
             .count();
         (errors, warnings)
+    }
+}
+
+#[cfg(test)]
+mod lsp_stderr_snippet_tests {
+    use super::lsp_stderr_snippet;
+
+    /// A stderr line where a two-byte UTF-8 character straddles byte
+    /// offset 100 must not panic when truncated for the status message.
+    /// Regression test for vimcode#620 / quadraui#472: the old code did
+    /// `&snippet[..100]`, a byte-indexed slice with no char-boundary
+    /// check, on arbitrary LSP subprocess stderr.
+    #[test]
+    fn multibyte_char_straddling_byte_100_does_not_panic() {
+        // 99 ASCII bytes, then 'é' (2 UTF-8 bytes) spanning bytes 99..101,
+        // so a slice at byte offset 100 lands mid-codepoint.
+        let mut stderr = "a".repeat(99);
+        stderr.push('é');
+        stderr.push_str("more trailing text past the truncation point");
+
+        let snippet = lsp_stderr_snippet(&stderr);
+
+        // Must be valid UTF-8 (guaranteed by type) and capped in display
+        // width, not silently unbounded.
+        assert!(quadraui::tui::display_width(snippet) <= 100);
+    }
+
+    #[test]
+    fn short_stderr_is_returned_unchanged() {
+        let stderr = "connection refused\n";
+        assert_eq!(lsp_stderr_snippet(stderr), "connection refused");
+    }
+
+    #[test]
+    fn finds_first_non_empty_line() {
+        let stderr = "\n   \nreal error here\nsecond line\n";
+        assert_eq!(lsp_stderr_snippet(stderr), "real error here");
+    }
+
+    #[test]
+    fn falls_back_when_all_lines_empty() {
+        let stderr = "\n   \n\t\n";
+        assert_eq!(lsp_stderr_snippet(stderr), "no output");
     }
 }

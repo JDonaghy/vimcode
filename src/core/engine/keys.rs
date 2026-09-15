@@ -5,6 +5,75 @@ impl Engine {
     // Key handling
     // =======================================================================
 
+    /// #805: decide whether `curswant` (the Normal-mode vertical-motion
+    /// desired column tracked in `self.curswant`) survives this keystroke.
+    ///
+    /// Must run before `self.pending_key` / `self.pending_operator` /
+    /// `self.pending_find_operator` / `self.pending_text_object` are consumed
+    /// by dispatch, since the classification reads them as they stood when
+    /// this keystroke arrived.
+    ///
+    /// Preserved (left untouched) for:
+    ///  - digits accumulating a count — they don't move the cursor at all;
+    ///  - `j` / `k` themselves;
+    ///  - `<C-d>` / `<C-u>` / `<C-f>` / `<C-b>` / `<C-e>` / `<C-y>` — Vim
+    ///    documents these as curswant-preserving alongside `j`/`k`, and
+    ///    `scroll_and_move_by`/`page_down`/`page_up` read/reapply `curswant`
+    ///    just like a plain vertical motion does.
+    ///
+    /// Reset to `None` for everything else, including `$` (its own handler
+    /// sets `Some(CURSWANT_EOL)` immediately afterward, so the reset here
+    /// just guarantees a clean slate for keys that don't) and `g` — even
+    /// when `g` is about to resolve to `gj`/`gk`: those dispatch to
+    /// `move_visual_down`/`move_visual_up` (`src/core/engine/search.rs`),
+    /// which never read or write `curswant`, so there is no downstream
+    /// motion for a preserved value to feed.
+    fn update_curswant_for_key(&mut self, unicode: Option<char>, ctrl: bool) {
+        if !matches!(
+            self.mode,
+            Mode::Normal | Mode::Visual | Mode::VisualLine | Mode::VisualBlock
+        ) {
+            self.latch_visual_block_want();
+            self.curswant = None;
+            return;
+        }
+        if self.pending_operator.is_some()
+            || self.pending_find_operator.is_some()
+            || self.pending_text_object.is_some()
+            || self.pending_key.is_some()
+        {
+            self.latch_visual_block_want();
+            self.curswant = None;
+            return;
+        }
+        if let Some(ch) = unicode {
+            if ctrl {
+                if matches!(ch, 'd' | 'u' | 'f' | 'b' | 'e' | 'y') {
+                    return;
+                }
+            } else if matches!(ch, 'j' | 'k') {
+                return;
+            } else if ch.is_ascii_digit() && (ch != '0' || self.count.is_some()) {
+                return; // count digit in progress; cursor hasn't moved
+            }
+        }
+        self.latch_visual_block_want();
+        self.curswant = None;
+    }
+
+    /// #807: copy the current wanted column into `visual_block_want` before
+    /// `curswant` is dropped, so a Visual-Block operator keystroke (`y`, `d`,
+    /// `I`, …) still knows which column the block's moving edge is on after
+    /// `j`/`k` clamped the cursor onto a shorter line.
+    fn latch_visual_block_want(&mut self) {
+        if self.mode == Mode::VisualBlock {
+            let col = self.view().cursor.col;
+            self.visual_block_want = Some(self.curswant.unwrap_or(col));
+        } else {
+            self.visual_block_want = None;
+        }
+    }
+
     /// Process a key event and return an action the UI should perform.
     pub fn handle_key(
         &mut self,
@@ -12,10 +81,29 @@ impl Engine {
         unicode: Option<char>,
         ctrl: bool,
     ) -> EngineAction {
+        // #805: decide whether this keystroke should drop the remembered
+        // `curswant` (Normal-mode vertical-motion desired column) before any
+        // of the pending-state fields it inspects get consumed below.
+        self.update_curswant_for_key(unicode, ctrl);
+
+        // Reset the per-keystroke failure flag (#806) — set by a Normal-mode
+        // command below that couldn't complete, and read once, right after
+        // this call returns, by `advance_macro_playback`.
+        self.command_failed = false;
+
         // Spell suggestion selection intercepts all keys.
         if self.spell_suggestions.is_some() {
             self.handle_spell_suggestion_key(key_name, unicode);
             return EngineAction::None;
+        }
+
+        // Expression register (`"=` in Normal mode, `<C-r>=` in Insert mode)
+        // intercepts all keys until the terminating `<CR>`/`<Esc>` — it's a
+        // mini command-line, entered from (and returning to) whichever mode
+        // triggered it, so it can't be handled as part of the mode-specific
+        // dispatch below (#806, `reg:"= expr`, `reg:C-r = in insert`).
+        if self.expr_register_pending.is_some() {
+            return self.handle_expr_register_key(key_name, unicode);
         }
 
         // Clear message on any keypress (unless we're in command/search mode
@@ -288,6 +376,15 @@ impl Engine {
             self.dismiss_completion();
         }
 
+        // `insert_last_key_char` (Vim's `lastc`) is only meaningful *within* one
+        // Insert session, so any key handled outside Insert mode — including the
+        // `i`/`a`/`A`/`o` that enters it, and the Normal-mode command run by
+        // `<C-o>` — clears it. Without this, `A<C-d>` on a line that already
+        // ends in a literal '0' would be mistaken for `:h i_0_CTRL-D` (#804).
+        if self.mode != Mode::Insert {
+            self.insert_last_key_char = None;
+        }
+
         // Capture cursor position before dispatching (used by cursor_move hook below).
         let pre_cursor_line = self.cursor().line;
         let pre_cursor_col = self.cursor().col;
@@ -324,7 +421,7 @@ impl Engine {
         // Ctrl+F: open find/replace from any mode (Visual captures the selection)
         if ctrl
             && key_name == "f"
-            && self.settings.ctrl_f_action == "find"
+            && self.settings.ctrl_f_action() == "find"
             && matches!(
                 self.mode,
                 Mode::Visual | Mode::VisualLine | Mode::VisualBlock | Mode::Insert
@@ -334,8 +431,53 @@ impl Engine {
             return EngineAction::None;
         }
 
+        // --- dot-repeat bookkeeping: snapshot state before dispatch ---
+        // `was_neutral`/`is_repeat_trigger` are computed from state as it was
+        // *before* this key is dispatched (matches Vim: `.` itself is never
+        // part of the thing it repeats).
+        let dot_was_neutral = self.is_dot_repeat_neutral();
+        let dot_is_repeat_trigger =
+            pre_mode == Mode::Normal && !ctrl && unicode == Some('.') && dot_was_neutral;
+        // Use the undo stack (not the `changed` out-param) as the "did this
+        // keystroke actually edit the buffer" signal: it's already the
+        // established, DRY source of truth for that question in this codebase
+        // (see `BufferState::has_unsaved_changes`), and unlike `changed` it
+        // can't be missed by a handler that forgets to set the out-param.
+        let dot_pre_undo_len = self.active_buffer_state().undo_stack.len();
+
+        // A count typed immediately before this `.` (the "2" of "2.") was
+        // buffered into `dot_scratch` as a *pending* count-prefix — by
+        // design, since at digit-typing time the recorder can't yet know
+        // whether a real command or a `.` trigger follows (see
+        // `record_dot_keystroke`). If a `.` trigger follows, that count is
+        // consumed below as `.`'s override count (`self.count`/
+        // `take_count()`), not as part of a new dot-repeat candidate — but
+        // because `.` itself skips `record_dot_keystroke` (see the call site
+        // below), that stale prefix would otherwise survive untouched and
+        // get folded into the *nested* `handle_key` calls that
+        // `repeat_last_change`'s replay performs (`replay_dot_keys`),
+        // corrupting `last_dot_count` for every later bare `.` (#803 review:
+        // `3x` `2.` would leave `last_dot_count = Some(22)` instead of
+        // `Some(2)`). Discard it here: a `.` keystroke never itself
+        // contributes to a new dot-repeat candidate, so whatever was pending
+        // before it is fully spent once `.` has consumed it as an override.
+        if dot_is_repeat_trigger {
+            self.dot_scratch.clear();
+            self.dot_scratch_any_change = false;
+        }
+
         match self.mode {
             Mode::Normal => {
+                // Was this keystroke the *start* of a brand-new command (not
+                // continuing an operator like `y`, a pending single-char
+                // command like `r`, or a register prefix like `"a`)? Needed
+                // below to tell a genuinely bare `$`/`p` apart from one that
+                // merely happens to be the *last* keystroke of a longer
+                // command (`y$`, `r p`, `"ap`) — those must not trigger the
+                // bare-`$`/bare-`p` cursor special-casing (#804 review).
+                let ctrl_o_key_starts_new_command = self.pending_key.is_none()
+                    && self.pending_operator.is_none()
+                    && self.selected_register.is_none();
                 action = self.handle_normal_key(key_name, unicode, ctrl, &mut changed);
                 // Ctrl-O auto-return: after one Normal command, return to Insert.
                 // Only if we're still in Normal mode (the command didn't change mode itself)
@@ -344,12 +486,44 @@ impl Engine {
                     if self.mode == Mode::Normal
                         && self.pending_key.is_none()
                         && self.pending_operator.is_none()
+                        // A count digit alone (`2` of `2w`) isn't a complete
+                        // command yet — without this a lone digit already
+                        // satisfies the two checks above and returns to
+                        // Insert before the motion it prefixes ever runs
+                        // (#804, "C-o with count").
+                        && self.count.is_none()
                     {
                         self.mode = Mode::Insert;
                         self.start_undo_group();
                         self.insert_ctrl_o_active = false;
-                    } else if self.mode != Mode::Normal {
-                        // Command changed mode (e.g. entered Insert via i/a/o) — clear flag
+                        // `:h i_CTRL-O`: a bare `$` sets Vim's sticky
+                        // "end of line" want-column, so resuming Insert
+                        // afterwards appends past the last character
+                        // instead of inserting before it (#804). Gated on
+                        // `ctrl_o_key_starts_new_command` so a `$` that's
+                        // merely the *motion half* of a longer command
+                        // (`y$`) doesn't also get this cursor shift.
+                        if ctrl_o_key_starts_new_command && !ctrl && unicode == Some('$') {
+                            let line = self.view().cursor.line;
+                            self.view_mut().cursor.col = self.get_line_len_for_insert(line);
+                        } else if ctrl_o_key_starts_new_command && !ctrl && unicode == Some('p') {
+                            // `p` leaves the cursor ON the last pasted
+                            // character in Normal mode; resuming Insert via
+                            // <C-o> continues typing *after* it instead
+                            // (#804, "C-o p"). Same gate: a `p` that's the
+                            // replacement char of `r` or the command after a
+                            // `"a`-style register prefix isn't the bare `p`
+                            // command and must not shift the cursor.
+                            let line = self.view().cursor.line;
+                            let max_col = self.get_line_len_for_insert(line);
+                            self.view_mut().cursor.col = (self.view().cursor.col + 1).min(max_col);
+                        }
+                    } else if self.mode != Mode::Normal && self.mode != Mode::Command {
+                        // Command changed mode (e.g. entered Insert via i/a/o) — clear flag.
+                        // Mode::Command is exempt: `<C-o>:s/a/b/<CR>` is still
+                        // "one command" spanning several keystrokes — see the
+                        // `Mode::Command` arm below, which resumes Insert once
+                        // the ex-command actually runs (#804, "C-o :s").
                         self.insert_ctrl_o_active = false;
                     }
                     // If pending_key/operator is set, keep flag active for next iteration
@@ -363,9 +537,18 @@ impl Engine {
             }
             Mode::Command => {
                 action = self.handle_command_key(key_name, unicode, ctrl);
+                // Ctrl-O auto-return, continued: an ex-command entered via
+                // `<C-o>:` counts as the one command <C-o> promised, so
+                // resume Insert once it has run (mode is back to Normal) —
+                // see the `Mode::Normal` arm above for the common case (#804).
+                if self.insert_ctrl_o_active && self.mode == Mode::Normal {
+                    self.mode = Mode::Insert;
+                    self.start_undo_group();
+                    self.insert_ctrl_o_active = false;
+                }
             }
             Mode::Search => {
-                self.handle_search_key(key_name, unicode, ctrl);
+                self.handle_search_key(key_name, unicode, ctrl, &mut changed);
             }
             Mode::Visual | Mode::VisualLine | Mode::VisualBlock => {
                 // Save pre-call visual state for 'gv' support
@@ -377,7 +560,8 @@ impl Engine {
                 if !matches!(
                     self.mode,
                     Mode::Visual | Mode::VisualLine | Mode::VisualBlock
-                ) {
+                ) && !std::mem::take(&mut self.last_visual_locked)
+                {
                     self.last_visual_mode = pre_mode;
                     self.last_visual_anchor = pre_anchor;
                     self.last_visual_cursor = Some(pre_cursor);
@@ -393,6 +577,26 @@ impl Engine {
                         self.visual_mark_end = Some((end.line, end.col));
                     }
                 }
+            }
+        }
+
+        // --- dot-repeat bookkeeping: fold this keystroke into the candidate
+        // recording (or finalize/discard it), now that dispatch has run.
+        // Excluded: Command/Search mode (ex-commands aren't dot-repeatable —
+        // `&`/`g&` cover `:s` repeat separately) and the `.` keystroke itself
+        // (it replays a command, it isn't one — see `dot_is_repeat_trigger`).
+        if !matches!(pre_mode, Mode::Command | Mode::Search) && !dot_is_repeat_trigger {
+            if matches!(self.mode, Mode::Command | Mode::Search) {
+                self.dot_scratch.clear();
+                self.dot_scratch_any_change = false;
+                // `record_dot_keystroke` — which normally clears this on the
+                // return to neutral — is skipped on this path, so an `@…`
+                // span that ends by opening `:`/`/` must release the flag here
+                // or every later command would be dropped from the candidate.
+                self.dot_skip_command = false;
+            } else {
+                let dot_did_change = self.active_buffer_state().undo_stack.len() > dot_pre_undo_len;
+                self.record_dot_keystroke(key_name, unicode, ctrl, dot_was_neutral, dot_did_change);
             }
         }
 
@@ -426,9 +630,7 @@ impl Engine {
 
             // Auto-promote preview buffer on text modification
             let active_id = self.active_buffer_id();
-            if self.preview_buffer_id == Some(active_id) {
-                self.promote_preview(active_id);
-            }
+            self.preview_tab_promote(active_id);
             // Mark buffer as needing an LSP didChange (debounced)
             self.lsp_dirty_buffers.insert(active_id, true);
 
@@ -481,22 +683,73 @@ impl Engine {
         action
     }
 
+    /// Handle one keystroke while the `"=`/`<C-r>=` expression prompt is
+    /// open (`self.expr_register_pending.is_some()`). `<CR>` evaluates the
+    /// accumulated text and stores the result in the `=` register; the
+    /// Insert-mode variant (`from_insert`) also inserts it at the cursor,
+    /// "as if typed" like any other `<C-r>` register paste. `<Esc>` cancels
+    /// without touching the `=` register, matching `i_CTRL-R_CTRL-R`'s
+    /// abort behavior (#806).
+    fn handle_expr_register_key(&mut self, key_name: &str, unicode: Option<char>) -> EngineAction {
+        let Some((from_insert, mut buf)) = self.expr_register_pending.take() else {
+            return EngineAction::None;
+        };
+        match key_name {
+            "Return" => match Engine::eval_expr_register(&buf) {
+                Ok(result) => {
+                    self.registers
+                        .insert('=', (result.clone(), RegType::Charwise));
+                    if from_insert {
+                        self.insert_register_content_at_cursor(&result);
+                    }
+                }
+                Err(e) => {
+                    self.message = format!("E15: Invalid expression: {}", e);
+                }
+            },
+            "Escape" => {
+                // Cancelled — leave the `=` register untouched and drop back
+                // into whichever mode triggered the prompt with no side effects.
+            }
+            "BackSpace" => {
+                buf.pop();
+                self.expr_register_pending = Some((from_insert, buf));
+            }
+            _ => {
+                if let Some(ch) = unicode {
+                    buf.push(ch);
+                    self.expr_register_pending = Some((from_insert, buf));
+                }
+            }
+        }
+        EngineAction::None
+    }
+
     /// Decode a sequence from the macro playback queue.
     /// Returns (key_name, unicode, ctrl) tuple and the number of characters consumed.
-    pub(crate) fn decode_macro_sequence(&mut self) -> Option<(String, Option<char>, bool, usize)> {
-        if self.macro_playback_queue.is_empty() {
-            return None;
-        }
+    pub(crate) fn decode_macro_sequence(&self) -> Option<(String, Option<char>, bool, usize)> {
+        self.decode_key_from_queue(&self.macro_playback_queue)
+    }
 
-        let first_char = *self.macro_playback_queue.front().unwrap();
+    /// Decode the *next* keystroke at the front of an encoded key-notation
+    /// queue (same notation as macro recording: bracketed `<...>` sequences,
+    /// the raw `\x1b` escape byte, or a literal character). Returns
+    /// `(key_name, unicode, ctrl, chars_consumed)`. Shared by macro playback
+    /// (`decode_macro_sequence`, over `self.macro_playback_queue`) and
+    /// dot-repeat replay (`replay_dot_keys`, over a private local queue) so
+    /// the two mechanisms can't interleave or clobber each other's state.
+    pub(crate) fn decode_key_from_queue(
+        &self,
+        queue: &VecDeque<char>,
+    ) -> Option<(String, Option<char>, bool, usize)> {
+        let first_char = *queue.front()?;
 
         // Check for angle-bracket notation (e.g., <Left>, <C-D>)
         if first_char == '<' {
             // Collect characters until we find '>'
             let mut sequence = String::new();
-            let temp_queue: Vec<char> = self.macro_playback_queue.iter().copied().collect();
 
-            for (i, &ch) in temp_queue.iter().enumerate() {
+            for (i, &ch) in queue.iter().enumerate() {
                 sequence.push(ch);
                 if ch == '>' {
                     // Found complete sequence
@@ -577,6 +830,19 @@ impl Engine {
                 return (false, EngineAction::Error);
             }
 
+            // A command inside the macro failed (`f{char}` not found, `j`/`k`
+            // already at a buffer edge, …): real Vim aborts the rest of this
+            // macro invocation *and* any outstanding repeat count right here
+            // (#806, "mac:10@a stops at failure"). This is also what makes a
+            // self-referential recursive macro terminate at EOF instead of
+            // spinning to `MAX_MACRO_RECURSION` — the trailing `@a` that
+            // would re-queue another pass is still sitting unexpanded at the
+            // front of the queue when the failure happens, so clearing here
+            // discards it before it ever runs (#806, "mac:recursive").
+            if self.command_failed {
+                self.macro_playback_queue.clear();
+            }
+
             (!self.macro_playback_queue.is_empty(), action)
         } else {
             (false, EngineAction::None)
@@ -645,26 +911,25 @@ impl Engine {
         if ctrl {
             match key_name {
                 "d" => {
-                    // Half-page down (fold-aware)
-                    let count = self.take_count();
-                    let half = self.viewport_lines() / 2;
-                    let scroll_amount = half * count;
-                    let max_line = self.buffer().len_lines().saturating_sub(1);
-                    let cur = self.view().cursor.line;
-                    let new_line = self.view().next_visible_line(cur, scroll_amount, max_line);
-                    self.view_mut().cursor.line = new_line;
-                    self.clamp_cursor_col();
+                    // <C-d>: half-page down. An explicit count SETS the
+                    // sticky 'scroll' value (replacing, not multiplying, any
+                    // previous one); a bare <C-d> reuses it (#805).
+                    let explicit = self.count.take();
+                    if let Some(n) = explicit {
+                        self.scroll_value = Some(n.max(1));
+                    }
+                    let amount = self.effective_scroll() as isize;
+                    self.scroll_and_move_by(amount);
                     return EngineAction::None;
                 }
                 "u" => {
-                    // Ctrl-U: Half-page up (fold-aware)
-                    let count = self.take_count();
-                    let half = self.viewport_lines() / 2;
-                    let scroll_amount = half * count;
-                    let cur = self.view().cursor.line;
-                    let new_line = self.view().prev_visible_line(cur, scroll_amount);
-                    self.view_mut().cursor.line = new_line;
-                    self.clamp_cursor_col();
+                    // <C-u>: half-page up, mirrors <C-d>.
+                    let explicit = self.count.take();
+                    if let Some(n) = explicit {
+                        self.scroll_value = Some(n.max(1));
+                    }
+                    let amount = self.effective_scroll() as isize;
+                    self.scroll_and_move_by(-amount);
                     return EngineAction::None;
                 }
                 "r" => {
@@ -674,31 +939,24 @@ impl Engine {
                     return EngineAction::None;
                 }
                 "f" => {
-                    if self.settings.ctrl_f_action == "find" {
+                    if self.settings.ctrl_f_action() == "find" {
                         // Open find/replace overlay
                         self.open_find_replace();
                         return EngineAction::None;
                     }
-                    // Full page down (fold-aware)
+                    // <C-f>: full page(s) forward, 2-line overlap (#805).
                     let count = self.take_count();
-                    let viewport = self.viewport_lines();
-                    let scroll_amount = viewport * count;
-                    let max_line = self.buffer().len_lines().saturating_sub(1);
-                    let cur = self.view().cursor.line;
-                    let new_line = self.view().next_visible_line(cur, scroll_amount, max_line);
-                    self.view_mut().cursor.line = new_line;
-                    self.clamp_cursor_col();
+                    for _ in 0..count {
+                        self.page_down();
+                    }
                     return EngineAction::None;
                 }
                 "b" => {
-                    // Full page up (fold-aware)
+                    // <C-b>: full page(s) backward, mirrors <C-f>.
                     let count = self.take_count();
-                    let viewport = self.viewport_lines();
-                    let scroll_amount = viewport * count;
-                    let cur = self.view().cursor.line;
-                    let new_line = self.view().prev_visible_line(cur, scroll_amount);
-                    self.view_mut().cursor.line = new_line;
-                    self.clamp_cursor_col();
+                    for _ in 0..count {
+                        self.page_up();
+                    }
                     return EngineAction::None;
                 }
                 "w" => {
@@ -718,13 +976,20 @@ impl Engine {
                     return EngineAction::None;
                 }
                 "o" => {
-                    // Ctrl-O: Jump list back
-                    self.jump_list_back();
+                    // Ctrl-O: jump list back, `N<C-o>` repeats N times
+                    // (#806, "jump:3<C-o>" — this previously ignored its count).
+                    let count = self.take_count().max(1);
+                    for _ in 0..count {
+                        self.jump_list_back();
+                    }
                     return EngineAction::None;
                 }
                 "i" => {
                     // Ctrl-I: Jump list forward (same as Tab in many terminals)
-                    self.jump_list_forward();
+                    let count = self.take_count().max(1);
+                    for _ in 0..count {
+                        self.jump_list_forward();
+                    }
                     return EngineAction::None;
                 }
                 "p" => {
@@ -754,28 +1019,17 @@ impl Engine {
                     return EngineAction::None;
                 }
                 "e" => {
-                    // Ctrl-E: scroll down one line (fold-aware, cursor stays)
+                    // Ctrl-E: scroll down one line (fold-aware). The cursor
+                    // only moves if the scroll pushed it out of view — and
+                    // then only as far as 'scrolloff' requires (#805).
                     let count = self.take_count();
-                    self.scroll_down_visible(count);
-                    // Keep cursor visible
-                    let viewport = self.viewport_lines();
-                    if viewport > 0 && self.view().cursor.line < self.view().scroll_top {
-                        self.view_mut().cursor.line = self.view().scroll_top;
-                        self.clamp_cursor_col();
-                    }
+                    self.scroll_viewport_with_cursor(1, count);
                     return EngineAction::None;
                 }
                 "y" => {
-                    // Ctrl-Y: scroll up one line (fold-aware, cursor stays)
+                    // Ctrl-Y: scroll up one line (fold-aware); mirrors <C-e>.
                     let count = self.take_count();
-                    self.scroll_up_visible(count);
-                    // Keep cursor visible
-                    let viewport = self.viewport_lines();
-                    if viewport > 0 && self.view().cursor.line >= self.view().scroll_top + viewport
-                    {
-                        self.view_mut().cursor.line = self.view().scroll_top + viewport - 1;
-                        self.clamp_cursor_col();
-                    }
+                    self.scroll_viewport_with_cursor(-1, count);
                     return EngineAction::None;
                 }
                 "a" => {
@@ -807,8 +1061,12 @@ impl Engine {
                     self.lsp_request_definition();
                     return EngineAction::None;
                 }
-                "backslash" => {
-                    // Ctrl+\: Split editor group to the right (VSCode style)
+                "backslash" | "\\" => {
+                    // Ctrl+\: Split editor group to the right (VSCode style).
+                    // TUI maps the raw '\' to "backslash"; the GTK ShellApp key
+                    // path forwards the raw char "\\". Accept both so the split
+                    // fires on every backend (mirrors the "bracketright" | "]"
+                    // dual-match above). (#515)
                     self.open_editor_group(SplitDirection::Vertical);
                     return EngineAction::None;
                 }
@@ -887,13 +1145,23 @@ impl Engine {
             Some('j') => {
                 let count = self.take_count();
                 for _ in 0..count {
-                    self.move_down();
+                    if !self.move_down() {
+                        // Already at the last line: a macro/`:normal` playing
+                        // this back must stop here (#806, "mac:recursive" —
+                        // this is what makes a self-referential macro
+                        // terminate at EOF instead of spinning forever).
+                        self.command_failed = true;
+                        break;
+                    }
                 }
             }
             Some('k') => {
                 let count = self.take_count();
                 for _ in 0..count {
-                    self.move_up();
+                    if !self.move_up() {
+                        self.command_failed = true;
+                        break;
+                    }
                 }
             }
             Some('l') => {
@@ -903,12 +1171,13 @@ impl Engine {
                 }
             }
             Some('i') => {
+                self.insert_repeat_count = self.take_count();
                 self.start_undo_group();
                 self.insert_text_buffer.clear();
                 self.set_mode(Mode::Insert);
-                self.count = None; // Clear count when entering insert mode
             }
             Some('a') => {
+                self.insert_repeat_count = self.take_count();
                 self.start_undo_group();
                 self.insert_text_buffer.clear();
                 let max_col = self.get_max_cursor_col(self.view().cursor.line);
@@ -920,17 +1189,21 @@ impl Engine {
                     self.view_mut().cursor.col = insert_max;
                 }
                 self.set_mode(Mode::Insert);
-                self.count = None; // Clear count when entering insert mode
             }
             Some('A') => {
-                self.start_undo_group();
+                self.insert_repeat_count = self.take_count();
                 self.insert_text_buffer.clear();
                 let line = self.view().cursor.line;
                 self.view_mut().cursor.col = self.get_line_len_for_insert(line);
+                // Undo group must start AFTER the cursor moves to the append
+                // position: `cursor_before` is what `u` restores to (clamped
+                // back into the line), and Vim restores to where the insert
+                // began, not to the pre-`A` cursor position (#886).
+                self.start_undo_group();
                 self.set_mode(Mode::Insert);
-                self.count = None; // Clear count when entering insert mode
             }
             Some('I') => {
+                self.insert_repeat_count = self.take_count();
                 self.start_undo_group();
                 self.insert_text_buffer.clear();
                 let line = self.view().cursor.line;
@@ -946,7 +1219,6 @@ impl Engine {
                 }
                 self.view_mut().cursor.col = col;
                 self.mode = Mode::Insert;
-                self.count = None; // Clear count when entering insert mode
             }
             Some('o') => {
                 let count = self.take_count();
@@ -955,6 +1227,7 @@ impl Engine {
                 let line = self.view().cursor.line;
                 let indent = self.smart_indent_for_newline(line);
                 let indent_len = indent.len();
+                self.insert_open_indent = indent.clone();
                 let line_end =
                     self.buffer().line_to_char(line) + self.buffer().line_len_chars(line);
                 let line_content = self.buffer().content.line(line);
@@ -983,6 +1256,16 @@ impl Engine {
                 self.insert_text_buffer.clear();
                 self.view_mut().cursor.line += 1;
                 self.view_mut().cursor.col = indent_len;
+                // `o` opens a brand-new line containing nothing but the
+                // auto-indent, so it's always "untouched" at this point —
+                // mirrors the `<CR>` path's tracking so a bare `<Esc>`
+                // removes the indent again instead of leaving a
+                // whitespace-only line (`:h 'autoindent'`, #883).
+                self.insert_indent_only_line = if !indent.is_empty() {
+                    Some(self.view().cursor.line)
+                } else {
+                    None
+                };
                 self.mode = Mode::Insert;
                 self.count = None; // Clear count when entering insert mode
                 *changed = true;
@@ -998,12 +1281,19 @@ impl Engine {
                     String::new()
                 };
                 let indent_len = indent.len();
+                self.insert_open_indent = indent.clone();
                 let line_start = self.buffer().line_to_char(line);
                 // Open one new line above (count is handled on Escape via insert_open_count)
                 let text = format!("{}\n", indent);
                 self.insert_with_undo(line_start, &text);
                 self.insert_text_buffer.clear();
                 self.view_mut().cursor.col = indent_len;
+                // Same tracking as `o` above, on the new (now-current) line.
+                self.insert_indent_only_line = if !indent.is_empty() {
+                    Some(self.view().cursor.line)
+                } else {
+                    None
+                };
                 self.mode = Mode::Insert;
                 self.count = None; // Clear count when entering insert mode
                 *changed = true;
@@ -1046,41 +1336,45 @@ impl Engine {
                 self.view_mut().cursor.col = target_col.min(max_col);
             }
             Some('&') => {
-                // & : repeat last :s on current line
-                if let Some((pattern, replacement, flags)) = self.last_substitute.clone() {
-                    let line = self.view().cursor.line;
-                    match self.replace_in_range(Some((line, line)), &pattern, &replacement, &flags)
-                    {
-                        Ok(count) => {
-                            self.message = format!(
-                                "{} substitution{}",
-                                count,
-                                if count == 1 { "" } else { "s" }
-                            );
-                        }
-                        Err(e) => {
-                            self.message = e;
-                        }
-                    }
+                // & : repeat last :s on the current line, without its flags
+                if let Some((pattern, replacement, _flags)) = self.last_substitute.clone() {
+                    let line = self.view().cursor.line as isize;
+                    self.run_substitute(Some((line, line)), &pattern, Some(&replacement), "");
                     *changed = true;
                 } else {
-                    self.message = "No previous substitute command".to_string();
+                    self.message = "E33: No previous substitute regular expression".to_string();
                 }
             }
             Some('$') => {
-                let line = self.view().cursor.line;
+                // Vim: a count moves down (count - 1) lines first, THEN to the
+                // end of THAT line — `2$` is not "end of the current line".
+                let count = self.take_count();
+                let max_line = self.buffer().len_lines().saturating_sub(1);
+                let line = (self.view().cursor.line + count - 1).min(max_line);
+                self.view_mut().cursor.line = line;
                 self.view_mut().cursor.col = self.get_max_cursor_col(line);
+                self.curswant = Some(CURSWANT_EOL);
             }
             Some('x') => {
                 let count = self.take_count();
                 let line = self.view().cursor.line;
                 let col = self.view().cursor.col;
-                let max_col = self.get_max_cursor_col(line);
-                if max_col > 0 || self.buffer().line_len_chars(line) > 0 {
+                // `line_len_chars` counts the trailing '\n' as part of the line,
+                // so an empty line (content just "\n") reports len 1 — exclude
+                // the newline itself so `x` on an empty line is a no-op instead
+                // of deleting the newline and joining with the next line.
+                let raw_line_len = self.buffer().line_len_chars(line);
+                let has_newline = raw_line_len > 0
+                    && self.buffer().content.line(line).chars().last() == Some('\n');
+                let content_len = if has_newline {
+                    raw_line_len - 1
+                } else {
+                    raw_line_len
+                };
+                if content_len > col {
                     let char_idx = self.buffer().line_to_char(line) + col;
                     // Calculate how many chars we can actually delete
-                    let line_end =
-                        self.buffer().line_to_char(line) + self.buffer().line_len_chars(line);
+                    let line_end = self.buffer().line_to_char(line) + content_len;
                     let available = line_end - char_idx;
                     let to_delete = count.min(available);
 
@@ -1101,14 +1395,6 @@ impl Engine {
                         self.finish_undo_group();
                         self.clamp_cursor_col();
                         *changed = true;
-
-                        // Record for repeat
-                        self.last_change = Some(Change {
-                            op: ChangeOp::Delete,
-                            text: String::new(),
-                            count,
-                            motion: Some(Motion::Right),
-                        });
                     }
                 }
             }
@@ -1175,60 +1461,62 @@ impl Engine {
                 }
             }
             Some('H') => {
-                // H: jump to top of visible screen
+                // H: jump to line [count] from top of visible screen, kept
+                // at least 'scrolloff' lines from the top (#805).
                 let count = self.take_count().max(1);
-                let scroll_top = self.view().scroll_top;
-                let viewport = self.viewport_lines();
-                let max_line = self.buffer().len_lines().saturating_sub(1);
-                let target = (scroll_top + count - 1).min(max_line);
-                let target = target.min(scroll_top + viewport.saturating_sub(1));
+                let target = self.screen_top_target(count);
                 self.push_jump_location();
-                self.view_mut().cursor.line = target;
-                self.clamp_cursor_col();
+                self.land_line_jump_cursor(target);
             }
             Some('M') => {
-                // M: jump to middle of visible screen
-                let scroll_top = self.view().scroll_top;
-                let viewport = self.viewport_lines();
-                let max_line = self.buffer().len_lines().saturating_sub(1);
-                let mid = scroll_top + viewport / 2;
+                // M: jump to the middle of the lines actually visible.
+                // Unlike H/L, M ignores 'scrolloff' (#805) — and its count
+                // (`:h M`), but the count must still be consumed or it leaks
+                // into the next command (#807).
+                let _ = self.take_count();
+                let mid = self.middle_visible_line();
                 self.push_jump_location();
-                self.view_mut().cursor.line = mid.min(max_line);
-                self.clamp_cursor_col();
+                self.land_line_jump_cursor(mid);
             }
             Some('L') => {
-                // L: jump to bottom of visible screen
+                // L: jump to line [count] from bottom of visible screen,
+                // kept at least 'scrolloff' lines from the bottom (#805).
                 let count = self.take_count().max(1);
-                let scroll_top = self.view().scroll_top;
-                let viewport = self.viewport_lines();
-                let max_line = self.buffer().len_lines().saturating_sub(1);
-                let target_from_bottom = scroll_top + viewport.saturating_sub(count);
+                let target = self.screen_bottom_target(count);
                 self.push_jump_location();
-                self.view_mut().cursor.line = target_from_bottom.min(max_line);
-                self.clamp_cursor_col();
+                self.land_line_jump_cursor(target);
             }
             Some('R') => {
                 // R: enter Replace mode
                 self.start_undo_group();
                 self.insert_text_buffer.clear();
+                self.replace_overwritten.clear();
+                self.replace_repeat_count = self.take_count().max(1);
                 self.mode = Mode::Replace;
                 self.count = None;
             }
             Some('(') => {
-                // (: backward sentence
+                // (: backward sentence. Only pushes a jump when the sentence
+                // start lands on a different line — verified against real
+                // Neovim, same rule as `%` (#806, "jump:C-o after (": pushing
+                // unconditionally here made `<C-o>` snap straight back to
+                // the pre-`(` column instead of leaving a same-line move
+                // alone).
                 let count = self.take_count();
-                self.push_jump_location();
+                let pre_cursor = self.view().cursor;
                 for _ in 0..count {
                     self.move_sentence_backward();
                 }
+                self.record_jump_from(pre_cursor);
             }
             Some(')') => {
-                // ): forward sentence
+                // ): forward sentence — see `(` above for the same-line gate.
                 let count = self.take_count();
-                self.push_jump_location();
+                let pre_cursor = self.view().cursor;
                 for _ in 0..count {
                     self.move_sentence_forward();
                 }
+                self.record_jump_from(pre_cursor);
             }
             Some('f') => {
                 self.pending_key = Some('f');
@@ -1324,7 +1612,7 @@ impl Engine {
                             .chars()
                             .collect();
                         let reg = self.active_register();
-                        self.set_register(reg, deleted_chars, false);
+                        self.set_delete_register(reg, deleted_chars, false);
                         self.clear_selected_register();
 
                         self.start_undo_group();
@@ -1381,8 +1669,14 @@ impl Engine {
                             .slice(line_start..delete_end)
                             .chars()
                             .collect();
+                        // `S` register content is linewise (`:h registers`) —
+                        // same as `cc` (#806, "reg:\"1 after cc"): even though
+                        // the buffer edit only clears the line's content and
+                        // leaves the newline in place, a subsequent `P` must
+                        // paste the yanked text back as a whole line above
+                        // the cursor, not inline.
                         let reg = self.active_register();
-                        self.set_register(reg, deleted, false);
+                        self.set_delete_register(reg, format!("{}\n", deleted), true);
                         self.clear_selected_register();
 
                         self.delete_with_undo(line_start, delete_end);
@@ -1436,40 +1730,26 @@ impl Engine {
             }
             Some('G') => {
                 self.push_jump_location();
-                if self.peek_count().is_some() {
+                let target_line = if self.peek_count().is_some() {
                     // Count provided: go to line N (1-indexed)
                     let count = self.take_count();
-                    let target_line = (count - 1).min(self.buffer().len_lines().saturating_sub(1));
-                    self.view_mut().cursor.line = target_line;
+                    (count - 1).min(self.buffer().len_lines().saturating_sub(1))
                 } else {
                     // No count: go to last line
-                    let last = self.buffer().len_lines().saturating_sub(1);
-                    self.view_mut().cursor.line = last;
-                }
-                self.clamp_cursor_col();
+                    self.buffer().len_lines().saturating_sub(1)
+                };
+                self.land_line_jump_cursor(target_line);
             }
             Some('~') => {
                 // Toggle case of char(s) under cursor
                 let count = self.take_count();
                 self.toggle_case_at_cursor(count, changed);
-                self.last_change = Some(Change {
-                    op: ChangeOp::ToggleCase,
-                    text: String::new(),
-                    count,
-                    motion: None,
-                });
             }
             Some('J') => {
                 // Join lines
                 let count = self.take_count().max(1);
                 self.push_jump_location();
                 self.join_lines(count, changed);
-                self.last_change = Some(Change {
-                    op: ChangeOp::Join,
-                    text: String::new(),
-                    count,
-                    motion: None,
-                });
             }
             Some('*') => {
                 // Search forward for word under cursor
@@ -1510,16 +1790,29 @@ impl Engine {
                 self.pending_operator = Some('!');
             }
             Some('u') => {
-                self.undo();
+                // `[count]u` undoes `count` changes (`:h u`), not just one —
+                // stop early if we run out of history rather than looping
+                // past the oldest change.
+                let count = self.take_count();
+                for _ in 0..count {
+                    if !self.undo() {
+                        break;
+                    }
+                }
                 self.refresh_md_previews();
             }
             Some('U') => {
                 *changed = self.undo_line();
             }
             Some('.') => {
-                // Repeat last change
-                let count = self.take_count();
-                self.repeat_last_change(count, changed);
+                // Repeat last change. A count given here *replaces* the
+                // original command's count (`:h .`) — so we must distinguish
+                // "no count typed" from "count of 1 typed", which is why we
+                // peek before consuming rather than trusting `take_count()`'s
+                // 1-as-sentinel default.
+                let override_count = self.peek_count();
+                self.take_count();
+                self.repeat_last_change(override_count, changed);
             }
             Some('y') => {
                 self.operator_count = self.count.take();
@@ -1531,15 +1824,11 @@ impl Engine {
             }
             Some('p') => {
                 let count = self.take_count();
-                for _ in 0..count {
-                    self.paste_after(changed);
-                }
+                self.paste_after(count, changed);
             }
             Some('P') => {
                 let count = self.take_count();
-                for _ in 0..count {
-                    self.paste_before(changed);
-                }
+                self.paste_before(count, changed);
             }
             Some('q') => {
                 // If already recording, stop recording
@@ -1596,7 +1885,8 @@ impl Engine {
             }
             Some('%') => {
                 let pre_line = self.view().cursor.line;
-                if self.peek_count().is_some() {
+                let is_bracket_match = self.peek_count().is_none();
+                if !is_bracket_match {
                     // N% — go to N% of file
                     let pct = self.take_count().min(100);
                     let total = self.buffer().len_lines();
@@ -1609,15 +1899,30 @@ impl Engine {
                     self.view_mut().cursor.line = target;
                     let fnb = self.first_non_blank_col(target);
                     self.view_mut().cursor.col = fnb;
+                    // `N%` scrolls like any other jump — minimally, via the
+                    // `ensure_cursor_visible()` call `handle_key` already
+                    // makes after dispatch (#805: verified against real
+                    // interactive Neovim — a 50%-of-60-lines jump lands the
+                    // target line at the *bottom* of the window, not
+                    // centered; see scripts/nvim_headless_vs_interactive_repro.sh).
                 } else {
-                    self.push_jump_location();
+                    // `%` always moves the `` ` `` pcmark, but only appends
+                    // to the persistent jumplist when the matched bracket is
+                    // on a DIFFERENT line — verified against real Neovim:
+                    // `getjumplist()` stays empty for a same-line match, yet
+                    // `` `` `` still returns to the pre-`%` column (#806,
+                    // "jump:% C-o" vs "mark:`` after %").
+                    let pre_cursor = self.view().cursor;
                     self.move_to_matching_bracket();
+                    self.record_jump_from(pre_cursor);
                 }
-                // Center viewport when the match is far from the current view,
-                // so the matched brace is clearly visible (like search `n`).
+                // Center viewport when a matched bracket is far from the
+                // current view, so it's clearly visible (like search `n`).
+                // Only applies to bracket matching — `N%` (above) uses the
+                // normal minimal-scroll jump behavior instead.
                 let post_line = self.view().cursor.line;
                 let vp = self.view().viewport_lines;
-                if vp > 0 && pre_line.abs_diff(post_line) > vp / 2 {
+                if is_bracket_match && vp > 0 && pre_line.abs_diff(post_line) > vp / 2 {
                     self.scroll_cursor_center();
                 }
             }
@@ -1625,7 +1930,19 @@ impl Engine {
                 self.mode = Mode::Command;
                 self.command_buffer.clear();
                 self.command_cursor = 0;
-                self.count = None; // Clear count when entering command mode
+                // A count typed before `:` pre-fills the command line with a
+                // range of that many lines starting at the cursor
+                // (`:h cmdline-ranges`): `3:` -> `:.,.+2`, `1:` -> `:.,.`.
+                if let Some(n) = self.count.take() {
+                    self.command_buffer = if n > 1 {
+                        format!(".,.+{}", n - 1)
+                    } else {
+                        ".,.".to_string()
+                    };
+                    self.command_cursor = self.command_buffer.chars().count();
+                }
+                // `.take()` above already leaves `self.count` as `None`
+                // whether or not a count was present.
             }
             Some('/') => {
                 self.mode = Mode::Search;
@@ -1633,8 +1950,8 @@ impl Engine {
                 self.command_cursor = 0;
                 self.search_direction = SearchDirection::Forward;
                 self.search_start_cursor = Some(self.view().cursor);
-                self.search_word_bounded = false; // Clear word-boundary mode
-                self.count = None; // Clear count when entering search mode
+                // `3/foo` jumps to the third match — keep the count for submit.
+                self.search_pending_count = self.take_count();
             }
             Some('?') => {
                 self.mode = Mode::Search;
@@ -1642,8 +1959,8 @@ impl Engine {
                 self.command_cursor = 0;
                 self.search_direction = SearchDirection::Backward;
                 self.search_start_cursor = Some(self.view().cursor);
-                self.search_word_bounded = false; // Clear word-boundary mode
-                self.count = None; // Clear count when entering search mode
+                // `3?foo` jumps to the third match backwards.
+                self.search_pending_count = self.take_count();
             }
             _ => match key_name {
                 "Escape" => {
@@ -1657,6 +1974,15 @@ impl Engine {
                         self.search_matches.clear();
                         self.search_index = None;
                     }
+                }
+                "Return" | "KP_Enter" => {
+                    // <CR> as a motion: identical to `+` — first non-blank of
+                    // the line `count` lines down (:help <CR>).
+                    let count = self.take_count();
+                    let max_line = self.buffer().len_lines().saturating_sub(1);
+                    let target = (self.view().cursor.line + count).min(max_line);
+                    self.view_mut().cursor.line = target;
+                    self.view_mut().cursor.col = self.first_non_blank_col(target);
                 }
                 "Left" => {
                     let count = self.take_count();
@@ -1740,15 +2066,26 @@ impl Engine {
                         }
                     } else {
                         self.push_jump_location();
-                        if self.peek_count().is_some() {
+                        let target_line = if self.peek_count().is_some() {
                             let count = self.take_count();
-                            let target_line =
-                                (count - 1).min(self.buffer().len_lines().saturating_sub(1));
-                            self.view_mut().cursor.line = target_line;
+                            (count - 1).min(self.buffer().len_lines().saturating_sub(1))
                         } else {
-                            self.view_mut().cursor.line = 0;
-                        }
-                        self.view_mut().cursor.col = 0;
+                            0
+                        };
+                        // `gg`, like `G`/`H`/`M`/`L`, doesn't use `curswant` at
+                        // all — there's no remembered column to fall back on
+                        // (see `land_line_jump_cursor`'s own doc comment).
+                        // `'startofline'` (`Settings::startofline`, #876) is
+                        // OFF by default (Neovim's default; Vim's is ON), so
+                        // out of the box `gg` never jumps to column
+                        // 0/first-non-blank; it keeps the column the cursor
+                        // already had, clamped to the target line's length
+                        // (verified against `nvim --headless`, the conformance
+                        // oracle this repo's tests run against; see #806 review —
+                        // a real `vim` binary's `col('.')` after `gg` is not a
+                        // substitute for the actual nvim oracle used by
+                        // `tests/nvim_conformance.rs`).
+                        self.land_line_jump_cursor(target_line);
                     }
                 }
                 Some('e') => {
@@ -1763,8 +2100,16 @@ impl Engine {
                         let end_pos = self.buffer().line_to_char(self.view().cursor.line)
                             + self.view().cursor.col;
                         if end_pos < start_pos {
-                            // Include the character at end_pos
-                            self.apply_charwise_operator(op, end_pos, start_pos + 1, changed);
+                            // Include the character at end_pos: ge is naturally
+                            // inclusive of its landing character (:help ge), so
+                            // `v`-forcing must shrink this range, not grow it
+                            // (#881 review).
+                            self.apply_charwise_operator_inclusive(
+                                op,
+                                end_pos,
+                                start_pos + 1,
+                                changed,
+                            );
                         }
                     } else {
                         let count = self.take_count();
@@ -1785,7 +2130,14 @@ impl Engine {
                         let end_pos = self.buffer().line_to_char(self.view().cursor.line)
                             + self.view().cursor.col;
                         if end_pos < start_pos {
-                            self.apply_charwise_operator(op, end_pos, start_pos + 1, changed);
+                            // gE is naturally inclusive too (:help gE), same as
+                            // ge above.
+                            self.apply_charwise_operator_inclusive(
+                                op,
+                                end_pos,
+                                start_pos + 1,
+                                changed,
+                            );
                         }
                     } else {
                         let count = self.take_count();
@@ -1898,8 +2250,9 @@ impl Engine {
                     return self.cmd_git_stage_hunk();
                 }
                 Some('d') => {
-                    self.push_jump_location();
-                    self.lsp_request_definition();
+                    // gd: go to local declaration — pure motion, no LSP
+                    // involved (:h gd). See `Engine::cmd_gd`.
+                    self.cmd_gd();
                 }
                 Some('D') => {
                     self.open_diff_peek();
@@ -2027,16 +2380,12 @@ impl Engine {
                 Some('p') => {
                     // gp: paste after, leave cursor after pasted text
                     let count = self.take_count();
-                    for _ in 0..count {
-                        self.paste_after_cursor_after(changed);
-                    }
+                    self.paste_after_cursor_after(count, changed);
                 }
                 Some('P') => {
                     // gP: paste before, leave cursor after pasted text
                     let count = self.take_count();
-                    for _ in 0..count {
-                        self.paste_before_cursor_after(changed);
-                    }
+                    self.paste_before_cursor_after(count, changed);
                 }
                 Some('v') => {
                     // gv: reselect last visual selection
@@ -2065,33 +2414,43 @@ impl Engine {
                     }
                 }
                 Some(',') => {
-                    // g,: jump to next change position
+                    // g,: jump to next (newer) change position. Symmetric with
+                    // g; above: g; decrements-then-looks-up, so g, must
+                    // increment-then-look-up too, or it just re-visits the
+                    // entry the last g; already landed on instead of
+                    // advancing past it (#891, "jump:g; g; g,").
                     if self.change_list.is_empty() {
                         self.message = "Change list is empty".to_string();
-                    } else if self.change_list_pos >= self.change_list.len() {
+                    } else if self.change_list_pos + 1 >= self.change_list.len() {
                         self.message = "Already at newest change".to_string();
                     } else {
+                        self.change_list_pos += 1;
                         let (line, col) = self.change_list[self.change_list_pos];
                         let max_line = self.buffer().len_lines().saturating_sub(1);
                         self.view_mut().cursor.line = line.min(max_line);
                         self.view_mut().cursor.col = col;
                         self.clamp_cursor_col();
-                        self.change_list_pos =
-                            (self.change_list_pos + 1).min(self.change_list.len());
                     }
                 }
                 Some('m') => {
-                    // gm: go to middle of screen line
+                    // gm: go to middle of screen line. The count is ignored,
+                    // but it must still be CONSUMED or it leaks into the next
+                    // command (#807).
+                    self.take_count();
                     let vp_cols = self.view().viewport_cols;
                     let mid = vp_cols / 2;
                     self.view_mut().cursor.col = mid;
                     self.clamp_cursor_col();
                 }
                 Some('M') => {
-                    // gM: go to middle of text line
+                    // gM: go to the character `count` percent into the line,
+                    // defaulting to 50 — i.e. the middle (`:h gM`). Before
+                    // #807 the count was ignored *and* leaked.
+                    let pct = self.peek_count().filter(|n| *n <= 100).unwrap_or(50);
+                    self.take_count();
                     let line = self.view().cursor.line;
-                    let line_len = self.buffer().line_len_chars(line).saturating_sub(1); // exclude newline
-                    self.view_mut().cursor.col = line_len / 2;
+                    let len = self.line_text_len(line);
+                    self.view_mut().cursor.col = len * pct / 100;
                     self.clamp_cursor_col();
                 }
                 Some('a') => {
@@ -2128,13 +2487,13 @@ impl Engine {
                     self.start_undo_group();
                 }
                 Some('&') => {
-                    // g&: repeat last substitution on all lines
+                    // g&: repeat last substitution on all lines, keeping flags
                     if let Some((pat, rep, flags)) = self.last_substitute.clone() {
-                        let cmd = format!("%s/{}/{}/{}", pat, rep, flags);
-                        self.execute_substitute_command(&cmd);
+                        let last = self.buffer().len_lines().saturating_sub(1) as isize;
+                        self.run_substitute(Some((0, last)), &pat, Some(&rep), &flags);
                         *changed = true;
                     } else {
-                        self.message = "No previous substitute command".to_string();
+                        self.message = "E33: No previous substitute regular expression".to_string();
                     }
                 }
                 Some('+') => {
@@ -2190,27 +2549,57 @@ impl Engine {
                     self.pending_key = Some('\x08'); // sentinel for g` handler
                 }
                 Some('q') => {
-                    // gq{motion}: format text operator
-                    self.operator_count = self.count.take();
-                    self.pending_operator = Some('q');
+                    if self.pending_operator == Some('q') {
+                        // gqgq: doubled operator — same as gqq (#807).
+                        self.pending_operator = None;
+                        let count = self.take_count().max(1);
+                        let line = self.view().cursor.line;
+                        self.format_lines(line, line + count - 1, changed);
+                    } else {
+                        // gq{motion}: format text operator
+                        self.operator_count = self.count.take();
+                        self.pending_operator = Some('q');
+                    }
                 }
                 Some('w') => {
-                    // gw{motion}: format text, keep cursor
-                    self.operator_count = self.count.take();
-                    self.pending_operator = Some('Q');
+                    if self.pending_operator == Some('Q') {
+                        // gwgw: doubled operator — same as gww; `gw` keeps the
+                        // cursor where it was (#807).
+                        self.pending_operator = None;
+                        let count = self.take_count().max(1);
+                        let line = self.view().cursor.line;
+                        let saved = self.view().cursor;
+                        self.format_lines(line, line + count - 1, changed);
+                        self.view_mut().cursor = saved;
+                        self.clamp_cursor_col();
+                    } else {
+                        // gw{motion}: format text, keep cursor
+                        self.operator_count = self.count.take();
+                        self.pending_operator = Some('Q');
+                    }
                 }
                 Some('R') => {
                     // gR: enter Virtual Replace mode (tab-aware overwrite)
                     self.start_undo_group();
                     self.insert_text_buffer.clear();
+                    self.replace_overwritten.clear();
+                    self.replace_repeat_count = self.take_count().max(1);
                     self.virtual_replace = true;
                     self.mode = Mode::Replace;
                     self.count = None;
                 }
                 Some('?') => {
-                    // g?{motion}: ROT13 encode operator
-                    self.operator_count = self.count.take();
-                    self.pending_operator = Some('R');
+                    if self.pending_operator == Some('R') {
+                        // g?g?: doubled operator — same as g?? (#807).
+                        self.pending_operator = None;
+                        let count = self.take_count().max(1);
+                        let line = self.view().cursor.line;
+                        self.apply_linewise_operator('R', line, line + count - 1, changed);
+                    } else {
+                        // g?{motion}: ROT13 encode operator
+                        self.operator_count = self.count.take();
+                        self.pending_operator = Some('R');
+                    }
                 }
                 Some('@') => {
                     // g@{motion}: call user-defined operatorfunc
@@ -2435,14 +2824,26 @@ impl Engine {
                     self.finish_undo_group();
                 }
             '"' => {
-                // Register selection: "x sets selected_register for next operation
-                // Uppercase A-Z appends to lowercase register
+                // Register selection: "x sets selected_register for next operation.
+                // Uppercase A-Z appends to lowercase register. `_` is the black
+                // hole (reads/writes go nowhere — `:h quote_`); `.`, `/`, `%`,
+                // `:`, `-` are the read-mostly special registers (`:h
+                // registers`); `=` opens the expression-register prompt (#806).
                 if let Some(ch) = unicode {
-                    if ch.is_ascii_lowercase()
+                    if ch == '=' {
+                        self.selected_register = Some('=');
+                        self.expr_register_pending = Some((false, String::new()));
+                    } else if ch.is_ascii_lowercase()
                         || ch.is_ascii_uppercase()
                         || ch == '"'
                         || ch == '+'
                         || ch == '*'
+                        || ch == '_'
+                        || ch == '.'
+                        || ch == '/'
+                        || ch == '%'
+                        || ch == ':'
+                        || ch == '-'
                         || ch.is_ascii_digit()
                     {
                         self.selected_register = Some(ch);
@@ -2458,6 +2859,10 @@ impl Engine {
                         self.open_cmdline_window(true);
                     } else if ch.is_ascii_lowercase() {
                         self.start_macro_recording(ch);
+                    } else if ch.is_ascii_uppercase() {
+                        // qA: append to register "a" instead of overwriting
+                        // it (`:h q`, #806 "mac:qA append").
+                        self.start_macro_recording_append(ch.to_ascii_lowercase());
                     } else {
                         self.message = "Invalid register for macro".to_string();
                     }
@@ -2487,6 +2892,13 @@ impl Engine {
                     } else if ch.is_ascii_lowercase() {
                         let count = self.take_count();
                         let _ = self.play_macro_with_count(ch, count);
+                    } else if ch.is_ascii_uppercase() {
+                        // @Q plays the same register as @q: register names
+                        // read case-insensitively (`:h quote_alpha`) — only
+                        // *writing* (`qA`, `"Ayy`) distinguishes upper from
+                        // lower as overwrite-vs-append (#890).
+                        let count = self.take_count();
+                        let _ = self.play_macro_with_count(ch.to_ascii_lowercase(), count);
                     } else {
                         self.message = "Invalid register for macro playback".to_string();
                     }
@@ -2496,36 +2908,36 @@ impl Engine {
                 // Character find motions
                 if let Some(target) = unicode {
                     let count = self.take_count();
+                    let mut found = true;
                     for _ in 0..count {
-                        self.find_char(pending, target);
+                        if !self.find_char(pending, target) {
+                            found = false;
+                            break;
+                        }
                     }
                     // Remember this find for ; and , repeat
                     self.last_find = Some((pending, target));
+                    // Target not found on the line: a macro/`:normal` playing
+                    // this back must stop here rather than continue on as if
+                    // it succeeded (#806, "mac:10@a stops at failure").
+                    if !found {
+                        self.command_failed = true;
+                    }
                 }
             }
             'r' => {
                 // Replace character: r followed by a character replaces char under cursor.
                 // Special case: Return/Enter replaces with newline (splits line).
-                let replacement = unicode.or_else(|| {
-                    if key_name == "Return" {
-                        Some('\n')
-                    } else {
-                        None
-                    }
+                let replacement = unicode.or(match key_name {
+                    "Return" | "KP_Enter" => Some('\n'),
+                    "Tab" => Some('\t'),
+                    _ => None,
                 });
                 if let Some(replacement) = replacement {
                     let count = self.take_count();
                     self.start_undo_group();
                     self.replace_chars(replacement, count, changed);
                     self.finish_undo_group();
-
-                    // Record for repeat (.)
-                    self.last_change = Some(Change {
-                        op: ChangeOp::Replace,
-                        text: replacement.to_string(),
-                        count,
-                        motion: None,
-                    });
                 }
             }
             '\x17' => {
@@ -2596,15 +3008,33 @@ impl Engine {
                 if let Some(ch) = unicode {
                     match ch {
                         '\'' => {
-                            // '' jump to position before last jump
+                            // '' jumps to the position before the last jump —
+                            // and IS ITSELF a jump, so it toggles: read the
+                            // target before `push_jump_location` overwrites
+                            // `last_jump_pos` with where we're jumping FROM
+                            // (#806, "mark:'' toggles").
                             if let Some((line, _)) = self.last_jump_pos {
                                 let max_line = self.buffer().len_lines().saturating_sub(1);
                                 let target = line.min(max_line);
+                                self.push_jump_location();
                                 self.view_mut().cursor.line = target;
                                 self.view_mut().cursor.col = self.first_non_blank_col(target);
                                 self.clamp_cursor_col();
                             } else {
                                 self.message = "No previous jump position".to_string();
+                            }
+                        }
+                        '^' => {
+                            // '^ / `^: position where Insert mode was last
+                            // left, RAW column (may be one past the last
+                            // char — clamped like any other mark jump).
+                            if let Some((line, col)) = self.last_insert_pos {
+                                let max_line = self.buffer().len_lines().saturating_sub(1);
+                                self.view_mut().cursor.line = line.min(max_line);
+                                self.view_mut().cursor.col = col;
+                                self.clamp_cursor_col();
+                            } else {
+                                self.message = "No previous insert position".to_string();
                             }
                         }
                         '.' => {
@@ -2617,6 +3047,30 @@ impl Engine {
                                 self.clamp_cursor_col();
                             } else {
                                 self.message = "No previous edit position".to_string();
+                            }
+                        }
+                        '[' => {
+                            // '[ jump to start of last change (#806, "mark:'[ after >>")
+                            if let Some((line, _)) = self.last_change_start {
+                                let max_line = self.buffer().len_lines().saturating_sub(1);
+                                let target = line.min(max_line);
+                                self.view_mut().cursor.line = target;
+                                self.view_mut().cursor.col = self.first_non_blank_col(target);
+                                self.clamp_cursor_col();
+                            } else {
+                                self.message = "No previous change".to_string();
+                            }
+                        }
+                        ']' => {
+                            // '] jump to end of last change
+                            if let Some((line, _)) = self.last_change_end {
+                                let max_line = self.buffer().len_lines().saturating_sub(1);
+                                let target = line.min(max_line);
+                                self.view_mut().cursor.line = target;
+                                self.view_mut().cursor.col = self.first_non_blank_col(target);
+                                self.clamp_cursor_col();
+                            } else {
+                                self.message = "No previous change".to_string();
                             }
                         }
                         '<' => {
@@ -2645,15 +3099,20 @@ impl Engine {
                         }
                         _ if ch.is_ascii_lowercase() => {
                             let buffer_id = self.active_window().buffer_id;
-                            if let Some(buffer_marks) = self.marks.get(&buffer_id) {
-                                if let Some(mark_cursor) = buffer_marks.get(&ch) {
-                                    let target = mark_cursor.line;
-                                    self.view_mut().cursor.line = target;
-                                    self.view_mut().cursor.col = self.first_non_blank_col(target);
-                                    self.clamp_cursor_col();
-                                } else {
-                                    self.message = format!("Mark '{}' not set", ch);
-                                }
+                            let target = self
+                                .marks
+                                .get(&buffer_id)
+                                .and_then(|m| m.get(&ch))
+                                .map(|c| c.line);
+                            if let Some(target) = target {
+                                // Mark jumps always move the pcmark, but only
+                                // append to the jumplist when they actually
+                                // change line (#806, "jump:'a C-o").
+                                let pre_cursor = self.view().cursor;
+                                self.view_mut().cursor.line = target;
+                                self.view_mut().cursor.col = self.first_non_blank_col(target);
+                                self.clamp_cursor_col();
+                                self.record_jump_from(pre_cursor);
                             } else {
                                 self.message = format!("Mark '{}' not set", ch);
                             }
@@ -2662,9 +3121,11 @@ impl Engine {
                             if let Some(&(_, line, _)) = self.global_marks.get(&ch) {
                                 let max_line = self.buffer().len_lines().saturating_sub(1);
                                 let target = line.min(max_line);
+                                let pre_cursor = self.view().cursor;
                                 self.view_mut().cursor.line = target;
                                 self.view_mut().cursor.col = self.first_non_blank_col(target);
                                 self.clamp_cursor_col();
+                                self.record_jump_from(pre_cursor);
                             } else {
                                 self.message = format!("Mark '{}' not set", ch);
                             }
@@ -2676,18 +3137,80 @@ impl Engine {
                 }
             }
             '`' => {
+                // d`{mark} / y`{mark} / c`{mark}: charwise (exclusive) operator
+                // to the exact mark position.
+                if let Some(op) = self.pending_operator.take() {
+                    if let Some(ch) = unicode {
+                        let target: Option<(usize, usize)> = match ch {
+                            '`' => self.last_jump_pos,
+                            '.' => self.last_edit_pos,
+                            '<' => self.visual_mark_start,
+                            '>' => self.visual_mark_end,
+                            _ if ch.is_ascii_lowercase() => {
+                                let buffer_id = self.active_window().buffer_id;
+                                self.marks
+                                    .get(&buffer_id)
+                                    .and_then(|m| m.get(&ch))
+                                    .map(|c| (c.line, c.col))
+                            }
+                            _ if ch.is_ascii_uppercase() => self
+                                .global_marks
+                                .get(&ch)
+                                .map(|&(_, line, col)| (line, col)),
+                            _ => None,
+                        };
+                        if let Some((target_line, target_col)) = target {
+                            let max_line = self.buffer().len_lines().saturating_sub(1);
+                            let target_line = target_line.min(max_line);
+                            let target_col =
+                                target_col.min(self.buffer().line_len_chars(target_line));
+                            let cur = self.view().cursor;
+                            let cur_pos = self.buffer().line_to_char(cur.line) + cur.col;
+                            let tgt_pos = self.buffer().line_to_char(target_line) + target_col;
+                            if cur_pos > tgt_pos {
+                                self.view_mut().cursor = Cursor {
+                                    line: target_line,
+                                    col: target_col,
+                                };
+                            }
+                            let (lo, hi) = if cur_pos <= tgt_pos {
+                                (cur_pos, tgt_pos)
+                            } else {
+                                (tgt_pos, cur_pos)
+                            };
+                            self.apply_operator_exclusive_range(op, lo, hi, changed);
+                        } else {
+                            self.message = format!("Mark `{}` not set", ch);
+                        }
+                    }
+                    return EngineAction::None;
+                }
                 // Jump to exact mark position: `{a-z|A-Z|`|.|<|>}
                 if let Some(ch) = unicode {
                     match ch {
                         '`' => {
-                            // `` jump to exact position before last jump
+                            // `` jumps to the exact position before the last
+                            // jump — and toggles, same as '' (#806, "mark:``
+                            // after ''").
                             if let Some((line, col)) = self.last_jump_pos {
+                                let max_line = self.buffer().len_lines().saturating_sub(1);
+                                let target_line = line.min(max_line);
+                                self.push_jump_location();
+                                self.view_mut().cursor.line = target_line;
+                                self.view_mut().cursor.col = col;
+                                self.clamp_cursor_col();
+                            } else {
+                                self.message = "No previous jump position".to_string();
+                            }
+                        }
+                        '^' => {
+                            if let Some((line, col)) = self.last_insert_pos {
                                 let max_line = self.buffer().len_lines().saturating_sub(1);
                                 self.view_mut().cursor.line = line.min(max_line);
                                 self.view_mut().cursor.col = col;
                                 self.clamp_cursor_col();
                             } else {
-                                self.message = "No previous jump position".to_string();
+                                self.message = "No previous insert position".to_string();
                             }
                         }
                         '.' => {
@@ -2720,15 +3243,40 @@ impl Engine {
                                 self.message = "No previous visual selection".to_string();
                             }
                         }
+                        '[' => {
+                            // `` `[ ``: jump to the exact start of the last
+                            // change/yank (#891, sibling of `'[` above, which
+                            // lands on first-non-blank instead of the exact
+                            // column — `:h '[`).
+                            if let Some((line, col)) = self.last_change_start {
+                                let max_line = self.buffer().len_lines().saturating_sub(1);
+                                self.view_mut().cursor.line = line.min(max_line);
+                                self.view_mut().cursor.col = col;
+                                self.clamp_cursor_col();
+                            } else {
+                                self.message = "No previous change".to_string();
+                            }
+                        }
+                        ']' => {
+                            // `` `] ``: jump to the exact end of the last
+                            // change/yank (#891).
+                            if let Some((line, col)) = self.last_change_end {
+                                let max_line = self.buffer().len_lines().saturating_sub(1);
+                                self.view_mut().cursor.line = line.min(max_line);
+                                self.view_mut().cursor.col = col;
+                                self.clamp_cursor_col();
+                            } else {
+                                self.message = "No previous change".to_string();
+                            }
+                        }
                         _ if ch.is_ascii_lowercase() => {
                             let buffer_id = self.active_window().buffer_id;
-                            if let Some(buffer_marks) = self.marks.get(&buffer_id) {
-                                if let Some(mark_cursor) = buffer_marks.get(&ch) {
-                                    self.view_mut().cursor = *mark_cursor;
-                                    self.clamp_cursor_col();
-                                } else {
-                                    self.message = format!("Mark `{}` not set", ch);
-                                }
+                            let target = self.marks.get(&buffer_id).and_then(|m| m.get(&ch)).copied();
+                            if let Some(mark_cursor) = target {
+                                let pre_cursor = self.view().cursor;
+                                self.view_mut().cursor = mark_cursor;
+                                self.clamp_cursor_col();
+                                self.record_jump_from(pre_cursor);
                             } else {
                                 self.message = format!("Mark `{}` not set", ch);
                             }
@@ -2736,9 +3284,12 @@ impl Engine {
                         _ if ch.is_ascii_uppercase() => {
                             if let Some(&(_, line, col)) = self.global_marks.get(&ch) {
                                 let max_line = self.buffer().len_lines().saturating_sub(1);
-                                self.view_mut().cursor.line = line.min(max_line);
+                                let target_line = line.min(max_line);
+                                let pre_cursor = self.view().cursor;
+                                self.view_mut().cursor.line = target_line;
                                 self.view_mut().cursor.col = col;
                                 self.clamp_cursor_col();
+                                self.record_jump_from(pre_cursor);
                             } else {
                                 self.message = format!("Mark `{}` not set", ch);
                             }
@@ -3009,6 +3560,9 @@ impl Engine {
                         self.apply_case_range(line_start, line_end, operator, changed);
                     }
                 }
+                // Doubled case operators land on the first non-blank of the
+                // FIRST line, not the last one touched (#807, `op:3guu`).
+                self.move_cursor_to_first_non_blank(line);
             } else if unicode == Some('i') || unicode == Some('a') {
                 // Text object: g~iw, guaw, etc.
                 self.pending_text_object = unicode;
@@ -3022,7 +3576,10 @@ impl Engine {
             } else if unicode.is_some() {
                 // Fall through to common motion dispatch below
             } else {
-                self.count = None; // Cancel
+                // Cancel (e.g. <Esc>) — a pending count must not survive to
+                // leak into the next, unrelated command (misc:2d then Esc).
+                self.count = None;
+                self.operator_count = None;
                 return EngineAction::None;
             }
             if is_doubled
@@ -3046,21 +3603,9 @@ impl Engine {
                 let count = self.take_count();
                 let line = self.view().cursor.line;
                 if operator == '>' {
-                    self.indent_lines(line, count, changed);
-                    self.last_change = Some(Change {
-                        op: ChangeOp::Indent,
-                        text: String::new(),
-                        count,
-                        motion: None,
-                    });
+                    self.indent_lines(line, count, changed, true);
                 } else {
-                    self.dedent_lines(line, count, changed);
-                    self.last_change = Some(Change {
-                        op: ChangeOp::Dedent,
-                        text: String::new(),
-                        count,
-                        motion: None,
-                    });
+                    self.dedent_lines(line, count, changed, true);
                 }
                 return EngineAction::None;
             }
@@ -3195,6 +3740,7 @@ impl Engine {
                         self.apply_rot13_range(line_start, line_end, changed);
                     }
                 }
+                self.move_cursor_to_first_non_blank(line);
                 return EngineAction::None;
             }
             if unicode == Some('i') || unicode == Some('a') {
@@ -3249,57 +3795,76 @@ impl Engine {
                 self.start_undo_group();
                 self.delete_lines(count, changed);
                 self.finish_undo_group();
-
-                // Record for repeat
-                self.last_change = Some(Change {
-                    op: ChangeOp::Delete,
-                    text: String::new(),
-                    count,
-                    motion: Some(Motion::DeleteLine),
-                });
             }
             Some('c') if operator == 'c' => {
-                // cc: change line (like S)
+                // cc: change [count] lines (like S). With 'autoindent' on,
+                // Vim preserves the leading indent of the first line instead
+                // of dropping it.
+                //
+                // Unlike `[count]dd` (which aborts the whole command when
+                // the count overruns the buffer, #882 "op:5dd from last
+                // line"/"misc:2dd on last"), `[count]cc` just clamps to
+                // however many lines exist — verified directly against the
+                // oracle (#882, "misc:cc with count beyond": `5cc` on a
+                // 2-line buffer changes both lines, it does not abort).
                 let count = self.take_count();
                 let start_line = self.view().cursor.line;
 
+                let indent = if self.settings.auto_indent {
+                    self.get_line_indent_str(start_line)
+                } else {
+                    String::new()
+                };
+
                 self.start_undo_group();
 
-                // Delete content of lines
-                for i in 0..count {
-                    let line_idx = start_line + i;
-                    if line_idx >= self.buffer().len_lines() {
-                        break;
-                    }
+                let num_lines = self.buffer().len_lines();
+                let end_line = (start_line + count.saturating_sub(1)).min(num_lines - 1);
 
-                    let line_start = self.buffer().line_to_char(line_idx);
-                    let line_len = self.buffer().line_len_chars(line_idx);
-                    let line_content = self.buffer().content.line(line_idx);
-
-                    let delete_end = if line_content.chars().last() == Some('\n') && line_len > 0 {
-                        line_start + line_len - 1
+                let line_start = self.buffer().line_to_char(start_line);
+                let end_line_start = self.buffer().line_to_char(end_line);
+                let end_line_len = self.buffer().line_len_chars(end_line);
+                let end_line_content = self.buffer().content.line(end_line);
+                // Delete through the last line's content, excluding its
+                // trailing newline (if it has one) so exactly one newline is
+                // left in place — either the boundary with the next
+                // surviving line, or none at all if `end_line` was the last
+                // line in the buffer.
+                let delete_end =
+                    if end_line_content.chars().last() == Some('\n') && end_line_len > 0 {
+                        end_line_start + end_line_len - 1
                     } else {
-                        line_start + line_len
+                        end_line_start + end_line_len
                     };
 
-                    if line_start < delete_end {
-                        let deleted: String = self
-                            .buffer()
-                            .content
-                            .slice(line_start..delete_end)
-                            .chars()
-                            .collect();
-                        let reg = self.active_register();
-                        self.set_register(reg, deleted, false);
-                        self.clear_selected_register();
+                if line_start < delete_end {
+                    let deleted: String = self
+                        .buffer()
+                        .content
+                        .slice(line_start..delete_end)
+                        .chars()
+                        .collect();
+                    // `cc` register content is linewise (`:h registers`)
+                    // even though the buffer edit itself only clears the
+                    // lines' content and leaves one newline in place —
+                    // `"1p` after `cc` must paste back whole line(s)
+                    // (#806, "reg:\"1 after cc").
+                    let reg = self.active_register();
+                    self.set_delete_register(reg, format!("{}\n", deleted), true);
+                    self.clear_selected_register();
 
-                        self.delete_with_undo(line_start, delete_end);
-                        *changed = true;
-                        break;
-                    }
+                    self.delete_with_undo(line_start, delete_end);
+                    *changed = true;
                 }
 
-                self.view_mut().cursor.col = 0;
+                // Re-insert preserved indent
+                if !indent.is_empty() {
+                    let line_start = self.buffer().line_to_char(start_line);
+                    self.insert_with_undo(line_start, &indent);
+                }
+
+                self.view_mut().cursor.line = start_line;
+                self.view_mut().cursor.col = indent.chars().count();
                 self.insert_text_buffer.clear();
                 self.mode = Mode::Insert;
                 self.count = None;
@@ -3376,7 +3941,9 @@ impl Engine {
                 self.view_mut().cursor = start_cursor;
                 if end_pos >= start_pos {
                     let end = (end_pos + 1).min(self.buffer().len_chars());
-                    self.apply_charwise_operator(operator, start_pos, end, changed);
+                    // E is naturally inclusive of its landing character, same
+                    // as e (:help E, #881 review).
+                    self.apply_charwise_operator_inclusive(operator, start_pos, end, changed);
                 }
             }
             Some('b') => {
@@ -3410,7 +3977,7 @@ impl Engine {
                 if start_pos >= line_end {
                     return EngineAction::None;
                 }
-                self.apply_charwise_operator(operator, start_pos, line_end, changed);
+                self.apply_charwise_operator_inclusive(operator, start_pos, line_end, changed);
             }
             Some('0') => {
                 // y0/d0: from start of line to (not including) cursor
@@ -3484,19 +4051,44 @@ impl Engine {
                 self.apply_charwise_operator(operator, start, end, changed);
             }
             Some('j') => {
-                // dj: delete current line + count lines below (linewise)
+                // dj: delete current line + count lines below (linewise).
+                // Vim: if `j` cannot move at all (already on the last line), the
+                // motion fails and the whole operator is a no-op — it does NOT
+                // fall back to operating on just the current line.
                 let count = self.take_count();
                 let current_line = self.view().cursor.line;
                 let last_line = self.buffer().len_lines().saturating_sub(1);
+                if current_line >= last_line {
+                    self.count = None;
+                    return EngineAction::None;
+                }
                 let end_line = (current_line + count).min(last_line);
-                self.apply_linewise_operator(operator, current_line, end_line, changed);
+                self.apply_vertical_operator_motion(
+                    operator,
+                    count,
+                    true,
+                    (current_line, end_line),
+                    changed,
+                );
             }
             Some('k') => {
-                // dk: delete current line + count lines above (linewise)
+                // dk: delete current line + count lines above (linewise).
+                // Vim: if `k` cannot move at all (already on the first line), the
+                // motion fails and the whole operator is a no-op.
                 let count = self.take_count();
                 let current_line = self.view().cursor.line;
+                if current_line == 0 {
+                    self.count = None;
+                    return EngineAction::None;
+                }
                 let start_line = current_line.saturating_sub(count);
-                self.apply_linewise_operator(operator, start_line, current_line, changed);
+                self.apply_vertical_operator_motion(
+                    operator,
+                    count,
+                    false,
+                    (start_line, current_line),
+                    changed,
+                );
             }
             Some('G') => {
                 // dG: delete from current line to end (or to line N if count given)
@@ -3601,10 +4193,12 @@ impl Engine {
                 }
             }
             Some('H') => {
-                // dH: delete from current line to top of screen (linewise)
-                let _ = self.take_count();
+                // dH: delete from the current line to the [count]'th line from
+                // the top of the screen (linewise). The count used to be
+                // thrown away, making `d3H` behave as `dH` (#807).
+                let count = self.take_count().max(1);
                 let current_line = self.view().cursor.line;
-                let top = self.view().scroll_top;
+                let top = self.screen_top_target(count);
                 let (s, e) = if top <= current_line {
                     (top, current_line)
                 } else {
@@ -3613,12 +4207,11 @@ impl Engine {
                 self.apply_linewise_operator(operator, s, e, changed);
             }
             Some('M') => {
-                // dM: delete from current line to middle of screen (linewise)
+                // dM: delete from current line to middle of screen (linewise).
+                // `M` genuinely ignores its count, but must consume it.
                 let _ = self.take_count();
                 let current_line = self.view().cursor.line;
-                let viewport_lines = self.view().viewport_lines.max(1);
-                let mid = self.view().scroll_top + viewport_lines / 2;
-                let mid = mid.min(self.buffer().len_lines().saturating_sub(1));
+                let mid = self.middle_visible_line();
                 let (s, e) = if mid <= current_line {
                     (mid, current_line)
                 } else {
@@ -3627,12 +4220,11 @@ impl Engine {
                 self.apply_linewise_operator(operator, s, e, changed);
             }
             Some('L') => {
-                // dL: delete from current line to bottom of screen (linewise)
-                let _ = self.take_count();
+                // dL: delete from the current line to the [count]'th line from
+                // the bottom of the screen (linewise) — see `dH` (#807).
+                let count = self.take_count().max(1);
                 let current_line = self.view().cursor.line;
-                let viewport_lines = self.view().viewport_lines.max(1);
-                let bot = (self.view().scroll_top + viewport_lines).saturating_sub(1);
-                let bot = bot.min(self.buffer().len_lines().saturating_sub(1));
+                let bot = self.screen_bottom_target(count);
                 let (s, e) = if bot >= current_line {
                     (current_line, bot)
                 } else {
@@ -3710,9 +4302,54 @@ impl Engine {
                 self.pending_key = Some('\'');
                 self.pending_operator = Some(operator);
             }
+            Some('`') => {
+                // d`{mark}: charwise (exclusive) delete to exact mark position —
+                // wait for mark char.
+                self.pending_key = Some('`');
+                self.pending_operator = Some(operator);
+            }
+            Some('/') | Some('?') => {
+                // d/pat<CR>, c/pat, y/pat, d?pat, ...: enter Search mode but keep
+                // the operator armed so `submit_search` can apply it once the
+                // pattern is confirmed (see handle_search_key's "Return" arm).
+                let count = self.take_count();
+                self.pending_operator = Some(operator);
+                self.mode = Mode::Search;
+                self.command_buffer.clear();
+                self.command_cursor = 0;
+                self.search_direction = if unicode == Some('/') {
+                    SearchDirection::Forward
+                } else {
+                    SearchDirection::Backward
+                };
+                self.search_start_cursor = Some(self.view().cursor);
+                self.search_pending_count = count;
+            }
+            Some('n') | Some('N') => {
+                // dn/dN, cn/cN, yn/yN: repeat the last search and operate over
+                // the jump, the same way a fresh d/pat<CR> would.
+                let count = self.take_count();
+                let start_cursor = self.view().cursor;
+                let forward = unicode == Some('n');
+                for _ in 0..count {
+                    let go_forward = if forward {
+                        self.search_direction == SearchDirection::Forward
+                    } else {
+                        self.search_direction != SearchDirection::Forward
+                    };
+                    if go_forward {
+                        self.search_next();
+                    } else {
+                        self.search_prev();
+                    }
+                }
+                self.apply_operator_over_search_motion(operator, start_cursor, changed);
+            }
             _ => {
-                // Invalid motion - cancel operator
+                // Invalid motion - cancel operator. A pending count must not
+                // survive to leak into the next, unrelated command.
                 self.count = None;
+                self.operator_count = None;
             }
         }
         EngineAction::None
@@ -3756,6 +4393,15 @@ impl Engine {
         }
     }
 
+    /// Park the cursor on the character at `pos`.
+    pub(crate) fn move_cursor_to_range_start(&mut self, pos: usize) {
+        let pos = pos.min(self.buffer().len_chars());
+        let line = self.buffer().content.char_to_line(pos);
+        self.view_mut().cursor.line = line;
+        self.view_mut().cursor.col = pos - self.buffer().line_to_char(line);
+        self.clamp_cursor_col();
+    }
+
     /// Apply ROT13 encoding to a char range.
     pub(crate) fn apply_rot13_range(&mut self, start: usize, end: usize, changed: &mut bool) {
         if start >= end {
@@ -3779,7 +4425,10 @@ impl Engine {
         }
     }
 
-    /// Apply a charwise operator on a byte/char range [start..end).
+    /// Apply a charwise operator on a byte/char range [start..end), where
+    /// the motion that produced the range is naturally *exclusive*
+    /// (`end` is not itself included) — the common case.  See
+    /// `apply_charwise_operator_kind` for `v`-forcing details.
     pub(crate) fn apply_charwise_operator(
         &mut self,
         operator: char,
@@ -3787,6 +4436,47 @@ impl Engine {
         end: usize,
         changed: &mut bool,
     ) {
+        self.apply_charwise_operator_kind(operator, start, end, changed, false);
+    }
+
+    /// Apply a charwise operator on a byte/char range [start..end), where
+    /// the motion that produced the range is naturally *inclusive* of its
+    /// last character (`end` already points one past that character, e.g.
+    /// `e`/`$`). See `apply_charwise_operator_kind`.
+    pub(crate) fn apply_charwise_operator_inclusive(
+        &mut self,
+        operator: char,
+        start: usize,
+        end: usize,
+        changed: &mut bool,
+    ) {
+        self.apply_charwise_operator_kind(operator, start, end, changed, true);
+    }
+
+    /// Apply a charwise operator on a byte/char range [start..end).
+    ///
+    /// `natural_inclusive` records whether, absent any `v` forcing, this
+    /// range is inclusive of its last character (`e`, `E`, `ge`, `gE`, `$`,
+    /// `f`/`t`, the `/pat/e` search offset, …) or exclusive (`w`, `b`, `F`/
+    /// `T`, most others). Every caller of `apply_charwise_operator` /
+    /// `apply_charwise_operator_inclusive` goes through this, so `v`-forcing
+    /// applies uniformly — each call site must pick the flag that matches
+    /// how its own range was built, or `v`-forcing will grow/shrink the
+    /// range in the wrong direction (#881 review). It exists so `v` forcing
+    /// (`:help o_v`) has something to toggle: forcing a charwise motion with
+    /// `v` flips inclusive <-> exclusive in place, without touching which
+    /// characters were selected in the first place.
+    pub(crate) fn apply_charwise_operator_kind(
+        &mut self,
+        operator: char,
+        start: usize,
+        end: usize,
+        changed: &mut bool,
+        natural_inclusive: bool,
+    ) {
+        // One-shot; consume unconditionally so it can never leak into a
+        // later, unrelated command regardless of which branch below runs.
+        let force_numbered = std::mem::take(&mut self.force_numbered_register);
         if start >= end {
             return;
         }
@@ -3818,7 +4508,23 @@ impl Engine {
             );
             return;
         }
-        self.force_motion_mode = None;
+        // Force charwise mode (`v`): the motion is already charwise, so
+        // this just toggles inclusive <-> exclusive (:help o_v) by
+        // shrinking or growing the range by one character.
+        let (start, end) = if self.force_motion_mode == Some('v') {
+            self.force_motion_mode = None;
+            if natural_inclusive {
+                (start, end.saturating_sub(1).max(start))
+            } else {
+                (start, (end + 1).min(self.buffer().len_chars()))
+            }
+        } else {
+            self.force_motion_mode = None;
+            (start, end)
+        };
+        if start >= end {
+            return;
+        }
         match operator {
             'y' => {
                 let text: String = self.buffer().content.slice(start..end).chars().collect();
@@ -3848,7 +4554,11 @@ impl Engine {
             'd' => {
                 let text: String = self.buffer().content.slice(start..end).chars().collect();
                 let reg = self.active_register();
-                self.set_delete_register(reg, text, false);
+                if force_numbered {
+                    self.set_delete_register_special_motion(reg, text, false);
+                } else {
+                    self.set_delete_register(reg, text, false);
+                }
                 self.clear_selected_register();
                 self.start_undo_group();
                 self.delete_with_undo(start, end);
@@ -3859,7 +4569,11 @@ impl Engine {
             'c' => {
                 let text: String = self.buffer().content.slice(start..end).chars().collect();
                 let reg = self.active_register();
-                self.set_delete_register(reg, text, false);
+                if force_numbered {
+                    self.set_delete_register_special_motion(reg, text, false);
+                } else {
+                    self.set_delete_register(reg, text, false);
+                }
                 self.clear_selected_register();
                 self.start_undo_group();
                 self.delete_with_undo(start, end);
@@ -3871,10 +4585,14 @@ impl Engine {
             }
             '~' | 'u' | 'U' => {
                 self.apply_case_range(start, end, operator, changed);
+                // Like every other operator, `g~`/`gu`/`gU` leave the cursor
+                // at the start of the region they changed (#807).
+                self.move_cursor_to_range_start(start);
             }
             'R' => {
                 // g?: ROT13 encode
                 self.apply_rot13_range(start, end, changed);
+                self.move_cursor_to_range_start(start);
             }
             '>' | '<' | '=' => {
                 // Indent/dedent/auto-indent: operate on full lines containing the range
@@ -3885,9 +4603,9 @@ impl Engine {
                     .char_to_line(end.saturating_sub(1).max(start));
                 let count = end_line - start_line + 1;
                 if operator == '>' {
-                    self.indent_lines(start_line, count, changed);
+                    self.indent_lines(start_line, count, changed, true);
                 } else if operator == '<' {
-                    self.dedent_lines(start_line, count, changed);
+                    self.dedent_lines(start_line, count, changed, true);
                 } else {
                     self.auto_indent_lines(start_line, count, changed);
                 }
@@ -3936,6 +4654,11 @@ impl Engine {
         end_line: usize,
         changed: &mut bool,
     ) {
+        // One-shot; a linewise delete already always lands in "1 via
+        // `delete_lines`, so this flag is irrelevant here — just make sure it
+        // can't leak into a later command when `apply_operator_exclusive_range`
+        // redirected here instead of into `apply_charwise_operator`.
+        self.force_numbered_register = false;
         if start_line > end_line {
             return;
         }
@@ -4011,10 +4734,10 @@ impl Engine {
                 *changed = true;
             }
             '>' => {
-                self.indent_lines(start_line, count, changed);
+                self.indent_lines(start_line, count, changed, true);
             }
             '<' => {
-                self.dedent_lines(start_line, count, changed);
+                self.dedent_lines(start_line, count, changed, true);
             }
             '=' => {
                 self.auto_indent_lines(start_line, count, changed);
@@ -4025,6 +4748,9 @@ impl Engine {
                     .buffer()
                     .line_to_char((end_line + 1).min(self.buffer().len_lines()));
                 self.apply_case_range(start, end, operator, changed);
+                // A *linewise* case operator lands on the first non-blank of
+                // the first line it changed (#807, `op:g~~ cursor`, `op:gUU`).
+                self.move_cursor_to_first_non_blank(start_line);
             }
             'R' => {
                 // g?: ROT13 encode lines
@@ -4033,6 +4759,7 @@ impl Engine {
                     .buffer()
                     .line_to_char((end_line + 1).min(self.buffer().len_lines()));
                 self.apply_rot13_range(start, end, changed);
+                self.move_cursor_to_first_non_blank(start_line);
             }
             'q' => {
                 // gq: format lines
@@ -4107,7 +4834,16 @@ impl Engine {
             start_col
         };
 
-        self.apply_charwise_operator(operator, range_start, range_end, changed);
+        // f/t are naturally inclusive of the found character (`range_end`
+        // above already accounts for that with `+1`); F/T are naturally
+        // exclusive of the cursor's original position (:help f, :help F).
+        // This only matters when `v` forces the motion charwise-toggled
+        // (#881 review) — otherwise it's a no-op.
+        if find_type == 'f' || find_type == 't' {
+            self.apply_charwise_operator_inclusive(operator, range_start, range_end, changed);
+        } else {
+            self.apply_charwise_operator(operator, range_start, range_end, changed);
+        }
     }
 
     /// gn: find next (or prev if `backward`) search match, enter Visual mode selecting it.
@@ -4121,7 +4857,20 @@ impl Engine {
         let col = self.view().cursor.col;
         let cursor_char = self.buffer().line_to_char(line) + col;
 
-        let idx = if backward {
+        // `:h gn` / `:h gN` — "If the cursor is on the match, visually
+        // selects it." This applies regardless of direction, and takes
+        // priority over searching forward/backward: a strict `<`/`>=`
+        // comparison against the cursor would otherwise skip straight past
+        // the match the cursor is already sitting in (wrapping `gN` to the
+        // *last* match instead of reselecting the current one, #889).
+        let on_match = self
+            .search_matches
+            .iter()
+            .position(|&(start, end)| cursor_char >= start && cursor_char < end);
+
+        let idx = if let Some(i) = on_match {
+            i
+        } else if backward {
             self.search_matches
                 .iter()
                 .rposition(|(start, _)| *start < cursor_char)
@@ -4337,37 +5086,110 @@ impl Engine {
         let start_pos = self.buffer().line_to_char(start_cursor.line) + start_cursor.col;
         let total = self.buffer().len_chars();
 
-        // Check if cursor is on a word char — if not, fall back to ce.
+        // On whitespace, `cw`/`cW` do NOT get the "like ce" special case —
+        // they behave like a plain `dw`/`dW` (Vim: ":help cw" only special-cases
+        // a start on a non-blank). That means only the whitespace run up to the
+        // next word is consumed, not a jump into/through that next word.
         if start_pos < total {
             let ch = self.buffer().content.char(start_pos);
-            let on_word = if bigword {
-                !ch.is_whitespace()
-            } else {
-                is_word_char(ch)
-            };
-            if !on_word {
-                // Not on a word char: cw behaves like ce
-                self.apply_operator_with_motion(
-                    'c',
-                    if bigword { 'E' } else { 'e' },
-                    count,
-                    changed,
-                );
+            if ch.is_whitespace() {
+                if bigword {
+                    let start_cursor = self.view().cursor;
+                    let start_pos =
+                        self.buffer().line_to_char(start_cursor.line) + start_cursor.col;
+                    for _ in 0..count {
+                        self.move_bigword_forward();
+                    }
+                    let end_cursor = self.view().cursor;
+                    let mut end_pos = self.buffer().line_to_char(end_cursor.line) + end_cursor.col;
+                    self.view_mut().cursor = start_cursor;
+                    if end_cursor.line > start_cursor.line {
+                        let line_char_start = self.buffer().line_to_char(start_cursor.line);
+                        let line_len = self.buffer().line_len_chars(start_cursor.line);
+                        let has_nl = self.buffer().content.line(start_cursor.line).chars().last()
+                            == Some('\n');
+                        end_pos = if has_nl {
+                            (line_char_start + line_len - 1).min(end_pos)
+                        } else {
+                            (line_char_start + line_len).min(end_pos)
+                        };
+                    }
+                    if start_pos < end_pos {
+                        self.apply_charwise_operator('c', start_pos, end_pos, changed);
+                    }
+                } else {
+                    // Two edge cases the shared `dw` path
+                    // (`apply_operator_with_motion`) gets wrong specifically
+                    // for `cw`:
+                    //
+                    //  - A completely empty line: real `dw` deletes the
+                    //    line's own newline and joins with the next line
+                    //    (Neovim behavior, matched inside
+                    //    `apply_operator_with_motion`) — but `cw` must NOT
+                    //    join. There is nothing on the line to change, so
+                    //    `cw` just enters insert mode on the (still empty)
+                    //    line, like `s` does.
+                    //  - Trailing whitespace at the very end of the buffer
+                    //    (no following word and no further line to land
+                    //    on): the shared `w`-motion clamps back onto the
+                    //    same last character instead of advancing, which
+                    //    turns into a no-op range — `cw` must still consume
+                    //    that trailing whitespace and enter insert mode.
+                    let line = start_cursor.line;
+                    let line_len = self.buffer().line_len_chars(line);
+                    let is_empty_line = line_len == 0
+                        || (line_len == 1
+                            && self.buffer().content.line(line).chars().next() == Some('\n'));
+                    if is_empty_line {
+                        self.start_undo_group();
+                        self.insert_text_buffer.clear();
+                        self.mode = Mode::Insert;
+                        self.count = None;
+                        return;
+                    }
+                    self.apply_operator_with_motion('c', 'w', count, changed);
+                    if self.mode != Mode::Insert {
+                        // The shared `w`-motion didn't move at all (ran off
+                        // the end of the buffer while still inside the
+                        // whitespace run under the cursor) — consume the
+                        // remaining whitespace to the end of the buffer
+                        // directly instead of leaving `cw` a no-op.
+                        let total = self.buffer().len_chars();
+                        if start_pos < total {
+                            self.apply_charwise_operator('c', start_pos, total, changed);
+                        }
+                    }
+                }
                 return;
             }
         }
 
-        // Find end of Nth word. For count=1, stop at end of current word.
-        // For count>1, skip whitespace between words but NOT after the last.
+        // On a non-blank (word char or punctuation run): change up through the
+        // end of the Nth run under the cursor, WITHOUT extending into trailing
+        // whitespace or hopping onto a following word.  This deliberately does
+        // NOT reuse the `e`/`E` motion (move_word_end) — that motion's "already
+        // at the end of a word" rule jumps forward onto the *next* word when the
+        // cursor sits on a short/lone punctuation run, which is wrong for `cw`.
         let mut end = start_pos;
         for i in 0..count {
-            // Skip to end of current word
+            if end >= total {
+                break;
+            }
             if bigword {
                 while end < total && !self.buffer().content.char(end).is_whitespace() {
                     end += 1;
                 }
-            } else {
+            } else if is_word_char(self.buffer().content.char(end)) {
                 while end < total && is_word_char(self.buffer().content.char(end)) {
+                    end += 1;
+                }
+            } else {
+                // Punctuation run: scan to its end (stop at a word char or whitespace).
+                while end < total {
+                    let c = self.buffer().content.char(end);
+                    if is_word_char(c) || c.is_whitespace() {
+                        break;
+                    }
                     end += 1;
                 }
             }
@@ -4383,10 +5205,73 @@ impl Engine {
             return;
         }
 
-        // Record motion for dot repeat
-        self.pending_change_motion = Some((if bigword { 'W' } else { 'w' }, count));
-
         self.apply_charwise_operator('c', start_pos, end, changed);
+    }
+
+    /// Shared body for the `j`/`k` operator-pending handlers (`dj`/`dk` and
+    /// their `v`-forced charwise variants `dvj`/`dvk`).
+    ///
+    /// `j`/`k` are ordinarily linewise, so the un-forced case just uses the
+    /// caller-computed whole-line `line_range`. But `:help o_v` says
+    /// forcing a linewise motion charwise takes "the cursor position" as
+    /// one end and "the position the motion would move the cursor to" as
+    /// the other — i.e. the *exact* landing column, not the whole target
+    /// line. Rather than reimplementing that column (curswant, folds via
+    /// `is_line_hidden`, …), this runs the real `move_down`/`move_up` to
+    /// find it, then rewinds the cursor before either operator applies
+    /// (#881, `op:dvj charwise force`).
+    fn apply_vertical_operator_motion(
+        &mut self,
+        operator: char,
+        count: usize,
+        down: bool,
+        line_range: (usize, usize),
+        changed: &mut bool,
+    ) {
+        if self.force_motion_mode != Some('v') {
+            self.apply_linewise_operator(operator, line_range.0, line_range.1, changed);
+            return;
+        }
+        let start_cursor = self.view().cursor;
+        let start_pos = self.buffer().line_to_char(start_cursor.line) + start_cursor.col;
+        let mut moved = false;
+        for _ in 0..count {
+            let did_move = if down {
+                self.move_down()
+            } else {
+                self.move_up()
+            };
+            if !did_move {
+                break;
+            }
+            moved = true;
+        }
+        if !moved {
+            // Motion couldn't move at all: the whole operator is a no-op,
+            // same as the un-forced case (checked by the callers before
+            // they even get here, but a forced count-0 move can still
+            // land here if a future caller stops checking that).
+            self.view_mut().cursor = start_cursor;
+            self.force_motion_mode = None;
+            return;
+        }
+        let end_cursor = self.view().cursor;
+        let end_pos = self.buffer().line_to_char(end_cursor.line) + end_cursor.col;
+        self.view_mut().cursor = start_cursor;
+        // This range is already the fully-resolved forced-exclusive
+        // range; clear the force flag now so `apply_charwise_operator`'s
+        // own `v`-toggle (meant for motions that are natively charwise)
+        // does not fire a second time on top of it.
+        self.force_motion_mode = None;
+        let (lo, hi) = if start_pos <= end_pos {
+            (start_pos, end_pos)
+        } else {
+            (end_pos, start_pos)
+        };
+        let lo_line = self.buffer().content.char_to_line(lo);
+        self.view_mut().cursor.line = lo_line;
+        self.view_mut().cursor.col = lo - self.buffer().line_to_char(lo_line);
+        self.apply_charwise_operator(operator, lo, hi, changed);
     }
 
     pub(crate) fn apply_operator_with_motion(
@@ -4400,8 +5285,18 @@ impl Engine {
         let start_cursor = self.view().cursor;
         let start_pos = self.buffer().line_to_char(start_cursor.line) + start_cursor.col;
 
-        // Execute motion to find end position
-        for _ in 0..count {
+        // Execute motion to find end position.  Track the cursor as it stood
+        // just before the FINAL step of a multi-count motion (`pre_final_cursor`)
+        // — Vim's line-boundary clamp below only fires when that last single
+        // word-step is the one that crosses onto a new line, not whenever the
+        // motion crossed a line boundary at any point during a multi-count `2dw`
+        // (":help word-motions": "the *last* word moved over is at the end of
+        // a line").
+        let mut pre_final_cursor = start_cursor;
+        for i in 0..count {
+            if i == count - 1 {
+                pre_final_cursor = self.view().cursor;
+            }
             match motion {
                 'w' => self.move_word_forward(),
                 'b' => self.move_word_backward(),
@@ -4417,13 +5312,16 @@ impl Engine {
         self.view_mut().cursor = start_cursor;
 
         // Vim rule: 'w' operator motion does not cross line boundaries.
-        // When the motion lands on the next line (col 0), clamp the end to
-        // just before the newline on the start line, so dw/yw on the last word
-        // of a line does not delete/yank the newline character.
+        // When the *final* word-step lands on the next line (col 0), clamp the
+        // end to just before the newline on the line that step started from, so
+        // dw/yw on the last word of a line does not delete/yank the newline
+        // character.  A `2dw`/`3dw` whose final step stays on the same line
+        // (even though earlier steps crossed a line boundary) is NOT clamped —
+        // it continues across the line end, joining lines, as Vim does.
         // Exception: on an empty line (only '\n'), dw should delete the newline
         // and join with the next line (Neovim behavior).
-        let end_pos = if motion == 'w' && end_cursor.line > start_cursor.line {
-            let line = start_cursor.line;
+        let end_pos = if motion == 'w' && end_cursor.line > pre_final_cursor.line {
+            let line = pre_final_cursor.line;
             let line_char_start = self.buffer().line_to_char(line);
             let line_len = self.buffer().line_len_chars(line);
             let is_empty_line =
@@ -4458,11 +5356,21 @@ impl Engine {
                     // [start, end_pos) would then miss that final character.
                     // Detect this by checking that end_pos is the last char and it
                     // is not a newline (if it were '\n', the existing line-boundary
-                    // clamping has already handled things correctly).
+                    // clamping has already handled things correctly) — AND that it
+                    // was actually reached via that clamp rather than landing
+                    // cleanly on the start of a fresh word/WORD (a genuine next-word
+                    // landing is always immediately preceded by whitespace; a
+                    // clamped position is not, since it's still inside the run the
+                    // motion was scanning when it ran out of buffer — this matters
+                    // for a multi-count `2dw`/`3dw` whose earlier steps already
+                    // landed cleanly on a later line's word, e.g. "a b"/"c d").
                     let total = self.buffer().len_chars();
+                    let landed_mid_run =
+                        end_pos > 0 && !self.buffer().content.char(end_pos - 1).is_whitespace();
                     let end = if end_pos + 1 == total
                         && total > 0
                         && self.buffer().content.char(end_pos) != '\n'
+                        && landed_mid_run
                     {
                         total
                     } else {
@@ -4490,36 +5398,132 @@ impl Engine {
             self.view_mut().cursor = end_cursor;
         }
 
-        // Record the motion so `.` can replay c{motion} properly.
-        if operator == 'c' {
-            self.pending_change_motion = Some((motion, count));
+        // `e` is naturally inclusive of its last character (`delete_end`
+        // above already accounts for that with `+1`); `w`/`b` are
+        // naturally exclusive. This only matters when `v` forces the
+        // motion charwise-toggled (#881, `dve`); otherwise it's a no-op.
+        if motion == 'e' {
+            self.apply_charwise_operator_inclusive(operator, delete_start, delete_end, changed);
+        } else {
+            self.apply_charwise_operator(operator, delete_start, delete_end, changed);
+        }
+    }
+
+    /// Apply `operator` over an *exclusive* charwise range `[lo, hi)`,
+    /// applying Vim's `:help exclusive-linewise` adjustment: an exclusive
+    /// motion whose end lands exactly at column 1 of a line either becomes
+    /// linewise (when the start was at or before the first non-blank of its
+    /// line) or has its end pulled back to the end of the previous line
+    /// (motion becomes inclusive of that line's last character).
+    ///
+    /// Shared by the operator-pending search motion (`d/pat`, `dn`) and mark
+    /// motion (`` d`a ``) paths, both of which resolve to "delete everything
+    /// between the original cursor and wherever the motion landed."
+    pub(crate) fn apply_operator_exclusive_range(
+        &mut self,
+        operator: char,
+        lo: usize,
+        hi: usize,
+        changed: &mut bool,
+    ) {
+        if lo >= hi {
+            return;
+        }
+        let hi_line = self.buffer().content.char_to_line(hi);
+        let hi_line_start = self.buffer().line_to_char(hi_line);
+        if hi == hi_line_start && hi_line > 0 {
+            let lo_line = self.buffer().content.char_to_line(lo);
+            let lo_col = lo - self.buffer().line_to_char(lo_line);
+            let lo_fnb_col = self.first_non_blank_col(lo_line);
+            if lo_col <= lo_fnb_col {
+                // Becomes linewise; the line the end landed on (col 1) is excluded.
+                let end_line = (hi_line - 1).max(lo_line);
+                self.apply_linewise_operator(operator, lo_line, end_line, changed);
+                return;
+            }
+            // Stays charwise, but the end is pulled back to the end of the
+            // previous line (inclusive of its last character).
+            let prev_line = hi_line - 1;
+            let prev_line_start = self.buffer().line_to_char(prev_line);
+            let prev_line_len = self.buffer().line_len_chars(prev_line);
+            let prev_has_nl = self.buffer().content.line(prev_line).chars().last() == Some('\n');
+            // One past the last REAL character of `prev_line` — already the
+            // correct exclusive-range end, since dropping the trailing
+            // newline from the length lands exactly there.
+            let prev_content_end = prev_line_start
+                + if prev_has_nl {
+                    prev_line_len.saturating_sub(1)
+                } else {
+                    prev_line_len
+                };
+            let new_hi = prev_content_end.min(self.buffer().len_chars()).max(lo + 1);
+            self.apply_charwise_operator(operator, lo, new_hi, changed);
+            return;
+        }
+        self.apply_charwise_operator(operator, lo, hi, changed);
+    }
+
+    /// Apply `operator` over the motion from `start_cursor` (the cursor
+    /// position before a search) to wherever the engine's *current* cursor
+    /// now sits (after `submit_search`/`search_next`/`search_prev` jumped it
+    /// there) — the shared tail for `d/pat<CR>`, `c/pat`, `y/pat`, `dn`, `dN`.
+    ///
+    /// Linewise exactly when the active search offset is a line offset
+    /// (`/pat/+1`, see `search_offset_is_linewise`); otherwise an exclusive
+    /// charwise motion (see `apply_operator_exclusive_range`).
+    pub(crate) fn apply_operator_over_search_motion(
+        &mut self,
+        operator: char,
+        start_cursor: Cursor,
+        changed: &mut bool,
+    ) {
+        let end_cursor = self.view().cursor;
+        self.view_mut().cursor = start_cursor;
+
+        if start_cursor.line == end_cursor.line && start_cursor.col == end_cursor.col {
+            return;
         }
 
-        self.apply_charwise_operator(operator, delete_start, delete_end, changed);
+        let start_pos = self.buffer().line_to_char(start_cursor.line) + start_cursor.col;
+        let end_pos = self.buffer().line_to_char(end_cursor.line) + end_cursor.col;
 
-        // Record for dot repeat (d/y/>/</gu/gU/g~ with motion).
-        // 'c' is recorded after Esc from insert mode, not here.
-        if operator != 'c' && operator != 'y' {
-            let motion_enum = match motion {
-                'w' => Some(Motion::WordForward),
-                'b' => Some(Motion::WordBackward),
-                'e' => Some(Motion::WordEnd),
-                _ => None,
+        if self.search_offset_is_linewise() {
+            let (start_line, end_line) = if start_cursor.line <= end_cursor.line {
+                (start_cursor.line, end_cursor.line)
+            } else {
+                (end_cursor.line, start_cursor.line)
             };
-            if let Some(m) = motion_enum {
-                self.last_change = Some(Change {
-                    op: match operator {
-                        'd' => ChangeOp::Delete,
-                        '>' => ChangeOp::Indent,
-                        '<' => ChangeOp::Dedent,
-                        '~' => ChangeOp::ToggleCase,
-                        _ => ChangeOp::Delete,
-                    },
-                    text: String::new(),
-                    count,
-                    motion: Some(m),
-                });
-            }
+            self.apply_linewise_operator(operator, start_line, end_line, changed);
+            return;
+        }
+
+        // A backward motion (`?`) puts the cursor at the earlier position
+        // once the operator range is applied.
+        if end_pos < start_pos {
+            self.view_mut().cursor = end_cursor;
+        }
+        let (lo, hi) = if start_pos <= end_pos {
+            (start_pos, end_pos)
+        } else {
+            (end_pos, start_pos)
+        };
+
+        // `d/pat<CR>`, `dn`, `dN`, … always land in "1 on delete, even when
+        // the match is within one line (#806, "d/ goes to \"1", "dn goes to
+        // \"1") — consumed by `apply_charwise_operator`/
+        // `apply_operator_exclusive_range` just below.
+        self.force_numbered_register = true;
+
+        // `:help search-offset`: an `e[+-N]` offset (`/pat/e`) makes the
+        // search motion INCLUSIVE of the last matched character — bypass the
+        // exclusive-linewise adjustment entirely and just extend the range.
+        if self.search_offset.trim().starts_with('e') {
+            let hi = (hi + 1).min(self.buffer().len_chars());
+            // The `e` search offset is naturally inclusive of the last
+            // matched character (:help search-offset, #881 review).
+            self.apply_charwise_operator_inclusive(operator, lo, hi, changed);
+        } else {
+            self.apply_operator_exclusive_range(operator, lo, hi, changed);
         }
     }
 
@@ -4532,7 +5536,42 @@ impl Engine {
             return;
         }
 
-        let current_char = self.buffer().content.char(start_pos);
+        let mut bracket_pos = start_pos;
+        let mut current_char = self.buffer().content.char(bracket_pos);
+
+        // Like plain `%` (see `search_forward_for_bracket`): if the cursor isn't
+        // on a bracket, scan forward on the current line for the first one
+        // before giving up.  The operated range still starts at the ORIGINAL
+        // cursor position (`start_pos`), not at the found bracket — `%` is an
+        // inclusive motion, so `d%` deletes from wherever the cursor was
+        // through the matched bracket.
+        if !matches!(current_char, '(' | ')' | '{' | '}' | '[' | ']') {
+            let line_start = self.buffer().line_to_char(start_line);
+            let line_len = self.buffer().line_len_chars(start_line);
+            let total_chars = self.buffer().len_chars();
+            let mut found = None;
+            for i in start_col..line_len {
+                let pos = line_start + i;
+                if pos >= total_chars {
+                    break;
+                }
+                let ch = self.buffer().content.char(pos);
+                if ch == '\n' {
+                    break;
+                }
+                if matches!(ch, '(' | ')' | '{' | '}' | '[' | ']') {
+                    found = Some(pos);
+                    break;
+                }
+            }
+            match found {
+                Some(pos) => {
+                    bracket_pos = pos;
+                    current_char = self.buffer().content.char(pos);
+                }
+                None => return,
+            }
+        }
 
         // Find matching bracket and determine search parameters
         let (is_opening, open_char, close_char) = match current_char {
@@ -4542,15 +5581,12 @@ impl Engine {
             '}' => (false, '{', '}'),
             '[' => (true, '[', ']'),
             ']' => (false, '[', ']'),
-            _ => {
-                // Not on a bracket - cancel operation
-                return;
-            }
+            _ => unreachable!("current_char is guaranteed to be a bracket above"),
         };
 
         // Find the matching bracket position
         if let Some(match_pos) =
-            self.find_matching_bracket(start_pos, open_char, close_char, is_opening)
+            self.find_matching_bracket(bracket_pos, open_char, close_char, is_opening)
         {
             // Determine range to delete (inclusive of both brackets)
             let (delete_start, delete_end) = if is_opening {
@@ -4567,7 +5603,13 @@ impl Engine {
                 .chars()
                 .collect();
             let reg = self.active_register();
-            self.set_register(reg, text, false);
+            if operator == 'y' {
+                self.set_yank_register(reg, text, false);
+            } else {
+                // `%` always goes to "1 even though the matched region is
+                // often less than a line (#806, "d% goes to \"1").
+                self.set_delete_register_special_motion(reg, text, false);
+            }
             self.clear_selected_register();
 
             if operator == 'y' {
@@ -4617,6 +5659,148 @@ impl Engine {
         }
     }
 
+    /// Does the currently pressed key match a configured key-binding string?
+    ///
+    /// Handles both forms used by mode-derived key settings (see
+    /// `CompletionKeys::accept`): bracketed Vim-style bindings like `<C-y>`
+    /// (parsed via [`crate::core::settings::parse_key_binding_named`]) and
+    /// bare named keys like `Tab` (matched literally, no modifier).
+    pub(crate) fn key_matches_binding(binding: &str, ctrl: bool, key_name: &str) -> bool {
+        if let Some((b_ctrl, _b_shift, _b_alt, b_key)) =
+            crate::core::settings::parse_key_binding_named(binding)
+        {
+            ctrl == b_ctrl && key_name.eq_ignore_ascii_case(&b_key)
+        } else {
+            !ctrl && key_name == binding
+        }
+    }
+
+    /// Vim abandons a count-prefixed insert (`3ix`) as soon as the cursor is
+    /// moved with an arrow/Home/End key during that insert: `3ix<Left>y<Esc>`
+    /// yields `yxa`, not `yxyxyxa` (`:h i_<Left>` — "the count is not used
+    /// after a cursor key"). Called from every insert-mode cursor movement,
+    /// *after* the cursor has actually moved (see `split_insert_undo_group`,
+    /// called alongside it, which needs the post-move position).
+    fn cancel_insert_repeat_count(&mut self) {
+        self.insert_repeat_count = 0;
+    }
+
+    /// Splits the undo group: moving the cursor with an arrow key during
+    /// Insert mode starts a new change, so `u` after `ifoo<Left>bar<Esc>`
+    /// undoes only "bar", not the whole insert (#804, "undo:arrow breaks
+    /// undo"). Must run *after* the cursor has moved, so the new group's
+    /// saved cursor is the position the next edit will actually start from.
+    /// `finish_undo_group`/`start_undo_group` are no-ops on an empty group,
+    /// so this is free when nothing was typed yet.
+    fn split_insert_undo_group(&mut self) {
+        self.finish_undo_group();
+        self.start_undo_group();
+    }
+
+    /// `:h 'autoindent'`: "If you do not type anything on the new line
+    /// except <BS> or CTRL-D and then type <Esc>, CTRL-O or <CR>, the
+    /// indent is deleted again." Only fires on the specific line
+    /// `insert_indent_only_line` points at (set when `<CR>` last created an
+    /// indent-only line and nothing but `<BS>`/`<C-d>` has touched it since —
+    /// a plain "is this line blank" check would also strip a line the user
+    /// deliberately emptied with `<C-u>`, which Vim does not do (#804).
+    /// Moves the cursor to column 0 when it strips.
+    fn strip_blank_current_line_indent(&mut self, changed: &mut bool) {
+        let line = self.view().cursor.line;
+        if self.insert_indent_only_line.take() != Some(line) {
+            return;
+        }
+        if !self.settings.auto_indent {
+            return;
+        }
+        let line_start = self.buffer().line_to_char(line);
+        let line_len = self.buffer().line_len_chars(line);
+        let content_len =
+            if line_len > 0 && self.buffer().content.char(line_start + line_len - 1) == '\n' {
+                line_len - 1
+            } else {
+                line_len
+            };
+        if content_len == 0 {
+            return;
+        }
+        let all_blank = (0..content_len)
+            .all(|i| matches!(self.buffer().content.char(line_start + i), ' ' | '\t'));
+        if all_blank {
+            self.delete_with_undo(line_start, line_start + content_len);
+            self.view_mut().cursor.col = 0;
+            *changed = true;
+        }
+    }
+
+    /// Expand any literal tabs in text about to be bulk-inserted (`<C-r>`
+    /// register insertion), the same way a real `<Tab>` keypress would be
+    /// expanded — `:h i_CTRL-R` inserts the register "as if typed", and that
+    /// includes 'expandtab' (#804). `start_col` is the column the first
+    /// character lands at; each embedded `\n` resets the column to 0 for the
+    /// next line.
+    fn expand_tabs_for_insert(&self, content: &str, start_col: usize) -> String {
+        if !self.settings.expand_tab || !content.contains('\t') {
+            return content.to_string();
+        }
+        let ts = (self.settings.tabstop as usize).max(1);
+        let mut out = String::with_capacity(content.len());
+        let mut col = start_col;
+        for ch in content.chars() {
+            match ch {
+                '\t' => {
+                    let target = (col / ts + 1) * ts;
+                    out.push_str(&" ".repeat(target - col));
+                    col = target;
+                }
+                '\n' => {
+                    out.push('\n');
+                    col = 0;
+                }
+                c => {
+                    out.push(c);
+                    col += 1;
+                }
+            }
+        }
+        out
+    }
+
+    /// Insert register/expression content at the cursor "as if typed"
+    /// (`:h i_CTRL-R`) — shared by plain `<C-r>{reg}` and the result of
+    /// `<C-r>=expr<CR>` (#806). Expands embedded tabs per 'expandtab' and
+    /// advances the cursor line-by-line for a linewise (or otherwise
+    /// multi-line) register instead of just adding the raw character count.
+    fn insert_register_content_at_cursor(&mut self, content: &str) {
+        let line = self.view().cursor.line;
+        let col = self.view().cursor.col;
+        let content = self.expand_tabs_for_insert(content, col);
+        let char_idx = self.buffer().line_to_char(line) + col;
+        self.insert_with_undo(char_idx, &content);
+        let lines: Vec<&str> = content.split('\n').collect();
+        if lines.len() > 1 {
+            self.view_mut().cursor.line = line + lines.len() - 1;
+            self.view_mut().cursor.col = lines.last().map_or(0, |l| l.chars().count());
+        } else {
+            self.view_mut().cursor.col = col + content.chars().count();
+        }
+    }
+
+    /// Insert the character named by a `<C-v>{digits}` numeric sequence
+    /// (`:h i_CTRL-V_digit`) at the cursor.
+    fn insert_ctrl_v_char_value(&mut self, value: u32, changed: &mut bool) {
+        let ch = char::from_u32(value).unwrap_or('\u{FFFD}');
+        let line = self.view().cursor.line;
+        let col = self.view().cursor.col;
+        let char_idx = self.buffer().line_to_char(line) + col;
+        let mut buf = [0u8; 4];
+        let s = ch.encode_utf8(&mut buf);
+        self.insert_with_undo(char_idx, s);
+        self.insert_text_buffer.push(ch);
+        self.view_mut().cursor.col += 1;
+        *changed = true;
+    }
+
     pub(crate) fn handle_insert_key(
         &mut self,
         key_name: &str,
@@ -4624,6 +5808,61 @@ impl Engine {
         ctrl: bool,
         changed: &mut bool,
     ) {
+        // ── Terminal ctrl-key aliases (#804) ──────────────────────────────────
+        // In a real terminal, crossterm delivers `<C-h>` as ctrl+'h' (byte
+        // 0x08), `<C-j>`/`<C-m>` as ctrl+'j'/'m' (bytes 0x0A/0x0D), and
+        // `<C-c>`/`<C-[>` as ctrl+'c'/'bracketleft' — none of those are the
+        // named keys (`BackSpace`/`Return`/`Escape`) the rest of this
+        // function matches on, so without this they fell through to the
+        // catch-all character-insert arm and typed the literal letter
+        // instead of doing what Vim does with them. Remap to the canonical
+        // name up front so every downstream check (undo grouping, autopair
+        // backspace, autoindent CR, …) runs the real BackSpace/Return/Escape
+        // path rather than a reimplementation of it.
+        //
+        // Both "bracketleft" (the crossterm/X11 keysym-style name) and "["
+        // (the literal-character name `src/core/engine/vscode.rs` already
+        // treats as its synonym elsewhere in this codebase) are accepted:
+        // the nvim-conformance harness's own `press_ctrl('[')` sends the
+        // literal "[" name, so matching only "bracketleft" would leave
+        // `<C-[>` permanently unreachable through that harness.
+        let (key_name, ctrl) = if ctrl {
+            match key_name {
+                "h" => ("BackSpace", false),
+                "j" | "m" => ("Return", false),
+                "c" | "bracketleft" | "[" => ("Escape", false),
+                other => (other, true),
+            }
+        } else {
+            (key_name, ctrl)
+        };
+
+        // Vim's `lastc` (`edit()` in edit.c): remember the character of the
+        // key *before* this one so `<C-d>` can recognise the `0`/`^` signal
+        // prefix (`:h i_0_CTRL-D`). Only a plain typed character counts — a
+        // ctrl combo or a named key (`<BS>`, `<Left>`, …) sets it to `None`,
+        // which is what makes `0<C-d><C-d>` dedent normally the second time.
+        let prev_insert_key_char = self.insert_last_key_char;
+        self.insert_last_key_char = if ctrl { None } else { unicode };
+
+        // `:h 'autoindent'` exempts only <BS> and <C-d> from breaking a
+        // freshly-created indent-only line's "untouched" status; every other
+        // key (including a plain <C-u>, which has its own distinct
+        // first-non-blank behavior above) clears it. <CR>/<Esc> consult and
+        // clear the flag themselves via `strip_blank_current_line_indent`.
+        if key_name != "BackSpace"
+            && key_name != "Return"
+            && key_name != "Escape"
+            && !(ctrl && key_name == "d")
+        {
+            self.insert_indent_only_line = None;
+        }
+        // A run of <Down>/<Up> remembers its want-column (#804); any other
+        // key ends the run.
+        if key_name != "Down" && key_name != "Up" {
+            self.insert_vertical_want_col = None;
+        }
+
         // ── Configured completion trigger (e.g. Ctrl-Space) ──────────────────
         {
             let trigger = self.settings.completion_keys.trigger.clone();
@@ -4732,16 +5971,30 @@ impl Engine {
             }
         }
 
-        // ── Tab: accept display-only popup OR fall through ────────────────────
-        if !ctrl && key_name == "Tab" && self.completion_display_only {
+        // ── Configured accept key: accept display-only popup OR fall through ──
+        // The accept key is mode-derived (`completion_keys.accept(editor_mode)`
+        // — see the field doc comment): Vim mode defaults to `<C-y>` so `<Tab>`
+        // is left alone for indentation, matching Vim's own ins-completion-menu
+        // where `i_CTRL-Y` accepts when the menu is visible and otherwise falls
+        // through to its unrelated "insert char from line above" binding
+        // (handled further down). Vscode mode defaults to `Tab`.
+        if self.completion_display_only {
             if let Some(idx) = self.completion_idx {
-                self.apply_completion_candidate(idx);
-                self.dismiss_completion();
-                *changed = true;
-                return;
+                let accept_key = self
+                    .settings
+                    .completion_keys
+                    .accept(self.settings.editor_mode);
+                if Self::key_matches_binding(&accept_key, ctrl, key_name) {
+                    self.apply_completion_candidate(idx);
+                    self.dismiss_completion();
+                    *changed = true;
+                    return;
+                }
             }
         }
-        // No display-only popup — fall through to regular Tab handling in match below.
+        // No display-only popup, or key doesn't match the accept binding —
+        // fall through to regular key handling (e.g. Tab indentation, or the
+        // Ctrl+Y "insert char from line above" binding further down).
 
         // ── Down/Up: navigate completion popup if active ──────────────────────
         if !ctrl
@@ -4776,29 +6029,39 @@ impl Engine {
             self.insert_ctrl_r_pending = true;
             return;
         }
-        // When Ctrl+R pending, next char selects the register to insert
+        // When Ctrl+R pending, next char selects the register to insert.
+        // `=` doesn't paste directly — it opens the expression prompt (#806,
+        // "reg:C-r = in insert"), same as `"=` in Normal mode.
         if self.insert_ctrl_r_pending {
             self.insert_ctrl_r_pending = false;
+            if unicode == Some('=') {
+                self.expr_register_pending = Some((true, String::new()));
+                return;
+            }
             if let Some(reg_char) = unicode {
                 if let Some((content, _)) = self.get_register_content(reg_char) {
-                    let content_clone = content.clone();
-                    let line = self.view().cursor.line;
-                    let col = self.view().cursor.col;
-                    let char_idx = self.buffer().line_to_char(line) + col;
-                    let char_count = content_clone.chars().count();
-                    self.insert_with_undo(char_idx, &content_clone);
-                    self.view_mut().cursor.col += char_count;
+                    self.insert_register_content_at_cursor(&content);
                     *changed = true;
                 }
             }
             return;
         }
 
-        // Ctrl+U: delete from cursor back to insert-start column (Vim behavior)
+        // Ctrl+U: delete entered characters back to insert-start column
+        // (`:h i_CTRL-U`). If nothing has been typed on this line since
+        // insert started (or a previous <C-u> already consumed it all),
+        // Vim ignores the insert-start column entirely and deletes back to
+        // the first non-blank instead — leaving autoindent alone unless the
+        // indent is all there is before the cursor, in which case that goes
+        // too (#804).
         if ctrl && key_name == "u" {
             let line = self.view().cursor.line;
             let col = self.view().cursor.col;
-            let del_to = self.insert_enter_col;
+            let del_to = if col > self.insert_enter_col {
+                self.insert_enter_col
+            } else {
+                self.first_non_blank_col(line)
+            };
             if col > del_to {
                 let line_start = self.buffer().line_to_char(line);
                 let from = line_start + del_to;
@@ -4811,20 +6074,70 @@ impl Engine {
         }
 
         // Ctrl+O: execute one normal-mode command then return to insert
+        // (`:h i_CTRL-O`). "If the cursor was beyond the end of the line, it
+        // will be put on the last character" — clamp now, before the one
+        // command runs, exactly like leaving insert mode via <Esc> does
+        // (#804, "A C-o h": without this, `h` from insert's one-past-eol
+        // column lands one column too far right).
         if ctrl && key_name == "o" {
             self.finish_undo_group();
             self.mode = Mode::Normal;
+            self.clamp_cursor_col();
             self.insert_ctrl_o_active = true;
             return;
         }
 
-        // Ctrl+V: insert next character literally (two-key sequence)
+        // Ctrl+V: insert next character literally, or — when it's a digit,
+        // or one of o/O (octal), x/X (hex), u (hex4), U (hex8) — accumulate
+        // the decimal/octal/hex/unicode value of a character to insert
+        // instead (`:h i_CTRL-V_digit`, #804).
         if ctrl && key_name == "v" {
             self.insert_ctrl_v_pending = true;
             return;
         }
+        if let Some((base, max_digits, mut count, mut value)) = self.insert_ctrl_v_numeric {
+            let digit = unicode.and_then(|ch| ch.to_digit(base));
+            if let Some(d) = digit {
+                value = value * base + d;
+                count += 1;
+                if count >= max_digits {
+                    self.insert_ctrl_v_numeric = None;
+                    self.insert_ctrl_v_char_value(value, changed);
+                } else {
+                    self.insert_ctrl_v_numeric = Some((base, max_digits, count, value));
+                }
+                return;
+            }
+            // A char that doesn't fit the mode ends the sequence early: use
+            // whatever value was accumulated, then let this key fall
+            // through and get handled normally below.
+            self.insert_ctrl_v_numeric = None;
+            if count > 0 {
+                self.insert_ctrl_v_char_value(value, changed);
+            }
+        }
         if self.insert_ctrl_v_pending {
             self.insert_ctrl_v_pending = false;
+            if let Some(ch) = unicode {
+                let mode = match ch {
+                    '0'..='9' => Some((10u32, 3u32)),
+                    'o' | 'O' => Some((8, 3)),
+                    'x' | 'X' => Some((16, 2)),
+                    'u' => Some((16, 4)),
+                    'U' => Some((16, 8)),
+                    _ => None,
+                };
+                if let Some((base, max_digits)) = mode {
+                    // A leading digit is itself the first digit of the
+                    // value; o/O/x/X/u/U are mode prefixes, not digits.
+                    let (count, value) = match ch.to_digit(10) {
+                        Some(d) => (1, d),
+                        None => (0, 0),
+                    };
+                    self.insert_ctrl_v_numeric = Some((base, max_digits, count, value));
+                    return;
+                }
+            }
             // Insert the raw character regardless of what it is
             let literal = if let Some(ch) = unicode {
                 Some(ch.to_string())
@@ -4852,12 +6165,15 @@ impl Engine {
             return;
         }
 
-        // Ctrl+W: delete word backward from cursor
+        // Ctrl+W: delete word backward from cursor (`:h i_CTRL-W`). Respects
+        // Vim's three word classes (blank / keyword / punctuation) so
+        // "foo.bar" only loses "bar", not the whole run of non-blank chars
+        // (#804) — and at column 1, joins with the previous line exactly
+        // like BackSpace does, then keeps the joined cursor position (#804).
         if ctrl && key_name == "w" {
             let line = self.view().cursor.line;
             let col = self.view().cursor.col;
             if col > 0 {
-                // Find start of word backward
                 let line_start = self.buffer().line_to_char(line);
                 let char_idx = line_start + col;
                 let line_text: String = self
@@ -4866,16 +6182,22 @@ impl Engine {
                     .slice(line_start..char_idx)
                     .chars()
                     .collect();
-                // Skip trailing spaces, then skip non-spaces
                 let chars: Vec<char> = line_text.chars().collect();
                 let mut i = chars.len();
-                // Skip trailing whitespace
-                while i > 0 && chars[i - 1] == ' ' {
+                // Skip trailing blanks.
+                while i > 0 && (chars[i - 1] == ' ' || chars[i - 1] == '\t') {
                     i -= 1;
                 }
-                // Skip word chars
-                while i > 0 && chars[i - 1] != ' ' {
-                    i -= 1;
+                // Skip one run of same-class (keyword vs. punctuation) chars.
+                if i > 0 {
+                    let is_word = Self::is_word_char(chars[i - 1]);
+                    while i > 0
+                        && chars[i - 1] != ' '
+                        && chars[i - 1] != '\t'
+                        && Self::is_word_char(chars[i - 1]) == is_word
+                    {
+                        i -= 1;
+                    }
                 }
                 let delete_start = line_start + i;
                 let delete_end = char_idx;
@@ -4884,6 +6206,15 @@ impl Engine {
                     self.view_mut().cursor.col = i;
                     *changed = true;
                 }
+            } else if line > 0 {
+                // At column 1: join with the previous line, same as BackSpace.
+                let prev_line_len = self.buffer().line_len_chars(line - 1);
+                let new_col = prev_line_len.saturating_sub(1);
+                let char_idx = self.buffer().line_to_char(line);
+                self.delete_with_undo(char_idx - 1, char_idx);
+                self.view_mut().cursor.line -= 1;
+                self.view_mut().cursor.col = new_col;
+                *changed = true;
             }
             return;
         }
@@ -4926,14 +6257,7 @@ impl Engine {
             self.finish_undo_group();
             if !self.insert_text_buffer.is_empty() {
                 self.last_inserted_text = self.insert_text_buffer.clone();
-                self.last_change = Some(Change {
-                    op: ChangeOp::Insert,
-                    text: self.insert_text_buffer.clone(),
-                    count: 1,
-                    motion: None,
-                });
             }
-            self.pending_change_motion = None;
             self.mode = Mode::Normal;
             self.clamp_cursor_col();
             self.view_mut().extra_cursors.clear();
@@ -5049,7 +6373,38 @@ impl Engine {
         // Ctrl+D: dedent current line by shiftwidth
         if ctrl && key_name == "d" {
             let line = self.view().cursor.line;
+            let col = self.view().cursor.col;
             let line_start = self.buffer().line_to_char(line);
+            // `:h i_0_CTRL-D` / `:h i_^_CTRL-D`: when the key typed immediately
+            // before this `<C-d>` was a literal `0` or `^`, that character is
+            // itself deleted and ALL indent on the line is removed (not just
+            // one shiftwidth) — #804.
+            //
+            // The trigger is Vim's `lastc` — *the previous keystroke* — not the
+            // buffer text before the cursor (`ins_shift()` in edit.c). The two
+            // differ in both directions and the nvim oracle pins both:
+            //   * `A0<C-d>` on `"    afoo"` DOES strip everything → `"afoo"`,
+            //     even though non-blank text precedes the typed '0';
+            //   * `A<C-d>` on `"    a0"` does NOT, even though a literal '0'
+            //     sits right before the cursor, because no '0' was typed.
+            let typed_signal_prefix =
+                col > 0 && matches!(prev_insert_key_char, Some('0') | Some('^'));
+            if typed_signal_prefix {
+                let signal_idx = line_start + col - 1;
+                self.delete_with_undo(signal_idx, signal_idx + 1);
+                let line_start = self.buffer().line_to_char(line);
+                let line_text: String = self.buffer().content.line(line).chars().collect();
+                let indent_len = line_text
+                    .chars()
+                    .take_while(|c| *c == ' ' || *c == '\t')
+                    .count();
+                if indent_len > 0 {
+                    self.delete_with_undo(line_start, line_start + indent_len);
+                }
+                self.view_mut().cursor.col = (col - 1).saturating_sub(indent_len);
+                *changed = true;
+                return;
+            }
             let sw = self.effective_shift_width();
             // Count leading spaces
             let line_text: String = self.buffer().content.line(line).chars().take(sw).collect();
@@ -5065,67 +6420,45 @@ impl Engine {
 
         match key_name {
             "Escape" => {
-                self.finish_undo_group();
-                // Record the insert operation for repeat and ". register
-                if !self.insert_text_buffer.is_empty() {
-                    self.last_inserted_text = self.insert_text_buffer.clone();
-                    if let Some((motion_ch, count)) = self.pending_change_motion.take() {
-                        // Insert was entered via c{motion} — record as Change so `.`
-                        // replays the delete-motion + insert, not just the insert.
-                        let motion = match motion_ch {
-                            'w' => Some(Motion::WordForward),
-                            'e' => Some(Motion::WordEnd),
-                            'b' => Some(Motion::WordBackward),
-                            _ => None,
-                        };
-                        self.last_change = Some(Change {
-                            op: ChangeOp::Change,
-                            text: self.insert_text_buffer.clone(),
-                            count,
-                            motion,
-                        });
-                    } else {
-                        self.last_change = Some(Change {
-                            op: ChangeOp::Insert,
-                            text: self.insert_text_buffer.clone(),
-                            count: 1,
-                            motion: None,
-                        });
-                    }
-                }
-                self.pending_change_motion = None;
-                // Apply visual block insert/append to remaining lines
-                if let Some((start_line, end_line, col, _is_append, virtual_end)) =
+                // `:h 'autoindent'` — leaving a line that's still nothing but
+                // the auto-inserted indent removes that indent (#804).
+                self.strip_blank_current_line_indent(changed);
+                // Apply visual block insert/append to the remaining lines.
+                //
+                // This runs BEFORE `finish_undo_group()` on purpose: with its
+                // own start/finish pair the replicated rows became a *second*
+                // undo step, so `<C-v>jjAx<Esc>u` undid only rows 2..n and
+                // left row 1 changed (#807, `vb:jjAx then u`).
+                let mut block_park = None;
+                if let Some((start_line, end_line, col, is_append, virtual_end, park_col)) =
                     self.visual_block_insert_info.take()
                 {
-                    let text = self.insert_text_buffer.clone();
-                    if !text.is_empty() {
-                        // The first line was already typed into; apply to remaining lines
-                        let first_typed_line = start_line;
-                        self.start_undo_group();
+                    // A count on block `I`/`A` repeats the typed text on every
+                    // row (`<C-v>j2Ix` → `xx`), so replicate the repeated form.
+                    let reps = self.insert_repeat_count.max(1);
+                    let text = self.insert_text_buffer.repeat(reps);
+                    // `:h v_b_I`: a block insert whose text contains a line
+                    // break is not replicated at all.
+                    if !text.is_empty() && !text.contains('\n') {
                         for line in start_line..=end_line {
-                            if line == first_typed_line {
+                            // The first line was already typed into.
+                            if line == start_line {
                                 continue;
                             }
                             if line >= self.buffer().len_lines() {
                                 break;
                             }
-                            let line_len = self.buffer().line_len_chars(line);
-                            let line_len_no_nl = if line_len > 0
-                                && self
-                                    .buffer()
-                                    .content
-                                    .char(self.buffer().line_to_char(line) + line_len - 1)
-                                    == '\n'
-                            {
-                                line_len - 1
-                            } else {
-                                line_len
-                            };
+                            let line_len_no_nl = self.line_text_len(line);
                             // In virtual-end mode (`$<C-v>...A`), the insert column is this
                             // specific line's own end — no padding needed, just append.
                             // Otherwise use the captured column and pad if the line is shorter.
                             let target_col = if virtual_end { line_len_no_nl } else { col };
+                            // `I` skips a row too short to reach the block's
+                            // column; only `A` pads it out with spaces
+                            // (`:h v_b_I` vs `:h v_b_A`).
+                            if !is_append && target_col > line_len_no_nl {
+                                continue;
+                            }
                             let insert_col = target_col.min(line_len_no_nl);
                             let pad = target_col.saturating_sub(line_len_no_nl);
                             let char_idx = self.buffer().line_to_char(line) + insert_col;
@@ -5138,8 +6471,18 @@ impl Engine {
                                 &text,
                             );
                         }
-                        self.finish_undo_group();
+                        // Vim leaves the cursor on the block's LEFT column,
+                        // which for `A` is not the column it inserted at.
+                        block_park = park_col.map(|c| (start_line, c));
                     }
+                }
+                self.finish_undo_group();
+                // Record inserted text for the "." register and Ctrl-A/Ctrl-@
+                // (`.` dot-repeat itself is handled generically by the
+                // keystroke recorder wrapping `handle_key` — see
+                // `record_dot_keystroke`/`finalize_dot_recording`).
+                if !self.insert_text_buffer.is_empty() {
+                    self.last_inserted_text = self.insert_text_buffer.clone();
                 }
                 // Repeat o/O insert for count > 1: duplicate typed text on new lines
                 if self.insert_open_count > 1 && !self.insert_text_buffer.is_empty() {
@@ -5155,14 +6498,40 @@ impl Engine {
                         let has_nl =
                             line_len > 0 && self.buffer().content.char(insert_pos - 1) == '\n';
                         let insert_pos = if has_nl { insert_pos - 1 } else { insert_pos };
-                        let new_line = format!("\n{}", text);
+                        // Repeat the *indented* line, not just the typed
+                        // text — `2ox<Esc>` on an indented line repeats
+                        // "  x", not "x" (#804).
+                        let new_line = format!("\n{}{}", self.insert_open_indent, text);
                         self.insert_with_undo(insert_pos, &new_line);
                         self.view_mut().cursor.line += 1;
-                        self.view_mut().cursor.col = text.chars().count();
+                        self.view_mut().cursor.col =
+                            self.insert_open_indent.chars().count() + text.chars().count();
                     }
                     self.finish_undo_group();
                 }
                 self.insert_open_count = 0;
+                self.insert_open_indent.clear();
+                // Repeat i/a/I/A insert for count > 1: duplicate typed text in
+                // place (Vim behavior for `3ihello<Esc>`).
+                if self.insert_repeat_count > 1 && !self.insert_text_buffer.is_empty() {
+                    let repeated = self.insert_text_buffer.repeat(self.insert_repeat_count - 1);
+                    let line = self.view().cursor.line;
+                    let col = self.view().cursor.col;
+                    let char_idx = self.buffer().line_to_char(line) + col;
+                    self.start_undo_group();
+                    self.insert_with_undo(char_idx, &repeated);
+                    self.finish_undo_group();
+                    let newlines = repeated.matches('\n').count();
+                    if newlines > 0 {
+                        self.view_mut().cursor.line += newlines;
+                        if let Some(last_nl) = repeated.rfind('\n') {
+                            self.view_mut().cursor.col = repeated[last_nl + 1..].chars().count();
+                        }
+                    } else {
+                        self.view_mut().cursor.col += repeated.chars().count();
+                    }
+                }
+                self.insert_repeat_count = 0;
                 // Track cursor pos for gi (insert at last insert position)
                 let cur = self.view().cursor;
                 self.last_insert_pos = Some((cur.line, cur.col));
@@ -5172,6 +6541,13 @@ impl Engine {
                     self.view_mut().cursor.col -= 1;
                 }
                 self.clamp_cursor_col();
+                // A replicated block insert overrides that: the cursor goes to
+                // the block's left column (see `block_park` above).
+                if let Some((line, col)) = block_park {
+                    self.view_mut().cursor.line = line;
+                    self.view_mut().cursor.col = col;
+                    self.clamp_cursor_col();
+                }
                 // Dismiss signature help when leaving insert mode
                 self.lsp_signature_help = None;
                 // Collapse all extra cursors.
@@ -5195,11 +6571,25 @@ impl Engine {
                     let line = self.view().cursor.line;
                     let col = self.view().cursor.col;
                     let char_idx = self.buffer().line_to_char(line) + col;
-                    if col > 0 {
+                    let line_start = self.buffer().line_to_char(line);
+                    let leading_blanks = col > 0
+                        && self.settings.expand_tab
+                        && (0..col).all(|i| self.buffer().content.char(line_start + i) == ' ');
+                    if leading_blanks {
+                        // `:h smarttab`: backspacing within leading indentation
+                        // removes a whole 'shiftwidth' worth of blanks
+                        // (rounded to the previous stop), not one space at a
+                        // time (#804).
+                        let sw = self.effective_shift_width().max(1);
+                        let new_col = ((col - 1) / sw) * sw;
+                        self.delete_with_undo(line_start + new_col, char_idx);
+                        self.view_mut().cursor.col = new_col;
+                        *changed = true;
+                    } else if col > 0 {
                         // Auto-pair backspace: delete both opener and closer
                         let prev_char = self.buffer().content.char(char_idx - 1);
                         let next_char_matches =
-                            if self.settings.auto_pairs && char_idx < self.buffer().len_chars() {
+                            if self.settings.auto_pairs() && char_idx < self.buffer().len_chars() {
                                 let next = self.buffer().content.char(char_idx);
                                 auto_pair_closer(prev_char) == Some(next)
                             } else {
@@ -5252,34 +6642,100 @@ impl Engine {
                     *changed = true;
                 } else {
                     let line = self.view().cursor.line;
-                    let col = self.view().cursor.col;
-                    let char_idx = self.buffer().line_to_char(line) + col;
+                    // Compute the new line's indent from the *current* line's
+                    // content before any stripping below touches it — the
+                    // second <CR> in `A<CR><CR>x` must still copy the first
+                    // line's indent even though the (untouched, blank)
+                    // intermediate line is about to be emptied out (#804).
                     let indent = self.smart_indent_for_newline(line);
                     let indent_len = indent.len();
+                    // `:h 'autoindent'`: pressing <CR> on a line that's
+                    // nothing but the not-yet-typed-on autoindent removes
+                    // that indent first (#804).
+                    self.strip_blank_current_line_indent(changed);
+                    let line = self.view().cursor.line;
+                    let col = self.view().cursor.col;
+                    let line_start = self.buffer().line_to_char(line);
+                    let mut char_idx = line_start + col;
+                    // With autoindent on, splitting a line strips leading
+                    // blanks from the remainder that moves to the new line —
+                    // it gets the freshly-computed indent instead, not the
+                    // indent-plus-leftover-whitespace a naive split would
+                    // produce (#804, "CR mid-line").
+                    let line_len = self.buffer().line_len_chars(line);
+                    let remainder_is_blank_only = if self.settings.auto_indent {
+                        let mut end = col;
+                        while end < line_len
+                            && matches!(self.buffer().content.char(line_start + end), ' ' | '\t')
+                        {
+                            end += 1;
+                        }
+                        // `\n` (or EOF) right after the stripped run means
+                        // nothing but blanks followed the cursor. Check this
+                        // *before* deleting — afterwards the same buffer
+                        // offset no longer points at the same character.
+                        let blank_only =
+                            end >= line_len || self.buffer().content.char(line_start + end) == '\n';
+                        if end > col {
+                            self.delete_with_undo(char_idx, line_start + end);
+                        }
+                        blank_only
+                    } else {
+                        col >= line_len
+                    };
+                    char_idx = self.buffer().line_to_char(line) + col;
                     let text = format!("\n{}", indent);
                     self.insert_with_undo(char_idx, &text);
                     self.insert_text_buffer.push('\n');
                     self.view_mut().cursor.line += 1;
                     self.view_mut().cursor.col = indent_len;
+                    // Track the new line as "indent-only, untouched" so a
+                    // following bare <CR>/<Esc> can remove that indent again
+                    // (`:h 'autoindent'`, #804) — only when it truly has no
+                    // other content.
+                    self.insert_indent_only_line = if !indent.is_empty() && remainder_is_blank_only
+                    {
+                        Some(self.view().cursor.line)
+                    } else {
+                        None
+                    };
                     *changed = true;
                 }
             }
             "Tab" => {
                 if !self.view().extra_cursors.is_empty() {
-                    let tab_text = if self.settings.expand_tab {
-                        " ".repeat(self.settings.tabstop as usize)
-                    } else {
-                        "\t".to_string()
-                    };
-                    self.insert_text_buffer.push_str(&tab_text);
-                    self.mc_insert(&tab_text);
+                    // #804 review: use the same next-tabstop/smarttab-aware
+                    // calculation as the single-cursor path below, per
+                    // cursor, instead of always inserting a fixed
+                    // `tabstop`-width block of spaces.
+                    // `insert_text_buffer` records one fragment per logical
+                    // keystroke (it is replayed verbatim for dot-repeat and
+                    // count-prefixed inserts), so push only the primary
+                    // cursor's indent, once — never one fragment per cursor.
+                    let primary_text = self.mc_insert_tab();
+                    self.insert_text_buffer.push_str(&primary_text);
                     *changed = true;
                 } else {
                     let line = self.view().cursor.line;
                     let col = self.view().cursor.col;
                     let char_idx = self.buffer().line_to_char(line) + col;
                     if self.settings.expand_tab {
-                        let n = self.settings.tabstop as usize;
+                        // `:h smarttab`: in front of a line (nothing but
+                        // blanks before the cursor) Tab advances using
+                        // 'shiftwidth'; everywhere else it uses 'tabstop' —
+                        // in both cases advancing to the *next* stop, not
+                        // inserting a fixed count of spaces (#804).
+                        let line_start = self.buffer().line_to_char(line);
+                        let front_of_line = (0..col).all(|i| {
+                            matches!(self.buffer().content.char(line_start + i), ' ' | '\t')
+                        });
+                        let stop = if front_of_line {
+                            self.effective_shift_width().max(1)
+                        } else {
+                            (self.settings.tabstop as usize).max(1)
+                        };
+                        let target = (col / stop + 1) * stop;
+                        let n = target - col;
                         let spaces = " ".repeat(n);
                         self.insert_with_undo(char_idx, &spaces);
                         self.insert_text_buffer.push_str(&spaces);
@@ -5292,30 +6748,70 @@ impl Engine {
                     *changed = true;
                 }
             }
-            "Left" => self.move_left(),
-            "Right" => self.move_right_insert(),
+            "Left" => {
+                self.cancel_insert_repeat_count();
+                self.move_left();
+                self.split_insert_undo_group();
+            }
+            "Right" => {
+                self.cancel_insert_repeat_count();
+                self.move_right_insert();
+                self.split_insert_undo_group();
+            }
             "Up" => {
+                self.cancel_insert_repeat_count();
                 if self.view().cursor.line > 0 {
+                    // Remember the column this vertical run started at
+                    // (#804) — clamping to each intermediate line's length
+                    // would otherwise lose it permanently, not just while
+                    // passing through a short line.
+                    let want = self
+                        .insert_vertical_want_col
+                        .unwrap_or(self.view().cursor.col);
                     self.view_mut().cursor.line -= 1;
-                    self.clamp_cursor_col_insert();
+                    let line = self.view().cursor.line;
+                    self.view_mut().cursor.col = want.min(self.get_line_len_for_insert(line));
+                    self.insert_vertical_want_col = Some(want);
                 }
+                self.split_insert_undo_group();
             }
             "Down" => {
+                self.cancel_insert_repeat_count();
                 let max_line = self.buffer().len_lines().saturating_sub(1);
                 if self.view().cursor.line < max_line {
+                    let want = self
+                        .insert_vertical_want_col
+                        .unwrap_or(self.view().cursor.col);
                     self.view_mut().cursor.line += 1;
-                    self.clamp_cursor_col_insert();
+                    let line = self.view().cursor.line;
+                    self.view_mut().cursor.col = want.min(self.get_line_len_for_insert(line));
+                    self.insert_vertical_want_col = Some(want);
                 }
+                self.split_insert_undo_group();
             }
-            "Home" => self.view_mut().cursor.col = 0,
+            "Home" => {
+                self.cancel_insert_repeat_count();
+                self.view_mut().cursor.col = 0;
+                self.split_insert_undo_group();
+            }
             "End" => {
+                self.cancel_insert_repeat_count();
                 let line = self.view().cursor.line;
                 self.view_mut().cursor.col = self.get_line_len_for_insert(line);
+                self.split_insert_undo_group();
             }
             _ => {
                 // Try plugin insert-mode keymaps first (for non-printable or special keys)
                 if unicode.is_none() && self.plugin_run_keymap("i", key_name) {
                     // keymap handled it — skip default character insertion
+                } else if ctrl {
+                    // Catch-all (#804): every ctrl combo this function knows
+                    // how to handle has already matched an explicit arm above
+                    // and returned. Anything reaching here is an unrecognised
+                    // ctrl combo — Vim either ignores it or binds it to
+                    // something we don't implement yet, but in no case does
+                    // it insert the bare letter. Do nothing, rather than
+                    // falling through to the character-insert branch below.
                 } else if let Some(ch) = unicode {
                     if !self.view().extra_cursors.is_empty() {
                         // Multi-cursor character insert.
@@ -5331,7 +6827,7 @@ impl Engine {
 
                         // Auto-pairs: skip-over closing bracket/quote
                         let closing_pair = auto_pair_closer(ch);
-                        if self.settings.auto_pairs
+                        if self.settings.auto_pairs()
                             && is_closing_pair(ch)
                             && char_idx < self.buffer().len_chars()
                             && self.buffer().content.char(char_idx) == ch
@@ -5340,7 +6836,7 @@ impl Engine {
                             self.view_mut().cursor.col += 1;
                             self.insert_text_buffer.push(ch);
                             *changed = true;
-                        } else if self.settings.auto_pairs && closing_pair.is_some() {
+                        } else if self.settings.auto_pairs() && closing_pair.is_some() {
                             let closer = closing_pair.unwrap();
                             // Smart context for quotes: only auto-pair if preceded by
                             // whitespace, bracket, or BOL
@@ -5463,9 +6959,7 @@ impl Engine {
         self.set_dirty(true);
         self.update_syntax();
         let active_id = self.active_buffer_id();
-        if self.preview_buffer_id == Some(active_id) {
-            self.promote_preview(active_id);
-        }
+        self.preview_tab_promote(active_id);
         self.lsp_dirty_buffers.insert(active_id, true);
         self.refresh_md_previews();
         self.swap_mark_dirty();
@@ -5544,16 +7038,7 @@ impl Engine {
         }
         // --- Ctrl-V: paste from clipboard ---
         if ctrl && key_name == "v" && !self.history_search_active {
-            if let Some(text) = Self::clipboard_paste() {
-                let line = text.lines().next().unwrap_or("");
-                for ch in line.chars() {
-                    if !ch.is_control() {
-                        let byte_off = cmd_char_to_byte(&self.command_buffer, self.command_cursor);
-                        self.command_buffer.insert(byte_off, ch);
-                        self.command_cursor += 1;
-                    }
-                }
-            }
+            self.paste_clipboard_to_input();
             return EngineAction::None;
         }
 
@@ -5874,7 +7359,13 @@ impl Engine {
         }
     }
 
-    pub(crate) fn handle_search_key(&mut self, key_name: &str, unicode: Option<char>, ctrl: bool) {
+    pub(crate) fn handle_search_key(
+        &mut self,
+        key_name: &str,
+        unicode: Option<char>,
+        ctrl: bool,
+        changed: &mut bool,
+    ) {
         // Ctrl-A / Ctrl-E: move cursor to start/end
         if ctrl && key_name == "a" {
             self.command_cursor = 0;
@@ -5895,27 +7386,21 @@ impl Engine {
         }
         // Ctrl-V: paste from clipboard
         if ctrl && key_name == "v" {
-            if let Some(text) = Self::clipboard_paste() {
-                let line = text.lines().next().unwrap_or("");
-                for ch in line.chars() {
-                    if !ch.is_control() {
-                        let byte_off = cmd_char_to_byte(&self.command_buffer, self.command_cursor);
-                        self.command_buffer.insert(byte_off, ch);
-                        self.command_cursor += 1;
-                    }
-                }
-                if self.settings.incremental_search {
-                    self.perform_incremental_search();
-                }
-            }
+            self.paste_clipboard_to_input();
             return;
         }
         match key_name {
             "Escape" => {
-                self.mode = Mode::Normal;
+                // v/pat<Esc>: return to the visual sub-mode we came from
+                // (selection anchor intact) instead of dropping to Normal.
+                self.mode = self.visual_search_return.take().unwrap_or(Mode::Normal);
                 self.command_buffer.clear();
                 self.search_history_index = None;
                 self.search_typing_buffer.clear();
+                // Cancel any operator waiting on this search (d/pat<Esc>): a
+                // pending count must not survive to leak into the next command.
+                self.pending_operator = None;
+                self.operator_count = None;
 
                 // Restore cursor to original position (incremental search)
                 if let Some(start_cursor) = self.search_start_cursor.take() {
@@ -5927,24 +7412,25 @@ impl Engine {
                 }
             }
             "Return" => {
-                self.mode = Mode::Normal;
+                let visual_return = self.visual_search_return.take();
+                self.mode = visual_return.unwrap_or(Mode::Normal);
                 let query = self.command_buffer.clone();
                 self.command_buffer.clear();
 
-                // Add to search history
+                // Restore the pre-search cursor so the submitted search starts
+                // from where the user typed `/`, not from wherever incremental
+                // search parked the cursor. `submit_search` then does all the
+                // positioning (offset + `;` chaining + count), which keeps the
+                // incsearch-on and incsearch-off paths identical.  Also doubles
+                // as the operator's start position for `d/pat<CR>` etc.
+                let mut operator_start = None;
+                if let Some(start) = self.search_start_cursor.take() {
+                    self.view_mut().cursor = start;
+                    self.push_jump_location();
+                    operator_start = Some(start);
+                }
+
                 if !query.is_empty() {
-                    // Push the pre-search position to the jump list so Ctrl-O returns here.
-                    // With incremental search the cursor has already moved; push the saved
-                    // start position (where the cursor was before the user typed `/`).
-                    if let Some(start) = self.search_start_cursor {
-                        let live = self.view().cursor;
-                        self.view_mut().cursor = start;
-                        self.push_jump_location();
-                        self.view_mut().cursor = live;
-                    }
-
-                    self.search_start_cursor = None; // Clear saved cursor position
-
                     self.history.add_search(&query);
                     self.search_history_index = None;
                     self.search_typing_buffer.clear();
@@ -5952,25 +7438,20 @@ impl Engine {
                     // Save session state
                     let _ = self.session.save();
                     let _ = self.history.save();
+                }
 
-                    self.search_query = query;
-                    self.run_search();
-                    // If incremental search is enabled, cursor is already at the correct match
-                    // Otherwise, jump to first match in the appropriate direction
-                    if !self.settings.incremental_search {
-                        match self.search_direction {
-                            SearchDirection::Forward => self.search_next(),
-                            SearchDirection::Backward => self.search_prev(),
-                        }
-                    }
-                } else {
-                    self.search_start_cursor = None;
-                    // Empty query with existing search — repeat in current direction
-                    if !self.search_query.is_empty() {
-                        self.run_search();
-                        match self.search_direction {
-                            SearchDirection::Forward => self.search_next(),
-                            SearchDirection::Backward => self.search_prev(),
+                let count = self.search_pending_count.max(1);
+                self.search_pending_count = 1;
+                self.submit_search(&query, count);
+
+                // d/pat<CR>, c/pat, y/pat: apply the armed operator over the
+                // motion from the pre-search cursor to wherever the search
+                // landed.  No match found → the operator fails (no-op), same
+                // as Vim's "E486: Pattern not found" aborting the operator.
+                if let Some(op) = self.pending_operator.take() {
+                    if let Some(start) = operator_start {
+                        if !self.search_matches.is_empty() {
+                            self.apply_operator_over_search_motion(op, start, changed);
                         }
                     }
                 }
@@ -6142,6 +7623,15 @@ impl Engine {
             }
         }
 
+        // Visual-mode <C-a> / <C-x>: increment every number in the selection by
+        // the same amount (the `g` prefixed variants step by line — see the
+        // `pending == 'g'` arm above).
+        if ctrl && self.pending_key.is_none() && (key_name == "a" || key_name == "x") {
+            let sign: i64 = if key_name == "a" { 1 } else { -1 };
+            self.visual_addsub(sign, false, changed);
+            return EngineAction::None;
+        }
+
         // Handle Ctrl-V for visual block mode switching
         if ctrl && key_name == "v" {
             if self.mode == Mode::VisualBlock {
@@ -6156,8 +7646,10 @@ impl Engine {
             return EngineAction::None;
         }
 
-        // Handle mode switching: v toggles to Visual, V toggles to VisualLine
-        if let Some(ch) = unicode {
+        // Handle mode switching: v toggles to Visual, V toggles to VisualLine.
+        // Skipped while a prefix key is pending, or the `v` of `gv` would
+        // toggle Visual off instead of completing the command (#807).
+        if let Some(ch) = unicode.filter(|_| self.pending_key.is_none()) {
             match ch {
                 'v' => {
                     if self.mode == Mode::Visual {
@@ -6206,6 +7698,17 @@ impl Engine {
             }
         }
 
+        // Handle `` `{mark} `` — jump the cursor to the exact mark position,
+        // extending the active Visual selection (the anchor is untouched).
+        // Normal mode's backtick handling (the `pending == '`'` arm further
+        // up in `handle_key`) only ever runs there; Visual mode fell through
+        // to the catch-all and treated `` ` `` as a no-op, so `v\`ad` never
+        // extended the selection (#887).
+        if !ctrl && self.pending_key.is_none() && unicode == Some('`') {
+            self.pending_key = Some('`');
+            return EngineAction::None;
+        }
+
         // Handle operators: d (delete), y (yank), c (change), u (lowercase), U (uppercase)
         // Note: count is NOT applied to visual operators - they operate on the selection
         if let Some(ch) = unicode {
@@ -6225,9 +7728,33 @@ impl Engine {
                     self.yank_visual_selection();
                     return EngineAction::None;
                 }
-                'c' if self.pending_key.is_none() => {
+                'c' | 's' if self.pending_key.is_none() => {
+                    // `:h v_s` — `s` is a synonym for `c` in Visual mode.
                     self.count = None; // Clear count (not used for visual operators)
                     self.change_visual_selection(changed);
+                    return EngineAction::None;
+                }
+                // Uppercase operators (`:h v_D`, `v_X`, `v_Y`, `v_C`, `v_S`,
+                // `v_R`) act LINEWISE on the selected lines whatever the
+                // current Visual mode is — except in Visual-Block, where `D`
+                // and `C` instead extend the block to end-of-line (#807).
+                'D' | 'X' | 'Y' | 'C' | 'S' | 'R' if self.pending_key.is_none() => {
+                    self.count = None;
+                    if self.mode == Mode::VisualBlock && matches!(ch, 'D' | 'C' | 'X') {
+                        self.visual_dollar = true;
+                        if ch == 'C' {
+                            self.change_visual_selection(changed);
+                        } else {
+                            self.delete_visual_selection(changed);
+                        }
+                    } else {
+                        self.mode = Mode::VisualLine;
+                        match ch {
+                            'D' | 'X' => self.delete_visual_selection(changed),
+                            'Y' => self.yank_visual_selection(),
+                            _ => self.change_visual_selection(changed),
+                        }
+                    }
                     return EngineAction::None;
                 }
                 'u' if !ctrl && self.pending_key.is_none() => {
@@ -6259,45 +7786,50 @@ impl Engine {
                     }
                     return EngineAction::None;
                 }
-                '>' => {
-                    // Visual indent: indent all selected lines
-                    self.count = None;
+                '>' | '<' => {
+                    // Visual indent/dedent. A count is a SHIFT MULTIPLIER here,
+                    // not a line count: `V3>` indents the selection by three
+                    // 'shiftwidth's (`:h v_>`), it does not select 3 lines
+                    // (#807 — the count used to be discarded entirely).
+                    let shifts = self.take_count().max(1);
+                    if self.mode == Mode::VisualBlock {
+                        // A blockwise shift moves the BLOCK, not the line:
+                        // `<C-v>j>` on `abc`/`def` from column 2 gives
+                        // `a    bc`, inserting the shift at the block's left
+                        // edge (`:h v_b_>`; #807).
+                        self.block_shift(ch == '>', shifts, changed);
+                        return EngineAction::None;
+                    }
                     if let Some((start, end)) = self.get_visual_selection_range() {
                         let start_line = start.line;
-                        let end_line = end.line;
-                        let line_count = end_line - start_line + 1;
+                        let line_count = end.line - start_line + 1;
                         // Exit visual mode first
                         self.mode = Mode::Normal;
                         self.visual_anchor = None;
-                        self.indent_lines(start_line, line_count, changed);
+                        for _ in 0..shifts {
+                            if ch == '>' {
+                                self.indent_lines(start_line, line_count, changed, true);
+                            } else {
+                                self.dedent_lines(start_line, line_count, changed, true);
+                            }
+                        }
                         self.view_mut().cursor.line = start_line;
-                        self.last_change = Some(Change {
-                            op: ChangeOp::Indent,
-                            text: String::new(),
-                            count: line_count,
-                            motion: None,
-                        });
                     }
                     return EngineAction::None;
                 }
-                '<' => {
-                    // Visual dedent: dedent all selected lines
+                '=' if self.pending_key.is_none() => {
+                    // Visual `=`: re-indent the selected lines (`:h v_=`).
+                    // VIM_COMPATIBILITY.md claimed this worked long before it
+                    // did — #807 makes the claim true.
                     self.count = None;
                     if let Some((start, end)) = self.get_visual_selection_range() {
                         let start_line = start.line;
-                        let end_line = end.line;
-                        let line_count = end_line - start_line + 1;
-                        // Exit visual mode first
+                        let line_count = end.line - start_line + 1;
                         self.mode = Mode::Normal;
                         self.visual_anchor = None;
-                        self.dedent_lines(start_line, line_count, changed);
-                        self.view_mut().cursor.line = start_line;
-                        self.last_change = Some(Change {
-                            op: ChangeOp::Dedent,
-                            text: String::new(),
-                            count: line_count,
-                            motion: None,
-                        });
+                        self.visual_dollar = false;
+                        self.auto_indent_lines(start_line, line_count, changed);
+                        self.move_cursor_to_first_non_blank(start_line);
                     }
                     return EngineAction::None;
                 }
@@ -6371,14 +7903,22 @@ impl Engine {
                 'I' => {
                     // Visual block I: insert at left column of block on all lines
                     if self.mode == Mode::VisualBlock {
+                        // `2I` repeats the typed text on every row.
+                        self.insert_repeat_count = self.take_count().max(1);
                         if let Some(anchor) = self.visual_anchor {
                             let cursor = self.view().cursor;
                             let start_line = anchor.line.min(cursor.line);
                             let end_line = anchor.line.max(cursor.line);
-                            let left_col = anchor.col.min(cursor.col);
+                            let (left_col, _) = self.visual_block_cols();
                             // Store block info for applying on Escape
-                            self.visual_block_insert_info =
-                                Some((start_line, end_line, left_col, false, false));
+                            self.visual_block_insert_info = Some((
+                                start_line,
+                                end_line,
+                                left_col,
+                                false,
+                                false,
+                                Some(left_col),
+                            ));
                             // Exit visual mode and enter insert at left col of first line
                             self.mode = Mode::Insert;
                             self.visual_anchor = None;
@@ -6399,6 +7939,7 @@ impl Engine {
                     // When the block was started with $, use each line's actual end
                     // instead of the captured column (Vim "virtual end" behaviour).
                     if self.mode == Mode::VisualBlock {
+                        self.insert_repeat_count = self.take_count().max(1);
                         if let Some(anchor) = self.visual_anchor {
                             let cursor = self.view().cursor;
                             let start_line = anchor.line.min(cursor.line);
@@ -6416,10 +7957,16 @@ impl Engine {
                                     line_len
                                 }
                             } else {
-                                anchor.col.max(cursor.col) + 1
+                                self.visual_block_cols().1 + 1
                             };
-                            self.visual_block_insert_info =
-                                Some((start_line, end_line, first_line_col, true, virtual_end));
+                            self.visual_block_insert_info = Some((
+                                start_line,
+                                end_line,
+                                first_line_col,
+                                true,
+                                virtual_end,
+                                Some(self.visual_block_cols().0),
+                            ));
                             // Exit visual mode and enter insert at the chosen col of first line
                             self.mode = Mode::Insert;
                             self.visual_anchor = None;
@@ -6493,14 +8040,28 @@ impl Engine {
         // Handle multi-key sequences (gg, {, }, text objects, register selection)
         if let Some(pending) = self.pending_key.take() {
             if pending == '"' {
-                // Register selection: "x (uppercase A-Z appends to lowercase)
+                // Register selection: "x (uppercase A-Z appends to lowercase).
+                // See the Normal-mode `'"'` arm for the full register-name
+                // rationale (#806); `=` opens the expression-register prompt
+                // the same way there, rather than silently leaving
+                // `selected_register` set with no prompt ever shown (#806
+                // review).
                 if let Some(ch) = unicode {
-                    if ch.is_ascii_lowercase()
+                    if ch == '=' {
+                        self.selected_register = Some('=');
+                        self.expr_register_pending = Some((false, String::new()));
+                    } else if ch.is_ascii_lowercase()
                         || ch.is_ascii_uppercase()
                         || ch.is_ascii_digit()
                         || ch == '"'
                         || ch == '+'
                         || ch == '*'
+                        || ch == '_'
+                        || ch == '.'
+                        || ch == '/'
+                        || ch == '%'
+                        || ch == ':'
+                        || ch == '-'
                     {
                         self.selected_register = Some(ch);
                     }
@@ -6513,8 +8074,44 @@ impl Engine {
                     let cursor = self.view().cursor;
                     let cursor_pos = self.buffer().line_to_char(cursor.line) + cursor.col;
 
+                    let mut count = self.take_count().max(1);
+
+                    // Paragraph objects have no "next occurrence" for the cursor
+                    // to land on the way brackets/quotes do — re-finding `ip`
+                    // from a cursor still inside the same paragraph returns the
+                    // identical range, so the naive "always recompute from the
+                    // cursor" approach below can't grow the selection. Vim's
+                    // actual behaviour: pressing the same paragraph object again
+                    // while the active Visual selection is *exactly* that
+                    // object grows it — it pairs in the next block (blank run
+                    // or paragraph), same as `find_paragraph_object`'s
+                    // count>1 path already does for an explicit `2ip`/`2ap`.
+                    // Detect that by walking `try_count` up while it keeps
+                    // reproducing the current selection (#887).
+                    if obj_type == 'p' && count == 1 {
+                        if let Some(anchor) = self.visual_anchor {
+                            let anchor_pos = self.buffer().line_to_char(anchor.line) + anchor.col;
+                            let (sel_lo, sel_hi_incl) = if anchor_pos <= cursor_pos {
+                                (anchor_pos, cursor_pos)
+                            } else {
+                                (cursor_pos, anchor_pos)
+                            };
+                            let max_tries = self.buffer().len_lines().max(1);
+                            let mut try_count = 1;
+                            while try_count <= max_tries {
+                                match self.find_paragraph_object(pending, cursor_pos, try_count) {
+                                    Some((s, e)) if s == sel_lo && e == sel_hi_incl + 1 => {
+                                        try_count += 1;
+                                    }
+                                    _ => break,
+                                }
+                            }
+                            count = try_count;
+                        }
+                    }
+
                     if let Some((start_pos, end_pos)) =
-                        self.find_text_object_range(pending, obj_type, cursor_pos)
+                        self.find_text_object_range(pending, obj_type, cursor_pos, count)
                     {
                         // Set visual selection to the text object range
                         let start_line = self.buffer().content.char_to_line(start_pos);
@@ -6540,9 +8137,79 @@ impl Engine {
                     }
                 }
                 return EngineAction::None;
+            } else if matches!(pending, 'f' | 'F' | 't' | 'T') {
+                if let Some(target) = unicode {
+                    let count = self.take_count();
+                    for _ in 0..count {
+                        if !self.find_char(pending, target) {
+                            break;
+                        }
+                    }
+                    self.last_find = Some((pending, target));
+                }
+                return EngineAction::None;
+            } else if pending == '`' {
+                // `` `{a-z|A-Z|`|.|<|>} ``: jump the cursor to the exact mark
+                // position, extending the Visual selection (anchor unchanged).
+                // Mirrors the Normal-mode `` ` `` resolution above but only
+                // moves the cursor — Visual mode's own operators (`d`, `y`,
+                // ...) apply to the resulting anchor..cursor span afterwards.
+                if let Some(ch) = unicode {
+                    let target: Option<(usize, usize)> = match ch {
+                        '`' => self.last_jump_pos,
+                        '.' => self.last_edit_pos,
+                        '<' => self.visual_mark_start,
+                        '>' => self.visual_mark_end,
+                        _ if ch.is_ascii_lowercase() => {
+                            let buffer_id = self.active_window().buffer_id;
+                            self.marks
+                                .get(&buffer_id)
+                                .and_then(|m| m.get(&ch))
+                                .map(|c| (c.line, c.col))
+                        }
+                        _ if ch.is_ascii_uppercase() => self
+                            .global_marks
+                            .get(&ch)
+                            .map(|&(_, line, col)| (line, col)),
+                        _ => None,
+                    };
+                    if let Some((target_line, target_col)) = target {
+                        let max_line = self.buffer().len_lines().saturating_sub(1);
+                        let target_line = target_line.min(max_line);
+                        let target_col = target_col.min(self.buffer().line_len_chars(target_line));
+                        self.view_mut().cursor.line = target_line;
+                        self.view_mut().cursor.col = target_col;
+                    } else {
+                        self.message = format!("Mark `{}` not set", ch);
+                    }
+                }
+                return EngineAction::None;
             } else if pending == 'r' {
-                // r{char}: replace all selected characters with the given character
-                if let Some(replacement) = unicode {
+                // r{char}: replace all selected characters with the given character.
+                // <CR> has no `unicode` (it arrives as key_name "Return" with
+                // unicode: None — see `press_special` in the conformance
+                // harness and the Normal-mode `'r'` handler above). VisualBlock
+                // special-cases it: instead of inserting a literal character,
+                // each selected line is split into two at the block column
+                // (`:h v_b_r`; #807, `vb:jr<CR>`). Char/line-wise Visual `r`
+                // does NOT get that special-case — this was re-verified
+                // empirically against the live nvim 0.12.5 oracle while fixing
+                // #887 review feedback that assumed the opposite: running
+                // `["abc"]` with `b` selected via `v` and `r<CR>` through
+                // `nvim_buf_get_lines` returns a *single* line containing a
+                // literal embedded `\r` byte (`"a\rc"`), not two lines split
+                // on a real `\n` (`"a"`, `"c"`). So despite `:h v_r`'s "a line
+                // break is inserted instead" wording, real Neovim's Visual `r`
+                // does not actually split the line — it inserts the literal
+                // carriage-return character, same as any other
+                // single-character replacement. Do not change this to `'\n'`
+                // without re-running the oracle; a prior review claimed `'\n'`
+                // was required and was wrong (see PROBE_FILTER="v_r CR").
+                if self.mode == Mode::VisualBlock && matches!(key_name, "Return" | "KP_Enter") {
+                    self.replace_visual_block_with_newline(changed);
+                } else if matches!(key_name, "Return" | "KP_Enter") {
+                    self.replace_visual_selection('\r', changed);
+                } else if let Some(replacement) = unicode {
                     self.replace_visual_selection(replacement, changed);
                 }
                 return EngineAction::None;
@@ -6556,27 +8223,50 @@ impl Engine {
                 } else {
                     self.view_mut().cursor.line = 0;
                 }
-                self.view_mut().cursor.col = 0;
+                // Neovim's 'startofline' is off by default, so `gg` keeps the
+                // column instead of snapping to 0 — `vggd` on `abc`/`def` from
+                // (2,2) must leave `af`, not `f` (#807; the Normal-mode `gg`
+                // was already fixed this way in #806).
+                self.clamp_cursor_col();
                 return EngineAction::None;
             } else if pending == 'g' && ctrl && (key_name == "a" || key_name == "x") {
                 // g Ctrl-A / g Ctrl-X in visual mode: sequential increment/decrement
-                let base_count = self.take_count().max(1) as i64;
-                let delta_sign: i64 = if key_name == "a" { 1 } else { -1 };
+                let sign: i64 = if key_name == "a" { 1 } else { -1 };
+                self.visual_addsub(sign, true, changed);
+                return EngineAction::None;
+            } else if pending == 'g' && unicode == Some('v') {
+                // `gv` while already in Visual mode swaps to the PREVIOUS
+                // selection (`:h gv`); before #807 it was Normal-mode only, so
+                // `vl<Esc>$vgvd` deleted nothing.
+                self.count = None;
+                let cur_anchor = self.visual_anchor;
+                let cur_cursor = self.view().cursor;
+                let cur_mode = self.mode;
+                if let (Some(a), Some(c)) = (self.last_visual_anchor, self.last_visual_cursor) {
+                    self.mode = self.last_visual_mode;
+                    self.visual_anchor = Some(a);
+                    self.view_mut().cursor = c;
+                    self.clamp_cursor_col();
+                }
+                self.last_visual_mode = cur_mode;
+                self.last_visual_anchor = cur_anchor;
+                self.last_visual_cursor = Some(cur_cursor);
+                return EngineAction::None;
+            } else if pending == 'g' && unicode == Some('J') {
+                // Visual `gJ`: join the selected lines without inserting or
+                // collapsing white space (`:h v_gJ`) — another row
+                // VIM_COMPATIBILITY.md marked ✅ before it existed (#807).
+                self.count = None;
                 if let Some((start, end)) = self.get_visual_selection_range() {
-                    let saved_line = self.view().cursor.line;
-                    let saved_col = self.view().cursor.col;
-                    self.start_undo_group();
-                    for (i, line) in (start.line..=end.line).enumerate() {
-                        let delta = delta_sign * base_count * (i as i64 + 1);
-                        self.view_mut().cursor.line = line;
-                        self.view_mut().cursor.col = 0;
-                        self.increment_number_at_cursor(delta, changed);
-                    }
-                    self.finish_undo_group();
-                    self.view_mut().cursor.line = saved_line;
-                    self.view_mut().cursor.col = saved_col;
+                    let line_count = end.line - start.line + 1;
                     self.mode = Mode::Normal;
                     self.visual_anchor = None;
+                    self.visual_dollar = false;
+                    self.view_mut().cursor.line = start.line;
+                    self.view_mut().cursor.col = 0;
+                    if line_count > 1 {
+                        self.join_lines_no_space(line_count, changed);
+                    }
                 }
                 return EngineAction::None;
             } else if pending == 'g' && unicode == Some('c') {
@@ -6649,13 +8339,23 @@ impl Engine {
             Some('j') => {
                 let count = self.take_count();
                 for _ in 0..count {
-                    self.move_down();
+                    if !self.move_down() {
+                        // Already at the last line: a macro/`:normal` playing
+                        // this back must stop here (#806, "mac:recursive" —
+                        // this is what makes a self-referential macro
+                        // terminate at EOF instead of spinning forever).
+                        self.command_failed = true;
+                        break;
+                    }
                 }
             }
             Some('k') => {
                 let count = self.take_count();
                 for _ in 0..count {
-                    self.move_up();
+                    if !self.move_up() {
+                        self.command_failed = true;
+                        break;
+                    }
                 }
             }
             Some('l') => {
@@ -6686,6 +8386,26 @@ impl Engine {
                 self.view_mut().cursor.col = 0;
                 self.visual_dollar = false;
             }
+            Some('^') => {
+                // `^` in Visual mode — was unbound before #807, so `v^d`
+                // deleted only the character under the cursor.
+                let line = self.view().cursor.line;
+                self.view_mut().cursor.col = self.first_non_blank_col(line);
+                self.visual_dollar = false;
+            }
+            Some('f') | Some('F') | Some('t') | Some('T') => {
+                // Character find motions extend the selection; the target
+                // character is inclusive for `f`/`F` (#807, `vis:vf,d`).
+                self.pending_key = unicode;
+                self.visual_dollar = false;
+            }
+            Some(';') | Some(',') => {
+                let count = self.take_count();
+                let reverse = unicode == Some(',');
+                for _ in 0..count {
+                    self.repeat_find(reverse);
+                }
+            }
             Some('$') => {
                 let line = self.view().cursor.line;
                 self.view_mut().cursor.col = self.get_max_cursor_col(line);
@@ -6714,6 +8434,39 @@ impl Engine {
             }
             Some('%') => {
                 self.move_to_matching_bracket();
+            }
+            Some('/') | Some('?') => {
+                // v/pat<CR>, V/pat<CR>: enter Search mode, returning to this
+                // visual sub-mode (selection anchor intact) once resolved.
+                let count = self.take_count();
+                self.visual_search_return = Some(self.mode);
+                self.mode = Mode::Search;
+                self.command_buffer.clear();
+                self.command_cursor = 0;
+                self.search_direction = if unicode == Some('/') {
+                    SearchDirection::Forward
+                } else {
+                    SearchDirection::Backward
+                };
+                self.search_start_cursor = Some(self.view().cursor);
+                self.search_pending_count = count;
+            }
+            Some('n') | Some('N') => {
+                // vn/vN: extend the selection by repeating the last search.
+                let count = self.take_count();
+                let forward = unicode == Some('n');
+                for _ in 0..count {
+                    let go_forward = if forward {
+                        self.search_direction == SearchDirection::Forward
+                    } else {
+                        self.search_direction != SearchDirection::Forward
+                    };
+                    if go_forward {
+                        self.search_next();
+                    } else {
+                        self.search_prev();
+                    }
+                }
             }
             _ => match key_name {
                 "Left" => {
@@ -6762,253 +8515,206 @@ impl Engine {
     // Repeat command (.)
     // =======================================================================
 
-    pub(crate) fn repeat_last_change(&mut self, repeat_count: usize, changed: &mut bool) {
-        let change = match &self.last_change {
-            Some(c) => c.clone(),
-            None => return, // No change to repeat
+    /// Repeat the last dot-repeatable command (`.`).
+    ///
+    /// Unlike the old design (which reified a closed `ChangeOp`/`Motion` enum
+    /// and replayed *inserted text*), this replays the *recorded keystrokes*
+    /// of the last repeatable command through the same `handle_key` dispatcher
+    /// that produced it — see `record_dot_keystroke`/`finalize_dot_recording`
+    /// for how `last_dot_keys`/`last_dot_count` get set. Re-running the actual
+    /// keys re-derives the motion's extent live (at the new cursor position),
+    /// which is what lets this handle operator+motion, text objects, visual
+    /// operators, and insert-family commands uniformly, without per-command
+    /// replay logic.
+    ///
+    /// `override_count`, when `Some`, is the count given directly to `.`
+    /// (e.g. the `2` in `2.`) and *replaces* the count the original command
+    /// used, per `:h .`.
+    pub(crate) fn repeat_last_change(&mut self, override_count: Option<usize>, changed: &mut bool) {
+        let Some(keys) = self.last_dot_keys.clone() else {
+            return; // Nothing to repeat.
         };
 
-        let final_count = if repeat_count > 1 {
-            repeat_count
-        } else {
-            change.count
-        };
+        // `:h redo-register`: repeating a numbered-register paste ("1p, "2p, …)
+        // advances to the next register each time `.` is pressed.
+        let keys = Self::bump_numbered_register(&keys);
 
-        match change.op {
-            ChangeOp::Insert => {
-                // Repeat insert: insert the same text at current position
-                self.start_undo_group();
-                let line = self.view().cursor.line;
-                let col = self.view().cursor.col;
-                let char_idx = self.buffer().line_to_char(line) + col;
+        let effective_count = override_count.or(self.last_dot_count);
+        let mut replay = String::new();
+        if let Some(n) = effective_count {
+            replay.push_str(&n.to_string());
+        }
+        replay.push_str(&keys);
 
-                // Insert the text final_count times
-                let repeated_text = change.text.repeat(final_count);
-                self.insert_with_undo(char_idx, &repeated_text);
+        let pre_undo_len = self.active_buffer_state().undo_stack.len();
+        self.replay_dot_keys(&replay);
+        *changed = self.active_buffer_state().undo_stack.len() > pre_undo_len;
+    }
 
-                // Update cursor position based on inserted text
-                let newlines = repeated_text.matches('\n').count();
-                if newlines > 0 {
-                    self.view_mut().cursor.line += newlines;
-                    // Find column after last newline
-                    if let Some(last_nl) = repeated_text.rfind('\n') {
-                        self.view_mut().cursor.col = repeated_text[last_nl + 1..].chars().count();
-                    }
-                } else {
-                    self.view_mut().cursor.col += repeated_text.chars().count();
-                }
-                self.finish_undo_group();
-                *changed = true;
-            }
-            ChangeOp::Delete => {
-                // Repeat delete with motion — use final_count (not change.count)
-                // so that `4x` then `.` deletes 4 chars, and `2.` deletes 2 chars.
-                if let Some(motion) = &change.motion {
-                    self.start_undo_group();
-                    match motion {
-                        Motion::Right => {
-                            // Delete character(s) at cursor (like x)
-                            let line = self.view().cursor.line;
-                            let col = self.view().cursor.col;
-                            let char_idx = self.buffer().line_to_char(line) + col;
-                            let line_end = self.buffer().line_to_char(line)
-                                + self.buffer().line_len_chars(line);
-                            let available = line_end - char_idx;
-                            let to_delete = final_count.min(available);
+    /// `:h redo-register`: `"1p . .` pastes register 1, then 2, then 3, …
+    /// Only applies to a *numbered* register (1-9) used with `p`/`P`.
+    fn bump_numbered_register(keys: &str) -> String {
+        let mut chars: Vec<char> = keys.chars().collect();
+        if chars.len() >= 3
+            && chars[0] == '"'
+            && chars[1].is_ascii_digit()
+            && chars[1] != '9'
+            && matches!(chars[2], 'p' | 'P')
+        {
+            let d = chars[1].to_digit(10).unwrap();
+            chars[1] = std::char::from_digit(d + 1, 10).unwrap();
+        }
+        chars.into_iter().collect()
+    }
 
-                            if to_delete > 0 && char_idx < self.buffer().len_chars() {
-                                let deleted_chars: String = self
-                                    .buffer()
-                                    .content
-                                    .slice(char_idx..char_idx + to_delete)
-                                    .chars()
-                                    .collect();
-                                let reg = self.active_register();
-                                self.set_register(reg, deleted_chars, false);
-                                self.clear_selected_register();
-                                self.delete_with_undo(char_idx, char_idx + to_delete);
-                                self.clamp_cursor_col();
-                                *changed = true;
-                            }
-                        }
-                        Motion::DeleteLine => {
-                            // Repeat dd
-                            self.delete_lines(final_count, changed);
-                        }
-                        Motion::WordForward
-                        | Motion::WordBackward
-                        | Motion::WordEnd
-                        | Motion::WordBackwardEnd => {
-                            // Repeat dw/db/de/dge
-                            let m = match motion {
-                                Motion::WordForward => 'w',
-                                Motion::WordBackward => 'b',
-                                Motion::WordEnd => 'e',
-                                Motion::WordBackwardEnd => 'e', // ge uses 'e' in backward direction
-                                _ => unreachable!(),
-                            };
-                            self.apply_operator_with_motion('d', m, final_count, changed);
-                        }
-                        _ => {}
-                    }
-                    self.finish_undo_group();
-                }
+    /// Feed an encoded key-notation string (same alphabet as macro
+    /// recording/playback) through `handle_key`, one decoded keystroke at a
+    /// time. Used by `.` to replay a recorded command. Unlike macro playback
+    /// (`macro_playback_queue`/`advance_macro_playback`), this runs
+    /// synchronously to completion against a private queue, so it can't
+    /// interleave with — or be mistaken for — an in-progress macro recording
+    /// or playback.
+    pub(crate) fn replay_dot_keys(&mut self, keys: &str) {
+        // A macro records the keys the *user* typed. `.` is one such key, and
+        // `handle_key` has already appended it to `recording_buffer` by the
+        // time we get here — so the keys this replay synthesizes must not be
+        // appended as well, or `qax.jq` records `x.xj` instead of `x.j` and
+        // `@a` then performs one edit too many (#803).
+        let saved_recording = self.macro_recording.take();
+        let mut queue: VecDeque<char> = keys.chars().collect();
+        while let Some((key_name, unicode, ctrl, consume)) = self.decode_key_from_queue(&queue) {
+            for _ in 0..consume {
+                queue.pop_front();
             }
-            ChangeOp::Change => {
-                // Repeat c{motion}: delete the motion range, then insert the text.
-                if let Some(motion) = &change.motion {
-                    for _ in 0..final_count {
-                        let motion_char = match motion {
-                            Motion::WordForward => 'w',
-                            Motion::WordEnd => 'e',
-                            Motion::WordBackward => 'b',
-                            _ => continue,
-                        };
-                        // Reuse the same code path as the original cw/ce/cb:
-                        // apply_operator_with_motion deletes the range and enters
-                        // insert mode.  We then immediately insert the recorded
-                        // text and return to normal mode instead.
-                        let start_cursor = self.view().cursor;
-                        let start_pos =
-                            self.buffer().line_to_char(start_cursor.line) + start_cursor.col;
-                        let total = self.buffer().len_chars();
+            self.macro_recursion_depth += 1;
+            self.handle_key(&key_name, unicode, ctrl);
+            self.macro_recursion_depth -= 1;
+            if self.macro_recursion_depth >= MAX_MACRO_RECURSION {
+                break;
+            }
+        }
+        // Only restore if the replay didn't itself start a recording (it
+        // cannot in practice — `q` is not dot-repeatable — but never clobber
+        // live state on the way out).
+        if self.macro_recording.is_none() {
+            self.macro_recording = saved_recording;
+        }
+    }
 
-                        // For cw dot repeat, use cw-special logic: find end of
-                        // word without eating trailing whitespace.
-                        let delete_end = if motion_char == 'w' || motion_char == 'W' {
-                            let bigword = motion_char == 'W';
-                            let mut end = start_pos;
-                            for i in 0..change.count {
-                                if bigword {
-                                    while end < total
-                                        && !self.buffer().content.char(end).is_whitespace()
-                                    {
-                                        end += 1;
-                                    }
-                                } else {
-                                    while end < total
-                                        && is_word_char(self.buffer().content.char(end))
-                                    {
-                                        end += 1;
-                                    }
-                                }
-                                if i + 1 < change.count {
-                                    while end < total
-                                        && self.buffer().content.char(end).is_whitespace()
-                                    {
-                                        end += 1;
-                                    }
-                                }
-                            }
-                            end
-                        } else {
-                            for _ in 0..change.count {
-                                match motion_char {
-                                    'b' => self.move_word_backward(),
-                                    'e' => self.move_word_end(),
-                                    _ => {}
-                                }
-                            }
-                            let end_cursor = self.view().cursor;
-                            let end_pos =
-                                self.buffer().line_to_char(end_cursor.line) + end_cursor.col;
-                            self.view_mut().cursor = start_cursor;
-                            if motion_char == 'e' {
-                                (end_pos + 1).min(total)
-                            } else {
-                                end_pos
-                            }
-                        };
-                        if start_pos < delete_end {
-                            self.start_undo_group();
-                            self.delete_with_undo(start_pos, delete_end);
-                            if !change.text.is_empty() {
-                                self.insert_with_undo(start_pos, &change.text);
-                                let inserted_chars = change.text.chars().count();
-                                let newlines = change.text.matches('\n').count();
-                                if newlines > 0 {
-                                    self.view_mut().cursor.line += newlines;
-                                    if let Some(last_nl) = change.text.rfind('\n') {
-                                        self.view_mut().cursor.col =
-                                            change.text[last_nl + 1..].chars().count();
-                                    }
-                                } else {
-                                    self.view_mut().cursor.col += inserted_chars;
-                                }
-                            }
-                            self.clamp_cursor_col();
-                            self.finish_undo_group();
-                            *changed = true;
-                        }
-                    }
-                }
-            }
-            ChangeOp::Substitute => {
-                // Repeat s command
-                for _ in 0..final_count {
-                    let line = self.view().cursor.line;
-                    let col = self.view().cursor.col;
-                    let max_col = self.get_max_cursor_col(line);
-                    if max_col > 0 || self.buffer().line_len_chars(line) > 0 {
-                        let char_idx = self.buffer().line_to_char(line) + col;
-                        let line_end =
-                            self.buffer().line_to_char(line) + self.buffer().line_len_chars(line);
-                        let available = line_end - char_idx;
-                        let to_delete = change.count.min(available);
+    /// True when we're at a point where a brand-new dot-repeatable command
+    /// could start: Normal mode, and no operator/motion/text-object/register
+    /// prefix is still waiting on more keys.
+    pub(crate) fn is_dot_repeat_neutral(&self) -> bool {
+        self.mode == Mode::Normal
+            && self.pending_key.is_none()
+            && self.pending_operator.is_none()
+            && self.pending_find_operator.is_none()
+            && self.pending_text_object.is_none()
+    }
 
-                        self.start_undo_group();
-                        if to_delete > 0 && char_idx < self.buffer().len_chars() {
-                            self.delete_with_undo(char_idx, char_idx + to_delete);
-                            *changed = true;
-                        }
+    /// Fold one dispatched keystroke into the in-progress dot-repeat
+    /// candidate, called after every keystroke that isn't excluded outright
+    /// (Command/Search mode, or the `.` trigger itself — see the call site in
+    /// `handle_key`).
+    ///
+    /// The candidate spans from the first keystroke that leaves a "neutral"
+    /// state (see `is_dot_repeat_neutral`) through the next return to
+    /// neutral. At that point it's either finalized as the new `.` target (if
+    /// any keystroke in the span produced an undo-tracked edit) or discarded
+    /// (if not — e.g. a bare motion, or an operator that got cancelled).
+    ///
+    /// A neutral keystroke that neither starts a command nor changes
+    /// anything (a plain motion like `j`) is never buffered at all, *unless*
+    /// it's a count digit — digits must be held so they can prefix whatever
+    /// real command follows (`2dd`), and a bare `"`+register prefix must
+    /// likewise be held (checked via `has_pending_prefix` below) since
+    /// neither leaves any other trace once consumed.
+    fn record_dot_keystroke(
+        &mut self,
+        key_name: &str,
+        unicode: Option<char>,
+        ctrl: bool,
+        was_neutral: bool,
+        did_change: bool,
+    ) {
+        let now_neutral = self.is_dot_repeat_neutral();
 
-                        // Insert the recorded text
-                        if !change.text.is_empty() {
-                            self.insert_with_undo(char_idx, &change.text);
-                            *changed = true;
-                        }
-                        self.finish_undo_group();
-                    }
-                }
+        // `@x` / `@@` / `@:` runs *other* keys; per `:h .` the repeat target is
+        // whatever change those keys make, never the `@` command itself. For a
+        // register macro that falls out for free (`play_macro` only queues the
+        // keys, which are recorded when `macro_playback_queue` is later pumped
+        // through `handle_key`), but `@:` re-runs the ex command inline — and
+        // an ex command is not dot-repeatable at all — so `.` after `:d<CR>@:`
+        // must not delete a third line (#803). Drop the whole `@…` span.
+        if self.pending_key == Some('@') {
+            self.dot_skip_command = true;
+        }
+        if self.dot_skip_command {
+            if now_neutral {
+                self.dot_skip_command = false;
+                self.dot_scratch.clear();
+                self.dot_scratch_any_change = false;
             }
-            ChangeOp::SubstituteLine | ChangeOp::DeleteToEnd | ChangeOp::ChangeToEnd => {
-                // Handle other operations
+            return;
+        }
+
+        if was_neutral && self.dot_scratch.is_empty() && !did_change && now_neutral {
+            let is_count_digit =
+                unicode.map(|c| c.is_ascii_digit()).unwrap_or(false) && self.pending_key.is_none();
+            if !is_count_digit {
+                // A neutral no-op (plain cursor motion, etc.) — nothing to record.
+                return;
             }
-            ChangeOp::Replace => {
-                // Repeat r command — final_count is the number of chars to replace
-                if let Some(replacement_char) = change.text.chars().next() {
-                    self.start_undo_group();
-                    self.replace_chars(replacement_char, final_count, changed);
-                    self.finish_undo_group();
-                }
-            }
-            ChangeOp::ToggleCase => {
-                // Repeat ~ command
-                for _ in 0..final_count {
-                    self.toggle_case_at_cursor(change.count, changed);
-                }
-            }
-            ChangeOp::Join => {
-                // Repeat J command
-                for _ in 0..final_count {
-                    self.join_lines(change.count, changed);
-                }
-            }
-            ChangeOp::Indent => {
-                // Repeat >> command
-                let line = self.view().cursor.line;
-                for _ in 0..final_count {
-                    self.indent_lines(line, change.count, changed);
-                }
-            }
-            ChangeOp::Dedent => {
-                // Repeat << command
-                let line = self.view().cursor.line;
-                for _ in 0..final_count {
-                    self.dedent_lines(line, change.count, changed);
+        }
+
+        let encoded = self.encode_key_for_macro(key_name, unicode, ctrl);
+        for ch in encoded.chars() {
+            self.dot_scratch.push(ch);
+        }
+        self.dot_scratch_any_change |= did_change;
+
+        if now_neutral {
+            if self.dot_scratch_any_change {
+                self.finalize_dot_recording();
+            } else {
+                // Back to neutral with nothing changed yet. Keep the buffer
+                // alive only if there's a reason to believe a real command is
+                // still coming (a count and/or register prefix was consumed
+                // but not yet used) — otherwise this was a dead end (e.g. a
+                // cancelled operator) and shouldn't leak into the future.
+                let has_pending_prefix = self.count.is_some()
+                    || self.operator_count.is_some()
+                    || self.selected_register.is_some();
+                if !has_pending_prefix {
+                    self.dot_scratch.clear();
                 }
             }
         }
+    }
+
+    /// Finalize `dot_scratch` as the new `.` target: split off a purely
+    /// leading run of count digits (if any) into `last_dot_count` so `.` can
+    /// override it independently, and store the rest as `last_dot_keys`.
+    fn finalize_dot_recording(&mut self) {
+        let raw: String = self.dot_scratch.drain(..).collect();
+        self.dot_scratch_any_change = false;
+
+        let digit_prefix_len = raw.chars().take_while(|c| c.is_ascii_digit()).count();
+        if digit_prefix_len > 0 && digit_prefix_len < raw.chars().count() {
+            let split_at = raw
+                .char_indices()
+                .nth(digit_prefix_len)
+                .map(|(i, _)| i)
+                .unwrap_or(raw.len());
+            let (count_str, rest) = raw.split_at(split_at);
+            if let Ok(n) = count_str.parse::<usize>() {
+                self.last_dot_count = Some(n);
+                self.last_dot_keys = Some(rest.to_string());
+                return;
+            }
+        }
+        self.last_dot_count = None;
+        self.last_dot_keys = Some(raw);
     }
 
     /// Available commands for auto-completion
@@ -7212,6 +8918,8 @@ impl Engine {
             "ic",
             "smartcase",
             "scs",
+            "startofline",
+            "sol",
             "cursorline",
             "cul",
             "autoread",
@@ -7424,7 +9132,7 @@ impl Engine {
         }
 
         // No match and no prefix. Replay buffered keys.
-        let buf: Vec<String> = self.keymap_buf.drain(..).collect();
+        let buf: Vec<String> = std::mem::take(&mut self.keymap_buf);
         if buf.len() <= 1 {
             // Single key, no match — fall through to built-in handling
             return None;
@@ -7673,7 +9381,6 @@ impl Engine {
     /// Paste the first line from the system clipboard into the command buffer.
     /// Works in Command and Search modes. For Search mode with incremental search,
     /// also triggers a search update.
-    #[allow(dead_code)]
     pub fn paste_clipboard_to_input(&mut self) {
         let text = match self.clipboard_read {
             Some(ref cb_read) => match cb_read() {
@@ -7708,10 +9415,10 @@ impl Engine {
 
     /// Route pasted text to the correct input context.
     ///
-    /// Checks active contexts in priority order (terminal, picker, search,
-    /// SC commit, extension sidebar, AI chat) before falling through to
-    /// mode-based dispatch. Both backends call this instead of reimplementing
-    /// the priority chain.
+    /// Checks active contexts in priority order (terminal, picker, explorer
+    /// rename, search, SC commit, extension sidebar, AI chat) before falling
+    /// through to mode-based dispatch. Both backends call this instead of
+    /// reimplementing the priority chain.
     pub fn route_paste(&mut self, text: &str) {
         let first_line = text.lines().next().unwrap_or("");
 
@@ -7723,11 +9430,20 @@ impl Engine {
                     }
                 }
             } else if !text.is_empty() {
-                self.terminal_write(b"\x1b[200~");
-                self.terminal_write(text.as_bytes());
-                self.terminal_write(b"\x1b[201~");
-                self.poll_terminal();
+                self.terminal_paste(text);
             }
+            return;
+        }
+
+        // Find/replace overlay. Checked ahead of `picker_open` — same
+        // relative priority `Engine::handle_key` gives the two overlays
+        // (`find_replace_open` is tested before `picker_open` there too;
+        // #946 discovery: this branch used to be entirely missing, so
+        // Ctrl+V while the overlay was open fell through to the
+        // `Mode::Normal` arm below and pasted into the editor buffer
+        // instead of the focused query/replacement field).
+        if self.find_replace_open {
+            self.find_replace_paste(text);
             return;
         }
 
@@ -7741,6 +9457,28 @@ impl Engine {
             self.picker_scroll_top = 0;
             self.picker_filter();
             self.picker_load_preview();
+            return;
+        }
+
+        // Tree inline-edit (explorer rename). Mirrors the selection-replace
+        // + insert behaviour `handle_explorer_rename_key`'s own `ctrl+v`
+        // branch already has — that branch reads `self.clipboard_read`
+        // directly and only ever fired from a raw `KeyPressed("v", ctrl)`,
+        // which quadraui's GTK runner no longer delivers (#593: Ctrl+V is
+        // intercepted and turned into this fn's `text` argument instead).
+        if let Some(state) = self.explorer_rename.as_mut() {
+            if !first_line.is_empty() {
+                if let Some(anchor) = state.selection_anchor.take() {
+                    let lo = anchor.min(state.cursor);
+                    let hi = anchor.max(state.cursor);
+                    if lo != hi {
+                        state.input.drain(lo..hi);
+                        state.cursor = lo;
+                    }
+                }
+                state.input.insert_str(state.cursor, first_line);
+                state.cursor += first_line.len();
+            }
             return;
         }
 
@@ -7772,12 +9510,31 @@ impl Engine {
             return;
         }
 
-        if self.ai_has_focus && self.ai_input_active {
-            for c in first_line.chars() {
-                if !c.is_control() {
-                    self.ai_input.push(c);
-                }
-            }
+        if self.ai_has_focus {
+            let filtered: String = first_line.chars().filter(|c| !c.is_control()).collect();
+            self.ai_chat.borrow_mut().input_insert_str(&filtered);
+            return;
+        }
+
+        // Settings panel search/edit input (#937 discovery, quadraui pin bump
+        // to 68f0ef9). Before that bump, TUI's own dispatch caught the raw
+        // `Ctrl+V` `KeyPressed` ahead of this function
+        // (`shell_app.rs::handle_key_pressed`'s `FocusKeyRoute::Settings`
+        // arm) and called `settings_paste` directly — this function never
+        // saw a settings-panel paste at all, so it never needed this branch.
+        // quadraui#813 moved Ctrl-V/Ctrl-Shift-V interception into the
+        // shared `runtime::preprocess_event` every backend's
+        // `dispatch_event` (TUI included, for the first time) now runs
+        // *before* `AppLogic::handle`, so the raw keypress no longer reaches
+        // that TUI-only arm — every Ctrl-V now arrives here as `route_paste`'s
+        // `text` argument instead, on every backend uniformly. Without this
+        // branch, a Settings-panel paste would fall through to the
+        // mode-based match below (whatever `self.mode` happens to be behind
+        // the panel) instead of the settings input the user is looking at.
+        // `settings_paste` already no-ops if neither settings state is
+        // active, so this mirrors `ai_has_focus` above exactly.
+        if self.settings_input_active || self.settings_editing.is_some() {
+            self.settings_paste(text);
             return;
         }
 
@@ -7816,8 +9573,8 @@ impl Engine {
         let existing_lw = self
             .registers
             .get(&'"')
-            .map(|(reg_content, lw)| {
-                if !*lw {
+            .map(|(reg_content, ty)| {
+                if !ty.is_linewise() {
                     return false;
                 }
                 // Compare without trailing \n — clipboard may strip it
@@ -7834,9 +9591,11 @@ impl Engine {
             text
         };
 
-        self.registers.insert('"', (text.clone(), existing_lw));
-        self.registers.insert('+', (text.clone(), false));
-        self.registers.insert('*', (text, false));
+        self.registers
+            .insert('"', (text.clone(), RegType::from_linewise(existing_lw)));
+        self.registers
+            .insert('+', (text.clone(), RegType::Charwise));
+        self.registers.insert('*', (text, RegType::Charwise));
     }
 
     /// Returns `true` if the upcoming key is a paste that needs system clipboard
@@ -7868,8 +9627,9 @@ impl Engine {
     pub fn prepare_paste_clipboard(&mut self, clipboard_text: Option<String>) {
         if let Some(text) = clipboard_text.filter(|t| !t.is_empty()) {
             if self.is_vscode_mode() {
-                self.registers.insert('+', (text.clone(), false));
-                self.registers.insert('"', (text, false));
+                self.registers
+                    .insert('+', (text.clone(), RegType::Charwise));
+                self.registers.insert('"', (text, RegType::Charwise));
             } else {
                 self.load_clipboard_for_paste(text);
             }
@@ -7943,7 +9703,7 @@ impl Engine {
     }
 
     /// Drain the macro playback queue, executing each queued keystroke.
-    fn drain_macro_queue(&mut self) {
+    pub(crate) fn drain_macro_queue(&mut self) {
         // Guard against infinite recursion from self-referencing macros
         let max_iterations = 100_000;
         let mut iterations = 0;

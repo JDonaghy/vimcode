@@ -239,6 +239,18 @@ impl Engine {
             "q" | "Escape" => {
                 self.ext_panel_has_focus = false;
             }
+            "h" | "Left" => {
+                // Leave this panel and focus the activity bar at the matching row.
+                // Uses the same sorted-index mapping as the activity bar primitive.
+                let mut ext_names: Vec<_> = self.ext_panels.keys().cloned().collect();
+                ext_names.sort();
+                let idx = ext_names
+                    .iter()
+                    .position(|n| self.ext_panel_active.as_deref() == Some(n.as_str()))
+                    .unwrap_or(0);
+                self.ext_panel_has_focus = false;
+                self.activity_bar_focus_in_at(8 + idx as u16);
+            }
             "j" | "Down" => {
                 let max = self.ext_panel_flat_len();
                 if max > 0 && self.ext_panel_selected + 1 < max {
@@ -616,12 +628,15 @@ impl Engine {
         item_index: usize,
         markdown: &str,
     ) {
-        let rendered = crate::core::markdown::render_markdown(markdown);
-        let links = Self::extract_hover_links(&rendered);
+        let markdown = crate::core::markdown::linkify_bare_urls(markdown);
+        let (line_text, links, code_highlights) =
+            crate::core::markdown::hover_markdown_structure(&markdown);
         // Dismiss any active editor hover to avoid overlapping popups.
         self.dismiss_editor_hover();
         self.panel_hover = Some(PanelHoverPopup {
-            rendered,
+            markdown,
+            line_text,
+            code_highlights,
             links,
             panel_name: panel_name.to_string(),
             item_id: item_id.to_string(),
@@ -1123,46 +1138,30 @@ impl Engine {
         take_focus: bool,
         add_goto_links: bool,
     ) {
-        let mut rendered = crate::core::markdown::render_markdown(markdown);
-        let mut links = Self::extract_hover_links(&rendered);
+        let mut full_markdown = markdown.to_string();
 
         // Append "Go to" navigation links after actual LSP content (vim mode only).
+        // Emitted as real `[label](url)` markdown — quadraui's renderer
+        // (adopted below, #821) parses these into clickable links itself,
+        // so no manual span bookkeeping is needed here.
         if add_goto_links && !self.is_vscode_mode() {
             let goto = self.lsp_goto_links();
             if !goto.is_empty() {
-                use crate::core::markdown::{MdSpan, MdStyle};
-                // Separator line.
-                rendered.lines.push(String::new());
-                rendered.spans.push(Vec::new());
-                rendered.code_highlights.push(Vec::new());
-                // Build: "Go to Definition (:gd) | Type Definition (:gy) | ..."
-                // "Go to" is default fg; labels are link-colored and clickable.
-                let nav_line_idx = rendered.lines.len();
-                let mut nav_text = String::from("Go to ");
-                let mut nav_spans = Vec::new();
+                full_markdown.push_str("\n\nGo to ");
                 for (i, (label, keybind, url)) in goto.iter().enumerate() {
                     if i > 0 {
-                        nav_text.push_str(" | ");
+                        full_markdown.push_str(" | ");
                     }
-                    let start = nav_text.len();
-                    nav_text.push_str(label);
-                    let end = nav_text.len();
-                    nav_spans.push(MdSpan {
-                        start_byte: start,
-                        end_byte: end,
-                        style: MdStyle::Link,
-                    });
-                    links.push((nav_line_idx, start, end, url.to_string()));
-                    nav_text.push_str(&format!(" (:{})", keybind));
+                    full_markdown.push_str(&format!("[{label}]({url}) (:{keybind})"));
                 }
-                rendered.lines.push(nav_text);
-                rendered.spans.push(nav_spans);
-                rendered.code_highlights.push(Vec::new());
             }
         }
 
-        let popup_width = rendered
-            .lines
+        let full_markdown = crate::core::markdown::linkify_bare_urls(&full_markdown);
+        let (line_text, links, code_highlights) =
+            crate::core::markdown::hover_markdown_structure(&full_markdown);
+
+        let popup_width = line_text
             .iter()
             .map(|l| l.chars().count())
             .max()
@@ -1175,7 +1174,9 @@ impl Engine {
         // Dismiss any active panel hover to avoid overlapping popups.
         self.dismiss_panel_hover_now();
         self.editor_hover = Some(EditorHoverPopup {
-            rendered,
+            markdown: full_markdown,
+            line_text,
+            code_highlights,
             links,
             anchor_line,
             anchor_col,
@@ -1271,7 +1272,7 @@ impl Engine {
             "j" | "Down" => {
                 // Scroll down — stop when last line is visible
                 if let Some(hover) = &mut self.editor_hover {
-                    let max_scroll = hover.rendered.lines.len().saturating_sub(20);
+                    let max_scroll = hover.line_text.len().saturating_sub(20);
                     if hover.scroll_top < max_scroll {
                         hover.scroll_top += 1;
                     }
@@ -1401,7 +1402,7 @@ impl Engine {
     /// Returns true if the popup was scrolled.
     pub fn editor_hover_scroll(&mut self, delta: i32) -> bool {
         if let Some(hover) = &mut self.editor_hover {
-            let max_scroll = hover.rendered.lines.len().saturating_sub(20);
+            let max_scroll = hover.line_text.len().saturating_sub(20);
             if delta > 0 {
                 let new = (hover.scroll_top + delta as usize).min(max_scroll);
                 if new != hover.scroll_top {
@@ -1425,7 +1426,7 @@ impl Engine {
     /// from `quadraui::dispatch_mouse_drag` into this call (#215).
     pub fn editor_hover_set_scroll(&mut self, new_offset: usize) -> bool {
         if let Some(hover) = &mut self.editor_hover {
-            let max_scroll = hover.rendered.lines.len().saturating_sub(20);
+            let max_scroll = hover.line_text.len().saturating_sub(20);
             let clamped = new_offset.min(max_scroll);
             if clamped != hover.scroll_top {
                 hover.scroll_top = clamped;
@@ -1447,9 +1448,9 @@ impl Engine {
     pub fn hover_selection_text(&self) -> Option<String> {
         let hover = self.editor_hover.as_ref()?;
         let text = if let Some(ref sel) = hover.selection {
-            sel.extract_text(&hover.rendered.lines)
+            sel.extract_text(&hover.line_text)
         } else {
-            hover.rendered.lines.join("\n")
+            hover.line_text.join("\n")
         };
         if text.is_empty() {
             None
@@ -2862,9 +2863,12 @@ impl Engine {
 
     // ── AI assistant panel ─────────────────────────────────────────────────────
 
-    /// Send the current `ai_input` as a user message; clears input and spawns background thread.
-    pub fn ai_send_message(&mut self) {
-        let text = self.ai_input.trim().to_string();
+    /// Send `text` as a user message; spawns the background request thread.
+    /// Callers (`ChatControllerEvent::Submit` dispatch, the `:AI` command,
+    /// the palette's `chat_send:` action) own clearing whatever input widget
+    /// held the text — this only mutates the conversation/request state.
+    pub fn ai_send_message(&mut self, text: String) {
+        let text = text.trim().to_string();
         if text.is_empty() || self.ai_streaming {
             return;
         }
@@ -2872,8 +2876,6 @@ impl Engine {
             role: "user".to_string(),
             content: text,
         });
-        self.ai_input.clear();
-        self.ai_input_cursor = 0;
         self.ai_streaming = true;
 
         let provider = self.settings.ai_provider.clone();
@@ -2892,9 +2894,6 @@ impl Engine {
             );
             let _ = tx.send(result);
         });
-
-        // Scroll to bottom so the user sees the new message
-        self.ai_scroll_top = self.ai_messages.len().saturating_sub(1);
     }
 
     /// Non-blocking poll for a completed AI response. Returns `true` if something changed.
@@ -2915,7 +2914,6 @@ impl Engine {
                     role: "assistant".to_string(),
                     content: reply,
                 });
-                self.ai_scroll_top = self.ai_messages.len().saturating_sub(1);
             }
             Err(e) => {
                 self.message = format!("AI error: {e}");
@@ -2929,116 +2927,41 @@ impl Engine {
         self.ai_messages.clear();
         self.ai_rx = None;
         self.ai_streaming = false;
-        self.ai_scroll_top = 0;
+        self.ai_chat.borrow_mut().set_transcript_scroll_top(0);
         self.message = "AI conversation cleared.".to_string();
     }
 
-    /// Handle keyboard input for the AI sidebar panel.
-    /// Returns `true` if the key was consumed.
-    /// Insert text at the current ai_input cursor position (used for paste).
-    pub fn ai_insert_text(&mut self, text: &str) {
-        let byte = cmd_char_to_byte(&self.ai_input, self.ai_input_cursor);
-        self.ai_input.insert_str(byte, text);
-        self.ai_input_cursor += text.chars().count();
-    }
-
-    pub fn handle_ai_panel_key(&mut self, key: &str, ctrl: bool, unicode: Option<char>) -> bool {
-        if self.ai_input_active {
-            let char_len = self.ai_input.chars().count();
-            match key {
-                "Escape" => {
-                    self.ai_input_active = false;
-                }
-                "Return" if !ctrl => {
-                    self.ai_send_message();
-                    self.ai_input_active = false;
-                }
-                "BackSpace" => {
-                    if self.ai_input_cursor > 0 {
-                        self.ai_input_cursor -= 1;
-                        let byte = cmd_char_to_byte(&self.ai_input, self.ai_input_cursor);
-                        let next = cmd_char_to_byte(&self.ai_input, self.ai_input_cursor + 1);
-                        self.ai_input.drain(byte..next);
-                    }
-                }
-                "Delete" => {
-                    if self.ai_input_cursor < char_len {
-                        let byte = cmd_char_to_byte(&self.ai_input, self.ai_input_cursor);
-                        let next = cmd_char_to_byte(&self.ai_input, self.ai_input_cursor + 1);
-                        self.ai_input.drain(byte..next);
-                    }
-                }
-                "Left" => {
-                    self.ai_input_cursor = self.ai_input_cursor.saturating_sub(1);
-                }
-                "Right" => {
-                    self.ai_input_cursor = (self.ai_input_cursor + 1).min(char_len);
-                }
-                "Home" => {
-                    self.ai_input_cursor = 0;
-                }
-                "End" => {
-                    self.ai_input_cursor = char_len;
-                }
-                _ if ctrl && key == "a" => {
-                    self.ai_input_cursor = 0;
-                }
-                _ if ctrl && key == "e" => {
-                    self.ai_input_cursor = char_len;
-                }
-                _ if ctrl && key == "k" => {
-                    let byte = cmd_char_to_byte(&self.ai_input, self.ai_input_cursor);
-                    self.ai_input.truncate(byte);
-                }
-                _ => {
-                    if let Some(ch) = unicode {
-                        if !ch.is_control() {
-                            let byte = cmd_char_to_byte(&self.ai_input, self.ai_input_cursor);
-                            self.ai_input.insert(byte, ch);
-                            self.ai_input_cursor += 1;
-                        }
-                    }
-                }
+    /// Apply a [`quadraui::ChatControllerEvent`] the AI panel's `ChatController`
+    /// (`self.ai_chat`) returned from `handle()`. Shared by GTK and TUI via
+    /// `render::route_ai_chat_event` (#819 — the ChatController adoption that
+    /// replaced this panel's hand-rolled `handle_ai_panel_key`/`ai_insert_text`).
+    ///
+    /// Returns whether the panel should keep keyboard focus — `false` only on
+    /// `Cancelled` (Escape), mirroring every other panel's "Escape leaves the
+    /// panel" convention now that the always-focused `ChatController` input has
+    /// no separate "not editing" mode to fall back into.
+    pub fn dispatch_ai_chat_event(&mut self, event: quadraui::ChatControllerEvent) -> bool {
+        use quadraui::ChatControllerEvent as Ev;
+        match event {
+            Ev::Submit { text } => {
+                self.ai_send_message(text);
+                self.ai_chat.borrow_mut().clear_input();
+                true
             }
-            return true;
-        }
-
-        match key {
-            "q" | "Escape" => {
+            Ev::Cancelled => {
                 self.ai_has_focus = false;
-                true
+                false
             }
-            "h" | "Left" if !ctrl => {
-                self.ai_has_focus = false;
-                self.activity_bar_focus_in_at(6);
-                true
-            }
-            "i" | "a" | "Return" => {
-                self.ai_input_active = true;
-                true
-            }
-            "j" | "Down" => {
-                self.ai_scroll_top = self.ai_scroll_top.saturating_add(1);
-                true
-            }
-            "k" | "Up" => {
-                self.ai_scroll_top = self.ai_scroll_top.saturating_sub(1);
-                true
-            }
-            "G" => {
-                self.ai_scroll_top = self.ai_messages.len().saturating_sub(1);
-                true
-            }
-            "g" => {
-                self.ai_scroll_top = 0;
-                true
-            }
-            "c" if ctrl => {
-                // Ctrl-C: clear conversation
+            // Ctrl+C: clear the conversation. `ChatController` has no
+            // built-in binding for it (only Escape/Ctrl+S/Alt+Enter/
+            // Ctrl+Enter/PageUp/PageDown/Ctrl+A/Ctrl+E are handled
+            // internally), so it falls to this app-hotkey escape hatch,
+            // exactly as its own doc comment recommends.
+            Ev::KeyPressed { key, modifiers } if modifiers.ctrl && key == "Char('c')" => {
                 self.ai_clear();
                 true
             }
-            _ => false,
+            _ => true,
         }
     }
 

@@ -116,7 +116,7 @@ pub struct DapServer {
 impl DapServer {
     /// Launch a debug adapter process that communicates over stdin/stdout.
     pub fn spawn(cmd: &str, args: &[&str]) -> Result<Self, String> {
-        let mut command = std::process::Command::new(cmd);
+        let mut command = crate::core::git::hidden_command_new_process_group(cmd);
         command
             .args(args)
             .stdin(std::process::Stdio::piped())
@@ -137,12 +137,6 @@ impl DapServer {
                     Ok(())
                 });
             }
-        }
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            // CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW
-            command.creation_flags(0x00000200 | 0x08000000);
         }
         let mut child = command
             .spawn()
@@ -203,7 +197,7 @@ impl DapServer {
             v
         };
 
-        let mut tcp_command = std::process::Command::new(cmd);
+        let mut tcp_command = crate::core::git::hidden_command_new_process_group(cmd);
         tcp_command
             .args(&resolved_args)
             .stdin(std::process::Stdio::null())
@@ -218,12 +212,6 @@ impl DapServer {
                     Ok(())
                 });
             }
-        }
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            // CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW
-            tcp_command.creation_flags(0x00000200 | 0x08000000);
         }
         let child = tcp_command
             .spawn()

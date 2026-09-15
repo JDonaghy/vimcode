@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read as IoRead, Write as IoWrite};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -341,7 +341,11 @@ pub fn decode_semantic_tokens(raw: &[u32], legend: &SemanticTokensLegend) -> Vec
     let mut line: u32 = 0;
     let mut start_char: u32 = 0;
 
-    for chunk in raw.chunks_exact(5) {
+    // `as_chunks::<5>().0` rather than `chunks_exact(5)`: same semantics (a
+    // trailing partial group is dropped) but the compiler sees a `&[u32; 5]`,
+    // so the five indexings below need no bounds checks. Required by clippy
+    // 1.98's `chunks_exact_to_as_chunks` lint.
+    for chunk in raw.as_chunks::<5>().0 {
         let delta_line = chunk[0];
         let delta_start = chunk[1];
         let length = chunk[2];
@@ -915,7 +919,7 @@ impl LspServer {
         root_path: &Path,
         event_tx: Sender<LspEvent>,
     ) -> Result<Self, String> {
-        let mut cmd = Command::new(&config.command);
+        let mut cmd = crate::core::git::hidden_command_new_process_group(&config.command);
         cmd.args(&config.args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -929,12 +933,6 @@ impl LspServer {
                     Ok(())
                 });
             }
-        }
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            // CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW
-            cmd.creation_flags(0x00000200 | 0x08000000);
         }
         let mut child = cmd
             .spawn()

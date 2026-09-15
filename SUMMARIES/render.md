@@ -1,6 +1,22 @@
-# src/render.rs — ~14,155 lines
+# src/render.rs — 27,211 lines (~21,405 production)
 
-Platform-agnostic rendering abstraction. Transforms engine state into `ScreenLayout` consumed by both GTK and TUI backends. Contains all themes, render data structs, and the main layout builder.
+Platform-agnostic rendering abstraction, and since #751–#766 **the place every
+cross-backend decision is made**. Transforms engine state into `ScreenLayout`
+consumed by both backends; contains all themes, render data structs, the main
+layout builder, the shared mouse and keyboard routers, and `FrameOp` /
+`compose_frame` — the single frame sequence both backends walk.
+
+It grew **+5,847** production lines over the convergence chain (`6875315` →
+`eedebf8`) while the two backends shrank only **728** — a net **+5,119** across the
+three files; that trade is the subject of `GOALS.md`'s post-#735 audit. (The
++6,396/−3,656 pair this file used to carry spans 08-31 → 09-03, which pools in
+#722–#732's dead-code deletion and is not the chain.) Four of the nine recorded *"one-sided / do not converge"*
+verdicts live here.
+
+> The catalogue below predates the convergence chain and is **incomplete** for
+> the router and frame-composition surface added by #751–#766. Locate by symbol
+> (`grep -n "fn compose_frame" src/render.rs`) rather than trusting it to be
+> exhaustive.
 
 ## Key Types — Colors & Styling
 - `Color` — RGB color with hex parsing, lighten/darken, `cursorline_tint()`, Cairo/Pango conversion

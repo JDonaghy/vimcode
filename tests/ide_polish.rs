@@ -9,6 +9,20 @@ fn ensure_normal(e: &mut vimcode_core::Engine) {
     }
 }
 
+/// Build an engine with auto-pairing explicitly enabled.
+///
+/// #800: `auto_pairs` is now mode-derived — the default (`EditorMode::Vim`)
+/// resolves it *off*, matching real Vim. The behavioural tests below exercise
+/// the auto-pair machinery itself, so they opt in with an explicit override
+/// (exactly what a user typing `:set autopairs` gets). The mode-derived
+/// default itself is covered by `test_auto_pair_default_off_in_vim_mode` /
+/// `test_auto_pair_default_on_in_vscode_mode`.
+fn engine_with_autopairs(text: &str) -> vimcode_core::Engine {
+    let mut e = engine_with(text);
+    e.settings.auto_pairs = Some(true);
+    e
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // Feature 1: Indent Guides
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -167,7 +181,7 @@ fn test_bracket_match_query() {
 
 #[test]
 fn test_auto_pair_paren() {
-    let mut e = engine_with("");
+    let mut e = engine_with_autopairs("");
     ensure_normal(&mut e);
     set_content(&mut e, "\n");
     press(&mut e, 'i'); // enter insert mode
@@ -178,7 +192,7 @@ fn test_auto_pair_paren() {
 
 #[test]
 fn test_auto_pair_bracket() {
-    let mut e = engine_with("");
+    let mut e = engine_with_autopairs("");
     ensure_normal(&mut e);
     set_content(&mut e, "\n");
     press(&mut e, 'i');
@@ -189,7 +203,7 @@ fn test_auto_pair_bracket() {
 
 #[test]
 fn test_auto_pair_curly() {
-    let mut e = engine_with("");
+    let mut e = engine_with_autopairs("");
     ensure_normal(&mut e);
     set_content(&mut e, "\n");
     press(&mut e, 'i');
@@ -200,7 +214,7 @@ fn test_auto_pair_curly() {
 
 #[test]
 fn test_auto_pair_skip_over_closing() {
-    let mut e = engine_with("");
+    let mut e = engine_with_autopairs("");
     ensure_normal(&mut e);
     set_content(&mut e, "\n");
     press(&mut e, 'i');
@@ -214,7 +228,7 @@ fn test_auto_pair_skip_over_closing() {
 
 #[test]
 fn test_auto_pair_backspace_deletes_both() {
-    let mut e = engine_with("");
+    let mut e = engine_with_autopairs("");
     ensure_normal(&mut e);
     set_content(&mut e, "\n");
     press(&mut e, 'i');
@@ -228,7 +242,7 @@ fn test_auto_pair_backspace_deletes_both() {
 
 #[test]
 fn test_auto_pair_quote_after_space() {
-    let mut e = engine_with("");
+    let mut e = engine_with_autopairs("");
     ensure_normal(&mut e);
     set_content(&mut e, " \n");
     // Go to end of line and enter insert
@@ -239,7 +253,7 @@ fn test_auto_pair_quote_after_space() {
 
 #[test]
 fn test_auto_pair_quote_after_letter_no_pair() {
-    let mut e = engine_with("");
+    let mut e = engine_with_autopairs("");
     ensure_normal(&mut e);
     set_content(&mut e, "abc\n");
     press(&mut e, 'A'); // append at end
@@ -252,7 +266,7 @@ fn test_auto_pair_quote_after_letter_no_pair() {
 fn test_auto_pair_disabled() {
     let mut e = engine_with("");
     ensure_normal(&mut e);
-    e.settings.auto_pairs = false;
+    e.settings.auto_pairs = Some(false);
     set_content(&mut e, "\n");
     press(&mut e, 'i');
     press(&mut e, '(');
@@ -263,16 +277,54 @@ fn test_auto_pair_disabled() {
 fn test_auto_pair_setting_toggle() {
     let mut e = engine_with("hello\n");
     ensure_normal(&mut e);
-    assert!(e.settings.auto_pairs);
-    run_cmd(&mut e, "set noautopairs");
-    assert!(!e.settings.auto_pairs);
+    // #800: unset + default Vim mode → resolves off.
+    assert!(e.settings.auto_pairs.is_none(), "must start unset");
+    assert!(!e.settings.auto_pairs());
     run_cmd(&mut e, "set autopairs");
-    assert!(e.settings.auto_pairs);
+    assert_eq!(e.settings.auto_pairs, Some(true));
+    assert!(e.settings.auto_pairs());
+    run_cmd(&mut e, "set noautopairs");
+    assert_eq!(e.settings.auto_pairs, Some(false));
+    assert!(!e.settings.auto_pairs());
+}
+
+/// #800 acceptance: with nothing set, Vim mode does *not* auto-pair — typing
+/// `(` in Insert mode inserts a bare `(`. Fails against unfixed `develop`,
+/// where `default_auto_pairs()` unconditionally returned `true` and the buffer
+/// came out as `()`.
+#[test]
+fn test_auto_pair_default_off_in_vim_mode() {
+    let mut e = engine_with("");
+    ensure_normal(&mut e);
+    assert!(e.settings.auto_pairs.is_none(), "must start unset");
+    set_content(&mut e, "\n");
+    press(&mut e, 'i');
+    press(&mut e, '(');
+    assert_eq!(buf(&e), "(\n", "Vim mode must not auto-close brackets");
+}
+
+/// #800 acceptance: `:set mode=vscode` with nothing else set flips the
+/// unset `auto_pairs` back to today's IDE behaviour, with no restart.
+#[test]
+fn test_auto_pair_default_on_in_vscode_mode() {
+    let mut e = engine_with("");
+    ensure_normal(&mut e);
+    e.settings
+        .parse_set_option("mode=vscode")
+        .expect("mode=vscode is a valid :set option");
+    assert!(
+        e.settings.auto_pairs.is_none(),
+        "mode switch must not bake a value into the field"
+    );
+    assert!(
+        e.settings.auto_pairs(),
+        "Vscode mode must resolve auto_pairs on"
+    );
 }
 
 #[test]
 fn test_auto_pair_multiple_pairs() {
-    let mut e = engine_with("");
+    let mut e = engine_with_autopairs("");
     ensure_normal(&mut e);
     set_content(&mut e, "\n");
     press(&mut e, 'i');
@@ -293,7 +345,7 @@ fn test_auto_pair_normal_mode_unaffected() {
 
 #[test]
 fn test_auto_pair_backtick() {
-    let mut e = engine_with("");
+    let mut e = engine_with_autopairs("");
     ensure_normal(&mut e);
     set_content(&mut e, " \n");
     press(&mut e, 'A');
@@ -303,7 +355,7 @@ fn test_auto_pair_backtick() {
 
 #[test]
 fn test_auto_pair_single_quote_after_bracket() {
-    let mut e = engine_with("");
+    let mut e = engine_with_autopairs("");
     ensure_normal(&mut e);
     set_content(&mut e, "(\n");
     press(&mut e, 'l'); // cursor on \n? no, l stays on (
@@ -315,6 +367,13 @@ fn test_auto_pair_single_quote_after_bracket() {
 #[test]
 fn test_auto_pair_query() {
     let mut e = engine_with("hello\n");
+    // #800: `:set autopairs?` reports the *resolved* value, so unset + the
+    // default Vim mode reads back as "noautopairs".
+    let r = e.settings.parse_set_option("autopairs?");
+    assert_eq!(r, Ok("noautopairs".to_string()));
+    e.settings
+        .parse_set_option("mode=vscode")
+        .expect("mode=vscode is a valid :set option");
     let r = e.settings.parse_set_option("autopairs?");
     assert_eq!(r, Ok("autopairs".to_string()));
 }

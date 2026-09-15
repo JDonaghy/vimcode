@@ -3,22 +3,39 @@
 //!
 //! Each `Icon` carries a Nerd Font glyph and a standard Unicode/ASCII fallback.
 //! Call `Icon::s()` for `&str` or `Icon::c()` for `char` — these automatically
-//! select the right variant based on the global `use_nerd_fonts` flag.
+//! select the right variant based on the `use_nerd_fonts` flag.
 //!
 //! Set the flag at startup via `set_nerd_fonts(bool)`.
+//!
+//! ## Why thread-local, not process-global (#618)
+//!
+//! The flag is read on every `Icon::s()`/`Icon::c()` call to choose between
+//! the nerd glyph and the ASCII fallback, so it directly determines rendered
+//! output (and width, since the two variants differ in width). Both the GTK
+//! and TUI backends set it once from `engine.settings.use_nerd_fonts` and
+//! then render synchronously on that same thread — there is no cross-thread
+//! rendering in this codebase. Storing it thread-local rather than
+//! process-global means a test that flips the flag (directly or via
+//! `Engine`/`ShellApp` startup) can only ever affect other tests scheduled
+//! on that *same* worker thread, never tests running concurrently on other
+//! threads in the shared `cargo test` process. That closes off the exact
+//! failure shape #615 turned out not to be: a render depending on ambient
+//! process-wide state, passing locally and failing non-deterministically in
+//! CI depending on core count and scheduling.
+use std::cell::Cell;
 
-use std::sync::atomic::{AtomicBool, Ordering};
+thread_local! {
+    static USE_NERD_FONTS: Cell<bool> = const { Cell::new(true) };
+}
 
-static USE_NERD_FONTS: AtomicBool = AtomicBool::new(true);
-
-/// Enable or disable Nerd Font glyphs globally.  When disabled, `Icon::s()`
-/// and `Icon::c()` return the fallback character instead.
+/// Enable or disable Nerd Font glyphs on the current thread. When disabled,
+/// `Icon::s()` and `Icon::c()` return the fallback character instead.
 pub fn set_nerd_fonts(val: bool) {
-    USE_NERD_FONTS.store(val, Ordering::Relaxed);
+    USE_NERD_FONTS.with(|f| f.set(val));
 }
 
 pub fn nerd_fonts_enabled() -> bool {
-    USE_NERD_FONTS.load(Ordering::Relaxed)
+    USE_NERD_FONTS.with(|f| f.get())
 }
 
 /// A UI icon with a Nerd Font glyph and a standard-Unicode fallback.
@@ -33,9 +50,9 @@ impl Icon {
     }
 
     /// Return the icon as a string, selecting nerd or fallback based on the
-    /// global flag.
+    /// current thread's flag (see module docs).
     pub fn s(&self) -> &'static str {
-        if USE_NERD_FONTS.load(Ordering::Relaxed) {
+        if nerd_fonts_enabled() {
             self.nerd
         } else {
             self.fallback
@@ -52,8 +69,14 @@ impl Icon {
 
 pub const HAMBURGER: Icon = Icon::new("\u{f035c}", "\u{2630}"); // ☰
 pub const EXPLORER: Icon = Icon::new("\u{f07c}", "\u{229e}"); // ⊞
+
+// #950: GTK's `App::shell_config()` used to carry its own `SEARCH_COD`
+// (nf-cod-search, `\u{ea6d}`) instead of this constant, so the activity bar
+// showed a different search glyph per backend for no product reason — an
+// accidental fork, not a deliberate per-platform choice (nothing about a
+// search icon is GTK- or TUI-specific). Converged onto the one table both
+// backends already shared for every other activity-bar icon.
 pub const SEARCH: Icon = Icon::new("\u{f002}", "/"); // /
-pub const SEARCH_COD: Icon = Icon::new("\u{ea6d}", "/"); // nf-cod-search (GTK only)
 pub const DEBUG: Icon = Icon::new("\u{f188}", "!"); // !
 pub const GIT_BRANCH: Icon = Icon::new("\u{e702}", "Y"); // Y (branch shape)
 pub const GIT_BRANCH_ALT: Icon = Icon::new("\u{e725}", "Y"); // nf-dev-git_branch alt
@@ -132,6 +155,22 @@ pub const FIND_REPLACE_ALL: Icon = Icon::new("\u{eb3d}", "R*"); // nf-cod-replac
 pub const FIND_IN_SEL: Icon = Icon::new("\u{eb54}", "\u{2261}"); // ≡ nf-cod-selection
 pub const FIND_CLOSE: Icon = Icon::new("\u{ea76}", "\u{00d7}"); // × nf-cod-close
 
+// ─── Window Controls (GTK client-side titlebar, #552) ───────────────────────
+// Plain Unicode glyphs — deliberately no nerd-font-only variant since these
+// draw at the very top of the window before any font capability probing is
+// meaningful, and the shapes read fine as monospace fallback text too.
+
+// #715: U+2500 BOX DRAWINGS LIGHT HORIZONTAL is a hairline rule, not a
+// window-control glyph — at titlebar size it renders as a ~1px line, or
+// nothing at all if the resolved UI font has no box-drawing coverage (it
+// didn't, which is why minimize alone was invisible while □/✕ painted
+// fine). U+2014 EM DASH has the same broad coverage as any other symbol
+// glyph in a UI font, and its optical weight actually matches □/✕ beside it.
+pub const WINDOW_MINIMIZE: Icon = Icon::new("\u{2014}", "\u{2014}"); // —
+pub const WINDOW_MAXIMIZE: Icon = Icon::new("\u{25a1}", "\u{25a1}"); // □
+pub const WINDOW_RESTORE: Icon = Icon::new("\u{29c9}", "\u{29c9}"); // ⧉
+pub const WINDOW_CLOSE: Icon = Icon::new("\u{2715}", "\u{00d7}"); // ✕ / ×
+
 // ─── Tab Bar / Split Buttons (wide glyphs, TUI) ─────────────────────────────
 
 pub const DIFF_PREV: Icon = Icon::new("\u{F0143}", "<");
@@ -163,6 +202,75 @@ pub fn file_icon(ext: &str) -> &'static str {
         "lua" => FILE_LUA.s(),
         "txt" => FILE_TEXT.s(),
         _ => FILE_GENERIC.s(),
+    }
+}
+
+// ─── File Icon Colours ───────────────────────────────────────────────────────
+//
+// #703 design note — why these live here, next to `file_icon`, rather than as
+// `Theme` fields:
+//
+// The repo rule is "no hardcoded colours in rendering", and `tab_active_accent`
+// is the precedent for a theme-owned tab token. That rule is about *chrome*:
+// backgrounds, accents and text that must track the active colour scheme. A
+// language badge is not chrome — it is part of the icon's **identity**, the
+// same way the glyph is. VS Code's Seti icon theme keeps `.rs` orange and
+// `.ts` blue in every one of its built-in themes precisely because users
+// recognise files by that colour; making it theme-settable would let a theme
+// turn every badge the same shade and destroy the signal the badge exists for.
+//
+// So the colour is stored beside the glyph it belongs to, in one table, and no
+// rendering call site ever names a hex value: `render.rs` asks for
+// `icons::file_icon_color(ext)` exactly as it already asks for
+// `icons::file_icon(ext)`, and the two can never drift apart. If a future issue
+// wants per-theme overrides, the right shape is a `Theme` map that *overrides*
+// this table, not a replacement for it.
+//
+// Palette below is Seti-UI's, which is tuned for dark editor chrome (it is what
+// VS Code ships).
+
+/// Seti-UI blue — TypeScript, Python, C/C++, CSS, Lua, Markdown.
+pub const ICON_BLUE: (u8, u8, u8) = (0x51, 0x9a, 0xba);
+/// Seti-UI green — shell scripts.
+pub const ICON_GREEN: (u8, u8, u8) = (0x8d, 0xc1, 0x49);
+/// Seti-UI orange — Rust, TOML, HTML.
+pub const ICON_ORANGE: (u8, u8, u8) = (0xe3, 0x79, 0x33);
+/// Seti-UI purple — C/C++ headers, YAML.
+pub const ICON_PURPLE: (u8, u8, u8) = (0xa0, 0x74, 0xc4);
+/// Seti-UI yellow — JavaScript, JSON.
+pub const ICON_YELLOW: (u8, u8, u8) = (0xcb, 0xcb, 0x41);
+/// Seti-UI cyan — Go.
+pub const ICON_CYAN: (u8, u8, u8) = (0x51, 0xc9, 0xd4);
+/// Seti-UI off-white — plain text and unknown extensions.
+pub const ICON_NEUTRAL: (u8, u8, u8) = (0xd4, 0xd7, 0xd6);
+
+/// Return the identity colour (24-bit RGB) for a given file extension's icon.
+///
+/// Pairs 1:1 with [`file_icon`] — every arm there has an arm here, so a tab's
+/// glyph and its colour are always looked up from the same extension string.
+/// Unknown extensions get [`ICON_NEUTRAL`], matching [`FILE_GENERIC`].
+///
+/// Returned as a plain RGB triple rather than `render::Color` so this module
+/// stays free of any rendering dependency; `render::tab_icon_color` converts.
+pub fn file_icon_color(ext: &str) -> (u8, u8, u8) {
+    match ext.to_lowercase().as_str() {
+        "rs" => ICON_ORANGE,
+        "py" => ICON_BLUE,
+        "js" | "jsx" | "mjs" | "cjs" => ICON_YELLOW,
+        "ts" | "tsx" => ICON_BLUE,
+        "go" => ICON_CYAN,
+        "cpp" | "cc" | "cxx" | "c" => ICON_BLUE,
+        "h" | "hpp" => ICON_PURPLE,
+        "md" | "markdown" => ICON_BLUE,
+        "json" => ICON_YELLOW,
+        "toml" => ICON_ORANGE,
+        "yaml" | "yml" => ICON_PURPLE,
+        "html" | "htm" => ICON_ORANGE,
+        "css" => ICON_BLUE,
+        "sh" | "bash" | "zsh" => ICON_GREEN,
+        "lua" => ICON_BLUE,
+        "txt" => ICON_NEUTRAL,
+        _ => ICON_NEUTRAL,
     }
 }
 
@@ -203,4 +311,78 @@ pub fn detect_nerd_font_windows() -> bool {
 #[cfg(not(target_os = "windows"))]
 pub fn detect_nerd_font_windows() -> bool {
     true // On non-Windows, assume available (GTK bundles, Linux has fontconfig)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SAMPLE: Icon = Icon::new("nerd", "fallback");
+
+    /// New threads default to nerd fonts on, matching the old process-global
+    /// default — the thread-local swap (#618) must not change this default.
+    #[test]
+    fn defaults_to_nerd_fonts_enabled_on_a_fresh_thread() {
+        let (enabled, s) = std::thread::spawn(|| (nerd_fonts_enabled(), SAMPLE.s()))
+            .join()
+            .unwrap();
+        assert!(enabled);
+        assert_eq!(s, "nerd");
+    }
+
+    /// The core #618 guarantee: flipping the flag on one thread must not
+    /// leak to a concurrently-running thread. With the old `AtomicBool`
+    /// this test would be flaky-by-construction (a race whose outcome
+    /// depends on scheduling); with thread-local storage each thread's
+    /// view is independent by construction, so it's deterministic.
+    #[test]
+    fn set_nerd_fonts_does_not_leak_across_threads() {
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+
+        let b1 = barrier.clone();
+        let disabling = std::thread::spawn(move || {
+            set_nerd_fonts(false);
+            b1.wait(); // let the other thread observe state while this thread has it disabled
+            b1.wait(); // hold until the other thread has taken its reading
+            nerd_fonts_enabled()
+        });
+
+        let b2 = barrier.clone();
+        let observing = std::thread::spawn(move || {
+            b2.wait(); // wait for the other thread to disable on its own thread
+            let seen = nerd_fonts_enabled(); // must still be this thread's own default: true
+            let icon = SAMPLE.s();
+            b2.wait();
+            (seen, icon)
+        });
+
+        assert!(
+            !disabling.join().unwrap(),
+            "flag should stay disabled on its own thread"
+        );
+        let (seen, icon) = observing.join().unwrap();
+        assert!(
+            seen,
+            "a thread that never called set_nerd_fonts must still see the default"
+        );
+        assert_eq!(icon, "nerd");
+    }
+
+    /// Sanity check that `set_nerd_fonts(true)` after a `false` still works
+    /// on the same thread (round-trip), independent of thread-local storage
+    /// mechanics.
+    #[test]
+    fn set_nerd_fonts_round_trips_on_the_same_thread() {
+        std::thread::spawn(|| {
+            set_nerd_fonts(false);
+            assert!(!nerd_fonts_enabled());
+            assert_eq!(SAMPLE.s(), "fallback");
+
+            set_nerd_fonts(true);
+            assert!(nerd_fonts_enabled());
+            assert_eq!(SAMPLE.s(), "nerd");
+        })
+        .join()
+        .unwrap();
+    }
 }

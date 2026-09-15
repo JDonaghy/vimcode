@@ -130,14 +130,29 @@ Spell checking via spellbook (Hunspell format).
 - `suggest(word)` — spelling suggestions
 - `add_word(word)` / `remove_word(word)` — user dictionary management
 
-## extensions.rs — 353 lines
-Bundled extension system.
+## extensions.rs — 819 lines
+Extension manifest data model (fetched from a remote registry; no compiled-in extensions).
 ### Types
-- `BundledExtension` — name + manifest TOML + script files
-- `ExtensionManifest` — parsed extension metadata (name, languages, LSP/DAP config, install commands)
+- `ExtensionManifest` — parsed manifest (name, languages, LSP/DAP config, `board` provider config, install commands)
+- `LspConfig` / `DapConfig` / `CommentConfig` / `ExtSettingDef` — manifest sub-sections
+- `BoardProviderConfig` (#522) — declares an extension as a Board-panel data provider: `refresh_command` argv, `poll_interval_secs`, `actions` map (BoardAction variant name -> argv template with `{id}` substitution). Generic — names no particular provider.
+- `Platform` — testable seam for platform-specific install command resolution
 ### Key Functions
-- `find_by_name(name)` / `find_for_file_ext(ext)` / `find_for_language_id(id)` — extension lookup
-- `BUNDLED` — static array of 12 compiled-in extensions
+- `find_manifest_by_name(name)` / `find_manifest_for_file_ext(ext)` / `find_manifest_for_language_id(id)` — manifest lookup
+- `ExtensionManifest::parse(toml)` / `display_or_name()`
+- `LspConfig::install_cmd_for(platform)` / `DapConfig::install_cmd_for(platform)`
+- `BoardProviderConfig::action_argv(action_name, card_id)` — resolve an action's argv, substituting `{id}`
+
+## tool_client.rs — 291 lines (#522)
+Generic external-tool JSON seam. No coordinator-specific vocabulary — vimcode is an editor
+that can *host* a pipeline-management client, not one itself.
+### Types
+- `ToolError` — typed failure modes (`EmptyCommand`, `BinaryNotFound`, `Spawn`, `NonZeroExit`, `InvalidJson`), with `user_message()`
+- `ToolClient` trait — `run_json(argv) -> Result<serde_json::Value, ToolError>` (blocking; callers thread it like `Engine::ext_refresh`)
+- `SubprocessToolClient` — real impl, spawns an OS subprocess via `core::git::hidden_command`
+- `MockToolClient` — test impl, returns a canned `Result` with no subprocess spawned
+### Key Functions
+- `fetch_board_model(client, argv)` — run argv and parse stdout into `quadraui::BoardModel` (vimcode's board contract, reused directly from quadraui's `Board` primitive rather than duplicated)
 
 ## settings.rs — 2,206 lines
 User settings with serde JSON persistence.
@@ -172,3 +187,20 @@ Extension registry (GitHub-hosted JSON).
 ### Key Functions
 - `fetch_registry(url)` — download extension registry
 - `download_script(url, dest)` — download extension file via curl
+
+## vim_regex.rs — 854 lines
+Vim pattern → Rust `regex` translation (#801). The single translation point for
+`/`, `?`, `:s`, `:g` and the ex `/pat/` address. Rejects patterns it cannot
+express (back-references, look-around, `\&`, `\_x`) rather than falling back to
+literal matching.
+### Types
+- `Magic` — `\v` / `\m` / `\M` / `\V`
+- `CaseOverride` — `\c` / `\C`
+- `Translation` — Rust regex source + case override + `\zs`/`\ze` span group + Vim→Rust group map
+- `Compiled` — compiled `regex::Regex` plus the span group and group map
+### Key Functions
+- `translate(pattern, magic, last_sub) -> Result<Translation, String>` — pure translation
+- `compile(pattern, ignorecase, smartcase, smartcase_applies, last_sub) -> Result<Compiled, String>` — translate + apply case options + compile
+- `Compiled::span(caps)` — the byte span a match *reports*, honouring `\zs` / `\ze`
+- `pat_has_uppercase(pat)` — Vim's `'smartcase'` test (skips backslash escapes)
+- `escape_literal(s)` / `escape_vim_literal(s)` — literal escaping for Rust regex / for a Vim pattern

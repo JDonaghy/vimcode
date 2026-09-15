@@ -2,15 +2,14 @@
 source: src/tui_main/render_impl.rs
 expression: "lines.join(\"\\n\")"
 ---
- 󰍜   1: [No Name] ×                                 󰤲    ⋯
-▎
-    hello world
- 
- 
- 
- 
+     [No Name] ×                                   󰤲    ⋯
+
+     hello world                                    ⠉⠉⠉⠉⠉⠉⠉⠉
 
 
 
-     INSERT  [No Name]    󰘖 utf-8 LF Spaces: 4  Ln 1, Col 1
- 
+
+
+
+
+     INSERT  [No Name]   LF Spaces: 4  Ln 1, Col 1

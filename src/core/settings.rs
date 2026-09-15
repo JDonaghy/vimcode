@@ -14,8 +14,44 @@ pub fn save_revision() -> u64 {
     SAVE_REVISION.load(Ordering::Acquire)
 }
 
+/// Test-only seam (#949 review) — see [`Settings::settings_file_path`]'s
+/// doc for why this is a thread-local rather than a `$HOME` mutation.
+#[cfg(test)]
+thread_local! {
+    static TEST_SETTINGS_PATH_OVERRIDE: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// RAII installer for the [`Settings::settings_file_path`] test override —
+/// mirrors `crate::test_cwd::CwdReadGuard`/`crate::test_paint::PaintGuard`'s
+/// "acquire on construct, restore on `Drop`" shape, so a test that panics
+/// mid-assertion still clears the thread-local instead of leaking the
+/// override into whatever other `#[test]` fn Rust's runner schedules next
+/// on the same pooled thread.
+#[cfg(test)]
+pub(crate) struct TestSettingsPathGuard {
+    _private: (),
+}
+
+#[cfg(test)]
+impl TestSettingsPathGuard {
+    /// Point `settings_file_path()` at `path` for the calling test thread
+    /// only until the returned guard drops.
+    pub(crate) fn install(path: PathBuf) -> Self {
+        TEST_SETTINGS_PATH_OVERRIDE.with(|cell| *cell.borrow_mut() = Some(path));
+        Self { _private: () }
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestSettingsPathGuard {
+    fn drop(&mut self) {
+        TEST_SETTINGS_PATH_OVERRIDE.with(|cell| *cell.borrow_mut() = None);
+    }
+}
+
 /// Which editing paradigm the editor uses.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum EditorMode {
     /// Classic modal Vim key-bindings (default).
@@ -23,6 +59,37 @@ pub enum EditorMode {
     Vim,
     /// VSCode-style always-insert editing (Shift+Arrow select, Ctrl-C/X/V/Z/Y/A).
     Vscode,
+}
+
+/// How right-click context menus are presented — platform look-and-feel,
+/// **not** a keybinding paradigm (that's [`EditorMode`]; the two are
+/// orthogonal and must not be folded together).
+///
+/// Mirrors VS Code's `window.menuStyle` (v1.101), which the release notes
+/// describe as controlling "the menu style ... for context menus on
+/// macOS" specifically — the macOS menu *bar* is always native and has no
+/// such setting (see `native_menu`/`install_menu_bar`, vimcode#901); this
+/// setting only ever changes anything on a backend that advertises
+/// `quadraui::BackendCaps::native_menu` (macOS's `MacBackend` today). GTK
+/// and TUI report `native_menu: false`, so every variant here resolves to
+/// the same in-window `paint_context_menu_rung` path on those backends —
+/// see `render::context_menu_should_be_native`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum MenuStyle {
+    /// Always use the backend's native context menu when it has one
+    /// (`BackendCaps::native_menu`); fall back to the in-window rasteriser
+    /// on a backend that doesn't (GTK, TUI never draw nothing).
+    Native,
+    /// Always paint the in-window `ContextMenuPanel`, even on a backend
+    /// that could show a native one.
+    Custom,
+    /// Follow the window's title-bar style, matching VS Code. vimcode has
+    /// no `titleBarStyle` setting yet, so until it does this resolves the
+    /// same as `Native` (capability-gated) — revisit this arm once
+    /// `titleBarStyle` exists.
+    #[default]
+    Inherit,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -132,6 +199,13 @@ pub struct Settings {
     #[serde(default)]
     pub editor_mode: EditorMode,
 
+    /// How right-click context menus are presented (native OS popup vs.
+    /// the in-window rasteriser). See [`MenuStyle`] — orthogonal to
+    /// `editor_mode`, only observable on a backend with
+    /// `BackendCaps::native_menu` (macOS today).
+    #[serde(default)]
+    pub menu_style: MenuStyle,
+
     /// Single character used as the leader key prefix in normal mode.
     /// Default is Space (' '). Override in settings.json: { "leader": "\\" }
     #[serde(default = "default_leader")]
@@ -184,6 +258,19 @@ pub struct Settings {
     /// Number of lines to keep visible above/below the cursor (default 0).
     #[serde(default)]
     pub scrolloff: usize,
+
+    /// When true, commands that move the cursor to a different line
+    /// (`<C-d>`, `<C-u>`, `<C-b>`, `<C-f>`, `G`, `gg`, `H`, `M`, `L`) park the
+    /// cursor on the first non-blank column of the destination line instead
+    /// of keeping the current column. Corresponds to Vim's `'startofline'` /
+    /// `'sol'`. Default **false**, matching Neovim (real Vim defaults this
+    /// **on** — see `:h 'startofline'`); vimcode's existing hardcoded
+    /// column-preserving behavior for these commands already matched
+    /// Neovim's default before this option existed, so flipping the default
+    /// would silently change behavior for every user who never touches this
+    /// setting.
+    #[serde(default)]
+    pub startofline: bool,
 
     /// Highlight the line the cursor is on (default true).
     #[serde(default = "default_cursorline")]
@@ -296,13 +383,24 @@ pub struct Settings {
     #[serde(default = "default_indent_guides")]
     pub indent_guides: bool,
 
+    /// Show the code-overview minimap on the right edge of each editor pane.
+    #[serde(default = "default_minimap")]
+    pub minimap: bool,
+
     /// Highlight matching brackets when cursor is on one.
     #[serde(default = "default_match_brackets")]
     pub match_brackets: bool,
 
     /// Auto-close brackets and quotes in Insert mode.
-    #[serde(default = "default_auto_pairs")]
-    pub auto_pairs: bool,
+    ///
+    /// Mode-derived (see `EditorMode`): `None` means "inherit from
+    /// `editor_mode`" and is resolved live by the [`Settings::auto_pairs`]
+    /// accessor method — Vim mode is strict-off, Vscode mode is on. `Some(_)`
+    /// is an explicit user override that always wins, including across a
+    /// later `:set mode=...` switch. Never read this field directly; call
+    /// the accessor method (`self.settings.auto_pairs()`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_pairs: Option<bool>,
 
     /// Mouse dwell delay (ms) before auto-showing hover popups. 0 = disabled.
     #[serde(default = "default_hover_delay")]
@@ -313,10 +411,18 @@ pub struct Settings {
     #[serde(default = "default_use_nerd_fonts")]
     pub use_nerd_fonts: bool,
 
-    /// What Ctrl+F does: "find" opens the find/replace overlay (default),
-    /// "page_down" preserves traditional Vim Ctrl+F page-down behavior.
-    #[serde(default = "default_ctrl_f_action")]
-    pub ctrl_f_action: String,
+    /// What Ctrl+F does: "find" opens the find/replace overlay, "page_down"
+    /// is traditional Vim Ctrl+F page-down behavior.
+    ///
+    /// Mode-derived (see `EditorMode`): `None` means "inherit from
+    /// `editor_mode`" and is resolved live by the
+    /// [`Settings::ctrl_f_action`] accessor method — Vim mode is
+    /// `page_down`, Vscode mode is `find`. `Some(_)` is an explicit user
+    /// override that always wins, including across a later `:set
+    /// mode=...` switch. Never read this field directly; call the
+    /// accessor method (`self.settings.ctrl_f_action()`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ctrl_f_action: Option<String>,
 
     /// Maximum buffer line count for tree-sitter syntax highlighting.
     /// Files with more lines than this render as plain text. Default 20_000
@@ -328,8 +434,14 @@ pub struct Settings {
     pub syntax_max_lines: usize,
 }
 
-fn default_ctrl_f_action() -> String {
-    "find".to_string()
+/// Mode-derived default for `ctrl_f_action` — see the field doc comment on
+/// [`Settings::ctrl_f_action`]. Vim mode pages down (traditional Vim
+/// behavior); Vscode mode opens find/replace (today's IDE default).
+fn default_ctrl_f_action(mode: EditorMode) -> String {
+    match mode {
+        EditorMode::Vim => "page_down".to_string(),
+        EditorMode::Vscode => "find".to_string(),
+    }
 }
 
 fn default_syntax_max_lines() -> usize {
@@ -340,12 +452,22 @@ fn default_indent_guides() -> bool {
     true
 }
 
+fn default_minimap() -> bool {
+    true
+}
+
 fn default_match_brackets() -> bool {
     true
 }
 
-fn default_auto_pairs() -> bool {
-    true
+/// Mode-derived default for `auto_pairs` — see the field doc comment on
+/// [`Settings::auto_pairs`]. Vim mode is strict (no auto-pairing); Vscode
+/// mode auto-closes brackets/quotes (today's IDE default).
+fn default_auto_pairs(mode: EditorMode) -> bool {
+    match mode {
+        EditorMode::Vim => false,
+        EditorMode::Vscode => true,
+    }
 }
 
 fn default_hover_delay() -> u32 {
@@ -477,6 +599,50 @@ pub enum ExplorerAction {
     Delete,
     Rename,
     MoveFile,
+}
+
+impl ExplorerAction {
+    /// Resolve an explorer context-menu/keyboard-shortcut action id string
+    /// to the `ExplorerAction` both backends dispatch through
+    /// `Engine::dispatch_explorer_crud`.
+    ///
+    /// #823 item 6: GTK's `App::explorer_action` (`app.rs`) and TUI's
+    /// `handle_explorer_context_action` (`tui_main/mod.rs`) map this same
+    /// 5-string table, but they are no longer safe to fully collapse — they
+    /// were re-verified against current `HEAD` per this issue's own
+    /// instruction, not just the line numbers recorded when the issue was
+    /// filed, and the two functions have drifted past what a mechanical
+    /// merge could do without changing behavior:
+    ///
+    /// * TUI's "delete" arm calls `Engine::confirm_delete_file` directly
+    ///   with the context menu's explicit target path; GTK's routes
+    ///   through `dispatch_explorer_crud(Delete)`, which acts on
+    ///   `explorer_tree`'s *selected row* instead — forcing GTK onto TUI's
+    ///   explicit-path behavior (or vice versa) is a real behavior change,
+    ///   not a refactor, and picks the wrong file if a context-menu click
+    ///   and the tree's selection ever disagree.
+    /// * TUI's match has no `"move_file"` arm at all — it silently no-ops
+    ///   today. Wiring it up via this table would be a new capability, not
+    ///   a dedup, and needs its own test/issue.
+    ///
+    /// What both sides still agree on byte-for-byte is the `new_file` /
+    /// `new_folder` / `rename` subset, both feeding the identical
+    /// `dispatch_explorer_crud` call — that's what this function shares.
+    /// `delete` / `move_file` are included for GTK's benefit (its own
+    /// `explorer_action` handles all five through one call to
+    /// `dispatch_explorer_crud`) but TUI's caller never reaches this
+    /// function for those two strings — its own arms handle `"delete"`
+    /// first and it has no `"move_file"` arm to reach here at all.
+    pub fn from_action_str(s: &str) -> Option<Self> {
+        Some(match s {
+            "new_file" => Self::NewFile,
+            "new_folder" => Self::NewFolder,
+            "rename" => Self::Rename,
+            "delete" => Self::Delete,
+            "move_file" => Self::MoveFile,
+            _ => return None,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -647,8 +813,16 @@ impl Default for PanelKeys {
 fn default_completion_trigger() -> String {
     "<C-Space>".to_string()
 }
-fn default_completion_accept() -> String {
-    "Tab".to_string()
+
+/// Mode-derived default for `completion_keys.accept` — see the field doc
+/// comment on [`CompletionKeys::accept`]. Vim mode leaves `<Tab>` alone
+/// (`<C-y>` accepts, matching Vim's native completion menu); Vscode mode
+/// uses `Tab` (today's IDE default).
+fn default_completion_accept(mode: EditorMode) -> String {
+    match mode {
+        EditorMode::Vim => "<C-y>".to_string(),
+        EditorMode::Vscode => "Tab".to_string(),
+    }
 }
 
 /// Key bindings for the auto-popup completion menu.
@@ -657,16 +831,34 @@ pub struct CompletionKeys {
     /// Key to manually trigger completion popup. Default: `<C-Space>`
     #[serde(default = "default_completion_trigger")]
     pub trigger: String,
-    /// Key to accept the highlighted completion item. Default: `Tab`
-    #[serde(default = "default_completion_accept")]
-    pub accept: String,
+    /// Key to accept the highlighted completion item.
+    ///
+    /// Mode-derived (see `EditorMode`): `None` means "inherit from
+    /// `editor_mode`" and is resolved live by the
+    /// [`CompletionKeys::accept`] accessor method — Vim mode is `<C-y>`,
+    /// Vscode mode is `Tab`. `Some(_)` is an explicit user override that
+    /// always wins, including across a later `:set mode=...` switch. Never
+    /// read this field directly; call the accessor method
+    /// (`self.settings.completion_keys.accept(self.settings.editor_mode)`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accept: Option<String>,
+}
+
+impl CompletionKeys {
+    /// Resolve the effective accept key: an explicit override if set,
+    /// otherwise the mode-derived default for `mode`.
+    pub fn accept(&self, mode: EditorMode) -> String {
+        self.accept
+            .clone()
+            .unwrap_or_else(|| default_completion_accept(mode))
+    }
 }
 
 impl Default for CompletionKeys {
     fn default() -> Self {
         Self {
             trigger: default_completion_trigger(),
-            accept: default_completion_accept(),
+            accept: None,
         }
     }
 }
@@ -751,6 +943,7 @@ impl Default for Settings {
             panel_keys: PanelKeys::default(),
             completion_keys: CompletionKeys::default(),
             editor_mode: EditorMode::Vim,
+            menu_style: MenuStyle::Inherit,
             leader: default_leader(),
             wrap: false,
             spell: false,
@@ -762,6 +955,7 @@ impl Default for Settings {
             ignorecase: false,
             smartcase: false,
             scrolloff: 0,
+            startofline: false,
             cursorline: default_cursorline(),
             window_status_line: default_window_status_line(),
             status_line_above_terminal: default_status_line_above_terminal(),
@@ -786,17 +980,54 @@ impl Default for Settings {
             hide_single_tab: false,
             autohide_panels: false,
             indent_guides: default_indent_guides(),
+            minimap: default_minimap(),
             match_brackets: default_match_brackets(),
-            auto_pairs: default_auto_pairs(),
+            auto_pairs: None, // mode-derived — see Settings::auto_pairs()
             hover_delay: default_hover_delay(),
             use_nerd_fonts: default_use_nerd_fonts(),
-            ctrl_f_action: default_ctrl_f_action(),
+            ctrl_f_action: None, // mode-derived — see Settings::ctrl_f_action()
             syntax_max_lines: default_syntax_max_lines(),
         }
     }
 }
 
 impl Settings {
+    // ── Mode-derived contested defaults ─────────────────────────────────────
+    //
+    // These three settings (`ctrl_f_action`, `auto_pairs`,
+    // `completion_keys.accept`) are stored as `Option<T>`: `None` means
+    // "not explicitly set, inherit from `editor_mode`"; `Some(_)` is an
+    // explicit user override. Resolution is intentionally *lazy* — done on
+    // every read via these accessor methods rather than baked into the
+    // field at load time — so that:
+    //   1. An explicit override always wins, even after a later
+    //      `:set mode=...` switch (there is no stale "filled" state to
+    //      accidentally clobber).
+    //   2. `:set mode=vim` / `:set mode=vscode` re-resolves every unset
+    //      field immediately, with no extra step and no restart, because
+    //      the next read naturally uses the new `self.editor_mode`.
+    //   3. `Settings::save()` never persists a resolved value for a field
+    //      the user never touched (`skip_serializing_if = "Option::is_none"`),
+    //      so a fresh settings.json stays mode-reactive across restarts too.
+    //
+    // See `docs/PATTERNS.md` ("Mode-derived contested defaults") for the
+    // full table and the recipe for adding a fourth one.
+
+    /// Resolve the effective `ctrl_f_action`: an explicit override if set,
+    /// otherwise the default for the current `editor_mode`.
+    pub fn ctrl_f_action(&self) -> String {
+        self.ctrl_f_action
+            .clone()
+            .unwrap_or_else(|| default_ctrl_f_action(self.editor_mode))
+    }
+
+    /// Resolve the effective `auto_pairs`: an explicit override if set,
+    /// otherwise the default for the current `editor_mode`.
+    pub fn auto_pairs(&self) -> bool {
+        self.auto_pairs
+            .unwrap_or_else(|| default_auto_pairs(self.editor_mode))
+    }
+
     /// Load settings from ~/.config/vimcode/settings.json
     /// Falls back to defaults if file doesn't exist or is invalid
     ///
@@ -1006,8 +1237,13 @@ impl Settings {
         } else {
             "nonerdfonts"
         };
+        let sol = if self.startofline {
+            "startofline"
+        } else {
+            "nostartofline"
+        };
         format!(
-            "{}  {}  ts={}  sw={}  {}  {}  {}  {}  {}  {}  {}  {}  {}  {}  so={}  tw={}  {}",
+            "{}  {}  ts={}  sw={}  {}  {}  {}  {}  {}  {}  {}  {}  {}  {}  so={}  tw={}  {}  {}",
             num,
             et,
             self.tabstop,
@@ -1024,7 +1260,8 @@ impl Settings {
             sc,
             self.scrolloff,
             self.textwidth,
-            nf
+            nf,
+            sol
         )
     }
 
@@ -1065,6 +1302,7 @@ impl Settings {
             "hlsearch" | "hls" => self.hlsearch = enable,
             "ignorecase" | "ic" => self.ignorecase = enable,
             "smartcase" | "scs" => self.smartcase = enable,
+            "startofline" | "sol" => self.startofline = enable,
             "cursorline" | "cul" => self.cursorline = enable,
             "windowstatusline" | "wsl" => self.window_status_line = enable,
             "statuslineaboveterminal" | "slat" => self.status_line_above_terminal = enable,
@@ -1080,8 +1318,9 @@ impl Settings {
             "hidesingletab" | "hst" => self.hide_single_tab = enable,
             "autohidepanels" => self.autohide_panels = enable,
             "indentguides" => self.indent_guides = enable,
+            "minimap" => self.minimap = enable,
             "matchbrackets" => self.match_brackets = enable,
-            "autopairs" => self.auto_pairs = enable,
+            "autopairs" => self.auto_pairs = Some(enable),
             "nerdfonts" | "nf" => {
                 self.use_nerd_fonts = enable;
                 crate::icons::set_nerd_fonts(enable);
@@ -1276,6 +1515,11 @@ impl Settings {
                 "nosmartcase".to_string()
             }),
             "scrolloff" | "so" => Ok(format!("scrolloff={}", self.scrolloff)),
+            "startofline" | "sol" => Ok(if self.startofline {
+                "startofline".to_string()
+            } else {
+                "nostartofline".to_string()
+            }),
             "cursorline" | "cul" => Ok(if self.cursorline {
                 "cursorline".to_string()
             } else {
@@ -1344,12 +1588,17 @@ impl Settings {
             } else {
                 "noindentguides".to_string()
             }),
+            "minimap" => Ok(if self.minimap {
+                "minimap".to_string()
+            } else {
+                "nominimap".to_string()
+            }),
             "matchbrackets" => Ok(if self.match_brackets {
                 "matchbrackets".to_string()
             } else {
                 "nomatchbrackets".to_string()
             }),
-            "autopairs" => Ok(if self.auto_pairs {
+            "autopairs" => Ok(if self.auto_pairs() {
                 "autopairs".to_string()
             } else {
                 "noautopairs".to_string()
@@ -1410,7 +1659,28 @@ impl Settings {
         Ok(())
     }
 
+    /// Where `settings.json` lives — `~/.config/vimcode/settings.json`
+    /// (or the platform equivalent, see [`super::paths::vimcode_config_dir`]).
+    ///
+    /// Under `#[cfg(test)]`, a per-thread override installed via
+    /// [`TestSettingsPathGuard::install`] takes priority when set (#949
+    /// review).
+    /// This is a `thread_local`, not a `$HOME` env-var mutation, precisely
+    /// because `std::env::set_var` is process-global: Rust's default test
+    /// runner executes tests in parallel on multiple threads within the
+    /// same process, so mutating `$HOME` from one test would race every
+    /// other concurrently-running test that (transitively, via
+    /// `Engine::new`/`check_settings_reload`) also resolves this path.
+    /// A thread-local override carries no such risk — each test thread
+    /// gets its own slot — and needs no `serial_test`/lock discipline this
+    /// codebase doesn't otherwise have.
     pub fn settings_file_path() -> PathBuf {
+        #[cfg(test)]
+        {
+            if let Some(p) = TEST_SETTINGS_PATH_OVERRIDE.with(|cell| cell.borrow().clone()) {
+                return p;
+            }
+        }
         super::paths::vimcode_config_dir().join("settings.json")
     }
 
@@ -1440,6 +1710,7 @@ impl Settings {
             "spell" => self.spell.to_string(),
             "spelllang" => self.spelllang.clone(),
             "scrolloff" => self.scrolloff.to_string(),
+            "startofline" | "sol" => self.startofline.to_string(),
             "colorcolumn" => self.colorcolumn.clone(),
             "textwidth" => self.textwidth.to_string(),
             "hlsearch" => self.hlsearch.to_string(),
@@ -1449,6 +1720,11 @@ impl Settings {
             "editor_mode" => match self.editor_mode {
                 EditorMode::Vim => "vim".to_string(),
                 EditorMode::Vscode => "vscode".to_string(),
+            },
+            "menu_style" => match self.menu_style {
+                MenuStyle::Native => "native".to_string(),
+                MenuStyle::Custom => "custom".to_string(),
+                MenuStyle::Inherit => "inherit".to_string(),
             },
             "explorer_visible_on_startup" => self.explorer_visible_on_startup.to_string(),
             "autoread" => self.autoread.to_string(),
@@ -1473,11 +1749,12 @@ impl Settings {
             "hide_single_tab" | "hidesingletab" | "hst" => self.hide_single_tab.to_string(),
             "autohide_panels" | "autohidepanels" => self.autohide_panels.to_string(),
             "indent_guides" | "indentguides" => self.indent_guides.to_string(),
+            "minimap" => self.minimap.to_string(),
             "match_brackets" | "matchbrackets" => self.match_brackets.to_string(),
-            "auto_pairs" | "autopairs" => self.auto_pairs.to_string(),
+            "auto_pairs" | "autopairs" => self.auto_pairs().to_string(),
             "hover_delay" => self.hover_delay.to_string(),
             "use_nerd_fonts" | "nerdfonts" | "nf" => self.use_nerd_fonts.to_string(),
-            "ctrl_f_action" => self.ctrl_f_action.clone(),
+            "ctrl_f_action" => self.ctrl_f_action(),
             "extension_registries" => self.extension_registries.join(", "),
             "syntax_max_lines" | "syntaxmaxlines" => self.syntax_max_lines.to_string(),
             _ => String::new(),
@@ -1534,6 +1811,7 @@ impl Settings {
                     .parse()
                     .map_err(|_| format!("Invalid scrolloff: {value}"))?;
             }
+            "startofline" | "sol" => self.startofline = value == "true",
             "colorcolumn" => self.colorcolumn = value.to_string(),
             "textwidth" => {
                 self.textwidth = value
@@ -1549,6 +1827,14 @@ impl Settings {
                     "vim" => EditorMode::Vim,
                     "vscode" => EditorMode::Vscode,
                     _ => return Err(format!("Unknown editor_mode: {value}")),
+                };
+            }
+            "menu_style" => {
+                self.menu_style = match value {
+                    "native" => MenuStyle::Native,
+                    "custom" => MenuStyle::Custom,
+                    "inherit" => MenuStyle::Inherit,
+                    _ => return Err(format!("Unknown menu_style: {value}")),
                 };
             }
             "explorer_visible_on_startup" => self.explorer_visible_on_startup = value == "true",
@@ -1587,8 +1873,9 @@ impl Settings {
             "hide_single_tab" | "hidesingletab" | "hst" => self.hide_single_tab = value == "true",
             "autohide_panels" | "autohidepanels" => self.autohide_panels = value == "true",
             "indent_guides" | "indentguides" => self.indent_guides = value == "true",
+            "minimap" => self.minimap = value == "true",
             "match_brackets" | "matchbrackets" => self.match_brackets = value == "true",
-            "auto_pairs" | "autopairs" => self.auto_pairs = value == "true",
+            "auto_pairs" | "autopairs" => self.auto_pairs = Some(value == "true"),
             "hover_delay" => {
                 self.hover_delay = value
                     .parse()
@@ -1599,7 +1886,7 @@ impl Settings {
                 crate::icons::set_nerd_fonts(self.use_nerd_fonts);
             }
             "ctrl_f_action" => match value {
-                "find" | "page_down" => self.ctrl_f_action = value.to_string(),
+                "find" | "page_down" => self.ctrl_f_action = Some(value.to_string()),
                 _ => {
                     return Err(format!(
                         "Invalid ctrl_f_action: {value} (expected 'find' or 'page_down')"
@@ -1830,6 +2117,13 @@ pub static SETTING_DEFS: &[SettingDef] = &[
         setting_type: SettingType::Integer { min: 0, max: 30 },
     },
     SettingDef {
+        key: "startofline",
+        label: "Start Of Line",
+        description: "Land on the first non-blank column after G, gg, H, M, L, <C-d>, <C-u>, <C-b>, <C-f> (Vim's default; Neovim's is off)",
+        category: "Editor",
+        setting_type: SettingType::Bool,
+    },
+    SettingDef {
         key: "colorcolumn",
         label: "Color Column",
         description: "Columns to highlight as rulers (e.g. \"80,120\")",
@@ -1920,6 +2214,15 @@ pub static SETTING_DEFS: &[SettingDef] = &[
         description: "Vim (modal) or VSCode (always-insert) key bindings",
         category: "Workspace",
         setting_type: SettingType::Enum(&["vim", "vscode"]),
+    },
+    SettingDef {
+        key: "menu_style",
+        label: "Context Menu Style",
+        description: "Native OS context menu, the in-window one, or inherit \
+                       from the window style (only observable on a backend \
+                       with a native context menu, e.g. macOS)",
+        category: "Workspace",
+        setting_type: SettingType::Enum(&["native", "custom", "inherit"]),
     },
     SettingDef {
         key: "explorer_visible_on_startup",
@@ -2042,6 +2345,13 @@ pub static SETTING_DEFS: &[SettingDef] = &[
         setting_type: SettingType::Bool,
     },
     SettingDef {
+        key: "minimap",
+        label: "Minimap",
+        description: "Show the code-overview minimap on the right edge of each editor pane",
+        category: "Editor",
+        setting_type: SettingType::Bool,
+    },
+    SettingDef {
         key: "match_brackets",
         label: "Match Brackets",
         description: "Highlight matching bracket when cursor is on a bracket character",
@@ -2118,6 +2428,85 @@ mod tests {
         assert_eq!(settings.line_numbers, LineNumberMode::None);
         assert_eq!(settings.font_family, "Monospace");
         assert_eq!(settings.font_size, 14);
+        // #700 item 6: VS Code draws indent guides by default; nothing
+        // previously pinned this, so a future edit to
+        // `default_indent_guides()` could silently flip it back off with no
+        // test catching it.
+        assert!(
+            settings.indent_guides,
+            "indent guides must default on, matching VS Code"
+        );
+    }
+
+    // ── `minimap` option (#35) ───────────────────────────────────────────
+    // The option is plumbed through eight separate sites; miss one and it
+    // works from `:set` but not the settings UI (or vice versa). One test
+    // per site so a regression names the site it broke.
+
+    #[test]
+    fn minimap_defaults_on() {
+        assert!(
+            Settings::default().minimap,
+            "minimap must default on, matching VS Code"
+        );
+    }
+
+    #[test]
+    fn set_minimap_and_nominimap_both_parse() {
+        let mut s = Settings::default();
+        s.parse_set_option("nominimap").expect("nominimap");
+        assert!(!s.minimap, "`:set nominimap` must turn the minimap off");
+        s.parse_set_option("minimap").expect("minimap");
+        assert!(s.minimap, "`:set minimap` must turn it back on");
+    }
+
+    #[test]
+    fn set_minimap_query_form_reports_both_states() {
+        let mut s = Settings::default();
+        assert_eq!(s.parse_set_option("minimap?").unwrap(), "minimap");
+        s.minimap = false;
+        assert_eq!(s.parse_set_option("minimap?").unwrap(), "nominimap");
+    }
+
+    #[test]
+    fn minimap_round_trips_through_get_set_by_key() {
+        // The settings UI reads/writes by key string, not by field.
+        let mut s = Settings::default();
+        assert_eq!(s.get_value_str("minimap"), "true");
+        s.set_value_str("minimap", "false").expect("set");
+        assert!(!s.minimap);
+        assert_eq!(s.get_value_str("minimap"), "false");
+        s.set_value_str("minimap", "true").expect("set");
+        assert!(s.minimap);
+    }
+
+    #[test]
+    fn minimap_appears_in_the_settings_registry() {
+        let def = SETTING_DEFS
+            .iter()
+            .find(|d| d.key == "minimap")
+            .expect("`minimap` must appear in SETTING_DEFS so the settings UI lists it");
+        assert_eq!(def.category, "Editor");
+        assert!(matches!(def.setting_type, SettingType::Bool));
+        assert!(!def.label.is_empty());
+        assert!(!def.description.is_empty());
+    }
+
+    #[test]
+    fn minimap_round_trips_through_the_settings_file() {
+        let mut s = Settings::default();
+        s.minimap = false;
+        let json = serde_json::to_string(&s).expect("serialize");
+        let back: Settings = serde_json::from_str(&json).expect("deserialize");
+        assert!(!back.minimap, "`minimap: false` must survive a save/load");
+
+        // …and an older settings file with no `minimap` key at all must come
+        // back with the default (on), not `false` from `bool::default()`.
+        let legacy: Settings = serde_json::from_str("{}").expect("deserialize legacy");
+        assert!(
+            legacy.minimap,
+            "a settings file predating #35 must default the minimap on"
+        );
     }
 
     #[test]
@@ -2595,5 +2984,214 @@ mod tests {
         let s: Settings = serde_json::from_str(json).unwrap();
         assert_eq!(s.panel_keys.live_grep, "<C-A-g>");
         assert_eq!(s.panel_keys.toggle_sidebar, "<C-b>");
+    }
+
+    // ── Mode-derived contested defaults (#800) ──────────────────────────────
+    // `ctrl_f_action`, `auto_pairs`, `completion_keys.accept` derive their
+    // default from `editor_mode` when unset (`None`), but an explicit
+    // `Some(_)` override always wins — including across a later mode
+    // switch. Each field gets: unset×Vim, unset×Vscode, explicit-survives-
+    // mode-switch, plus the two acceptance scenarios (no config file /
+    // `mode=vscode` with nothing else set).
+
+    #[test]
+    fn ctrl_f_action_unset_is_page_down_in_vim_mode() {
+        let mut s = Settings::default();
+        s.editor_mode = EditorMode::Vim;
+        assert!(s.ctrl_f_action.is_none(), "must start unset");
+        assert_eq!(s.ctrl_f_action(), "page_down");
+    }
+
+    #[test]
+    fn ctrl_f_action_unset_is_find_in_vscode_mode() {
+        let mut s = Settings::default();
+        s.editor_mode = EditorMode::Vscode;
+        assert!(s.ctrl_f_action.is_none(), "must start unset");
+        assert_eq!(s.ctrl_f_action(), "find");
+    }
+
+    #[test]
+    fn ctrl_f_action_explicit_override_survives_mode_switch() {
+        let mut s = Settings::default();
+        s.editor_mode = EditorMode::Vim;
+        s.ctrl_f_action = Some("find".to_string());
+        assert_eq!(s.ctrl_f_action(), "find");
+        // A later mode switch must not clobber the explicit override.
+        s.editor_mode = EditorMode::Vscode;
+        assert_eq!(
+            s.ctrl_f_action(),
+            "find",
+            "explicit override must survive a mode switch"
+        );
+    }
+
+    #[test]
+    fn auto_pairs_unset_is_false_in_vim_mode() {
+        let mut s = Settings::default();
+        s.editor_mode = EditorMode::Vim;
+        assert!(s.auto_pairs.is_none(), "must start unset");
+        assert!(!s.auto_pairs());
+    }
+
+    #[test]
+    fn auto_pairs_unset_is_true_in_vscode_mode() {
+        let mut s = Settings::default();
+        s.editor_mode = EditorMode::Vscode;
+        assert!(s.auto_pairs.is_none(), "must start unset");
+        assert!(s.auto_pairs());
+    }
+
+    #[test]
+    fn auto_pairs_explicit_override_survives_mode_switch() {
+        // The scenario called out by #800: `:set mode=vim` + `:set
+        // auto_pairs=true` keeps autopairs on; a later `:set mode=vscode`
+        // must not clobber that explicit `true` (nor, symmetrically, an
+        // explicit `false`).
+        let mut s = Settings::default();
+        s.editor_mode = EditorMode::Vim;
+        s.auto_pairs = Some(true);
+        assert!(s.auto_pairs());
+        s.editor_mode = EditorMode::Vscode;
+        assert!(
+            s.auto_pairs(),
+            "explicit auto_pairs=true must survive mode=vscode"
+        );
+
+        let mut s2 = Settings::default();
+        s2.editor_mode = EditorMode::Vscode;
+        s2.auto_pairs = Some(false);
+        assert!(!s2.auto_pairs());
+        s2.editor_mode = EditorMode::Vim;
+        assert!(
+            !s2.auto_pairs(),
+            "explicit auto_pairs=false must survive mode=vim"
+        );
+    }
+
+    #[test]
+    fn completion_accept_unset_is_c_y_in_vim_mode() {
+        let ck = CompletionKeys::default();
+        assert!(ck.accept.is_none(), "must start unset");
+        assert_eq!(ck.accept(EditorMode::Vim), "<C-y>");
+        assert_ne!(
+            ck.accept(EditorMode::Vim),
+            "Tab",
+            "Vim mode must not capture <Tab> for completion accept"
+        );
+    }
+
+    #[test]
+    fn completion_accept_unset_is_tab_in_vscode_mode() {
+        let ck = CompletionKeys::default();
+        assert!(ck.accept.is_none(), "must start unset");
+        assert_eq!(ck.accept(EditorMode::Vscode), "Tab");
+    }
+
+    #[test]
+    fn completion_accept_explicit_override_survives_mode_switch() {
+        let mut ck = CompletionKeys::default();
+        ck.accept = Some("<C-Space>".to_string());
+        assert_eq!(ck.accept(EditorMode::Vim), "<C-Space>");
+        assert_eq!(
+            ck.accept(EditorMode::Vscode),
+            "<C-Space>",
+            "explicit override must survive a mode switch"
+        );
+    }
+
+    #[test]
+    fn no_config_file_defaults_are_strict_vim() {
+        // Acceptance: with no config file (Settings::default(), nothing
+        // ever set), mode=vim and all three contested defaults are the
+        // strict Vim values.
+        let s = Settings::default();
+        assert_eq!(s.editor_mode, EditorMode::Vim);
+        assert_eq!(s.ctrl_f_action(), "page_down");
+        assert!(!s.auto_pairs());
+        assert_ne!(
+            s.completion_keys.accept(s.editor_mode),
+            "Tab",
+            "the completion popup must not eat <Tab> in default (Vim) mode"
+        );
+    }
+
+    #[test]
+    fn mode_vscode_with_nothing_else_set_reverts_to_ide_defaults() {
+        // Acceptance: `mode=vscode` with nothing else set reverts all
+        // three contested defaults to today's IDE values.
+        let mut s = Settings::default();
+        s.parse_set_option("mode=vscode").unwrap();
+        assert_eq!(s.editor_mode, EditorMode::Vscode);
+        assert_eq!(s.ctrl_f_action(), "find");
+        assert!(s.auto_pairs());
+        assert_eq!(s.completion_keys.accept(s.editor_mode), "Tab");
+    }
+
+    #[test]
+    fn contested_fields_omitted_from_json_when_unset() {
+        // Unset contested fields must not be baked into a fresh
+        // settings.json — otherwise a fresh install would stop being
+        // mode-reactive after the very first save/load round trip.
+        let s = Settings::default();
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(
+            !json.contains("\"ctrl_f_action\""),
+            "unset ctrl_f_action must be omitted from serialized settings"
+        );
+        assert!(
+            !json.contains("\"auto_pairs\""),
+            "unset auto_pairs must be omitted from serialized settings"
+        );
+        assert!(
+            !json.contains("\"accept\""),
+            "unset completion_keys.accept must be omitted from serialized settings"
+        );
+
+        // Round-trip: deserializing that JSON must still resolve unset.
+        let s2: Settings = serde_json::from_str(&json).unwrap();
+        assert!(s2.ctrl_f_action.is_none());
+        assert!(s2.auto_pairs.is_none());
+        assert!(s2.completion_keys.accept.is_none());
+    }
+
+    #[test]
+    fn contested_fields_round_trip_when_explicitly_set() {
+        let mut s = Settings::default();
+        s.ctrl_f_action = Some("find".to_string());
+        s.auto_pairs = Some(true);
+        s.completion_keys.accept = Some("<C-y>".to_string());
+
+        let json = serde_json::to_string(&s).unwrap();
+        let s2: Settings = serde_json::from_str(&json).unwrap();
+        assert_eq!(s2.ctrl_f_action, Some("find".to_string()));
+        assert_eq!(s2.auto_pairs, Some(true));
+        assert_eq!(s2.completion_keys.accept, Some("<C-y>".to_string()));
+    }
+
+    /// #902: `menu_style` defaults to `Inherit`, matching VS Code's
+    /// `window.menuStyle` default.
+    #[test]
+    fn menu_style_defaults_to_inherit() {
+        assert_eq!(Settings::default().menu_style, MenuStyle::Inherit);
+    }
+
+    /// #902: `get_value_str`/`set_value_str` round-trip every `MenuStyle`
+    /// variant, the same contract every other `SETTING_DEFS` `Enum` entry
+    /// (e.g. `editor_mode`, `line_numbers`) already has to hold for the
+    /// Settings sidebar UI to read/write it.
+    #[test]
+    fn menu_style_round_trips_through_value_str() {
+        let mut s = Settings::default();
+        for (text, variant) in [
+            ("native", MenuStyle::Native),
+            ("custom", MenuStyle::Custom),
+            ("inherit", MenuStyle::Inherit),
+        ] {
+            s.set_value_str("menu_style", text).unwrap();
+            assert_eq!(s.menu_style, variant);
+            assert_eq!(s.get_value_str("menu_style"), text);
+        }
+
+        assert!(s.set_value_str("menu_style", "bogus").is_err());
     }
 }

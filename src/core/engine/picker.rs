@@ -1,82 +1,8 @@
 use super::*;
 
-// ─── Fuzzy score (shared utility, used by tab switcher + unified picker) ──────
-
-impl Engine {
-    /// Compute a fuzzy match score of `query` against `text`.
-    /// Returns `None` if not all query characters appear as a subsequence.
-    pub fn fuzzy_score(text: &str, query: &str) -> Option<i32> {
-        if query.is_empty() {
-            return Some(0);
-        }
-        let text_lc = text.to_lowercase();
-        let query_lc = query.to_lowercase();
-        let tb = text_lc.as_bytes();
-        let qb = query_lc.as_bytes();
-        let mut qi = 0usize;
-        let mut score = 100i32;
-        let mut last_ti = 0usize;
-        for ti in 0..tb.len() {
-            if qi < qb.len() && tb[ti] == qb[qi] {
-                if qi > 0 {
-                    score -= (ti - last_ti - 1) as i32; // penalize gaps
-                }
-                if ti == 0 || matches!(tb[ti - 1], b'/' | b'_' | b'-' | b'.') {
-                    score += 5;
-                }
-                last_ti = ti;
-                qi += 1;
-            }
-        }
-        if qi < qb.len() {
-            None
-        } else {
-            Some(score - tb.len() as i32 / 20)
-        }
-    }
-}
-
 // ─── Unified Picker ───────────────────────────────────────────────────────────
 
 impl Engine {
-    /// Compute a fuzzy match score and record the byte positions in `text` that matched.
-    /// Returns `None` if not all query characters appear as a subsequence.
-    pub fn fuzzy_score_with_positions(text: &str, query: &str) -> Option<(i32, Vec<usize>)> {
-        if query.is_empty() {
-            return Some((0, Vec::new()));
-        }
-        let text_lc = text.to_lowercase();
-        let query_lc = query.to_lowercase();
-        let tb = text_lc.as_bytes();
-        let qb = query_lc.as_bytes();
-        let mut qi = 0usize;
-        let mut score = 100i32;
-        let mut last_ti = 0usize;
-        let mut positions = Vec::with_capacity(qb.len());
-        for ti in 0..tb.len() {
-            if qi < qb.len() && tb[ti] == qb[qi] {
-                if qi > 0 {
-                    score -= (ti - last_ti - 1) as i32; // penalize gaps
-                }
-                if ti == 0 || matches!(tb[ti - 1], b'/' | b'_' | b'-' | b'.') {
-                    score += 5;
-                }
-                // Map back to the original text's byte position.
-                // Since to_lowercase() can change byte lengths for non-ASCII,
-                // we use char-index mapping for safety, but for ASCII paths
-                // the positions are identical.
-                positions.push(ti);
-                last_ti = ti;
-                qi += 1;
-            }
-        }
-        if qi < qb.len() {
-            None
-        } else {
-            Some((score - tb.len() as i32 / 20, positions))
-        }
-    }
-
     /// Open the unified picker with a given source.
     pub fn open_picker(&mut self, source: PickerSource) {
         // Opening a picker is a "user is now focused on this modal"
@@ -282,14 +208,48 @@ impl Engine {
         }
     }
 
+    /// Focus `group_id` if it exists, so the breadcrumb helpers below (which
+    /// all read the *active* group's buffer and cursor) resolve against the
+    /// bar the user actually clicked (#555).
+    fn focus_breadcrumb_group(&mut self, group_id: GroupId) {
+        if self.active_group != group_id && self.editor_groups.contains_key(&group_id) {
+            self.active_group = group_id;
+        }
+    }
+
     /// Open a scoped picker for the currently selected breadcrumb segment.
     /// Path segments open the file picker for that directory.
     /// Handle a breadcrumb segment click from either backend.
-    /// Rebuilds segments, selects the clicked index, and opens scoped.
-    pub fn handle_breadcrumb_click(&mut self, idx: usize) {
+    /// Focuses the clicked group, rebuilds its segments, selects the clicked
+    /// index, and opens scoped.
+    ///
+    /// `group_id` comes from `render::BreadcrumbClickResult::Hit` — it is the
+    /// group whose *bar* was clicked, which is not necessarily the focused one
+    /// in a split. Resolving the index against the focused group instead was
+    /// the #555 "clicks do nothing" bug: an index valid for the clicked bar
+    /// could be out of range for the focused group's shorter segment list, and
+    /// `breadcrumb_open_scoped` would silently bail.
+    pub fn handle_breadcrumb_click(&mut self, group_id: GroupId, idx: usize) {
+        self.focus_breadcrumb_group(group_id);
         self.rebuild_breadcrumb_segments();
         self.breadcrumb_selected = idx;
         self.breadcrumb_open_scoped();
+    }
+
+    /// Handle a breadcrumb segment *double*-click from either backend.
+    ///
+    /// Same group-resolution contract as [`Self::handle_breadcrumb_click`].
+    /// Symbol segments jump straight to the definition; path segments fall
+    /// back to the single-click behaviour (open the scoped picker).
+    pub fn handle_breadcrumb_double_click(&mut self, group_id: GroupId, idx: usize) {
+        self.focus_breadcrumb_group(group_id);
+        self.rebuild_breadcrumb_segments();
+        let seg = match self.breadcrumb_segments.get(idx) {
+            Some(s) => s.clone(),
+            None => return,
+        };
+        self.breadcrumb_selected = idx;
+        self.breadcrumb_double_click(seg.is_symbol, seg.path_prefix.as_deref(), seg.symbol_line);
     }
 
     /// Symbol segments open the `@` symbol picker filtered to siblings
@@ -782,17 +742,17 @@ impl Engine {
         if query.is_empty() {
             *out = all_items.iter().take(cap).cloned().collect();
         } else {
+            let query_lc = query.to_lowercase();
             let mut scored: Vec<PickerItem> = all_items
                 .iter()
                 .filter_map(|item| {
-                    Self::fuzzy_score_with_positions(&item.filter_text, query).map(
-                        |(s, positions)| {
+                    quadraui::text_util::fuzzy_score(&item.filter_text.to_lowercase(), &query_lc)
+                        .map(|(s, positions)| {
                             let mut item = item.clone();
                             item.score = s;
                             item.match_positions = positions;
                             item
-                        },
-                    )
+                        })
                 })
                 .collect();
             scored.sort_by_key(|b| std::cmp::Reverse(b.score));
@@ -2084,8 +2044,7 @@ impl Engine {
                     // Send a question to the AI provider
                     let question = question.to_string();
                     self.close_picker();
-                    self.ai_input = question;
-                    self.ai_send_message();
+                    self.ai_send_message(question);
                     self.ai_has_focus = true;
                     EngineAction::None
                 } else if key == "chat_configure" {
@@ -2254,7 +2213,7 @@ impl Engine {
             }
             "v" if ctrl => {
                 // Paste clipboard into picker query
-                if let Some(text) = Self::clipboard_paste() {
+                if let Some(text) = self.clipboard_read.as_ref().and_then(|cb| cb().ok()) {
                     // Take first line only, strip control chars
                     let line = text.lines().next().unwrap_or("");
                     for c in line.chars() {

@@ -133,7 +133,13 @@ impl Engine {
         .to_string();
 
         // Registers snapshot
-        let registers_snapshot = self.registers.clone();
+        // The plugin ABI predates blockwise registers and still exposes a plain
+        // `is_linewise` bool (#807); flatten at the boundary.
+        let registers_snapshot = self
+            .registers
+            .iter()
+            .map(|(k, (text, ty))| (*k, (text.clone(), ty.is_linewise())))
+            .collect();
 
         // Marks snapshot for the active buffer (1-indexed)
         let marks_snapshot = self
@@ -301,7 +307,8 @@ impl Engine {
                     let _ = cb(&content);
                 }
             }
-            self.registers.insert(ch, (content, linewise));
+            self.registers
+                .insert(ch, (content, RegType::from_linewise(linewise)));
         }
         // Apply line insertions (process in reverse to keep indices stable)
         if !ctx.insert_lines.is_empty() {
@@ -416,8 +423,19 @@ impl Engine {
             self.async_shell_tasks.insert(req.callback_event, rx);
             std::thread::spawn(move || {
                 use std::process::{Command, Stdio};
-                let mut cmd = Command::new("sh");
-                cmd.arg("-c").arg(&req.command);
+                // #948 review (non-blocking): no dedicated regression test
+                // for this call site specifically — it's the identical
+                // two-line `shell_command()` pattern already covered by
+                // `:!`'s tests (`tests/new_vim_features.rs`'s
+                // `test_bang_command_honours_shell_env_var` and
+                // `src/tui_main/shell_app.rs`'s
+                // `bang_command_shell_output_paints_on_command_line_via_shell_app`),
+                // so a future divergence here (e.g. someone hand-rolling a
+                // shell string again for "just this one" call site) isn't
+                // caught by this PR's tests.
+                let (shell, flag) = shell_command();
+                let mut cmd = Command::new(shell);
+                cmd.arg(flag).arg(&req.command);
                 if let Some(ref cwd) = req.cwd {
                     cmd.current_dir(cwd);
                 }

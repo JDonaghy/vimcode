@@ -29,7 +29,9 @@ Engine
 ## Commands
 ```bash
 cargo build               # Compile
-cargo test                # Run all tests
+cargo test                # Run all tests (GUI on — covers BOTH backends; the
+                          # --no-default-features lane never compiles src/gtk/,
+                          # see CLAUDE.md "Test lanes" / #645)
 cargo clippy -- -D warnings  # Lint (must pass)
 cargo fmt                 # Format
 ```

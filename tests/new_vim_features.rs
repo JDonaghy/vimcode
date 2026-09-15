@@ -89,11 +89,135 @@ fn test_L_goes_to_screen_bottom() {
 
 #[test]
 fn test_M_goes_to_screen_middle() {
+    // #805: M's target is `scroll_top + (visible_lines - 1) / 2`, matching
+    // real Vim's own `(height - 1) / 2` — NOT `viewport_lines / 2`, which
+    // this test asserted before the fix and which is off by one for an
+    // even-height window (verified against real `nvim`: a freshly opened
+    // 4-row window with cursor on line 1 sends `M` to line 2, i.e. topline
+    // (1) + 1, not topline + 2).
     let mut e = engine_with("line1\nline2\nline3\nline4\nline5\n");
     e.set_viewport_lines(4);
     e.view_mut().scroll_top = 0;
     press(&mut e, 'M');
-    assert_cursor(&e, 2, 0); // scroll_top + viewport_lines/2 = 0 + 2 = 2
+    assert_cursor(&e, 1, 0); // scroll_top + (viewport_lines - 1) / 2 = 0 + 1 = 1
+}
+
+#[test]
+fn test_H_respects_scrolloff() {
+    // #805: 'scrolloff' keeps H at least that many lines below the window's
+    // top edge, not pinned exactly to scroll_top.
+    let mut e = engine_with("l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nl9\nl10\n");
+    e.set_viewport_lines(6);
+    e.settings.scrolloff = 2;
+    e.view_mut().scroll_top = 2;
+    e.view_mut().cursor.line = 6;
+    press(&mut e, 'H');
+    assert_cursor(&e, 4, 0); // scroll_top + scrolloff = 2 + 2 = 4
+}
+
+#[test]
+fn test_L_respects_scrolloff() {
+    // #805: mirror of `test_H_respects_scrolloff` for the bottom edge.
+    let mut e = engine_with("l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nl9\nl10\n");
+    e.set_viewport_lines(6);
+    e.settings.scrolloff = 2;
+    e.view_mut().scroll_top = 2;
+    press(&mut e, 'L');
+    // window bottom = scroll_top + viewport - 1 = 7; minus scrolloff (2) = 5
+    assert_cursor(&e, 5, 0);
+}
+
+#[test]
+fn test_ctrl_d_count_sets_sticky_scroll_value() {
+    // #805: an explicit count on <C-d> SETS Vim's 'scroll' option (replacing,
+    // not multiplying, any previous value), and a later bare <C-d> reuses it.
+    let mut e = engine_with(&(1..=60).map(|n| format!("L{n}\n")).collect::<String>());
+    e.set_viewport_lines(20);
+    type_chars(&mut e, "5"); // count
+    ctrl(&mut e, 'd'); // sets 'scroll' = 5, moves 5 lines down
+    assert_cursor(&e, 5, 0);
+    ctrl(&mut e, 'd'); // bare <C-d>: reuses 'scroll' = 5, NOT the default half-page
+    assert_cursor(&e, 10, 0);
+}
+
+/// A 60-line buffer in a 22-row window — the exact fixture the `scroll:*`
+/// conformance cases use, so these expectations can be read straight off real
+/// interactive Neovim (`'scroll'` = 22 / 2 = 11).
+fn scroll_fixture() -> vimcode_core::Engine {
+    let mut e = engine_with(&(1..=60).map(|n| format!("L{n}\n")).collect::<String>());
+    e.set_viewport_lines(22);
+    e
+}
+
+// #805 review: the conformance labels `scroll:C-d C-d`, `scroll:5C-d C-d`,
+// `scroll:C-d twice then C-u` and `scroll:C-f C-f` stay in KNOWN_DEVIATIONS
+// because the *headless* nvim oracle mis-handles the second and later scroll
+// command of a single feedkeys burst (see the group-B comment block in
+// `tests/nvim_conformance.rs`). The expectations below are the values real
+// *interactive* Neovim produces for the same fixture — captured with
+// `scripts/nvim_headless_vs_interactive_repro.sh` — so a regression in
+// vimcode's own chained-scroll behaviour still fails a test rather than
+// hiding behind a deviation label.
+
+#[test]
+fn test_ctrl_d_chain_moves_a_full_scroll_each_time() {
+    // interactive nvim: <C-d><C-d> from line 1 lands on line 23 (1-indexed).
+    // headless nvim wrongly says 22.
+    let mut e = scroll_fixture();
+    ctrl(&mut e, 'd');
+    assert_cursor(&e, 11, 0);
+    ctrl(&mut e, 'd');
+    assert_cursor(&e, 22, 0);
+}
+
+#[test]
+fn test_ctrl_d_chain_then_ctrl_u_returns_one_scroll() {
+    // interactive nvim: <C-d><C-d><C-u> from line 1 lands back on line 12.
+    let mut e = scroll_fixture();
+    ctrl(&mut e, 'd');
+    ctrl(&mut e, 'd');
+    ctrl(&mut e, 'u');
+    assert_cursor(&e, 11, 0);
+}
+
+#[test]
+fn test_counted_ctrl_d_then_bare_ctrl_d_full_window() {
+    // interactive nvim: 5<C-d><C-d> from line 1 lands on line 11 — the count
+    // SETS 'scroll' to 5 and the bare <C-d> reuses it. headless says 10.
+    let mut e = scroll_fixture();
+    type_chars(&mut e, "5");
+    ctrl(&mut e, 'd');
+    assert_cursor(&e, 5, 0);
+    ctrl(&mut e, 'd');
+    assert_cursor(&e, 10, 0);
+}
+
+#[test]
+fn test_ctrl_f_chain_pages_forward_twice() {
+    // interactive nvim: <C-f><C-f> from line 1 lands on line 41. headless
+    // says 19 — i.e. *above* where a single <C-f> (line 21) lands.
+    let mut e = scroll_fixture();
+    ctrl(&mut e, 'f');
+    assert_cursor(&e, 20, 0);
+    ctrl(&mut e, 'f');
+    assert_cursor(&e, 40, 0);
+}
+
+#[test]
+fn test_dollar_sticks_through_ctrl_e_scrolloff_push() {
+    // #805 review: <C-e>/<C-y> are curswant-preserving, so when scrolloff
+    // forces the cursor onto a new line the column must be re-derived from
+    // the `$`-set CURSWANT_EOL, not clamped from the old column.
+    let mut e = engine_with("aaaaaaaa\nbb\ncccccccc\ndddddddd\neeeeeeee\n");
+    e.set_viewport_lines(3);
+    e.view_mut().scroll_top = 0;
+    e.view_mut().cursor.line = 0;
+    press(&mut e, '$'); // curswant = end-of-line
+    assert_cursor(&e, 0, 7);
+    ctrl(&mut e, 'e'); // scroll down: cursor pushed off the top onto line 1
+    assert_cursor(&e, 1, 1); // "bb" is short — clamped, but curswant survives
+    ctrl(&mut e, 'e'); // pushed onto line 2, a long line again
+    assert_cursor(&e, 2, 7); // back to end-of-line, not stuck at col 1
 }
 
 // ── Ctrl+e / Ctrl+y ──────────────────────────────────────────────────────────
@@ -236,6 +360,117 @@ fn test_count_ctrl_a() {
     press(&mut e, '5');
     ctrl(&mut e, 'a');
     assert_buf(&e, "x 8 y\n");
+}
+
+/// `<C-a>` / `<C-x>` across every 'nrformats' shape VimCode supports (#807).
+///
+/// Expectations are the **oracle's**, not hand-authored: each row was taken
+/// from `nvim --headless` on the same buffer + keys (they are also covered
+/// case-by-case by the `num:*` entries in `tests/nvim_conformance.rs`, which
+/// only run when nvim is on PATH — this table is the always-on regression
+/// net). VimCode pins Neovim's default 'nrformats' of `bin,hex`, so `007` is
+/// decimal-with-leading-zeros, not octal.
+#[test]
+fn test_number_formats_table() {
+    // (start, keys-are-<C-a>?, expected buffer, expected cursor col)
+    let cases: &[(&str, bool, &str, usize)] = &[
+        // Leading zeros: the width is preserved, and the run is *decimal*
+        // (before #807, `0099<C-x>` parsed as octal into an i64 and underflowed
+        // to "1777777777777777777777").
+        ("007", true, "008", 2),
+        ("009", true, "010", 2),
+        ("0099", false, "0098", 3),
+        ("000", false, "-001", 3),
+        // Hex keeps its `0x`/`0X` prefix case and the case of its last letter.
+        ("0x0", true, "0x1", 2),
+        ("0x0", false, "0xffffffffffffffff", 17),
+        ("0xaB", true, "0xAC", 3),
+        ("0xAb", true, "0xac", 3),
+        ("0X0f", true, "0X10", 3),
+        // A leading `-` is not part of a hex literal: only the digits change.
+        ("-0x1", true, "-0x2", 3),
+        // Binary.
+        ("0b101", true, "0b110", 4),
+        ("0B101", false, "0B100", 4),
+        // Decimal signs and u64 saturation.
+        ("-1", true, "0", 0),
+        ("-1", false, "-2", 1),
+        ("99999999999999999999", true, "18446744073709551615", 19),
+    ];
+    for &(start, add, expect, col) in cases {
+        let mut e = engine_with(&format!("{start}\n"));
+        ctrl(&mut e, if add { 'a' } else { 'x' });
+        assert_eq!(
+            buf(&e),
+            format!("{expect}\n"),
+            "{start} {}",
+            if add { "<C-a>" } else { "<C-x>" }
+        );
+        assert_eq!(
+            e.cursor().col,
+            col,
+            "{start} {} cursor",
+            if add { "<C-a>" } else { "<C-x>" }
+        );
+    }
+}
+
+/// Visual-mode `<C-a>` bumps every line's first selected number by the same
+/// amount, `g<C-a>` steps per changed line, and the cursor lands on the first
+/// change — not on the last line touched (#807).
+#[test]
+fn test_visual_ctrl_a_variants() {
+    let mut e = engine_with("1\n1\n1\n");
+    press(&mut e, 'V');
+    press(&mut e, 'j');
+    press(&mut e, 'j');
+    ctrl(&mut e, 'a');
+    assert_buf(&e, "2\n2\n2\n");
+    assert_cursor(&e, 0, 0);
+
+    let mut e = engine_with("1\n1\n1\n");
+    press(&mut e, 'V');
+    press(&mut e, 'j');
+    press(&mut e, 'j');
+    press(&mut e, 'g');
+    ctrl(&mut e, 'a');
+    assert_buf(&e, "2\n3\n4\n");
+    assert_cursor(&e, 0, 0);
+
+    // Lines with no number do not advance the g<C-a> counter.
+    let mut e = engine_with("1\nx\n1\n");
+    press(&mut e, 'V');
+    press(&mut e, 'j');
+    press(&mut e, 'j');
+    press(&mut e, 'g');
+    ctrl(&mut e, 'a');
+    assert_buf(&e, "2\nx\n3\n");
+
+    // Only the first number *inside the selection* on each line changes.
+    let mut e = engine_with("1 2\n3 4\n");
+    press(&mut e, 'V');
+    press(&mut e, 'j');
+    ctrl(&mut e, 'a');
+    assert_buf(&e, "2 2\n4 4\n");
+
+    // Blockwise: the selection picks which number on the line is hit.
+    let mut e = engine_with("1 1\n1 1\n");
+    press(&mut e, 'l');
+    press(&mut e, 'l');
+    ctrl(&mut e, 'v');
+    press(&mut e, 'j');
+    ctrl(&mut e, 'a');
+    assert_buf(&e, "1 2\n1 2\n");
+    assert_cursor(&e, 0, 2);
+
+    // A `-` outside the selection is not a sign: `vl<C-a>` on the `5` of
+    // `x -5` gives `x -6`, not `x -4`.
+    let mut e = engine_with("x -5\n");
+    press(&mut e, '$');
+    press(&mut e, 'v');
+    press(&mut e, 'l');
+    ctrl(&mut e, 'a');
+    assert_buf(&e, "x -6\n");
 }
 
 // ── = operator auto-indent ───────────────────────────────────────────────────
@@ -439,9 +674,91 @@ fn test_echo_empty_clears_message() {
 
 #[test]
 fn test_shell_command_shows_output() {
+    // Shares `SHELL_ENV_LOCK` with `test_bang_command_honours_shell_env_var`
+    // below: that test points process-global `$SHELL` at a fake shell for
+    // its duration, which would otherwise race this test's `:!` (both run
+    // in the same test binary, in parallel, by default).
+    let _lock = SHELL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut e = engine_with("hello\n");
     exec(&mut e, "!echo test_output");
     assert!(e.message.contains("test_output"));
+}
+
+/// #948: `:!` used to hardcode `Command::new("sh")`, ignoring `$SHELL`
+/// entirely (and having no Windows leg at all — `sh` doesn't exist there).
+/// Point `$SHELL` at a fake shell script that unconditionally prints a
+/// marker regardless of the command string it's handed, then run `:!` with
+/// a *different* command. If `:!` really resolves the shell binary through
+/// quadraui's `shell_command()` seam (as fixed), the fake shell runs and the
+/// marker shows up in the output instead of the real command's output.
+/// Verified RED against unfixed develop: reverting #948's `execute.rs`
+/// change back to `Command::new("sh")` makes this fail because a real `sh`
+/// ignores `$SHELL` and runs `echo real_sh_output` literally, never
+/// producing the marker.
+#[test]
+#[cfg(unix)]
+fn test_bang_command_honours_shell_env_var() {
+    let _lock = SHELL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let dir = std::env::temp_dir().join(format!("vimcode_test_fake_shell_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("create fake-shell temp dir");
+    let script = dir.join("fake_shell.sh");
+    std::fs::write(&script, "#!/bin/sh\necho FAKE_SHELL_MARKER\n").expect("write fake shell");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&script)
+            .expect("stat fake shell")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script, perms).expect("chmod fake shell");
+    }
+
+    let _guard = EnvVarGuard::set("SHELL", script.as_os_str());
+
+    let mut e = engine_with("hello\n");
+    exec(&mut e, "!echo real_sh_output");
+    assert!(
+        e.message.contains("FAKE_SHELL_MARKER"),
+        "expected :! to resolve the shell via $SHELL (fake shell script), got: {:?}",
+        e.message
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Serializes tests in this file that mutate the process-global `$SHELL`
+/// env var (shared with every other test in this binary), and an RAII guard
+/// that restores the prior value on drop — including on panic. Mirrors the
+/// pattern in `tests/extensions.rs`'s `HOMEBREW_ENV_LOCK`/`EnvVarGuard`.
+static SHELL_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+// Only ever constructed by `test_bang_command_honours_shell_env_var` above,
+// which is itself `#[cfg(unix)]`-gated — gate the whole type the same way so
+// a non-unix build doesn't carry an unused struct + `Drop` impl.
+#[cfg(unix)]
+struct EnvVarGuard {
+    key: &'static str,
+    old: Option<std::ffi::OsString>,
+}
+
+#[cfg(unix)]
+impl EnvVarGuard {
+    fn set(key: &'static str, value: &std::ffi::OsStr) -> Self {
+        let old = std::env::var_os(key);
+        std::env::set_var(key, value);
+        Self { key, old }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        match self.old.take() {
+            Some(v) => std::env::set_var(self.key, v),
+            None => std::env::remove_var(self.key),
+        }
+    }
 }
 
 // ── ignorecase / smartcase ──────────────────────────────────────────────────
@@ -570,4 +887,304 @@ fn test_set_textwidth() {
     let mut e = engine_with("hello\n");
     exec(&mut e, "set textwidth=79");
     assert_eq!(e.settings.textwidth, 79);
+}
+
+// ── #806: mark adjustment, '' toggling, macro failure-stop/recursion ───────────
+
+#[test]
+fn test_mark_shifts_after_line_inserted_above() {
+    // `:h mark-motions` — inserting a line above a mark must shift the
+    // mark's line number down with it, not leave it pointing at whatever
+    // text slid into its old slot.
+    let mut e = engine_with("a\nb\nc\n");
+    press(&mut e, 'j'); // line 1, "b"
+    press(&mut e, 'm');
+    press(&mut e, 'a'); // mark a := (line 1, "b")
+    press(&mut e, 'g');
+    press(&mut e, 'g'); // back to line 0, "a"
+    press(&mut e, 'O'); // open a new blank line above line 0
+    type_chars(&mut e, "x");
+    press_key(&mut e, "Escape");
+    // Buffer is now ["x", "a", "b", "c"] — "b" (and mark a) shifted to line 2.
+    assert_eq!(
+        get_lines(&e),
+        vec![
+            "x".to_string(),
+            "a".to_string(),
+            "b".to_string(),
+            "c".to_string(),
+        ]
+    );
+    press(&mut e, '\'');
+    press(&mut e, 'a');
+    assert_cursor(&e, 2, 0);
+}
+
+#[test]
+fn test_mark_on_same_line_shifts_when_o_inserts_above() {
+    // #806 review: `O` splices a new blank line in at COLUMN 0 of the
+    // cursor's own line, so the entire original line — including a mark
+    // sitting on that same line, not just marks strictly below it — slides
+    // down by one. Before this fix, `shift_marks_for_line_insert` only
+    // shifted `cursor.line > at_line`, silently leaving a same-line mark
+    // pointing at the new, blank line instead of the text it used to mark.
+    let mut e = engine_with("a\nb\nc\n");
+    press(&mut e, 'm');
+    press(&mut e, 'a'); // mark a := (line 0, "a") -- the line `O` fires from
+    press(&mut e, 'O'); // open a new blank line above line 0
+    type_chars(&mut e, "x");
+    press_key(&mut e, "Escape");
+    // Buffer is now ["x", "a", "b", "c"] -- "a" (and mark a) shifted to line 1.
+    assert_eq!(
+        get_lines(&e),
+        vec![
+            "x".to_string(),
+            "a".to_string(),
+            "b".to_string(),
+            "c".to_string(),
+        ]
+    );
+    press(&mut e, '\'');
+    press(&mut e, 'a');
+    assert_cursor(&e, 1, 0);
+}
+
+#[test]
+fn test_visual_expr_register_prompts() {
+    // #806 review: the Visual-mode `'"'` pending-key arm mirrored the
+    // Normal-mode register-name set but dropped the `'='` branch that opens
+    // `expr_register_pending` — typing `"=` in Visual mode just set
+    // `selected_register = Some('=')` with no prompt ever shown, so the
+    // keys meant for the expression ("1+1<CR>") fell through and were
+    // executed as ordinary Visual-mode motions instead of being consumed by
+    // the expression prompt. Round-trip through `p` to prove the expression
+    // was actually evaluated and landed in the buffer, not just that some
+    // internal flag got set.
+    let mut e = engine_with("hello world\n");
+    press(&mut e, 'v'); // Visual mode, selects "h"
+    press(&mut e, '"');
+    press(&mut e, '=');
+    type_chars(&mut e, "1+1");
+    press_key(&mut e, "Return"); // evaluates to "2", stored in register '='
+    press(&mut e, 'p'); // replace the visual selection with register '='
+    assert_eq!(get_lines(&e), vec!["2ello world".to_string()]);
+}
+
+#[test]
+fn test_double_quote_mark_toggles() {
+    // `''` jumps to the position before the last jump — and IS ITSELF a
+    // jump, so a second `''` toggles back (`:h ''`).
+    let mut e = engine_with("a\nb\nc\nd\n");
+    press(&mut e, '3');
+    press(&mut e, 'G'); // line 2 ("c") — a real jump, so '' now targets line 0
+    assert_cursor(&e, 2, 0);
+    press(&mut e, '\'');
+    press(&mut e, '\'');
+    assert_cursor(&e, 0, 0); // back to where 3G started
+    press(&mut e, '\'');
+    press(&mut e, '\'');
+    assert_cursor(&e, 2, 0); // toggled forward again, to where '' jumped from
+}
+
+#[test]
+fn test_macro_count_stops_at_first_failure() {
+    // Vim aborts the whole repeat count when a command inside the macro
+    // fails — `100@a` must behave exactly like `10@a` here (stop once `f,`
+    // can't find a comma), not run all 100 requested repetitions.
+    let mut e = engine_with("a,b\nc,d\ne f\ng,h\n");
+    press(&mut e, 'q');
+    press(&mut e, 'a');
+    press(&mut e, '0');
+    press(&mut e, 'f');
+    press(&mut e, ',');
+    press(&mut e, 'x');
+    press(&mut e, 'j');
+    press(&mut e, 'q');
+    press(&mut e, '1');
+    press(&mut e, '0');
+    press(&mut e, '0');
+    press(&mut e, '@');
+    press(&mut e, 'a');
+    drain_macro_queue(&mut e);
+    assert_eq!(
+        get_lines(&e),
+        vec![
+            "ab".to_string(),
+            "cd".to_string(),
+            "e f".to_string(),
+            "g,h".to_string(),
+        ],
+        "the count must stop at the first line without a comma, not paper \
+         over it and keep going"
+    );
+    assert_cursor(&e, 2, 0);
+}
+
+#[test]
+fn test_recursive_macro_terminates_at_eof() {
+    // The idiomatic Vim "run this macro over the whole file" trick: record
+    // an empty macro (`qaq`), then re-record it ending in a self-referential
+    // `@a` — at record time that refers to the still-empty macro (a no-op),
+    // but once saved, playing it back makes `@a` recurse for real. It must
+    // stop when `j` fails at the last line, not spin forever.
+    let mut e = engine_with("a\nb\nc\nd\n");
+    press(&mut e, 'q');
+    press(&mut e, 'a');
+    press(&mut e, 'q'); // qaq: register 'a' is now "" (empty)
+    press(&mut e, 'q');
+    press(&mut e, 'a'); // start recording 'a' for real
+    press(&mut e, 'A');
+    type_chars(&mut e, "!");
+    press_key(&mut e, "Escape");
+    press(&mut e, 'j');
+    press(&mut e, '@');
+    press(&mut e, 'a'); // during recording, plays back the still-empty macro
+    press(&mut e, 'q'); // stop: register 'a' is now "A!<Esc>j@a"
+    drain_macro_queue(&mut e); // nothing should be queued, but be safe
+    press(&mut e, '@');
+    press(&mut e, 'a'); // the real, recursive invocation
+                        // Bounded drain: assert it terminates well before any "safety cap"
+                        // would — a regression back to the old behavior spins until
+                        // MAX_MACRO_RECURSION, which this loop deliberately doesn't reach.
+    let mut iterations = 0;
+    while !e.macro_playback_queue.is_empty() && iterations < 1000 {
+        e.advance_macro_playback();
+        iterations += 1;
+    }
+    assert!(
+        e.macro_playback_queue.is_empty(),
+        "recursive macro should terminate at EOF, not keep running \
+         (queue still has {} keys after {iterations} iterations)",
+        e.macro_playback_queue.len()
+    );
+    assert_eq!(
+        get_lines(&e),
+        vec![
+            "a!".to_string(),
+            "b!".to_string(),
+            "c!".to_string(),
+            "d!".to_string(),
+        ]
+    );
+}
+
+/// `r<CR>` / `r<Tab>` and Replace-mode `<BS>` (#807).
+///
+/// Expectations are the nvim oracle's (`op:r<CR>`, `op:3r<CR>`, `misc:r Tab`,
+/// `op:5r beyond eol`, `op:R BS restores`, `op:2R`, `op:R <CR>`).
+#[test]
+fn test_r_special_keys_and_replace_mode_backspace() {
+    // r<CR> replaces the character with a line break and lands on the new line.
+    let mut e = engine_with("abc def\n");
+    type_chars(&mut e, "lll");
+    press(&mut e, 'r');
+    press_key(&mut e, "Return");
+    assert_buf(&e, "abc\ndef\n");
+    assert_cursor(&e, 1, 0);
+
+    // A count replaces N characters with ONE line break.
+    let mut e = engine_with("abcdef\n");
+    press(&mut e, 'l');
+    type_chars(&mut e, "3");
+    press(&mut e, 'r');
+    press_key(&mut e, "Return");
+    assert_buf(&e, "a\nef\n");
+
+    // r<Tab> honours 'expandtab'.
+    let mut e = engine_with("ab\n");
+    press(&mut e, 'r');
+    press_key(&mut e, "Tab");
+    assert_buf(&e, "    b\n");
+    assert_cursor(&e, 0, 3);
+
+    // A count that does not fit on the line makes `r` do nothing at all.
+    let mut e = engine_with("abc\n");
+    press(&mut e, 'l');
+    type_chars(&mut e, "5");
+    press(&mut e, 'r');
+    press(&mut e, 'x');
+    assert_buf(&e, "abc\n");
+
+    // Replace-mode <BS> restores the overwritten characters.
+    let mut e = engine_with("abcdef\n");
+    press(&mut e, 'l');
+    type_chars(&mut e, "Rxyz");
+    assert_buf(&e, "axyzef\n");
+    press_key(&mut e, "BackSpace");
+    press_key(&mut e, "BackSpace");
+    press_key(&mut e, "Escape");
+    assert_buf(&e, "axcdef\n");
+
+    // 2R re-applies the typed text, still overwriting.
+    let mut e = engine_with("abcdef\n");
+    type_chars(&mut e, "2Rxy");
+    press_key(&mut e, "Escape");
+    assert_buf(&e, "xyxyef\n");
+
+    // <CR> in Replace mode breaks the line without consuming a character.
+    let mut e = engine_with("abcdef\n");
+    press(&mut e, 'l');
+    type_chars(&mut e, "Rx");
+    press_key(&mut e, "Return");
+    type_chars(&mut e, "y");
+    press_key(&mut e, "Escape");
+    assert_buf(&e, "ax\nydef\n");
+}
+
+/// Counts on the screen-relative operators and motions (#807).
+///
+/// `dH` / `dL` used to throw their count away (`let _ = self.take_count()`),
+/// and `M` / `gm` / `gM` never consumed theirs at all, so it leaked into the
+/// next command. The conformance suite cannot cover these: its headless nvim
+/// oracle mis-reports window-relative state (see the Group A comment in
+/// `tests/nvim_conformance.rs`), so they are pinned here instead.
+#[test]
+fn test_screen_relative_counts() {
+    let fixture = || {
+        let mut e = engine_with(&(1..=20).map(|n| format!("L{n}\n")).collect::<String>());
+        e.set_viewport_lines(10);
+        e.view_mut().scroll_top = 0;
+        e
+    };
+
+    // d3H from line 7 deletes lines 3..7 (the 3rd line from the top down).
+    let mut e = fixture();
+    e.view_mut().cursor.line = 6;
+    type_chars(&mut e, "d3H");
+    assert_eq!(
+        get_lines(&e)[..3],
+        ["L1".to_string(), "L2".to_string(), "L8".to_string()]
+    );
+
+    // Without a count dH reaches the very top line.
+    let mut e = fixture();
+    e.view_mut().cursor.line = 6;
+    type_chars(&mut e, "dH");
+    assert_eq!(get_lines(&e)[0], "L8");
+
+    // d3L from line 1 deletes down to the 3rd line from the window bottom.
+    let mut e = fixture();
+    type_chars(&mut e, "d3L");
+    assert_eq!(get_lines(&e)[0], "L9");
+
+    // `M` ignores its count but must CONSUME it: the `3` must not survive to
+    // turn the following `x` into `3x`.
+    let mut e = fixture();
+    type_chars(&mut e, "3Mx");
+    assert_eq!(get_lines(&e)[4], "5");
+    assert_eq!(e.peek_count(), None);
+
+    // Same leak for gm / gM.
+    let mut e = engine_with("abcdefghij\n");
+    type_chars(&mut e, "3gmx");
+    assert_eq!(buf(&e).matches('a').count(), 1, "only one char removed");
+    assert_eq!(e.peek_count(), None);
+
+    // gM without a count is the middle of the line; `20gM` is 20% into it.
+    let mut e = engine_with("abcdefghij\n");
+    type_chars(&mut e, "gM");
+    assert_cursor(&e, 0, 5);
+    let mut e = engine_with("abcdefghij\n");
+    type_chars(&mut e, "20gM");
+    assert_cursor(&e, 0, 2);
 }

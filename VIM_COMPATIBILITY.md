@@ -165,12 +165,14 @@ See [README.md](README.md) for full feature documentation.
 
 | Command | Description | Status | Notes |
 |---------|-------------|--------|-------|
-| `/pattern` | Search forward | ✅ | Incremental highlight |
-| `?pattern` | Search backward | ✅ | Incremental highlight |
-| `n` | Next match | ✅ | Direction-aware |
+| `/pattern` | Search forward | ✅ | Full Vim regex (see below); incremental highlight |
+| `?pattern` | Search backward | ✅ | Full Vim regex; incremental highlight |
+| `/pat/{offset}` | Search offset | ✅ | `e`, `e±N`, `s`/`b±N`, `±N` linewise; `;` chains a second search |
+| `//` / `/<CR>` | Repeat last pattern | ✅ | Also `:s//rep/` |
+| `n` | Next match | ✅ | Direction-aware; keeps the search offset |
 | `N` | Previous match | ✅ | |
-| `*` | Search word forward | ✅ | Word-bounded |
-| `#` | Search word backward | ✅ | Word-bounded |
+| `*` | Search word forward | ✅ | Sets `\<word\>` as the last pattern; `'smartcase'` does not apply |
+| `#` | Search word backward | ✅ | As `*` |
 | `g*` | Search word forward | ✅ | Partial match |
 | `g#` | Search word backward | ✅ | Partial match |
 | `gn` | Select next match | ✅ | |
@@ -186,13 +188,50 @@ See [README.md](README.md) for full feature documentation.
 | `'.` | Jump to last edit line | ✅ | |
 | `` `. `` | Jump to last edit position | ✅ | |
 | `'<` / `'>` | Jump to visual selection | ✅ | |
-| `CTRL-O` | Jump list back | ✅ | |
-| `CTRL-I` | Jump list forward | ✅ | |
+| `CTRL-O` | Jump list back | ✅ | Carries tab/split identity (#674); see note below |
+| `CTRL-I` | Jump list forward | ✅ | Carries tab/split identity (#674); see note below |
 | `g;` | Older change position | ✅ | |
 | `g,` | Newer change position | ✅ | |
 | `g'` / `` g` `` | Mark jump without jumplist | ✅ | |
 
 **Search & Marks: 26/26 (100%)**
+
+### Search pattern syntax (`src/core/vim_regex.rs`)
+
+Vim patterns are translated to Rust `regex` before matching, so `/`, `?`, `:s`,
+`:g` and the ex `/pat/` address all share one engine.
+
+| Supported | Notes |
+|---|---|
+| `\m` `\M` `\v` `\V` | all four magic levels |
+| `^` `$` `.` `*` `[…]` `~` | magic-level aware (`^`/`$` anchor only where Vim says) |
+| `\+` `\?` `\=` `\{n,m}` `\{-}` `\{-n,m}` | quantifiers, greedy and non-greedy |
+| `\(…\)` `\%(…\)` `\\|` | groups and alternation |
+| `\<` `\>` | word boundaries |
+| `\zs` `\ze` | match-span trimming |
+| `\c` `\C` | inline case override; `'ignorecase'` / `'smartcase'` otherwise |
+| `\n` `\t` `\r` `\e` | multi-line search works across the whole buffer |
+| `\s \d \w \a \l \u \x \o \h \i \k \f \p` + uppercase negations | character classes |
+| `\%^` `\%$` | start/end of buffer |
+
+**Not supported** — these are *rejected with an error*, never silently matched
+as literal text: back-references in a pattern (`\1`…`\9`), look-around
+(`\@=`, `\@!`), `\&`, and `\_x`. The Rust `regex` crate has no back-tracking,
+so it cannot express them.
+
+**Known deviation — jumplist scope (#674):** stock Vim keeps one jumplist
+*per window* (`:help jumplist`): `CTRL-O`/`CTRL-I` never cross a window or
+tab boundary on their own, even though each entry still records which
+buffer it was in. VimCode's jumplist is intentionally **global** instead —
+one timeline shared across every tab and split. Each entry additionally
+records the group/tab/window it was made in, and `CTRL-O`/`CTRL-I` restore
+by *switching to that pane* when it still exists (falling back to
+reopening the file only if the pane was closed), rather than reopening the
+file into whichever pane is currently focused. This was a deliberate
+choice, not an oversight: the reported use case is explicitly cross-tab —
+"jump back to a tab I visited a few minutes earlier, then forward again" —
+which a strictly per-window jumplist cannot do. A tab/split closing prunes
+its entries from the list so `CTRL-O`/`CTRL-I` keep working afterward.
 
 ---
 
@@ -456,17 +495,21 @@ Operators `d`, `c`, `y`, `>`, `<`, `=`, `g~`, `gu`, `gU` all accept these motion
 | `O` | Swap to other corner (block) | ✅ | |
 | `gv` | Reselect last visual | ✅ | |
 | `d` / `x` | Delete selection | ✅ | |
-| `c` / `s` | Change selection | ✅ | |
+| `c` / `s` | Change selection | ✅ | `s` implemented in #807 — this row was ✅ before it was true |
 | `y` | Yank selection | ✅ | |
 | `>` / `<` | Indent/dedent selection | ✅ | |
 | `~` | Toggle case | ✅ | |
 | `u` | Lowercase selection | ✅ | |
 | `U` | Uppercase selection | ✅ | |
-| `=` | Auto-indent selection | ✅ | |
-| `p` / `P` | Paste over selection | ✅ | |
+| `=` | Auto-indent selection | ✅ | Implemented in #807 — this row was ✅ for months before the key did anything |
+| `p` / `P` | Paste over selection | ✅ | A blockwise register puts a rectangle back (#807) |
 | `:` | Enter command with range | ✅ | `'<,'>` pre-filled |
 | `J` | Join selected lines | ✅ | |
-| `gJ` | Join without space | ✅ | |
+| `gJ` | Join without space | ✅ | Implemented in #807 — same stale-✅ story as `=` above |
+| `D` / `X` | Delete selected lines (linewise) | ✅ | Block `D` deletes to end of line (#807) |
+| `C` / `S` / `R` | Change selected lines (linewise) | ✅ | Block `C` changes to end of line (#807) |
+| `Y` | Yank selected lines (linewise) | ✅ | #807 |
+| `CTRL-A` / `CTRL-X` | Increment/decrement in selection | ✅ | #807 |
 | `%` | Jump to matching bracket | ✅ | Extends selection |
 | `r{char}` | Replace all selected chars | ✅ | Visual/VisualLine/VisualBlock |
 | `I` (block) | Block insert | ✅ | Text applied to all block lines on Escape |
@@ -476,7 +519,7 @@ Operators `d`, `c`, `y`, `>`, `<`, `=`, `g~`, `gu`, `gU` all accept these motion
 | `g CTRL-X` | Sequential decrement | ✅ | |
 | Movement keys | Extend selection | ✅ | All motions work |
 
-**Visual mode: 26/26 (100%)**
+**Visual mode: 30/30 (100%)**
 
 ---
 
@@ -510,9 +553,9 @@ Operators `d`, `c`, `y`, `>`, `<`, `=`, `g~`, `gu`, `gU` all accept these motion
 | `:tabclose` | Close tab | ✅ | |
 | `:tabnext` / `:tabprevious` | Next/prev tab | ✅ | |
 | `:tabmove` | Move tab | ✅ | |
-| `:s/pat/rep/[flags]` | Substitute | ✅ | `g`, `i` flags |
-| `:%s/pat/rep/` | Substitute all lines | ✅ | |
-| `:g/pat/cmd` | Global command | ✅ | |
+| `:[range]s/pat/rep/[flags] [count]` | Substitute | ✅ | Vim regex; `g c e i I n &` flags (`c` errors — not implemented); any delimiter (`:s#a#b#`); `:&`, `:&&`, `:~`; `\|` chaining |
+| `:%s/pat/rep/` | Substitute all lines | ✅ | Multi-line patterns (`\n`) supported |
+| `:[range]g/pat/cmd` | Global command | ✅ | `:g!`, any delimiter, empty pattern reuses last search |
 | `:v/pat/cmd` | Inverse global | ✅ | |
 | `:d` / `:delete` | Delete lines | ✅ | |
 | `:m` / `:move` | Move lines | ✅ | |
@@ -523,7 +566,8 @@ Operators `d`, `c`, `y`, `>`, `<`, `=`, `g~`, `gu`, `gU` all accept these motion
 | `:sort` | Sort lines | ✅ | `n`/`r`/`u`/`i` flags |
 | `:norm` / `:normal` | Execute normal keys | ✅ | Range support, `!` variant |
 | `:noh` / `:nohlsearch` | Clear highlight | ✅ | |
-| `:set {option}` | Set option | ✅ | Full `:set` syntax |
+| Ex ranges | `N`, `.`, `$`, `%`, `'m`, `'<,'>`, `/pat/`, `?pat?`, `+N`/`-N`, `a,b`, `a;b` | ✅ | Accepted by `:s`, `:g`, `:d`, `:y`, `:j`, `:>`, `:<`, `:t`, `:m`, `:normal` |
+| `:set {option}` | Set option | ✅ | Full `:set` syntax, several options per command (`:set ic scs`) |
 | `:r {file}` / `:read` | Read file into buffer | ✅ | |
 | `:!{cmd}` | Execute shell command | ✅ | |
 | `:reg` / `:registers` | Display registers | ✅ | |

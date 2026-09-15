@@ -1,0 +1,160 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+
+env:
+  CARGO_TERM_COLOR: always
+  # #865: the Neovim that tests/nvim_conformance.rs uses as its oracle. Must be
+  # >= `MIN_NVIM_VERSION` in that file (0.12), and should match the fleet
+  # standard installed on every agent host so CI and the fleet judge Vim
+  # behaviour with the same binary. `ubuntu-24.04`'s apt ships 0.9.5, which is
+  # below the floor, so both jobs install this pinned upstream tarball instead.
+  NVIM_ORACLE_VERSION: v0.12.5
+
+jobs:
+  test:
+    name: Test (Linux, headless)
+    runs-on: ubuntu-24.04
+
+    steps:
+    - uses: actions/checkout@v4
+
+    # #691: quadraui is a git dependency pinned to a `rev` in Cargo.toml
+    # (`quadraui = { git = ..., rev = ... }`), resolved and locked in
+    # Cargo.lock. Cargo fetches it itself on the first cargo invocation below
+    # — no separate checkout step needed. (Formerly a hand-cloned sibling path
+    # dep pinned out-of-band via `quadraui-pin.txt`; see git history / #638 /
+    # #625 for why that existed and why it was retired.)
+
+    # #795/#865: tests/nvim_conformance.rs is the only test that validates
+    # VimCode against real Vim behaviour. It's a default integration test
+    # compiled in this (`--no-default-features`) lane too, and since #865 it
+    # hard-fails on EVERY lane if nvim is missing or older than its declared
+    # `MIN_NVIM_VERSION` — so this install step is load-bearing, not optional.
+    # Do not swap it back to `apt-get install neovim`: ubuntu-24.04 apt ships
+    # 0.9.5, which is below the floor and would fail the job.
+    - name: Install Neovim ${{ env.NVIM_ORACLE_VERSION }} (oracle for tests/nvim_conformance.rs)
+      run: |
+        set -euo pipefail
+        curl -fsSL -o /tmp/nvim.tar.gz \
+          "https://github.com/neovim/neovim/releases/download/${NVIM_ORACLE_VERSION}/nvim-linux-x86_64.tar.gz"
+        sudo tar -C /opt -xzf /tmp/nvim.tar.gz
+        echo "/opt/nvim-linux-x86_64/bin" >> "$GITHUB_PATH"
+
+    - name: Verify the conformance oracle
+      run: nvim --version | head -1
+
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Cache cargo registry
+      uses: actions/cache@v4
+      with:
+        path: ~/.cargo/registry
+        key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+
+    - name: Cache cargo index
+      uses: actions/cache@v4
+      with:
+        path: ~/.cargo/git
+        key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
+
+    - name: Cache cargo build
+      uses: actions/cache@v4
+      with:
+        path: target
+        key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
+
+    - name: Check formatting
+      run: cargo fmt -- --check
+
+    - name: Run clippy
+      run: cargo clippy --no-default-features -- -D warnings
+
+    - name: Build
+      run: cargo build --no-default-features
+
+    - name: Run tests
+      run: |
+        cargo test --no-default-features
+
+  # #645: the job above compiles GTK OUT (`--no-default-features`), so a green
+  # run there carries zero information about `src/gtk/`. This job is the lane
+  # that actually compiles and tests the GTK backend. It runs headlessly — no
+  # DISPLAY is set on a GitHub runner and none is needed: the `gtk::*` unit
+  # tests paint into in-memory Cairo ImageSurfaces (the quadraui#301 GtkDriver
+  # pattern) and nothing calls `gtk::init`. The `--no-default-features` job is
+  # kept for the one thing this job can't prove: vimcode still builds on a
+  # machine without GTK dev libs.
+  test-gui:
+    name: Test (Linux, headless, GUI feature on)
+    runs-on: ubuntu-24.04
+
+    steps:
+    - uses: actions/checkout@v4
+
+    # #691: quadraui fetched by Cargo itself, same as the TUI job — see the
+    # comment there.
+
+    - name: Install GTK4 dev libraries
+      run: |
+        sudo apt-get update
+        # #720: librsvg2-common ships the gdk-pixbuf SVG loader. It's only a
+        # `Recommends` of libgtk-4-1 on Ubuntu, not a hard `Depends`, so
+        # --no-install-recommends (below) does NOT pull it in on its own --
+        # it must be listed explicitly. Without it, `Pixbuf::from_read` on
+        # the app-icon SVG (src/gtk/util.rs) fails, and the two #720 icon
+        # tests (src/gtk/testing.rs, src/gtk/util.rs) hard-fail rather than
+        # exercising real rasterised pixels.
+        #
+        sudo apt-get install -y --no-install-recommends libgtk-4-dev librsvg2-common
+
+    # #795/#865: neovim is the oracle for tests/nvim_conformance.rs, a default
+    # integration test this (default-features) lane also compiles and runs. It
+    # hard-fails on every lane if nvim is missing or below its declared
+    # `MIN_NVIM_VERSION`, so this install is load-bearing. It is a pinned
+    # upstream tarball rather than `apt-get install neovim` because
+    # ubuntu-24.04 apt ships 0.9.5, below the floor — and because CI and the
+    # agent fleet must judge Vim behaviour with the same binary.
+    - name: Install Neovim ${{ env.NVIM_ORACLE_VERSION }} (oracle for tests/nvim_conformance.rs)
+      run: |
+        set -euo pipefail
+        curl -fsSL -o /tmp/nvim.tar.gz \
+          "https://github.com/neovim/neovim/releases/download/${NVIM_ORACLE_VERSION}/nvim-linux-x86_64.tar.gz"
+        sudo tar -C /opt -xzf /tmp/nvim.tar.gz
+        echo "/opt/nvim-linux-x86_64/bin" >> "$GITHUB_PATH"
+
+    - name: Verify the conformance oracle
+      run: nvim --version | head -1
+
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Cache cargo registry
+      uses: actions/cache@v4
+      with:
+        path: ~/.cargo/registry
+        key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+
+    - name: Cache cargo index
+      uses: actions/cache@v4
+      with:
+        path: ~/.cargo/git
+        key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
+
+    - name: Cache cargo build
+      uses: actions/cache@v4
+      with:
+        path: target
+        # Distinct key from the TUI job — the target dirs diverge (GTK crates).
+        key: ${{ runner.os }}-cargo-build-target-gui-${{ hashFiles('**/Cargo.lock') }}
+
+    - name: Run tests (GUI feature on, no DISPLAY)
+      run: |
+        # Guard the lane's whole point: this must be a headless run.
+        test -z "${DISPLAY:-}" && test -z "${WAYLAND_DISPLAY:-}"
+        cargo test

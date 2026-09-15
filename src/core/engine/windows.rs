@@ -110,6 +110,7 @@ impl Engine {
         // Remove window from windows map and any scroll-bind pairs that referenced it.
         let closed_buf_id = self.windows.get(&window_id).map(|w| w.buffer_id);
         self.windows.remove(&window_id);
+        self.prune_jump_list_windows(&[window_id]);
         self.scroll_bind_pairs
             .retain(|&(a, b)| a != window_id && b != window_id);
         if let Some((a, b)) = self.diff_window_pair.take() {
@@ -131,6 +132,7 @@ impl Engine {
                         }
                     }
                     self.windows.remove(&partner);
+                    self.prune_jump_list_windows(&[partner]);
                     self.scroll_bind_pairs
                         .retain(|&(x, y)| x != partner && y != partner);
                 }
@@ -185,6 +187,7 @@ impl Engine {
         tab.layout = WindowLayout::leaf(active_window_id);
 
         // Remove closed windows and any scroll-bind pairs referencing them.
+        self.prune_jump_list_windows(&windows_to_close);
         for id in windows_to_close {
             self.windows.remove(&id);
             self.scroll_bind_pairs.retain(|&(a, b)| a != id && b != id);
@@ -341,26 +344,20 @@ impl Engine {
         }
     }
 
-    /// Close the current tab. Returns true if closed.
-    pub fn close_tab(&mut self) -> bool {
-        if self.active_group().tabs.len() <= 1 {
-            // If there is a second group, close this group instead of erroring.
-            if !self.group_layout.is_single_group() {
-                self.close_editor_group();
-                return true;
-            }
-            self.message = "Cannot close last tab".to_string();
-            return false;
-        }
-
+    /// Remove tab `tab_idx` from `group_id`: tears down its windows, cleans
+    /// up orphaned buffers, and strips it from nav history and the MRU
+    /// stack. Does **not** decide or touch `active_tab` / global focus —
+    /// callers own that policy. Returns the `TabId` that was removed.
+    fn remove_tab_raw(&mut self, group_id: GroupId, tab_idx: usize) -> TabId {
         // Collect the buffer IDs of windows being closed so we can clean them
         // up from the buffer manager if nothing else references them.
-        let active_tab_idx = self.active_group().active_tab;
-        let window_ids: Vec<WindowId> = self.active_group().tabs[active_tab_idx].window_ids();
+        let window_ids: Vec<WindowId> = self.editor_groups[&group_id].tabs[tab_idx].window_ids();
         let closed_buffer_ids: Vec<BufferId> = window_ids
             .iter()
             .filter_map(|wid| self.windows.get(wid).map(|w| w.buffer_id))
             .collect();
+
+        self.prune_jump_list_windows(&window_ids);
 
         // Remove all windows in this tab
         for window_id in &window_ids {
@@ -377,35 +374,24 @@ impl Engine {
             }
         }
 
-        let closed_group = self.active_group;
-        let closed_tab_id = self.active_group().tabs[active_tab_idx].id;
-        self.active_group_mut().tabs.remove(active_tab_idx);
+        let closed_tab_id = self.editor_groups[&group_id].tabs[tab_idx].id;
+        self.editor_groups
+            .get_mut(&group_id)
+            .unwrap()
+            .tabs
+            .remove(tab_idx);
 
         // Remove the closed tab from nav history.
         self.tab_nav_history
-            .retain(|&(g, t)| !(g == closed_group && t == closed_tab_id));
+            .retain(|&(g, t)| !(g == group_id && t == closed_tab_id));
         if self.tab_nav_index >= self.tab_nav_history.len() {
             self.tab_nav_index = self.tab_nav_history.len().saturating_sub(1);
         }
 
-        // Remove the closed tab from MRU and adjust indices
+        // Remove the closed tab from MRU. No index fixup needed — entries
+        // are keyed by TabId, so removing one tab never repoints another.
         self.tab_mru
-            .retain(|&(g, idx)| !(g == closed_group && idx == active_tab_idx));
-        for entry in &mut self.tab_mru {
-            if entry.0 == closed_group && entry.1 > active_tab_idx {
-                entry.1 -= 1;
-            }
-        }
-
-        // Adjust active tab index
-        let tabs_len = self.active_group().tabs.len();
-        if self.active_group().active_tab >= tabs_len {
-            self.active_group_mut().active_tab = tabs_len - 1;
-        }
-        self.tab_mru_touch();
-        // Ensure the new active tab's window state is consistent.
-        self.repair_active_window();
-        self.ensure_active_tab_visible();
+            .retain(|&(g, t)| !(g == group_id && t == closed_tab_id));
 
         // Remove any buffers that are no longer referenced by any window.
         // This prevents orphaned dirty buffers from falsely triggering `:qa`
@@ -423,34 +409,148 @@ impl Engine {
             }
         }
 
+        closed_tab_id
+    }
+
+    /// Determine which tab should become active in `group_id` after closing
+    /// `closed_tab_id`. Reads the MRU stack for the most recently used tab
+    /// that still exists in the group (other than the one being closed) and
+    /// returns `None` when the MRU has nothing usable, so the caller can
+    /// fall back to positional adjacency (#673).
+    pub(crate) fn successor_tab_after_close(
+        &self,
+        group_id: GroupId,
+        closed_tab_id: TabId,
+    ) -> Option<TabId> {
+        let group = self.editor_groups.get(&group_id)?;
+        self.tab_mru.iter().find_map(|&(g, tid)| {
+            (g == group_id && tid != closed_tab_id && group.tabs.iter().any(|t| t.id == tid))
+                .then_some(tid)
+        })
+    }
+
+    /// Close the current tab. Returns true if closed.
+    pub fn close_tab(&mut self) -> bool {
+        if self.active_group().tabs.len() <= 1 {
+            // If there is a second group, close this group instead of erroring.
+            if !self.group_layout.is_single_group() {
+                self.close_editor_group();
+                return true;
+            }
+            self.message = "Cannot close last tab".to_string();
+            return false;
+        }
+
+        let group_id = self.active_group;
+        let active_tab_idx = self.active_group().active_tab;
+        let closed_tab_id = self.active_group().tabs[active_tab_idx].id;
+
+        // Decide the successor before mutating the tab list: MRU-first,
+        // falling back to whatever adjacency shifts into the closed slot.
+        let successor = self.successor_tab_after_close(group_id, closed_tab_id);
+
+        self.remove_tab_raw(group_id, active_tab_idx);
+
+        let tabs_len = self.active_group().tabs.len();
+        let new_idx = successor
+            .and_then(|tid| self.active_group().tabs.iter().position(|t| t.id == tid))
+            .unwrap_or_else(|| active_tab_idx.min(tabs_len.saturating_sub(1)));
+        self.active_group_mut().active_tab = new_idx;
+
+        self.tab_mru_touch();
+        // Ensure the new active tab's window state is consistent.
+        self.repair_active_window();
+        self.ensure_active_tab_visible();
+
         true
     }
 
-    /// Close a specific tab by group and index. Used for right-click "Close" on non-active tabs.
+    /// Close a specific tab by group and index. Used for right-click "Close"
+    /// on a tab bar entry.
+    ///
+    /// Closing a tab that is **not** the group's active tab never changes
+    /// `active_tab` or steals global focus (#673) — it just removes the tab
+    /// in place. Closing a group's own active tab picks a successor the same
+    /// way `close_tab` does, but only moves global focus to `group_id` when
+    /// that group was already focused.
     pub fn close_tab_at(&mut self, group_id: GroupId, tab_idx: usize) -> bool {
-        // Switch to the target group/tab, then close it.
-        if !self.editor_groups.contains_key(&group_id) {
+        let Some(group) = self.editor_groups.get(&group_id) else {
+            return false;
+        };
+        if tab_idx >= group.tabs.len() {
             return false;
         }
-        let tabs_len = self.editor_groups[&group_id].tabs.len();
-        if tab_idx >= tabs_len {
-            return false;
+
+        if tab_idx == group.active_tab {
+            if group_id == self.active_group {
+                return self.close_tab();
+            }
+            return self.close_active_tab_of_background_group(group_id);
         }
-        let prev_group = self.active_group;
-        let prev_tab = self.active_group().active_tab;
-        self.active_group = group_id;
-        self.editor_groups.get_mut(&group_id).unwrap().active_tab = tab_idx;
-        let closed = self.close_tab();
-        // If we didn't close (last tab), restore.
-        if !closed {
-            self.active_group = prev_group;
-            if let Some(g) = self.editor_groups.get_mut(&prev_group) {
-                if prev_tab < g.tabs.len() {
-                    g.active_tab = prev_tab;
-                }
+
+        // Closing a background tab: remove it in place. Active tab index,
+        // MRU order, and global focus are all left untouched aside from the
+        // index shift needed to keep `active_tab` pointing at the same tab.
+        self.remove_tab_raw(group_id, tab_idx);
+        if let Some(g) = self.editor_groups.get_mut(&group_id) {
+            if tab_idx < g.active_tab {
+                g.active_tab -= 1;
             }
         }
-        closed
+        if group_id == self.active_group {
+            self.ensure_active_tab_visible();
+        }
+        true
+    }
+
+    /// Close the active tab of a group that is not the globally focused
+    /// group, without moving focus there. Mirrors `close_tab`'s successor
+    /// policy and last-tab-in-group handling, scoped to `group_id`.
+    fn close_active_tab_of_background_group(&mut self, group_id: GroupId) -> bool {
+        let Some(group) = self.editor_groups.get(&group_id) else {
+            return false;
+        };
+        let active_tab_idx = group.active_tab;
+
+        if group.tabs.len() <= 1 {
+            if self.group_layout.is_single_group() {
+                return false;
+            }
+            // Remove the whole (unfocused) group; global focus is untouched.
+            if let Some(g) = self.editor_groups.get(&group_id) {
+                let window_ids: Vec<WindowId> =
+                    g.tabs.iter().flat_map(|t| t.window_ids()).collect();
+                self.prune_jump_list_windows(&window_ids);
+                for wid in window_ids {
+                    self.windows.remove(&wid);
+                }
+            }
+            self.editor_groups.remove(&group_id);
+            self.group_layout.remove(group_id);
+            self.tab_mru.retain(|&(g, _)| g != group_id);
+            self.tab_nav_history.retain(|&(g, _)| g != group_id);
+            if self.tab_nav_index >= self.tab_nav_history.len() {
+                self.tab_nav_index = self.tab_nav_history.len().saturating_sub(1);
+            }
+            return true;
+        }
+
+        let closed_tab_id = group.tabs[active_tab_idx].id;
+        let successor = self.successor_tab_after_close(group_id, closed_tab_id);
+
+        self.remove_tab_raw(group_id, active_tab_idx);
+
+        let tabs_len = self.editor_groups[&group_id].tabs.len();
+        let new_idx = successor
+            .and_then(|tid| {
+                self.editor_groups[&group_id]
+                    .tabs
+                    .iter()
+                    .position(|t| t.id == tid)
+            })
+            .unwrap_or_else(|| active_tab_idx.min(tabs_len.saturating_sub(1)));
+        self.editor_groups.get_mut(&group_id).unwrap().active_tab = new_idx;
+        true
     }
 
     /// Close all tabs in the current group except the active one.
@@ -471,6 +571,13 @@ impl Engine {
             // After closing, the active_tab might have shifted.
         }
         // Ensure the originally active tab (now the only one) is selected.
+        // Each `close_tab()` call above already ran the MRU-successor logic
+        // and its own `tab_mru_touch()` for the *intermediate* tabs this
+        // loop temporarily made active — those entries are transient and get
+        // overwritten below. The final `tab_mru_touch()` call MUST stay
+        // after this `active_tab = 0` assignment; reordering them would
+        // leave the front of the MRU stack pointing at a tab this function
+        // never intended to keep active.
         self.active_group_mut().active_tab = 0;
         self.tab_mru_touch();
         self.repair_active_window();
@@ -488,6 +595,10 @@ impl Engine {
             self.active_group_mut().active_tab = i;
             self.close_tab();
         }
+        // As in `close_other_tabs`: this `tab_mru_touch()` must stay after
+        // pinning `active_tab` back to the original tab, so it overwrites
+        // whatever transient MRU entries the loop's intermediate closes
+        // wrote for tabs that were never meant to end up active.
         self.active_group_mut().active_tab = active_tab_idx;
         self.tab_mru_touch();
         self.repair_active_window();
@@ -505,6 +616,7 @@ impl Engine {
             self.active_group_mut().active_tab = 0;
             self.close_tab();
         }
+        // See `close_other_tabs`: pin-then-touch ordering is load-bearing.
         self.active_group_mut().active_tab = 0;
         self.tab_mru_touch();
         self.repair_active_window();
@@ -541,6 +653,9 @@ impl Engine {
             self.close_tab();
         }
         // Recalculate the active tab (original one shifted down by removed tabs below it).
+        // See `close_other_tabs`: this `tab_mru_touch()` must stay after the
+        // active-tab recalculation above, so it overwrites the transient MRU
+        // entries the loop's intermediate closes wrote along the way.
         let remaining = self.active_group().tabs.len();
         if self.active_group().active_tab >= remaining {
             self.active_group_mut().active_tab = remaining.saturating_sub(1);
@@ -561,11 +676,6 @@ impl Engine {
 
     /// Open the system file manager at the given path's parent directory.
     pub fn reveal_in_file_manager(&self, path: &Path) {
-        let dir = if path.is_dir() {
-            path
-        } else {
-            path.parent().unwrap_or(path)
-        };
         #[cfg(target_os = "macos")]
         {
             let _ = std::process::Command::new("open")
@@ -575,8 +685,18 @@ impl Engine {
                 .stderr(std::process::Stdio::null())
                 .spawn();
         }
+        // `dir` is only consulted by the xdg-open leg — macOS's `open -R`
+        // takes the file itself and reveals it in its parent.  Binding it
+        // outside this block made it an unused variable on macOS, i.e. a
+        // `-D warnings` failure that only ever fired on the platform #896
+        // is about (Linux CI uses it, so CI stayed green).
         #[cfg(not(target_os = "macos"))]
         {
+            let dir = if path.is_dir() {
+                path
+            } else {
+                path.parent().unwrap_or(path)
+            };
             let _ = std::process::Command::new("xdg-open")
                 .arg(dir)
                 .stdout(std::process::Stdio::null())
@@ -991,7 +1111,10 @@ impl Engine {
             ContextMenuItem {
                 label: "Go to Definition".into(),
                 action: "goto_definition".into(),
-                shortcut: if vsc { "F12" } else { "gd" }.into(),
+                // `gd` is Vim's local-declaration motion, not this LSP
+                // command (:h gd). The Vim-mode key for LSP go-to-definition
+                // is the tag-jump `Ctrl-]` (see `keys.rs` "bracketright").
+                shortcut: if vsc { "F12" } else { "Ctrl+]" }.into(),
                 separator_after: false,
                 enabled: has_lsp,
             },
@@ -1294,9 +1417,9 @@ impl Engine {
                     if let Some(ref cb_read) = self.clipboard_read {
                         if let Ok(text) = cb_read() {
                             if !text.is_empty() {
-                                self.registers.insert('"', (text, false));
+                                self.registers.insert('"', (text, RegType::Charwise));
                                 let mut changed = false;
-                                self.paste_after(&mut changed);
+                                self.paste_after(1, &mut changed);
                             }
                         }
                     }
@@ -1426,9 +1549,9 @@ impl Engine {
         }
     }
 
-    /// Record the current (group, tab_index) as the most recently used tab.
+    /// Record the current (group, tab_id) as the most recently used tab.
     pub fn tab_mru_touch(&mut self) {
-        let entry = (self.active_group, self.active_group().active_tab);
+        let entry = (self.active_group, self.active_tab().id);
         self.tab_mru.retain(|e| *e != entry);
         self.tab_mru.insert(0, entry);
     }
@@ -1512,6 +1635,123 @@ impl Engine {
         }
     }
 
+    // =======================================================================
+    // Jump list pane lookup (#674)
+    // =======================================================================
+
+    /// Find where a jump-list entry's pane now lives. Returns the
+    /// `(GroupId, tab index)` to activate, or `None` when the window itself
+    /// no longer exists (its tab or split was closed).
+    ///
+    /// Tolerates a tab that moved to a different editor group since the
+    /// jump was recorded (`move_tab_to_other_group`) by falling back to a
+    /// search across all groups — mirrors the reasoning in that function's
+    /// doc comment about `tab_mru`/`tab_nav_history` entries simply not
+    /// matching after a move rather than being misread.
+    pub(crate) fn locate_jump_pane(
+        &self,
+        group_id: GroupId,
+        tab_id: TabId,
+        window_id: WindowId,
+    ) -> Option<(GroupId, usize)> {
+        if !self.windows.contains_key(&window_id) {
+            return None;
+        }
+        let tab_has_window = |group: &EditorGroup| {
+            group
+                .tabs
+                .iter()
+                .position(|t| t.id == tab_id && t.window_ids().contains(&window_id))
+        };
+        if let Some(group) = self.editor_groups.get(&group_id) {
+            if let Some(idx) = tab_has_window(group) {
+                return Some((group_id, idx));
+            }
+        }
+        for (&gid, group) in &self.editor_groups {
+            if let Some(idx) = tab_has_window(group) {
+                return Some((gid, idx));
+            }
+        }
+        None
+    }
+
+    /// Whether `window_id`'s *current* buffer still matches the file a
+    /// jump-list entry was recorded against.
+    ///
+    /// `locate_jump_pane` only proves the window still exists and still
+    /// belongs to the recorded tab — it says nothing about what the window
+    /// is showing *now*. `open_file_with_mode` (the path used by `:e`, `gf`,
+    /// the explorer/fuzzy-finder, …) replaces a window's buffer **in
+    /// place**, keeping the same `WindowId`. So a window matching on id/tab
+    /// alone can easily be showing a different file than the one the jump
+    /// remembers — most commonly the single-window, no-splits-no-tabs case:
+    /// jump inside file A, open file B into that same pane, then `Ctrl-O`.
+    /// Without this check the entry would silently apply file A's
+    /// remembered line/col onto file B's buffer (#674 review).
+    pub(crate) fn jump_pane_buffer_matches(
+        &self,
+        window_id: WindowId,
+        file: &Option<std::path::PathBuf>,
+    ) -> bool {
+        let current = self
+            .windows
+            .get(&window_id)
+            .and_then(|w| self.buffer_manager.get(w.buffer_id))
+            .and_then(|s| s.file_path.as_ref());
+        current == file.as_ref()
+    }
+
+    /// Switch to a specific pane (group/tab/window) located by
+    /// `locate_jump_pane`. Mirrors `tab_nav_switch_to`, but also focuses the
+    /// exact window (split) the jump was recorded in, not just the tab.
+    pub(crate) fn switch_to_jump_pane(
+        &mut self,
+        group_id: GroupId,
+        tab_idx: usize,
+        window_id: WindowId,
+    ) {
+        self.active_group = group_id;
+        self.active_group_mut().active_tab = tab_idx;
+        self.active_tab_mut().active_window = window_id;
+        self.line_annotations.clear();
+        self.blame_annotations_active = false;
+        self.tab_mru_touch();
+        self.lsp_ensure_active_buffer();
+        self.ensure_active_tab_visible();
+        self.explorer_reveal_active_file();
+    }
+
+    /// Drop jump-list entries whose window was just closed, re-clamping
+    /// `jump_list_pos` so it keeps pointing at the same logical entry (or
+    /// the nearest one) — mirrors the `tab_nav_history`/`tab_mru`
+    /// retain-and-clamp pattern used for tab close. Called from every path
+    /// that removes windows from `self.windows` (split close, tab close,
+    /// group close) so `Ctrl-O`/`Ctrl-I` skip dead entries instead of
+    /// reopening a closed file or panicking (#674).
+    pub(crate) fn prune_jump_list_windows(&mut self, removed: &[WindowId]) {
+        if removed.is_empty() || self.jump_list.is_empty() {
+            return;
+        }
+        let removed_set: std::collections::HashSet<WindowId> = removed.iter().copied().collect();
+        let old_pos = self.jump_list_pos;
+        let mut removed_before_pos = 0usize;
+        let mut kept = Vec::with_capacity(self.jump_list.len());
+        for (i, entry) in self.jump_list.iter().enumerate() {
+            if removed_set.contains(&entry.window_id) {
+                if i < old_pos {
+                    removed_before_pos += 1;
+                }
+                continue;
+            }
+            kept.push(entry.clone());
+        }
+        self.jump_list = kept;
+        self.jump_list_pos = old_pos
+            .saturating_sub(removed_before_pos)
+            .min(self.jump_list.len());
+    }
+
     /// Whether back navigation is available (across all editor groups).
     pub fn tab_nav_can_go_back(&self) -> bool {
         self.tab_nav_index > 0
@@ -1556,13 +1796,13 @@ impl Engine {
     /// Calling again toggles back (Vim behaviour).
     pub fn goto_last_accessed_tab(&mut self) {
         // Prune stale entries
-        self.tab_mru.retain(|&(g, idx)| {
+        self.tab_mru.retain(|&(g, tid)| {
             self.editor_groups
                 .get(&g)
-                .is_some_and(|grp| idx < grp.tabs.len())
+                .is_some_and(|grp| grp.tabs.iter().any(|t| t.id == tid))
         });
         // Ensure current is at index 0
-        let current = (self.active_group, self.active_group().active_tab);
+        let current = (self.active_group, self.active_tab().id);
         if self.tab_mru.first() != Some(&current) {
             self.tab_mru.retain(|e| *e != current);
             self.tab_mru.insert(0, current);
@@ -1570,8 +1810,12 @@ impl Engine {
         if self.tab_mru.len() < 2 {
             return; // No previous tab to jump to
         }
-        let (group_id, tab_idx) = self.tab_mru[1];
-        if self.editor_groups.contains_key(&group_id) {
+        let (group_id, tab_id) = self.tab_mru[1];
+        let tab_idx = self
+            .editor_groups
+            .get(&group_id)
+            .and_then(|g| g.tabs.iter().position(|t| t.id == tab_id));
+        if let Some(tab_idx) = tab_idx {
             self.active_group = group_id;
             self.active_group_mut().active_tab = tab_idx;
             self.line_annotations.clear();
@@ -1590,22 +1834,22 @@ impl Engine {
         self.dismiss_editor_hover();
 
         // Build a clean MRU list: only include entries that still exist
-        self.tab_mru.retain(|&(g, idx)| {
+        self.tab_mru.retain(|&(g, tid)| {
             self.editor_groups
                 .get(&g)
-                .is_some_and(|grp| idx < grp.tabs.len())
+                .is_some_and(|grp| grp.tabs.iter().any(|t| t.id == tid))
         });
         // Ensure the current tab is at index 0
-        let current = (self.active_group, self.active_group().active_tab);
+        let current = (self.active_group, self.active_tab().id);
         if self.tab_mru.first() != Some(&current) {
             self.tab_mru.retain(|e| *e != current);
             self.tab_mru.insert(0, current);
         }
         // Also add any tabs not yet in MRU (e.g. from before MRU tracking started)
         for (&gid, group) in &self.editor_groups {
-            for idx in 0..group.tabs.len() {
-                if !self.tab_mru.contains(&(gid, idx)) {
-                    self.tab_mru.push((gid, idx));
+            for tab in &group.tabs {
+                if !self.tab_mru.contains(&(gid, tab.id)) {
+                    self.tab_mru.push((gid, tab.id));
                 }
             }
         }
@@ -1619,6 +1863,8 @@ impl Engine {
 
     /// Open the tab switcher if not already open, then cycle the selection.
     /// `forward`: true = next (Alt+t, Ctrl+Tab), false = previous (Shift+Tab).
+    /// Dead in ShellApp mode until tab-switcher key handling is re-wired (#448-C follow-on).
+    #[allow(dead_code)]
     pub fn tab_switcher_cycle(&mut self, forward: bool) {
         if !self.tab_switcher_open {
             self.open_tab_switcher();
@@ -1651,8 +1897,12 @@ impl Engine {
             return;
         }
         let idx = self.tab_switcher_selected;
-        if let Some(&(group_id, tab_idx)) = self.tab_mru.get(idx) {
-            if self.editor_groups.contains_key(&group_id) {
+        if let Some(&(group_id, tab_id)) = self.tab_mru.get(idx) {
+            let tab_idx = self
+                .editor_groups
+                .get(&group_id)
+                .and_then(|g| g.tabs.iter().position(|t| t.id == tab_id));
+            if let Some(tab_idx) = tab_idx {
                 self.active_group = group_id;
                 self.active_group_mut().active_tab = tab_idx;
                 self.tab_mru_touch();
@@ -1730,9 +1980,9 @@ impl Engine {
     pub fn tab_switcher_items(&self) -> Vec<(String, String, bool)> {
         self.tab_mru
             .iter()
-            .filter_map(|&(gid, tab_idx)| {
+            .filter_map(|&(gid, tab_id)| {
                 let group = self.editor_groups.get(&gid)?;
-                let tab = group.tabs.get(tab_idx)?;
+                let tab = group.tabs.iter().find(|t| t.id == tab_id)?;
                 let win = self.windows.get(&tab.active_window)?;
                 let state = self.buffer_manager.get(win.buffer_id)?;
                 let name = state.display_name();
@@ -1755,9 +2005,7 @@ impl Engine {
             self.blame_annotations_active = false;
             // Clicking a preview tab promotes it to permanent (VSCode behavior).
             let buf_id = self.active_buffer_id();
-            if self.buffer_manager.get(buf_id).is_some_and(|s| s.preview) {
-                self.promote_preview(buf_id);
-            }
+            self.preview_tab_promote(buf_id);
             self.tab_mru_touch();
             self.tab_nav_push();
             self.lsp_ensure_active_buffer();
@@ -1777,7 +2025,10 @@ impl Engine {
                 // " N: display_name "
                 let dn = state.display_name();
                 // leading space + digits + ": " + name + trailing space
-                1 + (i + 1).to_string().len() + 2 + dn.chars().count() + 1
+                // Uses cell width, not `.chars().count()`, so double-width
+                // glyphs (CJK, many emoji) in the buffer name are accounted
+                // for correctly — see vimcode#620 / quadraui#472.
+                1 + (i + 1).to_string().len() + 2 + quadraui::tui::display_width(&dn) + 1
             } else {
                 // " N: [No Name] "
                 1 + (i + 1).to_string().len() + 2 + 9 + 1
@@ -1788,27 +2039,19 @@ impl Engine {
         name_len + 2 // +1 close button + 1 separator
     }
 
-    /// Count how many tabs fit in the available width starting from `offset`.
-    fn tabs_fitting_from(&self, group: &EditorGroup, offset: usize, width: usize) -> usize {
-        let mut used = 0;
-        let mut count = 0;
-        for i in offset..group.tabs.len() {
-            let tw = self.tab_display_width(group, i);
-            if used + tw > width {
-                break;
-            }
-            used += tw;
-            count += 1;
-        }
-        count
-    }
-
     /// Adjust `tab_scroll_offset` on the active group so that the active tab
     /// is visible in the tab bar, while showing as many tabs as possible.
     ///
-    /// Strategy: start from offset 0 (maximize visible tabs), then only
-    /// increase the offset if the active tab wouldn't fit.  Uses actual
-    /// tab name widths and the reported tab bar width for accuracy.
+    /// The fit algorithm itself (try offset 0 first, else walk backwards
+    /// from the active tab accumulating widths) is
+    /// `quadraui::TabBar::fit_active_scroll_offset` — this is the
+    /// char-cell-measured, backend-agnostic caller of it that keeps engine
+    /// state internally consistent even before any backend has painted a
+    /// frame (see vimcode#660: the engine used to carry its own copy of
+    /// this exact algorithm, hardcoded to `tab_display_width`'s char-cell
+    /// estimate; GTK/Win-GUI compute their own pixel-accurate offset via
+    /// the same quadraui helper and write it back through
+    /// `set_tab_scroll_offset` instead of relying on this method).
     pub(crate) fn ensure_active_tab_visible(&mut self) {
         let group = match self.editor_groups.get(&self.active_group) {
             Some(g) => g,
@@ -1816,36 +2059,16 @@ impl Engine {
         };
         let active = group.active_tab;
         let width = group.tab_bar_width;
+        let tab_count = group.tabs.len();
 
-        // How many tabs fit starting from offset 0?
-        let from_zero = self.tabs_fitting_from(group, 0, width);
+        let offset = quadraui::TabBar::fit_active_scroll_offset(active, tab_count, width, |i| {
+            self.tab_display_width(group, i)
+        });
 
-        if active < from_zero {
-            // Active tab is visible from offset 0 — use it.
-            self.editor_groups
-                .get_mut(&self.active_group)
-                .unwrap()
-                .tab_scroll_offset = 0;
-            return;
-        }
-
-        // Active tab doesn't fit from offset 0.  Find the smallest offset
-        // that makes the active tab visible (i.e. at the right edge).
-        // Walk backwards from the active tab, accumulating widths.
-        let mut used = 0;
-        let mut best_offset = active;
-        for i in (0..=active).rev() {
-            let tw = self.tab_display_width(group, i);
-            if used + tw > width {
-                break;
-            }
-            used += tw;
-            best_offset = i;
-        }
         self.editor_groups
             .get_mut(&self.active_group)
             .unwrap()
-            .tab_scroll_offset = best_offset;
+            .tab_scroll_offset = offset;
     }
 
     /// Called by the renderer to report the available tab bar width in
@@ -1881,6 +2104,8 @@ impl Engine {
     /// GTK / Win-GUI / macOS have pixel-based padding that doesn't map to
     /// char units, so they compute their own offset via
     /// `quadraui::TabBar::fit_active_scroll_offset` and write it here.
+    /// Dead in ShellApp mode until tab scroll offset is re-wired (#448-C follow-on).
+    #[allow(dead_code)]
     pub fn set_tab_scroll_offset(&mut self, group_id: GroupId, offset: usize) -> bool {
         if let Some(g) = self.editor_groups.get_mut(&group_id) {
             if g.tab_scroll_offset != offset {
@@ -1975,6 +2200,7 @@ impl Engine {
         if let Some(group) = self.editor_groups.get(&closing) {
             let window_ids: Vec<WindowId> =
                 group.tabs.iter().flat_map(|t| t.window_ids()).collect();
+            self.prune_jump_list_windows(&window_ids);
             for wid in window_ids {
                 self.windows.remove(&wid);
             }
@@ -1994,6 +2220,12 @@ impl Engine {
     }
 
     /// Move the current tab from the active group to the next group.
+    ///
+    /// Any `tab_mru`/`tab_nav_history` entry for this tab still names the
+    /// old group; since both stacks are keyed by `(GroupId, TabId)` (#673),
+    /// such an entry simply stops matching anything (the tab isn't in that
+    /// group anymore) rather than being misread as pointing at whatever tab
+    /// now occupies its old slot. No explicit fixup is required.
     pub fn move_tab_to_other_group(&mut self) {
         if self.group_layout.is_single_group() {
             return;
@@ -2037,72 +2269,6 @@ impl Engine {
     // --- Tab drag-and-drop ---
 
     /// Begin dragging a tab from the given group.
-    pub fn tab_drag_begin(&mut self, group_id: GroupId, tab_index: usize) {
-        let name = self
-            .editor_groups
-            .get(&group_id)
-            .and_then(|g| g.tabs.get(tab_index))
-            .and_then(|t| self.windows.get(&t.active_window))
-            .and_then(|w| self.buffer_manager.get(w.buffer_id))
-            .map(|s| s.display_name())
-            .unwrap_or_default();
-        self.tab_drag = Some(TabDragState {
-            source_group: group_id,
-            source_tab_index: tab_index,
-            tab_name: name,
-        });
-        self.tab_drop_zone = DropZone::None;
-    }
-
-    /// Cancel an in-progress tab drag.
-    #[allow(dead_code)]
-    pub fn tab_drag_cancel(&mut self) {
-        self.tab_drag = None;
-        self.tab_drag_mouse = None;
-        self.tab_drop_zone = DropZone::None;
-    }
-
-    /// Execute the drop for the current tab drag.
-    pub fn tab_drag_drop(&mut self, zone: DropZone) {
-        let drag = match self.tab_drag.take() {
-            Some(d) => d,
-            None => return,
-        };
-        self.tab_drag_mouse = None;
-        self.tab_drop_zone = DropZone::None;
-
-        match zone {
-            DropZone::Center(target) => {
-                if target != drag.source_group {
-                    self.move_tab_to_target_group(drag.source_group, drag.source_tab_index, target);
-                }
-            }
-            DropZone::Split(target, direction, new_first) => {
-                self.move_tab_to_new_split(
-                    drag.source_group,
-                    drag.source_tab_index,
-                    target,
-                    direction,
-                    new_first,
-                );
-            }
-            DropZone::TabReorder(group_id, to_idx) => {
-                if group_id == drag.source_group {
-                    self.reorder_tab_in_group(group_id, drag.source_tab_index, to_idx);
-                } else {
-                    // Drag to a specific position in another group
-                    self.move_tab_to_target_group_at(
-                        drag.source_group,
-                        drag.source_tab_index,
-                        group_id,
-                        to_idx,
-                    );
-                }
-            }
-            DropZone::None => {}
-        }
-    }
-
     /// Move a tab from one group to another (appends at end).
     pub fn move_tab_to_target_group(
         &mut self,
@@ -2114,7 +2280,10 @@ impl Engine {
     }
 
     /// Move a tab from one group to another at a specific insertion index.
-    pub(crate) fn move_tab_to_target_group_at(
+    ///
+    /// See `move_tab_to_other_group` re: `tab_mru` — stale cross-group
+    /// entries harmlessly stop matching rather than repointing (#673).
+    pub fn move_tab_to_target_group_at(
         &mut self,
         src_group: GroupId,
         tab_idx: usize,
@@ -2152,7 +2321,10 @@ impl Engine {
     }
 
     /// Move a tab out of its group into a new split adjacent to `target_group`.
-    pub(crate) fn move_tab_to_new_split(
+    ///
+    /// See `move_tab_to_other_group` re: `tab_mru` — stale cross-group
+    /// entries harmlessly stop matching rather than repointing (#673).
+    pub fn move_tab_to_new_split(
         &mut self,
         src_group: GroupId,
         tab_idx: usize,
@@ -2188,7 +2360,52 @@ impl Engine {
         }
     }
 
+    /// Apply a resolved tab-drag [`DropZone`] to the engine.
+    ///
+    /// This is the single, backend-agnostic entry point for committing a tab
+    /// drag-and-drop. Both the GTK and TUI backends resolve the drop zone with
+    /// `quadraui::compute_drop_zone` (via `render::compute_tab_drop_zone`) and
+    /// then call this method, so the mutation semantics live in exactly one
+    /// place. `source_gid` / `source_tab_idx` identify the dragged tab, captured
+    /// when the drag started.
+    pub fn apply_tab_drop_zone(
+        &mut self,
+        source_gid: GroupId,
+        source_tab_idx: usize,
+        zone: crate::core::window::DropZone,
+    ) {
+        use crate::core::window::DropZone;
+        match zone {
+            DropZone::Center(target) => {
+                if target != source_gid {
+                    self.move_tab_to_target_group(source_gid, source_tab_idx, target);
+                }
+            }
+            DropZone::Split(target, direction, new_first) => {
+                self.move_tab_to_new_split(
+                    source_gid,
+                    source_tab_idx,
+                    target,
+                    direction,
+                    new_first,
+                );
+            }
+            DropZone::TabReorder(group_id, to_idx) => {
+                if group_id == source_gid {
+                    self.reorder_tab_in_group(group_id, source_tab_idx, to_idx);
+                } else {
+                    self.move_tab_to_target_group_at(source_gid, source_tab_idx, group_id, to_idx);
+                }
+            }
+            DropZone::None => {}
+        }
+    }
+
     /// Reorder a tab within its group.
+    ///
+    /// No `tab_mru` fixup is needed here: the MRU stack is keyed by `TabId`
+    /// (#673), and reordering never changes a tab's id — only its position
+    /// in `tabs`, which the MRU doesn't track.
     pub fn reorder_tab_in_group(&mut self, group_id: GroupId, from_idx: usize, to_idx: usize) {
         if let Some(g) = self.editor_groups.get_mut(&group_id) {
             if from_idx >= g.tabs.len() {
@@ -2212,6 +2429,7 @@ impl Engine {
         if let Some(group) = self.editor_groups.get(&group_id) {
             let window_ids: Vec<WindowId> =
                 group.tabs.iter().flat_map(|t| t.window_ids()).collect();
+            self.prune_jump_list_windows(&window_ids);
             for wid in window_ids {
                 self.windows.remove(&wid);
             }
@@ -2246,6 +2464,53 @@ impl Engine {
         (all_rects, dividers)
     }
 
+    /// Compute window-split dividers (`:split`/`:vsplit` boundaries) for every
+    /// editor group's active tab, one independent `WindowLayout` tree per
+    /// group.
+    ///
+    /// Derives each group's bounds from the bounding box of its own entries
+    /// in `window_rects` (rather than re-deriving them from
+    /// `group_layout.calculate_group_rects` with a fresh tab-bar-height
+    /// guess) so divider positions always agree exactly with whatever
+    /// `window_rects` the caller is already using/rendering — see #582.
+    pub fn calculate_window_dividers(
+        &self,
+        window_rects: &[(WindowId, WindowRect)],
+    ) -> Vec<WindowDivider> {
+        let mut out = Vec::new();
+        for gid in self.group_layout.group_ids() {
+            let Some(group) = self.editor_groups.get(&gid) else {
+                continue;
+            };
+            let tab = group.active_tab();
+            let ids = tab.layout.window_ids();
+            let mut min_x = f64::MAX;
+            let mut min_y = f64::MAX;
+            let mut max_x = f64::MIN;
+            let mut max_y = f64::MIN;
+            for (wid, rect) in window_rects {
+                if ids.contains(wid) {
+                    min_x = min_x.min(rect.x);
+                    min_y = min_y.min(rect.y);
+                    max_x = max_x.max(rect.x + rect.width);
+                    max_y = max_y.max(rect.y + rect.height);
+                }
+            }
+            if min_x == f64::MAX {
+                continue; // group has no rendered windows (shouldn't happen)
+            }
+            let bounds = WindowRect::new(min_x, min_y, max_x - min_x, max_y - min_y);
+            let mut counter = 0;
+            out.extend(
+                tab.layout
+                    .dividers(bounds, &mut counter)
+                    .into_iter()
+                    .map(|d| WindowDivider::from_group_divider(gid, d)),
+            );
+        }
+        out
+    }
+
     /// Open a file from the explorer: switch to an existing tab that shows it,
     /// or create a new tab when no tab currently displays it.
     ///
@@ -2266,8 +2531,8 @@ impl Engine {
             .apply_language_map(buffer_id, &self.settings.language_map);
 
         // If this buffer is the current preview, just promote it in-place.
-        if self.preview_buffer_id == Some(buffer_id) {
-            self.promote_preview(buffer_id);
+        if self.preview_tab.is_preview(&buffer_id.to_string()) {
+            self.preview_tab_promote(buffer_id);
             self.refresh_git_diff(buffer_id);
             self.message = format!("\"{}\"", path.display());
             self.lsp_did_open(buffer_id);
@@ -2373,21 +2638,39 @@ impl Engine {
             return;
         }
 
-        // Find the existing preview tab, if any (within the active group).
-        let mut preview_slot: Option<(usize, WindowId, BufferId)> = None;
-        if let Some(preview_buf_id) = self.preview_buffer_id {
-            for (idx, tab) in self.active_group().tabs.iter().enumerate() {
-                let win_id = tab.active_window;
-                if self
-                    .windows
-                    .get(&win_id)
-                    .is_some_and(|w| w.buffer_id == preview_buf_id)
-                {
-                    preview_slot = Some((idx, win_id, preview_buf_id));
-                    break;
+        // Ask the shared preview tier (quadraui#597) whether this reuses the
+        // existing preview slot or needs a new one; it hands back the old
+        // preview's id (if any) via a `Closed` event so we can unload it.
+        let label = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let events = self
+            .preview_tab
+            .open_preview(WorkspaceDoc::new(buffer_id.to_string(), label));
+        let mut old_buf_id = None;
+        for ev in &events {
+            if let WorkspaceEvent::Closed { id, .. } = ev {
+                if let Ok(raw) = id.parse::<usize>() {
+                    old_buf_id = Some(BufferId(raw));
                 }
             }
         }
+
+        // Find the tab/window currently showing the old preview buffer, if any.
+        let preview_slot = old_buf_id.and_then(|old_id| {
+            self.active_group()
+                .tabs
+                .iter()
+                .enumerate()
+                .find_map(|(idx, tab)| {
+                    let win_id = tab.active_window;
+                    self.windows
+                        .get(&win_id)
+                        .is_some_and(|w| w.buffer_id == old_id)
+                        .then_some((idx, win_id, old_id))
+                })
+        });
 
         if let Some((tab_idx, win_id, old_buf_id)) = preview_slot {
             // Reuse the existing preview tab: close old preview buffer and
@@ -2399,7 +2682,6 @@ impl Engine {
             if let Some(state) = self.buffer_manager.get_mut(buffer_id) {
                 state.preview = true;
             }
-            self.preview_buffer_id = Some(buffer_id);
             self.active_group_mut().active_tab = tab_idx;
             let view = self.restore_file_position(buffer_id);
             if let Some(w) = self.windows.get_mut(&win_id) {
@@ -2417,12 +2699,12 @@ impl Engine {
             if let Some(state) = self.buffer_manager.get_mut(buffer_id) {
                 state.preview = true;
             }
-            self.preview_buffer_id = Some(buffer_id);
             let view = self.restore_file_position(buffer_id);
             if let Some(w) = self.windows.get_mut(&window_id) {
                 w.view = view;
             }
         }
+        self.sync_preview_buffer_id();
 
         self.ensure_active_tab_visible();
         self.refresh_git_diff(buffer_id);
@@ -2576,6 +2858,43 @@ impl Engine {
             .buffer_manager
             .get(self.active_buffer_id())
             .and_then(|s| s.file_path.clone());
+    }
+
+    /// Save the active file's cursor/scroll position, snapshot the open-file
+    /// list, save the per-workspace session (if any), then persist the
+    /// global session file.
+    ///
+    /// Shared by both backends (#823 item 5) — `App::save_session_and_exit`
+    /// (`app.rs`) and `tui_main`'s `save_session` free function were the
+    /// same ~20 lines restated twice, GTK's copy with its own window
+    /// width/height capture spliced in before `collect_session_open_files`
+    /// and its own swap-cleanup/LSP-shutdown/exit-request epilogue spliced
+    /// after `session.save()` — both are genuinely backend-specific (GTK
+    /// has a live window handle to read geometry from; TUI's own quit path
+    /// runs cleanup/shutdown around this call too, just at a different
+    /// call site, `handle_action`'s `Quit`/`SaveQuit` arm) so they stay at
+    /// each call site rather than becoming parameters here.
+    pub fn save_session_state(&mut self) {
+        let buffer_id = self.active_buffer_id();
+        if let Some(path) = self
+            .buffer_manager
+            .get(buffer_id)
+            .and_then(|s| s.file_path.as_deref())
+            .map(|p| p.to_path_buf())
+        {
+            let view = self.active_window().view.clone();
+            self.session.save_file_position(
+                &path,
+                view.cursor.line,
+                view.cursor.col,
+                view.scroll_top,
+            );
+        }
+        self.collect_session_open_files();
+        if let Some(ref root) = self.workspace_root.clone() {
+            self.save_session_for_workspace(root);
+        }
+        let _ = self.session.save();
     }
 
     /// Restore open files from session state (called at startup when no CLI file is given).
@@ -2823,10 +3142,10 @@ impl Engine {
             }
         }
 
-        // Clear preview tracking if deleting the preview buffer
-        if self.preview_buffer_id == Some(id) {
-            self.preview_buffer_id = None;
-        }
+        // Drop the deleted buffer from the shared preview tier — clears its
+        // preview flag if it held one, and stops its doc entry from lingering.
+        self.preview_tab.close(&id.to_string());
+        self.sync_preview_buffer_id();
 
         self.lsp_did_close(id);
         self.buffer_manager.delete(id, force)
@@ -2862,9 +3181,21 @@ impl Engine {
     // Window resize (CTRL-W +/-/</>=/|/_)
     // =======================================================================
 
-    /// Resize the window's parent split by delta steps.
+    /// Resize the active window's parent split by delta steps.
     /// `direction`: which split direction to look for (Horizontal for +/-, Vertical for </>).
-    /// `increase`: true = make active group bigger, false = smaller.
+    /// `increase`: true = make active window/group bigger, false = smaller.
+    ///
+    /// #582: tries the active *window*'s split within its tab's
+    /// `WindowLayout` first (vim `:split`/`:vsplit` panes) — this was
+    /// entirely unwired before (Ctrl-W resize only ever touched
+    /// `self.group_layout`, so it was a no-op for vim window splits, whose
+    /// active window is never a `GroupId`). Falls back to the active
+    /// editor-group's parent split (`Ctrl-W e`/`E` layouts, a separate,
+    /// pre-existing, already-tested feature — see
+    /// `tests/vim_compat_batch.rs::test_ctrl_w_plus_resize`) when the active
+    /// tab has no window split in the requested direction, matching vim's
+    /// "operate on the current window, or whatever's locally splittable"
+    /// convention.
     pub(crate) fn resize_window_split(
         &mut self,
         direction: SplitDirection,
@@ -2872,28 +3203,61 @@ impl Engine {
         count: usize,
     ) {
         let delta_per_step = 0.05;
+        let delta = if increase {
+            delta_per_step * count as f64
+        } else {
+            -(delta_per_step * count as f64)
+        };
+        let active_window = self.active_window_id();
+        if let Some((split_idx, split_dir, is_first)) =
+            self.active_tab().layout.parent_split_of(active_window)
+        {
+            if split_dir == direction {
+                // Active window is in first child → increasing ratio makes it bigger
+                let delta = if is_first { delta } else { -delta };
+                self.active_tab_mut()
+                    .layout
+                    .adjust_ratio_at_index(split_idx, delta);
+                return;
+            }
+        }
         if let Some((split_idx, split_dir, is_first)) =
             self.group_layout.parent_split_of(self.active_group)
         {
             if split_dir == direction {
-                // Active group is in first child → increasing ratio makes it bigger
-                let delta = if (is_first && increase) || (!is_first && !increase) {
-                    delta_per_step * count as f64
-                } else {
-                    -(delta_per_step * count as f64)
-                };
+                let delta = if is_first { delta } else { -delta };
                 self.group_layout.adjust_ratio_at_index(split_idx, delta);
             }
         }
     }
 
-    /// Equalize all split ratios to 0.5.
+    /// Equalize split ratios to 0.5. Prefers the active tab's window splits
+    /// (vim `:split`/`:vsplit`) when any exist, falling back to editor-group
+    /// splits otherwise — see `resize_window_split`'s doc for why (#582).
     pub(crate) fn equalize_splits(&mut self) {
-        self.group_layout.set_all_ratios(0.5);
+        if self.active_tab().layout.is_single_window() {
+            self.group_layout.set_all_ratios(0.5);
+        } else {
+            self.active_tab_mut().layout.set_all_ratios(0.5);
+        }
     }
 
     /// Maximize window in a given direction (CTRL-W _ for height, CTRL-W | for width).
+    /// Same window-split-first, group-split-fallback preference as
+    /// `resize_window_split` (#582).
     pub(crate) fn maximize_window_split(&mut self, direction: SplitDirection) {
+        let active_window = self.active_window_id();
+        if let Some((split_idx, split_dir, is_first)) =
+            self.active_tab().layout.parent_split_of(active_window)
+        {
+            if split_dir == direction {
+                let ratio = if is_first { 0.9 } else { 0.1 };
+                self.active_tab_mut()
+                    .layout
+                    .set_ratio_at_index(split_idx, ratio);
+                return;
+            }
+        }
         if let Some((split_idx, split_dir, is_first)) =
             self.group_layout.parent_split_of(self.active_group)
         {
@@ -3540,11 +3904,22 @@ impl Engine {
             lines_text.push_str(&line);
         }
         // Pipe through the command
+        // #948 review (non-blocking): this real-spawn branch is
+        // `#[cfg(not(test))]`, with the `#[cfg(test)]` no-op stub below
+        // standing in under `cargo test` — pre-existing (not introduced by
+        // #948), but it means `shell_command()`'s use here has zero
+        // automated coverage under either the engine-level or driver-tier
+        // test styles: `cargo test` never compiles this arm at all, and a
+        // driver test couldn't close the gap either since it hits the exact
+        // same `cfg(test)` stub. Manually verified: `:1,3!sort` on a real
+        // (non-test) build honours `$SHELL` the same way `:!` does, via the
+        // identical `shell_command()` call.
         #[cfg(not(test))]
         let result = {
             use std::io::Write;
-            let mut child = match std::process::Command::new("sh")
-                .arg("-c")
+            let (shell, flag) = shell_command();
+            let mut child = match std::process::Command::new(shell)
+                .arg(flag)
                 .arg(filter_cmd)
                 .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::piped())

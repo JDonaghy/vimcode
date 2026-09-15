@@ -4,14 +4,31 @@
 //! primitives into a ratatui `Buffer`. Over time this file will grow to
 //! cover every primitive; currently supports `TreeView` (A.1a),
 //! `Form` (A.3a), `Palette` (A.4), and `ListView` (A.5).
+//!
+//! #600 Stage 1: the wrappers that used to live here for `ContextMenu`,
+//! `Completions`, `Dialog`, `Tooltip`, `FindReplacePanel`, and
+//! `RichTextPopup` were removed — every call site now routes through the
+//! equivalent `Backend::draw_*` trait method (which reaches the same
+//! underlying `quadraui::tui::draw_*` rasteriser internally) instead of
+//! calling these free functions directly on `frame.buffer_mut()`.
+//! `draw_activity_bar` stays a free function: `Backend::draw_activity_bar`
+//! has a side effect (`focused_activity_bar` bookkeeping for a keyboard-
+//! routing feature TUI doesn't use yet) and a `hovered_idx` parameter this
+//! call site has no value for, so swapping it in isn't a same-behavior
+//! change like the others were.
 
 use super::*;
+// Only the `#[cfg(test)]` legacy paint path below needs raw ratatui types.
+#[cfg(test)]
 use ratatui::buffer::Buffer;
+#[cfg(test)]
 use ratatui::layout::Rect;
+#[cfg(test)]
 use ratatui::style::Color as RatatuiColor;
 
 /// Convert a `quadraui::Color` to the ratatui palette colour used by
 /// `set_cell`.
+#[cfg(test)]
 fn qc(c: quadraui::Color) -> RatatuiColor {
     RatatuiColor::Rgb(c.r, c.g, c.b)
 }
@@ -32,66 +49,7 @@ pub(super) fn q_theme(theme: &Theme) -> quadraui::Theme {
 /// Keyboard-selected items get a full-row selection-bg fill; active
 /// items get a left-edge accent bar (unless keyboard-selected, where
 /// the selection bg takes precedence).
-/// Draw a `quadraui::ContextMenu` popup via its D6 `ContextMenuLayout`.
-/// Matches the pre-migration chrome: thin box border, selected item
-/// rendered inverted, separators as a horizontal dash line, disabled
-/// items dimmed. Shortcut (from item.detail) is right-aligned.
-pub(super) fn draw_context_menu(
-    buf: &mut Buffer,
-    menu: &quadraui::ContextMenu,
-    layout: &quadraui::ContextMenuLayout,
-    theme: &Theme,
-) {
-    quadraui::tui::draw_context_menu(buf, menu, layout, &q_theme(theme));
-}
-
-/// Draw a `quadraui::Completions` popup via the lifted
-/// `quadraui::tui::draw_completions` rasteriser (#266). Vimcode's shim
-/// role is to map the rich `render::Theme` to the smaller
-/// `quadraui::Theme` via `q_theme()` — the body of the rasteriser
-/// lives in the quadraui crate.
-pub(super) fn draw_completions(
-    buf: &mut Buffer,
-    completions: &quadraui::Completions,
-    layout: &quadraui::CompletionsLayout,
-    theme: &Theme,
-) {
-    quadraui::tui::draw_completions(buf, completions, layout, &q_theme(theme));
-}
-
-/// Draw a `quadraui::Dialog` via its D6 `DialogLayout`. Handles the
-/// rounded-border chrome the TUI has always drawn and respects
-/// horizontal vs. vertical button layout.
-///
-/// The body text may contain embedded `\n` for multi-line messages —
-/// each line is drawn on its own row inside `layout.body_bounds`.
-pub(super) fn draw_dialog(
-    buf: &mut Buffer,
-    dialog: &quadraui::Dialog,
-    layout: &quadraui::DialogLayout,
-    theme: &Theme,
-) {
-    quadraui::tui::draw_dialog(buf, dialog, layout, &q_theme(theme));
-}
-
-/// Draw a `quadraui::Tooltip` into `layout.bounds` on `buf`. Renders a
-/// text box with side-bar borders only (`│` on the first and last
-/// columns, no top/bottom border) — matches the visual style used by
-/// the LSP hover popup and signature help.
-///
-/// If `tooltip.styled` is `Some`, a single line of styled spans is
-/// rendered (signature help path). Otherwise `tooltip.text` is split
-/// on `\n` and each line is rendered plain (hover popup path). Lines
-/// that exceed the box width are truncated.
-pub(super) fn draw_tooltip(
-    buf: &mut Buffer,
-    tooltip: &quadraui::Tooltip,
-    layout: &quadraui::TooltipLayout,
-    theme: &Theme,
-) {
-    quadraui::tui::draw_tooltip(buf, tooltip, layout, &q_theme(theme));
-}
-
+#[cfg(test)]
 pub(super) fn draw_activity_bar(
     buf: &mut Buffer,
     area: Rect,
@@ -134,57 +92,19 @@ pub(super) fn draw_activity_bar(
             set_cell(buf, x, y, ' ', icon_fg, row_bg);
         }
         if area.width >= 3 {
-            let icon_ch = item.icon.chars().next().unwrap_or('?');
+            // quadraui#683: `ActivityItem.icon` is now `Icon { glyph, fallback }`;
+            // which half paints is the same nerd-fonts flag every other TUI icon
+            // resolver in this crate already reads (`crate::icons::nerd_fonts_enabled`).
+            let icon_str = if crate::icons::nerd_fonts_enabled() {
+                &item.icon.glyph
+            } else {
+                &item.icon.fallback
+            };
+            let icon_ch = icon_str.chars().next().unwrap_or('?');
             set_cell(buf, area.x + 1, y, icon_ch, icon_fg, row_bg);
         }
         if item.is_active && !item.is_keyboard_selected {
             set_cell(buf, area.x, y, '\u{258E}', accent_fg, bar_bg); // ▎
         }
     }
-}
-
-/// Draw one row of a `quadraui::Terminal` cell grid into a ratatui buffer.
-///
-/// `start_x` / `screen_row` are the destination cell coordinates;
-/// `max_cols` clips the row to the visible width. `theme` supplies
-/// fallback colours for find-match overlays — the cell's own `fg` / `bg`
-/// win for normal cells and cursor/selection (which use inverted colours).
-/// Draw the find/replace overlay by walking `panel.hit_regions` (the
-/// shared cross-backend layout source-of-truth from
-/// `core::engine::compute_find_replace_hit_regions`). Painting and
-/// hit-test then derive from the same `FrHitRegion` list, so column
-/// drift bugs (the same class fixed for debug toolbar + breadcrumb)
-/// can't recur on this overlay.
-///
-/// `editor_left` is the absolute screen column of the editor area's
-/// left edge (after activity bar + sidebar). `panel.group_bounds.x/y`
-/// are content-relative; the overlay anchors at the top-right of the
-/// active editor group.
-///
-/// Painting that the hit-region list doesn't directly cover —
-/// borders, the match-count text (a non-clickable status string), and
-/// the focused field's cursor + selection — is layered in around the
-/// region-driven dispatch.
-pub(super) fn draw_find_replace(
-    buf: &mut Buffer,
-    area: Rect,
-    panel: &crate::render::FindReplacePanel,
-    theme: &Theme,
-    editor_left: u16,
-) {
-    quadraui::tui::draw_find_replace(buf, area, panel, &q_theme(theme), editor_left);
-}
-
-/// Draw a `quadraui::RichTextPopup` into the buffer via the lifted
-/// `quadraui::tui::draw_rich_text_popup` rasteriser (#266). Vimcode's
-/// shim role is to map the rich `render::Theme` to the smaller
-/// `quadraui::Theme` via `q_theme()` — the body of the rasteriser
-/// lives in the quadraui crate.
-pub(super) fn draw_rich_text_popup(
-    buf: &mut Buffer,
-    popup: &quadraui::RichTextPopup,
-    layout: &quadraui::RichTextPopupLayout,
-    theme: &Theme,
-) {
-    quadraui::tui::draw_rich_text_popup(buf, popup, layout, &q_theme(theme));
 }

@@ -555,12 +555,19 @@ impl BufferState {
 
     /// Finish the current undo group and push it to the undo stack.
     /// Call this after a Normal mode command completes, or when leaving Insert mode.
-    pub fn finish_undo_group(&mut self) {
+    /// Returns `true` if a non-empty group was actually pushed — callers use
+    /// this to skip work (e.g. the undo timeline snapshot) that's only
+    /// meaningful when something actually changed (#804: `finish_undo_group`
+    /// used to unconditionally snapshot the *entire buffer text* on every
+    /// call, including no-op calls made by insert-mode cursor movement).
+    pub fn finish_undo_group(&mut self) -> bool {
         if let Some(group) = self.current_undo_group.take() {
             if !group.is_empty() {
                 self.undo_stack.push(group);
+                return true;
             }
         }
+        false
     }
 
     /// Undo the last change. Returns the cursor position to restore, or None if nothing to undo.

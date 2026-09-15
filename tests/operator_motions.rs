@@ -677,14 +677,11 @@ fn test_d_right_brace_paragraph_forward() {
     let mut e = engine_with("aaa\nbbb\n\nccc\nddd\n");
     press(&mut e, 'd');
     press(&mut e, '}');
-    // d} deletes lines before the blank line, keeping the blank line.
-    // Neovim: "\nccc\nddd" (blank line preserved).
-    let b = buf(&e);
-    assert!(
-        b.starts_with("\nccc") || b.starts_with("ccc"),
-        "should have ccc after deleting paragraph; got: {:?}",
-        b
-    );
+    // d} is exclusive; since the motion lands in column 1, the end moves back
+    // to the end of the previous line (:help exclusive), so the blank line
+    // is preserved and NOT deleted. Neovim: "\nccc\nddd" with cursor at (0,0).
+    assert_buf(&e, "\nccc\nddd\n");
+    assert_cursor(&e, 0, 0);
 }
 
 #[test]
@@ -708,7 +705,7 @@ fn test_y_right_brace_yank_paragraph() {
     press(&mut e, '}');
     // Should yank lines 0 through the blank line
     let (content, is_linewise) = e.registers.get(&'"').unwrap();
-    assert!(is_linewise, "y}} should be linewise");
+    assert!(is_linewise.is_linewise(), "y}} should be linewise");
     assert!(content.contains("aaa"), "should contain aaa");
     assert!(content.contains("bbb"), "should contain bbb");
 }
@@ -720,13 +717,10 @@ fn test_d_right_paren_sentence_forward() {
     let mut e = engine_with("Hello world. Goodbye world.\n");
     press(&mut e, 'd');
     press(&mut e, ')');
-    // Should delete to next sentence start
-    let b = buf(&e);
-    assert!(
-        b.contains("Goodbye") || b.starts_with("Goodbye"),
-        "second sentence should remain: {:?}",
-        b
-    );
+    // d) deletes the first sentence (including its trailing space), leaving
+    // exactly the second sentence with the cursor on its first character.
+    assert_buf(&e, "Goodbye world.\n");
+    assert_cursor(&e, 0, 0);
 }
 
 // ── dW/dB/dE: WORD motions ──────────────────────────────────────────────────
@@ -957,7 +951,7 @@ fn test_yge_yank_backward_to_end_of_previous_word() {
     press(&mut e, 'g');
     press(&mut e, 'e');
     let (content, is_linewise) = e.registers.get(&'"').unwrap();
-    assert!(!is_linewise, "yge should be charwise");
+    assert!(!is_linewise.is_linewise(), "yge should be charwise");
     assert!(content.contains("r"), "should include 'r' (end of bar)");
     assert_buf(&e, "foo bar baz\n"); // unchanged
 }
@@ -1044,23 +1038,158 @@ fn test_gu_dollar_lowercase_to_eol() {
 // ── Edge cases ──────────────────────────────────────────────────────────────
 
 #[test]
-fn test_dj_at_last_line_noop_or_delete_last() {
+fn test_dj_at_last_line_is_noop() {
     let mut e = engine_with("aaa\nbbb\n");
     press(&mut e, 'j'); // line 1 (last line)
     press(&mut e, 'd');
     press(&mut e, 'j');
-    // dj at last line: no line below, deletes just current line
-    let b = buf(&e);
-    assert!(b.contains("aaa"), "aaa should survive");
+    // Vim: `j` cannot move (already on the last line), so the whole `dj`
+    // motion fails and the operator is a complete no-op — nothing is deleted.
+    assert_buf(&e, "aaa\nbbb\n");
+    assert_cursor(&e, 1, 0);
 }
 
 #[test]
-fn test_dk_at_first_line() {
+fn test_dk_at_first_line_is_noop() {
     let mut e = engine_with("aaa\nbbb\n");
     press(&mut e, 'd');
     press(&mut e, 'k');
-    // dk at first line: no line above, deletes just current line
-    assert_buf(&e, "bbb\n");
+    // Vim: `k` cannot move (already on the first line), so the whole `dk`
+    // motion fails and the operator is a complete no-op — nothing is deleted.
+    assert_buf(&e, "aaa\nbbb\n");
+    assert_cursor(&e, 0, 0);
+}
+
+// ── Issue #802: operator-pending / motion edge cases (Vim compat 4/9) ──────
+
+#[test]
+fn test_x_on_empty_line_is_noop() {
+    let mut e = engine_with("\nx\n");
+    press(&mut e, 'x');
+    // Vim: `x` on an empty line is a no-op — it must NOT delete the newline
+    // and join with the next line.
+    assert_buf(&e, "\nx\n");
+    assert_cursor(&e, 0, 0);
+}
+
+#[test]
+fn test_cw_on_whitespace_changes_only_the_whitespace_run() {
+    let mut e = engine_with("foo   bar\n");
+    press(&mut e, 'l');
+    press(&mut e, 'l');
+    press(&mut e, 'l'); // cursor on the first of the three spaces (col 3)
+    press(&mut e, 'c');
+    press(&mut e, 'w');
+    press(&mut e, 'X');
+    press_key(&mut e, "Escape");
+    // Vim: `cw` starting on whitespace changes just the whitespace run — it
+    // does NOT jump into (or through) the following word.
+    assert_buf(&e, "fooXbar\n");
+    assert_cursor(&e, 0, 3);
+}
+
+#[test]
+fn test_cw_on_punctuation_changes_only_the_punctuation_run() {
+    let mut e = engine_with("foo.bar\n");
+    press(&mut e, 'l');
+    press(&mut e, 'l');
+    press(&mut e, 'l'); // cursor on '.' (col 3)
+    press(&mut e, 'c');
+    press(&mut e, 'w');
+    press(&mut e, 'X');
+    press_key(&mut e, "Escape");
+    // Vim: `cw` on punctuation changes just the punctuation run, not the
+    // following word (move_word_end's "already at end" quirk must not apply
+    // to a short/lone punctuation run).
+    assert_buf(&e, "fooXbar\n");
+    assert_cursor(&e, 0, 3);
+}
+
+#[test]
+fn test_2dw_continues_across_line_end() {
+    let mut e = engine_with("a b\nc d\n");
+    press(&mut e, 'l');
+    press(&mut e, 'l'); // cursor on 'b' (col 2)
+    press(&mut e, '2');
+    press(&mut e, 'd');
+    press(&mut e, 'w');
+    // Vim: only the FINAL word-step of a multi-count `dw` is subject to the
+    // "stop at end of line" special case — 2dw here continues across the
+    // line end and joins the lines.
+    assert_buf(&e, "a d\n");
+    assert_cursor(&e, 0, 2);
+}
+
+#[test]
+fn test_d_percent_before_paren_searches_forward_first() {
+    let mut e = engine_with("foo(a, b) bar\n");
+    press(&mut e, 'd');
+    press(&mut e, '%');
+    // Vim: `%` with the cursor before any bracket on the line searches
+    // forward for the first one before jumping to its match.
+    assert_buf(&e, " bar\n");
+    assert_cursor(&e, 0, 0);
+}
+
+#[test]
+fn test_count_before_operator_does_not_survive_escape() {
+    let mut e = engine_with("abc\n");
+    press(&mut e, 'l'); // cursor col 1 ('b')
+    press(&mut e, '2');
+    press(&mut e, 'd');
+    press_key(&mut e, "Escape");
+    press(&mut e, 'x');
+    // Vim: <Esc> clears the pending count — `2d<Esc>x` deletes just one
+    // character, not two.
+    assert_buf(&e, "ac\n");
+    assert_cursor(&e, 0, 1);
+}
+
+#[test]
+fn test_cc_preserves_autoindent() {
+    let mut e = engine_with("    foo\nbar\n");
+    press(&mut e, 'c');
+    press(&mut e, 'c');
+    press(&mut e, 'X');
+    press_key(&mut e, "Escape");
+    // Vim: with 'autoindent' on (the engine default), cc/S preserve the
+    // leading indent of the line instead of dropping it.
+    assert_buf(&e, "    X\nbar\n");
+    assert_cursor(&e, 0, 4);
+}
+
+#[test]
+fn test_return_key_is_a_linewise_motion() {
+    let mut e = engine_with("  a\n  b\n");
+    press_key(&mut e, "Return");
+    // Vim: <CR> in Normal mode moves down (count) lines to the first
+    // non-blank column, same as `+`.
+    assert_buf(&e, "  a\n  b\n");
+    assert_cursor(&e, 1, 2);
+}
+
+#[test]
+fn test_count_dollar_moves_down_first() {
+    let mut e = engine_with("ab\ncd\nef\n");
+    press(&mut e, '2');
+    press(&mut e, '$');
+    // Vim: `2$` is NOT "end of the current line" — it moves down
+    // (count - 1) lines first, THEN goes to the end of that line.
+    assert_buf(&e, "ab\ncd\nef\n");
+    assert_cursor(&e, 1, 1);
+}
+
+#[test]
+fn test_semicolon_after_till_skips_the_adjacent_match() {
+    let mut e = engine_with("foo; bar; baz\n");
+    press(&mut e, 't');
+    press(&mut e, ';');
+    press(&mut e, ';');
+    // Vim's default `cpoptions` ';' semantics: repeating a `t` search skips
+    // the immediately-adjacent match instead of getting stuck at zero
+    // movement.
+    assert_buf(&e, "foo; bar; baz\n");
+    assert_cursor(&e, 0, 7);
 }
 
 #[test]
@@ -1080,11 +1209,7 @@ fn test_dgg_from_last_line_deletes_entire_file() {
     press(&mut e, 'd');
     press(&mut e, 'g');
     press(&mut e, 'g');
-    // Should delete all lines
-    let b = buf(&e);
-    assert!(
-        b.trim().is_empty() || b == "\n",
-        "file should be empty after dgg from last line, got: {:?}",
-        b
-    );
+    // dgg from the last line deletes the whole file, leaving an empty buffer.
+    assert_buf(&e, "");
+    assert_cursor(&e, 0, 0);
 }

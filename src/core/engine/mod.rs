@@ -1,3 +1,10 @@
+// #937's quadraui pin bump deprecated `TabBarHits` (quadraui#823) that this
+// module (and its `terminal_ops` child) still reads; migrating to its
+// `TabBarLayout` replacement is an unrelated, cross-backend refactor deferred
+// to a follow-up, so it's silenced here rather than left as a stray warning
+// under `-D warnings`.
+#![allow(deprecated)]
+
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 
@@ -25,12 +32,15 @@ use super::session::{ExtensionState, HistoryState, SessionGroupLayout, SessionSt
 use super::settings::{EditorMode, Settings};
 use super::syntax::Syntax;
 use super::tab::{Tab, TabId};
-use super::terminal::{default_shell, InstallContext, TerminalPane};
+use super::terminal::{default_shell, shell_command, InstallContext};
 use super::view::{FoldRegion, View};
+use super::vim_regex;
 use super::window::{
-    DropZone, GroupDivider, GroupId, GroupLayout, SplitDirection, Window, WindowId, WindowLayout,
-    WindowRect,
+    GroupDivider, GroupId, GroupLayout, SplitDirection, Window, WindowDivider, WindowId,
+    WindowLayout, WindowRect,
 };
+use quadraui::compose::workspace::{WorkspaceController, WorkspaceDoc, WorkspaceEvent};
+use quadraui::terminal_engine::TerminalSession;
 use std::borrow::Cow;
 
 use super::{Cursor, Mode};
@@ -45,6 +55,55 @@ pub use quadraui::{Accelerator, AcceleratorId, AcceleratorScope, KeyBinding, UiE
 /// High bit marker for synthetic "Non-Public Members" group var_refs.
 /// Real DAP adapters use sequential integers that never set this bit.
 const SYNTHETIC_NON_PUBLIC_MASK: u64 = 0x8000_0000_0000_0000;
+
+/// A single terminal slot: a running PTY session plus its optional install context.
+///
+/// Coupling the session and its context in one struct prevents the `terminal_panes` and
+/// `terminal_install_contexts` parallel-Vec desync bug (any push/pop that touched one Vec
+/// but forgot the other would silently corrupt which context belongs to which session).
+pub struct TerminalSlot {
+    pub session: TerminalSession,
+    /// `Some` only for panes opened by `terminal_run_command` (extension installs).
+    pub install_ctx: Option<InstallContext>,
+}
+
+/// How a register's contents were captured, and therefore how `p`/`P` put them
+/// back — Vim's `MCHAR` / `MLINE` / `MBLOCK` (`:h registers`).
+///
+/// Before #807 this was a bare `bool` meaning "linewise", which made blockwise
+/// yanks indistinguishable from charwise ones: `<C-v>jy` followed by `p`
+/// pasted the block's lines as ordinary text instead of re-inserting a
+/// rectangle.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum RegType {
+    /// Character-wise (`MCHAR`) — the default.
+    #[default]
+    Charwise,
+    /// Line-wise (`MLINE`) — `p` opens whole new lines below the cursor.
+    Linewise,
+    /// Block-wise (`MBLOCK`) — `p` re-inserts a rectangle, one line per
+    /// `\n`-separated chunk, starting at the cursor's column.
+    Blockwise,
+}
+
+impl RegType {
+    /// Charwise/linewise from the legacy `is_linewise` boolean.
+    pub fn from_linewise(linewise: bool) -> Self {
+        if linewise {
+            Self::Linewise
+        } else {
+            Self::Charwise
+        }
+    }
+
+    pub fn is_linewise(self) -> bool {
+        matches!(self, Self::Linewise)
+    }
+
+    pub fn is_blockwise(self) -> bool {
+        matches!(self, Self::Blockwise)
+    }
+}
 
 /// Actions returned from `handle_key` that the UI layer must act on.
 /// This keeps GTK/platform concerns out of the core engine.
@@ -93,6 +152,8 @@ pub struct RegisteredAccelerator {
     /// (`(ctrl, shift, alt, key_name)`). `None` if the binding string is
     /// unparseable; the registration is still kept so `unregister_accelerator`
     /// can find it by id.
+    /// Dead in ShellApp mode until GTK accelerator lookup is re-wired.
+    #[allow(dead_code)]
     pub parsed: Option<(bool, bool, bool, String)>,
 }
 
@@ -546,7 +607,9 @@ pub static PALETTE_COMMANDS: &[PaletteCommand] = &[
     },
     PaletteCommand {
         label: "Go: Go to Definition",
-        shortcut: "gd",
+        // `gd` is Vim's local-declaration motion, not this LSP command
+        // (:h gd) — the tag-jump `Ctrl-]` is what invokes the server.
+        shortcut: "Ctrl+]",
         vscode_shortcut: "F12",
         action: "lsp_definition",
     },
@@ -948,7 +1011,8 @@ pub enum PickerSource {
     /// Line ending picker (LF / CRLF).
     LineEndings,
     /// Recent workspaces (#274). Replaces the native GTK Dialog and the
-    /// TUI's `FolderPickerState::new_recent` with the engine-driven picker.
+    /// TUI's old `FolderPickerState::new_recent` (removed, #815) with the
+    /// engine-driven picker.
     RecentWorkspaces,
     Custom(String),
 }
@@ -973,7 +1037,7 @@ pub struct BreadcrumbSegmentInfo {
 pub struct PickerItem {
     /// Text shown in the result list.
     pub display: String,
-    /// Text matched against the query by `fuzzy_score`.
+    /// Text matched against the query by `quadraui::text_util::fuzzy_score`.
     pub filter_text: String,
     /// Right-aligned hint (shortcut, line number, etc.).
     pub detail: Option<String>,
@@ -1184,16 +1248,6 @@ pub enum TabBarClickTarget {
     DiffToggle,
 }
 
-/// A hit region within a group's tab bar, expressed in character-cell units
-/// relative to the tab bar's left edge.
-#[derive(Debug, Clone)]
-pub struct TabBarHitRegion {
-    /// Column offset from the tab bar left edge.
-    pub col: u16,
-    /// Width of this region in char cells.
-    pub width: u16,
-}
-
 // ── Context menu hit regions ────────────────────────────────────────────────
 
 /// Result of resolving a click against a context menu popup.
@@ -1270,118 +1324,11 @@ pub fn resolve_context_menu_click(
     ContextMenuClickResult::InsidePopup
 }
 
-// ── Dialog hit regions ──────────────────────────────────────────────────────
-
-/// Result of resolving a click against a modal dialog.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DialogClickResult {
-    /// Click on a button at this index.
-    Button(usize),
-    /// Click inside the dialog but not on a button.
-    InsideDialog,
-    /// Click outside the dialog — should dismiss.
-    Outside,
-}
-
-/// Pre-computed dialog layout bounds (in char-cell units, absolute screen position).
-pub struct DialogLayout {
-    pub x: u16,
-    pub y: u16,
-    pub width: u16,
-    pub height: u16,
-    /// Row containing the buttons (absolute screen row).
-    pub btn_y: u16,
-}
-
-/// Resolve a click position against a dialog popup.
-pub fn resolve_dialog_click(
-    buttons: &[DialogButton],
-    layout: &DialogLayout,
-    click_col: u16,
-    click_row: u16,
-    format_label: &dyn Fn(&str, char) -> String,
-) -> DialogClickResult {
-    // Outside dialog?
-    if click_col < layout.x
-        || click_col >= layout.x + layout.width
-        || click_row < layout.y
-        || click_row >= layout.y + layout.height
-    {
-        return DialogClickResult::Outside;
-    }
-
-    // Check button row
-    if click_row == layout.btn_y {
-        let mut col_offset = layout.x + 2; // left padding
-        for (i, btn) in buttons.iter().enumerate() {
-            let label = format_label(&btn.label, btn.hotkey);
-            let btn_w = label.len() as u16 + 4;
-            if click_col >= col_offset && click_col < col_offset + btn_w {
-                return DialogClickResult::Button(i);
-            }
-            col_offset += btn_w;
-        }
-    }
-
-    DialogClickResult::InsideDialog
-}
-
-/// Represents a change operation that can be repeated with `.`
-#[derive(Debug, Clone)]
-struct Change {
-    /// Type of operation
-    op: ChangeOp,
-    /// Text inserted (for insert operations)
-    text: String,
-    /// Count used with the operation
-    count: usize,
-    /// Motion used with operator (for d/c with motions)
-    motion: Option<Motion>,
-}
-
 /// C preprocessor directive kind for `[#` / `]#` navigation.
 pub(crate) enum PreprocKind {
     If,
     ElseElif,
     Endif,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-#[allow(dead_code)]
-enum ChangeOp {
-    Insert,
-    Delete,
-    Change,
-    Substitute,
-    SubstituteLine,
-    DeleteToEnd,
-    ChangeToEnd,
-    Replace,
-    ToggleCase,
-    Join,
-    Indent,
-    Dedent,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-#[allow(dead_code)]
-enum Motion {
-    Left,
-    Right,
-    Up,
-    Down,
-    WordForward,
-    WordBackward,
-    WordEnd,
-    WordBackwardEnd,
-    LineStart,
-    LineEnd,
-    DeleteLine,
-    CharFind(char, char), // (motion_type, target_char)
-    ParagraphForward,
-    ParagraphBackward,
-    MatchingBracket,
-    TextObject(char, char), // (modifier, object) - e.g., ('i', 'w')
 }
 
 /// Which section of the debug sidebar currently has the selection cursor.
@@ -1475,14 +1422,6 @@ pub enum TerminalKeyAction {
     Ignore,
 }
 
-/// State of an in-progress tab drag operation.
-#[derive(Debug, Clone)]
-pub struct TabDragState {
-    pub source_group: GroupId,
-    pub source_tab_index: usize,
-    pub tab_name: String,
-}
-
 // ── Context menu data model ──────────────────────────────────────────────────
 
 /// What the context menu was opened on.
@@ -1512,9 +1451,19 @@ pub struct ContextMenuItem {
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct PanelHoverPopup {
-    /// Rendered markdown lines + spans (reuses the existing markdown module).
-    pub rendered: crate::core::markdown::MdRendered,
-    /// Clickable link URLs extracted from LinkUrl spans: (line_idx, start_byte, end_byte, url).
+    /// Raw markdown source (already passed through
+    /// `core::markdown::linkify_bare_urls`). Styled at paint time via
+    /// `quadraui::compose::markdown::render_markdown_to_styled` with the
+    /// active theme (#821) — see `EditorHoverPopup::markdown`'s doc for the
+    /// full rationale.
+    pub markdown: String,
+    /// Plain per-line text (markdown syntax stripped) — used for the
+    /// popup's empty-content check and content-width sizing.
+    pub line_text: Vec<String>,
+    /// Per-line tree-sitter highlights for fenced code-block lines. See
+    /// `EditorHoverPopup::code_highlights`.
+    pub code_highlights: Vec<Vec<crate::core::markdown::MdCodeHighlight>>,
+    /// Clickable link URLs: (line_idx, start_byte, end_byte, url).
     pub links: Vec<(usize, usize, usize, String)>,
     /// Panel name this hover belongs to.
     pub panel_name: String,
@@ -1526,6 +1475,8 @@ pub struct PanelHoverPopup {
 
 impl PanelHoverPopup {
     /// Whether this hover comes from a native (trusted) panel like source_control.
+    /// Dead in ShellApp mode until panel hover is re-wired (#448-C follow-on).
+    #[allow(dead_code)]
     pub fn is_native(&self) -> bool {
         self.panel_name == "source_control"
     }
@@ -1550,8 +1501,23 @@ pub enum EditorHoverSource {
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct EditorHoverPopup {
-    /// Rendered markdown content.
-    pub rendered: crate::core::markdown::MdRendered,
+    /// Raw markdown source (already passed through
+    /// `core::markdown::linkify_bare_urls`, and with any "Go to" nav links
+    /// appended). Styled at paint time via
+    /// `quadraui::compose::markdown::render_markdown_to_styled` with the
+    /// active theme — see `render.rs`'s `markdown_hover_to_quadraui_lines`
+    /// (#821).
+    pub markdown: String,
+    /// Plain per-line text (markdown syntax stripped) — used for scroll
+    /// bounds, clipboard copy, and selection extraction. Computed once, at
+    /// show time, via `core::markdown::hover_markdown_structure` (theme-
+    /// independent, so it doesn't drift from what's painted regardless of
+    /// theme changes while the popup is open).
+    pub line_text: Vec<String>,
+    /// Per-line tree-sitter highlights for fenced code-block lines (empty
+    /// for non-code-block lines). Byte offsets are relative to the code
+    /// line's own raw text — see `hover_markdown_structure`'s doc.
+    pub code_highlights: Vec<Vec<crate::core::markdown::MdCodeHighlight>>,
     /// Clickable link regions: (line_idx, start_byte, end_byte, url).
     pub links: Vec<(usize, usize, usize, String)>,
     /// Buffer line where the hover is anchored (0-indexed).
@@ -1657,14 +1623,10 @@ pub fn open_url_in_browser(url: &str) {
     #[cfg(target_os = "windows")]
     {
         // `cmd /c start "" "url"` — empty title needed for start.
-        let mut cmd = std::process::Command::new("cmd");
+        let mut cmd = crate::core::git::hidden_command("cmd");
         cmd.args(["/c", "start", "", url])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
-        {
-            use std::os::windows::process::CommandExt;
-            cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
-        }
         cmd.spawn().ok();
     }
     #[cfg(target_os = "macos")]
@@ -1878,6 +1840,7 @@ Ctrl+D  Ctrl+U      Half-page down / up
 Ctrl+F  Ctrl+B      Page down / up
 Ctrl+E  Ctrl+Y      Scroll one line down / up (cursor stays)
 Ctrl+O  Ctrl+I      Jump list back / forward
+Ctrl+]              Go to definition (LSP)                :def
 
 ── Editing ─────────────────────────────────────────────
 i I                 Insert before cursor / at first non-blank
@@ -1933,7 +1896,7 @@ it at               Inner / around HTML/XML tag
 
 ── g-Commands ──────────────────────────────────────────
 gg                  Go to first line
-gd                  Go to definition (LSP)                :def
+gd                  Go to local declaration
 gr                  Find references (LSP)                 :refs
 gy                  Go to type definition (LSP)           :LspTypedef
 gi                  Insert at last insert position
@@ -2324,6 +2287,29 @@ pub struct DiffPeekState {
     pub hunk: git::Hunk,
 }
 
+/// One entry in the jump list (`Ctrl-O` / `Ctrl-I`).
+///
+/// Besides the cursor position, an entry carries the *pane identity* it was
+/// recorded in — group, tab and window — so `apply_jump_list_entry` can
+/// restore by switching back to that pane when it still exists, rather than
+/// re-opening the file into whichever pane happens to be active now (#674).
+/// `file` is kept for display (`:jumps`) and as the path used by the
+/// recovery-path fallback when the pane is gone.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct JumpEntry {
+    pub file: Option<PathBuf>,
+    pub line: usize,
+    pub col: usize,
+    pub group_id: GroupId,
+    pub tab_id: TabId,
+    pub window_id: WindowId,
+}
+
+/// Sentinel `curswant` value meaning "always the end of the line", set by
+/// `$` so vertical motions keep tracking the last column through lines of
+/// varying length instead of the (shorter) column `$` happened to land on.
+pub(crate) const CURSWANT_EOL: usize = usize::MAX;
+
 pub struct Engine {
     // --- Multi-buffer/window state ---
     pub buffer_manager: BufferManager,
@@ -2340,15 +2326,14 @@ pub struct Engine {
     next_group_id: usize,
     next_window_id: usize,
     next_tab_id: usize,
-    /// Active tab drag-and-drop operation (set by UI on drag start).
-    pub tab_drag: Option<TabDragState>,
-    /// Current mouse position during a tab drag (for rendering ghost/overlay).
-    pub tab_drag_mouse: Option<(f64, f64)>,
-    /// Computed drop zone for the current tab drag (updated each frame).
-    pub tab_drop_zone: DropZone,
-
     // --- Preview mode ---
-    /// The buffer currently in preview mode (at most one at a time).
+    /// Shared preview-tab policy tier (quadraui#597) — the single source of
+    /// truth for which buffer, if any, is the preview and for applying the
+    /// six promotion triggers. See `sync_preview_buffer_id` and
+    /// `preview_tab_promote` in `engine/buffers.rs`.
+    preview_tab: WorkspaceController,
+    /// Cached mirror of `preview_tab`'s current preview document, refreshed
+    /// by `sync_preview_buffer_id` after every `preview_tab` mutation.
     pub preview_buffer_id: Option<BufferId>,
 
     // --- Global state (not per-window) ---
@@ -2373,8 +2358,24 @@ pub struct Engine {
     pub search_index: Option<usize>,
     /// Direction of the last search operation.
     pub search_direction: SearchDirection,
+    /// Search offset from the last `/pat/{offset}` (`:h search-offset`), e.g.
+    /// `"e"`, `"e+1"`, `"b+2"`, `"+1"`. Empty when the search had no offset.
+    /// Re-applied by `n` / `N`, which is why it lives in engine state.
+    pub search_offset: String,
+    /// Whether `'smartcase'` may apply to the current pattern. False for `*`,
+    /// `#` and `gd`, which per `:h 'smartcase'` never consult the option.
+    pub(crate) search_smartcase_applies: bool,
+    /// Count typed before `/` or `?` (`3/foo` = "jump to the 3rd match").
+    /// Held across the command line because the count is consumed on entry but
+    /// only usable once the pattern is submitted.
+    pub(crate) search_pending_count: usize,
     /// Cursor position when search mode was entered (for incremental search)
     search_start_cursor: Option<Cursor>,
+    /// Set when `/`/`?` is pressed from Visual/VisualLine/VisualBlock mode
+    /// (`v/pat<CR>d`, `V/pat<CR>`) — remembers which visual sub-mode to
+    /// return to (with the selection anchor intact) once the search resolves,
+    /// instead of always dropping back to Normal mode.
+    visual_search_return: Option<Mode>,
 
     // --- Find/Replace state ---
     /// Replacement text for current operation
@@ -2407,15 +2408,34 @@ pub struct Engine {
     pub activity_bar_selected: u16,
 
     // --- Registers (yank/delete storage) ---
-    /// Named registers: 'a'-'z' plus '"' (unnamed default). Value is (content, is_linewise).
-    pub registers: HashMap<char, (String, bool)>,
+    /// Named registers: 'a'-'z' plus '"' (unnamed default). Value is
+    /// `(content, register type)` — see [`RegType`].
+    pub registers: HashMap<char, (String, RegType)>,
     /// Currently selected register for next yank/delete/paste (set by "x prefix).
     pub selected_register: Option<char>,
+    /// Accumulating the expression typed after `"=` (Normal mode) or
+    /// `<C-r>=` (Insert mode), up to the terminating `<CR>` — `:h quote_=`.
+    /// `true` marks the Insert-mode variant, which inserts the evaluated
+    /// result at the cursor instead of only filling the `=` register.
+    pub(crate) expr_register_pending: Option<(bool, String)>,
+    /// One-shot flag: the pending charwise-delete/change is via `%`, `/`,
+    /// `?`, `n` or `N`, so it must land in `"1` (shifting `"1`-`"9`) even
+    /// though the deleted text is often less than one line (`:h
+    /// quotedash`). Set just before dispatching into the motion, consumed
+    /// (and reset) by `apply_charwise_operator`/`apply_operator_exclusive_range`
+    /// — mirrors the existing one-shot `force_motion_mode` flag (#806).
+    pub(crate) force_numbered_register: bool,
 
     // --- Marks ---
     /// Marks per buffer: BufferId -> (mark_char -> Cursor position)
     /// Supports 'a'-'z' for file-local marks
     pub marks: HashMap<BufferId, HashMap<char, Cursor>>,
+    /// Set around a `join_lines` splice so `insert_with_undo`/`delete_with_undo`
+    /// skip their generic whole-line mark shift — `join_lines` does its own
+    /// precise offset-based mark adjustment instead, because a join (unlike
+    /// `O`/`o`/`dd`) needs the absorbed line's marks to gain a *column* offset,
+    /// not just a line shift (#806, "`a after line join").
+    pub(crate) suppress_mark_line_adjust: bool,
 
     // --- Visual mode state ---
     /// Visual mode anchor point (where visual selection started).
@@ -2428,6 +2448,54 @@ pub struct Engine {
     /// visual mode variant so the selection remains visible and `'<,'>` range
     /// resolves correctly.  Cleared on command execution or Escape.
     pub command_from_visual: Option<Mode>,
+
+    // --- Cursor column memory (curswant) ---
+    /// Vim's `curswant`: the column that Normal-mode vertical motions
+    /// (`j`/`k`, and the scroll commands below) try to return to after being
+    /// clamped onto a shorter intervening line. `None` means "not tracked
+    /// yet — derive it from the actual cursor column the first time a
+    /// vertical motion needs it". `Some(CURSWANT_EOL)` means "always the end
+    /// of the line", set by `$` (mirrors `visual_dollar` above, but for
+    /// Normal mode).
+    ///
+    /// `gj`/`gk` do NOT participate: they dispatch to
+    /// `move_visual_down`/`move_visual_up` (`src/core/engine/search.rs`),
+    /// which compute their target column from the raw viewport column and
+    /// never read or write this field.
+    ///
+    /// Reset to `None` at the top of `handle_key` for any key that is not
+    /// itself a curswant-preserving vertical motion or a key that merely
+    /// builds toward one (count digits) — see `update_curswant_for_key` for
+    /// the single choke point that decides.
+    pub(crate) curswant: Option<usize>,
+
+    /// The column a Visual-Block selection's moving edge *wants*, latched at
+    /// the start of every keystroke while Visual-Block is active (#807).
+    ///
+    /// `<C-v>jj` down onto a shorter line clamps `cursor.col`, but Vim keeps
+    /// the block anchored on the wanted column — `<C-v>jjy` on
+    /// `abc / abc / x` with the cursor in column 2 yanks `b`, `b`, `` and not
+    /// `ab`, `ab`, `x`. `curswant` itself already holds that value, but
+    /// `handle_key` clears it on the operator keystroke *before* the operator
+    /// runs, so it is copied here first.
+    pub(crate) visual_block_want: Option<usize>,
+
+    /// Replace-mode undo trail: one entry per character typed since `R` was
+    /// pressed — `Some(original)` when it overwrote an existing character,
+    /// `None` when it was appended past the end of the line (#807).
+    ///
+    /// `<BS>` in Replace mode does not delete: it walks back through this
+    /// trail putting the original characters back (`:h Replace-mode`).
+    pub(crate) replace_overwritten: Vec<Option<char>>,
+    /// Count given to `R` — on Escape the typed text is re-applied that many
+    /// times, still overwriting (`2Rxy` on `abcdef` → `xyxyef`).
+    pub(crate) replace_repeat_count: usize,
+
+    /// Vim's `'scroll'` option: the line count `<C-d>`/`<C-u>` use. `None`
+    /// means "not set yet — use half the window height". Set (replaced, not
+    /// multiplied) whenever `<C-d>`/`<C-u>` is given an explicit count, and
+    /// reused by later counts until then (#805).
+    pub(crate) scroll_value: Option<usize>,
 
     // --- Count state ---
     /// Accumulated count for commands (e.g., 5j, 3dd). None means no count entered yet.
@@ -2453,16 +2521,33 @@ pub struct Engine {
     pub pending_text_object: Option<char>,
 
     // --- Repeat state ---
-    /// Last change operation for repeat (.)
-    last_change: Option<Change>,
+    /// Encoded keystrokes (Vim key-notation, same alphabet as macro recording)
+    /// for the in-progress candidate dot-repeat command. Bracketed by
+    /// transitions in/out of a "neutral" state (Normal mode, no pending
+    /// operator/motion/register-prefix) — see `is_dot_repeat_neutral`.
+    dot_scratch: Vec<char>,
+    /// Whether an undo-tracked edit has happened since `dot_scratch` was last
+    /// empty — decides whether the in-progress candidate gets finalized (as
+    /// the new `.` target) or discarded when we return to neutral.
+    dot_scratch_any_change: bool,
+    /// Set while an `@`-triggered execution (`@x`, `@@`, `@:`) is being keyed
+    /// in, so those keystrokes are dropped from the dot-repeat candidate
+    /// instead of becoming the `.` target themselves. Cleared on the return to
+    /// neutral that ends the `@…` command.
+    dot_skip_command: bool,
+    /// The last dot-repeatable command's keystrokes, with any leading count
+    /// digits stripped out into `last_dot_count`. `.` replays this verbatim
+    /// (optionally prefixed by a new count) through the same key dispatcher
+    /// that produced it, rather than replaying stored text.
+    last_dot_keys: Option<String>,
+    /// The leading count recorded with `last_dot_keys` (None = no explicit
+    /// count was given). A count typed before `.` overrides this.
+    last_dot_count: Option<usize>,
     /// Text accumulated during insert mode for repeat
     insert_text_buffer: String,
     /// When true, Replace mode uses virtual column awareness (gR).
     /// Tabs are expanded to spaces before overwriting.
     virtual_replace: bool,
-    /// When insert mode was entered via a change operator (cw, ce, cb, etc.),
-    /// stores (motion_char, count) so `.` can replay the full change.
-    pending_change_motion: Option<(char, usize)>,
 
     // --- Settings ---
     /// Editor settings (line numbers, etc.)
@@ -2504,6 +2589,10 @@ pub struct Engine {
     pub macro_recording: Option<char>,
     /// Accumulated keystrokes during recording.
     pub recording_buffer: Vec<char>,
+    /// `qA` (uppercase register) was used to start the current recording, so
+    /// `stop_macro_recording` must append to the existing lowercase register
+    /// content instead of overwriting it (`:h q`).
+    pub(crate) macro_recording_append: bool,
 
     // --- Macro playback state ---
     /// Keys to inject for playback.
@@ -2512,6 +2601,15 @@ pub struct Engine {
     pub last_macro_register: Option<char>,
     /// Prevent infinite recursion.
     pub macro_recursion_depth: usize,
+    /// Set by a Normal-mode command that failed to complete (target char not
+    /// found for `f`/`F`/`t`/`T`, `j`/`k` already at a buffer edge, …) and
+    /// checked once per keystroke by `advance_macro_playback`: a failure
+    /// during macro playback aborts the rest of the currently-playing macro
+    /// *and* any outstanding repeat count (`:h :normal`, `10@a` stopping
+    /// partway through) — real Vim's rule, and also what makes a
+    /// self-referential recursive macro terminate at EOF instead of spinning
+    /// forever (#806). Reset to `false` at the top of every `handle_key`.
+    pub(crate) command_failed: bool,
 
     // --- Git integration ---
     /// Current git branch name (None if not in a git repo or git not available).
@@ -2644,14 +2742,16 @@ pub struct Engine {
     leader_partial: Option<String>,
 
     // --- Jump list ---
-    /// List of (file_path, line, col) jump positions. Max 100 entries.
-    jump_list: Vec<(Option<PathBuf>, usize, usize)>,
+    /// List of jump positions, each carrying the pane (group/tab/window) it
+    /// was recorded in. Max 100 entries. Global across tabs/splits — see
+    /// `apply_jump_list_entry` doc comment for why this isn't per-window.
+    jump_list: Vec<JumpEntry>,
     /// Current position in jump list (points past the last entry when at newest).
     jump_list_pos: usize,
-
-    // --- Search word under cursor ---
-    /// Whether current search uses word boundaries (set by * and #).
-    search_word_bounded: bool,
+    /// Cursor position captured once at construction, used by
+    /// `seed_jump_list_if_line_left` to lazily seed an otherwise-empty
+    /// jumplist the first time the cursor leaves this starting line (#806).
+    startup_jump_entry: Option<JumpEntry>,
 
     // --- Workspace ---
     /// Path to the loaded `.vimcode-workspace` file, if any.
@@ -2741,9 +2841,11 @@ pub struct Engine {
     pub tab_switcher_open: bool,
     /// Index of the currently highlighted item in the MRU list.
     pub tab_switcher_selected: usize,
-    /// MRU-ordered list of (group_id, tab_index) pairs.
-    /// Most recently used is at index 0.
-    pub tab_mru: Vec<(GroupId, usize)>,
+    /// MRU-ordered list of (group_id, tab_id) pairs.
+    /// Most recently used is at index 0. Keyed by `TabId` (not a positional
+    /// index) so reordering or moving tabs between groups can never silently
+    /// repoint an entry at the wrong tab (#673).
+    pub tab_mru: Vec<(GroupId, TabId)>,
 
     /// Back/forward tab navigation history.
     /// Each entry is (GroupId, TabId) at the time of the switch.
@@ -2916,6 +3018,60 @@ pub struct Engine {
     /// quadraui MenuSystem — owns all menu bar + dropdown state and logic.
     /// Both TUI and GTK call `menu_system.render()` and `menu_system.handle()`.
     pub menu_system: std::rc::Rc<std::cell::RefCell<quadraui::MenuSystem>>,
+    /// Cached menu-bar band rect from the last paint (#695). GTK already had
+    /// this as a backend-local `Cell<Rect>` (`GtkShell::menu_row_rect`,
+    /// `gtk/mod.rs`) since paint and hit-test both live in the same file
+    /// there; TUI's equivalents are split across `shell_app.rs` (paint +
+    /// event dispatch) and `mouse.rs` (the legacy mouse dispatcher, a
+    /// separate file that only ever sees `&mut Engine`), so the cache lives
+    /// here instead so both can read the *one* rect the frame actually
+    /// painted from — `layout.title_bar_bounds`, quadraui's single source of
+    /// truth for the reserved band — rather than each re-deriving their own
+    /// notion of "is there a menu-bar row" (previously `engine.menu_bar_visible
+    /// ? 1 : 0`, independently, in nine places across the two files, per
+    /// #695). Empty rect (`width`/`height` 0) means "not currently painted",
+    /// matching GTK's `unwrap_or_default()` convention.
+    pub menu_bar_rect: std::cell::Cell<quadraui::Rect>,
+    /// Cached global (bottom-of-screen) status bar rect from the last paint
+    /// (#752) — the exact twin of [`Self::menu_bar_rect`] one band lower, and
+    /// for the same reason.
+    ///
+    /// Before this, neither backend hit-tested the rect it had painted:
+    /// TUI re-derived the row as `row + 2 == term_height` and then swallowed
+    /// every click on it (`// no interactive segments`), while GTK re-derived
+    /// the band from `height - lh * rows - wildmenu_px` and hit-tested the git
+    /// branch inside it against `cached_char_width`, not the width the frame
+    /// painted with. Caching what paint actually did is the #555 rule, and
+    /// `render::route_chrome_click` reads this rect on both backends.
+    ///
+    /// Empty rect (`width`/`height` 0) means "not currently painted" — the bar
+    /// is absent whenever `settings.window_status_line` is on — matching
+    /// [`Self::menu_bar_rect`]'s convention.
+    pub global_status_rect: std::cell::Cell<quadraui::Rect>,
+    /// Cached command/message-line rect from the last paint (#816) — the
+    /// exact twin of [`Self::global_status_rect`] one band lower, and the
+    /// geometry [`crate::render::command_line_click_char_idx`] hit-tests
+    /// against. TUI populates it in `render_impl`/`shell_app`'s
+    /// `FrameOp::CommandLine` arm and GTK in `App`'s; both are ABSOLUTE,
+    /// backend-native units (TUI: character cells, GTK: pixels) — same
+    /// convention as `global_status_rect`. Empty rect means "not currently
+    /// painted".
+    pub command_line_rect: std::cell::Cell<quadraui::Rect>,
+    /// Mouse-driven text selection over the command/message line, as a
+    /// **character-count** `(anchor, head)` pair into the painted text
+    /// (either order) — `None` when no selection is live. Armed by a press
+    /// on the line (gated by [`crate::render::command_line_selection_allowed`]),
+    /// extended on drag, read by [`crate::render::route_cmdline_selection_key`]
+    /// for the Ctrl+C-copies-and-clears / any-other-key-clears keyboard
+    /// tier. Previously TUI-only local state (`mouse::handle_mouse`'s
+    /// `cmd_sel` parameter); lives on `Engine` now so GTK's press/drag/
+    /// release handlers can drive the same field through the same
+    /// `CommandLineLayout::hit_test`-backed helper instead of GTK growing a
+    /// second, unshared copy of this state (#816).
+    pub cmd_sel: std::cell::Cell<Option<(usize, usize)>>,
+    /// Whether a command-line mouse selection is being actively dragged
+    /// (button down, pointer moving) — the counterpart to `cmd_sel` above.
+    pub cmd_dragging: std::cell::Cell<bool>,
     /// quadraui SidebarSystem — owns debug sidebar (4 sections: Variables,
     /// Watch, Call Stack, Breakpoints) selection, scroll, keyboard nav, and
     /// mouse handling. Both TUI and GTK call `render()` and `handle()`.
@@ -3078,8 +3234,8 @@ pub struct Engine {
     pub dap_deferred_lang: Option<String>,
 
     // --- Integrated terminal ---
-    /// All open terminal panes (PTY + VT100 parser). Empty until first open.
-    pub terminal_panes: Vec<TerminalPane>,
+    /// All open terminal sessions (PTY + VT100 parser, via quadraui primitive). Empty until first open.
+    pub terminal_panes: Vec<TerminalSlot>,
     /// Pending install context for the next `terminal_run_command()` call.
     pub pending_install_context: Option<InstallContext>,
     /// Command that should be run in a visible terminal pane (set by ext_install).
@@ -3119,8 +3275,17 @@ pub struct Engine {
     pub last_jump_pos: Option<(usize, usize)>,
     /// Position of last buffer edit (for '. and `. marks).
     pub last_edit_pos: Option<(usize, usize)>,
-    /// Position where cursor was when last leaving Insert mode (for `gi`).
+    /// Position where cursor was when last leaving Insert mode (for `gi`,
+    /// and for the `^`/`` `^ `` mark — `:h '^`).
     pub last_insert_pos: Option<(usize, usize)>,
+    /// Start of the most recent `>>`/`<<`-style line-shift change (for `'[`
+    /// / `` `[ ``). Narrower than real Vim's `[`/`]` (which track every
+    /// change/yank/paste — `` `] `` after yank is a tracked, separate
+    /// deviation), but covers the shift-command case (#806).
+    pub(crate) last_change_start: Option<(usize, usize)>,
+    /// End of the most recent `>>`/`<<`-style line-shift change (for `']` /
+    /// `` `] ``). See `last_change_start`.
+    pub(crate) last_change_end: Option<(usize, usize)>,
     /// Start of last visual selection (for '< and `< marks).
     pub visual_mark_start: Option<(usize, usize)>,
     /// End of last visual selection (for '> and `> marks).
@@ -3135,6 +3300,14 @@ pub struct Engine {
     pub last_visual_cursor: Option<Cursor>,
     /// Visual mode saved when leaving visual mode (for gv).
     pub last_visual_mode: Mode,
+    /// One-shot: the last Visual operator already set
+    /// `last_visual_anchor`/`last_visual_cursor` itself, so `handle_key`'s
+    /// generic "record the selection on leaving Visual mode" hook must not
+    /// overwrite them (#807).
+    ///
+    /// Vim collapses `'<`/`'>` onto the start of a Visual **delete**, so `gv`
+    /// afterwards reselects a single character/line, not the original extent.
+    pub(crate) last_visual_locked: bool,
 
     // --- Change list (g; / g,) ---
     /// List of (line, col) positions where buffer changes occurred. Max 100.
@@ -3153,6 +3326,9 @@ pub struct Engine {
     // --- Last substitute (&) ---
     /// Last substitute (pattern, replacement, flags) for & repeat.
     pub last_substitute: Option<(String, String, String)>,
+    /// Last *expanded* `:s` replacement string. `~` in a later replacement and
+    /// `~` in a later pattern both expand to this (`:h sub-replace-special`).
+    pub last_sub_replacement: String,
 
     // --- Yank highlight (transient visual feedback) ---
     /// Region to highlight briefly after a yank operation: (start, end, is_linewise).
@@ -3171,17 +3347,52 @@ pub struct Engine {
     pub insert_ctrl_o_active: bool,
     /// Column where insert mode was entered (for Ctrl-U to delete only typed text).
     pub insert_enter_col: usize,
+    /// Line index of a freshly created, still-untouched autoindent-only line
+    /// (`:h 'autoindent'`), or `None`. Set when `<CR>`/`o`/`O` create a line
+    /// whose only content is the copied indent; cleared by any key other
+    /// than `<BS>`/`<C-d>` (which the docs specifically exempt). Consulted by
+    /// `<CR>`/`<Esc>` to decide whether to delete that indent again (#804).
+    pub insert_indent_only_line: Option<usize>,
+    /// The character of the *previous* key pressed in Insert mode, or `None`
+    /// if that key was not a plain character (a ctrl combo, `<BS>`, an arrow
+    /// key, …) or Insert mode was only just entered. This mirrors Vim's
+    /// `lastc` in `edit()`, which exists for exactly one feature:
+    /// `:h i_0_CTRL-D` / `:h i_^_CTRL-D` key off *what you typed last*, not
+    /// off what happens to sit in the buffer before the cursor (#804).
+    pub insert_last_key_char: Option<char>,
     /// When true, next keypress in Insert mode is inserted literally (Ctrl-V).
     pub insert_ctrl_v_pending: bool,
-    /// Stores visual block insert/append info: (start_line, end_line, col, is_append).
+    /// Active `<C-v>{digits}` numeric character entry (`:h i_CTRL-V_digit`):
+    /// `(base, max_digits, digits_so_far, accumulated_value)`. `None` when no
+    /// numeric sequence is in progress.
+    pub insert_ctrl_v_numeric: Option<(u32, u32, u32, u32)>,
+    /// "Want" column for consecutive `<Down>`/`<Up>` in Insert mode: a run of
+    /// vertical moves remembers the column the run started at, so stepping
+    /// through a short intermediate line and back onto a long one restores
+    /// the original column instead of sticking to the short line's length
+    /// (#804). Cleared by any other key.
+    pub insert_vertical_want_col: Option<usize>,
+    /// Stores visual block insert/append info:
+    /// `(start_line, end_line, col, is_append, virtual_end, left_col)`.
     /// On Escape from Insert, apply insert_text_buffer to all block lines.
-    /// (start_line, end_line, col, is_append, virtual_end).
+    ///
     /// `virtual_end` = true when the block was started with `$`: the insert column
     /// for each line is that line's own end, not the captured `col`.
-    pub visual_block_insert_info: Option<(usize, usize, usize, bool, bool)>,
+    /// `park_col` is `Some(block left edge)` for `I`/`A`, where Vim leaves the
+    /// cursor on the block's own left column — which for `A` is *not* `col`.
+    /// It is `None` for a blockwise `c`, which leaves the cursor after the
+    /// typed text like any other insert (#807).
+    pub visual_block_insert_info: Option<(usize, usize, usize, bool, bool, Option<usize>)>,
     /// Count for o/O repeat: when >1, Escape from insert repeats the typed text
     /// on additional new lines (Vim behavior for 3oXX<Esc>).
     pub insert_open_count: usize,
+    /// The autoindent `o`/`O` copied onto its new line, so a count-repeat
+    /// (`2ox<Esc>`) can prepend the same indent to each additional repeated
+    /// line instead of just the typed text (#804).
+    pub insert_open_indent: String,
+    /// Count for i/a/I/A repeat: when >1, Escape from insert repeats the
+    /// typed text in place (Vim behavior for 3ihello<Esc>).
+    pub insert_repeat_count: usize,
     /// Force motion mode: 'v' = charwise, 'V' = linewise.
     /// Set by pressing v/V/CTRL-V while an operator is pending (e.g., dVj).
     pub force_motion_mode: Option<char>,
@@ -3279,22 +3490,26 @@ pub struct Engine {
     async_shell_tasks: HashMap<String, std::sync::mpsc::Receiver<(bool, String)>>,
 
     // --- AI assistant panel ---
-    /// Conversation history shown in the AI sidebar.
+    /// Conversation history shown in the AI sidebar. The business-logic
+    /// source of truth (fed to `crate::core::ai::send_chat`); `ai_chat`'s
+    /// own transcript is a per-frame render-only mirror of this, rebuilt by
+    /// `render::populate_ai_chat_controller`.
     pub ai_messages: Vec<AiMessage>,
-    /// Current input text being composed.
-    pub ai_input: String,
-    /// Cursor position in `ai_input` (char index, 0 = before first char).
-    pub ai_input_cursor: usize,
     /// Whether the AI sidebar has keyboard focus.
     pub ai_has_focus: bool,
-    /// Whether the input box is in active editing mode.
-    pub ai_input_active: bool,
     /// True while a request is in-flight.
     pub ai_streaming: bool,
     /// Channel for receiving the AI response from the background thread.
     pub ai_rx: Option<std::sync::mpsc::Receiver<Result<String, String>>>,
-    /// Scroll offset for the conversation history (in lines).
-    pub ai_scroll_top: usize,
+    /// quadraui ChatController — owns the AI sidebar's transcript scroll,
+    /// multi-line input buffer/cursor/history, and scrollbar-drag state
+    /// (#819). Both TUI and GTK call `render()` for painting and `handle()`
+    /// for mouse/keyboard events via the shared `render::route_ai_chat_event`
+    /// wrapper.
+    pub ai_chat: std::rc::Rc<std::cell::RefCell<quadraui::ChatController>>,
+    /// Cached rect from last render frame — used by `route_ai_chat_event` so
+    /// keyboard/mouse dispatch computes the same layout `render()` painted.
+    pub ai_chat_rect: std::cell::Cell<quadraui::Rect>,
 
     // --- AI inline completions (ghost text) ---
     /// Ghost text currently shown at the cursor (first/current alternative).
@@ -3468,6 +3683,60 @@ pub struct Engine {
 
 impl Engine {
     pub fn new() -> Self {
+        let settings = {
+            // Ensure settings.json exists with defaults
+            Settings::ensure_exists().ok();
+            Settings::load()
+        };
+        let session = SessionState::load();
+        let history = HistoryState::load();
+        let git_branch = {
+            let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            git::current_branch(&cwd)
+        };
+        let settings_mtime = {
+            let path = Settings::settings_file_path();
+            std::fs::metadata(&path)
+                .ok()
+                .and_then(|m| m.modified().ok())
+        };
+        Self::new_from_state(settings, session, history, git_branch, settings_mtime)
+    }
+
+    /// Test-only constructor: builds an [`Engine`] entirely from in-memory
+    /// defaults, never touching `~/.config/vimcode/{settings,session,history}.json`
+    /// or shelling out to `git`.
+    ///
+    /// `Engine::new()` reads `Settings::load()`, `SessionState::load()`,
+    /// `HistoryState::load()`, and `git::current_branch()` from ambient disk
+    /// and repo state, then uses `session.explorer_visible` to decide whether
+    /// to call `app_shell.hide_sidebar()` before the constructor returns.
+    /// Tests used to call `Engine::new()` and overwrite the loaded fields
+    /// afterward, but that doesn't reliably undo `hide_sidebar()`'s effect
+    /// (#615) — the sidebar visibility decision has already been baked into
+    /// `app_shell` by the time a post-hoc `e.session = ...` assignment runs.
+    /// This constructor sidesteps the whole class of bug by never loading
+    /// ambient state in the first place, including `settings_mtime` (also an
+    /// ambient disk read via `Settings::settings_file_path()` +
+    /// `fs::metadata`, left as `None` here rather than snuck back in).
+    #[cfg(test)]
+    pub fn new_for_test() -> Self {
+        Self::new_from_state(
+            Settings::default(),
+            SessionState::default(),
+            HistoryState::default(),
+            None,
+            None,
+        )
+    }
+
+    fn new_from_state(
+        settings: Settings,
+        session: SessionState,
+        history: HistoryState,
+        git_branch: Option<String>,
+        settings_mtime: Option<std::time::SystemTime>,
+    ) -> Self {
         let mut buffer_manager = BufferManager::new();
         let buffer_id = buffer_manager.create();
 
@@ -3494,9 +3763,7 @@ impl Engine {
             next_group_id: 1,
             next_window_id: 2,
             next_tab_id: 2,
-            tab_drag: None,
-            tab_drag_mouse: None,
-            tab_drop_zone: DropZone::None,
+            preview_tab: WorkspaceController::new("vimcode:preview"),
             preview_buffer_id: None,
             mode: Mode::Normal,
             command_buffer: String::new(),
@@ -3509,7 +3776,11 @@ impl Engine {
             search_matches: Vec::new(),
             search_index: None,
             search_direction: SearchDirection::Forward,
+            search_offset: String::new(),
+            search_smartcase_applies: true,
+            search_pending_count: 1,
             search_start_cursor: None,
+            visual_search_return: None,
             replace_text: String::new(),
             replace_flags: String::new(),
             pending_key: None,
@@ -3521,34 +3792,36 @@ impl Engine {
             activity_bar_selected: 1,
             registers: HashMap::new(),
             selected_register: None,
+            expr_register_pending: None,
+            force_numbered_register: false,
             marks: HashMap::new(),
+            suppress_mark_line_adjust: false,
             visual_anchor: None,
             visual_dollar: false,
             command_from_visual: None,
+            curswant: None,
+            visual_block_want: None,
+            replace_overwritten: Vec::new(),
+            replace_repeat_count: 1,
+            scroll_value: None,
             count: None,
             operator_count: None,
             last_find: None,
             pending_operator: None,
             pending_find_operator: None,
             pending_text_object: None,
-            last_change: None,
+            dot_scratch: Vec::new(),
+            dot_scratch_any_change: false,
+            dot_skip_command: false,
+            last_dot_keys: None,
+            last_dot_count: None,
             insert_text_buffer: String::new(),
             virtual_replace: false,
-            pending_change_motion: None,
-            settings: {
-                // Ensure settings.json exists with defaults
-                Settings::ensure_exists().ok();
-                Settings::load()
-            },
-            settings_mtime: {
-                let path = Settings::settings_file_path();
-                std::fs::metadata(&path)
-                    .ok()
-                    .and_then(|m| m.modified().ok())
-            },
+            settings_mtime,
             settings_save_revision: crate::core::settings::save_revision(),
-            session: SessionState::load(),
-            history: HistoryState::load(),
+            settings,
+            session,
+            history,
             command_history_index: None,
             command_typing_buffer: String::new(),
             history_search_active: false,
@@ -3558,13 +3831,12 @@ impl Engine {
             search_typing_buffer: String::new(),
             macro_recording: None,
             recording_buffer: Vec::new(),
+            macro_recording_append: false,
             macro_playback_queue: VecDeque::new(),
             last_macro_register: None,
             macro_recursion_depth: 0,
-            git_branch: {
-                let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-                git::current_branch(&cwd)
-            },
+            command_failed: false,
+            git_branch,
             last_git_branch_check: None,
             scroll_bind_pairs: Vec::new(),
             completion_candidates: Vec::new(),
@@ -3618,7 +3890,7 @@ impl Engine {
             leader_partial: None,
             jump_list: Vec::new(),
             jump_list_pos: 0,
-            search_word_bounded: false,
+            startup_jump_entry: None,
             find_replace_open: false,
             find_replace_query: String::new(),
             find_replace_replacement: String::new(),
@@ -3684,7 +3956,7 @@ impl Engine {
             cwd,
             tab_switcher_open: false,
             tab_switcher_selected: 0,
-            tab_mru: vec![(GroupId(0), 0)],
+            tab_mru: vec![(GroupId(0), TabId(1))],
             tab_nav_history: vec![(GroupId(0), TabId(1))],
             tab_nav_index: 0,
             tab_nav_navigating: false,
@@ -3745,6 +4017,11 @@ impl Engine {
             menu_system: std::rc::Rc::new(std::cell::RefCell::new(quadraui::MenuSystem::new(
                 Vec::new(),
             ))),
+            menu_bar_rect: std::cell::Cell::new(quadraui::Rect::default()),
+            global_status_rect: std::cell::Cell::new(quadraui::Rect::default()),
+            command_line_rect: std::cell::Cell::new(quadraui::Rect::default()),
+            cmd_sel: std::cell::Cell::new(None),
+            cmd_dragging: std::cell::Cell::new(false),
             dap_sidebar_system: {
                 let mut s = quadraui::SidebarSystem::new(vec![
                     quadraui::SidebarSectionDef::new("vars", "VARIABLES"),
@@ -3822,26 +4099,36 @@ impl Engine {
             last_jump_pos: None,
             last_edit_pos: None,
             last_insert_pos: None,
+            last_change_start: None,
+            last_change_end: None,
             visual_mark_start: None,
             visual_mark_end: None,
             global_marks: HashMap::new(),
             last_visual_anchor: None,
             last_visual_cursor: None,
             last_visual_mode: Mode::Normal,
+            last_visual_locked: false,
             change_list: Vec::new(),
             change_list_pos: 0,
             last_inserted_text: String::new(),
             last_ex_command: None,
             last_substitute: None,
+            last_sub_replacement: String::new(),
             yank_highlight: None,
             bracket_match: None,
             insert_ctrl_r_pending: false,
             insert_ctrl_g_pending: false,
             insert_ctrl_o_active: false,
             insert_enter_col: 0,
+            insert_indent_only_line: None,
+            insert_last_key_char: None,
             insert_ctrl_v_pending: false,
+            insert_ctrl_v_numeric: None,
+            insert_vertical_want_col: None,
             visual_block_insert_info: None,
             insert_open_count: 0,
+            insert_open_indent: String::new(),
+            insert_repeat_count: 0,
             force_motion_mode: None,
             extension_state: ExtensionState::load(),
             prompted_extensions: HashSet::new(),
@@ -3894,13 +4181,13 @@ impl Engine {
             ai_completion_rx: None,
             ai_completion_prefix_tail: String::new(),
             ai_messages: Vec::new(),
-            ai_input: String::new(),
-            ai_input_cursor: 0,
             ai_has_focus: false,
-            ai_input_active: false,
             ai_streaming: false,
             ai_rx: None,
-            ai_scroll_top: 0,
+            ai_chat: std::rc::Rc::new(std::cell::RefCell::new(quadraui::ChatController::new(
+                "vimcode:ai",
+            ))),
+            ai_chat_rect: std::cell::Cell::new(quadraui::Rect::new(0.0, 0.0, 0.0, 0.0)),
             md_preview_links: HashMap::new(),
             swap_write_needed: HashSet::new(),
             swap_last_write: std::time::Instant::now(),
@@ -4027,6 +4314,9 @@ impl Engine {
         // skip the expensive initial tree-sitter parse.
         crate::core::buffer_manager::set_syntax_max_lines(engine.settings.syntax_max_lines);
         engine.explorer_rebuild_rows();
+        // Record the startup position for `seed_jump_list_if_line_left` —
+        // see that function's doc comment (#806).
+        engine.startup_jump_entry = Some(engine.current_jump_entry());
         engine
     }
 
@@ -4034,15 +4324,76 @@ impl Engine {
     /// registry, then either open the CLI-supplied path or restore the
     /// previous session.  Both TUI and GTK call this identically.
     pub fn startup(&mut self, file_path: Option<&Path>) {
-        self.plugin_init();
-        self.ext_refresh();
+        self.startup_inner(file_path, true, true);
+    }
+
+    /// [`Engine::startup`] minus the per-workspace session restore — the
+    /// constructor deterministic-geometry tests must use.
+    ///
+    /// [`Engine::new_for_test`] is **not** sufficient on its own.  It builds
+    /// the engine from in-memory `Settings::default()` / `SessionState::default()`,
+    /// but `startup(None)` then calls `restore_session_files()`, which performs
+    /// a *second, independent* disk read —
+    /// `SessionState::load_for_workspace(&self.cwd)` — keyed on the process's
+    /// `current_dir()` at construction time and entirely unrelated to whichever
+    /// `Settings`/`SessionState` the engine was built with.
+    /// `SessionState::save_for_workspace` is stubbed out under `cfg(test)`, but
+    /// `load_for_workspace` deliberately is not (several tests write a workspace
+    /// session file and assert it is restored).  So on a machine that happens to
+    /// have a real `~/.config/vimcode/sessions/<hash>.json` for the checkout the
+    /// test binary runs in — entirely plausible for a self-hosting editor whose
+    /// developers edit it with itself — `startup(None)` reopens that session's
+    /// files and splits, `new_tab()` allocates a fresh `WindowId` per extra
+    /// file, and `windows.len()` stops being 1.  Geometry measured against that
+    /// layout is then machine-dependent.
+    ///
+    /// This entry point skips the restore entirely, so the resulting engine
+    /// depends on nothing but its in-memory defaults and the explicit
+    /// `file_path` argument.
+    ///
+    /// #890: for the same reason it also skips the *other* two ambient reads
+    /// `startup` performs — `plugin_init()` (loads and **executes** every
+    /// `.lua` script in the developer's real
+    /// `~/.config/vimcode/{plugins,extensions}/`, then fires `VimEnter`) and
+    /// `ext_refresh()` (spawns a thread that fetches the remote extension
+    /// registry over the network). Both make driver-tier tests depend on the
+    /// machine they run on: a user plugin that hooks `ModeChanged` /
+    /// `InsertEnter` / `cursor_move` can call `vimcode.buf.set_cursor` or
+    /// `set_lines` *synchronously inside a keystroke*, so an installed
+    /// plugin silently rewrites what a `TuiDriver` test types. That is how
+    /// `gp_charwise_multiline_lands_cursor_on_rendered_last_pasted_char_via_shell_app`
+    /// failed on one machine while passing on every other — reproduced
+    /// exactly by pointing `$HOME` at a config dir holding a two-line
+    /// `ModeChanged` plugin. Tests must exercise vimcode, not vimcode plus
+    /// whatever the developer happens to have installed.
+    pub fn startup_without_session_restore(&mut self, file_path: Option<&Path>) {
+        self.startup_inner(file_path, false, false);
+    }
+
+    /// Shared body of [`Engine::startup`] and
+    /// [`Engine::startup_without_session_restore`].
+    ///
+    /// `load_ambient_state` covers the two startup steps that read (and
+    /// run) whatever is on the host machine — user plugins/extensions and
+    /// the remote extension registry. Production startup wants them; the
+    /// deterministic test entry point must not have them.
+    fn startup_inner(
+        &mut self,
+        file_path: Option<&Path>,
+        restore_session: bool,
+        load_ambient_state: bool,
+    ) {
+        if load_ambient_state {
+            self.plugin_init();
+            self.ext_refresh();
+        }
         if let Some(path) = file_path {
             if path.is_dir() {
                 self.open_folder(path);
             } else {
                 let _ = self.open_file_with_mode(path, OpenMode::Permanent);
             }
-        } else {
+        } else if restore_session {
             self.restore_session_files();
         }
     }
@@ -4054,7 +4405,7 @@ impl Engine {
     /// - `format_save_quit_ready` — backends must check and trigger exit
     /// - `pending_terminal_command` — needs backend-supplied terminal size
     /// - `ext_panel_focus_pending` — extension panel reveals (needs dynamic AppShell panels)
-    /// - `explorer_needs_refresh` — GTK sends Msg::RefreshFileTree
+    /// - `explorer_needs_refresh` — GTK calls `App::refresh_file_tree`
     /// - SC/explorer periodic auto-refresh — gated on sidebar visibility
     /// - Settings file auto-reload (#376)
     pub fn poll_idle(&mut self) -> bool {
@@ -4099,7 +4450,7 @@ impl Engine {
     /// Create an engine with a file loaded (or empty buffer for new file).
     #[cfg(test)]
     pub fn open(path: &Path) -> Self {
-        let mut engine = Self::new();
+        let mut engine = Self::new_for_test();
 
         // Replace the default empty buffer with the file
         let old_buffer_id = engine.active_buffer_id();
@@ -4332,9 +4683,13 @@ impl Engine {
     /// B.3+).
     ///
     /// Backends pass the same `(ctrl, shift, alt, key_char, is_tab,
-    /// is_space, is_escape)` shape they already use with
-    /// [`crate::render::matches_key_binding`], so this slots into existing
-    /// key-handler sites without translation.
+    /// is_space, is_escape)` shape their key handlers already destructure, so
+    /// this slots into existing key-handler sites without translation.
+    /// (It used to name `render::matches_key_binding` as the reference for that
+    /// shape; #812 moved that helper into `render`'s test module — it had no
+    /// production callers — so the shape is spelled out here instead.)
+    /// Dead in ShellApp mode until GTK accelerator matching is re-wired (#448-C follow-on).
+    #[allow(dead_code)]
     #[allow(clippy::too_many_arguments)]
     pub fn match_accelerator(
         &self,
@@ -4548,53 +4903,6 @@ fn engine_visual_rows_for_line(line_char_len: usize, viewport_cols: usize) -> us
     }
     line_char_len.div_ceil(viewport_cols).max(1)
 }
-
-/// Try to parse a `:norm[al][!] {keys}` command with an optional range prefix.
-/// Returns `(range_str, keys)` if recognized, `None` otherwise.
-/// Supported ranges: `""` (current line), `"%"` (all), `"'<,'>"` (visual), `"N,M"` (numeric, 1-based).
-fn try_parse_norm(cmd: &str) -> Option<(&str, &str)> {
-    // Strip optional range prefix
-    let (range_str, rest) = if let Some(r) = cmd.strip_prefix("'<,'>") {
-        ("'<,'>", r)
-    } else if let Some(r) = cmd.strip_prefix('%') {
-        ("%", r)
-    } else if let Some(idx) = norm_numeric_range_end(cmd) {
-        (&cmd[..idx], &cmd[idx..])
-    } else {
-        ("", cmd)
-    };
-
-    // Strip "norm[al][!] " keyword — trailing space is required; keys must follow
-    let keys = rest
-        .strip_prefix("normal! ")
-        .or_else(|| rest.strip_prefix("normal "))
-        .or_else(|| rest.strip_prefix("norm! "))
-        .or_else(|| rest.strip_prefix("norm "))?;
-
-    Some((range_str, keys))
-}
-
-/// Returns the byte index right after a `"N,M"` numeric range prefix, or `None`.
-fn norm_numeric_range_end(cmd: &str) -> Option<usize> {
-    let bytes = cmd.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() && bytes[i].is_ascii_digit() {
-        i += 1;
-    }
-    if i == 0 || i >= bytes.len() || bytes[i] != b',' {
-        return None;
-    }
-    i += 1; // skip ','
-    let j = i;
-    while i < bytes.len() && bytes[i].is_ascii_digit() {
-        i += 1;
-    }
-    if i == j {
-        return None;
-    }
-    Some(i)
-}
-
 // =============================================================================
 // DAP helpers
 
@@ -4633,10 +4941,12 @@ fn rust_debug_binary(cwd: &std::path::Path) -> Result<String, String> {
 }
 
 // =============================================================================
-// LCS-based two-way line diff
+// Two-way line diff — algorithm delegated to `quadraui::compute_hunks`;
+// this module only adapts hunks back into vimcode's own per-line/aligned-row
+// interchange types (`DiffLine` / `AlignedDiffEntry`), which drive rendering,
+// folding, and navigation. See `Engine::compute_diff` in `buffers.rs`.
 // =============================================================================
 
-/// Compute per-line diff status for two sequences of lines using a standard
 /// Maximum number of consecutive `Same` lines between two changed regions
 /// that will be absorbed into the surrounding change for visual continuity.
 /// Short "islands" of matching lines in the middle of an edit are typically
@@ -4644,7 +4954,7 @@ fn rust_debug_binary(cwd: &std::path::Path) -> Result<String, String> {
 /// coloured block around them is confusing.
 const DIFF_MERGE_SAME_THRESHOLD: usize = 1;
 
-/// Post-process LCS diff results: short runs of `Same` lines (up to
+/// Post-process per-line diff results: short runs of `Same` lines (up to
 /// [`DIFF_MERGE_SAME_THRESHOLD`]) that sit between two non-Same regions
 /// are re-classified to `fill`, preventing visual fragmentation of what
 /// the user perceives as a single edit.
@@ -4671,24 +4981,6 @@ fn merge_short_same_runs(results: &mut [DiffLine], fill: DiffLine) {
     }
 }
 
-/// Myers diff algorithm — finds the Shortest Edit Script (SES) between two
-/// sequences of lines.  Complexity is O((N+M)·D) where D is the edit distance,
-/// which is much faster than O(N×M) LCS when the files are large but the
-/// diff is small (the common case).
-///
-/// Returns `(status_a, status_b)` where each element corresponds to one line
-/// of the respective input sequence:
-/// - `DiffLine::Same`    — line is shared by both sides.
-/// - `DiffLine::Removed` — line exists in `a` but not `b`.
-/// - `DiffLine::Added`   — line exists in `b` but not `a`.
-///
-/// Build aligned diff sequences with padding so that Same lines appear at the
-/// same visual row.  Walks the raw per-file diff status arrays (one entry per
-/// buffer line) with two pointers and inserts `DiffLine::Padding` entries on
-/// the opposite side whenever one side has Removed/Added lines that the other
-/// does not.
-///
-/// Returns `(aligned_a, aligned_b)` — both the same length.
 impl Engine {
     /// Drop all aligned-diff state and reset every window's
     /// `aligned_top` pin. Use this anywhere `diff_aligned.clear()`
@@ -4703,202 +4995,122 @@ impl Engine {
     }
 }
 
-pub fn build_aligned_diff(
-    da: &[DiffLine],
-    db: &[DiffLine],
-) -> (Vec<AlignedDiffEntry>, Vec<AlignedDiffEntry>) {
-    let mut aligned_a = Vec::new();
-    let mut aligned_b = Vec::new();
-    let mut i = 0; // pointer into da (side A)
-    let mut j = 0; // pointer into db (side B)
-
-    while i < da.len() || j < db.len() {
-        // Both sides have Same — they correspond to each other.
-        if i < da.len() && j < db.len() && da[i] == DiffLine::Same && db[j] == DiffLine::Same {
+/// Rebuild vimcode's per-real-line diff status (`DiffLine`, one entry per
+/// buffer line) and visually-aligned row mapping (`AlignedDiffEntry`, padded
+/// so matching content lines up across both panes) from a
+/// [`quadraui::DiffHunk`] list produced by `quadraui::compute_hunks`.
+///
+/// `compute_hunks` only returns rows within `CONTEXT_LINES` of an actual
+/// change (see quadraui's `diff::mod`), so any real line *not* covered by a
+/// hunk is guaranteed to be an unchanged `Same` line that lines up 1:1 with
+/// its counterpart on the other side — that's precisely why it wasn't
+/// included in a hunk. This walks the hunks in order, filling the gaps
+/// before/between/after them with straight `Same` pairs, and expands each
+/// hunk's rows into per-side `DiffLine`/`AlignedDiffEntry` entries using the
+/// hunk's `left_start`/`right_start` (both 1-based) as running line counters.
+pub(crate) fn diff_state_from_hunks(
+    hunks: &[quadraui::DiffHunk],
+    a_len: usize,
+    b_len: usize,
+) -> (
+    Vec<DiffLine>,
+    Vec<DiffLine>,
+    Vec<AlignedDiffEntry>,
+    Vec<AlignedDiffEntry>,
+) {
+    /// Emit `Same`-Same aligned pairs for the unchanged gap between
+    /// `next_a..end_a` and `next_b..end_b`. Returns the advanced cursors.
+    fn push_same_gap(
+        aligned_a: &mut Vec<AlignedDiffEntry>,
+        aligned_b: &mut Vec<AlignedDiffEntry>,
+        next_a: usize,
+        next_b: usize,
+        end_a: usize,
+        end_b: usize,
+    ) -> (usize, usize) {
+        let gap = end_a
+            .saturating_sub(next_a)
+            .min(end_b.saturating_sub(next_b));
+        for k in 0..gap {
             aligned_a.push(AlignedDiffEntry {
-                source_line: Some(i),
+                source_line: Some(next_a + k),
             });
             aligned_b.push(AlignedDiffEntry {
-                source_line: Some(j),
+                source_line: Some(next_b + k),
             });
-            i += 1;
-            j += 1;
-            continue;
         }
-
-        // Collect a change hunk: consume all non-Same lines from both sides.
-        let mut removed = Vec::new();
-        let mut added = Vec::new();
-        while i < da.len() && da[i] != DiffLine::Same {
-            removed.push(i);
-            i += 1;
-        }
-        while j < db.len() && db[j] != DiffLine::Same {
-            added.push(j);
-            j += 1;
-        }
-
-        // If both sides hit Same (or end) without consuming anything,
-        // treat remaining Same lines on either side as unmatched to avoid
-        // an infinite loop.
-        if removed.is_empty() && added.is_empty() {
-            if i < da.len() {
-                aligned_a.push(AlignedDiffEntry {
-                    source_line: Some(i),
-                });
-                aligned_b.push(AlignedDiffEntry { source_line: None });
-                i += 1;
-            }
-            if j < db.len() {
-                aligned_a.push(AlignedDiffEntry { source_line: None });
-                aligned_b.push(AlignedDiffEntry {
-                    source_line: Some(j),
-                });
-                j += 1;
-            }
-            continue;
-        }
-
-        // Pair up removed/added lines, padding the shorter side.
-        let max_len = removed.len().max(added.len());
-        for k in 0..max_len {
-            if k < removed.len() {
-                aligned_a.push(AlignedDiffEntry {
-                    source_line: Some(removed[k]),
-                });
-            } else {
-                aligned_a.push(AlignedDiffEntry { source_line: None });
-            }
-            if k < added.len() {
-                aligned_b.push(AlignedDiffEntry {
-                    source_line: Some(added[k]),
-                });
-            } else {
-                aligned_b.push(AlignedDiffEntry { source_line: None });
-            }
-        }
+        (next_a + gap, next_b + gap)
     }
 
-    (aligned_a, aligned_b)
-}
+    let mut da = vec![DiffLine::Same; a_len];
+    let mut db = vec![DiffLine::Same; b_len];
+    let mut aligned_a = Vec::new();
+    let mut aligned_b = Vec::new();
+    let mut next_a = 0usize;
+    let mut next_b = 0usize;
 
-/// Falls back to all-Same if the edit distance exceeds `MAX_EDIT_DIST` (to
-/// avoid pathological runtime on completely unrelated files).
-pub fn lcs_diff(a: &[&str], b: &[&str]) -> (Vec<DiffLine>, Vec<DiffLine>) {
-    let n = a.len();
-    let m = b.len();
-    if n == 0 && m == 0 {
-        return (vec![], vec![]);
-    }
-    if n == 0 {
-        return (vec![], vec![DiffLine::Added; m]);
-    }
-    if m == 0 {
-        return (vec![DiffLine::Removed; n], vec![]);
-    }
+    for hunk in hunks {
+        // `left_start`/`right_start` are 1-based; convert to 0-based indices.
+        let hunk_a = hunk.left_start.saturating_sub(1);
+        let hunk_b = hunk.right_start.saturating_sub(1);
+        let (ga, gb) = push_same_gap(
+            &mut aligned_a,
+            &mut aligned_b,
+            next_a,
+            next_b,
+            hunk_a,
+            hunk_b,
+        );
+        // Defensive: gap sizes should always match (see doc comment above);
+        // snap forward to the hunk start in case they don't, rather than panic.
+        next_a = ga.max(hunk_a);
+        next_b = gb.max(hunk_b);
 
-    // Maximum edit distance we're willing to explore.
-    // Myers diff is O(N·D) in time and O(D²) in memory where D = edit distance.
-    // For large files with small diffs (the common case), D is small so this is
-    // fast regardless of file size.  The MAX_EDIT_DIST cap prevents blow-up when
-    // two files are extremely different.
-    const MAX_EDIT_DIST: usize = 2_000;
-    let max_d = (n + m).min(MAX_EDIT_DIST);
-
-    // V array indexed by k = x - y, offset so k=0 maps to index `offset`.
-    let offset = max_d;
-    let v_size = 2 * max_d + 1;
-    let mut v = vec![0usize; v_size];
-
-    // Store the trace of V snapshots for backtracking.
-    let mut trace: Vec<Vec<usize>> = Vec::with_capacity(max_d);
-
-    let mut found_d = None;
-    'outer: for d in 0..=max_d {
-        trace.push(v.clone());
-
-        for k in (-(d as isize)..=(d as isize)).step_by(2) {
-            let ki = (k + offset as isize) as usize;
-
-            let mut x = if d == 0 {
-                0
-            } else if k == -(d as isize) || (k != d as isize && v[ki - 1] < v[ki + 1]) {
-                v[ki + 1] // move down (insert)
-            } else {
-                v[ki - 1] + 1 // move right (delete)
-            };
-
-            let mut y = (x as isize - k) as usize;
-
-            // Follow diagonal (matching lines)
-            while x < n && y < m && a[x] == b[y] {
-                x += 1;
-                y += 1;
+        let mut la = next_a;
+        let mut lb = next_b;
+        for row in &hunk.rows {
+            let left_idx = row.left.as_ref().map(|_| {
+                let i = la;
+                la += 1;
+                i
+            });
+            let right_idx = row.right.as_ref().map(|_| {
+                let i = lb;
+                lb += 1;
+                i
+            });
+            aligned_a.push(AlignedDiffEntry {
+                source_line: left_idx,
+            });
+            aligned_b.push(AlignedDiffEntry {
+                source_line: right_idx,
+            });
+            if let Some(i) = left_idx {
+                if i < da.len() {
+                    da[i] = if row.kind == quadraui::DiffRowKind::Same {
+                        DiffLine::Same
+                    } else {
+                        DiffLine::Removed
+                    };
+                }
             }
-
-            v[ki] = x;
-
-            if x >= n && y >= m {
-                found_d = Some(d);
-                break 'outer;
+            if let Some(i) = right_idx {
+                if i < db.len() {
+                    db[i] = if row.kind == quadraui::DiffRowKind::Same {
+                        DiffLine::Same
+                    } else {
+                        DiffLine::Added
+                    };
+                }
             }
         }
+        next_a = la;
+        next_b = lb;
     }
 
-    if found_d.is_none() {
-        // Edit distance exceeded limit — fall back to all-Same.
-        return (vec![DiffLine::Same; n], vec![DiffLine::Same; m]);
-    }
-    let d = found_d.unwrap();
+    push_same_gap(&mut aligned_a, &mut aligned_b, next_a, next_b, a_len, b_len);
 
-    // Backtrack through the trace to build an edit script.
-    // Each edit is either Insert(y_idx) or Delete(x_idx), in reverse order.
-    #[derive(Clone, Copy)]
-    enum Edit {
-        Insert(usize), // b[y] was inserted
-        Delete(usize), // a[x] was deleted
-    }
-    let mut edits: Vec<Edit> = Vec::with_capacity(d);
-    let mut cx = n;
-    let mut cy = m;
-
-    for d_step in (1..=d).rev() {
-        let v_d = &trace[d_step];
-        let k = cx as isize - cy as isize;
-        let ki = (k + offset as isize) as usize;
-
-        let is_insert =
-            k == -(d_step as isize) || (k != d_step as isize && v_d[ki - 1] < v_d[ki + 1]);
-
-        let prev_k = if is_insert { k + 1 } else { k - 1 };
-        let prev_ki = (prev_k + offset as isize) as usize;
-        let prev_x = v_d[prev_ki];
-        let prev_y = (prev_x as isize - prev_k) as usize;
-
-        if is_insert {
-            // y stepped from prev_y to prev_y+1, then diagonal to (cx, cy).
-            edits.push(Edit::Insert(prev_y));
-        } else {
-            // x stepped from prev_x to prev_x+1, then diagonal to (cx, cy).
-            edits.push(Edit::Delete(prev_x));
-        }
-
-        cx = prev_x;
-        cy = prev_y;
-    }
-    edits.reverse();
-
-    // Build per-line status arrays from the edit script.
-    let mut da = vec![DiffLine::Same; n];
-    let mut db = vec![DiffLine::Same; m];
-    for edit in &edits {
-        match *edit {
-            Edit::Delete(x) => da[x] = DiffLine::Removed,
-            Edit::Insert(y) => db[y] = DiffLine::Added,
-        }
-    }
-
-    (da, db)
+    (da, db, aligned_a, aligned_b)
 }
 
 mod accessors;

@@ -28,9 +28,7 @@ impl Engine {
             }
         }
 
-        while pos < total_chars && self.buffer().content.char(pos).is_whitespace() {
-            pos += 1;
-        }
+        pos = self.skip_separators_forward_word_aware(pos);
 
         if pos >= total_chars {
             pos = total_chars.saturating_sub(1);
@@ -40,6 +38,60 @@ impl Engine {
         let line_start = self.buffer().line_to_char(new_line);
         self.view_mut().cursor.line = new_line;
         self.view_mut().cursor.col = pos - line_start;
+    }
+
+    /// Skip a run of separator whitespace forward from `pos`, treating a
+    /// completely blank line as a word in its own right (Vim: "An empty
+    /// line is also considered to be a word") rather than something to skip
+    /// through. Returns the position of the next non-blank word start, or
+    /// the position of a blank line's own (only) char if one is crossed, or
+    /// `len_chars()` if the buffer ends first.
+    fn skip_separators_forward_word_aware(&self, mut pos: usize) -> usize {
+        let total = self.buffer().len_chars();
+        loop {
+            if pos >= total {
+                return pos;
+            }
+            let ch = self.buffer().content.char(pos);
+            if ch == '\n' {
+                let line_of_nl = self.buffer().content.char_to_line(pos);
+                let next_line = line_of_nl + 1;
+                if next_line >= self.buffer().len_lines() {
+                    return total;
+                }
+                pos = self.buffer().line_to_char(next_line);
+                if pos >= total || self.is_line_blank_strict(next_line) {
+                    return pos;
+                }
+            } else if ch.is_whitespace() {
+                pos += 1;
+            } else {
+                return pos;
+            }
+        }
+    }
+
+    /// Mirror of `skip_separators_forward_word_aware` for backward motions
+    /// (`b`, `ge`): skip whitespace backward from `pos`, stopping as soon as
+    /// landing on a blank line's own char (that blank line is itself the
+    /// previous word) or at the start of the buffer.
+    fn skip_separators_backward_word_aware(&self, mut pos: usize) -> usize {
+        loop {
+            let ch = self.buffer().content.char(pos);
+            if !ch.is_whitespace() {
+                return pos;
+            }
+            if ch == '\n' {
+                let ln = self.buffer().content.char_to_line(pos);
+                if self.is_line_blank_strict(ln) {
+                    return pos;
+                }
+            }
+            if pos == 0 {
+                return 0;
+            }
+            pos -= 1;
+        }
     }
 
     pub(crate) fn move_word_backward(&mut self) {
@@ -52,12 +104,13 @@ impl Engine {
         }
         pos -= 1;
 
-        while pos > 0 && self.buffer().content.char(pos).is_whitespace() {
-            pos -= 1;
-        }
+        pos = self.skip_separators_backward_word_aware(pos);
 
         let ch = self.buffer().content.char(pos);
-        if is_word_char(ch) {
+        if ch == '\n' {
+            // Landed exactly on a blank line, which Vim counts as its own
+            // word — nothing more to extend backward into.
+        } else if is_word_char(ch) {
             while pos > 0 && is_word_char(self.buffer().content.char(pos - 1)) {
                 pos -= 1;
             }
@@ -181,14 +234,19 @@ impl Engine {
         // Step 2: Move back one char (from start of current word or from whitespace)
         pos -= 1;
 
-        // Step 3: Skip whitespace backward
-        while pos > 0 && self.buffer().content.char(pos).is_whitespace() {
-            pos -= 1;
-        }
+        // Step 3: Skip whitespace backward, treating a blank line as a word
+        // in its own right (so `ge` can land on one) rather than skipping
+        // through it.
+        pos = self.skip_separators_backward_word_aware(pos);
 
-        // If at pos 0 and it's whitespace, no previous word exists
-        if pos == 0 && self.buffer().content.char(pos).is_whitespace() {
-            return;
+        // If we stopped on whitespace that ISN'T a blank line, we ran off
+        // the start of the buffer without finding a previous word.
+        let ch = self.buffer().content.char(pos);
+        if ch.is_whitespace() {
+            let ln = self.buffer().content.char_to_line(pos);
+            if !self.is_line_blank_strict(ln) {
+                return;
+            }
         }
 
         // pos is now at the last char of the previous word (the target)
@@ -432,9 +490,16 @@ impl Engine {
             return;
         }
 
-        // Step back to skip current whitespace / sentence start
+        // Step back to skip current whitespace / sentence start. A blank
+        // line is itself a paragraph/sentence boundary (`word:( para`), so
+        // stop there instead of skipping through it.
         pos = pos.saturating_sub(1);
         while pos > 0 && self.buffer().content.char(pos).is_whitespace() {
+            if self.buffer().content.char(pos) == '\n'
+                && self.is_line_blank_strict(self.buffer().content.char_to_line(pos))
+            {
+                break;
+            }
             pos -= 1;
         }
 
@@ -468,141 +533,55 @@ impl Engine {
 
     // --- Number increment/decrement (Ctrl+a / Ctrl+x) ---
 
+    /// Normal-mode `<C-a>` / `<C-x>`: find the number at or after the cursor on
+    /// the current line and add `delta` to it.
     pub(crate) fn increment_number_at_cursor(&mut self, delta: i64, changed: &mut bool) {
         let line = self.view().cursor.line;
         let col = self.view().cursor.col;
-        let line_start = self.buffer().line_to_char(line);
-        let line_len = self.buffer().line_len_chars(line);
-
-        let line_text: String = self.buffer().content.line(line).chars().collect();
-        let chars: Vec<char> = line_text.chars().collect();
-
-        // Find number at or after cursor
-        // First, look for a digit at or after current col
-        let mut num_start = None;
-        let mut num_end = 0;
-
-        // Check if we're inside a number already
-        let search_start = col;
-        for i in search_start..chars.len() {
-            if chars[i].is_ascii_digit() {
-                // Find start of this number (walk back)
-                let mut s = i;
-                // Check for hex prefix (0x)
-                if s > 0 && chars[s - 1] == 'x' && s > 1 && chars[s - 2] == '0' {
-                    s -= 2;
-                } else if s > 0 && chars[s - 1] == '-' {
-                    // Could be negative
-                }
-                // Find exact start: walk back from i
-                let mut start = i;
-                while start > 0
-                    && (chars[start - 1].is_ascii_digit()
-                        || (start >= 2 && chars[start - 1] == 'x' && chars[start - 2] == '0'))
-                {
-                    start -= 1;
-                }
-                // Check negative sign
-                if start > 0 && chars[start - 1] == '-' {
-                    start -= 1;
-                }
-                // Find end
-                let mut end = i;
-                while end < chars.len() && chars[end].is_ascii_hexdigit() {
-                    end += 1;
-                }
-                let _ = s;
-                num_start = Some(start);
-                num_end = end;
-                break;
-            }
-        }
-
-        let start_col = match num_start {
-            Some(s) => s,
-            None => {
-                self.message = "No number under cursor".to_string();
-                return;
-            }
-        };
-
-        // Hex prefix detection: if start is on '0' (or '-0') with 'x'/'X' following,
-        // extend num_end forward to cover all hex digits so parsing sees "0xXX".
-        // Without this, cursor landing on the leading '0' of "0x09" would only see
-        // the digit "0" and increment it as decimal to "1x09" (Vim deviation #109).
-        let hex_prefix_at = if start_col + 1 < chars.len()
-            && chars[start_col] == '0'
-            && (chars[start_col + 1] == 'x' || chars[start_col + 1] == 'X')
-        {
-            Some(start_col)
-        } else if start_col + 2 < chars.len()
-            && chars[start_col] == '-'
-            && chars[start_col + 1] == '0'
-            && (chars[start_col + 2] == 'x' || chars[start_col + 2] == 'X')
-        {
-            Some(start_col + 1)
-        } else {
-            None
-        };
-        if let Some(p) = hex_prefix_at {
-            let mut end = p + 2;
-            while end < chars.len() && chars[end].is_ascii_hexdigit() {
-                end += 1;
-            }
-            num_end = end;
-        }
-
-        let num_str: String = chars[start_col..num_end].iter().collect();
-        let trimmed = num_str.trim_start_matches('-');
-        let negative = num_str.starts_with('-');
-
-        // Parse the number
-        let (value, radix, prefix_len): (i64, u32, usize) =
-            if trimmed.starts_with("0x") || trimmed.starts_with("0X") {
-                let v = i64::from_str_radix(&trimmed[2..], 16).unwrap_or(0);
-                let v = if negative { -v } else { v };
-                (v, 16, if negative { 3 } else { 2 })
-            } else if trimmed.starts_with('0')
-                && trimmed.len() > 1
-                && trimmed.chars().all(|c| c.is_ascii_digit())
-            {
-                let v = i64::from_str_radix(trimmed, 8).unwrap_or(0);
-                let v = if negative { -v } else { v };
-                (v, 8, 0)
-            } else {
-                let v: i64 = num_str.parse().unwrap_or(0);
-                (v, 10, 0)
-            };
-
-        let new_value = value + delta;
-
-        // Format new value preserving radix and padding
-        let new_str = if radix == 16 {
-            let prefix = if negative { "-0x" } else { "0x" };
-            let digits = trimmed.len() - prefix_len; // digit count
-            format!(
-                "{}{:0>width$x}",
-                prefix,
-                new_value.unsigned_abs(),
-                width = digits
-            )
-        } else if radix == 8 {
-            format!("{:o}", new_value)
-        } else {
-            format!("{}", new_value)
-        };
-
-        // Replace in buffer
-        let del_start = line_start + start_col;
-        let del_end = line_start + num_end.min(line_len);
         self.start_undo_group();
-        self.delete_with_undo(del_start, del_end);
-        self.insert_with_undo(del_start, &new_str);
+        let hit = self.addsub_on_line(line, col, delta, None).is_some();
         self.finish_undo_group();
+        if hit {
+            *changed = true;
+        } else {
+            self.message = "No number under cursor".to_string();
+        }
+    }
 
-        // Position cursor at end of new number
-        self.view_mut().cursor.col = start_col + new_str.chars().count().saturating_sub(1);
-        *changed = true;
+    /// One `do_addsub()` application on `line`.
+    ///
+    /// `sel` is `Some(selected_len)` when driven from Visual mode — the search
+    /// for a digit is then confined to `selected_len` chars starting at `col`,
+    /// and a `-` immediately before the number only counts as a sign when it is
+    /// itself inside the selection (Vim: `vl<C-a>` on the `5` of `x -5` yields
+    /// `x -6`, not `x -4`).
+    ///
+    /// Returns the column the replacement started at when the line changed.
+    ///
+    /// The caller owns the undo group — `start_undo_group()` finishes any group
+    /// already open, so a per-line group here would split a Visual-mode
+    /// `<C-a>` across N undo steps.
+    pub(crate) fn addsub_on_line(
+        &mut self,
+        line: usize,
+        col: usize,
+        delta: i64,
+        sel: Option<usize>,
+    ) -> Option<usize> {
+        if line >= self.buffer().len_lines() {
+            return None;
+        }
+        let line_text: String = self.buffer().content.line(line).chars().collect();
+        let chars: Vec<char> = line_text.trim_end_matches('\n').chars().collect();
+        let (start, len, new_text) = addsub_in_line(&chars, col, delta, NrFormats::default(), sel)?;
+
+        let line_start = self.buffer().line_to_char(line);
+        self.delete_with_undo(line_start + start, line_start + start + len);
+        self.insert_with_undo(line_start + start, &new_text);
+
+        self.view_mut().cursor.line = line;
+        self.view_mut().cursor.col = start + new_text.chars().count().saturating_sub(1);
+        Some(start)
     }
 
     // --- Auto-indent lines (= operator) ---
@@ -851,6 +830,18 @@ impl Engine {
             79
         };
 
+        // `gq` keeps the indent of the first line of the range and applies it
+        // to every wrapped line (`:h gq`; #807, `op:gqq indented` used to
+        // strip it), so 'textwidth' is measured against the indented width.
+        let indent: String = {
+            let first: String = self.buffer().content.line(start).chars().collect();
+            first
+                .chars()
+                .take_while(|c| *c == ' ' || *c == '\t')
+                .collect()
+        };
+        let tw = tw.saturating_sub(indent.chars().count()).max(1);
+
         // Collect the text of the range
         let mut text = String::new();
         for l in start..=end {
@@ -881,6 +872,7 @@ impl Engine {
                 if line_buf.is_empty() {
                     line_buf.push_str(word);
                 } else if line_buf.len() + 1 + word.len() > tw {
+                    result.push_str(&indent);
                     result.push_str(&line_buf);
                     result.push('\n');
                     line_buf = word.to_string();
@@ -890,6 +882,7 @@ impl Engine {
                 }
             }
             if !line_buf.is_empty() {
+                result.push_str(&indent);
                 result.push_str(&line_buf);
                 if pi < paragraphs.len() - 1 || end + 1 < total {
                     result.push('\n');
@@ -910,60 +903,16 @@ impl Engine {
         self.insert_with_undo(range_start, &result);
         self.finish_undo_group();
 
-        // Move cursor to start of formatted area
-        self.view_mut().cursor.line = start;
-        self.view_mut().cursor.col = self.first_non_blank_col(start);
+        // `gq` leaves the cursor on the FIRST non-blank of the LAST formatted
+        // line (`:h gq`; #807 — it used to stay on the first line).  `gw` is
+        // the variant that keeps the cursor, and its caller restores it.
+        let formatted_lines = result.matches('\n').count()
+            + usize::from(!result.is_empty() && !result.ends_with('\n'));
+        let last = (start + formatted_lines.saturating_sub(1))
+            .min(self.buffer().len_lines().saturating_sub(1));
+        self.view_mut().cursor.line = last;
+        self.view_mut().cursor.col = self.first_non_blank_col(last);
         *changed = true;
-    }
-
-    // --- WORD text object (iW / aW) ---
-
-    pub(crate) fn find_bigword_object(
-        &self,
-        modifier: char,
-        cursor_pos: usize,
-    ) -> Option<(usize, usize)> {
-        let total_chars = self.buffer().len_chars();
-        if cursor_pos >= total_chars {
-            return None;
-        }
-
-        let char_at_cursor = self.buffer().content.char(cursor_pos);
-
-        // If on whitespace and modifier is 'i', no match
-        if modifier == 'i' && char_at_cursor.is_whitespace() {
-            return None;
-        }
-
-        let mut start = cursor_pos;
-        let mut end = cursor_pos;
-
-        // Expand backward to start of WORD (non-whitespace)
-        while start > 0 && !self.buffer().content.char(start - 1).is_whitespace() {
-            start -= 1;
-        }
-
-        // Expand forward to end of WORD
-        while end < total_chars && !self.buffer().content.char(end).is_whitespace() {
-            end += 1;
-        }
-
-        // For 'aW', include trailing whitespace
-        if modifier == 'a' {
-            while end < total_chars {
-                let ch = self.buffer().content.char(end);
-                if !ch.is_whitespace() || ch == '\n' {
-                    break;
-                }
-                end += 1;
-            }
-        }
-
-        if start < end {
-            Some((start, end))
-        } else {
-            None
-        }
     }
 
     // --- gJ: join lines without inserting space ---
@@ -1176,52 +1125,25 @@ impl Engine {
     // --- g* / g#: partial word search ---
 
     pub(crate) fn search_word_under_cursor_partial(&mut self, forward: bool) {
-        let word = match self.word_under_cursor() {
-            Some(w) => w,
-            None => {
-                self.message = "No word under cursor".to_string();
-                return;
-            }
-        };
-
-        self.search_query = word.clone();
-        self.search_direction = if forward {
-            SearchDirection::Forward
-        } else {
-            SearchDirection::Backward
-        };
-        self.search_word_bounded = false;
-
-        // Use plain text search (no word boundaries)
-        self.run_search();
-
-        if self.search_matches.is_empty() {
-            self.message = format!("Pattern not found: {}", word);
-            return;
-        }
-
-        if forward {
-            self.search_next();
-        } else {
-            self.search_prev();
-        }
+        self.search_word_under_cursor_generic(forward, false);
     }
 
     // --- ]p / [p: paste with indent adjustment ---
 
     pub(crate) fn paste_after_adjusted_indent(&mut self, changed: &mut bool) {
         let reg = self.active_register();
-        let (content, is_linewise) = match self.get_register_content(reg) {
+        let (content, reg_type) = match self.get_register_content(reg) {
             Some(pair) => pair,
             None => {
                 self.clear_selected_register();
                 return;
             }
         };
+        let is_linewise = reg_type.is_linewise();
 
         if !is_linewise {
             // For characterwise, just paste normally
-            self.paste_after(changed);
+            self.paste_after(1, changed);
             return;
         }
 
@@ -1255,16 +1177,17 @@ impl Engine {
 
     pub(crate) fn paste_before_adjusted_indent(&mut self, changed: &mut bool) {
         let reg = self.active_register();
-        let (content, is_linewise) = match self.get_register_content(reg) {
+        let (content, reg_type) = match self.get_register_content(reg) {
             Some(pair) => pair,
             None => {
                 self.clear_selected_register();
                 return;
             }
         };
+        let is_linewise = reg_type.is_linewise();
 
         if !is_linewise {
-            self.paste_before(changed);
+            self.paste_before(1, changed);
             return;
         }
 
@@ -1325,6 +1248,24 @@ impl Engine {
         let _ = ctrl;
         match key_name {
             "Escape" => {
+                // `2Rxy` re-applies the typed text `count - 1` more times,
+                // still overwriting (#807, `op:2R`).
+                let reps = self.replace_repeat_count.max(1);
+                let typed = self.insert_text_buffer.clone();
+                if reps > 1 && !typed.is_empty() && !typed.contains('\n') {
+                    for _ in 1..reps {
+                        for ch in typed.chars() {
+                            self.replace_mode_put(ch, changed);
+                        }
+                    }
+                }
+                self.replace_repeat_count = 1;
+                self.replace_overwritten.clear();
+                // The whole Replace session is ONE undo step (`R` opened the
+                // group). Closing it here is also what makes the session land
+                // on the undo stack in time for dot-repeat's change detection
+                // (#807, `dot:R .`).
+                self.finish_undo_group();
                 self.virtual_replace = false;
                 self.mode = Mode::Normal;
                 // Vim steps cursor one left when leaving Replace mode (unless at col 0)
@@ -1333,9 +1274,49 @@ impl Engine {
                 }
                 self.clamp_cursor_col();
             }
+            "Return" | "KP_Enter" => {
+                // `<CR>` in Replace mode breaks the line without consuming a
+                // character (`:h Replace-mode`; #807, `op:R <CR>`).
+                let line = self.view().cursor.line;
+                let col = self.view().cursor.col;
+                let char_idx = self.buffer().line_to_char(line) + col;
+                self.insert_with_undo(char_idx, "\n");
+                self.insert_text_buffer.push('\n');
+                self.replace_overwritten.clear();
+                self.view_mut().cursor.line = line + 1;
+                self.view_mut().cursor.col = 0;
+                *changed = true;
+            }
             "BackSpace" => {
-                // In replace mode, backspace just moves cursor back (simplified)
-                self.move_left();
+                // Replace-mode `<BS>` restores what was overwritten rather
+                // than deleting (`:h Replace-mode`; #807, `op:R BS restores`).
+                // Past the trail's start it is a plain cursor move.
+                let col = self.view().cursor.col;
+                if col == 0 {
+                    // Cursor at column 0 with a non-empty trail can only
+                    // happen if arrow-key movement desynced it from the
+                    // cursor (arrow keys don't touch the trail) — leave the
+                    // trail alone rather than silently dropping an entry, so
+                    // a later `<BS>` in the same Replace session still
+                    // restores the right character.
+                    self.move_left();
+                    return;
+                }
+                match self.replace_overwritten.pop() {
+                    Some(orig) => {
+                        let line = self.view().cursor.line;
+                        let at = self.buffer().line_to_char(line) + col - 1;
+                        self.delete_with_undo(at, at + 1);
+                        if let Some(c) = orig {
+                            let mut buf = [0u8; 4];
+                            self.insert_with_undo(at, c.encode_utf8(&mut buf));
+                        }
+                        self.insert_text_buffer.pop();
+                        self.view_mut().cursor.col = col - 1;
+                        *changed = true;
+                    }
+                    None => self.move_left(),
+                }
             }
             "Left" => self.move_left(),
             "Right" => self.move_right(),
@@ -1408,72 +1389,106 @@ impl Engine {
                         }
                     }
 
-                    self.start_undo_group();
-                    if col < line_content_len {
-                        // Overwrite: delete one char, insert replacement
-                        self.delete_with_undo(char_idx, char_idx + 1);
-                        let mut buf = [0u8; 4];
-                        let s = ch.encode_utf8(&mut buf);
-                        self.insert_with_undo(char_idx, s);
-                        self.view_mut().cursor.col += 1;
-                    } else {
-                        // Past end of line: insert
-                        let mut buf = [0u8; 4];
-                        let s = ch.encode_utf8(&mut buf);
-                        self.insert_with_undo(char_idx, s);
-                        self.view_mut().cursor.col += 1;
-                    }
-                    self.finish_undo_group();
-                    *changed = true;
+                    let _ = (char_idx, line_content_len);
+                    self.replace_mode_put(ch, changed);
+                    self.insert_text_buffer.push(ch);
                 }
             }
         }
+    }
+
+    /// Overwrite the character under the cursor with `ch`, remembering what
+    /// was there so Replace-mode `<BS>` can put it back (#807).
+    fn replace_mode_put(&mut self, ch: char, changed: &mut bool) {
+        let line = self.view().cursor.line;
+        let col = self.view().cursor.col;
+        let line_start = self.buffer().line_to_char(line);
+        let char_idx = line_start + col;
+        let content_len = self.line_text_len(line);
+        let mut buf = [0u8; 4];
+        let s = ch.encode_utf8(&mut buf);
+        if col < content_len {
+            let orig = self.buffer().content.char(char_idx);
+            self.delete_with_undo(char_idx, char_idx + 1);
+            self.insert_with_undo(char_idx, s);
+            self.replace_overwritten.push(Some(orig));
+        } else {
+            self.insert_with_undo(char_idx, s);
+            self.replace_overwritten.push(None);
+        }
+        self.view_mut().cursor.col = col + 1;
+        *changed = true;
     }
 
     // --- Paragraph motions ---
 
     pub(crate) fn move_paragraph_forward(&mut self) {
         let total_lines = self.buffer().len_lines();
+        let max_line = total_lines.saturating_sub(1);
         let mut line = self.view().cursor.line;
 
-        // Move forward at least one line to find the next empty line
-        if line + 1 >= total_lines {
-            // Already at or past last line, don't move
+        // `}` always moves at least one line, and never moves past the last
+        // line of the buffer.
+        if line >= max_line {
             return;
         }
-        line += 1;
 
-        // Search for the next empty line
-        while line < total_lines && !self.is_line_empty(line) {
+        // A run of consecutive blank lines is a single paragraph boundary:
+        // if we're starting inside one, skip past the whole run first so a
+        // second `}` doesn't stop again one line later within the same run.
+        if self.is_line_blank_strict(line) {
+            while line < max_line && self.is_line_blank_strict(line) {
+                line += 1;
+            }
+        }
+        // Now advance to the next blank line (the next paragraph boundary),
+        // or the last line of the buffer if there isn't one.
+        while line < max_line && !self.is_line_blank_strict(line) {
             line += 1;
         }
 
-        // Move to the empty line we found, or the last line if we hit EOF
-        if line >= total_lines {
-            line = total_lines.saturating_sub(1);
-        }
         self.view_mut().cursor.line = line;
-        self.view_mut().cursor.col = self.get_line_len_for_insert(line);
+        self.view_mut().cursor.col = 0;
     }
 
     pub(crate) fn move_paragraph_backward(&mut self) {
         let mut line = self.view().cursor.line;
 
-        // Already at top, don't move
+        // `{` always moves at least one line, and never moves past line 0.
         if line == 0 {
             return;
         }
-        line -= 1;
 
-        // Search backward for an empty line
-        while line > 0 && !self.is_line_empty(line) {
+        // Mirror of the forward run-skipping: starting inside a blank-line
+        // run skips the whole run before searching for the previous one.
+        if self.is_line_blank_strict(line) {
+            while line > 0 && self.is_line_blank_strict(line) {
+                line -= 1;
+            }
+        }
+        while line > 0 && !self.is_line_blank_strict(line) {
             line -= 1;
         }
 
-        // Move to the found empty line (or line 0 if that's where we stopped)
         self.view_mut().cursor.line = line;
-        // Move to end of line (column 0 for empty lines)
-        self.view_mut().cursor.col = self.get_line_len_for_insert(line);
+        self.view_mut().cursor.col = 0;
+    }
+
+    /// Returns true if the line has no characters at all (besides its own
+    /// line terminator). Unlike `is_line_empty`, a whitespace-only line
+    /// (e.g. `"   "`) is NOT considered blank here — this is the stricter
+    /// notion Vim's `{`/`}` paragraph motions and blank-line word/sentence
+    /// boundaries use (:help paragraph: a set of consecutive blank lines
+    /// separates paragraphs, and whitespace-only doesn't count).
+    pub(crate) fn is_line_blank_strict(&self, line: usize) -> bool {
+        if line >= self.buffer().len_lines() {
+            return false;
+        }
+        let len = self.buffer().line_len_chars(line);
+        if len == 0 {
+            return true;
+        }
+        len == 1 && self.buffer().content.line(line).char(0) == '\n'
     }
 
     /// Returns true if the line is empty or contains only whitespace.
@@ -1484,8 +1499,17 @@ impl Engine {
 
         let line_len = self.buffer().line_len_chars(line);
 
-        // Line with no characters or just newline
-        if line_len == 0 || line_len == 1 {
+        // A line with zero chars is trivially empty. Do NOT special-case
+        // `line_len == 1` as "just a newline" — the *last* line of a buffer
+        // with no trailing newline also has length 1, and its one character
+        // can be real content (e.g. a single-char last paragraph). That
+        // false positive made `ap`/`ip` paragraph-boundary detection treat
+        // that line as blank: `dap` would swallow it as a "trailing blank"
+        // and delete past it, and `ip`/`ap` would stop just short of
+        // including it. The loop below already handles both `line_len == 0`
+        // (never runs, falls through to `true`) and a real lone `"\n"`
+        // (matches whitespace) correctly, so it covers this case too.
+        if line_len == 0 {
             return true;
         }
 
@@ -1579,8 +1603,49 @@ impl Engine {
             } else {
                 motion_type
             };
-            self.find_char(actual_motion, target);
+            if actual_motion == 't' || actual_motion == 'T' {
+                self.repeat_till(actual_motion, target);
+            } else {
+                self.find_char(actual_motion, target);
+            }
         }
+    }
+
+    /// Repeat a `t`/`T` "till" search via `;`/`,` (Vim's default `cpoptions`
+    /// behavior). Because `t`/`T` park the cursor one character short of the
+    /// target, a naive repeat immediately re-finds that same adjacent target
+    /// and "gets stuck" (zero movement). Vim's default `;`/`,` skip that
+    /// immediately-adjacent occurrence and advance to the next one instead —
+    /// which is always safe to do unconditionally: if the adjacent character
+    /// isn't the target, starting one position further finds the exact same
+    /// first match a plain search would have.
+    fn repeat_till(&mut self, motion_type: char, target: char) -> bool {
+        let line = self.view().cursor.line;
+        let col = self.view().cursor.col;
+        let line_start = self.buffer().line_to_char(line);
+        let line_len = self.buffer().line_len_chars(line);
+        match motion_type {
+            't' => {
+                for i in (col + 2)..line_len {
+                    let ch = self.buffer().content.char(line_start + i);
+                    if ch == target && ch != '\n' {
+                        self.view_mut().cursor.col = i - 1;
+                        return true;
+                    }
+                }
+            }
+            'T' if col > 1 => {
+                for i in (0..col - 1).rev() {
+                    let ch = self.buffer().content.char(line_start + i);
+                    if ch == target {
+                        self.view_mut().cursor.col = i + 1;
+                        return true;
+                    }
+                }
+            }
+            _ => {}
+        }
+        false
     }
 
     // --- Bracket matching (%) ---
@@ -1611,6 +1676,14 @@ impl Engine {
             }
         };
 
+        // Vim's built-in `%` (no matchit plugin) treats a bracket as not a
+        // real bracket at all when it falls inside an unterminated
+        // double-quoted string earlier on the same line, and does nothing
+        // rather than matching across the string boundary.
+        if self.quotes_before_on_line(line, char_pos) % 2 == 1 {
+            return;
+        }
+
         // Find matching bracket
         if let Some(match_pos) =
             self.find_matching_bracket(char_pos, open_char, close_char, is_opening)
@@ -1620,6 +1693,16 @@ impl Engine {
             self.view_mut().cursor.line = new_line;
             self.view_mut().cursor.col = match_pos - line_start;
         }
+    }
+
+    /// Count `"` characters on `line` before `pos` (exclusive). An odd count
+    /// means `pos` falls inside an unterminated double-quoted string that
+    /// started earlier on the line.
+    fn quotes_before_on_line(&self, line: usize, pos: usize) -> usize {
+        let line_start = self.buffer().line_to_char(line);
+        (line_start..pos)
+            .filter(|&i| self.buffer().content.char(i) == '"')
+            .count()
     }
 
     pub(crate) fn search_forward_for_bracket(&mut self) {
@@ -1708,6 +1791,13 @@ impl Engine {
         }
         let line = self.view().cursor.line;
         let col = self.view().cursor.col;
+        // Guard against stale cursors that are out of range for the current
+        // buffer (e.g. after :help / :split reassigns a shorter buffer to the
+        // active window while the view still holds the previous cursor position).
+        if line >= self.buffer().len_lines() {
+            self.bracket_match = None;
+            return;
+        }
         let line_start = self.buffer().line_to_char(line);
         let char_pos = line_start + col;
         if char_pos >= self.buffer().len_chars() {
@@ -1740,24 +1830,28 @@ impl Engine {
 
     /// Find the range for a text object.
     /// Returns (start_pos, end_pos) if found, None otherwise.
+    /// `count` is the `N` in `d2aw` / `v3iw` / `d2i(` — a text object that
+    /// cannot be extended that far returns `None` so the whole operator
+    /// aborts, which is what Vim does (#807).
     pub(crate) fn find_text_object_range(
         &self,
         modifier: char,
         obj_type: char,
         cursor_pos: usize,
+        count: usize,
     ) -> Option<(usize, usize)> {
         match obj_type {
-            'w' => self.find_word_object(modifier, cursor_pos),
-            'W' => self.find_bigword_object(modifier, cursor_pos),
+            'w' => self.find_word_object(modifier, cursor_pos, count),
+            'W' => self.find_bigword_object(modifier, cursor_pos, count),
             '"' => self.find_quote_object(modifier, '"', cursor_pos),
             '\'' => self.find_quote_object(modifier, '\'', cursor_pos),
-            '(' | ')' | 'b' => self.find_bracket_object(modifier, '(', ')', cursor_pos),
-            '{' | '}' | 'B' => self.find_bracket_object(modifier, '{', '}', cursor_pos),
-            '[' | ']' => self.find_bracket_object(modifier, '[', ']', cursor_pos),
-            '<' | '>' => self.find_bracket_object(modifier, '<', '>', cursor_pos),
-            'p' => self.find_paragraph_object(modifier, cursor_pos),
+            '(' | ')' | 'b' => self.find_bracket_object(modifier, '(', ')', cursor_pos, count),
+            '{' | '}' | 'B' => self.find_bracket_object(modifier, '{', '}', cursor_pos, count),
+            '[' | ']' => self.find_bracket_object(modifier, '[', ']', cursor_pos, count),
+            '<' | '>' => self.find_bracket_object(modifier, '<', '>', cursor_pos, count),
+            'p' => self.find_paragraph_object(modifier, cursor_pos, count),
             's' => self.find_sentence_object(modifier, cursor_pos),
-            't' => self.find_tag_text_object(modifier, cursor_pos),
+            't' => self.find_tag_text_object(modifier, cursor_pos, count),
             '`' => self.find_quote_object(modifier, '`', cursor_pos),
             'e' => self.find_latex_environment_object(modifier, cursor_pos),
             'c' if self.is_latex_buffer() => self.find_latex_command_object(modifier, cursor_pos),
@@ -1766,76 +1860,139 @@ impl Engine {
         }
     }
 
-    /// Find word text object range (iw/aw)
+    /// Find word text object range (`iw`/`aw`), honouring `count` (#807).
+    ///
+    /// Vim splits a line into three char classes — blanks, word characters and
+    /// punctuation — and a "word" for `iw` is one maximal run of a single
+    /// class. `Niw` takes N consecutive runs (so `3iw` on `a b c` is `a b`).
+    ///
+    /// `aw` takes N *words* together with their white space: the trailing run
+    /// if there is one, otherwise the leading run — but Vim never absorbs
+    /// leading blanks that start at column 0 (`daw` on the `foo` of `  foo`
+    /// leaves `  `, while on the `foo` of `ab foo` it leaves `ab`). Starting
+    /// on blanks, `aw` is instead "these blanks plus the following word".
+    /// When there are not N words available the whole object fails, which is
+    /// how `d5aw` on `a b` correctly does nothing.
     pub(crate) fn find_word_object(
         &self,
         modifier: char,
         cursor_pos: usize,
+        count: usize,
     ) -> Option<(usize, usize)> {
-        let total_chars = self.buffer().len_chars();
-        if cursor_pos >= total_chars {
-            return None;
-        }
-
-        let char_at_cursor = self.buffer().content.char(cursor_pos);
-
-        // If on whitespace and modifier is 'i', no match
-        if modifier == 'i' && (char_at_cursor.is_whitespace() && char_at_cursor != '\n') {
-            return None;
-        }
-
-        // Find word boundaries
-        let mut start = cursor_pos;
-        let mut end = cursor_pos;
-
-        // Expand backward to start of word
-        while start > 0 {
-            let ch = self.buffer().content.char(start - 1);
-            if ch.is_whitespace() || !is_word_char(ch) {
-                break;
-            }
-            start -= 1;
-        }
-
-        // Expand forward to end of word
-        while end < total_chars {
-            let ch = self.buffer().content.char(end);
-            if ch.is_whitespace() || !is_word_char(ch) {
-                break;
-            }
-            end += 1;
-        }
-
-        // For 'aw', include trailing whitespace; if none, include leading whitespace
-        if modifier == 'a' {
-            let end_before = end;
-            while end < total_chars {
-                let ch = self.buffer().content.char(end);
-                if !ch.is_whitespace() || ch == '\n' {
-                    break;
-                }
-                end += 1;
-            }
-            // No trailing whitespace consumed — try leading instead
-            if end == end_before {
-                while start > 0 {
-                    let ch = self.buffer().content.char(start - 1);
-                    if !ch.is_whitespace() || ch == '\n' {
-                        break;
-                    }
-                    start -= 1;
-                }
-            }
-        }
-
-        if start < end {
-            Some((start, end))
-        } else {
-            None
-        }
+        self.find_word_object_classed(modifier, cursor_pos, count, char_class)
     }
 
-    /// Find quote text object range (i"/a")
+    /// `iW`/`aW`: identical to [`Engine::find_word_object`] except that
+    /// punctuation counts as part of a WORD.
+    pub(crate) fn find_bigword_object(
+        &self,
+        modifier: char,
+        cursor_pos: usize,
+        count: usize,
+    ) -> Option<(usize, usize)> {
+        self.find_word_object_classed(modifier, cursor_pos, count, bigword_class)
+    }
+
+    fn find_word_object_classed(
+        &self,
+        modifier: char,
+        cursor_pos: usize,
+        count: usize,
+        class: fn(char) -> u8,
+    ) -> Option<(usize, usize)> {
+        let total = self.buffer().len_chars();
+        if cursor_pos >= total {
+            return None;
+        }
+        let count = count.max(1);
+        let at = |i: usize| self.buffer().content.char(i);
+        let cls = |i: usize| class(at(i));
+        // A newline ends every run, so runs never span lines.
+        let run_start = |mut i: usize| {
+            let c = cls(i);
+            while i > 0 && cls(i - 1) == c && c != CLASS_NL {
+                i -= 1;
+            }
+            i
+        };
+        let run_end = |mut i: usize| {
+            let c = cls(i);
+            while i < total && cls(i) == c && c != CLASS_NL {
+                i += 1;
+            }
+            if c == CLASS_NL {
+                i + 1
+            } else {
+                i
+            }
+        };
+
+        if cls(cursor_pos) == CLASS_NL {
+            return None;
+        }
+
+        if modifier == 'i' {
+            let start = run_start(cursor_pos);
+            let mut end = run_end(cursor_pos);
+            for _ in 1..count {
+                if end >= total || cls(end) == CLASS_NL {
+                    return None;
+                }
+                end = run_end(end);
+            }
+            return (start < end).then_some((start, end));
+        }
+
+        // `aw`
+        let line = self.buffer().content.char_to_line(cursor_pos);
+        let line_start = self.buffer().line_to_char(line);
+        if cls(cursor_pos) == CLASS_BLANK {
+            // Blanks first, then the word that follows them — repeated.
+            let start = run_start(cursor_pos);
+            let mut end = start;
+            for _ in 0..count {
+                if end < total && cls(end) == CLASS_BLANK {
+                    end = run_end(end);
+                }
+                if end >= total || cls(end) == CLASS_NL || cls(end) == CLASS_BLANK {
+                    return None; // no word to pair the blanks with
+                }
+                end = run_end(end);
+            }
+            return (start < end).then_some((start, end));
+        }
+
+        let start = run_start(cursor_pos);
+        let mut end = start;
+        let mut white_ended = false;
+        for _ in 0..count {
+            if end >= total || cls(end) == CLASS_NL || cls(end) == CLASS_BLANK {
+                return None; // ran out of words before the count was satisfied
+            }
+            end = run_end(end);
+            white_ended = false;
+            if end < total && cls(end) == CLASS_BLANK {
+                end = run_end(end);
+                white_ended = true;
+            }
+        }
+        let mut start = start;
+        if !white_ended {
+            let lead = run_start(start.saturating_sub(1));
+            if start > line_start && cls(start - 1) == CLASS_BLANK && lead > line_start {
+                start = lead;
+            }
+        }
+        (start < end).then_some((start, end))
+    }
+
+    /// Find quote text object range (`i"`/`a"`).
+    ///
+    /// Vim pairs the quotes up from the **start of the line** rather than
+    /// searching backwards from the cursor, which is what makes `di"` work
+    /// with the cursor on the closing quote or anywhere before the pair
+    /// (`:h i_quote`; #807 — the old backward scan treated a closing quote as
+    /// an opening one and silently found no object).
     pub(crate) fn find_quote_object(
         &self,
         modifier: char,
@@ -1847,160 +2004,191 @@ impl Engine {
             return None;
         }
 
-        // Get current line bounds to search within
         let cursor_line = self.buffer().content.char_to_line(cursor_pos);
         let line_start = self.buffer().line_to_char(cursor_line);
         let line_len = self.buffer().line_len_chars(cursor_line);
         let line_end = line_start + line_len;
 
-        // Find opening quote (search backward from cursor)
-        let mut open_pos = None;
-        let mut pos = cursor_pos;
-        while pos >= line_start {
-            let ch = self.buffer().content.char(pos);
-            if ch == quote_char {
-                // Check if it's escaped
-                if pos == line_start || self.buffer().content.char(pos - 1) != '\\' {
-                    open_pos = Some(pos);
-                    break;
-                }
-            }
-            if pos == line_start {
-                break;
-            }
-            pos -= 1;
-        }
+        let is_quote = |pos: usize| {
+            self.buffer().content.char(pos) == quote_char
+                && (pos == line_start || self.buffer().content.char(pos - 1) != '\\')
+        };
+        let next_quote = |from: usize| {
+            (from..line_end).find(|&p| self.buffer().content.char(p) != '\n' && is_quote(p))
+        };
 
-        let open_pos = open_pos?;
+        // Vim's `current_quote()`: take the nearest quote *before* the cursor
+        // as the opening one; only if there is none does it look forward. The
+        // consequence is deliberate — with the cursor between two strings,
+        // `di"` deletes what is between them (`"a" x "b"` → `"a""b"`).
+        let open_pos = (line_start..cursor_pos)
+            .rev()
+            .find(|&p| is_quote(p))
+            .or_else(|| next_quote(cursor_pos))?;
+        let close_pos = next_quote(open_pos + 1)?;
 
-        // Find closing quote (search forward from opening)
-        let mut close_pos = None;
-        let mut pos = open_pos + 1;
-        while pos < line_end {
-            let ch = self.buffer().content.char(pos);
-            if ch == quote_char {
-                // Check if it's escaped
-                if self.buffer().content.char(pos - 1) != '\\' {
-                    close_pos = Some(pos);
-                    break;
-                }
-            }
-            pos += 1;
-        }
-
-        let close_pos = close_pos?;
-
-        // Return range based on modifier
         if modifier == 'i' {
             // Inner: exclude quotes
-            if open_pos < close_pos {
-                Some((open_pos + 1, close_pos))
+            return Some((open_pos + 1, close_pos));
+        }
+        // Around: include quotes + trailing whitespace (or leading if no trailing)
+        let mut end = close_pos + 1;
+        let mut start = open_pos;
+        let mut trail = end;
+        while trail < line_end {
+            let ch = self.buffer().content.char(trail);
+            if ch == ' ' || ch == '\t' {
+                trail += 1;
             } else {
-                None
+                break;
             }
+        }
+        if trail > end {
+            end = trail;
         } else {
-            // Around: include quotes + trailing whitespace (or leading if no trailing)
-            let mut end = close_pos + 1;
-            let mut start = open_pos;
-            // Try trailing whitespace first
-            let mut trail = end;
-            while trail < line_end {
-                let ch = self.buffer().content.char(trail);
+            let mut lead = start;
+            while lead > line_start {
+                let ch = self.buffer().content.char(lead - 1);
                 if ch == ' ' || ch == '\t' {
-                    trail += 1;
+                    lead -= 1;
                 } else {
                     break;
                 }
             }
-            if trail > end {
-                end = trail;
-            } else {
-                // No trailing whitespace — try leading whitespace
-                let mut lead = start;
-                while lead > line_start {
-                    let ch = self.buffer().content.char(lead - 1);
-                    if ch == ' ' || ch == '\t' {
-                        lead -= 1;
-                    } else {
-                        break;
-                    }
-                }
-                start = lead;
-            }
-            Some((start, end))
+            start = lead;
         }
+        Some((start, end))
     }
 
-    /// Find bracket text object range (i(/a()
+    /// Find bracket text object range (`i(`/`a(`, `i{`, `i[`, `i<`).
+    ///
+    /// `count` steps out that many nesting levels (`d2i(` on `f(a, (b), c)`
+    /// with the cursor on `b` takes the outer pair); a count deeper than the
+    /// available nesting fails outright, as in Vim.
     pub(crate) fn find_bracket_object(
         &self,
         modifier: char,
         open_char: char,
         close_char: char,
         cursor_pos: usize,
+        count: usize,
     ) -> Option<(usize, usize)> {
         let total_chars = self.buffer().len_chars();
         if cursor_pos >= total_chars {
             return None;
         }
 
-        // Find the nearest enclosing bracket pair
-        let mut open_pos = None;
-        let mut depth = 0;
+        let mut open_pos = self.enclosing_open_bracket(open_char, close_char, cursor_pos)?;
+        let mut close_pos = self.find_matching_bracket(open_pos, open_char, close_char, true)?;
+        for _ in 1..count.max(1) {
+            if open_pos == 0 {
+                return None;
+            }
+            open_pos = self.enclosing_open_bracket(open_char, close_char, open_pos - 1)?;
+            close_pos = self.find_matching_bracket(open_pos, open_char, close_char, true)?;
+        }
 
-        // Search backward for opening bracket
-        let mut pos = cursor_pos;
+        if modifier != 'i' {
+            // Around: include brackets
+            return Some((open_pos, close_pos + 1));
+        }
+        if open_pos >= close_pos {
+            return None;
+        }
+        let open_line = self.buffer().content.char_to_line(open_pos);
+        let close_line = self.buffer().content.char_to_line(close_pos);
+        if open_line == close_line {
+            return Some((open_pos + 1, close_pos));
+        }
+        // Multi-line: Vim drops the line break after the open bracket when
+        // nothing but white space follows it, and the line break before the
+        // close bracket when nothing but white space precedes it (`:h ib`).
+        // Getting only one of the two right is what made `di(` on
+        // `f(` / `a` / `b)` stop after the first line (#807).
+        let start = if self.blank_after(open_pos, open_line) {
+            self.buffer().line_to_char(open_line + 1)
+        } else {
+            open_pos + 1
+        };
+        let close_line_start = self.buffer().line_to_char(close_line);
+        let end = if self.blank_before(close_pos, close_line_start) {
+            close_line_start
+        } else {
+            close_pos
+        };
+        if start <= end {
+            Some((start, end))
+        } else {
+            Some((start, start))
+        }
+    }
+
+    /// The nearest unmatched `open_char` at or before `pos`, or — when the
+    /// cursor is not inside a pair at all — the next one forward on the line
+    /// (the fallback `%` uses, `:h ib`).
+    ///
+    /// A cursor sitting **on** the closing bracket belongs to that pair, so
+    /// the scan must not count it as one more level of nesting (#807,
+    /// `to:di( on )`).
+    fn enclosing_open_bracket(
+        &self,
+        open_char: char,
+        close_char: char,
+        pos: usize,
+    ) -> Option<usize> {
+        let total_chars = self.buffer().len_chars();
+        let mut depth: i32 = 0;
+        let mut i = pos;
         loop {
-            let ch = self.buffer().content.char(pos);
-            if ch == close_char {
+            let ch = self.buffer().content.char(i);
+            if ch == close_char && i != pos {
                 depth += 1;
             } else if ch == open_char {
                 if depth == 0 {
-                    open_pos = Some(pos);
-                    break;
-                } else {
-                    depth -= 1;
+                    return Some(i);
                 }
+                depth -= 1;
             }
-            if pos == 0 {
+            if i == 0 {
                 break;
             }
-            pos -= 1;
+            i -= 1;
         }
-
-        let open_pos = open_pos?;
-
-        // Find matching closing bracket
-        let close_pos = self.find_matching_bracket(open_pos, open_char, close_char, true)?;
-
-        // Return range based on modifier
-        if modifier == 'i' {
-            // Inner: exclude brackets
-            if open_pos < close_pos {
-                let open_line = self.buffer().content.char_to_line(open_pos);
-                let close_line = self.buffer().content.char_to_line(close_pos);
-                if open_line != close_line {
-                    // Multiline: Vim makes inner bracket objects linewise —
-                    // delete from start of line after open bracket to start of
-                    // line with close bracket.
-                    let start = self.buffer().line_to_char(open_line + 1);
-                    let end = self.buffer().line_to_char(close_line);
-                    if start <= end {
-                        Some((start, end))
-                    } else {
-                        // Empty interior (brackets on adjacent lines)
-                        Some((start, start))
-                    }
-                } else {
-                    Some((open_pos + 1, close_pos))
-                }
-            } else {
-                None
+        // Not inside a pair: scan forward on this line for the next opener.
+        let line = self.buffer().content.char_to_line(pos);
+        let line_start = self.buffer().line_to_char(line);
+        let line_len = self.buffer().line_len_chars(line);
+        for p in pos..(line_start + line_len).min(total_chars) {
+            let ch = self.buffer().content.char(p);
+            if ch == '\n' {
+                break;
             }
-        } else {
-            // Around: include brackets
-            Some((open_pos, close_pos + 1))
+            if ch == open_char {
+                return Some(p);
+            }
         }
+        None
+    }
+
+    /// Is everything between `pos` and the end of `line` white space?
+    fn blank_after(&self, pos: usize, line: usize) -> bool {
+        let line_start = self.buffer().line_to_char(line);
+        let line_end = line_start + self.buffer().line_len_chars(line);
+        for p in (pos + 1)..line_end {
+            let ch = self.buffer().content.char(p);
+            if ch == '\n' {
+                break;
+            }
+            if !ch.is_whitespace() {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Is everything between `line_start` and `pos` white space?
+    fn blank_before(&self, pos: usize, line_start: usize) -> bool {
+        (line_start..pos).all(|p| self.buffer().content.char(p).is_whitespace())
     }
 
     /// Find paragraph text object range (ip/ap).
@@ -2012,6 +2200,7 @@ impl Engine {
         &self,
         modifier: char,
         cursor_pos: usize,
+        count: usize,
     ) -> Option<(usize, usize)> {
         let total_lines = self.buffer().len_lines();
         if total_lines == 0 {
@@ -2034,16 +2223,48 @@ impl Engine {
             end_line += 1;
         }
 
-        // `ap` on a non-blank paragraph: include the following blank lines.
-        // If there are no following blank lines (end of file), include any preceding ones.
-        if modifier == 'a' && !on_blank {
-            if end_line + 1 < total_lines && self.is_line_empty(end_line + 1) {
-                while end_line + 1 < total_lines && self.is_line_empty(end_line + 1) {
+        // `ap` pairs each block with the block of the *other* kind that
+        // follows it — a blank run takes the paragraph below it, a paragraph
+        // takes the blank lines below it (or, at end of file, the blank lines
+        // above). A count repeats that pairing, so `d2ap` swallows two
+        // paragraph+blank groups (#807).
+        if modifier == 'a' {
+            let reps = count.max(1);
+            for rep in 0..reps {
+                // Pair this block with the following block of the other kind.
+                let want = !on_blank;
+                if end_line + 1 < total_lines && self.is_line_empty(end_line + 1) == want {
+                    while end_line + 1 < total_lines && self.is_line_empty(end_line + 1) == want {
+                        end_line += 1;
+                    }
+                } else if !on_blank && start_line > 0 && self.is_line_empty(start_line - 1) {
+                    // At end of file there is nothing trailing, so Vim takes
+                    // the preceding blank lines instead.
+                    while start_line > 0 && self.is_line_empty(start_line - 1) {
+                        start_line -= 1;
+                    }
+                }
+                if rep + 1 == reps {
+                    break;
+                }
+                // Another repetition: step over the next block of our own kind.
+                if end_line + 1 >= total_lines || self.is_line_empty(end_line + 1) != on_blank {
+                    return None;
+                }
+                while end_line + 1 < total_lines && self.is_line_empty(end_line + 1) == on_blank {
                     end_line += 1;
                 }
-            } else if start_line > 0 && self.is_line_empty(start_line - 1) {
-                while start_line > 0 && self.is_line_empty(start_line - 1) {
-                    start_line -= 1;
+            }
+        } else if count > 1 {
+            // `Nip`: N alternating blocks.
+            let mut kind = on_blank;
+            for _ in 1..count {
+                kind = !kind;
+                if end_line + 1 >= total_lines || self.is_line_empty(end_line + 1) != kind {
+                    return None;
+                }
+                while end_line + 1 < total_lines && self.is_line_empty(end_line + 1) == kind {
+                    end_line += 1;
                 }
             }
         }
@@ -2102,11 +2323,18 @@ impl Engine {
 
         // --- Find start of current sentence (scan backward) ---
         let mut sent_start = 0usize;
+        // Whether `sent_start` was set because the previous sentence actually
+        // ended in punctuation right there — as opposed to a paragraph break
+        // or the start of the buffer. Only in that case is the whitespace
+        // between `sent_start` and `inner_start` a genuine inter-sentence gap
+        // (see the `is` cursor-on-whitespace handling below).
+        let mut start_after_punct = false;
         if cursor_pos > 0 {
             let mut pos = cursor_pos - 1;
             loop {
                 if is_sentence_end_punct(pos) {
                     sent_start = pos + 1;
+                    start_after_punct = true;
                     break;
                 }
                 if is_blank_line(pos) {
@@ -2152,7 +2380,18 @@ impl Engine {
         }
 
         let (start, end) = if modifier == 'i' {
-            (inner_start, sent_end)
+            if start_after_punct && cursor_pos < inner_start {
+                // `is` with the cursor sitting on the whitespace *between* two
+                // sentences selects that whitespace run itself, not either
+                // neighbouring sentence (oracle: `to:dis on whitespace
+                // between`). This only applies when the gap is a genuine
+                // inter-sentence one — leading whitespace after a paragraph
+                // break or at the start of the buffer still belongs to the
+                // sentence that follows it.
+                (sent_start, inner_start)
+            } else {
+                (inner_start, sent_end)
+            }
         } else {
             // `as`: include trailing whitespace (spaces/tabs only, not newlines).
             let mut e = sent_end;
@@ -2163,7 +2402,17 @@ impl Engine {
                 }
                 e += 1;
             }
-            (inner_start, e)
+            if e > sent_end {
+                (inner_start, e)
+            } else if sent_start < inner_start {
+                // No trailing whitespace to absorb (e.g. the last sentence in
+                // a paragraph/buffer) — Vim falls back to the whitespace
+                // *before* the sentence instead (oracle: `to:das last
+                // sentence`).
+                (sent_start, sent_end)
+            } else {
+                (inner_start, sent_end)
+            }
         };
 
         if start < end {
@@ -2179,13 +2428,47 @@ impl Engine {
     /// `at` (around tag) includes the opening and closing tags themselves.
     /// Tag-name comparison is case-insensitive; nested same-name tags are handled by
     /// depth tracking during the forward scan for the closing tag.
+    /// `count` steps out that many tag-nesting levels (`d2it` on
+    /// `<a><b>x</b></a>` with the cursor on `x` takes `<a>`'s inner text, not
+    /// `<b>`'s) — mirrors `find_bracket_object`'s count handling (#807,
+    /// `to:d2it`; before this, tag objects silently ignored any count).
     pub(crate) fn find_tag_text_object(
         &self,
         modifier: char,
         cursor_pos: usize,
+        count: usize,
     ) -> Option<(usize, usize)> {
+        let (open_start, inner_start, close_start, close_end) =
+            self.find_enclosing_tag(cursor_pos, cursor_pos)?;
+        let mut level = (open_start, inner_start, close_start, close_end);
+        for _ in 1..count.max(1) {
+            if level.0 == 0 {
+                return None;
+            }
+            level = self.find_enclosing_tag(level.0 - 1, level.0)?;
+        }
+        let (open_start, inner_start, close_start, close_end) = level;
+        if modifier == 'i' {
+            if inner_start <= close_start {
+                Some((inner_start, close_start))
+            } else {
+                None
+            }
+        } else {
+            Some((open_start, close_end))
+        }
+    }
+
+    /// Find the nearest tag whose extent `[open_start, close_end)` contains
+    /// `contains_pos`, scanning backward for `<` starting at `scan_start`.
+    /// Returns `(open_start, inner_start, close_start, close_end)`.
+    fn find_enclosing_tag(
+        &self,
+        scan_start: usize,
+        contains_pos: usize,
+    ) -> Option<(usize, usize, usize, usize)> {
         let total_chars = self.buffer().len_chars();
-        if total_chars == 0 || cursor_pos >= total_chars {
+        if total_chars == 0 || scan_start >= total_chars {
             return None;
         }
 
@@ -2268,8 +2551,8 @@ impl Engine {
             None // unclosed tag
         };
 
-        // Main loop: walk backward from cursor_pos looking for an enclosing open tag.
-        let mut scan_pos = cursor_pos;
+        // Main loop: walk backward from scan_start looking for an enclosing open tag.
+        let mut scan_pos = scan_start;
         loop {
             // Walk backward to the nearest '<'.
             while ch(scan_pos) != '<' {
@@ -2312,17 +2595,10 @@ impl Engine {
                     }
 
                     if let Some((close_start, close_end)) = close_result {
-                        // Accept only if cursor is within this element's extent.
-                        if cursor_pos >= open_start && cursor_pos < close_end {
-                            return if modifier == 'i' {
-                                if inner_start <= close_start {
-                                    Some((inner_start, close_start))
-                                } else {
-                                    None
-                                }
-                            } else {
-                                Some((open_start, close_end))
-                            };
+                        // Accept only if the reference position is within
+                        // this element's extent.
+                        if contains_pos >= open_start && contains_pos < close_end {
+                            return Some((open_start, inner_start, close_start, close_end));
                         }
                     }
                 }
@@ -2668,24 +2944,60 @@ impl Engine {
         let cursor_pos = self.buffer().line_to_char(cursor.line) + cursor.col;
 
         // Find text object range
-        let range = match self.find_text_object_range(modifier, obj_type, cursor_pos) {
+        let count = self.take_count().max(1);
+        let range = match self.find_text_object_range(modifier, obj_type, cursor_pos, count) {
             Some(r) => r,
-            None => return, // No matching text object found
+            None => {
+                // `aw`/`aW` always need a neighbouring word to pair with; when
+                // that fails — the count asks for more words than exist, or
+                // the line is pure whitespace — Vim aborts the operator with
+                // no edit, but the cursor has already been walked to the end
+                // of the line during the (abandoned) search (oracle:
+                // `to:d5aw too many`, `to:daw on only whitespace line`).
+                // Other text objects (brackets, quotes, tags, …) leave the
+                // cursor untouched on failure (`to:di( count 3 too many`).
+                if modifier == 'a' && matches!(obj_type, 'w' | 'W') {
+                    let line = self.view().cursor.line;
+                    let max_col = self.get_max_cursor_col(line);
+                    self.view_mut().cursor.col = max_col;
+                }
+                return; // No matching text object found
+            }
         };
 
-        let (start_pos, end_pos) = range;
+        let (mut start_pos, end_pos) = range;
+
+        // `ip`/`ap` are *linewise* objects, so `dip`/`dap` must remove whole
+        // lines — including one line separator per deleted line. The range
+        // normally carries the deleted lines' trailing newlines, but the final
+        // paragraph of a buffer with no trailing newline has none to carry: the
+        // separator that has to go is the one *before* it. Without absorbing
+        // it, `dip` on the last line of "a\n\nb" leaves "a\n\n" (an extra blank
+        // line) with the cursor on a line Vim has already removed (#803).
+        if operator == 'd'
+            && obj_type == 'p'
+            && end_pos == self.buffer().len_chars()
+            && start_pos > 0
+            && self.buffer().content.char(start_pos - 1) == '\n'
+        {
+            start_pos -= 1;
+        }
+
         if start_pos >= end_pos {
-            // Empty inner range (e.g. ci( on "()"). For 'c' operator,
-            // still enter insert mode at the position between the delimiters.
+            // Empty inner range (e.g. `ci(`/`di(` on `f()`). Nothing is
+            // deleted, but Vim still moves the cursor between the delimiters
+            // (#807, `to:di( empty`).
+            let line = self.buffer().content.char_to_line(start_pos);
+            let line_start = self.buffer().line_to_char(line);
+            self.view_mut().cursor.line = line;
+            self.view_mut().cursor.col = start_pos - line_start;
             if operator == 'c' {
-                let line = self.buffer().content.char_to_line(start_pos);
-                let line_start = self.buffer().line_to_char(line);
-                self.view_mut().cursor.line = line;
-                self.view_mut().cursor.col = start_pos - line_start;
                 self.mode = Mode::Insert;
                 self.start_undo_group();
                 self.insert_text_buffer.clear();
                 *changed = true;
+            } else {
+                self.clamp_cursor_col();
             }
             return;
         }
@@ -2705,20 +3017,80 @@ impl Engine {
         // Perform operation based on operator type
         match operator {
             'y' => {
-                // Yank only - don't delete, don't change cursor
-                // No undo group needed for yank
+                // Yank leaves the cursor on the FIRST character of the yanked
+                // text when that is before the cursor (`:h y`) — `yi(` on
+                // `f(a, b)` lands on the `a`, not wherever the cursor was
+                // (#807, `to:yi( cursor` and five siblings).
+                if start_pos < cursor_pos {
+                    let line = self.buffer().content.char_to_line(start_pos);
+                    self.view_mut().cursor.line = line;
+                    self.view_mut().cursor.col = start_pos - self.buffer().line_to_char(line);
+                }
+                // `` `[ ``/`` `] `` bracket the last changed *or yanked* text
+                // (`:h '[`) — a text-object yank is exactly the case #806's
+                // narrower tracking (indent-shift only) missed (#891,
+                // "mark:`] after yank"). `end_pos` is exclusive, so the `]`
+                // mark sits on its last *contained* char, not one past it.
+                let start_line = self.buffer().content.char_to_line(start_pos);
+                let start_col = start_pos - self.buffer().line_to_char(start_line);
+                self.last_change_start = Some((start_line, start_col));
+                let last_char_pos = end_pos.saturating_sub(1).max(start_pos);
+                let end_line = self.buffer().content.char_to_line(last_char_pos);
+                let end_col = last_char_pos - self.buffer().line_to_char(end_line);
+                self.last_change_end = Some((end_line, end_col));
             }
             'd' | 'c' => {
                 // Delete or change
                 self.start_undo_group();
-                self.delete_with_undo(start_pos, end_pos);
 
-                // Move cursor to start of deletion
-                let new_line = self.buffer().content.char_to_line(start_pos);
-                let line_start = self.buffer().line_to_char(new_line);
-                let new_col = start_pos - line_start;
-                self.view_mut().cursor.line = new_line;
-                self.view_mut().cursor.col = new_col;
+                // `ci{`/`ci(`/etc. on a bracket pair whose inner text is
+                // whole lines (the open line has only the opening delimiter,
+                // the close line only the closing one) is special-cased by
+                // Vim: `di{` joins the delimiters together linewise, but
+                // `ci{` instead leaves a single blank line — indented like
+                // the first deleted line — for the typed replacement, the
+                // same way `cc` behaves (`:h v_ib`). Before this, vimcode
+                // treated `c` exactly like `d` here, so `ci{X<Esc>` on
+                // `{`/`  a`/`  b`/`}` produced `{\nX}` instead of Vim's
+                // `{\n  X\n}` (#807, `to:ci{ multiline`).
+                let start_line = self.buffer().content.char_to_line(start_pos);
+                let end_line = self.buffer().content.char_to_line(end_pos);
+                let is_linewise_inner_bracket_change = operator == 'c'
+                    && modifier == 'i'
+                    && matches!(
+                        obj_type,
+                        '(' | ')' | 'b' | '{' | '}' | 'B' | '[' | ']' | '<' | '>'
+                    )
+                    && end_line > start_line
+                    && start_pos == self.buffer().line_to_char(start_line)
+                    && end_pos == self.buffer().line_to_char(end_line);
+
+                // `ip`/`ap` are always linewise (a run of blank or non-blank
+                // lines), so `cip`/`cap` follow `cc`'s rule rather than a
+                // plain charwise substitution: the selected lines disappear
+                // entirely and a single new — indented — line is opened for
+                // the typed replacement, leaving any lines after the object
+                // (e.g. a following blank line) untouched (oracle: `to:cip`;
+                // before this, `cip` on `a`/`b`/``/`c` swallowed the blank
+                // line that `dip` correctly leaves behind).
+                let is_linewise_paragraph_change = operator == 'c' && obj_type == 'p';
+
+                if is_linewise_inner_bracket_change || is_linewise_paragraph_change {
+                    let indent = self.get_line_indent_str(start_line);
+                    self.delete_with_undo(start_pos, end_pos);
+                    self.insert_with_undo(start_pos, &format!("{indent}\n"));
+                    self.view_mut().cursor.line = start_line;
+                    self.view_mut().cursor.col = indent.chars().count();
+                } else {
+                    self.delete_with_undo(start_pos, end_pos);
+
+                    // Move cursor to start of deletion
+                    let new_line = self.buffer().content.char_to_line(start_pos);
+                    let line_start = self.buffer().line_to_char(new_line);
+                    let new_col = start_pos - line_start;
+                    self.view_mut().cursor.line = new_line;
+                    self.view_mut().cursor.col = new_col;
+                }
 
                 *changed = true;
 
@@ -2753,10 +3125,14 @@ impl Engine {
             }
             '~' | 'u' | 'U' => {
                 self.apply_case_range(start_pos, end_pos, operator, changed);
+                // Cursor to the start of the changed region, like every other
+                // operator (#807, `op:g~iw`, `op:gUap`).
+                self.move_cursor_to_range_start(start_pos);
             }
             'R' => {
                 // g?: ROT13 encode
                 self.apply_rot13_range(start_pos, end_pos, changed);
+                self.move_cursor_to_range_start(start_pos);
             }
             '>' | '<' | '=' => {
                 let start_line = self.buffer().content.char_to_line(start_pos);
@@ -2766,9 +3142,9 @@ impl Engine {
                     .char_to_line(end_pos.saturating_sub(1).max(start_pos));
                 let count = end_line - start_line + 1;
                 if operator == '>' {
-                    self.indent_lines(start_line, count, changed);
+                    self.indent_lines(start_line, count, changed, true);
                 } else if operator == '<' {
-                    self.dedent_lines(start_line, count, changed);
+                    self.dedent_lines(start_line, count, changed, true);
                 } else {
                     self.auto_indent_lines(start_line, count, changed);
                 }
@@ -2804,6 +3180,17 @@ impl Engine {
         }
 
         let start_line = self.view().cursor.line;
+        // `[count]dd` behaves like `dd` plus `count - 1` applications of the
+        // `j` motion under the hood: if the cursor is already on the last
+        // line, that `j` component cannot move at all, and per the same
+        // "motion fails entirely, no partial fallback" rule already applied
+        // to `dj`/`dk` above, the whole operator aborts — Vim beeps and
+        // deletes nothing (#882, "op:5dd from last line", "misc:2dd on
+        // last"). If at least one line below is reachable, the count still
+        // clamps to whatever's available, same as before.
+        if count > 1 && start_line == num_lines - 1 {
+            return;
+        }
         let end_line = (start_line + count).min(num_lines);
         let actual_count = end_line - start_line;
 
@@ -2854,7 +3241,9 @@ impl Engine {
         if self.view().cursor.line >= new_num_lines && new_num_lines > 0 {
             self.view_mut().cursor.line = new_num_lines - 1;
         }
-        self.view_mut().cursor.col = 0;
+        // Vim leaves the cursor on the same column it was on (clamped to the
+        // resulting line's length) — it does NOT reset to column 0 or to the
+        // first non-blank character.
         self.clamp_cursor_col();
     }
 
@@ -2983,35 +3372,198 @@ impl Engine {
         }
     }
 
-    pub(crate) fn move_down(&mut self) {
+    /// Returns `false` when already on the last visible line (no-op) — used
+    /// by the `j` handler to detect a failed move for macro-abort purposes
+    /// (#806).
+    pub(crate) fn move_down(&mut self) -> bool {
         let max_line = self.buffer().len_lines().saturating_sub(1);
         let mut next = self.view().cursor.line;
         loop {
             if next >= max_line {
-                return;
+                return false;
             }
             next += 1;
             if !self.view().is_line_hidden(next) {
                 break;
             }
         }
+        let want = self.curswant();
         self.view_mut().cursor.line = next;
-        self.clamp_cursor_col();
+        self.apply_curswant(want);
+        true
     }
 
-    pub(crate) fn move_up(&mut self) {
+    /// Returns `false` when already on the first visible line (no-op) — see `move_down`.
+    pub(crate) fn move_up(&mut self) -> bool {
         let mut prev = self.view().cursor.line;
         loop {
             if prev == 0 {
-                return;
+                return false;
             }
             prev -= 1;
             if !self.view().is_line_hidden(prev) {
                 break;
             }
         }
+        let want = self.curswant();
         self.view_mut().cursor.line = prev;
-        self.clamp_cursor_col();
+        self.apply_curswant(want);
+        true
+    }
+
+    /// The column a vertical motion should aim for: the remembered
+    /// `curswant` if one is set, otherwise the cursor's actual current
+    /// column (captured now, before this motion moves the line, so a chain
+    /// of `j`/`k` keeps returning to the column the chain *started* at
+    /// rather than whatever a shorter intervening line clamped it to).
+    pub(crate) fn curswant(&mut self) -> usize {
+        let want = self.curswant.unwrap_or(self.view().cursor.col);
+        self.curswant = Some(want);
+        want
+    }
+
+    /// Land the cursor on `want` (a column, or `CURSWANT_EOL` for "end of
+    /// line"), clamped to the current line's length. Does NOT touch
+    /// `self.curswant` itself — the whole point is that the desired column
+    /// survives being clamped so a later vertical motion can return to it.
+    pub(crate) fn apply_curswant(&mut self, want: usize) {
+        let line = self.view().cursor.line;
+        let max_col = self.get_max_cursor_col(line);
+        let col = if want == CURSWANT_EOL {
+            max_col
+        } else {
+            want.min(max_col)
+        };
+        self.view_mut().cursor.col = col;
+    }
+
+    /// The buffer line `M` (and `dM`) target: the middle of the lines
+    /// actually visible in the window, which for a buffer shorter than the
+    /// window is fewer than `viewport_lines()` (#805).
+    pub(crate) fn middle_visible_line(&self) -> usize {
+        let scroll_top = self.view().scroll_top;
+        let viewport = self.viewport_lines().max(1);
+        let max_line = self.buffer().len_lines().saturating_sub(1);
+        // #805 review: `saturating_sub` here is cheap insurance against a
+        // transient `scroll_top > max_line` (e.g. right after the buffer
+        // shrinks) underflowing this hot path for both `M` and `dM`.
+        let last_visible = (scroll_top + viewport - 1).min(max_line);
+        let visible_count = last_visible.saturating_sub(scroll_top) + 1;
+        scroll_top + (visible_count - 1) / 2
+    }
+
+    /// Vim's `'scroll'` option: sticky line count used by `<C-d>`/`<C-u>`.
+    /// Defaults to half the window height when never explicitly set.
+    pub(crate) fn effective_scroll(&self) -> usize {
+        self.scroll_value
+            .unwrap_or_else(|| (self.viewport_lines() / 2).max(1))
+    }
+
+    /// Land the cursor on `line` after one of the curswant-preserving
+    /// vertical-scroll motions (`<C-d>`/`<C-u>`/`<C-b>`/`<C-f>`). Vim's
+    /// `'startofline'` option (see `Settings::startofline`) names these four
+    /// among the commands it governs: when set, park on the first non-blank
+    /// column instead of the remembered `curswant`, and make that column the
+    /// new `curswant` — confirmed against real Neovim (`vim.o.startofline =
+    /// true`), a plain `<C-d>` afterwards keeps returning to the
+    /// first-non-blank column, not the pre-jump one. `G`/`gg`/`H`/`M`/`L` are
+    /// the other 'startofline' commands but don't use `curswant` at all in
+    /// their off-state (they just leave the actual column untouched), so
+    /// they honor the option directly at their own call sites instead of
+    /// through this helper.
+    pub(crate) fn land_vertical_scroll_cursor(&mut self, line: usize) {
+        self.view_mut().cursor.line = line;
+        if self.settings.startofline {
+            self.move_cursor_to_first_non_blank(line);
+            self.curswant = Some(self.view().cursor.col);
+        } else {
+            let want = self.curswant();
+            self.apply_curswant(want);
+        }
+    }
+
+    /// `<C-d>`/`<C-u>`: scroll the viewport AND move the cursor by the same
+    /// `delta` lines (positive = down), fold-aware and clamped to the
+    /// buffer. Column follows `curswant` like any other vertical motion
+    /// (or `'startofline'`, when set — see `land_vertical_scroll_cursor`).
+    pub(crate) fn scroll_and_move_by(&mut self, delta: isize) {
+        let max_line = self.buffer().len_lines().saturating_sub(1);
+        let count = delta.unsigned_abs();
+        let (new_line, new_top) = if delta >= 0 {
+            (
+                self.view()
+                    .next_visible_line(self.view().cursor.line, count, max_line),
+                self.view()
+                    .next_visible_line(self.view().scroll_top, count, max_line),
+            )
+        } else {
+            (
+                self.view()
+                    .prev_visible_line(self.view().cursor.line, count),
+                self.view().prev_visible_line(self.view().scroll_top, count),
+            )
+        };
+        self.view_mut().scroll_top = new_top;
+        self.land_vertical_scroll_cursor(new_line);
+    }
+
+    /// `<C-f>`: scroll a full page forward, keeping a 2-line overlap with
+    /// the previous page, and land the cursor on the new top line
+    /// (adjusted for `scrolloff`). Fold-aware.
+    ///
+    /// Once the last buffer line is already visible, real Vim stops
+    /// stepping and collapses the window to show just that last line
+    /// instead of clamping the usual step (#805: confirmed against real
+    /// interactive Neovim in a real terminal, which behaves differently
+    /// here than the headless oracle `tests/nvim_conformance.rs` uses —
+    /// see `scripts/nvim_headless_vs_interactive_repro.sh`). A step that
+    /// merely undershoots `max_line` by a line or two would otherwise miss
+    /// this collapse, since it never overshoots far enough to hit
+    /// `next_visible_line`'s own clamp.
+    pub(crate) fn page_down(&mut self) {
+        let viewport = self.viewport_lines().max(1);
+        let max_line = self.buffer().len_lines().saturating_sub(1);
+        let old_top = self.view().scroll_top;
+        if (old_top + viewport).saturating_sub(1) >= max_line {
+            self.view_mut().scroll_top = max_line;
+            self.land_vertical_scroll_cursor(max_line);
+            return;
+        }
+        let overlap = 2usize.min(viewport.saturating_sub(1));
+        let step = viewport.saturating_sub(overlap);
+        let new_top = self.view().next_visible_line(old_top, step, max_line);
+        self.view_mut().scroll_top = new_top;
+        let scrolloff = self.settings.scrolloff;
+        let target = self.view().next_visible_line(new_top, scrolloff, max_line);
+        self.land_vertical_scroll_cursor(target);
+    }
+
+    /// `<C-b>`: scroll a full page backward, keeping a 2-line overlap with
+    /// the previous page. Mirrors `<C-f>`, with two differences confirmed
+    /// against real interactive Neovim (#805; see
+    /// `scripts/nvim_headless_vs_interactive_repro.sh` — the headless
+    /// oracle `tests/nvim_conformance.rs` uses disagrees with real Neovim
+    /// on both):
+    ///  - already at the top of the buffer is a true no-op (no cursor
+    ///    move at all), not just a clamped scroll;
+    ///  - the cursor lands on `scrolloff + 1` lines below the *previous*
+    ///    topline — not at the bottom of the new page — which only
+    ///    coincides with "bottom of the new page" when the scroll isn't
+    ///    clamped by the start of the buffer.
+    pub(crate) fn page_up(&mut self) {
+        let old_top = self.view().scroll_top;
+        if old_top == 0 {
+            return;
+        }
+        let viewport = self.viewport_lines().max(1);
+        let max_line = self.buffer().len_lines().saturating_sub(1);
+        let overlap = 2usize.min(viewport.saturating_sub(1));
+        let step = viewport.saturating_sub(overlap);
+        let new_top = self.view().prev_visible_line(old_top, step);
+        self.view_mut().scroll_top = new_top;
+        let scrolloff = self.settings.scrolloff;
+        let target = (old_top + scrolloff + 1).min(max_line);
+        self.land_vertical_scroll_cursor(target);
     }
 
     // ── Indent / completion helpers ───────────────────────────────────────────
@@ -3158,8 +3710,20 @@ impl Engine {
     /// Collect all words in the current buffer that start with `prefix`,
     /// deduplicated, sorted, excluding an exact match of `prefix` itself.
     /// Used by Ctrl-N/Ctrl-P (manual completion) which can afford the full scan.
+    /// Candidates for `<C-n>`/`<C-p>` keyword completion, ordered the way
+    /// Vim's actual scan is (`:h compl-keyword`): forward distance from the
+    /// cursor, wrapping around the buffer. `<C-n>` takes index 0 (nearest
+    /// match after the cursor); `<C-p>` takes the last index, which under
+    /// this wraparound ordering is the nearest match *before* the cursor —
+    /// not alphabetical order, which picks an arbitrary match regardless of
+    /// proximity (#804, "C-p completion").
     pub(crate) fn word_completions_for_prefix(&self, prefix: &str) -> Vec<String> {
-        let mut set: std::collections::HashSet<String> = Default::default();
+        let cursor_line = self.view().cursor.line;
+        let cursor_col = self.view().cursor.col;
+        let cursor_pos = self.buffer().line_to_char(cursor_line) + cursor_col;
+        let total = self.buffer().len_chars().max(1);
+        let mut best_dist: std::collections::HashMap<String, usize> = Default::default();
+        let mut abs = 0usize;
         for line_idx in 0..self.buffer().len_lines() {
             let text: String = self.buffer().content.line(line_idx).chars().collect();
             let chars: Vec<char> = text.chars().collect();
@@ -3173,16 +3737,26 @@ impl Engine {
                     }
                     let word: String = chars[start..i].iter().collect();
                     if word.starts_with(prefix) && word != prefix {
-                        set.insert(word);
+                        let occ_pos = abs + start;
+                        let dist = if occ_pos >= cursor_pos {
+                            occ_pos - cursor_pos
+                        } else {
+                            occ_pos + total - cursor_pos
+                        };
+                        best_dist
+                            .entry(word)
+                            .and_modify(|d| *d = (*d).min(dist))
+                            .or_insert(dist);
                     }
                 } else {
                     i += 1;
                 }
             }
+            abs += len;
         }
-        let mut v: Vec<String> = set.into_iter().collect();
-        v.sort();
-        v
+        let mut v: Vec<(String, usize)> = best_dist.into_iter().collect();
+        v.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+        v.into_iter().map(|(w, _)| w).collect()
     }
 
     /// Delete the previously inserted candidate (or prefix), insert the new
@@ -3297,7 +3871,13 @@ impl Engine {
     /// `handle_insert_key`:
     ///
     /// - `Ctrl+N` / `Ctrl+P` — always (start or cycle word completion).
-    /// - `Tab` / `Down` / `Up` — only while a display-only popup is active.
+    /// - `Down` / `Up` — only while a display-only popup is active.
+    /// - The configured accept key (`completion_keys.accept`, mode-derived —
+    ///   `<Tab>` in Vscode mode, `<C-y>` in Vim mode — see #800) — only while
+    ///   a display-only popup is active.
+    ///
+    /// Dead in ShellApp mode until completion key intercept is re-wired (#448-C follow-on).
+    #[allow(dead_code)]
     pub fn insert_completion_intercepts_key(&self, key_name: &str, ctrl: bool) -> bool {
         if self.mode != Mode::Insert {
             return false;
@@ -3309,7 +3889,14 @@ impl Engine {
         if !popup_active {
             return false;
         }
-        !ctrl && (key_name == "Tab" || key_name == "Down" || key_name == "Up")
+        if !ctrl && (key_name == "Down" || key_name == "Up") {
+            return true;
+        }
+        let accept_key = self
+            .settings
+            .completion_keys
+            .accept(self.settings.editor_mode);
+        Self::key_matches_binding(&accept_key, ctrl, key_name)
     }
 
     // ── Fold helpers ──────────────────────────────────────────────────────────
@@ -3788,31 +4375,66 @@ impl Engine {
         self.selected_register.unwrap_or('"')
     }
 
-    /// Sets a register's content. `is_linewise` affects paste behavior.
-    /// For `+` and `*` registers, also writes to the system clipboard.
+    /// Sets a register's content, charwise or linewise.
+    ///
+    /// Convenience wrapper over [`Engine::set_register_typed`] for the many
+    /// callers that can only ever produce those two types; blockwise yanks and
+    /// deletes call the typed form directly.
     pub(crate) fn set_register(&mut self, reg: char, content: String, is_linewise: bool) {
+        self.set_register_typed(reg, content, RegType::from_linewise(is_linewise));
+    }
+
+    /// Sets a register's content. The [`RegType`] affects paste behavior.
+    /// For `+` and `*` registers, also writes to the system clipboard.
+    pub(crate) fn set_register_typed(&mut self, reg: char, content: String, ty: RegType) {
+        let is_linewise = ty.is_linewise();
+        // `"_` is the black hole register (`:h quote_`): writes to it vanish
+        // entirely — crucially, they do NOT fall through to the unnamed
+        // register the way every other named register does below. This is
+        // what makes `"_dd` (or `viw"_dP`, `:d _`) leave `""`/`"1`-`"9`
+        // untouched instead of clobbering them (#806).
+        if reg == '_' {
+            return;
+        }
         // Uppercase register (A-Z): append to lowercase register
         if reg.is_ascii_uppercase() {
             let lower = reg.to_ascii_lowercase();
-            let (existing, existing_lw) = self.registers.get(&lower).cloned().unwrap_or_default();
-            let combined_lw = existing_lw || is_linewise;
+            let (existing, existing_ty) = self.registers.get(&lower).cloned().unwrap_or_default();
+            let existing_lw = existing_ty.is_linewise();
+            // An append inherits the "widest" type: linewise wins over
+            // charwise, and a blockwise append degrades to the appended type
+            // (Vim does not concatenate two rectangles).
+            let combined_ty = if existing_lw || is_linewise {
+                RegType::Linewise
+            } else {
+                ty
+            };
             let combined = if existing.is_empty() {
                 content.clone()
             } else if existing_lw {
-                // Linewise: just concatenate (existing already ends with \n)
+                // Existing is linewise: already ends with '\n', just concatenate.
                 format!("{}{}", existing, content)
-            } else {
+            } else if is_linewise {
+                // Charwise existing + linewise append: the result becomes
+                // linewise, so it needs the line break the append itself
+                // doesn't carry yet.
                 format!("{}\n{}", existing, content)
+            } else {
+                // Charwise + charwise: appending is plain concatenation, no
+                // separator (`:h quote_alpha`) — a `\n` here was corrupting
+                // `"Ayw` appends with a line break neither piece had (#806,
+                // `reg:"ayw "Ayw "ap`).
+                format!("{}{}", existing, content)
             };
             self.registers
-                .insert(lower, (combined.clone(), combined_lw));
-            self.registers.insert('"', (combined, combined_lw));
+                .insert(lower, (combined.clone(), combined_ty));
+            self.registers.insert('"', (combined, combined_ty));
             return;
         }
-        self.registers.insert(reg, (content.clone(), is_linewise));
+        self.registers.insert(reg, (content.clone(), ty));
         // Also copy to unnamed register if using a named register
         if reg != '"' {
-            self.registers.insert('"', (content.clone(), is_linewise));
+            self.registers.insert('"', (content.clone(), ty));
         }
         // Sync clipboard registers to system clipboard
         if reg == '+' || reg == '*' {
@@ -3824,8 +4446,8 @@ impl Engine {
         }
     }
 
-    /// Gets a register's content and linewise flag (borrowed).
-    pub(crate) fn get_register(&self, reg: char) -> Option<&(String, bool)> {
+    /// Gets a register's content and type (borrowed).
+    pub(crate) fn get_register(&self, reg: char) -> Option<&(String, RegType)> {
         self.registers.get(&reg)
     }
 
@@ -3833,11 +4455,17 @@ impl Engine {
     /// target is the unnamed register. Yanks to a named register (e.g. "ayy)
     /// leave "0 untouched, matching Vim's :help registers semantics.
     pub(crate) fn set_yank_register(&mut self, reg: char, content: String, is_linewise: bool) {
-        self.set_register(reg, content.clone(), is_linewise);
+        self.set_yank_register_typed(reg, content, RegType::from_linewise(is_linewise));
+    }
+
+    /// [`set_yank_register`] with an explicit [`RegType`] — blockwise yanks
+    /// (`<C-v>y`) must reach `"0` with their blockwise-ness intact.
+    pub(crate) fn set_yank_register_typed(&mut self, reg: char, content: String, ty: RegType) {
+        self.set_register_typed(reg, content.clone(), ty);
         if reg == '"' {
             // "0 is the yank-only register — set on every unnamed yank, never on
             // deletes or on yanks to an explicit named register.
-            self.registers.insert('0', (content, is_linewise));
+            self.registers.insert('0', (content, ty));
         }
     }
 
@@ -3845,8 +4473,46 @@ impl Engine {
     /// - Linewise / multi-line: shifts "1"-"8" → "2"-"9", sets "1".
     /// - Character (< 1 line): sets "-" (small-delete register).
     pub(crate) fn set_delete_register(&mut self, reg: char, content: String, is_linewise: bool) {
-        self.set_register(reg, content.clone(), is_linewise);
-        if is_linewise || content.contains('\n') {
+        self.set_delete_register_impl(reg, content, RegType::from_linewise(is_linewise), false);
+    }
+
+    /// [`set_delete_register`] with an explicit [`RegType`].
+    pub(crate) fn set_delete_register_typed(&mut self, reg: char, content: String, ty: RegType) {
+        self.set_delete_register_impl(reg, content, ty, false);
+    }
+
+    /// Like [`set_delete_register`], but always goes through the numbered
+    /// `"1"`-`"9"` chain even when the deleted text is less than one line.
+    /// Real Vim carves out this exception specifically for deletes made with
+    /// `%`, `` ` ``, `/`, `?`, `n`, `N`, `(`, `)`, `{`, `}` — motions that
+    /// aren't "smaller than a line" deletes even when their result happens to
+    /// be (`:h quotedash`: "This does not happen for the delete operator
+    /// with a few specific motions, or a specific register was used with the
+    /// delete."). Ordinary char motions (`dw`, `x`, `dl`, …) still use the
+    /// small-delete `"-` register via `set_delete_register` (#806).
+    pub(crate) fn set_delete_register_special_motion(
+        &mut self,
+        reg: char,
+        content: String,
+        is_linewise: bool,
+    ) {
+        self.set_delete_register_impl(reg, content, RegType::from_linewise(is_linewise), true);
+    }
+
+    fn set_delete_register_impl(
+        &mut self,
+        reg: char,
+        content: String,
+        ty: RegType,
+        force_numbered: bool,
+    ) {
+        let is_linewise = ty.is_linewise();
+        self.set_register_typed(reg, content.clone(), ty);
+        // Black hole: no register bookkeeping of any kind (see `set_register`).
+        if reg == '_' {
+            return;
+        }
+        if is_linewise || content.contains('\n') || force_numbered {
             // Multi-line delete: shift numbered registers down
             for i in (1usize..=8).rev() {
                 let from = char::from_digit(i as u32, 10).unwrap();
@@ -3855,22 +4521,27 @@ impl Engine {
                     self.registers.insert(to, val);
                 }
             }
-            self.registers.insert('1', (content, is_linewise));
-        } else if !content.is_empty() {
-            // Small character delete: set "-" register
-            self.registers.insert('-', (content, false));
+            self.registers.insert('1', (content, ty));
+        } else if !content.is_empty() && reg == '"' {
+            // Small character delete: set "-" register — but only for an
+            // unnamed delete. An explicit register (`"adw`) does NOT also
+            // touch "- (#806, `reg:"adw does not set "-`), even though a
+            // multi-line/linewise explicit-register delete DOES still touch
+            // "1-"9 above (verified against real Vim: `"add` sets both "a
+            // and "1; `"bdw` sets only "b, leaving "- untouched).
+            self.registers.insert('-', (content, RegType::Charwise));
         }
     }
 
     /// Gets register content as owned data.
     /// For `+` and `*` registers, reads from the system clipboard.
     /// For `%`, `/`, `.` read-only registers, returns the appropriate value.
-    pub fn get_register_content(&mut self, reg: char) -> Option<(String, bool)> {
+    pub fn get_register_content(&mut self, reg: char) -> Option<(String, RegType)> {
         match reg {
             '+' | '*' => {
                 if let Some(ref cb_read) = self.clipboard_read {
                     match cb_read() {
-                        Ok(text) => return Some((text, false)),
+                        Ok(text) => return Some((text, RegType::Charwise)),
                         Err(e) => {
                             self.message = format!("Clipboard read failed: {}", e);
                         }
@@ -3888,15 +4559,23 @@ impl Engine {
                     .and_then(|p| p.file_name())
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_default();
-                Some((name, false))
+                Some((name, RegType::Charwise))
             }
             '/' => {
                 // Last search pattern (read-only)
-                Some((self.search_query.clone(), false))
+                Some((self.search_query.clone(), RegType::Charwise))
             }
             '.' => {
                 // Last inserted text (read-only)
-                Some((self.last_inserted_text.clone(), false))
+                Some((self.last_inserted_text.clone(), RegType::Charwise))
+            }
+            ':' => {
+                // Last command-line (read-only, `:h quote_:`) — the command
+                // text itself, with no leading `:` (matches `last_ex_command`,
+                // which is already stored that way for `@:`; #890).
+                self.last_ex_command
+                    .clone()
+                    .map(|cmd| (cmd, RegType::Charwise))
             }
             _ => self.registers.get(&reg).cloned(),
         }
@@ -3905,6 +4584,20 @@ impl Engine {
     /// Clears the selected register after an operation.
     pub(crate) fn clear_selected_register(&mut self) {
         self.selected_register = None;
+    }
+
+    /// Evaluate the text typed into the `"=`/`<C-r>=` expression register and
+    /// return its result formatted as it would be inserted/pasted, or an
+    /// error message.
+    ///
+    /// Real Vim runs the full Vimscript expression evaluator here. VimCode
+    /// doesn't embed one, so this covers only integer arithmetic (`+ - * /
+    /// %`, unary minus, parens) — enough for the "do a little math and paste
+    /// the answer" idiom the register exists for (#806). Anything fancier
+    /// (string concatenation, function calls, variables) reports an error
+    /// rather than silently doing the wrong thing.
+    pub(crate) fn eval_expr_register(src: &str) -> Result<String, String> {
+        eval_expr_register_arith(src).map(|n| n.to_string())
     }
 
     /// Records a yank highlight region for brief visual feedback.
@@ -3967,7 +4660,18 @@ impl Engine {
     pub(crate) fn start_macro_recording(&mut self, register: char) {
         self.macro_recording = Some(register);
         self.recording_buffer.clear();
+        self.macro_recording_append = false;
         self.message = format!("Recording macro into register '{}'", register);
+    }
+
+    /// Start recording a macro that appends to `register`'s existing content
+    /// instead of overwriting it (`qA` — `register` is already the lowercase
+    /// target, #806 "mac:qA append").
+    pub(crate) fn start_macro_recording_append(&mut self, register: char) {
+        self.macro_recording = Some(register);
+        self.recording_buffer.clear();
+        self.macro_recording_append = true;
+        self.message = format!("Recording macro into register '{}' (appending)", register);
     }
 
     /// Stop recording and save the macro to the register.
@@ -3976,12 +4680,20 @@ impl Engine {
             // Convert recording_buffer to string
             let macro_content: String = self.recording_buffer.iter().collect();
 
-            // Store in register (not linewise)
-            self.set_register(reg, macro_content, false);
+            // Store in register (not linewise). `set_register`'s uppercase
+            // form does a plain charwise concat onto the existing lowercase
+            // content — exactly `qA`'s append semantics — so route through
+            // that instead of duplicating the combine logic here.
+            if self.macro_recording_append {
+                self.set_register(reg.to_ascii_uppercase(), macro_content, false);
+            } else {
+                self.set_register(reg, macro_content, false);
+            }
 
             self.message = format!("Macro recorded into register '{}'", reg);
             self.macro_recording = None;
             self.recording_buffer.clear();
+            self.macro_recording_append = false;
         }
     }
 
@@ -4087,7 +4799,41 @@ impl Engine {
             available
         };
 
+        // `:h r` — the count must fit on the line, otherwise `r` fails
+        // entirely (`5rx` on `abc` changes nothing).
+        if count > available {
+            return;
+        }
         let to_replace = count.min(available);
+
+        if replacement == '\n' {
+            // `Nr<CR>` replaces the N characters with a SINGLE line break and
+            // leaves the cursor at the start of the new line (`:h r`; #807 —
+            // vimcode used to insert N line breaks).
+            if to_replace == 0 {
+                return;
+            }
+            self.delete_with_undo(char_idx, char_idx + to_replace);
+            self.insert_with_undo(char_idx, "\n");
+            self.view_mut().cursor.line = line + 1;
+            self.view_mut().cursor.col = 0;
+            *changed = true;
+            return;
+        }
+        if replacement == '\t' && self.settings.expand_tab {
+            // With 'expandtab', `r<Tab>` puts spaces in, not a tab (#807).
+            let width = (self.settings.tabstop as usize).max(1);
+            let spaces = " ".repeat(width);
+            if to_replace == 0 {
+                return;
+            }
+            self.delete_with_undo(char_idx, char_idx + to_replace);
+            self.insert_with_undo(char_idx, &spaces);
+            self.view_mut().cursor.col = col + width - 1;
+            self.clamp_cursor_col();
+            *changed = true;
+            return;
+        }
 
         if to_replace > 0 && char_idx < self.buffer().len_chars() {
             // Build the replacement string
@@ -4162,15 +4908,113 @@ impl Engine {
         self.message = msg;
     }
 
+    /// Put a blockwise register back as a rectangle (`:h blockwise-register`).
+    ///
+    /// Each `\n`-separated chunk goes on a successive line starting at the
+    /// cursor's line, at a fixed column: `cursor.col + 1` for `p`, `cursor.col`
+    /// for `P`.  Lines shorter than that column are padded with spaces, and
+    /// lines past the end of the buffer are created.  `count` repeats each
+    /// chunk horizontally, not vertically.
+    ///
+    /// Before #807 a blockwise yank was stored as an ordinary charwise
+    /// register, so `<C-v>jy` then `p` spliced `"a\nc"` in as literal text and
+    /// broke the line in half.
+    pub(crate) fn paste_blockwise(
+        &mut self,
+        content: &str,
+        count: usize,
+        after: bool,
+        changed: &mut bool,
+    ) {
+        let chunks: Vec<String> = content
+            .split('\n')
+            .map(|c| {
+                if count > 1 {
+                    c.repeat(count)
+                } else {
+                    c.to_string()
+                }
+            })
+            .collect();
+        if chunks.is_empty() {
+            return;
+        }
+        let start_line = self.view().cursor.line;
+        let cur_len = self.buffer().line_len_chars(start_line);
+        let has_nl = cur_len > 0
+            && self
+                .buffer()
+                .content
+                .line(start_line)
+                .chars()
+                .last()
+                .map(|c| c == '\n')
+                .unwrap_or(false);
+        let cur_text_len = if has_nl { cur_len - 1 } else { cur_len };
+        let col = if after && cur_text_len > 0 {
+            (self.view().cursor.col + 1).min(cur_text_len)
+        } else {
+            self.view().cursor.col.min(cur_text_len)
+        };
+
+        self.start_undo_group();
+        for (i, chunk) in chunks.iter().enumerate() {
+            let line = start_line + i;
+            if line >= self.buffer().len_lines() {
+                // Past the end of the buffer: open a new line first.
+                let end = self.buffer().len_chars();
+                self.insert_with_undo(end, "\n");
+            }
+            let line_start = self.buffer().line_to_char(line);
+            let raw = self.buffer().line_len_chars(line);
+            let text: String = self.buffer().content.line(line).chars().collect();
+            let text_len = if text.ends_with('\n') { raw - 1 } else { raw };
+            let mut insert = String::new();
+            if text_len < col {
+                // Short line: pad out to the block's column with spaces.
+                for _ in text_len..col {
+                    insert.push(' ');
+                }
+            }
+            insert.push_str(chunk);
+            let at = line_start + text_len.min(col);
+            self.insert_with_undo(at, &insert);
+        }
+        self.finish_undo_group();
+        self.view_mut().cursor.line = start_line;
+        self.view_mut().cursor.col = col;
+        self.clear_selected_register();
+        *changed = true;
+    }
+
     /// Paste after cursor (p). Linewise pastes below current line.
-    pub fn paste_after(&mut self, changed: &mut bool) {
+    ///
+    /// `count` repeats the *whole register content* `count` times as a single
+    /// paste (`:h p`) — NOT `count` separate paste operations. The two differ
+    /// for a multi-line register: `2yy3p` must produce three back-to-back
+    /// copies of the two yanked lines, not each yanked line tripled in place
+    /// (the latter is what calling this function in a loop produces, since
+    /// each call re-pastes after wherever the *previous* call's cursor
+    /// landed — #806, "misc:2yy 3p").
+    pub fn paste_after(&mut self, count: usize, changed: &mut bool) {
         let reg = self.active_register();
-        let (content, is_linewise) = match self.get_register_content(reg) {
+        let (content, reg_type) = match self.get_register_content(reg) {
             Some(pair) => pair,
             None => {
                 self.clear_selected_register();
                 return;
             }
+        };
+        let is_linewise = reg_type.is_linewise();
+        if reg_type.is_blockwise() {
+            // A rectangle goes back as a rectangle (#807).
+            self.paste_blockwise(&content, count, true, changed);
+            return;
+        }
+        let content = if count > 1 {
+            content.repeat(count)
+        } else {
+            content
         };
 
         self.start_undo_group();
@@ -4188,9 +5032,10 @@ impl Engine {
                 let content_with_newline = format!("\n{}", content);
                 self.insert_with_undo(line_end, &content_with_newline);
             };
-            // Move cursor to first non-blank of new line
-            self.view_mut().cursor.line += 1;
-            self.view_mut().cursor.col = 0;
+            // `:h p` — linewise put leaves the cursor on the first non-blank
+            // of the first pasted line, not column 0 (#807).
+            let target = self.view().cursor.line + 1;
+            self.move_cursor_to_first_non_blank(target);
         } else {
             // Paste after cursor position
             let line = self.view().cursor.line;
@@ -4203,9 +5048,14 @@ impl Engine {
                 char_idx
             };
             self.insert_with_undo(insert_pos, &content);
-            // Move cursor to end of pasted text (last char)
             let paste_len = content.chars().count();
-            if paste_len > 0 {
+            if content.contains('\n') {
+                // Vim leaves the cursor on the FIRST character of a
+                // multi-line charwise put, not the last (#807, `op:p charwise
+                // multiline` and the six `vis:*y … p` cursor cases).
+                self.view_mut().cursor.col = insert_pos - self.buffer().line_to_char(line);
+            } else if paste_len > 0 {
+                // Single line: cursor lands on the last pasted char.
                 self.view_mut().cursor.col = col + paste_len;
             }
         }
@@ -4216,14 +5066,26 @@ impl Engine {
     }
 
     /// Paste before cursor (P). Linewise pastes above current line.
-    pub(crate) fn paste_before(&mut self, changed: &mut bool) {
+    /// `count` repeats the register content as a single block — see `paste_after`.
+    pub(crate) fn paste_before(&mut self, count: usize, changed: &mut bool) {
         let reg = self.active_register();
-        let (content, is_linewise) = match self.get_register_content(reg) {
+        let (content, reg_type) = match self.get_register_content(reg) {
             Some(pair) => pair,
             None => {
                 self.clear_selected_register();
                 return;
             }
+        };
+        let is_linewise = reg_type.is_linewise();
+        if reg_type.is_blockwise() {
+            // A rectangle goes back as a rectangle (#807).
+            self.paste_blockwise(&content, count, false, changed);
+            return;
+        }
+        let content = if count > 1 {
+            content.repeat(count)
+        } else {
+            content
         };
 
         self.start_undo_group();
@@ -4233,17 +5095,22 @@ impl Engine {
             let line = self.view().cursor.line;
             let line_start = self.buffer().line_to_char(line);
             self.insert_with_undo(line_start, &content);
-            // Cursor stays on same line number (which is now the pasted line)
-            self.view_mut().cursor.col = 0;
+            // Cursor stays on the same line number (now the pasted line), on
+            // its first non-blank — see `paste_after` (#807).
+            let target = self.view().cursor.line;
+            self.move_cursor_to_first_non_blank(target);
         } else {
             // Paste before cursor position
             let line = self.view().cursor.line;
             let col = self.view().cursor.col;
             let char_idx = self.buffer().line_to_char(line) + col;
             self.insert_with_undo(char_idx, &content);
-            // Cursor moves to end of pasted text
             let paste_len = content.chars().count();
-            if paste_len > 0 {
+            if content.contains('\n') {
+                // See `paste_after`: multi-line charwise leaves the cursor at
+                // the start of the pasted text.
+                self.view_mut().cursor.col = col;
+            } else if paste_len > 0 {
                 self.view_mut().cursor.col = col + paste_len - 1;
             }
         }
@@ -4254,14 +5121,26 @@ impl Engine {
     }
 
     /// Paste after cursor, leave cursor after pasted text (gp).
-    pub(crate) fn paste_after_cursor_after(&mut self, changed: &mut bool) {
+    /// `count` repeats the register content as a single block — see `paste_after`.
+    pub(crate) fn paste_after_cursor_after(&mut self, count: usize, changed: &mut bool) {
         let reg = self.active_register();
-        let (content, is_linewise) = match self.get_register_content(reg) {
+        let (content, reg_type) = match self.get_register_content(reg) {
             Some(pair) => pair,
             None => {
                 self.clear_selected_register();
                 return;
             }
+        };
+        let is_linewise = reg_type.is_linewise();
+        if reg_type.is_blockwise() {
+            // A rectangle goes back as a rectangle (#807).
+            self.paste_blockwise(&content, count, true, changed);
+            return;
+        }
+        let content = if count > 1 {
+            content.repeat(count)
+        } else {
+            content
         };
 
         self.start_undo_group();
@@ -4306,6 +5185,14 @@ impl Engine {
                     end_pos.min(self.buffer().len_chars()) - self.buffer().line_to_char(new_line);
                 self.view_mut().cursor.line = new_line;
                 self.view_mut().cursor.col = new_col;
+                // With a charwise multi-line register, `end_pos` (one past
+                // the last pasted char) can land exactly on that line's own
+                // trailing newline when the last pasted char is immediately
+                // followed by pre-existing text that used to continue the
+                // line (#892). A normal-mode cursor can never rest on/after
+                // a line's newline, so pull it back onto the last real
+                // column — same clamp `p`/every other command relies on.
+                self.clamp_cursor_col();
             }
         }
 
@@ -4315,14 +5202,26 @@ impl Engine {
     }
 
     /// Paste before cursor, leave cursor after pasted text (gP).
-    pub(crate) fn paste_before_cursor_after(&mut self, changed: &mut bool) {
+    /// `count` repeats the register content as a single block — see `paste_after`.
+    pub(crate) fn paste_before_cursor_after(&mut self, count: usize, changed: &mut bool) {
         let reg = self.active_register();
-        let (content, is_linewise) = match self.get_register_content(reg) {
+        let (content, reg_type) = match self.get_register_content(reg) {
             Some(pair) => pair,
             None => {
                 self.clear_selected_register();
                 return;
             }
+        };
+        let is_linewise = reg_type.is_linewise();
+        if reg_type.is_blockwise() {
+            // A rectangle goes back as a rectangle (#807).
+            self.paste_blockwise(&content, count, false, changed);
+            return;
+        }
+        let content = if count > 1 {
+            content.repeat(count)
+        } else {
+            content
         };
 
         self.start_undo_group();
@@ -4355,6 +5254,10 @@ impl Engine {
                     end_pos.min(self.buffer().len_chars()) - self.buffer().line_to_char(new_line);
                 self.view_mut().cursor.line = new_line;
                 self.view_mut().cursor.col = new_col;
+                // See the matching clamp in `paste_after_cursor_after` (#892):
+                // a charwise multi-line register can put `end_pos` right on
+                // the line's own trailing newline.
+                self.clamp_cursor_col();
             }
         }
 
@@ -4434,8 +5337,61 @@ impl Engine {
             }
             self.finish_undo_group();
             self.view_mut().cursor = start;
+            if self.mode == Mode::VisualLine {
+                // A linewise `r` covers whole lines, so the cursor lands in
+                // column 0, not wherever the selection was anchored (#807,
+                // `vis:Vr-`).
+                self.view_mut().cursor.col = 0;
+            }
             self.mode = Mode::Normal;
             self.visual_anchor = None;
+            self.visual_dollar = false;
+            *changed = true;
+        }
+    }
+
+    /// `<C-v>{motion}r<CR>` (`:h v_b_r`): instead of inserting a literal
+    /// character into the block rectangle, each line the block touches is
+    /// split into two at the block's column range — the selected columns are
+    /// removed and replaced with a single line break. A line shorter than the
+    /// block's start column is left untouched (ragged block, nothing to
+    /// split). Processes lines bottom-to-top so a split on a later line never
+    /// shifts the char index of a line still to be processed above it.
+    pub(crate) fn replace_visual_block_with_newline(&mut self, changed: &mut bool) {
+        if let Some((start, end)) = self.get_visual_selection_range() {
+            self.start_undo_group();
+            let col_start = start.col.min(end.col);
+            let col_end = start.col.max(end.col);
+            for line in (start.line..=end.line).rev() {
+                if line >= self.buffer().len_lines() {
+                    continue;
+                }
+                let line_start = self.buffer().line_to_char(line);
+                let line_len = self.buffer().line_len_chars(line);
+                let has_nl = self.buffer().content.line(line).chars().last() == Some('\n');
+                let max_col = if has_nl {
+                    line_len.saturating_sub(1)
+                } else {
+                    line_len
+                };
+                if col_start > max_col {
+                    // Ragged line shorter than the block: no split here.
+                    continue;
+                }
+                let del_end_col = (col_end + 1).min(max_col);
+                if del_end_col > col_start {
+                    self.delete_with_undo(line_start + col_start, line_start + del_end_col);
+                }
+                self.insert_with_undo(line_start + col_start, "\n");
+            }
+            self.finish_undo_group();
+            self.view_mut().cursor = Cursor {
+                line: start.line,
+                col: 0,
+            };
+            self.mode = Mode::Normal;
+            self.visual_anchor = None;
+            self.visual_dollar = false;
             *changed = true;
         }
     }
@@ -4840,35 +5796,67 @@ impl Engine {
             // The newline is the last char of the current line
             let newline_pos = cur_line_start + cur_line_len - 1;
 
-            // Count leading whitespace on next line
+            // Count leading whitespace on next line. Strip the trailing
+            // newline first — `Rope::line()` includes it, and without
+            // stripping it a blank (or all-whitespace) next line reads its
+            // own line terminator as a "next non-whitespace char", wrongly
+            // triggering a space insert (#880, "op:J next blank").
             let next_line_start = self.buffer().line_to_char(next_line);
             let next_line_content: String = self.buffer().content.line(next_line).chars().collect();
-            let leading_ws = next_line_content
+            let next_line_text = next_line_content
+                .strip_suffix('\n')
+                .unwrap_or(&next_line_content);
+            let leading_ws = next_line_text
                 .chars()
                 .take_while(|c| *c == ' ' || *c == '\t')
                 .count();
 
             // Determine what char comes after the whitespace on the next line
-            let next_non_ws = next_line_content.chars().nth(leading_ws);
+            let next_non_ws = next_line_text.chars().nth(leading_ws);
 
             // Delete: newline + leading whitespace of next line
             let del_end = next_line_start + leading_ws;
-            self.delete_with_undo(newline_pos, del_end);
 
             // Insert a space unless the next non-ws char is ')' or next line was empty/only ws.
             // Also don't add space if the current line already ends with whitespace.
             let should_add_space = !matches!(next_non_ws, None | Some(')') | Some(']') | Some('}'));
             let ends_with_ws = newline_pos > cur_line_start
                 && self.buffer().content.char(newline_pos - 1).is_whitespace();
+            let insert_space = should_add_space && !ends_with_ws;
 
-            if should_add_space && !ends_with_ws {
+            // A join needs the absorbed line's marks to gain a *column*
+            // offset (not just shift down a line, which is all the generic
+            // `delete_with_undo`/`insert_with_undo` hook does) — precise
+            // offset-based fixup, done by hand around the raw splice
+            // (#806, "mark:`a after line join").
+            let (local_marks, global_marks) = self.snapshot_marks_as_offsets();
+            self.suppress_mark_line_adjust = true;
+            self.delete_with_undo(newline_pos, del_end);
+            if insert_space {
                 self.insert_with_undo(newline_pos, " ");
-                // Cursor at the inserted space
-                join_col = newline_pos - cur_line_start;
-            } else {
-                // No space inserted — cursor at last char before where next line starts
-                join_col = (newline_pos - cur_line_start).saturating_sub(1);
             }
+            self.suppress_mark_line_adjust = false;
+            let ins_len = if insert_space { 1 } else { 0 };
+            self.restore_marks_from_offsets(
+                local_marks,
+                global_marks,
+                newline_pos,
+                del_end - newline_pos,
+                ins_len,
+            );
+
+            // Cursor lands at the join point: where the space was inserted,
+            // or — when no space is inserted — where the next line's first
+            // surviving character now sits (e.g. landing on `)` for
+            // "foo(" + ")"，or on the char after an already-trailing space).
+            // That's the same offset either way: `newline_pos` is exactly
+            // where the deleted newline+leading-whitespace region started,
+            // so whatever now occupies that position (inserted space, or
+            // the next line's first non-ws char) is the join point. When
+            // the next line was blank there's nothing to land on there —
+            // `clamp_cursor_col` below pulls the cursor back onto the last
+            // char of the (now merged) line, matching Vim (#880).
+            join_col = newline_pos - cur_line_start;
         }
         self.finish_undo_group();
 
@@ -4885,7 +5873,10 @@ impl Engine {
     /// Scroll so that cursor line is centered in viewport.
     pub(crate) fn scroll_cursor_center(&mut self) {
         let cursor_line = self.view().cursor.line;
-        let half = self.viewport_lines() / 2;
+        // #805: `(viewport - 1) / 2`, not `viewport / 2` — confirmed against
+        // real interactive Neovim's `zz`, which was landing one line lower
+        // than vimcode did (see scripts/nvim_headless_vs_interactive_repro.sh).
+        let half = self.viewport_lines().saturating_sub(1) / 2;
         let new_top = cursor_line.saturating_sub(half);
         self.view_mut().scroll_top = new_top;
     }
@@ -4909,12 +5900,20 @@ impl Engine {
     // =======================================================================
 
     /// Push (line, col) to the change list, capped at 100 entries.
+    ///
+    /// A change on the same line as the list's most recent entry replaces
+    /// that entry rather than adding a new one — Vim does not grow the
+    /// changelist for a second change to a line already at its head (#891,
+    /// "jump:g; after 2 changes same line"; `:h changelist`).
     pub(crate) fn push_change_location(&mut self, line: usize, col: usize) {
         // Truncate any forward entries (if we navigated back with g;)
         self.change_list.truncate(self.change_list_pos);
-        // Avoid duplicate consecutive entries
-        if self.change_list.last() == Some(&(line, col)) {
-            return;
+        if let Some(last) = self.change_list.last_mut() {
+            if last.0 == line {
+                *last = (line, col);
+                self.change_list_pos = self.change_list.len();
+                return;
+            }
         }
         self.change_list.push((line, col));
         if self.change_list.len() > 100 {
@@ -4923,16 +5922,36 @@ impl Engine {
         self.change_list_pos = self.change_list.len();
     }
 
-    /// Push the current cursor position onto the jump list.
+    /// Build a `JumpEntry` snapshot of the engine's current cursor position
+    /// and the pane (group/tab/window) it's in.
+    pub(crate) fn current_jump_entry(&self) -> JumpEntry {
+        JumpEntry {
+            file: self.active_buffer_state().file_path.clone(),
+            line: self.view().cursor.line,
+            col: self.view().cursor.col,
+            group_id: self.active_group,
+            tab_id: self.active_tab().id,
+            window_id: self.active_window_id(),
+        }
+    }
+
+    /// Push the current cursor position onto the jump list, and set it as
+    /// the `''`/`` `` `` mark (pcmark).
     pub fn push_jump_location(&mut self) {
         // Save pre-jump position for '' / `` marks
         let line = self.view().cursor.line;
         let col = self.view().cursor.col;
         self.last_jump_pos = Some((line, col));
+        self.append_jump_list_entry();
+    }
 
-        let file = self.active_buffer_state().file_path.clone();
-        let line = self.view().cursor.line;
-        let col = self.view().cursor.col;
+    /// The jumplist-only half of `push_jump_location` — appends the current
+    /// cursor position, deduped against the top entry and truncating any
+    /// forward (redo) history. Split out so `record_jump_from` can update
+    /// the `''` mark unconditionally while only conditionally touching the
+    /// persistent list (#806).
+    fn append_jump_list_entry(&mut self) {
+        let entry = self.current_jump_entry();
 
         // Truncate forward history when a new jump is made
         if self.jump_list_pos < self.jump_list.len() {
@@ -4940,13 +5959,11 @@ impl Engine {
         }
 
         // Don't push a duplicate of the current top entry
-        if let Some(last) = self.jump_list.last() {
-            if last.0 == file && last.1 == line && last.2 == col {
-                return;
-            }
+        if self.jump_list.last() == Some(&entry) {
+            return;
         }
 
-        self.jump_list.push((file, line, col));
+        self.jump_list.push(entry);
 
         // Cap at 100 entries
         if self.jump_list.len() > 100 {
@@ -4956,8 +5973,52 @@ impl Engine {
         self.jump_list_pos = self.jump_list.len();
     }
 
+    /// Lazily seed the jumplist with the startup position the first time
+    /// `<C-o>` is asked to go somewhere and the list is otherwise empty.
+    /// Real Neovim behaves this way for line-changing-but-not-jump-worthy
+    /// motions (`j`/`k`, even `20j`): `getjumplist()` reports empty right
+    /// after such a motion, yet a bare `<C-o>` still returns to the
+    /// position editing started at — but ONLY once the cursor has actually
+    /// left that starting *line*; a same-line motion (`%` on a one-line
+    /// match, `(` within a sentence) leaves `<C-o>` a genuine no-op (#806:
+    /// "jump:C-o after j 20 lines" needs the seed, "jump:% C-o" / "jump:C-o
+    /// after (" must NOT get one). Checking "has the line changed" here,
+    /// right before the fallback would otherwise report "already at
+    /// oldest", reproduces both without a real jump command ever having to
+    /// decide it retroactively.
+    fn seed_jump_list_if_line_left(&mut self) {
+        if !self.jump_list.is_empty() {
+            return;
+        }
+        if let Some(entry) = &self.startup_jump_entry {
+            if entry.line != self.view().cursor.line {
+                self.jump_list.push(entry.clone());
+                self.jump_list_pos = self.jump_list.len();
+            }
+        }
+    }
+
+    /// Record a jump that started at `pre_cursor` (cursor has already moved
+    /// to its destination by the time this is called). Always updates the
+    /// `''`/`` `` `` pcmark, but only appends a *persistent jumplist* entry
+    /// when the move actually changed line. Verified against real Neovim: a
+    /// same-line `%`/`(`/`)` still moves the pcmark (`` `` `` returns to the
+    /// exact starting column) even though `getjumplist()` stays untouched
+    /// (#806, "mark:`` after %" vs "jump:% C-o").
+    pub(crate) fn record_jump_from(&mut self, pre_cursor: Cursor) {
+        self.last_jump_pos = Some((pre_cursor.line, pre_cursor.col));
+        if self.view().cursor.line == pre_cursor.line {
+            return;
+        }
+        let post_cursor = self.view().cursor;
+        self.view_mut().cursor = pre_cursor;
+        self.append_jump_list_entry();
+        self.view_mut().cursor = post_cursor;
+    }
+
     /// Navigate backward in the jump list (Ctrl-O).
     pub fn jump_list_back(&mut self) {
+        self.seed_jump_list_if_line_left();
         // When at the "live" end (not stored in list), save current position
         // so Ctrl-I can return to it, then jump to the previous entry.
         if self.jump_list_pos == self.jump_list.len() {
@@ -4965,15 +6026,10 @@ impl Engine {
                 self.message = "Already at oldest position in jump list".to_string();
                 return;
             }
-            let file = self.active_buffer_state().file_path.clone();
-            let line = self.view().cursor.line;
-            let col = self.view().cursor.col;
-            #[allow(clippy::unnecessary_map_or)] // is_none_or requires Rust 1.82+
-            let should_push = self.jump_list.last().map_or(true, |last| {
-                last.0 != file || last.1 != line || last.2 != col
-            });
+            let entry = self.current_jump_entry();
+            let should_push = self.jump_list.last() != Some(&entry);
             if should_push {
-                self.jump_list.push((file, line, col));
+                self.jump_list.push(entry);
                 if self.jump_list.len() > 100 {
                     self.jump_list.remove(0);
                 }
@@ -5011,26 +6067,57 @@ impl Engine {
     }
 
     /// Move to the position stored at the given jump list index.
+    ///
+    /// Restores **by lookup, not by open** (#674): if the entry's
+    /// group/tab/window still exist, switch to that exact pane — the same
+    /// tab/split gets activated, not a fresh copy of the file opened into
+    /// whatever pane is currently focused. Only when the pane is gone
+    /// (its tab or split was closed) does this fall back to
+    /// `open_file_with_mode`, which opens the file into the *current*
+    /// window; that fallback is the recovery path, not the normal one.
+    ///
+    /// A recorded window can also still exist, still belong to the same
+    /// tab, and yet no longer show the recorded file — `:e`, `gf`, and the
+    /// explorer/fuzzy-finder all replace a window's buffer **in place**,
+    /// keeping the `WindowId` the same. `jump_pane_buffer_matches` catches
+    /// that case (most commonly: single window, no splits/tabs, file A then
+    /// file B opened into the same pane) and re-opens the recorded file
+    /// into that exact window rather than trusting a pane match that no
+    /// longer holds the right buffer.
+    ///
+    /// The jump list is deliberately global rather than per-window (stock
+    /// Vim keeps one jumplist per window — see `:help jumplist`). This repo
+    /// chose global because the reported use case is explicitly
+    /// cross-tab/cross-pane: walking Ctrl-O back through time should surface
+    /// the tab you were in a few jumps ago, not stop dead at the pane
+    /// boundary. See VIM_COMPATIBILITY.md for the recorded decision.
     pub(crate) fn apply_jump_list_entry(&mut self, idx: usize) {
         let entry = match self.jump_list.get(idx) {
             Some(e) => e.clone(),
             None => return,
         };
 
-        let (file, line, col) = entry;
+        let pane = self
+            .locate_jump_pane(entry.group_id, entry.tab_id, entry.window_id)
+            .filter(|_| self.jump_pane_buffer_matches(entry.window_id, &entry.file));
 
-        // If cross-file, open the file
-        let current_file = self.active_buffer_state().file_path.clone();
-        if file != current_file {
-            if let Some(path) = &file {
-                let path = path.clone();
-                let _ = self.open_file_with_mode(&path, OpenMode::Permanent);
+        if let Some((group_id, tab_idx)) = pane {
+            self.switch_to_jump_pane(group_id, tab_idx, entry.window_id);
+        } else {
+            // Pane is gone, or it exists but its buffer was swapped in
+            // place since the jump was recorded — recover by opening the
+            // file into the current window.
+            let current_file = self.active_buffer_state().file_path.clone();
+            if entry.file != current_file {
+                if let Some(path) = &entry.file {
+                    let _ = self.open_file_with_mode(path, OpenMode::Permanent);
+                }
             }
         }
 
         let max_line = self.buffer().len_lines().saturating_sub(1);
-        self.view_mut().cursor.line = line.min(max_line);
-        self.view_mut().cursor.col = col;
+        self.view_mut().cursor.line = entry.line.min(max_line);
+        self.view_mut().cursor.col = entry.col;
         self.clamp_cursor_col();
     }
 
@@ -5038,13 +6125,105 @@ impl Engine {
     // Indent / Dedent (>> / <<)
     // =======================================================================
 
-    /// Indent `count` lines starting at `start_line` by shift_width.
-    pub(crate) fn indent_lines(&mut self, start_line: usize, count: usize, changed: &mut bool) {
-        let indent_str = if self.settings.expand_tab {
-            " ".repeat(self.effective_shift_width())
+    /// The virtual-column span `[start, end]` (0-indexed, `end` inclusive)
+    /// that the character at `col` on `line` occupies on screen, honoring
+    /// `'tabstop'` — a tab widens to the next tabstop, everything else is
+    /// exactly one column wide. `col` at or past the line's content lands on
+    /// an empty zero-width span at the line's total display width, which is
+    /// what "cursor past the last char" needs when there's no character to
+    /// measure. Mirrors Vim's `virtcol()` (`:h virtcol()`: "for a TAB the
+    /// last column is used"), which `>>`/`<<` need so `col_for_vcol` can put
+    /// the cursor back on the same screen column after the indent's tab/
+    /// space makeup changes shape underneath it (#883, "op:<< mixed tab
+    /// space").
+    fn char_vcol_span(&self, line: usize, col: usize) -> (usize, usize) {
+        let ts = (self.settings.tabstop as usize).max(1);
+        let line_start = self.buffer().line_to_char(line);
+        let content_len = self.line_content_len(line);
+        let mut vcol = 0usize;
+        for i in 0..col.min(content_len) {
+            let ch = self.buffer().content.char(line_start + i);
+            vcol += if ch == '\t' { ts - (vcol % ts) } else { 1 };
+        }
+        if col >= content_len {
+            return (vcol, vcol);
+        }
+        let ch = self.buffer().content.char(line_start + col);
+        let width = if ch == '\t' { ts - (vcol % ts) } else { 1 };
+        (vcol, vcol + width - 1)
+    }
+
+    /// Inverse of [`Engine::char_vcol_span`]: the character column on `line`
+    /// whose span contains `target_vcol`, clamped to the line's last
+    /// character when `target_vcol` falls past the end — Vim's
+    /// `coladvance()` behavior, and what actually lands the cursor after a
+    /// `>>`/`<<` shift (see `char_vcol_span`'s doc comment for why).
+    fn col_for_vcol(&self, line: usize, target_vcol: usize) -> usize {
+        let ts = (self.settings.tabstop as usize).max(1);
+        let line_start = self.buffer().line_to_char(line);
+        let content_len = self.line_content_len(line);
+        if content_len == 0 {
+            return 0;
+        }
+        let mut vcol = 0usize;
+        for i in 0..content_len {
+            let ch = self.buffer().content.char(line_start + i);
+            let width = if ch == '\t' { ts - (vcol % ts) } else { 1 };
+            if target_vcol < vcol + width {
+                return i;
+            }
+            vcol += width;
+        }
+        content_len - 1
+    }
+
+    /// A line's length in characters, excluding the trailing `\n` if any —
+    /// the "content" length several indent helpers above need instead of
+    /// the raw `line_len_chars` (which counts the newline).
+    fn line_content_len(&self, line: usize) -> usize {
+        let line_len = self.buffer().line_len_chars(line);
+        if line_len > 0
+            && self
+                .buffer()
+                .content
+                .char(self.buffer().line_to_char(line) + line_len - 1)
+                == '\n'
+        {
+            line_len - 1
         } else {
-            "\t".to_string()
-        };
+            line_len
+        }
+    }
+
+    /// Indent `count` lines starting at `start_line` by shift_width.
+    ///
+    /// `reposition_cursor` opts into Vim's `>>`/`>motion` cursor landing (on
+    /// the on-screen column, or first non-blank under `'startofline'`, per
+    /// `:h 'startofline'` — #883, "op:>> cursor sol"). VSCode-mode Ctrl+]
+    /// call sites pass `false`: they manage cursor position themselves
+    /// (per-cursor column bump, including under multi-cursor), and this
+    /// helper repositioning the shared cursor to `start_line` on every call
+    /// stomped every cursor but the last one under a multi-cursor selection
+    /// (#883 review).
+    pub(crate) fn indent_lines(
+        &mut self,
+        start_line: usize,
+        count: usize,
+        changed: &mut bool,
+        reposition_cursor: bool,
+    ) {
+        let sw = self.effective_shift_width();
+        let ts = (self.settings.tabstop as usize).max(1);
+        let expand = self.settings.expand_tab;
+
+        // Capture the cursor's on-screen column (as a virtual column, so a
+        // tab in the existing indent is measured the same way Vim's cursor
+        // rendering does) before editing touches the line — restored after
+        // the shift via `col_for_vcol` (#883, "op:>> cursor sol" and the
+        // general "leave the column where the eye sees it" case it's a
+        // special case of).
+        let orig_col = self.view().cursor.col;
+        let (_, target_vcol) = self.char_vcol_span(start_line, orig_col);
 
         self.start_undo_group();
         let total = self.buffer().len_lines();
@@ -5053,10 +6232,74 @@ impl Engine {
             if line_idx >= total {
                 break;
             }
+            let line_content: String = self.buffer().content.line(line_idx).chars().collect();
+            let body = line_content.trim_end_matches(['\n', '\r']);
+            // `:h >`: an empty line is never indented — `>ap` over a paragraph
+            // followed by a blank line must leave that blank line empty rather
+            // than filling it with 'shiftwidth' spaces (#807).
+            if body.is_empty() {
+                continue;
+            }
+
+            // Measure the existing indent in *display columns* — a tab advances
+            // to the next 'tabstop', which is not the same as 'shiftwidth'.
+            let mut cols = 0usize;
+            let mut ws_chars = 0usize;
+            for ch in body.chars() {
+                match ch {
+                    ' ' => {
+                        cols += 1;
+                        ws_chars += 1;
+                    }
+                    '\t' => {
+                        cols += ts - (cols % ts);
+                        ws_chars += 1;
+                    }
+                    _ => break,
+                }
+            }
+
+            let new_cols = cols + sw;
+            // `noet` only uses a tab where a *whole* tabstop fits, so with
+            // ts=8 / sw=4 Vim indents with four spaces, not a tab.
+            let new_indent = if expand {
+                " ".repeat(new_cols)
+            } else {
+                format!(
+                    "{}{}",
+                    "\t".repeat(new_cols / ts),
+                    " ".repeat(new_cols % ts)
+                )
+            };
+
             let line_start = self.buffer().line_to_char(line_idx);
-            self.insert_with_undo(line_start, &indent_str);
+            if ws_chars > 0 {
+                self.delete_with_undo(line_start, line_start + ws_chars);
+            }
+            self.insert_with_undo(line_start, &new_indent);
         }
         self.finish_undo_group();
+        // `'[`/`` `[ `` and `']`/`` `] `` after a shift command (#806, "mark:'[
+        // after >>"). Narrower than real Vim's `[`/`]` (which track every
+        // change/yank/paste — see `last_change_start`'s doc comment).
+        self.last_change_start = Some((start_line, 0));
+        let end_line = (start_line + count.saturating_sub(1)).min(total.saturating_sub(1));
+        let end_col = self.buffer().line_len_chars(end_line).saturating_sub(1);
+        self.last_change_end = Some((end_line, end_col));
+        // `:h 'startofline'`: ">>" is one of the commands the option names —
+        // when set, land on the first non-blank of the (first) shifted line
+        // instead of the screen column the cursor was sitting on (#883,
+        // "op:>> cursor sol"). Off (the default, matching Neovim) restores
+        // that screen column via `col_for_vcol`/`target_vcol` above. Gated by
+        // `reposition_cursor` — see the doc comment on this function.
+        if reposition_cursor {
+            self.view_mut().cursor.line = start_line;
+            if self.settings.startofline {
+                self.move_cursor_to_first_non_blank(start_line);
+            } else {
+                self.view_mut().cursor.col = self.col_for_vcol(start_line, target_vcol);
+            }
+        }
         *changed = true;
     }
 
@@ -5064,33 +6307,56 @@ impl Engine {
     /// Removes up to shift_width columns, but caps removal at the minimum
     /// indent across all non-blank lines in the selection to preserve
     /// relative nesting structure.
-    pub(crate) fn dedent_lines(&mut self, start_line: usize, count: usize, changed: &mut bool) {
+    ///
+    /// `reposition_cursor` — see [`Engine::indent_lines`]'s matching doc
+    /// comment (#883 review).
+    pub(crate) fn dedent_lines(
+        &mut self,
+        start_line: usize,
+        count: usize,
+        changed: &mut bool,
+        reposition_cursor: bool,
+    ) {
         let sw = self.effective_shift_width();
+        let ts = (self.settings.tabstop as usize).max(1);
+        let expand = self.settings.expand_tab;
         let total = self.buffer().len_lines();
 
-        // First pass: find minimum leading whitespace (visual columns) across
-        // all non-blank lines in the selection.
+        // Capture the cursor's on-screen column before editing — see
+        // `indent_lines`'s matching comment (#883).
+        let orig_col = self.view().cursor.col;
+        let (_, target_vcol) = self.char_vcol_span(start_line, orig_col);
+
+        // First pass: find minimum leading whitespace across all non-blank
+        // lines in the selection, measured in *display columns honouring
+        // 'tabstop'* — a tab's width is set by 'tabstop', not 'shiftwidth'
+        // (using `sw` here used to under/over-count a tab's true width
+        // whenever the two options differ, #883).
         let mut min_indent = usize::MAX;
         for i in 0..count {
             let line_idx = start_line + i;
             if line_idx >= total {
                 break;
             }
-            let line_content: String = self.buffer().content.line(line_idx).chars().collect();
-            let trimmed = line_content.trim_end_matches(['\n', '\r']);
-            // Skip blank/whitespace-only lines — they shouldn't constrain removal
-            if trimmed.trim().is_empty() {
-                continue;
-            }
-            let mut visual_indent = 0;
-            for ch in trimmed.chars() {
-                match ch {
-                    ' ' => visual_indent += 1,
-                    '\t' => visual_indent += sw - (visual_indent % sw),
-                    _ => break,
+            let content_len = self.line_content_len(line_idx);
+            let line_start = self.buffer().line_to_char(line_idx);
+            let mut cols = 0usize;
+            let mut all_blank = true;
+            for j in 0..content_len {
+                match self.buffer().content.char(line_start + j) {
+                    ' ' => cols += 1,
+                    '\t' => cols += ts - (cols % ts),
+                    _ => {
+                        all_blank = false;
+                        break;
+                    }
                 }
             }
-            min_indent = min_indent.min(visual_indent);
+            // Blank/whitespace-only lines shouldn't constrain removal.
+            if all_blank {
+                continue;
+            }
+            min_indent = min_indent.min(cols);
         }
 
         if min_indent == usize::MAX || min_indent == 0 {
@@ -5102,43 +6368,603 @@ impl Engine {
         let remove_cols = sw.min(min_indent);
 
         self.start_undo_group();
-        // Work backwards to avoid invalidating char positions
-        for i in (0..count).rev() {
+        for i in 0..count {
             let line_idx = start_line + i;
             if line_idx >= total {
-                continue;
+                break;
             }
+            let content_len = self.line_content_len(line_idx);
             let line_start = self.buffer().line_to_char(line_idx);
-            let line_content: String = self.buffer().content.line(line_idx).chars().collect();
-            let mut removed_visual = 0;
-            let mut removed_chars = 0;
-            for ch in line_content.chars() {
-                if removed_visual >= remove_cols {
-                    break;
-                }
-                match ch {
+            let mut cols = 0usize;
+            let mut ws_chars = 0usize;
+            for j in 0..content_len {
+                match self.buffer().content.char(line_start + j) {
                     ' ' => {
-                        removed_visual += 1;
-                        removed_chars += 1;
+                        cols += 1;
+                        ws_chars += 1;
                     }
                     '\t' => {
-                        let tab_width = sw - (removed_visual % sw);
-                        if removed_visual + tab_width > remove_cols {
-                            break; // don't partially remove a tab
-                        }
-                        removed_visual += tab_width;
-                        removed_chars += 1;
+                        cols += ts - (cols % ts);
+                        ws_chars += 1;
                     }
                     _ => break,
                 }
             }
-            if removed_chars > 0 {
-                self.delete_with_undo(line_start, line_start + removed_chars);
+            if ws_chars == 0 {
+                continue;
+            }
+            // Re-emit the reduced indent from scratch — like `indent_lines`,
+            // never incrementally strip characters — so a remaining tab gets
+            // converted to spaces under 'expandtab' instead of surviving
+            // untouched just because it wasn't the character actually
+            // removed (#883).
+            let new_cols = cols.saturating_sub(remove_cols);
+            let new_indent = if expand {
+                " ".repeat(new_cols)
+            } else {
+                format!(
+                    "{}{}",
+                    "\t".repeat(new_cols / ts),
+                    " ".repeat(new_cols % ts)
+                )
+            };
+            self.delete_with_undo(line_start, line_start + ws_chars);
+            if !new_indent.is_empty() {
+                self.insert_with_undo(line_start, &new_indent);
             }
         }
         self.finish_undo_group();
         if count > 0 {
             *changed = true;
+            // See `indent_lines`'s matching comment (#806, "mark:'[ after >>").
+            self.last_change_start = Some((start_line, 0));
+            let end_line = (start_line + count.saturating_sub(1)).min(total.saturating_sub(1));
+            let end_col = self.buffer().line_len_chars(end_line).saturating_sub(1);
+            self.last_change_end = Some((end_line, end_col));
+            // See `indent_lines`'s matching 'startofline' comment (#883),
+            // gated by `reposition_cursor` (#883 review).
+            if reposition_cursor {
+                self.view_mut().cursor.line = start_line;
+                if self.settings.startofline {
+                    self.move_cursor_to_first_non_blank(start_line);
+                } else {
+                    self.view_mut().cursor.col = self.col_for_vcol(start_line, target_vcol);
+                }
+            }
         }
     }
+
+    /// `H`'s target: the `count`'th line from the top of the window, kept at
+    /// least 'scrolloff' lines below the top edge (#805). Shared with `dH` so
+    /// the operator form honours its count too (#807).
+    pub(crate) fn screen_top_target(&self, count: usize) -> usize {
+        let scroll_top = self.view().scroll_top;
+        let viewport = self.view().viewport_lines.max(1);
+        let max_line = self.buffer().len_lines().saturating_sub(1);
+        let offset = count.saturating_sub(1).max(self.settings.scrolloff);
+        (scroll_top + offset)
+            .min(scroll_top + viewport.saturating_sub(1))
+            .min(max_line)
+    }
+
+    /// `L`'s target: the `count`'th line from the bottom of the window — the
+    /// mirror of [`Engine::screen_top_target`].
+    pub(crate) fn screen_bottom_target(&self, count: usize) -> usize {
+        let scroll_top = self.view().scroll_top;
+        let viewport = self.view().viewport_lines.max(1);
+        let max_line = self.buffer().len_lines().saturating_sub(1);
+        let window_bottom = scroll_top + viewport - 1;
+        let offset = count.saturating_sub(1).max(self.settings.scrolloff);
+        window_bottom
+            .saturating_sub(offset)
+            .max(scroll_top)
+            .min(max_line)
+    }
+
+    /// Park the cursor on `line`'s first non-blank column.
+    pub(crate) fn move_cursor_to_first_non_blank(&mut self, line: usize) {
+        let line = line.min(self.buffer().len_lines().saturating_sub(1));
+        self.view_mut().cursor.line = line;
+        self.view_mut().cursor.col = self.first_non_blank_col(line);
+    }
+
+    /// Land the cursor on `line` for `G`/`gg`/`H`/`M`/`L` — Vim's
+    /// `'startofline'` option names all five. `curswant` is already `None`
+    /// here (these keys aren't in `update_curswant_for_key`'s preserved
+    /// list), so unlike the `<C-d>`-family helper
+    /// (`land_vertical_scroll_cursor`) there is no remembered column to fall
+    /// back on when the option is off — the baseline behavior is simply
+    /// "leave the actual column alone, clamped to the new line".
+    pub(crate) fn land_line_jump_cursor(&mut self, line: usize) {
+        if self.settings.startofline {
+            self.move_cursor_to_first_non_blank(line);
+        } else {
+            self.view_mut().cursor.line = line;
+            self.clamp_cursor_col();
+        }
+    }
+}
+
+/// Minimal recursive-descent integer arithmetic parser backing
+/// [`Engine::eval_expr_register`] — `:h expr-register`, scoped down to
+/// `+ - * / %`, unary minus, and parens (#806). `/` and `%` truncate toward
+/// zero, matching Vimscript integer division.
+fn eval_expr_register_arith(src: &str) -> Result<i64, String> {
+    struct Parser<'a> {
+        chars: std::iter::Peekable<std::str::Chars<'a>>,
+    }
+
+    impl Parser<'_> {
+        fn skip_ws(&mut self) {
+            while matches!(self.chars.peek(), Some(c) if c.is_whitespace()) {
+                self.chars.next();
+            }
+        }
+
+        fn expr(&mut self) -> Result<i64, String> {
+            let mut val = self.term()?;
+            loop {
+                self.skip_ws();
+                match self.chars.peek() {
+                    Some('+') => {
+                        self.chars.next();
+                        val += self.term()?;
+                    }
+                    Some('-') => {
+                        self.chars.next();
+                        val -= self.term()?;
+                    }
+                    _ => break,
+                }
+            }
+            Ok(val)
+        }
+
+        fn term(&mut self) -> Result<i64, String> {
+            let mut val = self.unary()?;
+            loop {
+                self.skip_ws();
+                match self.chars.peek() {
+                    Some('*') => {
+                        self.chars.next();
+                        val *= self.unary()?;
+                    }
+                    Some('/') => {
+                        self.chars.next();
+                        let rhs = self.unary()?;
+                        if rhs == 0 {
+                            return Err("divide by zero".to_string());
+                        }
+                        val /= rhs;
+                    }
+                    Some('%') => {
+                        self.chars.next();
+                        let rhs = self.unary()?;
+                        if rhs == 0 {
+                            return Err("divide by zero".to_string());
+                        }
+                        val %= rhs;
+                    }
+                    _ => break,
+                }
+            }
+            Ok(val)
+        }
+
+        fn unary(&mut self) -> Result<i64, String> {
+            self.skip_ws();
+            match self.chars.peek() {
+                Some('-') => {
+                    self.chars.next();
+                    Ok(-self.unary()?)
+                }
+                Some('+') => {
+                    self.chars.next();
+                    self.unary()
+                }
+                _ => self.atom(),
+            }
+        }
+
+        fn atom(&mut self) -> Result<i64, String> {
+            self.skip_ws();
+            if let Some('(') = self.chars.peek() {
+                self.chars.next();
+                let val = self.expr()?;
+                self.skip_ws();
+                if self.chars.peek() == Some(&')') {
+                    self.chars.next();
+                } else {
+                    return Err("expected ')'".to_string());
+                }
+                return Ok(val);
+            }
+            let mut digits = String::new();
+            while matches!(self.chars.peek(), Some(c) if c.is_ascii_digit()) {
+                digits.push(self.chars.next().unwrap());
+            }
+            if digits.is_empty() {
+                return Err("expected a number".to_string());
+            }
+            digits.parse::<i64>().map_err(|e| e.to_string())
+        }
+    }
+
+    let mut parser = Parser {
+        chars: src.chars().peekable(),
+    };
+    let val = parser.expr()?;
+    parser.skip_ws();
+    if parser.chars.peek().is_some() {
+        return Err("trailing characters in expression".to_string());
+    }
+    Ok(val)
+}
+
+// ---------------------------------------------------------------------------
+// Char classes for the `iw`/`aw`/`iW`/`aW` text objects (#807)
+//
+// Vim groups characters into blanks, word characters and punctuation; a
+// "word" for `iw` is one maximal run of a single class, which is why `diw` on
+// the `.` of `foo.bar` deletes only the dot. `iW` collapses word and
+// punctuation into one class. A newline is its own class so runs never span
+// lines.
+// ---------------------------------------------------------------------------
+
+pub(crate) const CLASS_NL: u8 = 0;
+pub(crate) const CLASS_BLANK: u8 = 1;
+const CLASS_WORD: u8 = 2;
+const CLASS_PUNCT: u8 = 3;
+
+fn char_class(c: char) -> u8 {
+    if c == '\n' {
+        CLASS_NL
+    } else if c.is_whitespace() {
+        CLASS_BLANK
+    } else if is_word_char(c) {
+        CLASS_WORD
+    } else {
+        CLASS_PUNCT
+    }
+}
+
+fn bigword_class(c: char) -> u8 {
+    match char_class(c) {
+        CLASS_PUNCT => CLASS_WORD,
+        other => other,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// `<C-a>` / `<C-x>` — a port of Vim's `do_addsub()` + `vim_str2nr()` (#807)
+//
+// The pre-#807 implementation parsed into `i64` and reformatted with Rust's
+// `{}`/`{:x}`, which got five separate things wrong: it dropped leading zeros
+// (`009` → `1`), always treated a leading-zero run as octal even though
+// Neovim's default 'nrformats' is `bin,hex` (`0099<C-x>` underflowed to
+// `1777777777777777777777`), had no binary support, lost the case of hex
+// digits and of the `0X` prefix, and could not represent Vim's u64 wraparound
+// (`0x0<C-x>` → `0xffffffffffffffff`).  Vim's arithmetic is **unsigned 64-bit
+// plus a separate sign flag**, so that is what this models.
+// ---------------------------------------------------------------------------
+
+/// Vim's 'nrformats'.  VimCode has no setting for it yet and pins Neovim's
+/// default (`bin,hex` — note Vim's own default additionally includes `octal`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct NrFormats {
+    pub bin: bool,
+    pub oct: bool,
+    pub hex: bool,
+    pub alpha: bool,
+}
+
+impl Default for NrFormats {
+    fn default() -> Self {
+        Self {
+            bin: true,
+            oct: false,
+            hex: true,
+            alpha: false,
+        }
+    }
+}
+
+fn is_bin_digit(c: char) -> bool {
+    c == '0' || c == '1'
+}
+
+/// Char at `i`, or `'\0'` past the end — mirrors C string indexing so the
+/// ported bounds conditions stay readable.
+fn at(chars: &[char], i: usize) -> char {
+    chars.get(i).copied().unwrap_or('\0')
+}
+
+/// Parsed shape of a numeric literal, as produced by Vim's `vim_str2nr()`.
+struct ParsedNum {
+    /// `Some('x' | 'X' | 'b' | 'B')` for a prefixed literal, `Some('0')` for
+    /// octal, `None` for plain decimal.
+    pre: Option<char>,
+    /// Characters consumed, *including* any leading sign and prefix.
+    len: usize,
+    /// Magnitude, ignoring the sign.
+    value: u64,
+    /// The literal did not fit in a `u64` and was saturated to `u64::MAX`.
+    overflow: bool,
+}
+
+/// Port of `vim_str2nr()`, limited to what `do_addsub` asks of it.
+/// Parses at most `maxlen` characters starting at `start`.
+fn str2nr(chars: &[char], start: usize, nf: NrFormats, maxlen: usize) -> ParsedNum {
+    let end = (start + maxlen).min(chars.len());
+    let get = |i: usize| -> char {
+        if i < end {
+            at(chars, i)
+        } else {
+            '\0'
+        }
+    };
+    let mut i = start;
+    if get(i) == '-' || get(i) == '+' {
+        i += 1;
+    }
+    let mut pre = None;
+    if get(i) == '0' {
+        let c1 = get(i + 1);
+        let prefixed = (nf.hex && (c1 == 'x' || c1 == 'X') && get(i + 2).is_ascii_hexdigit())
+            || (nf.bin && (c1 == 'b' || c1 == 'B') && is_bin_digit(get(i + 2)));
+        if prefixed {
+            pre = Some(c1);
+            i += 2;
+        } else if nf.oct && c1 != '8' && c1 != '9' {
+            // Octal only when every following digit is in 0..=7; a trailing
+            // `8`/`9` makes the whole run decimal again.
+            let mut j = i + 1;
+            while ('0'..='7').contains(&get(j)) {
+                j += 1;
+            }
+            if get(j) != '8' && get(j) != '9' {
+                pre = Some('0');
+            }
+        }
+    }
+    let radix: u32 = match pre {
+        Some('x') | Some('X') => 16,
+        Some('b') | Some('B') => 2,
+        Some('0') => 8,
+        _ => 10,
+    };
+    let mut value: u64 = 0;
+    let mut overflow = false;
+    let mut any = false;
+    while let Some(d) = get(i).to_digit(radix) {
+        any = true;
+        value = match value
+            .checked_mul(radix as u64)
+            .and_then(|v| v.checked_add(d as u64))
+        {
+            Some(v) => v,
+            None => {
+                overflow = true;
+                u64::MAX
+            }
+        };
+        i += 1;
+    }
+    if !any {
+        // e.g. a bare `0x` with no hex digits — `pre` was never set in that
+        // case, so this only happens on an empty run.
+        return ParsedNum {
+            pre: None,
+            len: 0,
+            value: 0,
+            overflow: false,
+        };
+    }
+    ParsedNum {
+        pre,
+        len: i - start,
+        value,
+        overflow,
+    }
+}
+
+/// Port of Vim's `do_addsub()` for a single line.
+///
+/// `chars` is the line without its trailing newline, `cursor_col` the char
+/// index the operation starts from, `delta` the signed amount (`<C-x>` passes
+/// a negative value), and `sel` the length of the Visual-mode selection on
+/// this line (`None` in Normal mode).
+///
+/// Returns `(replace_start, replace_len, new_text)`, or `None` when there is
+/// no number to change.
+pub(crate) fn addsub_in_line(
+    chars: &[char],
+    cursor_col: usize,
+    delta: i64,
+    nf: NrFormats,
+    sel: Option<usize>,
+) -> Option<(usize, usize, String)> {
+    if chars.is_empty() || delta == 0 {
+        return None;
+    }
+    let visual = sel.is_some();
+    let mut col = cursor_col.min(chars.len());
+
+    if !visual {
+        // Vim scans backwards over binary then hexadecimal digits so the
+        // cursor can sit anywhere *inside* a `0x..`/`0b..` literal, then
+        // rescans decimally when that overshot a plain decimal number.
+        if nf.bin {
+            while col > 0 && is_bin_digit(at(chars, col)) {
+                col -= 1;
+            }
+        }
+        if nf.hex {
+            while col > 0 && at(chars, col).is_ascii_hexdigit() {
+                col -= 1;
+            }
+        }
+        let on_hex_prefix = |c: usize| {
+            c > 0
+                && (at(chars, c) == 'x' || at(chars, c) == 'X')
+                && at(chars, c - 1) == '0'
+                && at(chars, c + 1).is_ascii_hexdigit()
+        };
+        let on_bin_prefix = |c: usize| {
+            c > 0
+                && (at(chars, c) == 'b' || at(chars, c) == 'B')
+                && at(chars, c - 1) == '0'
+                && is_bin_digit(at(chars, c + 1))
+        };
+        if nf.bin && nf.hex && !on_hex_prefix(col) {
+            // Binary/hex pattern overlap (`0b101` is also valid hex) — rescan.
+            col = cursor_col.min(chars.len());
+            while col > 0 && at(chars, col).is_ascii_digit() {
+                col -= 1;
+            }
+        }
+        if (nf.hex && on_hex_prefix(col)) || (nf.bin && on_bin_prefix(col)) {
+            col -= 1;
+        } else {
+            // Search forward for a digit, then back to the start of its run.
+            col = cursor_col.min(chars.len());
+            while col < chars.len()
+                && !at(chars, col).is_ascii_digit()
+                && !(nf.alpha && at(chars, col).is_ascii_alphabetic())
+            {
+                col += 1;
+            }
+            while col > 0
+                && at(chars, col - 1).is_ascii_digit()
+                && !(nf.alpha && at(chars, col).is_ascii_alphabetic())
+            {
+                col -= 1;
+            }
+        }
+    }
+
+    let mut negative = false;
+    let mut remaining = sel.unwrap_or(usize::MAX);
+    if let Some(sel_len) = sel {
+        // Confine the forward search to the selection.
+        let pos_col = cursor_col;
+        remaining = sel_len;
+        while col < chars.len()
+            && remaining > 0
+            && !at(chars, col).is_ascii_digit()
+            && !(nf.alpha && at(chars, col).is_ascii_alphabetic())
+        {
+            col += 1;
+            remaining -= 1;
+        }
+        if remaining == 0 || col >= chars.len() {
+            return None;
+        }
+        // Only a `-` that is itself selected acts as a sign.
+        if col > pos_col && at(chars, col - 1) == '-' {
+            negative = true;
+        }
+    }
+
+    let firstdigit = at(chars, col);
+    if !firstdigit.is_ascii_digit() && !(nf.alpha && firstdigit.is_ascii_alphabetic()) {
+        return None;
+    }
+
+    if !visual && col > 0 && at(chars, col - 1) == '-' {
+        col -= 1;
+        negative = true;
+        remaining = usize::MAX;
+    }
+
+    let maxlen = if visual {
+        remaining.min(chars.len() - col)
+    } else {
+        chars.len() - col
+    };
+    let parsed = str2nr(chars, col, nf, maxlen);
+    if parsed.len == 0 {
+        return None;
+    }
+    let mut len = parsed.len;
+    // A leading `-` is not part of a hex/octal/binary literal: leave it in the
+    // buffer and rewrite only the digits (`-0x1<C-a>` → `-0x2`).
+    if !visual && parsed.pre.is_some() && negative {
+        col += 1;
+        len -= 1;
+        negative = false;
+    }
+
+    let mut subtract = delta < 0;
+    let amount = delta.unsigned_abs();
+    if negative {
+        subtract = !subtract;
+    }
+    let oldn = parsed.value;
+    let mut n = if subtract {
+        oldn.wrapping_sub(amount)
+    } else {
+        oldn.wrapping_add(amount)
+    };
+    if parsed.pre.is_none() {
+        // Decimal wraps through zero into the opposite sign; the prefixed
+        // formats just wrap modulo 2^64 (`0x0<C-x>` → `0xffffffffffffffff`).
+        if subtract {
+            if n > oldn {
+                n = 1u64.wrapping_add(!n);
+                negative = !negative;
+            }
+        } else if n < oldn {
+            n = !n;
+            negative = !negative;
+        }
+        if n == 0 {
+            negative = false;
+        }
+    }
+    if parsed.overflow {
+        // Vim leaves a literal too big for u64 saturated at u64::MAX.
+        n = u64::MAX;
+        negative = false;
+    }
+
+    // Take the case of the *last* alphabetic character in the literal — that
+    // is how Vim decides `0xaB` → `0xAC` but `0xAb` → `0xac`.
+    let mut hexupper = false;
+    for c in chars.iter().skip(col).take(len) {
+        if c.is_ascii_alphabetic() {
+            hexupper = c.is_ascii_uppercase();
+        }
+    }
+
+    let mut lead = String::new();
+    let mut width = len;
+    if negative {
+        lead.push('-');
+    }
+    if let Some(p) = parsed.pre {
+        lead.push('0');
+        width -= 1;
+        if p != '0' {
+            lead.push(p);
+            width -= 1;
+        }
+    }
+    let digits = match parsed.pre {
+        Some('b') | Some('B') => format!("{n:b}"),
+        Some('0') => format!("{n:o}"),
+        Some('x') | Some('X') if hexupper => format!("{n:X}"),
+        Some('x') | Some('X') => format!("{n:x}"),
+        _ => format!("{n}"),
+    };
+    width = width.saturating_sub(digits.chars().count());
+    // Keep the total width by re-padding with zeros, unless that would make
+    // the result look like an octal literal when 'nrformats' includes octal.
+    if firstdigit == '0' && !(nf.oct && parsed.pre.is_none()) {
+        for _ in 0..width {
+            lead.push('0');
+        }
+    }
+    lead.push_str(&digits);
+    Some((col, len, lead))
 }

@@ -1,16 +1,82 @@
+//! Integrated-terminal engine operations (panes, tabs, mouse, selection).
+//!
+//! ## Design note (#564): why terminal selection does *not* use
+//! `quadraui::dispatch::TextRegion` / `DragTarget::TextSelection`
+//!
+//! #564 asked whether the integrated terminal's click-drag text selection
+//! should be re-routed through quadraui's generic selectable-region
+//! pipeline (`Backend::register_text_region` +
+//! `dispatch::{dispatch_click, dispatch_mouse_drag}` +
+//! `DragTarget::TextSelection` + `UiEvent::TextSelectionChanged` /
+//! `TextCopied`, as demoed in `examples/common/selection_app.rs`). After
+//! reviewing that pipeline against what's already here, the answer is no —
+//! this pane already delegates the exact same responsibility to a
+//! **better-fitted** quadraui abstraction:
+//!
+//! - Selection state is [`TermSelection`], a re-export of
+//!   `quadraui::terminal_engine::TerminalSelection` — already a
+//!   quadraui-owned type, not a bespoke vimcode one.
+//! - The forward-vs-select gate (`mouse_reporting_enabled` /
+//!   `should_forward_mouse` / `forward_mouse`) is entirely inside
+//!   `quadraui::terminal_engine::TerminalSession` — this file only calls
+//!   it, per the doc comments below.
+//! - Selection highlight painting and text extraction
+//!   (`selected_text()`/`build_rows()`) are done in quadraui's
+//!   `terminal_engine`, using **display-row** coordinates that already
+//!   account for scrollback (`scroll_offset`) — both backends reach them
+//!   only through `Backend::draw_terminal`, so there is zero paint code
+//!   here or in `src/gtk/` / `src/tui_main/` for this.
+//!
+//! The generic `TextRegion` mechanism models a *fixed-bounds, currently
+//! painted* rectangle of `lines: Vec<String>` with anchor/focus expressed
+//! as screen `Point`s — it has no notion of scrollback. Routing terminal
+//! selection through it would mean translating `Point` anchor/focus back
+//! into `TerminalSelection`'s row/col space on every drag update (the
+//! `Point` round-trip `text_selection_line_range` produces would need to be
+//! re-mapped through `scroll_offset` anyway), for no behavioral gain — it
+//! would only add an indirection layer around a type that already fits.
+//! Confirming this isn't a vimcode-only view: quadraui's own canonical
+//! terminal reference (`examples/common/terminal_app.rs`, cited below as
+//! the gold standard these methods mirror) does not use `TextRegion` for
+//! terminal selection either — it only uses the generic dispatch pipeline
+//! for its scrollbar drag, and leaves PTY forwarding / local selection to
+//! `TerminalSession` directly, exactly as this file does.
+//!
+//! `TextRegion` *is* the right tool where a panel is a plain, non-scrolling
+//! text surface unrelated to a PTY (see `selection_app.rs`); the doc
+//! comment on [`Backend::cancel_text_selection_drag`] in quadraui even
+//! covers the composability case of such a panel sitting *next to* an
+//! embedded terminal. That's not this pane's situation — the terminal's
+//! own screen is the selectable surface, and it already has a
+//! purpose-built quadraui type for that. See also
+//! `docs/QUADRAUI_GUIDE.md` § "Terminal selection stays on
+//! `TerminalSelection`, not `TextRegion` (#564)".
+//!
+//! No quadraui-side gap exists here, so no quadraui issue was filed for
+//! this half of #508's follow-up work. #565 (routing the *editor's*
+//! visual-selection drag-origin arbitration through `DragTarget`) is a
+//! different, still-open question — that one is about document-model
+//! drag state across split windows, not terminal cell selection, and is
+//! unaffected by this note.
+
 use super::*;
+use crate::core::terminal::TermSelection;
 
 impl Engine {
     // ── Integrated Terminal ────────────────────────────────────────────────
 
-    /// Get a reference to the active terminal pane, if any.
-    pub fn active_terminal(&self) -> Option<&TerminalPane> {
-        self.terminal_panes.get(self.terminal_active)
+    /// Get a reference to the active terminal session, if any.
+    pub fn active_terminal(&self) -> Option<&TerminalSession> {
+        self.terminal_panes
+            .get(self.terminal_active)
+            .map(|s| &s.session)
     }
 
-    /// Get a mutable reference to the active terminal pane, if any.
-    pub fn active_terminal_mut(&mut self) -> Option<&mut TerminalPane> {
-        self.terminal_panes.get_mut(self.terminal_active)
+    /// Get a mutable reference to the active terminal session, if any.
+    pub fn active_terminal_mut(&mut self) -> Option<&mut TerminalSession> {
+        self.terminal_panes
+            .get_mut(self.terminal_active)
+            .map(|s| &mut s.session)
     }
 
     /// Open the terminal panel. If no panes exist, create the first one.
@@ -35,9 +101,12 @@ impl Engine {
         let shell = default_shell();
         let cwd = dir.unwrap_or(&self.cwd).to_path_buf();
         let history_cap = self.settings.terminal_scrollback_lines;
-        match TerminalPane::new(cols, rows, &shell, &cwd, history_cap) {
-            Ok(pane) => {
-                self.terminal_panes.push(pane);
+        match TerminalSession::spawn(cols, rows, &shell, &cwd, history_cap) {
+            Ok(sess) => {
+                self.terminal_panes.push(TerminalSlot {
+                    session: sess,
+                    install_ctx: None,
+                });
                 self.terminal_active = self.terminal_panes.len() - 1;
                 self.terminal_open = true;
                 self.terminal_has_focus = true;
@@ -48,15 +117,39 @@ impl Engine {
 
     /// Run a command in a new terminal pane (visible to the user).
     /// Used for extension installs so the user can see progress, errors, and enter
-    /// sudo passwords. The pane waits for Enter after the command finishes.
+    /// sudo passwords. The pane waits for Enter after the command finishes, then
+    /// the shell **exits** so `poll_terminal` detects `is_exited()` and calls
+    /// `finalize_install_from_terminal` to register the LSP/DAP server.
+    ///
+    /// Spawns an interactive shell via the quadraui `TerminalSession` primitive, then
+    /// immediately injects the wrapped command into the PTY so the shell executes it.
+    /// The wrapper ends with `exit` / `Exit` so the shell process exits after Enter —
+    /// without that suffix the interactive shell would return to its PS1 prompt and
+    /// `is_exited()` would never fire, leaving the install context unregistered.
     pub fn terminal_run_command(&mut self, command: &str, cols: u16, rows: u16) {
         let cwd = self.cwd.clone();
         let history_cap = self.settings.terminal_scrollback_lines;
-        // Extract install context from pending_install_context (set by ext_install_from_registry).
+        // Extract install context set by ext_install_from_registry.
         let ctx = self.pending_install_context.take();
-        match TerminalPane::new_command(cols, rows, command, &cwd, history_cap, ctx) {
-            Ok(pane) => {
-                self.terminal_panes.push(pane);
+        let shell = default_shell();
+        let is_powershell =
+            shell.to_lowercase().contains("powershell") || shell.to_lowercase().contains("pwsh");
+        // Build a wrapper script that runs the command, shows the exit status, waits
+        // for Enter, then exits the shell so `TerminalSession::is_exited()` fires and
+        // `poll_terminal` can call `finalize_install_from_terminal`.
+        let wrapped = build_terminal_install_wrapper(command, is_powershell);
+        match TerminalSession::spawn(cols, rows, &shell, &cwd, history_cap) {
+            Ok(mut sess) => {
+                // Inject the wrapped command immediately.  The PTY master writer is
+                // ready as soon as `spawn` returns — the kernel PTY subsystem buffers
+                // the bytes and the shell reads them from its stdin when it starts
+                // processing input, so there is no race between this write and the
+                // shell's readiness.
+                sess.write_input(wrapped.as_bytes());
+                self.terminal_panes.push(TerminalSlot {
+                    session: sess,
+                    install_ctx: ctx,
+                });
                 self.terminal_active = self.terminal_panes.len() - 1;
                 self.terminal_open = true;
                 self.terminal_has_focus = true;
@@ -93,8 +186,13 @@ impl Engine {
             let shell = default_shell();
             let cwd = self.cwd.clone();
             for _ in 0..2 {
-                match TerminalPane::new(half_cols, rows, &shell, &cwd, history_cap) {
-                    Ok(pane) => self.terminal_panes.push(pane),
+                match TerminalSession::spawn(half_cols, rows, &shell, &cwd, history_cap) {
+                    Ok(sess) => {
+                        self.terminal_panes.push(TerminalSlot {
+                            session: sess,
+                            install_ctx: None,
+                        });
+                    }
                     Err(e) => {
                         self.message = format!("terminal: failed to open PTY: {e}");
                         return;
@@ -105,11 +203,16 @@ impl Engine {
             self.terminal_has_focus = true;
         } else if self.terminal_panes.len() == 1 {
             // Resize existing pane to half-width, then spawn a second.
-            self.terminal_panes[0].resize(half_cols, rows);
+            self.terminal_panes[0].session.resize(half_cols, rows);
             let shell = default_shell();
             let cwd = self.cwd.clone();
-            match TerminalPane::new(half_cols, rows, &shell, &cwd, history_cap) {
-                Ok(pane) => self.terminal_panes.push(pane),
+            match TerminalSession::spawn(half_cols, rows, &shell, &cwd, history_cap) {
+                Ok(sess) => {
+                    self.terminal_panes.push(TerminalSlot {
+                        session: sess,
+                        install_ctx: None,
+                    });
+                }
                 Err(e) => {
                     self.message = format!("terminal: failed to open PTY: {e}");
                     return;
@@ -117,8 +220,8 @@ impl Engine {
             }
         } else {
             // Two or more panes exist — resize the first two to half-width.
-            self.terminal_panes[0].resize(half_cols, rows);
-            self.terminal_panes[1].resize(half_cols, rows);
+            self.terminal_panes[0].session.resize(half_cols, rows);
+            self.terminal_panes[1].session.resize(half_cols, rows);
         }
         self.terminal_split = true;
         self.terminal_active = 1; // right pane gets focus
@@ -131,8 +234,8 @@ impl Engine {
         self.terminal_split = false;
         self.terminal_split_left_cols = 0;
         // Resize whatever is now the active pane to full width.
-        if let Some(pane) = self.terminal_panes.get_mut(self.terminal_active) {
-            pane.resize(full_cols, rows);
+        if let Some(slot) = self.terminal_panes.get_mut(self.terminal_active) {
+            slot.session.resize(full_cols, rows);
         }
     }
 
@@ -164,8 +267,8 @@ impl Engine {
     pub fn terminal_split_finalize_drag(&mut self, left_cols: u16, right_cols: u16, rows: u16) {
         self.terminal_split_left_cols = 0;
         if self.terminal_panes.len() >= 2 {
-            self.terminal_panes[0].resize(left_cols, rows);
-            self.terminal_panes[1].resize(right_cols, rows);
+            self.terminal_panes[0].session.resize(left_cols, rows);
+            self.terminal_panes[1].session.resize(right_cols, rows);
         }
     }
 
@@ -208,42 +311,199 @@ impl Engine {
         Some(zone)
     }
 
-    /// Handle a content click on a non-split terminal pane. Focuses the
-    /// terminal, resets scrollback, and starts a zero-length selection
-    /// at `(col, row)` (0-based cells within the pane). Backends call
-    /// this when there is no `TerminalSplitLayout` cached — in the split
-    /// case, [`Self::handle_terminal_split_click`] delegates here after
-    /// setting the active pane (#429).
-    pub fn handle_terminal_pane_click(&mut self, col: u16, row: u16) {
+    /// Handle a mouse-button press on a non-split terminal pane.
+    ///
+    /// **Forwarding first**: when the child process has enabled SGR mouse
+    /// reporting (`mouse_reporting_enabled()`) the click is forwarded as an
+    /// SGR-1006 `Press` byte sequence and the function returns `true`.  In
+    /// that case no local selection is started — the inner app owns the
+    /// pointer.
+    ///
+    /// **Local fallback**: when forwarding returns `false` (ordinary shell on
+    /// the primary screen) the function focuses the terminal, resets any
+    /// scrollback offset, and starts a zero-length selection at `(col, row)`
+    /// (0-based cells within the pane).
+    ///
+    /// Backends call this for every left- (or right-) click in the content
+    /// area, passing the cell coordinates they already had to translate from
+    /// their native pixel / cell space.  The forwarding policy lives entirely
+    /// here — no backend-specific branching needed.
+    ///
+    /// Returns `true` when the event was forwarded to the child process.
+    ///
+    /// # Gold standard
+    /// Mirrors `examples/common/terminal_app.rs` `UiEvent::MouseDown` arm
+    /// (quadraui#279/#365) — zero backend-specific code.
+    pub fn handle_terminal_pane_press(
+        &mut self,
+        col: u16,
+        row: u16,
+        button: quadraui::MouseButton,
+        mods: quadraui::Modifiers,
+    ) -> bool {
+        use quadraui::terminal_engine::TerminalMouseKind;
         self.terminal_has_focus = true;
         self.terminal_scroll_reset();
-        if let Some(term) = self.active_terminal_mut() {
-            term.selection = Some(crate::core::terminal::TermSelection {
-                start_row: row,
-                start_col: col,
-                end_row: row,
-                end_col: col,
-            });
+        // Try to forward to the child first.  `forward_mouse` checks
+        // `should_forward_mouse(Press)` which is gated on
+        // `mouse_reporting_enabled()` only (not alt-screen — clicks are
+        // only forwarded when the child explicitly asked for them).
+        let forwarded = if let Some(term) = self.active_terminal_mut() {
+            term.forward_mouse(TerminalMouseKind::Press, button, col, row, mods)
+        } else {
+            false
+        };
+        if !forwarded {
+            // Local selection start.
+            if let Some(term) = self.active_terminal_mut() {
+                term.selection = Some(TermSelection {
+                    start_row: row,
+                    start_col: col,
+                    end_row: row,
+                    end_col: col,
+                });
+            }
         }
+        forwarded
+    }
+
+    /// Backward-compat wrapper: press with left button and no modifiers.
+    ///
+    /// Callers that don't have button/modifier info (e.g. split-click
+    /// helpers) use this.  New code should prefer
+    /// [`handle_terminal_pane_press`](Self::handle_terminal_pane_press).
+    #[allow(dead_code)]
+    pub fn handle_terminal_pane_click(&mut self, col: u16, row: u16) {
+        self.handle_terminal_pane_press(
+            col,
+            row,
+            quadraui::MouseButton::Left,
+            quadraui::Modifiers::default(),
+        );
+    }
+
+    /// Update the active pane's selection endpoint during a mouse drag.
+    ///
+    /// **Forwarding first**: when the child has mouse reporting enabled the
+    /// drag is forwarded as a `Move` (button-held) event.  The inner app
+    /// sees the live pointer position and can act on it (e.g. select text
+    /// inside a nested vim).
+    ///
+    /// **Local fallback**: when forwarding returns `false` the endpoint of
+    /// the in-progress selection is extended to `(col, row)`.
+    ///
+    /// Both TUI and GTK call this with their pane-relative cell coordinates
+    /// — no backend-specific branching.
+    ///
+    /// # Gold standard
+    /// Mirrors the `UiEvent::MouseMoved { buttons: left, .. }` arm of
+    /// `examples/common/terminal_app.rs`.
+    pub fn handle_terminal_pane_drag(&mut self, col: u16, row: u16) {
+        use quadraui::terminal_engine::TerminalMouseKind;
+        let forwarded = if let Some(term) = self.active_terminal_mut() {
+            term.forward_mouse(
+                TerminalMouseKind::Move,
+                quadraui::MouseButton::Left,
+                col,
+                row,
+                quadraui::Modifiers::default(),
+            )
+        } else {
+            false
+        };
+        if !forwarded {
+            if let Some(term) = self.active_terminal_mut() {
+                if let Some(ref mut sel) = term.selection {
+                    sel.end_row = row;
+                    sel.end_col = col;
+                }
+            }
+        }
+    }
+
+    /// Handle a mouse-button release over the terminal content area.
+    ///
+    /// Forwards the release to the child when it has mouse reporting enabled
+    /// (matches `UiEvent::MouseUp` in `terminal_app.rs`), then auto-copies
+    /// any live selection to the clipboard via the engine's `clipboard_write`
+    /// callback.
+    ///
+    /// Returns `true` when text was copied to the clipboard.
+    ///
+    /// Currently both backends call [`Self::terminal_autocopy_selection`]
+    /// directly from their general mouse-release handler rather than routing
+    /// through this method (doing so would incorrectly forward releases that
+    /// originate outside the terminal panel to the child process).  This
+    /// method is infrastructure for a future terminal-specific release handler
+    /// that can safely pass the coordinates and button through.
+    #[allow(dead_code)]
+    pub fn handle_terminal_pane_release(
+        &mut self,
+        col: u16,
+        row: u16,
+        button: quadraui::MouseButton,
+    ) -> bool {
+        use quadraui::terminal_engine::TerminalMouseKind;
+        // Forward release to child when it owns the pointer.
+        if let Some(term) = self.active_terminal_mut() {
+            term.forward_mouse(
+                TerminalMouseKind::Release,
+                button,
+                col,
+                row,
+                quadraui::Modifiers::default(),
+            );
+        }
+        // Auto-copy selection to clipboard.
+        self.terminal_autocopy_selection()
+    }
+
+    /// Copy the active pane's current text selection to the clipboard via
+    /// the engine's `clipboard_write` callback.
+    ///
+    /// Called from [`handle_terminal_pane_release`] and by each backend on
+    /// mouse-up when the terminal has focus.  Returns `true` when text was
+    /// copied.
+    pub fn terminal_autocopy_selection(&mut self) -> bool {
+        if !self.terminal_has_focus {
+            return false;
+        }
+        let text = self.active_terminal().and_then(|t| t.selected_text());
+        if let Some(ref text) = text {
+            if let Some(ref cb) = self.clipboard_write {
+                let _ = cb(text);
+                return true;
+            }
+        }
+        false
     }
 
     /// Handle a click on the terminal content area using a
     /// `TerminalSplitHit` from the cached layout. Sets pane focus,
-    /// starts selection, or signals a divider drag. Returns `true` if
-    /// the caller should start a split-divider drag.
-    pub fn handle_terminal_split_click(&mut self, hit: quadraui::TerminalSplitHit) -> bool {
+    /// starts selection or forwards press, or signals a divider drag.
+    /// Returns `true` if the caller should start a split-divider drag.
+    ///
+    /// `button` and `mods` are forwarded to
+    /// [`handle_terminal_pane_press`](Self::handle_terminal_pane_press)
+    /// for the pane-hit branches.
+    pub fn handle_terminal_split_click(
+        &mut self,
+        hit: quadraui::TerminalSplitHit,
+        button: quadraui::MouseButton,
+        mods: quadraui::Modifiers,
+    ) -> bool {
         use quadraui::TerminalSplitHit;
         self.terminal_has_focus = true;
         match hit {
             TerminalSplitHit::Divider => true,
             TerminalSplitHit::LeftPane { col, row } => {
                 self.terminal_active = 0;
-                self.handle_terminal_pane_click(col, row);
+                self.handle_terminal_pane_press(col, row, button, mods);
                 false
             }
             TerminalSplitHit::RightPane { col, row } => {
                 self.terminal_active = 1;
-                self.handle_terminal_pane_click(col, row);
+                self.handle_terminal_pane_press(col, row, button, mods);
                 false
             }
             TerminalSplitHit::Scrollbar | TerminalSplitHit::Outside => false,
@@ -441,21 +701,22 @@ impl Engine {
         }
     }
 
-    /// Drain PTY output from all panes and update VT100 screens.
+    /// Drain PTY output from all sessions and update VT100 screens.
     /// Returns true if a redraw is needed.
-    /// Exited panes are automatically removed; closes the panel when the last pane exits.
+    /// Exited sessions are automatically removed; closes the panel when the last one exits.
     pub fn poll_terminal(&mut self) -> bool {
         let mut got_data = false;
-        for pane in &mut self.terminal_panes {
-            got_data |= pane.poll();
+        for slot in &mut self.terminal_panes {
+            got_data |= slot.session.poll();
         }
-        // Remove exited panes in reverse order (preserves earlier indices during removal).
+        // Remove exited sessions in reverse order (preserves earlier indices during removal).
         // For install panes, finalize the install (check binary, register LSP) before removing.
         let mut i = self.terminal_panes.len();
         while i > 0 {
             i -= 1;
-            if self.terminal_panes[i].exited {
-                if let Some(ctx) = self.terminal_panes[i].install_context.take() {
+            if self.terminal_panes[i].session.is_exited() {
+                let ctx = self.terminal_panes[i].install_ctx.take();
+                if let Some(ctx) = ctx {
                     self.finalize_install_from_terminal(&ctx);
                 }
                 self.terminal_panes.remove(i);
@@ -546,14 +807,40 @@ impl Engine {
         }
     }
 
+    /// Paste `text` into the active pane's PTY, then poll it so the echo
+    /// lands in the frame the caller is about to paint.
+    ///
+    /// Delegates the bracketed-paste decision to quadraui's
+    /// `TerminalSession::paste` (quadraui#343/#415), which wraps in
+    /// `ESC[200~ … ESC[201~` only when the child has actually enabled DEC
+    /// private mode 2004. Both call sites used to hand-roll an
+    /// *unconditional* wrap, which leaked literal `[200~` bytes into programs
+    /// that do not strip them (`cat`, `less`, a shell without a line editor).
+    pub fn terminal_paste(&mut self, text: &str) {
+        if let Some(term) = self.active_terminal_mut() {
+            term.paste(text);
+        }
+        self.poll_terminal();
+    }
+
     /// Resize all terminal panes (shared panel height).
     pub fn terminal_resize(&mut self, cols: u16, rows: u16) {
-        for pane in &mut self.terminal_panes {
-            pane.resize(cols, rows);
+        for slot in &mut self.terminal_panes {
+            slot.session.resize(cols, rows);
         }
     }
 
     /// Return selected terminal text from the active pane for clipboard copy.
+    ///
+    /// #732: GTK's only caller was the `Msg::TerminalCopySelection` arm, which
+    /// had no producer left after the #540 Relm4→ShellApp cutover (the
+    /// per-DrawingArea key controller that used to send it went with it), and
+    /// TUI has never called it — so the `vimcode` bin, which compiles `core` as
+    /// a private module, now reports it dead. Kept (rather than deleted with
+    /// the orphaned arm) because it is part of `vimcode_core`'s public surface
+    /// and is what a re-wired terminal-copy binding on either backend will
+    /// call; `#[allow]` documents that it is currently unreached, not unwanted.
+    #[allow(dead_code)]
     pub fn terminal_copy_selection(&mut self) -> Option<String> {
         self.active_terminal()?.selected_text()
     }
@@ -569,6 +856,95 @@ impl Engine {
     pub fn terminal_scroll_down(&mut self, rows: usize) {
         if let Some(term) = self.active_terminal_mut() {
             term.scroll_down(rows);
+        }
+    }
+
+    /// Route a scroll-wheel notch from a raw `UiEvent::Scroll` delta.
+    ///
+    /// Both the TUI and GTK backends emit `UiEvent::Scroll { delta, .. }`
+    /// through `quadraui::dispatch_scroll`, where the canonical sign is:
+    ///
+    /// - `delta_y < 0` → scroll **up** into history
+    /// - `delta_y > 0` → scroll **down** toward the live view
+    ///
+    /// This matches the convention in `examples/common/terminal_app.rs` and
+    /// the GTK `EventControllerScroll` / TUI `crossterm::ScrollUp` (which
+    /// vimcode maps to `delta_y = -1.0`).
+    ///
+    /// A step of `ceil(|delta_y| × 3)` rows mirrors the example app (3 rows
+    /// per notch).  The forward-vs-scroll policy is delegated to
+    /// [`terminal_wheel`](Self::terminal_wheel) which calls
+    /// `TerminalSession::forward_mouse` / `scroll_up` / `scroll_down`.
+    ///
+    /// Backends call this in **one line** from their
+    /// `"terminal_scrollback"` dispatch arm — no per-backend step
+    /// computation, sign reversal, or forwarding logic needed.  When
+    /// quadraui ships `TerminalSession::handle_wheel` (quadraui#365) this
+    /// method will thin further to a single delegation.
+    pub fn handle_terminal_scroll(&mut self, delta_y: f32) {
+        if delta_y == 0.0 {
+            return;
+        }
+        let step = (delta_y.abs() * 3.0).ceil() as usize;
+        let up = delta_y < 0.0;
+        self.terminal_wheel(up, step);
+    }
+
+    /// Route a mouse-wheel notch for the active terminal pane: forward it to
+    /// the child when the child owns the wheel (alt-screen / mouse reporting),
+    /// otherwise scroll local scrollback by `step` rows.
+    ///
+    /// Called by [`handle_terminal_scroll`](Self::handle_terminal_scroll)
+    /// which backends should prefer.  Direct callers pass a pre-computed
+    /// step count — use this when you already have `up`/`step` (e.g. tests).
+    ///
+    /// Mirrors quadraui's `examples/common/terminal_app.rs` scroll handler,
+    /// which composes `forward_mouse()` + `scroll_up/down` the same way.
+    /// The longer-term goal (quadraui#365) is to lift this into
+    /// `TerminalSession::handle_wheel`.
+    pub fn terminal_wheel(&mut self, up: bool, step: usize) {
+        if !self.terminal_forward_wheel(up) {
+            if up {
+                self.terminal_scroll_up(step);
+            } else {
+                self.terminal_scroll_down(step);
+            }
+        }
+    }
+
+    /// Forward a mouse-wheel notch to the active pane's child process when it
+    /// owns the alternate screen or has enabled mouse reporting (vim, less,
+    /// tmux, claude, …). Returns `true` when the wheel was written to the
+    /// child — in that case the caller MUST NOT scroll local scrollback.
+    /// Returns `false` for an ordinary shell (primary screen, no mouse
+    /// reporting), where the caller falls back to
+    /// [`terminal_scroll_up`](Self::terminal_scroll_up) /
+    /// [`terminal_scroll_down`](Self::terminal_scroll_down).
+    ///
+    /// quadraui gates this through `TerminalSession::should_forward_wheel()`
+    /// (#514 stress-test: a stray wheel must never leak the previous command's
+    /// output into the shell's scrollback while an app owns the alt-screen).
+    ///
+    /// Wheel events report at cell `(0, 0)`.  The pointer position for wheels
+    /// is not yet passed through — this is tracked as part of the full
+    /// `UiEvent` unification (quadraui#365).
+    pub fn terminal_forward_wheel(&mut self, up: bool) -> bool {
+        use quadraui::terminal_engine::TerminalMouseKind;
+        if let Some(term) = self.active_terminal_mut() {
+            let kind = if up {
+                TerminalMouseKind::WheelUp
+            } else {
+                TerminalMouseKind::WheelDown
+            };
+            term.forward_mouse(
+                kind,
+                quadraui::MouseButton::Left,
+                0,
+                0,
+                quadraui::Modifiers::default(),
+            )
+        } else {
+            false
         }
     }
 
@@ -617,8 +993,8 @@ impl Engine {
         if n > 0 {
             self.terminal_find_selected = (self.terminal_find_selected + 1) % n;
             let (req_offset, _, _) = self.terminal_find_matches[self.terminal_find_selected];
-            if let Some(term) = self.terminal_panes.get_mut(self.terminal_active) {
-                term.set_scroll_offset(req_offset);
+            if let Some(slot) = self.terminal_panes.get_mut(self.terminal_active) {
+                slot.session.set_scroll_offset(req_offset);
             }
         }
     }
@@ -629,21 +1005,24 @@ impl Engine {
         if n > 0 {
             self.terminal_find_selected = (self.terminal_find_selected + n - 1) % n;
             let (req_offset, _, _) = self.terminal_find_matches[self.terminal_find_selected];
-            if let Some(term) = self.terminal_panes.get_mut(self.terminal_active) {
-                term.set_scroll_offset(req_offset);
+            if let Some(slot) = self.terminal_panes.get_mut(self.terminal_active) {
+                slot.session.set_scroll_offset(req_offset);
             }
         }
     }
 
-    /// Scan the entire history buffer and the live vt100 screen, rebuilding
+    /// Scan the entire history buffer and the live screen, rebuilding
     /// `terminal_find_matches`.  Case-insensitive.
     ///
     /// Matches are `(required_scroll_offset, row, col)` where:
-    /// - History match at `history[H]`: required_offset = `history.len() - H`, row = 0.
+    /// - History match at history row H: required_offset = `history_len - H`, row = 0.
     ///   Formula: visible_row = row + current_offset − required_offset.
-    /// - Live match at vt100 row R:    required_offset = 0, row = R.
+    /// - Live match at screen row R:     required_offset = 0, row = R.
     ///
     /// Sorted oldest-first (highest required_offset first, then top-to-bottom).
+    ///
+    /// Uses the quadraui `TerminalSession` public API (`scrollback_text()` /
+    /// `screen_text()`) to avoid touching private `history` / `parser` fields.
     fn terminal_find_update_matches(&mut self) {
         self.terminal_find_matches.clear();
         if !self.terminal_find_active || self.terminal_find_query.is_empty() {
@@ -652,58 +1031,49 @@ impl Engine {
         let q_lower: Vec<char> = self.terminal_find_query.to_lowercase().chars().collect();
         let qlen = q_lower.len();
         let active_idx = self.terminal_active;
-        let term = match self.terminal_panes.get(active_idx) {
-            Some(t) => t,
+        let sess = match self.terminal_panes.get(active_idx) {
+            Some(slot) => &slot.session,
             None => return,
         };
 
         let mut matches: Vec<(usize, u16, u16)> = Vec::new();
-        let hist_len = term.history.len();
 
-        // ── History rows (oldest → newest) ──────────────────────────────────
-        for (hist_idx, hist_row) in term.history.iter().enumerate() {
-            let required_offset = hist_len - hist_idx;
-            let row_lower: Vec<char> = hist_row
-                .iter()
-                .map(|cell| {
-                    let ch = cell.ch;
-                    ch.to_lowercase().next().unwrap_or(ch)
-                })
-                .collect();
-            if qlen <= row_lower.len() {
-                for c in 0..=(row_lower.len() - qlen) {
-                    if row_lower[c..c + qlen] == q_lower[..] {
-                        matches.push((required_offset, 0, c as u16));
+        // ── History rows via scrollback_text() ──────────────────────────────
+        // hist_len is the total ring-buffer size (including any trailing blank rows
+        // that scrollback_text() drops). required_offset uses hist_len so that
+        // scroll navigation stays correct for all non-blank rows.
+        let hist_len = sess.history_len();
+        let scrollback = sess.scrollback_text();
+        if !scrollback.is_empty() {
+            for (hist_idx, hist_line) in scrollback.split('\n').enumerate() {
+                let required_offset = hist_len - hist_idx;
+                let row_lower: Vec<char> = hist_line
+                    .chars()
+                    .map(|ch| ch.to_lowercase().next().unwrap_or(ch))
+                    .collect();
+                if qlen <= row_lower.len() {
+                    for c in 0..=(row_lower.len() - qlen) {
+                        if row_lower[c..c + qlen] == q_lower[..] {
+                            matches.push((required_offset, 0, c as u16));
+                        }
                     }
                 }
             }
         }
 
-        // ── Live vt100 rows (always at scrollback_offset = 0) ───────────────
-        let cols = term.cols;
-        let rows = term.rows;
-        let screen = term.parser.screen();
-        for r in 0..rows {
-            let row_lower: Vec<char> = (0..cols)
-                .map(|c| {
-                    let ch = screen
-                        .cell(r, c)
-                        .map(|cell| {
-                            let s = cell.contents();
-                            if s.is_empty() {
-                                ' '
-                            } else {
-                                s.chars().next().unwrap_or(' ')
-                            }
-                        })
-                        .unwrap_or(' ');
-                    ch.to_lowercase().next().unwrap_or(ch)
-                })
-                .collect();
-            if qlen <= row_lower.len() {
-                for c in 0..=(row_lower.len() - qlen) {
-                    if row_lower[c..c + qlen] == q_lower[..] {
-                        matches.push((0, r, c as u16));
+        // ── Live screen rows via screen_text() ──────────────────────────────
+        let screen_str = sess.screen_text();
+        if !screen_str.is_empty() {
+            for (r, line) in screen_str.split('\n').enumerate() {
+                let row_lower: Vec<char> = line
+                    .chars()
+                    .map(|ch| ch.to_lowercase().next().unwrap_or(ch))
+                    .collect();
+                if qlen <= row_lower.len() {
+                    for c in 0..=(row_lower.len() - qlen) {
+                        if row_lower[c..c + qlen] == q_lower[..] {
+                            matches.push((0, r as u16, c as u16));
+                        }
                     }
                 }
             }
@@ -830,6 +1200,45 @@ impl Engine {
     }
 }
 
+/// Build the PTY-injected wrapper script for `terminal_run_command`.
+///
+/// Wraps `command` in a shell fragment that:
+/// 1. Runs the command.
+/// 2. Prints a colour-coded success/failure banner.
+/// 3. Prints "Press Enter to close…" and waits for the user.
+/// 4. **Exits the shell** — without this final `exit` / `Exit`, the interactive
+///    shell returns to its PS1 prompt and `TerminalSession::is_exited()` never
+///    fires, so `poll_terminal` would never call `finalize_install_from_terminal`
+///    and the LSP/DAP server would never be registered.
+///
+/// Extracted as a pure function so the exit-suffix invariant can be tested
+/// without spawning a real PTY.
+pub fn build_terminal_install_wrapper(command: &str, is_powershell: bool) -> String {
+    if is_powershell {
+        format!(
+            concat!(
+                "{cmd}; ",
+                "$__ec = $LASTEXITCODE; ",
+                "Write-Host ''; ",
+                "if ($__ec -eq 0 -or $null -eq $__ec) {{ ",
+                "Write-Host \"`e[32m✓ Command completed successfully`e[0m\" ",
+                "}} else {{ ",
+                "Write-Host \"`e[31m✗ Command failed (exit code $__ec)`e[0m\" ",
+                "}}; ",
+                "Write-Host ''; ",
+                "Write-Host 'Press Enter to close…'; ",
+                "Read-Host; Exit\n"
+            ),
+            cmd = command
+        )
+    } else {
+        format!(
+            "{cmd}\n__exit_code=$?\necho ''\nif [ $__exit_code -eq 0 ]; then echo '\\033[32m✓ Command completed successfully\\033[0m'; else echo \"\\033[31m✗ Command failed (exit code $__exit_code)\\033[0m\"; fi\necho ''\necho 'Press Enter to close…'\nread __dummy\nexit\n",
+            cmd = command
+        )
+    }
+}
+
 /// Translate a key event to PTY input bytes. Shared by both backends (#351).
 pub fn key_to_pty_bytes(key_name: &str, unicode: Option<char>, ctrl: bool) -> Vec<u8> {
     if ctrl {
@@ -887,5 +1296,49 @@ pub fn key_to_pty_bytes(key_name: &str, unicode: Option<char>, ctrl: bool) -> Ve
                 vec![]
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_terminal_install_wrapper;
+
+    /// Verify that the POSIX wrapper ends with `\nexit\n` so the shell process
+    /// exits after the user presses Enter, enabling `poll_terminal` to call
+    /// `finalize_install_from_terminal` and register the LSP/DAP server.
+    #[test]
+    fn posix_wrapper_ends_with_exit() {
+        let script = build_terminal_install_wrapper("pip install foo", false);
+        assert!(
+            script.contains("read __dummy\nexit\n"),
+            "POSIX wrapper must end with `read __dummy\\nexit\\n` so the shell exits; got:\n{script}"
+        );
+    }
+
+    /// Verify that the PowerShell wrapper ends with `Read-Host; Exit\n` for the
+    /// same reason.
+    #[test]
+    fn powershell_wrapper_ends_with_exit() {
+        let script = build_terminal_install_wrapper("pip install foo", true);
+        assert!(
+            script.contains("Read-Host; Exit\n"),
+            "PowerShell wrapper must end with `Read-Host; Exit\\n` so the shell exits; got:\n{script}"
+        );
+    }
+
+    /// The command appears verbatim at the start of both wrapper flavours.
+    #[test]
+    fn wrapper_contains_command() {
+        let cmd = "cargo install my-tool";
+        let posix = build_terminal_install_wrapper(cmd, false);
+        let ps = build_terminal_install_wrapper(cmd, true);
+        assert!(
+            posix.starts_with(cmd),
+            "POSIX wrapper must start with the command"
+        );
+        assert!(
+            ps.starts_with(cmd),
+            "PowerShell wrapper must start with the command"
+        );
     }
 }

@@ -348,6 +348,147 @@ fn test_qa_bang_force_quits() {
     assert_eq!(action, EngineAction::Quit);
 }
 
+/// `Engine::startup_without_session_restore` must ignore a per-workspace
+/// session file that `Engine::startup` would have honoured.
+///
+/// This is the ambient-input class `TuiShellApp::new_for_test` exists to close:
+/// `Engine::new_for_test()` only replaces the two *global* config reads
+/// (`settings.json` / `session.json`), while `restore_session_files()` does a
+/// second, independent `SessionState::load_for_workspace(&self.cwd)` read keyed
+/// on the process's cwd. On a machine that has ever saved a session for the
+/// checkout the test binary runs in, that read reopens real files and splits
+/// and `windows.len()` stops being 1 — which is exactly what the TUI drag test's
+/// setup-sanity assertion trips on.
+///
+/// The first half of this test is the control: it proves the fixture session
+/// file on disk really is restorable, so a green second half means the restore
+/// was *skipped*, not that the fixture was inert.
+#[test]
+fn test_startup_without_session_restore_ignores_workspace_session() {
+    use crate::core::session::SessionState;
+    let dir = std::env::temp_dir();
+    let p1 = dir.join("vimcode_no_restore_a.txt");
+    let p2 = dir.join("vimcode_no_restore_b.txt");
+    std::fs::write(&p1, "aaa").unwrap();
+    std::fs::write(&p2, "bbb").unwrap();
+
+    let workspace_dir = dir.join("vimcode_no_restore_test_ws");
+    std::fs::create_dir_all(&workspace_dir).unwrap();
+    let mut ws_session = SessionState::default();
+    ws_session.open_files = vec![p1.clone(), p2.clone()];
+    ws_session.active_file = Some(p2.clone());
+    // save_for_workspace is a no-op under #[cfg(test)], so write directly.
+    let session_path = SessionState::session_path_for_workspace(&workspace_dir);
+    if let Some(parent) = session_path.parent() {
+        std::fs::create_dir_all(parent).unwrap();
+    }
+    std::fs::write(
+        &session_path,
+        serde_json::to_string_pretty(&ws_session).unwrap(),
+    )
+    .unwrap();
+
+    // Control: the on-disk session really does restore two tabs.
+    let mut restoring = Engine::new_for_test();
+    restoring.cwd = workspace_dir.clone();
+    restoring.settings.swap_file = false;
+    restoring.restore_session_files();
+    assert_eq!(
+        restoring.active_group().tabs.len(),
+        2,
+        "control: the fixture workspace session must be restorable, otherwise \
+         the assertion below proves nothing"
+    );
+
+    // Subject: the deterministic startup path must not touch it at all.
+    let mut deterministic = Engine::new_for_test();
+    deterministic.cwd = workspace_dir.clone();
+    deterministic.settings.swap_file = false;
+    let tabs_before = deterministic.active_group().tabs.len();
+    let windows_before = deterministic.windows.len();
+    deterministic.startup_without_session_restore(None);
+    assert_eq!(
+        deterministic.active_group().tabs.len(),
+        tabs_before,
+        "startup_without_session_restore must not reopen the workspace session's files"
+    );
+    assert_eq!(
+        deterministic.windows.len(),
+        windows_before,
+        "startup_without_session_restore must not allocate windows for restored files"
+    );
+    assert!(
+        !deterministic
+            .buffer_manager
+            .iter()
+            .any(|(_, s)| s.file_path.as_deref() == Some(p1.as_path())
+                || s.file_path.as_deref() == Some(p2.as_path())),
+        "no buffer should have been created for a session-listed file"
+    );
+
+    let _ = std::fs::remove_file(&p1);
+    let _ = std::fs::remove_file(&p2);
+    let _ = std::fs::remove_file(&session_path);
+    let _ = std::fs::remove_dir(&workspace_dir);
+}
+
+/// #890: `startup_without_session_restore` must skip the *other two* ambient
+/// reads `startup` performs, for the same machine-independence reason it
+/// already skips the workspace session:
+///
+/// - `plugin_init()` loads and **executes** every `.lua` file in the
+///   developer's real `~/.config/vimcode/{plugins,extensions}/`, then fires
+///   `VimEnter` into them. A plugin that hooks `ModeChanged` /
+///   `InsertEnter` / `cursor_move` can call `vimcode.buf.set_cursor` or
+///   `vimcode.buf.set_lines` *synchronously inside a keystroke*, so an
+///   installed plugin silently rewrites what a driver-tier test types.
+/// - `ext_refresh()` spawns a thread that fetches the remote extension
+///   registry over the network, per constructed app.
+///
+/// This is not hypothetical: with a two-line `ModeChanged` plugin dropped
+/// into `$HOME/.config/vimcode/plugins/`,
+/// `gp_charwise_multiline_lands_cursor_on_rendered_last_pasted_char_via_shell_app`
+/// fails 100 % of the time — which is how it failed on one machine while
+/// passing everywhere else.
+///
+/// The first half is the control: it proves `ext_refresh()` really does flip
+/// `ext_registry_fetching`, so a green second half means the call was
+/// *skipped* rather than that the flag is inert.
+#[test]
+fn test_startup_without_session_restore_skips_ambient_plugins_and_registry_fetch() {
+    // Control: `ext_refresh()` flips the flag when it does run. Clear the
+    // registry URLs first so the control itself performs no network I/O.
+    let mut control = Engine::new_for_test();
+    control.settings.extension_registries.clear();
+    control.ext_refresh();
+    assert!(
+        control.ext_registry_fetching,
+        "control: ext_refresh must set ext_registry_fetching, otherwise the \
+         assertion below proves nothing"
+    );
+
+    // Subject: the deterministic startup path must perform neither read.
+    let mut deterministic = Engine::new_for_test();
+    deterministic.settings.swap_file = false;
+    deterministic.startup_without_session_restore(None);
+    assert!(
+        !deterministic.ext_registry_fetching,
+        "startup_without_session_restore must not kick off the networked \
+         extension-registry fetch"
+    );
+    assert!(
+        deterministic.ext_registry_rx.is_none(),
+        "startup_without_session_restore must not leave a registry-fetch \
+         channel behind"
+    );
+    assert!(
+        deterministic.plugin_manager.is_none(),
+        "startup_without_session_restore must not load or execute the user's \
+         real ~/.config/vimcode/{{plugins,extensions}} Lua — a machine with \
+         plugins installed would otherwise run them inside every driver test"
+    );
+}
+
 #[test]
 fn test_restore_session_files_opens_separate_tabs() {
     use crate::core::session::SessionState;
@@ -699,6 +840,68 @@ fn test_search_n_and_N() {
 }
 
 #[test]
+fn test_gd_jumps_to_first_occurrence_before_cursor() {
+    // `gd` (:h gd) is a pure motion: it jumps to the first occurrence of the
+    // word under the cursor, searching from the top of the enclosing
+    // function (or the top of the file, absent one) — never via LSP.
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "int x = 1;\ny = x;");
+    engine.view_mut().cursor.line = 1;
+    engine.view_mut().cursor.col = 4; // the `x` in `y = x;`
+
+    press_char(&mut engine, 'g');
+    press_char(&mut engine, 'd');
+
+    assert_eq!(engine.view().cursor.line, 0);
+    assert_eq!(engine.view().cursor.col, 4); // the `x` in `int x = 1;`
+}
+
+#[test]
+fn test_gd_no_identifier_under_cursor_is_a_no_op() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "   ");
+    engine.view_mut().cursor.col = 1; // sitting on whitespace, not a word
+
+    press_char(&mut engine, 'g');
+    press_char(&mut engine, 'd');
+
+    assert_eq!(engine.view().cursor.line, 0);
+    assert_eq!(engine.view().cursor.col, 1);
+    assert!(engine.message.contains("No identifier"));
+}
+
+#[test]
+#[allow(non_snake_case)]
+fn test_gN_reselects_match_cursor_is_already_on() {
+    // `:h gN` — "If the cursor is on the match, visually selects it." When
+    // `/foo<CR>` wraps back onto the *first* match, a plain backward `gN`
+    // must reselect that same match rather than skipping past it to wrap
+    // around to the last one (the bug this test guards against, #889).
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "foo bar foo");
+    engine.view_mut().cursor.col = 10; // last char of the second "foo"
+
+    press_char(&mut engine, '/');
+    for ch in "foo".chars() {
+        press_char(&mut engine, ch);
+    }
+    press_special(&mut engine, "Return");
+    // Search wrapped back to the first "foo".
+    assert_eq!(engine.view().cursor.col, 0);
+
+    press_char(&mut engine, 'g');
+    press_char(&mut engine, 'N');
+    assert_eq!(engine.mode, Mode::Visual);
+    // Selection anchor must be the first match (cols 0..3), not the second.
+    assert_eq!(engine.visual_anchor, Some(Cursor { line: 0, col: 0 }));
+    assert_eq!(engine.view().cursor.col, 2);
+
+    press_char(&mut engine, 'd');
+    assert_eq!(engine.buffer().to_string(), " bar foo");
+    assert_eq!(engine.view().cursor.col, 0);
+}
+
+#[test]
 fn test_search_escape_cancels() {
     let mut engine = Engine::new();
     engine.buffer_mut().insert(0, "hello");
@@ -1047,12 +1250,16 @@ fn test_paragraph_backward_at_bof() {
 
 #[test]
 fn test_paragraph_whitespace_lines() {
+    // #805: Vim's `}`/`{` require a *completely* empty line to count as a
+    // paragraph boundary — a whitespace-only line does not qualify, so `}`
+    // skips over it and (with no real blank line in the buffer) lands on
+    // the last line instead.
     let mut engine = Engine::new();
     engine.buffer_mut().insert(0, "text1\n  \t  \ntext2");
 
     press_char(&mut engine, '}');
-    assert_eq!(engine.view().cursor.line, 1); // Whitespace line
-    assert_eq!(engine.view().cursor.col, 5); // End of whitespace line
+    assert_eq!(engine.view().cursor.line, 2); // last line — no blank line exists
+    assert_eq!(engine.view().cursor.col, 0);
 }
 
 #[test]
@@ -1088,17 +1295,18 @@ fn test_paragraph_backward_multiple() {
 
 #[test]
 fn test_paragraph_consecutive_empty_lines() {
+    // #805: a run of consecutive blank lines is a single paragraph
+    // boundary in Vim, not one stop per blank line — landing inside the
+    // run and pressing `}` again skips the rest of the run in one jump
+    // (here, straight to the last line, since there's no further boundary).
     let mut engine = Engine::new();
     engine.buffer_mut().insert(0, "text\n\n\n\nmore");
 
     press_char(&mut engine, '}');
-    assert_eq!(engine.view().cursor.line, 1); // First empty
+    assert_eq!(engine.view().cursor.line, 1); // first line of the blank run
 
     press_char(&mut engine, '}');
-    assert_eq!(engine.view().cursor.line, 2); // Second empty
-
-    press_char(&mut engine, '}');
-    assert_eq!(engine.view().cursor.line, 3); // Third empty
+    assert_eq!(engine.view().cursor.line, 4); // last line — no further boundary
 }
 
 #[test]
@@ -1511,6 +1719,43 @@ fn test_undo_x_delete() {
 }
 
 #[test]
+fn test_undo_counted_3u_undoes_three_changes() {
+    // `[count]u` undoes `count` changes (#885), not just one. Four separate
+    // `x` presses are four separate undo groups; `3u` must unwind exactly
+    // three of them, leaving the *first* x's effect in place.
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "abcdef");
+    engine.update_syntax();
+
+    press_char(&mut engine, 'x');
+    press_char(&mut engine, 'x');
+    press_char(&mut engine, 'x');
+    press_char(&mut engine, 'x');
+    assert_eq!(engine.buffer().to_string(), "ef");
+
+    press_char(&mut engine, '3');
+    press_char(&mut engine, 'u');
+    assert_eq!(engine.buffer().to_string(), "bcdef");
+}
+
+#[test]
+fn test_undo_counted_2u_stops_when_history_runs_out() {
+    // A count larger than the available history undoes everything there is
+    // and stops cleanly, matching Vim's `u` behaviour of not erroring past
+    // the oldest change.
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "abc");
+    engine.update_syntax();
+
+    press_char(&mut engine, 'x');
+    assert_eq!(engine.buffer().to_string(), "bc");
+
+    press_char(&mut engine, '9');
+    press_char(&mut engine, 'u');
+    assert_eq!(engine.buffer().to_string(), "abc");
+}
+
+#[test]
 fn test_undo_dd_delete_line() {
     let mut engine = Engine::new();
     engine.buffer_mut().insert(0, "line1\nline2\nline3");
@@ -1668,6 +1913,154 @@ fn test_undo_cursor_position_restored() {
     assert_eq!(engine.view().cursor.col, 6);
 }
 
+// #886: `u` restores the cursor to the position of the *first* change the
+// undo group reverted — verified directly against Neovim 0.12.5 in
+// tests/nvim_conformance.rs ("undo:A xyz u cursor" / "undo:u after :%s
+// cursor" / "undo:u after visual d" / "undo:u restores cursor after :g").
+// These are tight regression tests for the same fixes, in-crate.
+
+#[test]
+fn test_undo_after_append_at_eol_restores_cursor_to_last_char() {
+    // `A` moves the cursor to the append position *before* any text is
+    // inserted; `u` must restore to that position (clamped back into the
+    // line), not to wherever the cursor was before `A` was pressed.
+    let mut engine = setup_engine("abc", 0, 0);
+    send_keys(&mut engine, "A xyz<Esc>");
+    assert_eq!(engine.buffer().to_string(), "abc xyz");
+    send_keys(&mut engine, "u");
+    assert_eq!(engine.buffer().to_string(), "abc");
+    assert_eq!(engine.view().cursor.line, 0);
+    assert_eq!(engine.view().cursor.col, 2); // clamped onto the last 'c'
+}
+
+#[test]
+fn test_undo_after_percent_s_restores_cursor_to_first_changed_line() {
+    let mut engine = setup_engine("a\na\na", 2, 0);
+    engine.execute_command("%s/a/b/");
+    assert_eq!(engine.buffer().to_string(), "b\nb\nb");
+    send_keys(&mut engine, "u");
+    assert_eq!(engine.buffer().to_string(), "a\na\na");
+    assert_eq!(engine.view().cursor.line, 0);
+    assert_eq!(engine.view().cursor.col, 0);
+}
+
+#[test]
+fn test_undo_after_visual_delete_restores_cursor_to_selection_start() {
+    // `vll` leaves the (real) cursor at the *end* of the selection; `u`
+    // must restore to the *start* of what was deleted, not the cursor's
+    // position when `d` was pressed.
+    let mut engine = setup_engine("abcdef", 0, 1);
+    send_keys(&mut engine, "vlld");
+    assert_eq!(engine.buffer().to_string(), "aef");
+    send_keys(&mut engine, "u");
+    assert_eq!(engine.buffer().to_string(), "abcdef");
+    assert_eq!(engine.view().cursor.line, 0);
+    assert_eq!(engine.view().cursor.col, 1);
+}
+
+// ---------------------------------------------------------------------------
+// #887: visual-mode selection semantics (text objects, marks, undo, `r`,
+// paragraph edges). Each case mirrors an nvim-oracle case removed from
+// `KNOWN_DEVIATIONS` in tests/nvim_conformance.rs; the expected buffer/cursor
+// were independently re-verified against `nvim --headless -u NONE` 0.12.5,
+// not copied from what the engine happened to produce.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_visual_ip_repeated_extends_to_next_paragraph() {
+    // Oracle case "vis:vip then ip extends": a second `ip` while already
+    // inside a `vip` selection must *grow* the selection to swallow the
+    // next paragraph block, the way `2ip` already does, rather than
+    // reselecting the same paragraph it started with.
+    let mut engine = setup_engine("a\n\nb\n\nc", 0, 0);
+    send_keys(&mut engine, "vipipd");
+    assert_eq!(engine.buffer().to_string(), "b\n\nc");
+}
+
+#[test]
+fn test_visual_backtick_mark_extends_and_deletes() {
+    // Oracle case "vis:v'a? mark d": Visual mode must handle `` ` `` as a
+    // mark-target motion (it previously had no handler for it at all), so
+    // `v\`a` extends the charwise selection to the mark and `d` deletes
+    // through it inclusive.
+    let mut engine = setup_engine("abc\ndef", 1, 1);
+    send_keys(&mut engine, "magg0v`ad");
+    assert_eq!(engine.buffer().to_string(), "f");
+    assert_eq!(engine.view().cursor.line, 0);
+    assert_eq!(engine.view().cursor.col, 0);
+}
+
+#[test]
+fn test_visual_change_then_undo_is_one_step() {
+    // Oracle case "vis:vjc then u": `c`'s delete-then-insert must be a
+    // single undo group, so one `u` fully restores the pre-change buffer
+    // and cursor, not just the typed replacement text.
+    let mut engine = setup_engine("abc\ndef", 0, 1);
+    send_keys(&mut engine, "vjcX<Esc>u");
+    assert_eq!(engine.buffer().to_string(), "abc\ndef");
+    assert_eq!(engine.view().cursor.line, 0);
+    assert_eq!(engine.view().cursor.col, 1);
+}
+
+#[test]
+fn test_visual_r_cr_inserts_literal_carriage_return() {
+    // Oracle case "vis:v_r CR": real Neovim's Visual (char/line-wise) `r`
+    // with <CR> replaces the selection with a literal carriage-return
+    // *byte*, not an actual line split — confirmed empirically against the
+    // live nvim 0.12.5 oracle (`nvim_buf_get_lines` returns one line
+    // containing an embedded `\r`, not two lines). VisualBlock's `r<CR>`
+    // is the one that really splits lines (`:h v_b_r`; #807); plain Visual
+    // `r<CR>` does not get that special case.
+    let mut engine = setup_engine("abc", 0, 1);
+    send_keys(&mut engine, "vr<CR>");
+    assert_eq!(engine.buffer().to_string(), "a\rc");
+}
+
+#[test]
+fn test_visual_ap_on_last_paragraph_takes_leading_blank() {
+    // Oracle case "vis:v ap trailing": `ap` prefers a *trailing* blank
+    // block, but the cursor's paragraph here is the last one in the
+    // buffer (no trailing blank exists), so `ap` must fall back to the
+    // *leading* blank block instead of selecting no blank at all.
+    let mut engine = setup_engine("a\n\nb\nc", 2, 0);
+    send_keys(&mut engine, "vapd");
+    assert_eq!(engine.buffer().to_string(), "a\n");
+}
+
+#[test]
+fn test_visual_ip_on_last_paragraph_excludes_blank() {
+    // Oracle case "vis:vip on last para no trailing": unlike `ap`, `ip`
+    // never falls back to an adjacent blank block — even on the last
+    // paragraph with nothing trailing, `ip` deletes only the non-blank
+    // lines and leaves the leading blank line untouched.
+    let mut engine = setup_engine("a\n\nb\nc", 3, 0);
+    send_keys(&mut engine, "vipd");
+    // Ropey's trailing-line bookkeeping differs from Neovim's (same
+    // asymmetry `run_case` in tests/nvim_conformance.rs works around with
+    // `trim_end_matches('\n')`): the leading blank line survives either way,
+    // which is the behaviour under test.
+    assert_eq!(engine.buffer().to_string().trim_end_matches('\n'), "a");
+    assert_eq!(engine.view().cursor.line, 1);
+    assert_eq!(engine.view().cursor.col, 0);
+}
+
+#[test]
+fn test_undo_after_global_command_reverts_all_lines_in_one_step() {
+    // `:g/pat/cmd` is one undo block covering every matched line — a
+    // regression here used to leave one undo entry *per line*, so `u`
+    // only reverted the last one.
+    let mut engine = setup_engine("a\nb\na", 0, 0);
+    engine.execute_command("g/a/d");
+    assert_eq!(engine.buffer().to_string().trim_end_matches('\n'), "b");
+    send_keys(&mut engine, "u");
+    assert_eq!(
+        engine.buffer().to_string().trim_end_matches('\n'),
+        "a\nb\na"
+    );
+    assert_eq!(engine.view().cursor.line, 0);
+    assert_eq!(engine.view().cursor.col, 0);
+}
+
 #[test]
 fn test_undo_line_basic() {
     let mut engine = Engine::new();
@@ -1790,7 +2183,7 @@ fn test_yank_line_yy() {
     // Check register content
     let (content, is_linewise) = engine.registers.get(&'"').unwrap();
     assert_eq!(content, "line1\n");
-    assert!(is_linewise);
+    assert!(is_linewise.is_linewise());
     assert!(engine.message.contains("yanked"));
 }
 
@@ -1805,7 +2198,7 @@ fn test_yank_line_Y() {
 
     let (content, is_linewise) = engine.registers.get(&'"').unwrap();
     assert_eq!(content, "second\n");
-    assert!(is_linewise);
+    assert!(is_linewise.is_linewise());
 }
 
 #[test]
@@ -1852,7 +2245,7 @@ fn test_delete_x_fills_register() {
 
     let (content, is_linewise) = engine.registers.get(&'"').unwrap();
     assert_eq!(content, "A");
-    assert!(!is_linewise);
+    assert!(!is_linewise.is_linewise());
 }
 
 #[test]
@@ -1867,7 +2260,7 @@ fn test_delete_dd_fills_register() {
 
     let (content, is_linewise) = engine.registers.get(&'"').unwrap();
     assert_eq!(content, "second\n");
-    assert!(is_linewise);
+    assert!(is_linewise.is_linewise());
 }
 
 #[test]
@@ -1883,7 +2276,7 @@ fn test_delete_D_fills_register() {
 
     let (content, is_linewise) = engine.registers.get(&'"').unwrap();
     assert_eq!(content, "llo world");
-    assert!(!is_linewise);
+    assert!(!is_linewise.is_linewise());
 }
 
 #[test]
@@ -2018,12 +2411,15 @@ fn test_replace_char_doesnt_cross_line() {
     // Move to 'i' (last char of first line)
     engine.view_mut().cursor.col = 1;
 
-    // Try to replace 3 chars - should only replace 'i' (not crossing newline)
+    // `3rx` needs three characters on THIS line and there is only one, so
+    // Vim does nothing at all — it does not silently replace what it can.
+    // #807 corrected this hand-authored expectation against the nvim oracle
+    // (`op:5r beyond eol`: `5rx` on `abc` leaves `abc`).
     press_char(&mut engine, '3');
     press_char(&mut engine, 'r');
     press_char(&mut engine, 'x');
 
-    assert_eq!(engine.buffer().to_string(), "hx\nbye");
+    assert_eq!(engine.buffer().to_string(), "hi\nbye");
 }
 
 #[test]
@@ -2111,7 +2507,7 @@ fn test_yank_last_line_no_newline() {
     // Should still be linewise with newline added
     let (content, is_linewise) = engine.registers.get(&'"').unwrap();
     assert_eq!(content, "last\n");
-    assert!(is_linewise);
+    assert!(is_linewise.is_linewise());
 }
 
 // --- Visual Mode Tests ---
@@ -2174,7 +2570,7 @@ fn test_visual_yank_forward() {
     // Check register
     let (content, is_linewise) = engine.registers.get(&'"').unwrap();
     assert_eq!(content, "hello");
-    assert!(!is_linewise);
+    assert!(!is_linewise.is_linewise());
 
     // Should be back in normal mode
     assert_eq!(engine.mode, Mode::Normal);
@@ -2244,7 +2640,7 @@ fn test_visual_line_yank() {
 
     let (content, is_linewise) = engine.registers.get(&'"').unwrap();
     assert_eq!(content, "line1\nline2\n");
-    assert!(is_linewise);
+    assert!(is_linewise.is_linewise());
 }
 
 #[test]
@@ -2268,7 +2664,7 @@ fn test_visual_line_yank_cursor_moves_to_start() {
     // Verify register content
     let (content, is_linewise) = engine.registers.get(&'"').unwrap();
     assert_eq!(content, "line3\nline4\n");
-    assert!(is_linewise);
+    assert!(is_linewise.is_linewise());
 }
 
 #[test]
@@ -2752,6 +3148,11 @@ fn test_count_paragraph_motions() {
 
 #[test]
 fn test_count_scroll_commands() {
+    // #805: a count on <C-d>/<C-u> SETS Vim's sticky 'scroll' value (it
+    // does not multiply the half-page amount), and <C-f>/<C-b> keep a
+    // 2-line overlap between pages — both corrected by this issue, so the
+    // expected line numbers below no longer match the old
+    // "count * half/full page" arithmetic this test asserted before.
     let mut engine = Engine::new();
     // Create a buffer with 100 lines
     let mut text = String::new();
@@ -2762,26 +3163,28 @@ fn test_count_scroll_commands() {
     engine.update_syntax();
     engine.set_viewport_lines(20); // Simulate 20 lines visible
 
-    // Test 2 Ctrl-D (2 half-pages down = 20 lines)
+    // 2<C-d>: sets 'scroll' = 2, moves 2 lines down.
     press_char(&mut engine, '2');
     press_ctrl(&mut engine, 'd');
-    assert_eq!(engine.view().cursor.line, 20);
+    assert_eq!(engine.view().cursor.line, 2);
 
-    // Test 1 Ctrl-U (1 half-page up = 10 lines)
+    // 1<C-u>: sets 'scroll' = 1 (replacing 2), moves 1 line up.
     press_char(&mut engine, '1');
     press_ctrl(&mut engine, 'u');
-    assert_eq!(engine.view().cursor.line, 10);
+    assert_eq!(engine.view().cursor.line, 1);
 
-    // Test 3 Ctrl-F (3 full pages down = 60 lines) — requires page_down mode
-    engine.settings.ctrl_f_action = "page_down".to_string();
+    // 3<C-f>: 3 full pages down, each with a 2-line overlap
+    // (18 lines/page: 1 -> 19 -> 37 -> 55) — requires page_down mode.
+    engine.settings.ctrl_f_action = Some("page_down".to_string());
     press_char(&mut engine, '3');
     press_ctrl(&mut engine, 'f');
-    assert_eq!(engine.view().cursor.line, 70);
+    assert_eq!(engine.view().cursor.line, 55);
 
-    // Test 2 Ctrl-B (2 full pages up = 40 lines)
+    // 2<C-b>: 2 full pages up, mirroring <C-f> (55 -> 37 -> 19, then the
+    // window's bottom line at that scroll_top is 19 + 20 - 1 = 38).
     press_char(&mut engine, '2');
     press_ctrl(&mut engine, 'b');
-    assert_eq!(engine.view().cursor.line, 30);
+    assert_eq!(engine.view().cursor.line, 38);
 }
 
 #[test]
@@ -2837,7 +3240,7 @@ fn test_count_x_delete_chars() {
     // Check register contains deleted chars
     let (content, is_linewise) = engine.registers.get(&'"').unwrap();
     assert_eq!(content, "ABC");
-    assert!(!is_linewise);
+    assert!(!is_linewise.is_linewise());
 }
 
 #[test]
@@ -2871,7 +3274,7 @@ fn test_count_dd_delete_lines() {
     // Check register contains all 3 lines
     let (content, is_linewise) = engine.registers.get(&'"').unwrap();
     assert_eq!(content, "line1\nline2\nline3\n");
-    assert!(is_linewise);
+    assert!(is_linewise.is_linewise());
 }
 
 #[test]
@@ -2887,7 +3290,7 @@ fn test_count_yy_yank_lines() {
 
     let (content, is_linewise) = engine.registers.get(&'"').unwrap();
     assert_eq!(content, "alpha\nbeta\n");
-    assert!(is_linewise);
+    assert!(is_linewise.is_linewise());
     assert!(engine.message.contains("2 lines yanked"));
 
     // Buffer should be unchanged
@@ -2907,7 +3310,7 @@ fn test_count_Y_yank_lines() {
 
     let (content, is_linewise) = engine.registers.get(&'"').unwrap();
     assert_eq!(content, "one\ntwo\nthree\n");
-    assert!(is_linewise);
+    assert!(is_linewise.is_linewise());
     assert!(engine.message.contains("3 lines yanked"));
 }
 
@@ -3251,7 +3654,7 @@ fn test_count_visual_line_mode() {
 
     // Should have yanked 4 lines (lines 0-3)
     let (content, is_linewise) = engine.registers.get(&'"').unwrap();
-    assert!(is_linewise);
+    assert!(is_linewise.is_linewise());
     assert!(content.contains("line 1"));
     assert!(content.contains("line 4"));
 }
@@ -3519,7 +3922,7 @@ fn test_dw_delete_word() {
     // Check register
     let (content, is_linewise) = engine.registers.get(&'"').unwrap();
     assert_eq!(content, "hello ");
-    assert!(!is_linewise);
+    assert!(!is_linewise.is_linewise());
 }
 
 #[test]
@@ -4362,7 +4765,6 @@ fn test_visual_i_quote() {
 
 // TODO: Fix cursor positioning after insert operations
 #[test]
-#[ignore]
 fn test_repeat_insert() {
     let mut engine = Engine::new();
     engine.buffer_mut().insert(0, "line1\nline2\nline3");
@@ -4377,17 +4779,17 @@ fn test_repeat_insert() {
     assert_eq!(engine.mode, Mode::Normal);
     assert_eq!(engine.buffer().to_string(), "XYline1\nline2\nline3");
 
-    // Move to second line and repeat
+    // Move to second line and repeat. Escape left the cursor at column 1
+    // (Vim moves back one on leaving Insert), so `j` preserves that column
+    // and `.` replays `iXY<Esc>` inserting before the 'i' in "line2".
     press_char(&mut engine, 'j');
     press_char(&mut engine, '.');
-    assert_eq!(engine.buffer().to_string(), "XYline1\nXYline2\nline3");
+    assert_eq!(engine.buffer().to_string(), "XYline1\nlXYine2\nline3");
     assert_eq!(engine.view().cursor.line, 1);
     assert_eq!(engine.view().cursor.col, 2);
 }
 
-// TODO: Fix multi-count delete repeat
 #[test]
-#[ignore]
 fn test_repeat_delete_x() {
     let mut engine = Engine::new();
     engine.buffer_mut().insert(0, "ABCDEF\nGHIJKL");
@@ -4420,9 +4822,7 @@ fn test_repeat_delete_dd() {
     assert_eq!(engine.buffer().to_string(), "line3\nline4");
 }
 
-// TODO: Fix cursor positioning for repeat with count
 #[test]
-#[ignore]
 fn test_repeat_insert_with_count() {
     let mut engine = Engine::new();
     engine.buffer_mut().insert(0, "abc\ndef\nghi");
@@ -4441,31 +4841,29 @@ fn test_repeat_insert_with_count() {
     assert_eq!(engine.buffer().to_string(), "Xabc\nXXXdef\nghi");
 }
 
-// TODO: Fix cursor positioning with newline repeats
 #[test]
-#[ignore]
 fn test_repeat_insert_with_newline() {
     let mut engine = Engine::new();
     engine.buffer_mut().insert(0, "first");
     engine.update_syntax();
 
-    // Insert with newline
+    // Append at the end of the line, then split with a newline.
+    engine.view_mut().cursor.col = 4; // last char of "first"
     press_char(&mut engine, 'a');
     press_special(&mut engine, "Return");
     press_char(&mut engine, 'X');
     press_special(&mut engine, "Escape");
     assert_eq!(engine.buffer().to_string(), "first\nX");
 
-    // Move to start and repeat
+    // Repeat re-runs `a<CR>X<Esc>` at the new cursor — from column 0 on
+    // "first" that's "f" + append-after-col0 + split + "X".
     engine.view_mut().cursor.line = 0;
     engine.view_mut().cursor.col = 0;
     press_char(&mut engine, '.');
-    assert_eq!(engine.buffer().to_string(), "\nXfirst\nX");
+    assert_eq!(engine.buffer().to_string(), "f\nXirst\nX");
 }
 
-// TODO: Implement substitute repeat
 #[test]
-#[ignore]
 fn test_repeat_substitute_s() {
     let mut engine = Engine::new();
     engine.buffer_mut().insert(0, "hello\nworld");
@@ -4483,9 +4881,7 @@ fn test_repeat_substitute_s() {
     assert_eq!(engine.buffer().to_string(), "Xello\nXorld");
 }
 
-// TODO: Implement substitute repeat with count
 #[test]
-#[ignore]
 fn test_repeat_substitute_2s() {
     let mut engine = Engine::new();
     engine.buffer_mut().insert(0, "abcdef\nghijkl");
@@ -4499,10 +4895,12 @@ fn test_repeat_substitute_2s() {
     press_special(&mut engine, "Escape");
     assert_eq!(engine.buffer().to_string(), "XYcdef\nghijkl");
 
-    // Move to second line and repeat
+    // Move to second line and repeat. Escape left the cursor at column 1
+    // (Vim moves back one on leaving Insert), so `j` preserves that column
+    // and `.` replays `2sXY<Esc>` starting the substitute at "ghijkl"'s 'h'.
     press_char(&mut engine, 'j');
     press_char(&mut engine, '.');
-    assert_eq!(engine.buffer().to_string(), "XYcdef\nXYijkl");
+    assert_eq!(engine.buffer().to_string(), "XYcdef\ngXYjkl");
 }
 
 #[test]
@@ -4517,11 +4915,13 @@ fn test_repeat_append() {
     press_special(&mut engine, "Escape");
     assert_eq!(engine.buffer().to_string(), "o!ne\ntwo");
 
-    // Move to second line start and repeat (inserts at current position)
+    // Move to second line start and repeat — `.` re-runs the `a` command
+    // (append after cursor), not "insert the same text at the cursor": on
+    // "two" with the cursor at column 0 that appends '!' after 't'.
     press_char(&mut engine, 'j');
     engine.view_mut().cursor.col = 0; // Ensure we're at column 0
     press_char(&mut engine, '.');
-    assert_eq!(engine.buffer().to_string(), "o!ne\n!two");
+    assert_eq!(engine.buffer().to_string(), "o!ne\nt!wo");
 }
 
 #[test]
@@ -4538,12 +4938,13 @@ fn test_repeat_open_line_o() {
     press_special(&mut engine, "Escape");
     assert_eq!(engine.buffer().to_string(), "alpha\nNEW\nbeta");
 
-    // Repeat inserts the text "NEW" at current position (not a full 'o' command)
+    // Repeat re-runs the full `o` command (open a new line below and insert),
+    // not "insert the text NEW at the current position".
     // Move to last line and repeat
     press_char(&mut engine, 'j');
     engine.view_mut().cursor.col = 0;
     press_char(&mut engine, '.');
-    assert_eq!(engine.buffer().to_string(), "alpha\nNEW\nNEWbeta");
+    assert_eq!(engine.buffer().to_string(), "alpha\nNEW\nbeta\nNEW");
 }
 
 #[test]
@@ -4560,7 +4961,6 @@ fn test_repeat_before_any_change() {
 
 // TODO: Fix count preservation in repeat
 #[test]
-#[ignore]
 fn test_repeat_preserves_count() {
     let mut engine = Engine::new();
     engine.buffer_mut().insert(0, "ABCDEFGH\nIJKLMNOP");
@@ -4577,9 +4977,7 @@ fn test_repeat_preserves_count() {
     assert_eq!(engine.buffer().to_string(), "DEFGH\nLMNOP");
 }
 
-// TODO: Fix dd repeat with count
 #[test]
-#[ignore]
 fn test_repeat_dd_multiple_lines() {
     let mut engine = Engine::new();
     engine.buffer_mut().insert(0, "a\nb\nc\nd\ne\nf");
@@ -5382,7 +5780,7 @@ fn test_visual_block_yank() {
     // Check register - should have "ab\nde"
     let (content, is_linewise) = engine.registers.get(&'"').unwrap();
     assert_eq!(content, "ab\nde");
-    assert!(!is_linewise);
+    assert!(!is_linewise.is_linewise());
 
     // Should be back in normal mode
     assert_eq!(engine.mode, Mode::Normal);
@@ -5830,11 +6228,14 @@ fn test_mark_jump_exact_position() {
     press_char(&mut engine, 'm');
     press_char(&mut engine, 'b');
 
-    // Move to line 0, col 0
+    // Move to line 0 — `gg` preserves the cursor's column (clamped to the
+    // target line's length), matching Neovim's default 'startofline' being
+    // OFF (verified against `nvim --headless`; see #806 review). Column 4
+    // survives the jump since "hello world" is longer than 4 chars.
     press_char(&mut engine, 'g');
     press_char(&mut engine, 'g');
     assert_eq!(engine.view().cursor.line, 0);
-    assert_eq!(engine.view().cursor.col, 0);
+    assert_eq!(engine.view().cursor.col, 4);
 
     // Jump to exact mark position with backtick
     press_char(&mut engine, '`');
@@ -6119,6 +6520,40 @@ fn test_macro_recording_saves_to_register() {
     // Also should be in unnamed register
     let (unnamed_content, _) = engine.registers.get(&'"').unwrap();
     assert_eq!(unnamed_content, "ix\x1b");
+}
+
+/// Runs the macro playback queue to completion (mirrors the conformance
+/// harness's `pump` helper — production UI backends pump every frame).
+fn drain_macro_playback(engine: &mut Engine) {
+    let mut iterations = 0;
+    while !engine.macro_playback_queue.is_empty() && iterations < 10_000 {
+        let _ = engine.advance_macro_playback();
+        iterations += 1;
+    }
+}
+
+#[test]
+fn test_macro_uppercase_register_playback_reads_lowercase() {
+    // `qQ` records into register 'q' (uppercase just selects append-vs-
+    // overwrite, `:h q`), and `@Q` must read back that same register:
+    // register names are case-insensitive for *reads*, only writes
+    // distinguish upper (append) from lower (overwrite) (#890).
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "ab\ncd");
+
+    press_char(&mut engine, 'q');
+    press_char(&mut engine, 'Q'); // qQ: record, appending into register 'q'
+    press_char(&mut engine, 'x'); // delete 'a' -> "b"
+    press_char(&mut engine, 'q'); // stop recording
+
+    let (content, _) = engine.registers.get(&'q').unwrap();
+    assert_eq!(content, "x");
+
+    press_char(&mut engine, '@');
+    press_char(&mut engine, 'Q'); // @Q: replay register 'q' -> delete 'b'
+    drain_macro_playback(&mut engine);
+
+    assert_eq!(engine.buffer().to_string(), "\ncd");
 }
 
 #[test]
@@ -6740,7 +7175,18 @@ fn test_insert_completion_intercepts_key() {
     // #287: predicate that backends consult to suppress global accelerators
     // (Ctrl-P → fuzzy_finder, etc.) when insert-mode completion would
     // otherwise consume the key. Mirrors the gates in handle_insert_key.
+    //
+    // #800: the accept key is mode-derived (`completion_keys.accept`) —
+    // `Engine::new()` defaults to Vim mode, so the accept key here is
+    // `<C-y>`, not `Tab` (Vscode mode's default). See
+    // `no_config_file_defaults_are_strict_vim` in settings.rs for the
+    // settings-layer half of this contract.
     let mut engine = Engine::new();
+    assert_eq!(
+        engine.settings.editor_mode,
+        crate::core::settings::EditorMode::Vim,
+        "precondition: nothing set editor_mode away from its Vim default"
+    );
     engine.buffer_mut().insert(0, "foobar\n");
 
     // Normal mode: no interception even with a popup-like state set
@@ -6755,8 +7201,9 @@ fn test_insert_completion_intercepts_key() {
     // Ctrl-N / Ctrl-P always intercepted in insert (they can start completion).
     assert!(engine.insert_completion_intercepts_key("n", true));
     assert!(engine.insert_completion_intercepts_key("p", true));
-    // Tab / Down / Up NOT intercepted without an active popup.
-    assert!(!engine.insert_completion_intercepts_key("Tab", false));
+    // Accept key (Ctrl-Y in Vim mode) / Down / Up NOT intercepted without an
+    // active popup.
+    assert!(!engine.insert_completion_intercepts_key("y", true));
     assert!(!engine.insert_completion_intercepts_key("Down", false));
     assert!(!engine.insert_completion_intercepts_key("Up", false));
     // Non-completion keys never intercepted.
@@ -6767,12 +7214,15 @@ fn test_insert_completion_intercepts_key() {
     press_char(&mut engine, 'f');
     press_char(&mut engine, 'o');
     assert!(engine.completion_display_only && engine.completion_idx.is_some());
-    // Now Tab / Down / Up are intercepted.
-    assert!(engine.insert_completion_intercepts_key("Tab", false));
+    // Now the accept key (Ctrl-Y) / Down / Up are intercepted.
+    assert!(engine.insert_completion_intercepts_key("y", true));
     assert!(engine.insert_completion_intercepts_key("Down", false));
     assert!(engine.insert_completion_intercepts_key("Up", false));
-    // Ctrl variants of those keys are NOT — only the bare versions cycle.
-    assert!(!engine.insert_completion_intercepts_key("Tab", true));
+    // Bare Tab is NOT intercepted in default (Vim) mode — it's left alone
+    // for indentation; only the configured accept key is.
+    assert!(!engine.insert_completion_intercepts_key("Tab", false));
+    // Ctrl variants of Down/Up are NOT — only the bare versions cycle.
+    assert!(!engine.insert_completion_intercepts_key("Down", true));
 }
 
 #[test]
@@ -6904,9 +7354,18 @@ fn test_completion_replaces_when_prefix_changes_unrelated() {
     );
 }
 
+/// #800: the accept key is now mode-derived (`completion_keys.accept`) —
+/// `Engine::new()` defaults to Vim mode, whose accept key is `<C-y>`, not
+/// `Tab` (Vscode mode's default). `Ctrl-Y` accepting here mirrors Vim's own
+/// `i_CTRL-Y`, which accepts when the completion menu is visible.
 #[test]
-fn test_auto_popup_tab_accepts() {
+fn test_auto_popup_ctrl_y_accepts_in_default_vim_mode() {
     let mut engine = Engine::new();
+    assert_eq!(
+        engine.settings.editor_mode,
+        crate::core::settings::EditorMode::Vim,
+        "precondition: nothing set editor_mode away from its Vim default"
+    );
     engine.buffer_mut().insert(0, "foobar\n");
     press_char(&mut engine, 'G');
     press_char(&mut engine, 'o'); // insert mode, new line
@@ -6918,11 +7377,12 @@ fn test_auto_popup_tab_accepts() {
         "popup should be display-only"
     );
     assert!(engine.completion_idx.is_some(), "popup should be active");
-    // Tab should accept the highlighted candidate
-    press_special(&mut engine, "Tab");
+    // Ctrl-Y (the Vim-mode default accept key) should accept the highlighted
+    // candidate.
+    press_ctrl(&mut engine, 'y');
     assert!(
         engine.completion_idx.is_none(),
-        "popup should be cleared after Tab"
+        "popup should be cleared after Ctrl-Y"
     );
     assert!(
         !engine.completion_display_only,
@@ -6932,6 +7392,46 @@ fn test_auto_popup_tab_accepts() {
     assert!(
         line1.starts_with("foobar"),
         "buffer should contain accepted completion, got: {}",
+        line1
+    );
+}
+
+/// #800: `<Tab>` must NOT accept the popup in default (Vim) mode — it's left
+/// alone for indentation, matching Vim's own ins-completion-menu. This is the
+/// engine-level counterpart to
+/// `ctrl_y_accepts_tab_falls_through_for_completion_popup_in_default_vim_mode_via_shell_app`
+/// in `src/tui_main/shell_app.rs`, which asserts the same thing from
+/// rendered output.
+#[test]
+fn test_auto_popup_tab_does_not_accept_in_default_vim_mode() {
+    let mut engine = Engine::new();
+    assert_eq!(
+        engine.settings.editor_mode,
+        crate::core::settings::EditorMode::Vim,
+        "precondition: nothing set editor_mode away from its Vim default"
+    );
+    engine.buffer_mut().insert(0, "foobar\n");
+    press_char(&mut engine, 'G');
+    press_char(&mut engine, 'o'); // insert mode, new line
+    press_char(&mut engine, 'f');
+    press_char(&mut engine, 'o');
+    assert!(engine.completion_idx.is_some(), "popup should be active");
+    // Tab falls through to plain indentation instead of accepting.
+    press_special(&mut engine, "Tab");
+    assert!(
+        engine.completion_idx.is_none(),
+        "popup should still be dismissed by Tab (a non-completion key), \
+         just not via acceptance"
+    );
+    let line1: String = engine.buffer().content.line(1).chars().collect();
+    assert!(
+        !line1.starts_with("foobar"),
+        "Tab must NOT accept the completion in default (Vim) mode, got: {}",
+        line1
+    );
+    assert!(
+        line1.starts_with("fo") && line1.len() > "fo".len(),
+        "Tab should still insert its normal indentation after \"fo\", got: {}",
         line1
     );
 }
@@ -7633,6 +8133,123 @@ fn test_vis_selects_sentence_in_visual() {
     );
 }
 
+// #888 (`to:das last sentence`): `das` on the buffer's last sentence has no
+// trailing whitespace to absorb, so Vim falls back to the whitespace
+// *before* it instead of leaving it behind untouched.
+#[test]
+fn test_das_last_sentence_absorbs_leading_whitespace() {
+    let text = "One two.  Three four.";
+    let mut engine = make_paragraph_engine(text);
+    engine.view_mut().cursor.line = 0;
+    engine.view_mut().cursor.col = 11; // inside "Three"
+    engine.handle_key("", Some('d'), false);
+    engine.handle_key("", Some('a'), false);
+    engine.handle_key("", Some('s'), false);
+    let result: String = engine.buffer().content.chars().collect();
+    assert_eq!(
+        result, "One two.",
+        "das on the last sentence should absorb the leading whitespace, not leave it trailing"
+    );
+    assert_eq!(
+        engine.view().cursor.col,
+        7,
+        "cursor should land on the last char"
+    );
+}
+
+// #888 (`to:dis on whitespace between`): `is` with the cursor sitting on the
+// whitespace *between* two sentences selects that whitespace run itself, not
+// either neighbouring sentence's text.
+#[test]
+fn test_dis_on_inter_sentence_whitespace_selects_only_whitespace() {
+    let text = "One two.  Three four.";
+    let mut engine = make_paragraph_engine(text);
+    engine.view_mut().cursor.line = 0;
+    engine.view_mut().cursor.col = 9; // second of the two spaces after "One two."
+    engine.handle_key("", Some('d'), false);
+    engine.handle_key("", Some('i'), false);
+    engine.handle_key("", Some('s'), false);
+    let result: String = engine.buffer().content.chars().collect();
+    assert_eq!(
+        result, "One two.Three four.",
+        "dis on the gap between sentences should delete only the whitespace"
+    );
+}
+
+// #888 (`to:d5aw too many`): `aw` always needs a word to pair with; a count
+// asking for more words than exist aborts the operator with no edit, but
+// still walks the cursor to the end of the line (the same "abort but the
+// cursor already moved" shape as failed word motions elsewhere).
+#[test]
+fn test_d5aw_too_many_aborts_but_moves_cursor_to_eol() {
+    let text = "a b";
+    let mut engine = make_paragraph_engine(text);
+    engine.view_mut().cursor.line = 0;
+    engine.view_mut().cursor.col = 0;
+    engine.handle_key("", Some('5'), false);
+    engine.handle_key("", Some('d'), false);
+    engine.handle_key("", Some('a'), false);
+    engine.handle_key("", Some('w'), false);
+    let result: String = engine.buffer().content.chars().collect();
+    assert_eq!(
+        result, "a b",
+        "d5aw with only 2 words should not delete anything"
+    );
+    assert_eq!(
+        engine.view().cursor.col,
+        2,
+        "cursor should still walk to the last char of the line"
+    );
+}
+
+// #888 (`to:daw on only whitespace line`): a line of only whitespace has no
+// word for `aw` to pair with, so it degenerates the same way as an
+// impossible count — no edit, cursor clamped to the line's last char.
+#[test]
+fn test_daw_on_whitespace_only_line_is_a_noop_with_cursor_at_eol() {
+    let text = "   ";
+    let mut engine = make_paragraph_engine(text);
+    engine.view_mut().cursor.line = 0;
+    engine.view_mut().cursor.col = 1;
+    engine.handle_key("", Some('d'), false);
+    engine.handle_key("", Some('a'), false);
+    engine.handle_key("", Some('w'), false);
+    let result: String = engine.buffer().content.chars().collect();
+    assert_eq!(
+        result, "   ",
+        "daw on an all-whitespace line should not delete anything"
+    );
+    assert_eq!(
+        engine.view().cursor.col,
+        2,
+        "cursor should still walk to the last char of the line"
+    );
+}
+
+// #888 (`to:cip`): `cip`/`cap` are linewise like `cc` — the selected lines
+// disappear entirely and a single (indented) line opens for the typed
+// replacement, leaving any lines after the object (e.g. a following blank
+// line) untouched. Before this fix vimcode swallowed that trailing blank
+// line too.
+#[test]
+fn test_cip_leaves_trailing_blank_line_intact() {
+    let text = "a\nb\n\nc";
+    let mut engine = make_paragraph_engine(text);
+    engine.view_mut().cursor.line = 0;
+    engine.view_mut().cursor.col = 0;
+    engine.handle_key("", Some('c'), false);
+    engine.handle_key("", Some('i'), false);
+    engine.handle_key("", Some('p'), false);
+    assert_eq!(engine.mode, Mode::Insert, "cip should enter insert mode");
+    engine.handle_key("", Some('X'), false);
+    engine.handle_key("Escape", None, false);
+    let result: String = engine.buffer().content.chars().collect();
+    assert_eq!(
+        result, "X\n\nc",
+        "cip should replace the paragraph with one line, leaving the blank line and 'c' alone"
+    );
+}
+
 // ── Project search ────────────────────────────────────────────────────────
 
 fn make_search_dir(test_name: &str) -> std::path::PathBuf {
@@ -8313,7 +8930,15 @@ fn test_lsp_flush_clears_diagnostics_by_canonical_path() {
     let canonical = abs_path.canonicalize().unwrap();
 
     // Open the file via a relative path so state.file_path != canonical.
-    let prev_cwd = std::env::current_dir().ok();
+    //
+    // That needs the process working directory, which is shared by the whole
+    // test binary, so this is a CWD *writer* and takes the same guard the
+    // `open_folder` tests do (#785). Without it this test both leaks its
+    // temp directory into every later test and — reproducibly, 15 runs out
+    // of 15 when raced against `test_open_folder_resets_cwd` — fails itself
+    // on `canonical_path`, because the relative path resolved against
+    // whichever directory the *other* test had chdir'd to.
+    let _cwd = CwdGuard::new();
     std::env::set_current_dir(&dir).unwrap();
     let rel_path = PathBuf::from("file.rs");
     assert_ne!(
@@ -8378,9 +9003,8 @@ fn test_lsp_flush_clears_diagnostics_by_canonical_path() {
          not the original file_path key (#208)",
     );
 
-    if let Some(cwd) = prev_cwd {
-        let _ = std::env::set_current_dir(cwd);
-    }
+    // The working directory goes back when `_cwd` drops, which also happens
+    // on a panicking assert above — hence no manual restore here.
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -8674,6 +9298,37 @@ fn test_join_lines_last_line_noop() {
     assert_eq!(engine.buffer().to_string(), "only line");
 }
 
+// #880: cursor placement on the three "no space inserted" J variants —
+// each verified against `nvim --headless` (0.12.5) via `tests/nvim_conformance.rs`
+// ("op:J next starts with )", "op:J next blank", "op:J current ends with
+// space"). Vim leaves the cursor at the join point: the position that
+// either receives the inserted space, or — when nothing is inserted — is
+// occupied by the next line's first surviving character (clamped back onto
+// the last char of the merged line when there is no such character, i.e.
+// the next line was blank).
+
+#[test]
+fn test_join_lines_no_space_before_paren_cursor_on_paren() {
+    // Cursor lands ON the ')', not on the last char of the first line.
+    nvim_case("foo(\n  )\n", 0, 0, "J", "foo()\n", 0, 4);
+}
+
+#[test]
+fn test_join_lines_blank_next_line_no_trailing_space() {
+    // Joining onto a blank line adds no space and leaves none behind; the
+    // cursor clamps onto the last char of the (now merged, still one-char)
+    // line rather than landing past it.
+    nvim_case("a\n\nb\n", 0, 0, "J", "a\nb\n", 0, 0);
+}
+
+#[test]
+fn test_join_lines_current_ends_with_space_cursor_on_next_char() {
+    // First line already ends with a space: no second space is added, and
+    // the cursor lands on the next line's first char, not on the trailing
+    // space that was already there.
+    nvim_case("a \nb\n", 0, 0, "J", "a b\n", 0, 2);
+}
+
 // =======================================================================
 // Tests: Search word under cursor (* / #)
 // =======================================================================
@@ -8715,12 +9370,16 @@ fn test_star_word_boundaries() {
 }
 
 #[test]
-fn test_star_no_word_under_cursor() {
+fn test_star_scans_forward_for_nearest_word() {
+    // #801: Vim's `*` does not require the cursor to already be on a keyword —
+    // `nv_ident` scans forward on the line for the first one, moves there, then
+    // searches. Verified against Neovim: `*` on "   spaces" at col 0 lands on
+    // col 3 (the search wraps back to the only occurrence).
     let mut engine = Engine::new();
     engine.buffer_mut().insert(0, "   spaces");
     // cursor at space (col 0)
     press_char(&mut engine, '*');
-    assert!(engine.message.contains("No word under cursor"));
+    assert_eq!(engine.view().cursor.col, 3);
 }
 
 #[test]
@@ -8790,6 +9449,81 @@ fn test_jump_list_truncates_forward_on_new_jump() {
     assert_eq!(engine.view().cursor.line, 14);
 }
 
+// ─── #891: changelist (g;/g,) and `] after yank ────────────────────────────
+
+#[test]
+fn test_changelist_g_semi_then_g_comma_lands_on_second_newest() {
+    // Oracle case "jump:g; g; g," — two changes on different lines, then
+    // `gg` off the changelist entirely, then g; g; g,. The walk is a stable
+    // pointer into the list: two steps back then one step forward must land
+    // back on the second-most-recent change, not re-visit the oldest one.
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "a\nb\nc");
+    send_keys(&mut engine, "xjjxggg;g;g,");
+    // The change on line 2 ("c") deletes that line's only char, which makes
+    // the buffer's content end in "\n" — ropey (unlike Neovim) does not count
+    // a trailing newline as introducing an extra empty final line, so this
+    // engine's line 2 reads as vimcode-line-1 here (`tests/nvim_conformance.rs`
+    // carries the same +1 leniency for exactly this convention gap; it isn't
+    // part of what #891 owns). The changelist entry is still (line 2, col 0)
+    // — `change_list` — and g; g; g, must land back on it, not on line 0.
+    assert_eq!(engine.change_list, vec![(0, 0), (2, 0)]);
+    assert_eq!(
+        engine.view().cursor.line,
+        1,
+        "g; g; g, should land back on the newer of the two changes"
+    );
+}
+
+#[test]
+fn test_changelist_collapses_same_line_changes() {
+    // Oracle case "jump:g; after 2 changes same line" — a second change on
+    // the line already at the head of the changelist must update that entry
+    // in place rather than appending a second one, so a single g; jumps
+    // straight to it and a further g; reports "already at oldest" instead
+    // of walking to a (nonexistent) earlier duplicate.
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "abcdef");
+    send_keys(&mut engine, "x$xgg0g;");
+    assert_eq!(
+        engine.change_list.len(),
+        1,
+        "same-line changes must collapse"
+    );
+    assert_eq!(
+        engine.view().cursor.col,
+        3,
+        "g; should land on the column of the second (collapsed) change"
+    );
+    let msg_before = engine.message.clone();
+    send_keys(&mut engine, "g;");
+    assert_eq!(
+        engine.view().cursor.col,
+        3,
+        "a second g; must not move the cursor — there is only one entry"
+    );
+    assert_ne!(
+        engine.message, msg_before,
+        "a second g; with no earlier entry should report already-at-oldest"
+    );
+}
+
+#[test]
+fn test_backtick_close_bracket_after_yank_lands_on_last_char() {
+    // Oracle case "mark:`] after yank" — `[`/`] bracket the last changed
+    // *or yanked* text (`:h '[`). `] must land on the last character of the
+    // yanked region, not one past it.
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "abc def");
+    send_keys(&mut engine, "wyiw0`]");
+    assert_eq!(engine.view().cursor.line, 0);
+    assert_eq!(
+        engine.view().cursor.col,
+        6,
+        "`] should land on the 'f' in \"def\", the last yanked char"
+    );
+}
+
 #[test]
 fn test_jump_list_paragraph_motion() {
     let mut engine = Engine::new();
@@ -8799,6 +9533,254 @@ fn test_jump_list_paragraph_motion() {
     press_ctrl(&mut engine, 'o');
     let after_back = engine.view().cursor.line;
     assert!(after_back < after_brace);
+}
+
+// --- #674: jumplist carries pane (tab/split) identity -----------------
+
+/// Reproduces the issue's headline scenario: jump inside tab A, open a
+/// second tab with file B, jump inside B, then walk `Ctrl-O` back. The old
+/// code compared only `(file, line, col)` — with both buffers unnamed
+/// (`file: None`) it never told the tabs apart, so `Ctrl-O` just moved the
+/// cursor inside whichever tab was already active instead of switching
+/// back to tab A. This fails against unfixed `develop`: the second
+/// `Ctrl-O`'s `active_tab` assertion sees `1` (still tab B), not `0`.
+#[test]
+fn test_jump_list_ctrl_o_returns_to_original_tab() {
+    let mut engine = Engine::new();
+    let content_a: String = (0..30).map(|i| format!("AAA line {}\n", i)).collect();
+    engine.buffer_mut().insert(0, &content_a);
+    press_char(&mut engine, 'G'); // pushes (tab A, line 0); cursor -> last line
+    let tab_a_id = engine.active_tab().id;
+
+    engine.new_tab(None); // tab B, active
+    let content_b: String = (0..30).map(|i| format!("BBB line {}\n", i)).collect();
+    engine.buffer_mut().insert(0, &content_b);
+    press_char(&mut engine, 'G'); // pushes (tab B, line 0); cursor -> last line
+    let tab_b_id = engine.active_tab().id;
+    assert_ne!(tab_a_id, tab_b_id);
+    assert_eq!(engine.active_group().active_tab, 1);
+
+    // First Ctrl-O stays within tab B's own history.
+    press_ctrl(&mut engine, 'o');
+    assert_eq!(
+        engine.active_group().active_tab,
+        1,
+        "first Ctrl-O should stay in tab B"
+    );
+    assert_eq!(engine.view().cursor.line, 0);
+    assert!(engine.buffer().to_string().starts_with("BBB"));
+
+    // Second Ctrl-O exhausts B's history and must *activate* tab A —
+    // not open a fresh copy of A's content into tab B's pane.
+    press_ctrl(&mut engine, 'o');
+    assert_eq!(
+        engine.active_group().active_tab,
+        0,
+        "second Ctrl-O should switch back to tab A"
+    );
+    assert_eq!(engine.active_tab().id, tab_a_id);
+    assert_eq!(engine.view().cursor.line, 0);
+    assert!(
+        engine.buffer().to_string().starts_with("AAA"),
+        "Ctrl-O should have activated tab A's own buffer"
+    );
+    assert_eq!(
+        engine.active_group().tabs.len(),
+        2,
+        "Ctrl-O must not create a third tab"
+    );
+
+    // Ctrl-I retraces forward, back into tab B — still just 2 tabs.
+    press_ctrl(&mut engine, 'i');
+    assert_eq!(engine.active_group().active_tab, 1);
+    assert_eq!(engine.active_group().tabs.len(), 2);
+}
+
+/// Same identity-based restore, but across two splits in one tab rather
+/// than two tabs — both windows share the *same* buffer, so this can only
+/// pass if `apply_jump_list_entry` is switching on window identity, not on
+/// file path. Fails against unfixed `develop`: the old code never changes
+/// `active_window`, so the second `Ctrl-O` leaves the cursor in split B.
+#[test]
+fn test_jump_list_ctrl_o_returns_to_original_split() {
+    let mut engine = Engine::new();
+    let content: String = (0..30).map(|i| format!("line {}\n", i)).collect();
+    engine.buffer_mut().insert(0, &content);
+    press_char(&mut engine, 'G'); // pushes (split A, line 0); cursor -> last line
+    let window_a_id = engine.active_window_id();
+
+    engine.split_window(SplitDirection::Vertical, None); // split B, active
+    let window_b_id = engine.active_window_id();
+    assert_ne!(window_a_id, window_b_id);
+
+    engine.view_mut().cursor.line = 5;
+    press_char(&mut engine, 'G'); // pushes (split B, line 5); cursor -> last line
+
+    // First Ctrl-O stays in split B.
+    press_ctrl(&mut engine, 'o');
+    assert_eq!(engine.active_window_id(), window_b_id);
+    assert_eq!(engine.view().cursor.line, 5);
+
+    // Second Ctrl-O must switch focus back to split A.
+    press_ctrl(&mut engine, 'o');
+    assert_eq!(
+        engine.active_window_id(),
+        window_a_id,
+        "second Ctrl-O should switch focus back to split A"
+    );
+    assert_eq!(engine.view().cursor.line, 0);
+}
+
+/// Reproduces the review finding on #674: a jump-list entry's *window*
+/// surviving is not the same as its *buffer* surviving. `open_file_with_mode`
+/// (the path used by `:e`, `gf`, and the explorer/fuzzy-finder) replaces a
+/// window's buffer **in place**, keeping the same `WindowId` — the single
+/// most common jumplist workflow (no splits, no tabs, just switching files
+/// in one pane). Jump inside file A, open file B into that *same* window,
+/// then `Ctrl-O`: the old (unfixed) code saw the recorded window still
+/// existing and still in the same tab, trusted the pane match, and applied
+/// file A's remembered line/col directly onto file B's buffer — silently
+/// corrupting B's cursor instead of reopening A. Fails against unfixed
+/// `develop`: the buffer-content assertion sees "BBB" instead of "AAA".
+#[test]
+fn test_jump_list_ctrl_o_reopens_file_when_buffer_swapped_in_place() {
+    let dir = std::env::temp_dir().join("vimcode_jumplist_swap_in_place");
+    std::fs::create_dir_all(&dir).unwrap();
+    let file_a = dir.join("file_a_swap.txt");
+    let file_b = dir.join("file_b_swap.txt");
+    let content_a: String = (0..30).map(|i| format!("AAA line {}\n", i)).collect();
+    std::fs::write(&file_a, &content_a).unwrap();
+    std::fs::write(&file_b, "BBB only line\n").unwrap();
+
+    let mut engine = Engine::new();
+    engine
+        .open_file_with_mode(&file_a, OpenMode::Permanent)
+        .unwrap();
+    let window_id = engine.active_window_id();
+
+    press_char(&mut engine, 'G'); // pushes (window, file A, line 0); cursor -> last line
+
+    // Open file B into the *same* window — buffer swapped in place, same
+    // WindowId, exactly what `:e`/`gf`/explorer-click do.
+    engine
+        .open_file_with_mode(&file_b, OpenMode::Permanent)
+        .unwrap();
+    assert_eq!(
+        engine.active_window_id(),
+        window_id,
+        "opening B into the single window must reuse the same WindowId"
+    );
+    assert!(engine.buffer().to_string().starts_with("BBB"));
+
+    // Ctrl-O must recognise the recorded pane no longer holds file A and
+    // reopen A into this window, rather than trusting the stale window
+    // match and applying A's line/col onto B's buffer.
+    press_ctrl(&mut engine, 'o');
+    assert!(
+        engine.buffer().to_string().starts_with("AAA"),
+        "Ctrl-O should have reopened file A, not left B's buffer with A's cursor; buffer starts with:\n{}",
+        engine.buffer().to_string().lines().next().unwrap_or("")
+    );
+    assert_eq!(
+        engine.active_buffer_state().file_path.as_deref(),
+        Some(file_a.as_path())
+    );
+    assert_eq!(engine.view().cursor.line, 0);
+}
+
+/// Closing a tab that appears in the jumplist must not resurrect it: the
+/// dead entry is pruned, and `Ctrl-O` keeps working by skipping straight
+/// over it rather than reopening the closed file or panicking.
+#[test]
+fn test_jump_list_prunes_entry_on_tab_close() {
+    let mut engine = Engine::new();
+    let content_a: String = (0..30).map(|i| format!("AAA line {}\n", i)).collect();
+    engine.buffer_mut().insert(0, &content_a);
+    press_char(&mut engine, 'G'); // entry 1: (tab A, line 0)
+    let tab_a_id = engine.active_tab().id;
+    let bottom_a = engine.view().cursor.line;
+
+    engine.new_tab(None); // tab B
+    engine
+        .buffer_mut()
+        .insert(0, "BBB doomed tab, should never come back\n");
+    press_char(&mut engine, 'G'); // entry 2: (tab B, line 0) — will be pruned
+    let tab_b_id = engine.active_tab().id;
+    let tab_b_window = engine.active_window_id();
+
+    engine.goto_tab(0); // back to tab A without going through the jumplist
+    press_char(&mut engine, 'g');
+    press_char(&mut engine, 'g'); // entry 3: (tab A, bottom_a); cursor -> line 0
+
+    // Close tab B — its jumplist entry must be pruned.
+    engine.goto_tab(1);
+    assert_eq!(engine.active_tab().id, tab_b_id);
+    engine.close_tab();
+    assert!(
+        !engine
+            .jump_list
+            .iter()
+            .any(|e| e.tab_id == tab_b_id || e.window_id == tab_b_window),
+        "closing tab B must drop its jumplist entry"
+    );
+    assert_eq!(engine.active_tab().id, tab_a_id, "only tab A remains");
+
+    // Ctrl-O must keep working: first hop goes to (tab A, bottom_a) — the
+    // entry recorded by the `gg` above — never touching the pruned entry.
+    press_ctrl(&mut engine, 'o');
+    assert_eq!(engine.active_tab().id, tab_a_id);
+    assert_eq!(engine.view().cursor.line, bottom_a);
+
+    // Second hop goes further back to (tab A, line 0) — still no panic,
+    // still no attempt to reopen the closed tab B.
+    press_ctrl(&mut engine, 'o');
+    assert_eq!(engine.active_tab().id, tab_a_id);
+    assert_eq!(engine.view().cursor.line, 0);
+    assert_eq!(
+        engine.active_group().tabs.len(),
+        1,
+        "no tab should have been reopened while walking the jumplist"
+    );
+}
+
+/// `:jumps` must reflect the widened entries: a `tab` column showing the
+/// still-alive pane's `TabId`, or `x` once that pane has been closed.
+#[test]
+fn test_ex_jumps_shows_tab_identity() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "one\ntwo\nthree\n");
+    press_char(&mut engine, 'G');
+    let tab_a_id = engine.active_tab().id;
+
+    engine.new_tab(None);
+    engine.buffer_mut().insert(0, "four\nfive\nsix\n");
+    press_char(&mut engine, 'G');
+
+    engine.execute_command("jumps");
+    assert!(
+        engine.message.contains(&format!("{}", tab_a_id.0)),
+        ":jumps should list tab A's TabId while it's alive; message:\n{}",
+        engine.message
+    );
+
+    // A pane that's gone (normally pruned away entirely on close — see
+    // `test_jump_list_prunes_entry_on_tab_close`) must still render safely
+    // as "x" rather than crashing or claiming a dead pane is reachable.
+    // Fabricate one directly to pin down that defensive display path.
+    engine.jump_list.push(JumpEntry {
+        file: None,
+        line: 0,
+        col: 0,
+        group_id: GroupId(9999),
+        tab_id: TabId(9999),
+        window_id: WindowId(9999),
+    });
+    engine.execute_command("jumps");
+    assert!(
+        engine.message.contains(" x  "),
+        ":jumps should mark an unreachable pane's entry as dead; message:\n{}",
+        engine.message
+    );
 }
 
 // =======================================================================
@@ -8991,6 +9973,127 @@ fn test_dedent_normal_mode_preserves_nesting() {
     assert_eq!(lines[0], "line1", "should remove only 2 (min indent)");
     assert_eq!(lines[1], "    line2");
     assert_eq!(lines[2], "        line3");
+}
+
+// ─── #883: >> cursor landing, << with mixed tabs/spaces, o<Esc> autoindent ──
+
+#[test]
+fn test_shift_right_leaves_cursor_screen_column_alone_by_default() {
+    // `:h 'startofline'` names ">>" among the commands it governs; off (the
+    // default, matching Neovim) leaves the cursor on the same *screen*
+    // column rather than jumping to the first non-blank (confirmed against
+    // real Neovim: `>>` on "  abc" from column 4 stays at column 4, now
+    // sitting in the grown indent rather than on "b").
+    let mut e = engine_with_text("  abc\n");
+    e.settings.shift_width = 4;
+    e.settings.expand_tab = true;
+    e.settings.tabstop = 4;
+    e.view_mut().cursor.col = 3; // 0-indexed: the 'b' in "  abc"
+    press_char(&mut e, '>');
+    press_char(&mut e, '>');
+    assert_eq!(e.buffer().to_string(), "      abc\n");
+    assert_eq!(
+        e.view().cursor.col,
+        3,
+        ">> should leave the cursor's raw screen column untouched"
+    );
+}
+
+#[test]
+fn test_shift_right_startofline_lands_on_first_non_blank() {
+    // With 'startofline' on, the same shift instead parks on the first
+    // non-blank of the line (verified against real Neovim with
+    // `vim.o.startofline = true`).
+    let mut e = engine_with_text("  abc\n");
+    e.settings.shift_width = 4;
+    e.settings.expand_tab = true;
+    e.settings.tabstop = 4;
+    e.settings.startofline = true;
+    e.view_mut().cursor.col = 3;
+    press_char(&mut e, '>');
+    press_char(&mut e, '>');
+    assert_eq!(e.buffer().to_string(), "      abc\n");
+    assert_eq!(
+        e.view().cursor.col,
+        6,
+        ">> with 'startofline' should land on 'a'"
+    );
+}
+
+#[test]
+fn test_shift_left_measures_tabs_by_tabstop_not_shiftwidth() {
+    // Dedent has to measure a tab's *existing* display width using
+    // 'tabstop', not 'shiftwidth' — the two commonly differ. With ts=8 but
+    // sw=4, a single leading tab is 8 columns wide; removing one
+    // 'shiftwidth' (4) should leave 4 columns of indent behind, not zero
+    // (confirmed against real Neovim). The old implementation used `sw` for
+    // both the width *measurement* and the removal amount, so with ts != sw
+    // it silently mismeasured the tab and either over- or under-dedented.
+    let mut e = engine_with_text("\tabc\n");
+    e.settings.shift_width = 4;
+    e.settings.tabstop = 8;
+    e.settings.expand_tab = false;
+    press_char(&mut e, '<');
+    press_char(&mut e, '<');
+    assert_eq!(
+        e.buffer().to_string(),
+        "    abc\n",
+        "<< should leave 4 of the tab's 8 display columns, as 4 spaces (noet)"
+    );
+}
+
+#[test]
+fn test_shift_left_reexpresses_remaining_tab_under_expandtab() {
+    // A tab that survives the shift still has to be re-expressed as spaces
+    // when 'expandtab' is on — it wasn't the character actually deleted, so
+    // an implementation that just trims characters off the front leaves it
+    // as a literal tab instead (confirmed wrong against real Neovim, which
+    // always re-emits the whole indent from scratch).
+    let mut e = engine_with_text("\t\tabc\n"); // two tabs, ts=4 => 8 display columns
+    e.settings.shift_width = 4;
+    e.settings.tabstop = 4;
+    e.settings.expand_tab = true;
+    press_char(&mut e, '<');
+    press_char(&mut e, '<');
+    assert_eq!(
+        e.buffer().to_string(),
+        "    abc\n",
+        "the remaining 4 columns of indent must be spaces under 'expandtab', not a literal tab"
+    );
+}
+
+#[test]
+fn test_o_then_escape_with_no_text_leaves_a_truly_empty_line() {
+    // `:h 'autoindent'`: opening a line with `o` inserts the auto-indent;
+    // leaving insert mode without typing anything removes it again, leaving
+    // a genuinely empty line — not one padded with the untyped indent's
+    // whitespace (confirmed against real Neovim). This previously only
+    // worked for the `<CR>`-created case; `o`/`O` never armed the same
+    // "untouched indent-only line" tracking.
+    let mut e = engine_with_text("    foo\nbar\n");
+    e.settings.auto_indent = true;
+    press_char(&mut e, 'o');
+    press_special(&mut e, "Escape");
+    assert_eq!(
+        e.buffer().to_string(),
+        "    foo\n\nbar\n",
+        "o<Esc> with nothing typed should leave a bare empty line, no trailing whitespace"
+    );
+}
+
+#[test]
+fn test_capital_o_then_escape_with_no_text_leaves_a_truly_empty_line() {
+    // Same as above, for `O` (open above).
+    let mut e = engine_with_text("    foo\n");
+    e.settings.auto_indent = true;
+    e.view_mut().cursor.line = 0;
+    press_char(&mut e, 'O');
+    press_special(&mut e, "Escape");
+    assert_eq!(
+        e.buffer().to_string(),
+        "\n    foo\n",
+        "O<Esc> with nothing typed should leave a bare empty line above"
+    );
 }
 
 // ─── Tag text objects (it / at) ──────────────────────────────────────────
@@ -9261,21 +10364,27 @@ fn test_norm_undo_single_group() {
 #[test]
 fn test_fuzzy_score_empty_query() {
     // Empty query always matches with score 0
-    assert_eq!(Engine::fuzzy_score("src/main.rs", ""), Some(0));
-    assert_eq!(Engine::fuzzy_score("anything", ""), Some(0));
+    assert_eq!(
+        quadraui::text_util::fuzzy_score("src/main.rs", "").map(|(s, _)| s),
+        Some(0)
+    );
+    assert_eq!(
+        quadraui::text_util::fuzzy_score("anything", "").map(|(s, _)| s),
+        Some(0)
+    );
 }
 
 #[test]
 fn test_fuzzy_score_no_match() {
     // Query chars not present as subsequence → None
-    assert_eq!(Engine::fuzzy_score("src/main.rs", "xyz"), None);
-    assert_eq!(Engine::fuzzy_score("foo.rs", "bar"), None);
+    assert!(quadraui::text_util::fuzzy_score("src/main.rs", "xyz").is_none());
+    assert!(quadraui::text_util::fuzzy_score("foo.rs", "bar").is_none());
 }
 
 #[test]
 fn test_fuzzy_score_exact() {
     // Exact prefix should score positively
-    let score = Engine::fuzzy_score("engine.rs", "engine");
+    let score = quadraui::text_util::fuzzy_score("engine.rs", "engine").map(|(s, _)| s);
     assert!(score.is_some());
     assert!(score.unwrap() > 0);
 }
@@ -9284,8 +10393,12 @@ fn test_fuzzy_score_exact() {
 fn test_fuzzy_score_consecutive_bonus() {
     // Consecutive matches incur no gap penalty; widely scattered matches do.
     // Use paths without underscores to avoid word-boundary bonus interference.
-    let consecutive = Engine::fuzzy_score("abcdef.rs", "abc").unwrap();
-    let scattered = Engine::fuzzy_score("aXXbXXc.rs", "abc").unwrap();
+    let consecutive = quadraui::text_util::fuzzy_score("abcdef.rs", "abc")
+        .unwrap()
+        .0;
+    let scattered = quadraui::text_util::fuzzy_score("aXXbXXc.rs", "abc")
+        .unwrap()
+        .0;
     assert!(
         consecutive >= scattered,
         "consecutive={} scattered={}",
@@ -9569,18 +10682,18 @@ fn test_picker_commands_source() {
 #[test]
 fn test_fuzzy_score_with_positions() {
     // Exact prefix
-    let result = Engine::fuzzy_score_with_positions("src/main.rs", "main");
+    let result = quadraui::text_util::fuzzy_score("src/main.rs", "main");
     assert!(result.is_some());
     let (score, positions) = result.unwrap();
     assert!(score > 0);
     assert_eq!(positions.len(), 4);
 
     // No match
-    let result = Engine::fuzzy_score_with_positions("src/main.rs", "xyz");
+    let result = quadraui::text_util::fuzzy_score("src/main.rs", "xyz");
     assert!(result.is_none());
 
     // Empty query
-    let result = Engine::fuzzy_score_with_positions("anything", "");
+    let result = quadraui::text_util::fuzzy_score("anything", "");
     assert!(result.is_some());
     let (score, positions) = result.unwrap();
     assert_eq!(score, 0);
@@ -11194,190 +12307,145 @@ fn test_move_file_updates_buffer_path() {
     let _ = std::fs::remove_dir_all(&base);
 }
 
-// ─── LCS diff tests ───────────────────────────────────────────────────────
+// ─── diff_state_from_hunks tests ──────────────────────────────────────────
+//
+// The Myers-diff/alignment algorithm itself is now `quadraui::compute_hunks`
+// (tested in quadraui's own suite). These tests cover the vimcode-owned
+// adapter that reconstructs per-line `DiffLine` status and padded
+// `AlignedDiffEntry` rows from quadraui's hunk list — including gap-filling
+// for the unchanged regions `compute_hunks` doesn't return rows for.
 
 #[test]
-fn test_lcs_diff_same_content() {
-    let a = &["alpha", "beta", "gamma"];
-    let b = &["alpha", "beta", "gamma"];
-    let (da, db) = lcs_diff(a, b);
+fn test_diff_state_from_hunks_identical_files() {
+    let hunks = quadraui::compute_hunks("alpha\nbeta\ngamma", "alpha\nbeta\ngamma");
+    assert!(hunks.is_empty(), "identical texts produce no hunks");
+    let (da, db, aligned_a, aligned_b) = diff_state_from_hunks(&hunks, 3, 3);
     assert!(da.iter().all(|s| *s == DiffLine::Same));
     assert!(db.iter().all(|s| *s == DiffLine::Same));
-    assert_eq!(da.len(), 3);
-    assert_eq!(db.len(), 3);
+    // The whole file should be reconstructed as a same-same aligned gap.
+    assert_eq!(aligned_a.len(), 3);
+    assert_eq!(aligned_b.len(), 3);
+    for i in 0..3 {
+        assert_eq!(aligned_a[i].source_line, Some(i));
+        assert_eq!(aligned_b[i].source_line, Some(i));
+    }
 }
 
 #[test]
-fn test_lcs_diff_added_line() {
-    let a = &["alpha", "gamma"];
-    let b = &["alpha", "beta", "gamma"];
-    let (da, db) = lcs_diff(a, b);
+fn test_diff_state_from_hunks_added_line() {
+    let a = "alpha\ngamma";
+    let b = "alpha\nbeta\ngamma";
+    let hunks = quadraui::compute_hunks(a, b);
+    let (da, db, aligned_a, aligned_b) = diff_state_from_hunks(&hunks, 2, 3);
     assert!(da.iter().all(|s| *s == DiffLine::Same));
     assert_eq!(db[0], DiffLine::Same);
     assert_eq!(db[1], DiffLine::Added);
     assert_eq!(db[2], DiffLine::Same);
+    assert_eq!(aligned_a.len(), aligned_b.len());
+    // The added line has no left-side counterpart (padding).
+    let added_row = aligned_b
+        .iter()
+        .position(|e| e.source_line == Some(1))
+        .expect("aligned row for added line");
+    assert_eq!(aligned_a[added_row].source_line, None);
 }
 
 #[test]
-fn test_lcs_diff_removed_line() {
-    let a = &["alpha", "beta", "gamma"];
-    let b = &["alpha", "gamma"];
-    let (da, db) = lcs_diff(a, b);
+fn test_diff_state_from_hunks_removed_line() {
+    let a = "alpha\nbeta\ngamma";
+    let b = "alpha\ngamma";
+    let hunks = quadraui::compute_hunks(a, b);
+    let (da, db, aligned_a, aligned_b) = diff_state_from_hunks(&hunks, 3, 2);
     assert_eq!(da[0], DiffLine::Same);
     assert_eq!(da[1], DiffLine::Removed);
     assert_eq!(da[2], DiffLine::Same);
     assert!(db.iter().all(|s| *s == DiffLine::Same));
+    assert_eq!(aligned_a.len(), aligned_b.len());
 }
 
 #[test]
-fn test_myers_diff_two_change_blocks() {
-    // Mirrors the README vs README2 scenario: two distinct change blocks
-    // separated by 2 unchanged lines — must NOT merge into one block.
-    let a = &[
-        "# DemoConsoleGame",
-        "Simple demo game",
-        "",
-        "In the end he did get a degree",
-        "",
-        "Now he's doing a masters",
-        "",
-        "So, now the only point",
-    ];
-    let b = &[
-        "# DemoConsoleGame",
-        "Simple demo game",
-        "",
-        "In the end he did ge asdfadt a degree",
-        "",
-        "",
-        "asds",
-        "",
-        "zdxfasd",
-        "",
-        "",
-        "Now he's doing a masters",
-        "",
-        "asdfsd",
-        "",
-        "So, now the only point",
-    ];
-    let (da, db) = lcs_diff(a, b);
-    // Line 3 of a should be Removed, line 3 of b should be Added (changed line).
-    assert_eq!(da[3], DiffLine::Removed);
-    assert_eq!(db[3], DiffLine::Added);
-    // Lines 5-10 of b should be Added (inserted block).
-    for i in 5..11 {
-        assert_eq!(db[i], DiffLine::Added, "b[{}] should be Added", i);
-    }
-    // a[5] "Now he's doing..." should be Same (not merged).
-    assert_eq!(da[5], DiffLine::Same);
-    assert_eq!(db[11], DiffLine::Same);
-    // b[13] "asdfsd" should be Added (second change block).
-    assert_eq!(db[13], DiffLine::Added);
-}
-
-#[test]
-fn test_lcs_diff_changed_line() {
-    let a = &["hello world"];
-    let b = &["hello rust"];
-    let (da, db) = lcs_diff(a, b);
+fn test_diff_state_from_hunks_changed_line() {
+    let hunks = quadraui::compute_hunks("hello world", "hello rust");
+    let (da, db, _aligned_a, _aligned_b) = diff_state_from_hunks(&hunks, 1, 1);
     assert_eq!(da[0], DiffLine::Removed);
     assert_eq!(db[0], DiffLine::Added);
 }
 
 #[test]
-fn test_lcs_diff_empty() {
-    let (da, db) = lcs_diff(&[], &[]);
-    assert!(da.is_empty());
-    assert!(db.is_empty());
+fn test_diff_state_from_hunks_empty() {
+    let hunks = quadraui::compute_hunks("", "");
+    let (da, db, aligned_a, aligned_b) = diff_state_from_hunks(&hunks, 1, 1);
+    // A single empty line on each side, unchanged.
+    assert_eq!(da, vec![DiffLine::Same]);
+    assert_eq!(db, vec![DiffLine::Same]);
+    assert_eq!(aligned_a.len(), 1);
+    assert_eq!(aligned_b.len(), 1);
+}
+
+#[test]
+fn test_diff_state_from_hunks_two_change_blocks() {
+    // Mirrors the README vs README2 scenario: two distinct change blocks
+    // separated by unchanged lines far enough apart that `compute_hunks`
+    // must return two separate hunks — the gap between them must be
+    // reconstructed here as straight Same-Same pairs.
+    let a = "s0\ns1\ns2\ns3\nold1\ns4\ns5\ns6\ns7\ns8\ns9\ns10\nold2\ns11\ns12";
+    let b = "s0\ns1\ns2\ns3\nnew1\ns4\ns5\ns6\ns7\ns8\ns9\ns10\nnew2\ns11\ns12";
+    let hunks = quadraui::compute_hunks(a, b);
+    assert!(
+        hunks.len() >= 2,
+        "two well-separated changes should stay as separate hunks, got {hunks:?}"
+    );
+    let a_lines: Vec<&str> = a.split('\n').collect();
+    let b_lines: Vec<&str> = b.split('\n').collect();
+    let (da, db, aligned_a, aligned_b) =
+        diff_state_from_hunks(&hunks, a_lines.len(), b_lines.len());
+    assert_eq!(da[4], DiffLine::Removed, "old1");
+    assert_eq!(db[4], DiffLine::Added, "new1");
+    assert_eq!(da[12], DiffLine::Removed, "old2");
+    assert_eq!(db[12], DiffLine::Added, "new2");
+    // The long unchanged run between the two changes must reconstruct as Same.
+    for i in 5..12 {
+        assert_eq!(
+            da[i],
+            DiffLine::Same,
+            "da[{i}] should be Same (inter-hunk gap)"
+        );
+        assert_eq!(
+            db[i],
+            DiffLine::Same,
+            "db[{i}] should be Same (inter-hunk gap)"
+        );
+    }
+    assert_eq!(aligned_a.len(), aligned_b.len());
 }
 
 #[test]
 fn test_merge_short_same_runs_blank_lines() {
     // Blank lines inside an added block should not fragment it.
-    let a = &["header", "old", "footer"];
-    let b = &["header", "new1", "", "new2", "", "new3", "footer"];
-    let (da, mut db) = lcs_diff(a, b);
-    merge_short_same_runs(&mut db, DiffLine::Added);
-    // All lines between header and footer should be Added on the b side.
-    assert_eq!(db[0], DiffLine::Same, "header");
+    // (Constructed directly rather than via a Myers diff — this tests
+    // vimcode's own post-processing heuristic, not the diff algorithm.)
+    use DiffLine::*;
+    let mut db = vec![Same, Added, Same, Added, Same, Added, Same];
+    merge_short_same_runs(&mut db, Added);
+    assert_eq!(db[0], Same, "header");
     for i in 1..6 {
-        assert_eq!(db[i], DiffLine::Added, "line {i} should be Added");
+        assert_eq!(db[i], Added, "line {i} should be Added");
     }
-    assert_eq!(db[6], DiffLine::Same, "footer");
-    // A side should still have Removed for 'old'.
-    assert_eq!(da[0], DiffLine::Same);
-    assert_eq!(da[1], DiffLine::Removed);
-    assert_eq!(da[2], DiffLine::Same);
+    assert_eq!(db[6], Same, "footer");
 }
 
 #[test]
 fn test_merge_short_same_runs_common_lines() {
     // Short runs of common lines (braces, imports) between changes should
     // be absorbed into the surrounding change region.
-    let a = &["header", "}", "footer"];
-    let b = &["header", "new1", "}", "new2", "footer"];
-    let (_da, mut db) = lcs_diff(a, b);
-    merge_short_same_runs(&mut db, DiffLine::Added);
-    assert_eq!(db[0], DiffLine::Same, "header");
-    // "new1", "}", "new2" should all be Added (} is a short Same island).
+    use DiffLine::*;
+    let mut db = vec![Same, Added, Same, Added, Same];
+    merge_short_same_runs(&mut db, Added);
+    assert_eq!(db[0], Same, "header");
     for i in 1..4 {
-        assert_eq!(db[i], DiffLine::Added, "line {i} should be Added");
+        assert_eq!(db[i], Added, "line {i} should be Added");
     }
-    assert_eq!(db[4], DiffLine::Same, "footer");
-}
-
-#[test]
-fn test_build_aligned_diff_unequal_same_tails() {
-    // Regression: when one side has more Same lines than the other,
-    // build_aligned_diff must not loop forever.
-    use DiffLine::*;
-    let da = vec![Same, Same, Removed, Same, Same];
-    let db = vec![Same, Same, Same];
-    // This used to hang — the fix ensures progress when one side is
-    // exhausted while the other still has Same lines.
-    let (aa, ab) = build_aligned_diff(&da, &db);
-    assert_eq!(aa.len(), ab.len());
-}
-
-#[test]
-fn test_build_aligned_diff_basic() {
-    use DiffLine::*;
-    let da = vec![Same, Removed, Same];
-    let db = vec![Same, Added, Same];
-    let (aa, ab) = build_aligned_diff(&da, &db);
-    assert_eq!(aa.len(), ab.len());
-    // First and last should map to source lines.
-    assert!(aa[0].source_line.is_some());
-    assert!(ab[0].source_line.is_some());
-}
-
-#[test]
-fn test_lcs_diff_large_files_with_small_diff() {
-    // Regression: files >5000 lines used to return all-Same due to MAX_LINES guard.
-    let mut a_lines: Vec<String> = (0..8000).map(|i| format!("line {i}")).collect();
-    let mut b_lines = a_lines.clone();
-    // Insert 3 new lines in the middle of b.
-    b_lines.insert(4000, "new line 1".to_string());
-    b_lines.insert(4001, "new line 2".to_string());
-    b_lines.insert(4002, "new line 3".to_string());
-    // Also change one line.
-    a_lines[100] = "original line 100".to_string();
-    b_lines[100] = "modified line 100".to_string();
-
-    let a_refs: Vec<&str> = a_lines.iter().map(String::as_str).collect();
-    let b_refs: Vec<&str> = b_lines.iter().map(String::as_str).collect();
-    let (da, db) = lcs_diff(&a_refs, &b_refs);
-
-    // Should detect actual changes, not return all-Same.
-    let a_changes = da.iter().filter(|d| **d != DiffLine::Same).count();
-    let b_changes = db.iter().filter(|d| **d != DiffLine::Same).count();
-    assert!(
-        a_changes > 0 || b_changes > 0,
-        "diff should detect changes in large files"
-    );
-    // Specifically: b should have 3 Added lines + 1 changed line.
-    assert!(b_changes >= 3, "b should have at least 3 Added lines");
+    assert_eq!(db[4], Same, "footer");
 }
 
 // ─── cmd_diffthis / cmd_diffoff / cmd_diffsplit tests ─────────────────────
@@ -11448,6 +12516,63 @@ fn test_diffsplit_command() {
     );
     assert!(engine.diff_window_pair.is_some());
     assert!(!engine.diff_results.is_empty());
+}
+
+#[test]
+fn test_diffsplit_trailing_newline_aligned_length_matches_buffer() {
+    // Regression test (#512 review finding 1): `compute_diff` used to build
+    // `a_lines`/`b_lines` from raw `content.lines()` (ropey's `Rope::lines`),
+    // which — unlike `Buffer::len_lines()` — counts a trailing '\n' as
+    // starting a new, empty final line. So for a buffer ending in '\n'
+    // (i.e. almost every real file), `a_lines`/`b_lines` had one MORE
+    // element than the rest of the engine (window rendering, cursor bounds)
+    // considers the buffer's real line count. That phantom trailing line
+    // then made `aligned_a`/`aligned_b` — indexed against `a_lines.len()` —
+    // one entry longer than the real buffer. Fixed by truncating
+    // `a_lines`/`b_lines` to `buffer.len_lines()` and stripping the matching
+    // trailing '\n' before handing text to `quadraui::compute_hunks` (which
+    // re-splits on '\n' internally and would otherwise reproduce the same
+    // phantom element). This test uses single-line files with a real change
+    // on the last (only) line, mirroring the review's minimal repro.
+    let dir = std::env::temp_dir().join("vimcode_diffsplit_trailing_nl");
+    std::fs::create_dir_all(&dir).unwrap();
+    let f1 = dir.join("hello.txt");
+    let f2 = dir.join("world.txt");
+    std::fs::write(&f1, "hello\n").unwrap();
+    std::fs::write(&f2, "world\n").unwrap();
+
+    let mut engine = Engine::new();
+    engine
+        .open_file_with_mode(&f1, OpenMode::Permanent)
+        .unwrap();
+    engine.execute_command(&format!("diffsplit {}", f2.display()));
+
+    let (a_win, b_win) = engine
+        .diff_window_pair
+        .expect("diffsplit should set a window pair");
+    let aligned_a = engine.diff_aligned.get(&a_win).cloned().unwrap_or_default();
+    let aligned_b = engine.diff_aligned.get(&b_win).cloned().unwrap_or_default();
+
+    // Both files are exactly one line — the aligned rows must not grow
+    // past that, even though the raw text (with trailing '\n') would
+    // re-split into two pieces via `str::split('\n')`.
+    assert_eq!(
+        aligned_a.len(),
+        1,
+        "aligned_a should have exactly one entry for a one-line buffer, got {aligned_a:?}"
+    );
+    assert_eq!(
+        aligned_b.len(),
+        1,
+        "aligned_b should have exactly one entry for a one-line buffer, got {aligned_b:?}"
+    );
+    assert_eq!(aligned_a[0].source_line, Some(0));
+    assert_eq!(aligned_b[0].source_line, Some(0));
+
+    let da = engine.diff_results.get(&a_win).cloned().unwrap_or_default();
+    let db = engine.diff_results.get(&b_win).cloned().unwrap_or_default();
+    assert_eq!(da, vec![DiffLine::Removed]);
+    assert_eq!(db, vec![DiffLine::Added]);
 }
 
 // ── Diff toolbar + navigation tests ──────────────────────────────────────
@@ -12376,7 +13501,7 @@ fn test_clipboard_register_read() {
     assert!(content.is_some());
     let (text, linewise) = content.unwrap();
     assert_eq!(text, "from_clipboard");
-    assert!(!linewise);
+    assert!(!linewise.is_linewise());
 }
 
 #[test]
@@ -12407,6 +13532,121 @@ fn test_paste_clipboard_multiline_takes_first() {
     press_char(&mut engine, ':');
     engine.paste_clipboard_to_input();
     assert_eq!(engine.command_buffer, "first line");
+}
+
+// ── #946: clipboard paste routed through `engine.clipboard_read` ─────────
+//
+// `Engine::clipboard_paste()` (the hand-rolled xclip/xsel/pbpaste/
+// powershell shell-out) always returned `None` under `#[cfg(test)]`, so a
+// raw Ctrl+V key press into any of its six call sites was a silent no-op in
+// every unit test — there was no way to assert the paste actually landed.
+// Now that all six read `engine.clipboard_read` (the same callback every
+// backend already installs), a mocked callback makes the *real* key-press
+// path testable for the first time. Each test below fails against
+// unfixed `develop` (with `Self::clipboard_paste()` still in place) because
+// the mocked `clipboard_read` callback is never consulted and the target
+// field stays empty.
+
+#[test]
+fn test_ctrl_v_paste_in_command_mode_via_clipboard_read() {
+    let mut engine = Engine::new();
+    engine.clipboard_read = Some(Box::new(|| Ok("cmd_paste".to_string())));
+
+    press_char(&mut engine, ':');
+    assert_eq!(engine.mode, Mode::Command);
+
+    press_ctrl(&mut engine, 'v');
+    assert_eq!(engine.command_buffer, "cmd_paste");
+}
+
+#[test]
+fn test_ctrl_v_paste_in_search_mode_via_clipboard_read() {
+    let mut engine = Engine::new();
+    engine.clipboard_read = Some(Box::new(|| Ok("search_paste".to_string())));
+
+    press_char(&mut engine, '/');
+    assert_eq!(engine.mode, Mode::Search);
+
+    press_ctrl(&mut engine, 'v');
+    assert_eq!(engine.command_buffer, "search_paste");
+}
+
+#[test]
+fn test_ctrl_v_paste_into_sc_commit_message_via_clipboard_read() {
+    let mut engine = make_sc_engine_with_files();
+    engine.clipboard_read = Some(Box::new(|| Ok("commit message from clipboard".to_string())));
+    engine.sc_commit_input_active = true;
+
+    engine.handle_sc_commit_input_key("v", true, Some('v'));
+
+    assert_eq!(engine.sc_commit_message, "commit message from clipboard");
+}
+
+#[test]
+fn test_ctrl_v_paste_into_find_replace_via_clipboard_read() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "hello world");
+    engine.update_syntax();
+    engine.clipboard_read = Some(Box::new(|| Ok("needle".to_string())));
+
+    engine.open_find_replace();
+    engine.find_replace_focus = 0;
+    engine.find_replace_query.clear();
+    engine.find_replace_cursor = 0;
+
+    engine.handle_find_replace_key("v", None, true, false);
+
+    assert_eq!(engine.find_replace_query, "needle");
+}
+
+#[test]
+fn test_ctrl_v_paste_into_picker_query_via_clipboard_read() {
+    let mut engine = Engine::new();
+    engine.clipboard_read = Some(Box::new(|| Ok("query text".to_string())));
+
+    engine.open_picker(PickerSource::Files);
+    engine.handle_picker_key("v", Some('v'), true);
+
+    assert_eq!(engine.picker_query, "query text");
+}
+
+/// #946: `Engine::route_paste` is the function every backend's real Ctrl+V
+/// actually reaches — quadraui#813 intercepts Ctrl+V/Ctrl+Shift+V ahead of
+/// `AppLogic::handle` on every backend and redelivers the already-resolved
+/// clipboard text as `UiEvent::ClipboardPaste` → `route_paste`, so a raw
+/// `KeyPressed` Ctrl+V never reaches `handle_find_replace_key`'s own arm
+/// (see `tui_main::shell_app::tests::ctrl_v_paste_reaches_the_search_panel_via_clipboard_paste_event`'s
+/// doc comment for how this was confirmed empirically). Before this fix,
+/// `route_paste` had a branch for `picker_open`, `sc_commit_input_active`,
+/// `search_has_focus` and four other overlay flags but none for
+/// `find_replace_open`, so Ctrl+V while the overlay was open fell through to
+/// the `Mode::Normal` arm and pasted into the buffer instead of the query
+/// field — a live bug on both GTK and TUI, not just a dead-code gap.
+///
+/// **Verified RED:** temporarily deleting the `if self.find_replace_open
+/// { self.find_replace_paste(text); return; }` branch this fix adds to
+/// `route_paste` (`src/core/engine/keys.rs`) makes this test fail —
+/// `find_replace_query` stays empty because the paste falls through to the
+/// `Mode::Normal` arm and mutates the buffer instead.
+#[test]
+fn test_route_paste_into_find_replace_query_when_overlay_open() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "hello world");
+    engine.update_syntax();
+
+    engine.open_find_replace();
+    engine.find_replace_focus = 0;
+    engine.find_replace_query.clear();
+    engine.find_replace_cursor = 0;
+
+    engine.route_paste("needle");
+
+    assert_eq!(engine.find_replace_query, "needle");
+    assert_eq!(
+        engine.buffer().to_string(),
+        "hello world",
+        "the paste must not have fallen through to Mode::Normal's buffer paste"
+    );
 }
 
 // ── VSCode editing mode tests ────────────────────────────────────────────
@@ -12580,7 +13820,7 @@ fn test_vscode_mode_ctrl_c_no_selection_copies_line() {
     // Register '+' should contain the line
     let (reg_content, is_linewise) = engine.registers.get(&'+').cloned().unwrap_or_default();
     assert!(reg_content.contains("hello"));
-    assert!(is_linewise);
+    assert!(is_linewise.is_linewise());
 }
 
 #[test]
@@ -12649,6 +13889,58 @@ fn test_vscode_mode_comment_toggle() {
         text3.starts_with("// hello"),
         "Expected '// hello' via slash key_name, got {:?}",
         text3
+    );
+}
+
+#[test]
+fn test_vscode_mode_multi_cursor_indent_keeps_each_cursor_on_its_own_line() {
+    // #883 review: `indent_lines` grew a Vim-only cursor-repositioning side
+    // effect (land on `start_line`) that VSCode's multi-cursor Ctrl+] loop
+    // never expected — it iterates `indent_lines` once per selected line and
+    // then bumps every cursor's *column* itself, relying on the shared
+    // helper leaving each cursor's *line* alone. Before the `reposition_cursor`
+    // opt-in fix, the primary cursor ended up dragged onto the last line
+    // touched by the loop instead of staying on line 0.
+    let mut engine = make_vscode_engine("aaa\nbbb\nccc\n");
+    engine.view_mut().cursor.line = 0;
+    engine.view_mut().cursor.col = 1;
+    engine.view_mut().extra_cursors = vec![Cursor { line: 2, col: 1 }];
+
+    vscode_key(&mut engine, "bracketright", None, true);
+
+    assert_eq!(engine.buffer().to_string(), "    aaa\nbbb\n    ccc\n");
+    assert_eq!(
+        engine.view().cursor,
+        Cursor { line: 0, col: 5 },
+        "primary cursor must stay on its own line, only shifted by the indent size"
+    );
+    assert_eq!(
+        engine.view().extra_cursors,
+        vec![Cursor { line: 2, col: 5 }],
+        "extra cursor must stay on its own line, only shifted by the indent size"
+    );
+}
+
+#[test]
+fn test_vscode_mode_multi_cursor_outdent_keeps_each_cursor_on_its_own_line() {
+    // Same regression as the indent test above, for Ctrl+[ / `dedent_lines`.
+    let mut engine = make_vscode_engine("    aaa\n    bbb\n    ccc\n");
+    engine.view_mut().cursor.line = 0;
+    engine.view_mut().cursor.col = 5;
+    engine.view_mut().extra_cursors = vec![Cursor { line: 2, col: 5 }];
+
+    vscode_key(&mut engine, "bracketleft", None, true);
+
+    assert_eq!(engine.buffer().to_string(), "aaa\n    bbb\nccc\n");
+    assert_eq!(
+        engine.view().cursor,
+        Cursor { line: 0, col: 1 },
+        "primary cursor must stay on its own line, only shifted by the outdent size"
+    );
+    assert_eq!(
+        engine.view().extra_cursors,
+        vec![Cursor { line: 2, col: 1 }],
+        "extra cursor must stay on its own line, only shifted by the outdent size"
     );
 }
 
@@ -13453,8 +14745,34 @@ fn test_dap_var_ref_at_flat_index_with_scope_groups() {
 
 // ── Workspace / open-folder tests ─────────────────────────────────────────
 
+/// Exclusive claim on the **process** working directory, restored on drop.
+///
+/// `Engine::open_folder` / `open_workspace` deliberately call
+/// `std::env::set_current_dir` (see `buffers.rs`) — that is production
+/// behaviour, not a bug. But the process CWD is one of the few pieces of
+/// genuinely global state a `#[cfg(test)]` run has, and `cargo test` runs
+/// every test in the same process, on many threads at once.
+///
+/// That is not hypothetical (#785). The GTK harness paints a real file
+/// explorer whose root row is the process CWD, so with the directory moved
+/// the sidebar renders `VIMCODE_TEST_OPEN_FOLDER` and an empty tree instead
+/// of the repo's name and file list — a different frame around whatever
+/// pixels the test next to it was probing.
+///
+/// The first #785 round made this guard restore-on-`Drop`, which closed the
+/// *leak* (tests starting after a writer finished) but not the *overlap*
+/// (tests running while it holds the directory) — the same bug, reached by a
+/// different scheduling order, and the one that took
+/// `tab_hover_tooltip_paints_below_tab_row_not_inside_it` red. It now also
+/// takes [`crate::test_cwd::CWD_LOCK`] exclusively, which the GTK harness
+/// holds shared for its whole lifetime, so a writer and a painting harness
+/// can no longer overlap at all. See `src/test_cwd.rs` for the mechanism and
+/// its one rule (never take both on one thread).
+use crate::test_cwd::CwdGuard;
+
 #[test]
 fn test_open_folder_resets_cwd() {
+    let _cwd = CwdGuard::new();
     let dir = std::env::temp_dir().join("vimcode_test_open_folder");
     std::fs::create_dir_all(&dir).unwrap();
 
@@ -13475,6 +14793,7 @@ fn test_open_folder_resets_cwd() {
 
 #[test]
 fn test_open_workspace_parses_json() {
+    let _cwd = CwdGuard::new();
     let dir = std::env::temp_dir().join("vimcode_test_workspace_json");
     std::fs::create_dir_all(&dir).unwrap();
     let ws_path = dir.join(".vimcode-workspace");
@@ -13494,6 +14813,44 @@ fn test_open_workspace_parses_json() {
     assert_eq!(engine.settings.tabstop, 4);
     // expandtab = true
     assert!(engine.settings.expand_tab);
+}
+
+/// The process CWD must be back where it started once
+/// `test_open_folder_resets_cwd` has run — the regression guard for the
+/// leak [`CwdGuard`] exists to stop (#785).
+///
+/// This asserts on the *guard*, not on test ordering (which `libtest` gives
+/// no control over): it drives the same `open_folder` call in a scope and
+/// checks the directory is restored when that scope ends. Delete the
+/// `let _cwd = CwdGuard::new();` line from either workspace test above and
+/// the equivalent leak comes back; delete it here and this test fails
+/// directly.
+#[test]
+fn open_folder_does_not_leak_the_process_cwd() {
+    let before = std::env::current_dir().expect("test process must have a cwd");
+    let dir = std::env::temp_dir().join("vimcode_test_cwd_guard");
+    std::fs::create_dir_all(&dir).unwrap();
+
+    {
+        let _cwd = CwdGuard::new();
+        let mut engine = Engine::new();
+        engine.open_folder(&dir);
+        assert_eq!(
+            std::env::current_dir().ok().as_deref(),
+            Some(engine.cwd.as_path()),
+            "sanity: open_folder is expected to chdir the process — if it \
+             stopped doing that, CwdGuard is guarding nothing and this test \
+             is no longer meaningful"
+        );
+    }
+
+    assert_eq!(
+        std::env::current_dir().ok(),
+        Some(before),
+        "dropping CwdGuard must put the process working directory back; a \
+         leak here reaches every later test in the run, including the GTK \
+         harness's file-explorer paint (#785)"
+    );
 }
 
 // =========================================================================
@@ -13574,9 +14931,37 @@ fn test_plugin_disabled_not_registered() {
 
 // ─── Source Control (Session 99) ─────────────────────────────────────────
 
+/// An existing, empty, **non-git** directory for [`make_sc_engine_with_files`]
+/// to use as `Engine::cwd` — see that fixture's doc comment for what running
+/// the SC tests against a real checkout did instead.
+///
+/// Per-process (pid-suffixed) rather than a shared constant so two concurrent
+/// `cargo test` runs (a second worktree, CI matrix job, …) cannot collide, and
+/// deliberately *not* `git init`-ed: every `git -C` call made from it must
+/// fail, which is exactly what the tests below assert.
+fn sc_scratch_cwd() -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("vimcode-sc-tests-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    dir
+}
+
 /// Build an engine with synthetic SC file statuses for testing.
+///
+/// `cwd` is re-pointed at an empty scratch directory that is deliberately
+/// **not** a git repository, because the `sc_*` actions the tests below drive
+/// (`sc_do_commit`, `sc_stage_all`, `sc_unstage_all`, …) shell out to real
+/// `git -C <engine.cwd>` commands. Several of those tests document their
+/// expectations as "will fail silently since we're not in a real git repo" —
+/// which was only true when the suite ran somewhere unversioned. Run from a
+/// checkout (i.e. always), `Engine::new()`'s `cwd` *is* the vimcode repo, so
+/// `test_sc_unified_dispatch_stage_all` ran `git add -A` over the developer's
+/// working tree and `test_sc_commit_ctrl_enter_commits` then committed it
+/// under the message `"test\nmultiline"` — silently swallowing every
+/// uncommitted change in the checkout the suite was run from. Observed for
+/// real while fixing #821.
 fn make_sc_engine_with_files() -> Engine {
     let mut engine = Engine::new();
+    engine.cwd = sc_scratch_cwd();
     engine.sc_file_statuses = vec![
         git::FileStatus {
             path: "a.rs".to_string(),
@@ -13591,6 +14976,30 @@ fn make_sc_engine_with_files() -> Engine {
     ];
     engine.sc_sections_expanded = [true, true, false, true];
     engine
+}
+
+/// Guard for the hazard documented on [`make_sc_engine_with_files`]: the SC
+/// fixture's `cwd` must never be inside a git work tree, or the `sc_*` tests
+/// below stage and commit the checkout the suite is being run from.
+///
+/// Fails (as intended) against the pre-fix fixture, whose `cwd` was
+/// `Engine::new()`'s — the repo root.
+#[test]
+fn sc_fixture_cwd_is_never_inside_a_git_work_tree() {
+    let engine = make_sc_engine_with_files();
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&engine.cwd)
+        .args(["rev-parse", "--is-inside-work-tree"])
+        .output()
+        .expect("git must be runnable to check the fixture's cwd");
+    assert!(
+        !out.status.success(),
+        "the SC fixture's cwd ({}) is inside a git work tree — the sc_* tests \
+         run real `git add -A` / `git commit` against it and would swallow \
+         every uncommitted change in that checkout",
+        engine.cwd.display()
+    );
 }
 
 #[test]
@@ -14097,6 +15506,79 @@ fn test_multi_cursor_backspace() {
     assert_eq!(buf, "oo bar oo\n");
 }
 
+/// #804 review: the multi-cursor `"Tab"` arm used to always insert a fixed
+/// `tabstop`-width block of spaces at every cursor, unlike the single-cursor
+/// path (which advances each cursor to its own *next* tabstop, per
+/// `:h smarttab`). With `tabstop = 4`, a cursor at column 3 needs only 1
+/// space to reach the next stop (col 4) while a cursor at column 2 needs 2
+/// — proving the fix is genuinely per-cursor, not just a different constant.
+#[test]
+fn test_multi_cursor_tab_advances_to_each_cursors_own_next_tabstop() {
+    let mut engine = engine_with_text("abc\nab\n");
+    engine.settings.expand_tab = true;
+    engine.settings.tabstop = 4;
+    // Primary at end of "abc" (col 3) — 1 space to reach column 4.
+    engine.view_mut().cursor.col = 3;
+    // Extra cursor at end of "ab" (col 2) — 2 spaces to reach column 4.
+    engine.view_mut().extra_cursors = vec![Cursor { line: 1, col: 2 }];
+
+    engine.handle_key("i", Some('i'), false);
+    engine.handle_key("Tab", None, false);
+    engine.handle_key("Escape", None, false);
+
+    let buf = engine.buffer().to_string();
+    assert_eq!(
+        buf, "abc \nab  \n",
+        "each cursor must advance to its OWN next tabstop (1 space vs 2), \
+         not both inserting the same fixed-width block; got {buf:?}"
+    );
+}
+
+/// #804 review (iteration 2): `mc_insert_tab` used to push *each* cursor's
+/// own computed indent onto `insert_text_buffer`, so one `<Tab>` keystroke
+/// with N cursors recorded N concatenated fragments. `insert_text_buffer`
+/// becomes `last_inserted_text` on `Escape` and is replayed verbatim by the
+/// `"."` register and insert-mode `<C-a>`/`<C-@>`, so the replay inserted the
+/// concatenation of every cursor's indent instead of a single tabstop-aware
+/// one. With `tabstop = 4` and cursors needing 1 and 2 spaces, the buggy code
+/// recorded `"   "` (3 spaces); correct is `" "` (the primary cursor's, once).
+#[test]
+fn test_multi_cursor_tab_records_one_insert_fragment_not_one_per_cursor() {
+    let mut engine = engine_with_text("abc\nab\nZ\n");
+    engine.settings.expand_tab = true;
+    engine.settings.tabstop = 4;
+    // Primary at end of "abc" (col 3) — needs 1 space to reach column 4.
+    engine.view_mut().cursor.col = 3;
+    // Extra cursor at end of "ab" (col 2) — needs 2 spaces to reach column 4.
+    engine.view_mut().extra_cursors = vec![Cursor { line: 1, col: 2 }];
+
+    engine.handle_key("i", Some('i'), false);
+    engine.handle_key("Tab", None, false);
+    engine.handle_key("Escape", None, false);
+
+    assert_eq!(
+        engine.last_inserted_text, " ",
+        "one <Tab> keystroke must record exactly one insert fragment \
+         regardless of cursor count; got {:?}",
+        engine.last_inserted_text
+    );
+
+    // Replay it where a real user would notice: insert-mode <C-a> re-inserts
+    // `last_inserted_text` verbatim (same buffer the "." register and
+    // count-prefixed inserts replay).
+    engine.view_mut().cursor = Cursor { line: 2, col: 1 };
+    engine.handle_key("i", Some('i'), false);
+    engine.handle_key("a", Some('a'), true);
+    engine.handle_key("Escape", None, false);
+
+    let buf = engine.buffer().to_string();
+    assert_eq!(
+        buf, "abc \nab  \nZ \n",
+        "replaying the recorded insert must produce a single tabstop-aware \
+         indent, not every cursor's indent concatenated; got {buf:?}"
+    );
+}
+
 #[test]
 fn test_multi_cursor_escape_collapses() {
     // Escape from insert mode should clear extra cursors
@@ -14244,7 +15726,7 @@ fn test_yyp_pastes_on_next_line() {
     press_char(&mut engine, 'y');
     let (reg_content, is_lw) = engine.registers.get(&'"').unwrap().clone();
     assert_eq!(reg_content, "foo\n", "yanked content");
-    assert!(is_lw, "should be linewise");
+    assert!(is_lw.is_linewise(), "should be linewise");
     press_char(&mut engine, 'p');
     // Expected: "foo\nfoo\n\nfoo \n   foo foo\n"
     let result = engine.buffer().to_string();
@@ -14305,11 +15787,13 @@ fn test_add_cursor_at_next_match_shows_count_message() {
 fn test_load_clipboard_for_paste_preserves_linewise() {
     // When clipboard content matches the existing '"' register, is_linewise is kept.
     let mut engine = engine_with_text("foo\nbar\n");
-    engine.registers.insert('"', ("foo\n".to_string(), true));
+    engine
+        .registers
+        .insert('"', ("foo\n".to_string(), RegType::Linewise));
     engine.load_clipboard_for_paste("foo\n".to_string());
     let (_, lw) = engine.registers[&'"'].clone();
     assert!(
-        lw,
+        lw.is_linewise(),
         "load_clipboard_for_paste should preserve is_linewise when content matches"
     );
 }
@@ -14318,11 +15802,13 @@ fn test_load_clipboard_for_paste_preserves_linewise() {
 fn test_load_clipboard_for_paste_clears_linewise_for_foreign_content() {
     // When clipboard content differs (from another app), is_linewise becomes false.
     let mut engine = engine_with_text("foo\nbar\n");
-    engine.registers.insert('"', ("foo\n".to_string(), true));
+    engine
+        .registers
+        .insert('"', ("foo\n".to_string(), RegType::Linewise));
     engine.load_clipboard_for_paste("different text".to_string());
     let (_, lw) = engine.registers[&'"'].clone();
     assert!(
-        !lw,
+        !lw.is_linewise(),
         "load_clipboard_for_paste should clear is_linewise for external content"
     );
 }
@@ -14334,7 +15820,7 @@ fn test_yyp_linewise_via_clipboard_intercept() {
     press_char(&mut engine, 'y');
     press_char(&mut engine, 'y');
     let (content, lw) = engine.registers[&'"'].clone();
-    assert!(lw, "yy should set is_linewise=true");
+    assert!(lw.is_linewise(), "yy should set is_linewise=true");
     // Backend intercepts p, reads same text from clipboard, calls load_clipboard_for_paste.
     engine.load_clipboard_for_paste(content);
     press_char(&mut engine, 'p');
@@ -14348,6 +15834,23 @@ fn test_yyp_linewise_via_clipboard_intercept() {
 }
 
 // ── Editor group tests ────────────────────────────────────────────────────
+
+#[test]
+fn test_ctrl_backslash_splits_editor_right_both_key_names() {
+    // Regression (#515): the GTK ShellApp key path forwards the raw char "\\"
+    // while the TUI maps it to "backslash". The engine must split on both so
+    // Ctrl+\ works on every backend.
+    for name in ["backslash", "\\"] {
+        let mut engine = Engine::new();
+        assert_eq!(engine.group_layout.leaf_count(), 1);
+        engine.handle_key(name, Some('\\'), true);
+        assert_eq!(
+            engine.group_layout.leaf_count(),
+            2,
+            "Ctrl+\\ via key_name {name:?} should split the editor group to the right"
+        );
+    }
+}
 
 #[test]
 fn test_editor_group_split_commands() {
@@ -14683,6 +16186,52 @@ fn test_dialog_show_and_escape() {
     // Escape dismisses.
     e.handle_key("Escape", None, false);
     assert!(e.dialog.is_none());
+}
+
+/// #727: `Engine::dialog_cancel()` is what the GTK native-dialog path calls
+/// when `PlatformServices::show_message_dialog` comes back with no button
+/// chosen (Escape, close box on the real OS alert) — it must produce the
+/// exact same outcome as the in-canvas dialog's own Escape key, since both
+/// represent the same user action ("dismiss without choosing").
+#[test]
+fn test_dialog_cancel_mirrors_escape_dismiss() {
+    fn open_test_dialog(e: &mut Engine) {
+        e.show_dialog(
+            "test",
+            "Test Dialog",
+            vec!["Body line".into()],
+            vec![DialogButton {
+                label: "OK".into(),
+                hotkey: 'o',
+                action: "ok".into(),
+            }],
+        );
+    }
+
+    let mut escaped = Engine::new();
+    open_test_dialog(&mut escaped);
+    let escape_action = escaped.handle_key("Escape", None, false);
+    assert!(escaped.dialog.is_none());
+
+    let mut cancelled = Engine::new();
+    open_test_dialog(&mut cancelled);
+    let cancel_action = cancelled.dialog_cancel();
+    assert!(cancelled.dialog.is_none());
+
+    assert_eq!(
+        escape_action, cancel_action,
+        "dialog_cancel() must produce the same EngineAction as pressing Escape"
+    );
+}
+
+/// `dialog_cancel()` is a no-op (`EngineAction::None`) when no dialog is
+/// open — the native-dialog path could race a dialog being dismissed some
+/// other way before quadraui's blocking call returns.
+#[test]
+fn test_dialog_cancel_with_no_dialog_open_is_noop() {
+    let mut e = Engine::new();
+    assert!(e.dialog.is_none());
+    assert_eq!(e.dialog_cancel(), EngineAction::None);
 }
 
 #[test]
@@ -15383,7 +16932,7 @@ fn test_panel_hover_show_and_dismiss() {
     assert_eq!(ph.panel_name, "test_panel");
     assert_eq!(ph.item_id, "item_1");
     assert_eq!(ph.item_index, 0);
-    assert!(!ph.rendered.lines.is_empty());
+    assert!(!ph.line_text.is_empty());
     e.dismiss_panel_hover_now();
     assert!(e.panel_hover.is_none());
 }
@@ -15395,7 +16944,7 @@ fn test_panel_hover_links_extracted() {
     let ph = e.panel_hover.as_ref().unwrap();
     // Should have at least one link extracted from the markdown
     assert!(
-        !ph.links.is_empty() || !ph.rendered.lines.is_empty(),
+        !ph.links.is_empty() || !ph.line_text.is_empty(),
         "hover should have rendered content"
     );
 }
@@ -15807,7 +17356,6 @@ fn test_execute_command_uri_unknown_command() {
 
 #[test]
 fn test_tab_drag_reorder_same_group() {
-    use crate::core::window::DropZone;
     let mut e = engine_with_text("aaa\n");
     e.new_tab(None);
     e.buffer_mut().insert(0, "bbb\n");
@@ -15817,12 +17365,9 @@ fn test_tab_drag_reorder_same_group() {
     assert_eq!(e.active_group().tabs.len(), 3);
     assert_eq!(e.active_group().active_tab, 2);
 
-    // Drag tab 2 (ccc) to position 0
+    // Reorder tab 2 (ccc) to position 0
     let gid = e.active_group;
-    e.tab_drag_begin(gid, 2);
-    assert!(e.tab_drag.is_some());
-    e.tab_drag_drop(DropZone::TabReorder(gid, 0));
-    assert!(e.tab_drag.is_none());
+    e.reorder_tab_in_group(gid, 2, 0);
 
     // Now order should be [ccc, aaa, bbb], active tab is 0
     assert_eq!(e.active_group().active_tab, 0);
@@ -15837,7 +17382,6 @@ fn test_tab_drag_reorder_same_group() {
 
 #[test]
 fn test_tab_drag_to_other_group_center() {
-    use crate::core::window::DropZone;
     let mut e = engine_with_text("aaa\n");
     e.new_tab(None);
     e.buffer_mut().insert(0, "bbb\n");
@@ -15851,9 +17395,8 @@ fn test_tab_drag_to_other_group_center() {
     assert_ne!(group1, group2);
     e.buffer_mut().insert(0, "ccc\n");
 
-    // Drag bbb (tab 1 in group1) to group2 center
-    e.tab_drag_begin(group1, 1);
-    e.tab_drag_drop(DropZone::Center(group2));
+    // Move bbb (tab 1 in group1) to group2 center
+    e.move_tab_to_target_group(group1, 1, group2);
 
     // group1 should have 1 tab (aaa), group2 should have 2 tabs
     assert_eq!(e.editor_groups.get(&group1).unwrap().tabs.len(), 1);
@@ -15864,7 +17407,6 @@ fn test_tab_drag_to_other_group_center() {
 
 #[test]
 fn test_tab_drag_to_new_split() {
-    use crate::core::window::DropZone;
     let mut e = engine_with_text("aaa\n");
     e.new_tab(None);
     e.buffer_mut().insert(0, "bbb\n");
@@ -15872,9 +17414,8 @@ fn test_tab_drag_to_new_split() {
     assert_eq!(e.active_group().tabs.len(), 2);
     assert!(e.group_layout.is_single_group());
 
-    // Drag tab 0 (aaa) to create a new split
-    e.tab_drag_begin(gid, 0);
-    e.tab_drag_drop(DropZone::Split(gid, SplitDirection::Vertical, false));
+    // Move tab 0 (aaa) to create a new split
+    e.move_tab_to_new_split(gid, 0, gid, SplitDirection::Vertical, false);
 
     // Should now have 2 groups
     assert!(!e.group_layout.is_single_group());
@@ -15882,26 +17423,7 @@ fn test_tab_drag_to_new_split() {
 }
 
 #[test]
-fn test_tab_drag_cancel() {
-    let mut e = engine_with_text("aaa\n");
-    e.new_tab(None);
-    e.buffer_mut().insert(0, "bbb\n");
-    let gid = e.active_group;
-    let tabs_before = e.active_group().tabs.len();
-
-    e.tab_drag_begin(gid, 0);
-    assert!(e.tab_drag.is_some());
-    e.tab_drag_cancel();
-    assert!(e.tab_drag.is_none());
-    assert_eq!(e.tab_drag_mouse, None);
-    assert_eq!(e.tab_drop_zone, DropZone::None);
-    // No state changed
-    assert_eq!(e.active_group().tabs.len(), tabs_before);
-}
-
-#[test]
 fn test_tab_drag_last_tab_closes_group() {
-    use crate::core::window::DropZone;
     let mut e = engine_with_text("aaa\n");
     // Create second group with split
     e.open_editor_group(SplitDirection::Vertical);
@@ -15912,9 +17434,8 @@ fn test_tab_drag_last_tab_closes_group() {
     let group1 = *e.editor_groups.keys().find(|g| **g != group2).unwrap();
     assert_eq!(e.editor_groups.len(), 2);
 
-    // Drag the only tab from group1 to group2
-    e.tab_drag_begin(group1, 0);
-    e.tab_drag_drop(DropZone::Center(group2));
+    // Move the only tab from group1 to group2
+    e.move_tab_to_target_group(group1, 0, group2);
 
     // group1 should be closed, only group2 remains
     assert_eq!(e.editor_groups.len(), 1);
@@ -15924,16 +17445,15 @@ fn test_tab_drag_last_tab_closes_group() {
 
 #[test]
 fn test_tab_drag_drop_none_is_noop() {
-    use crate::core::window::DropZone;
     let mut e = engine_with_text("aaa\n");
     e.new_tab(None);
     e.buffer_mut().insert(0, "bbb\n");
-    let gid = e.active_group;
     let tabs_before = e.active_group().tabs.len();
     let active_before = e.active_group().active_tab;
 
-    e.tab_drag_begin(gid, 0);
-    e.tab_drag_drop(DropZone::None);
+    // DropZone::None → no-op (apply_drop_zone branch)
+    // Call engine underlying fn to verify nothing changes when called with same group.
+    e.reorder_tab_in_group(e.active_group, active_before, active_before);
 
     // Nothing changed
     assert_eq!(e.active_group().tabs.len(), tabs_before);
@@ -15942,7 +17462,6 @@ fn test_tab_drag_drop_none_is_noop() {
 
 #[test]
 fn test_tab_drag_reorder_to_other_group_at_index() {
-    use crate::core::window::DropZone;
     let mut e = engine_with_text("aaa\n");
     e.new_tab(None);
     e.buffer_mut().insert(0, "bbb\n");
@@ -15956,9 +17475,8 @@ fn test_tab_drag_reorder_to_other_group_at_index() {
     e.buffer_mut().insert(0, "ddd\n");
     assert_eq!(e.editor_groups.get(&group2).unwrap().tabs.len(), 2);
 
-    // Drag aaa (tab 0 in group1) to group2 at index 1
-    e.tab_drag_begin(group1, 0);
-    e.tab_drag_drop(DropZone::TabReorder(group2, 1));
+    // Move aaa (tab 0 in group1) to group2 at index 1
+    e.move_tab_to_target_group_at(group1, 0, group2, 1);
 
     // group1: [bbb], group2: [ccc, aaa, ddd]
     assert_eq!(e.editor_groups.get(&group1).unwrap().tabs.len(), 1);
@@ -15968,6 +17486,95 @@ fn test_tab_drag_reorder_to_other_group_at_index() {
     assert_eq!(e.active_group().active_tab, 1);
     // Verify the inserted tab has "aaa" content
     assert!(e.buffer().to_string().starts_with("aaa"));
+}
+
+// ── apply_tab_drop_zone: shared cross-backend drop entry point (#515) ────────
+
+#[test]
+fn test_apply_drop_zone_center_moves_tab() {
+    use crate::core::window::DropZone;
+    let mut e = engine_with_text("aaa\n");
+    e.new_tab(None);
+    e.buffer_mut().insert(0, "bbb\n");
+    let group1 = e.active_group;
+    e.open_editor_group(SplitDirection::Vertical);
+    let group2 = e.active_group;
+    assert_ne!(group1, group2);
+
+    // Drop tab 0 of group1 into the center of group2 → merge.
+    e.apply_tab_drop_zone(group1, 0, DropZone::Center(group2));
+    assert_eq!(e.editor_groups.get(&group1).unwrap().tabs.len(), 1);
+    assert_eq!(e.editor_groups.get(&group2).unwrap().tabs.len(), 2);
+    assert_eq!(e.active_group, group2);
+}
+
+#[test]
+fn test_apply_drop_zone_center_same_group_is_noop() {
+    use crate::core::window::DropZone;
+    let mut e = engine_with_text("aaa\n");
+    e.new_tab(None);
+    e.buffer_mut().insert(0, "bbb\n");
+    let g = e.active_group;
+    let before = e.editor_groups.get(&g).unwrap().tabs.len();
+    // Dropping onto its own group's center must not mutate anything.
+    e.apply_tab_drop_zone(g, 0, DropZone::Center(g));
+    assert_eq!(e.editor_groups.get(&g).unwrap().tabs.len(), before);
+}
+
+#[test]
+fn test_apply_drop_zone_split_creates_group() {
+    use crate::core::window::DropZone;
+    let mut e = engine_with_text("aaa\n");
+    e.new_tab(None);
+    e.buffer_mut().insert(0, "bbb\n");
+    let g = e.active_group;
+    assert_eq!(e.editor_groups.len(), 1);
+
+    // Split tab 1 out of the only group into a new vertical split.
+    e.apply_tab_drop_zone(g, 1, DropZone::Split(g, SplitDirection::Vertical, false));
+    assert_eq!(e.editor_groups.len(), 2);
+    assert!(!e.group_layout.is_single_group());
+}
+
+#[test]
+fn test_apply_drop_zone_reorder_within_group() {
+    use crate::core::window::DropZone;
+    let mut e = engine_with_text("aaa\n");
+    e.new_tab(None);
+    e.buffer_mut().insert(0, "bbb\n");
+    let g = e.active_group;
+    // Group has [aaa, bbb]; reorder tab 0 → index 1.
+    e.apply_tab_drop_zone(g, 0, DropZone::TabReorder(g, 1));
+    assert_eq!(e.active_group().active_tab, 1);
+}
+
+#[test]
+fn test_apply_drop_zone_reorder_across_groups() {
+    use crate::core::window::DropZone;
+    let mut e = engine_with_text("aaa\n");
+    let group1 = e.active_group;
+    e.open_editor_group(SplitDirection::Vertical);
+    let group2 = e.active_group;
+    e.buffer_mut().insert(0, "bbb\n");
+    // TabReorder targeting a *different* group routes to move_tab_to_target_group_at.
+    e.apply_tab_drop_zone(group1, 0, DropZone::TabReorder(group2, 0));
+    // group1 had its only tab → collapses; group2 gains it.
+    assert_eq!(e.editor_groups.len(), 1);
+    assert!(e.editor_groups.contains_key(&group2));
+}
+
+#[test]
+fn test_apply_drop_zone_none_is_noop() {
+    use crate::core::window::DropZone;
+    let mut e = engine_with_text("aaa\n");
+    e.new_tab(None);
+    e.buffer_mut().insert(0, "bbb\n");
+    let g = e.active_group;
+    let before = e.editor_groups.get(&g).unwrap().tabs.len();
+    let active_before = e.active_group().active_tab;
+    e.apply_tab_drop_zone(g, 0, DropZone::None);
+    assert_eq!(e.editor_groups.get(&g).unwrap().tabs.len(), before);
+    assert_eq!(e.active_group().active_tab, active_before);
 }
 
 #[test]
@@ -16439,6 +18046,7 @@ fn test_clear_sidebar_focus() {
     engine.ai_has_focus = true;
     engine.settings_has_focus = true;
     engine.ext_panel_has_focus = true;
+    engine.activity_bar_focused = true;
     assert!(engine.sidebar_has_focus());
 
     engine.clear_sidebar_focus();
@@ -16451,6 +18059,7 @@ fn test_clear_sidebar_focus() {
     assert!(!engine.ai_has_focus);
     assert!(!engine.settings_has_focus);
     assert!(!engine.ext_panel_has_focus);
+    assert!(!engine.activity_bar_focused);
 }
 
 #[test]
@@ -16727,6 +18336,314 @@ fn test_tab_nav_cross_group() {
         }
     }
     assert!(reached_group2, "forward nav should cross groups");
+}
+
+// ── #673: close-tab MRU successor ───────────────────────────────────────────
+//
+// `Engine::close_tab` used to pick the next active tab by index arithmetic
+// alone: whatever tab shifted into the closed slot became active. The
+// `tab_mru` stack was maintained on every activation but never consulted.
+// These tests pin the fix: the successor comes from `tab_mru` (falling back
+// to positional adjacency only when the MRU has nothing usable), and
+// `tab_mru` itself is keyed by `TabId` rather than a positional index so
+// reordering/moving tabs can't silently repoint an entry at the wrong tab.
+
+#[test]
+fn test_close_tab_picks_mru_successor_not_positional_neighbour() {
+    // The naive repro ([A, B, C], close C then B => A) passes by adjacency
+    // accident even with the bug fully present — see the issue's own
+    // warning about this. This uses a *non-adjacent* prior tab so the
+    // defect actually shows:
+    //
+    //   tabs: [X, A, Y, Z]     active = A
+    //   open B  -> [X, A, Y, Z, B]      active = B
+    //   open C  -> [X, A, Y, Z, B, C]   active = C
+    //   close C -> active = B           (adjacency: idx 5 clamped to 4)
+    //   close B -> MRU-correct: A       (buggy adjacency: idx 4 clamped to
+    //                                    3, landing on Z instead)
+    let mut engine = Engine::new(); // X, idx 0
+    engine.new_tab(None); // A, idx 1
+    engine.new_tab(None); // Y, idx 2
+    engine.new_tab(None); // Z, idx 3
+    engine.goto_tab(1); // back to A
+    let a_id = engine.active_tab().id;
+    assert_eq!(engine.active_group().active_tab, 1);
+
+    engine.new_tab(None); // B, idx 4, active
+    engine.new_tab(None); // C, idx 5, active
+    assert_eq!(engine.active_group().tabs.len(), 6);
+    assert_eq!(engine.active_group().active_tab, 5);
+
+    assert!(engine.close_tab(), "closing C should succeed"); // close C
+    assert_eq!(engine.active_group().tabs.len(), 5);
+
+    assert!(engine.close_tab(), "closing B should succeed"); // close B
+    assert_eq!(engine.active_group().tabs.len(), 4);
+    assert_eq!(
+        engine.active_tab().id,
+        a_id,
+        "closing B should reactivate A (the MRU successor), not whichever \
+         tab happens to shift into the closed slot"
+    );
+}
+
+#[test]
+fn test_close_tab_at_background_tab_does_not_change_active_tab() {
+    // Right-click "Close" on a tab that is not the group's active tab must
+    // not steal focus. `close_tab_at` used to switch to the target
+    // group/tab *before* closing it, which activated the closed tab's
+    // neighbour as a side effect and polluted the MRU/nav-history stacks on
+    // the way out.
+    let mut engine = Engine::new();
+    engine.new_tab(None); // idx 1
+    engine.new_tab(None); // idx 2
+    engine.new_tab(None); // idx 3, active
+    engine.goto_tab(1); // make idx 1 active
+    let active_id = engine.active_tab().id;
+    let group = engine.active_group;
+
+    let closed = engine.close_tab_at(group, 3); // background tab, idx 3
+    assert!(closed);
+    assert_eq!(engine.active_group().tabs.len(), 3);
+    assert_eq!(
+        engine.active_tab().id,
+        active_id,
+        "closing a background tab must not change the active tab"
+    );
+    assert_eq!(
+        engine.active_group().active_tab,
+        1,
+        "active index is unaffected when the removed tab was positioned after it"
+    );
+}
+
+#[test]
+fn test_close_tab_at_background_tab_shifts_active_index_when_before_it() {
+    // A background tab positioned *before* the active tab still must not
+    // change which tab is active — but the active tab's numeric index has
+    // to shift down by one to keep pointing at the same tab.
+    let mut engine = Engine::new();
+    engine.new_tab(None); // idx 1
+    engine.new_tab(None); // idx 2, active
+    let active_id = engine.active_tab().id;
+    let group = engine.active_group;
+
+    let closed = engine.close_tab_at(group, 0); // background tab, idx 0
+    assert!(closed);
+    assert_eq!(engine.active_tab().id, active_id);
+    assert_eq!(engine.active_group().active_tab, 1);
+}
+
+#[test]
+fn test_reorder_tab_does_not_corrupt_close_successor() {
+    // #673 defect 3: `tab_mru` used to store a positional `(GroupId,
+    // usize)` index, so dragging a tab elsewhere in the bar silently
+    // repointed every MRU entry sitting at or after the moved slot. This
+    // reproduces exactly that shape: record that A is the desired successor
+    // while A sits at index 1, then reorder the tab list so a *different*
+    // tab (Y) ends up at index 1. If `tab_mru` were still index-keyed, the
+    // successor lookup would resolve to Y; keyed by `TabId`, it must still
+    // resolve to A.
+    let mut engine = Engine::new(); // W, idx 0
+    engine.new_tab(None); // X, idx 1
+    engine.new_tab(None); // Y, idx 2
+    engine.new_tab(None); // Z, idx 3
+
+    engine.goto_tab(1); // active = X, MRU front = X
+    let x_id = engine.active_tab().id;
+    engine.goto_tab(3); // active = Z, MRU: [Z, X, ...]
+    let z_id = engine.active_tab().id;
+
+    let group = engine.active_group;
+    // Drag W (idx 0) to the end. After this, X sits at idx 0 (a completely
+    // different index than when its MRU entry was recorded) and Y — a tab
+    // that was never the intended successor — moves into X's *old* slot
+    // (idx 1). (Dragging also focuses the moved tab, W, per normal
+    // drag-and-drop UX — unrelated to the MRU logic under test here.)
+    engine.reorder_tab_in_group(group, 0, 3);
+    assert_eq!(
+        engine.active_group().tabs.iter().position(|t| t.id == x_id),
+        Some(0),
+        "X should now be at index 0 after the drag"
+    );
+
+    // Navigate to Z (now at idx 2, not its pre-drag idx 3) and close it.
+    // Z's MRU successor, recorded while X sat at idx 1, is X — even though
+    // the tab now sitting at idx 1 is Y, not X.
+    let z_idx = engine
+        .active_group()
+        .tabs
+        .iter()
+        .position(|t| t.id == z_id)
+        .unwrap();
+    engine.goto_tab(z_idx);
+    engine.close_tab(); // close Z
+    assert_eq!(
+        engine.active_tab().id,
+        x_id,
+        "the close successor must resolve X by TabId even though a drag \
+         moved a different tab into X's old positional slot"
+    );
+}
+
+#[test]
+fn test_close_across_two_groups_picks_correct_successor_per_group() {
+    use crate::core::window::SplitDirection;
+
+    let mut engine = Engine::new();
+    // Group 1: the same non-adjacent repro as above.
+    engine.new_tab(None); // A, idx 1
+    engine.new_tab(None); // Y, idx 2
+    engine.new_tab(None); // Z, idx 3
+    engine.goto_tab(1); // active = A
+    let a_id = engine.active_tab().id;
+    let group1 = engine.active_group;
+
+    // Split into a second group (starts with one tab, P).
+    engine.open_editor_group(SplitDirection::Vertical);
+    let group2 = engine.active_group;
+    assert_ne!(group1, group2);
+    let p_id = engine.active_tab().id;
+    engine.new_tab(None); // Q, active in group 2
+    let q_id = engine.active_tab().id;
+
+    // Back in group 1: replay the B/C open-then-close sequence. Group 2's
+    // MRU entries must not leak into group 1's successor decision.
+    engine.active_group = group1;
+    engine.new_tab(None); // B
+    engine.new_tab(None); // C
+    engine.close_tab(); // close C -> B
+    engine.close_tab(); // close B -> A
+    assert_eq!(
+        engine.active_tab().id,
+        a_id,
+        "group 1's own MRU should resolve the successor, unaffected by group 2"
+    );
+
+    // Group 2: closing Q must fall back to P via group 2's own MRU.
+    engine.active_group = group2;
+    assert_eq!(engine.active_tab().id, q_id);
+    engine.close_tab();
+    assert_eq!(
+        engine.active_tab().id,
+        p_id,
+        "group 2's successor must come from its own MRU, not group 1's"
+    );
+}
+
+#[test]
+fn test_close_tab_at_active_tab_of_unfocused_group_uses_own_mru_successor() {
+    // Right-click "Close" on the *active* tab of a background (unfocused)
+    // split group must route through `close_active_tab_of_background_group`,
+    // not `close_tab` (`close_tab` only ever closes `self.active_group`'s own
+    // active tab). It must (a) never move global focus or touch the focused
+    // group's own active tab, and (b) pick its successor from that
+    // background group's own MRU stack. This reuses the same non-adjacent
+    // repro as `test_close_tab_picks_mru_successor_not_positional_neighbour`
+    // so the MRU -- not adjacency -- is what's actually discriminating.
+    use crate::core::window::SplitDirection;
+
+    let mut engine = Engine::new(); // group1: X, idx 0
+    engine.new_tab(None); // A, idx 1
+    engine.new_tab(None); // Y, idx 2
+    engine.new_tab(None); // Z, idx 3
+    engine.goto_tab(1); // active = A
+    let a_id = engine.active_tab().id;
+    let group1 = engine.active_group;
+
+    engine.new_tab(None); // B, idx 4, active
+    engine.new_tab(None); // C, idx 5, active
+    assert_eq!(engine.active_group().tabs.len(), 6);
+
+    // Split off a second group and focus it. group1 is now the background
+    // group; nothing from here on touches group1's MRU (tab_mru_touch only
+    // ever records `self.active_group`).
+    engine.open_editor_group(SplitDirection::Vertical);
+    let group2 = engine.active_group;
+    assert_ne!(group1, group2);
+    let focused_active_before = engine.active_tab().id; // group2's only tab, P
+
+    // Right-click close on group1's active tab (C) while group2 is focused.
+    let closed = engine.close_tab_at(group1, 5);
+    assert!(closed);
+    assert_eq!(
+        engine.active_group, group2,
+        "closing a background group's active tab must not move global focus"
+    );
+    assert_eq!(
+        engine.active_tab().id,
+        focused_active_before,
+        "the focused group's own active tab must be untouched"
+    );
+    assert_eq!(engine.editor_groups[&group1].tabs.len(), 5);
+    let g1_active_idx = engine.editor_groups[&group1].active_tab;
+
+    // Close again: group1's active tab is now B. The MRU-correct successor
+    // is A (active before B/C were opened); positional adjacency alone
+    // would instead land on Z.
+    let closed2 = engine.close_tab_at(group1, g1_active_idx);
+    assert!(closed2);
+    assert_eq!(
+        engine.active_group, group2,
+        "second background close must also not move global focus"
+    );
+    assert_eq!(engine.active_tab().id, focused_active_before);
+    let g1 = &engine.editor_groups[&group1];
+    assert_eq!(g1.tabs.len(), 4);
+    assert_eq!(
+        g1.tabs[g1.active_tab].id, a_id,
+        "background group's active-tab close must pick its own MRU \
+         successor (A), not positional adjacency (which would land on Z)"
+    );
+}
+
+#[test]
+fn test_close_tab_at_last_tab_of_unfocused_group_removes_whole_group() {
+    // Right-click "Close" on the active tab of a background group that is
+    // down to its last tab must remove the whole group -- mirroring
+    // `close_editor_group`'s single-tab-group fallback -- without touching
+    // global focus, and must prune that group's tab_mru/tab_nav_history
+    // entries so a stale group id can never surface as a successor later.
+    use crate::core::window::SplitDirection;
+
+    let mut engine = Engine::new();
+    let group1 = engine.active_group;
+    // Touch nav history / MRU for group1 before splitting so we can assert
+    // they're pruned once the group is gone.
+    engine.goto_tab(0);
+    assert!(engine.tab_nav_history.iter().any(|&(g, _)| g == group1));
+    assert!(engine.tab_mru.iter().any(|&(g, _)| g == group1));
+
+    engine.open_editor_group(SplitDirection::Vertical);
+    let group2 = engine.active_group;
+    assert_ne!(group1, group2);
+    let focused_active_before = engine.active_tab().id;
+
+    assert_eq!(engine.editor_groups[&group1].tabs.len(), 1);
+    let closed = engine.close_tab_at(group1, 0);
+    assert!(closed);
+
+    assert!(
+        !engine.editor_groups.contains_key(&group1),
+        "closing the last tab of a background group must remove the whole group"
+    );
+    assert_eq!(
+        engine.active_group, group2,
+        "removing a background group must not move global focus"
+    );
+    assert_eq!(
+        engine.active_tab().id,
+        focused_active_before,
+        "the focused group's own active tab must be untouched"
+    );
+    assert!(
+        engine.tab_mru.iter().all(|&(g, _)| g != group1),
+        "tab_mru must be pruned of the removed group's entries"
+    );
+    assert!(
+        engine.tab_nav_history.iter().all(|&(g, _)| g != group1),
+        "tab_nav_history must be pruned of the removed group's entries"
+    );
 }
 
 // ── Git branch picker tests ─────────────────────────────────────────────────
@@ -17392,6 +19309,46 @@ fn test_tab_scroll_offset_pulls_back_when_room() {
 }
 
 #[test]
+fn test_tab_scroll_offset_accounts_for_wide_display_name() {
+    // Regression test for vimcode#620 / quadraui#472: tab-width layout must
+    // measure names in terminal display columns, not `.chars().count()`,
+    // or double-width glyphs (CJK, many emoji) make the tab bar under-scroll
+    // and clip the active tab.
+    let mut engine = Engine::new();
+    engine.new_tab(None);
+
+    // Give the second tab a scratch name containing one double-width (CJK)
+    // character. `display_name()` renders it as "[你]": bracket(1) +
+    // wide(2) + bracket(1) = 4 display columns, but only 3 `char`s.
+    let group = engine.editor_groups.get(&engine.active_group).unwrap();
+    let win_id = group.tabs[1].active_window;
+    let buf_id = engine.windows.get(&win_id).unwrap().buffer_id;
+    engine.buffer_manager.get_mut(buf_id).unwrap().scratch_name = Some("你".to_string());
+
+    // Tab 0 ("[No Name]", 9 cols) is 7 + 9 = 16 cols. Tab 1 ("[你]") is
+    // 7 + 4 = 11 cols under correct cell-width math, but would be only
+    // 7 + 3 = 10 cols under the old buggy `.chars().count()` math. A bar
+    // width of 26 fits both tabs under the old (wrong) math (16 + 10 = 26)
+    // but not under correct cell-width math (16 + 11 = 27).
+    engine
+        .editor_groups
+        .get_mut(&engine.active_group)
+        .unwrap()
+        .tab_bar_width = 26;
+    engine.ensure_active_tab_visible();
+
+    let group = engine.editor_groups.get(&engine.active_group).unwrap();
+    assert_eq!(group.tabs.len(), 2);
+    assert_eq!(group.active_tab, 1);
+    assert_ne!(
+        group.tab_scroll_offset, 0,
+        "tab 1's CJK name should be measured by display width (4 cols), not \
+         char count (3 cols) — with correct measurement both tabs don't fit \
+         at width 26, so the view must scroll to keep the active tab visible"
+    );
+}
+
+#[test]
 fn test_post_draw_apply_widths_reports_changes() {
     let mut engine = Engine::new();
     let group_id = engine.active_group;
@@ -17618,6 +19575,58 @@ fn test_colon_dot_stays() {
     e.view_mut().cursor.line = 1;
     e.execute_command(".");
     assert_eq!(e.view().cursor.line, 1);
+}
+
+// ── Issue #884: count before `:` pre-fills a range ───────────────────
+
+#[test]
+fn test_count_before_colon_prefills_range() {
+    // `3:` -> `:.,.+2` (`:h cmdline-ranges`).
+    let mut e = engine_with_text("a\nb\nc\nd\n");
+    send_keys(&mut e, "3:");
+    assert_eq!(e.command_buffer, ".,.+2");
+}
+
+#[test]
+fn test_count_one_before_colon_prefills_degenerate_range() {
+    // `1:` -> `:.,.`, not a bare `:` — the degenerate case still ranges.
+    let mut e = engine_with_text("a\nb\nc\n");
+    send_keys(&mut e, "1:");
+    assert_eq!(e.command_buffer, ".,.");
+}
+
+#[test]
+fn test_bare_colon_has_no_prefilled_range() {
+    let mut e = engine_with_text("a\nb\nc\n");
+    send_keys(&mut e, ":");
+    assert_eq!(e.command_buffer, "");
+}
+
+#[test]
+fn test_count_before_colon_delete_spans_lines() {
+    // `3:d<CR>` deletes the 3 lines starting at the cursor, not just one.
+    let mut e = engine_with_text("a\nb\nc\nd\n");
+    send_keys(&mut e, "3:d<CR>");
+    assert_eq!(e.buffer().to_string(), "d\n");
+}
+
+#[test]
+fn test_count_before_colon_substitute_spans_lines() {
+    // `3:s/a/b/<CR>` — the pre-filled range carries into `:s`.
+    let mut e = engine_with_text("a\na\na\na\n");
+    send_keys(&mut e, "3:s/a/b/<CR>");
+    assert_eq!(e.buffer().to_string(), "b\nb\nb\na\n");
+}
+
+#[test]
+fn test_count_before_colon_then_explicit_ex_command_follows_range() {
+    // `2:normal Ax<CR>` — oracle case "misc:count then : then range". The
+    // pre-filled `.,.+1` range is immediately followed by a full ex command
+    // name (`normal Ax`), not just a bare `d`/`s` letter; `:normal` runs
+    // `Ax` (append `x` at end of line) over both named lines.
+    let mut e = engine_with_text("a\nb\nc\n");
+    send_keys(&mut e, "2:normal Ax<CR>");
+    assert_eq!(e.buffer().to_string(), "ax\nbx\nc\n");
 }
 
 // ── Bicep comment style ────────────────────────────────────────────────
@@ -18191,6 +20200,52 @@ fn test_breadcrumb_double_click_no_line_falls_back() {
     e.breadcrumb_double_click(true, None, None);
     assert!(e.picker_open);
     assert_eq!(e.picker_query, "@");
+}
+
+/// #555: `handle_breadcrumb_click` must resolve the segment index against
+/// the group whose bar was clicked, not whichever group happens to hold
+/// focus. Both backends hand it the `GroupId` that
+/// `render::resolve_breadcrumb_click` reports.
+///
+/// Backend-agnostic guard for the same defect the GTK harness test
+/// `breadcrumb_click_acts_on_the_clicked_group_not_the_focused_one` covers
+/// end-to-end — TUI routes through this identical engine entry point.
+#[test]
+fn test_breadcrumb_click_resolves_against_the_clicked_group() {
+    let dir = std::env::temp_dir().join(format!("vc_bc_group_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(dir.join("src").join("core"));
+    let shallow = dir.join("a.rs");
+    let deep = dir.join("src").join("core").join("deep.rs");
+    let _ = std::fs::write(&shallow, "fn a() {}\n");
+    let _ = std::fs::write(&deep, "fn d() {}\n");
+
+    let mut e = Engine::new_for_test();
+    e.cwd = dir.clone();
+    let buf_a = e.active_buffer_id();
+    e.buffer_manager.get_mut(buf_a).unwrap().file_path = Some(shallow.clone());
+    let group_a = e.active_group;
+
+    e.open_editor_group(SplitDirection::Vertical);
+    let group_b = e.active_group;
+    let buf_b = e.buffer_manager.create();
+    e.buffer_manager.get_mut(buf_b).unwrap().file_path = Some(deep.clone());
+    let win_b = e.active_window_id();
+    e.windows.get_mut(&win_b).unwrap().buffer_id = buf_b;
+
+    // Focus A (1 path segment); click B's segment 2 (`deep.rs`).
+    e.active_group = group_a;
+    e.handle_breadcrumb_click(group_b, 2);
+
+    assert_eq!(
+        e.active_group, group_b,
+        "the clicked group must take focus so its segments are the ones resolved"
+    );
+    assert!(
+        e.picker_open,
+        "an index valid for the clicked group must open its dropdown, not bail"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 // ── Breadcrumb focus mode tests ────────────────────────────────────────
@@ -19157,6 +21212,56 @@ fn test_explorer_rename_ctrl_v_paste() {
     assert_eq!(rename.input, "pasted_name.rs");
 }
 
+/// #593: `UiEvent::ClipboardPaste` (delivered by quadraui's GTK runner when
+/// it intercepts Ctrl+V, and by TUI's crossterm bracketed-paste) reaches the
+/// engine as a call to `route_paste`, not a raw `KeyPressed("v", ctrl)` —
+/// so the explorer-rename ctrl+v branch in `handle_explorer_rename_key`
+/// (exercised by `test_explorer_rename_ctrl_v_paste` above) never fires for
+/// it. `route_paste` needs its own explorer-rename arm, checked before this
+/// fix landed: it fell through to the mode-based dispatch at the bottom of
+/// `route_paste` and did nothing, since `start_explorer_rename` doesn't
+/// change `engine.mode`.
+#[test]
+fn test_explorer_rename_route_paste() {
+    let mut e = Engine::new();
+    e.start_explorer_rename(PathBuf::from("/tmp/hello.rs"));
+    // Selection is "hello" (anchor=0, cursor=5) — route_paste must replace it,
+    // same as the ctrl+v key path does.
+    e.route_paste("pasted_name");
+    let rename = e.explorer_rename.as_ref().unwrap();
+    assert_eq!(rename.input, "pasted_name.rs");
+}
+
+/// #937 discovery (quadraui pin bump to 68f0ef9): the same #593 gap class as
+/// `test_explorer_rename_route_paste` above, found in the settings panel
+/// instead of explorer rename. Before the bump, TUI's own dispatch caught
+/// the raw `Ctrl+V` `KeyPressed` ahead of `route_paste`
+/// (`shell_app.rs::handle_key_pressed`'s `FocusKeyRoute::Settings` arm) and
+/// called `settings_paste` directly, so `route_paste` never needed a
+/// settings-panel arm — GTK had no equivalent raw-keypress fallback at all,
+/// meaning settings-panel paste-via-Ctrl+V was already silently broken on
+/// GTK the whole time (nothing else routes it through `settings_paste`).
+/// quadraui#813 moved Ctrl-V/Ctrl-Shift-V interception into the shared
+/// `runtime::preprocess_event` every backend's `dispatch_event` (TUI
+/// included, for the first time) now runs before `AppLogic::handle`, so the
+/// raw keypress no longer reaches TUI's arm either — every Ctrl-V now
+/// arrives as `route_paste`'s `text` argument, on every backend uniformly,
+/// which made this gap immediately observable (RED without `route_paste`'s
+/// `settings_input_active`/`settings_editing` branch: `settings_query`
+/// stays empty and the paste silently falls through to the mode-based
+/// dispatch at the bottom of `route_paste` instead).
+#[test]
+fn test_settings_panel_route_paste() {
+    let mut e = Engine::new();
+    e.settings_input_active = true;
+    e.route_paste("filter_text");
+    assert_eq!(
+        e.settings_query, "filter_text",
+        "route_paste must reach the settings search input while \
+         settings_input_active is set"
+    );
+}
+
 #[test]
 fn test_explorer_rename_ctrl_c_copies_selection() {
     use std::sync::{Arc, Mutex};
@@ -19717,6 +21822,9 @@ fn test_multi_group_window_rects_cover_all_groups() {
 fn test_find_replace_open_close() {
     let mut engine = Engine::new();
     engine.buffer_mut().insert(0, "hello world hello");
+    // #800: default (Vim mode, unset) ctrl_f_action is "page_down", not
+    // "find" — opt in explicitly to exercise Ctrl+F opening find/replace.
+    engine.settings.ctrl_f_action = Some("find".to_string());
 
     // Ctrl+F opens find/replace
     press_ctrl(&mut engine, 'f');
@@ -19925,15 +22033,14 @@ fn test_ctrl_f_setting() {
     engine.update_syntax();
     engine.set_viewport_lines(10);
 
-    // Default: ctrl_f_action = "find" → opens find/replace
-    press_ctrl(&mut engine, 'f');
-    assert!(engine.find_replace_open);
-    press_special(&mut engine, "Escape");
-
-    // Change setting → Ctrl+F does page down
-    engine.settings.ctrl_f_action = "page_down".to_string();
+    // Default (Vim mode, unset): ctrl_f_action resolves to "page_down" → no find overlay
     press_ctrl(&mut engine, 'f');
     assert!(!engine.find_replace_open);
+
+    // Explicit override → Ctrl+F opens find/replace
+    engine.settings.ctrl_f_action = Some("find".to_string());
+    press_ctrl(&mut engine, 'f');
+    assert!(engine.find_replace_open);
 }
 
 #[test]
@@ -20697,6 +22804,71 @@ fn test_matrix_delete_linewise_motions() {
 }
 
 #[test]
+fn test_matrix_delete_forced_motion_kind() {
+    // `v` in operator-pending position forces the motion's kind
+    // (`:help o_v`, #881): a linewise motion becomes charwise exclusive,
+    // and an already-charwise motion has its inclusive/exclusive flipped.
+    // Expected values verified against Neovim 0.12.5 (mirrors
+    // `tests/nvim_conformance.rs`'s "op:dvj charwise force",
+    // "op:dve exclusive force" and "op:dv$").
+    let cases: &[(&str, &str, usize, usize, &str, &str, usize, usize)] = &[
+        // dvj: `j` is ordinarily linewise (whole-line dj would delete both
+        // lines). Forced charwise-exclusive, it runs from the cursor to
+        // the same column on the next line, exclusive of that column.
+        ("dvj", "abc\ndef", 0, 1, "dvj", "aef", 0, 1),
+        // dve: `e` is ordinarily charwise *inclusive* (de includes the
+        // last char of the word). Forced exclusive, the last char of the
+        // word survives.
+        ("dve", "abc def", 0, 0, "dve", "c def", 0, 0),
+        // dv$: `$` is ordinarily charwise inclusive of the last char on
+        // the line. Forced exclusive, that last char survives.
+        ("dv$", "abc def", 0, 1, "dv$", "af", 0, 1),
+        // dvE: `E` is naturally inclusive, same as `e` above (#881 review —
+        // `E` was left on the exclusive-assuming path, so `v`-forcing grew
+        // the range instead of shrinking it). Verified against Neovim
+        // 0.12.5: `dE` on "abc def" from col 0 deletes "abc", `dvE` deletes
+        // only "ab".
+        ("dvE", "abc def", 0, 0, "dvE", "c def", 0, 0),
+        // dvf): `f`/`t` are naturally inclusive of the found/till character
+        // (#881 review — left on the exclusive-assuming path). Verified
+        // against Neovim 0.12.5: this is the review's own repro — `dvf)` on
+        // "a(bcd)e" from col 0 must leave ")e", not delete the whole buffer.
+        ("dvf)", "a(bcd)e", 0, 0, "dvf)", ")e", 0, 0),
+        // dvt): same naturally-inclusive fix, via the "till" variant.
+        // Neovim 0.12.5: `dt)` on "a(bcd)e" from col 0 deletes "a(bcd"
+        // (inclusive of the char just before ')'); `dvt)` deletes one less,
+        // "a(bc", leaving "d)e".
+        ("dvt)", "a(bcd)e", 0, 0, "dvt)", "d)e", 0, 0),
+        // dvge / dvgE: `ge`/`gE` are naturally inclusive backward motions
+        // (#881 review). Neovim 0.12.5: from col 6 ('f') on "abc def",
+        // `dge`/`dgE` both delete "c def" leaving "ab"; forced exclusive,
+        // `dvge`/`dvgE` delete one less character ("c de"), leaving "abf".
+        ("dvge", "abc def", 0, 6, "dvge", "abf", 0, 2),
+        ("dvgE", "abc def", 0, 6, "dvgE", "abf", 0, 2),
+    ];
+
+    for &(label, buf, cline, ccol, keys, expected_buf, eline, ecol) in cases {
+        let mut engine = setup_engine(buf, cline, ccol);
+        send_keys(&mut engine, keys);
+        assert_eq!(
+            engine.buffer().to_string(),
+            expected_buf,
+            "FAIL [{label}]: buffer mismatch"
+        );
+        assert_eq!(
+            engine.view().cursor.line,
+            eline,
+            "FAIL [{label}]: cursor line mismatch"
+        );
+        assert_eq!(
+            engine.view().cursor.col,
+            ecol,
+            "FAIL [{label}]: cursor col mismatch"
+        );
+    }
+}
+
+#[test]
 fn test_matrix_delete_special_motions() {
     let cases: &[(&str, &str, usize, usize, &str, &str, usize, usize)] = &[
         // % brace match
@@ -20793,7 +22965,8 @@ fn test_matrix_delete_register_contents() {
             "FAIL [{label}]: register content mismatch"
         );
         assert_eq!(
-            *is_linewise, expected_linewise,
+            is_linewise.is_linewise(),
+            expected_linewise,
             "FAIL [{label}]: linewise flag mismatch"
         );
     }
@@ -21202,9 +23375,12 @@ fn test_matrix_change_register_contents() {
     // c should populate the register with deleted text
     let cases: &[(&str, &str, usize, usize, &str, &str, bool)] = &[
         ("cw_reg", "hello world foo", 0, 0, "cw<Esc>", "hello", false),
-        // NOTE: Neovim cc register has "two\n" (with newline, linewise=true).
-        // VimCode: "two" (no newline, linewise=false).
-        ("cc_reg", "one\ntwo\nthree", 1, 0, "cc<Esc>", "two", false),
+        // `cc`'s register content is linewise, "two\n" (`:h registers`), even
+        // though the buffer edit itself only clears the line's content and
+        // leaves the newline in place (#806, "reg:\"1 after cc" — matches
+        // Neovim; this used to be documented here as a known VimCode
+        // deviation instead of fixed).
+        ("cc_reg", "one\ntwo\nthree", 1, 0, "cc<Esc>", "two\n", true),
         (
             "ciw_reg",
             "hello world foo",
@@ -21228,7 +23404,8 @@ fn test_matrix_change_register_contents() {
             "FAIL [{label}]: register content mismatch"
         );
         assert_eq!(
-            *is_linewise, expected_linewise,
+            is_linewise.is_linewise(),
+            expected_linewise,
             "FAIL [{label}]: linewise flag mismatch"
         );
     }
@@ -21286,7 +23463,8 @@ fn test_matrix_yank_char_motions() {
             .unwrap_or_else(|| panic!("FAIL [{label}]: no register"));
         assert_eq!(content, expected_reg, "FAIL [{label}]: register mismatch");
         assert_eq!(
-            *is_linewise, expected_linewise,
+            is_linewise.is_linewise(),
+            expected_linewise,
             "FAIL [{label}]: linewise mismatch"
         );
         assert_eq!(
@@ -21348,7 +23526,10 @@ fn test_matrix_yank_linewise_motions() {
             .get(&'"')
             .unwrap_or_else(|| panic!("FAIL [{label}]: no register"));
         assert_eq!(content, expected_reg, "FAIL [{label}]: register mismatch");
-        assert!(is_linewise, "FAIL [{label}]: should be linewise");
+        assert!(
+            is_linewise.is_linewise(),
+            "FAIL [{label}]: should be linewise"
+        );
         assert_eq!(
             engine.view().cursor.line,
             eline,
@@ -21399,7 +23580,7 @@ fn test_matrix_yank_with_count() {
     send_keys(&mut engine, "3y2w");
     let (content, is_linewise) = engine.registers.get(&'"').unwrap();
     assert_eq!(content, "a b c d e f ", "3y2w should yank 6 words");
-    assert!(!is_linewise, "3y2w should be charwise");
+    assert!(!is_linewise.is_linewise(), "3y2w should be charwise");
 }
 
 #[test]
@@ -21587,7 +23768,7 @@ fn test_matrix_count_yy() {
     send_keys(&mut engine, "2yy");
     let (content, is_linewise) = engine.registers.get(&'"').unwrap();
     assert_eq!(content, "a\nb\n");
-    assert!(is_linewise);
+    assert!(is_linewise.is_linewise());
     // Buffer unchanged
     assert_eq!(engine.buffer().to_string(), "a\nb\nc\nd");
 }
@@ -21887,6 +24068,120 @@ fn test_set_option_scrolloff_behavior() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// 'startofline' (#876) — off by default (matches Neovim and vimcode's
+// pre-existing hardcoded behavior; Vim's own default is on). `nvim_conformance`
+// carries four labels (`scroll:C-d col sol`, `word:gg indented (sol)`, `word:G
+// indented (sol)`, `word:5G then j col (sol)`) that pin `startofline=true` via
+// Lua `setup` to probe this — but that harness's `run_in_vimcode` never reads
+// a case's `setup` (#875), so those labels can't observe this option no
+// matter how correct it is. These are the option's own tests, driving the
+// engine directly instead of through that harness gap.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_startofline_default_off_keeps_column() {
+    // Sanity check: turning the setting into a real, toggleable field must not
+    // change the existing (off) default for anyone who never sets it.
+    let mut engine = setup_engine("  a\nb", 1, 0);
+    assert!(!engine.settings.startofline);
+    send_keys(&mut engine, "gg");
+    assert_eq!(engine.view().cursor.line, 0);
+    assert_eq!(engine.view().cursor.col, 0, "off: gg keeps column 0");
+}
+
+#[test]
+fn test_startofline_on_gg_lands_on_first_non_blank() {
+    let mut engine = setup_engine("  a\nb", 1, 0);
+    engine.settings.startofline = true;
+    send_keys(&mut engine, "gg");
+    assert_eq!(engine.view().cursor.line, 0);
+    assert_eq!(
+        engine.view().cursor.col,
+        2,
+        "on: gg lands on the first non-blank of \"  a\""
+    );
+}
+
+#[test]
+fn test_startofline_on_g_lands_on_first_non_blank() {
+    let mut engine = setup_engine("a\n  b", 0, 0);
+    engine.settings.startofline = true;
+    send_keys(&mut engine, "G");
+    assert_eq!(engine.view().cursor.line, 1);
+    assert_eq!(
+        engine.view().cursor.col,
+        2,
+        "on: G lands on the first non-blank of \"  b\""
+    );
+}
+
+#[test]
+fn test_startofline_on_hml_land_on_first_non_blank() {
+    let mut engine = setup_engine("  a\n  b\n  c", 0, 0);
+    engine.settings.startofline = true;
+    engine.set_viewport_lines(3);
+    engine.ensure_cursor_visible();
+    send_keys(&mut engine, "L");
+    assert_eq!(engine.view().cursor.line, 2);
+    assert_eq!(
+        engine.view().cursor.col,
+        2,
+        "on: L lands on first non-blank"
+    );
+    send_keys(&mut engine, "H");
+    assert_eq!(engine.view().cursor.line, 0);
+    assert_eq!(
+        engine.view().cursor.col,
+        2,
+        "on: H lands on first non-blank"
+    );
+    send_keys(&mut engine, "M");
+    assert_eq!(engine.view().cursor.line, 1);
+    assert_eq!(
+        engine.view().cursor.col,
+        2,
+        "on: M lands on first non-blank"
+    );
+}
+
+#[test]
+fn test_startofline_on_ctrl_d_lands_on_first_non_blank_and_sticks() {
+    // Mirrors the oracle's "scroll:C-d col sol" case, plus the extra step
+    // (a second <C-d>) that proves the option's landing column becomes the
+    // new remembered `curswant` — confirmed against real Neovim: after one
+    // <C-d> with 'startofline' on, a second <C-d> keeps returning to the
+    // first-non-blank column, not the pre-jump one.
+    let lines: Vec<String> = (1..=60).map(|i| format!("L{i:02} x")).collect();
+    let mut engine = setup_engine(&lines.join("\n"), 0, 2);
+    engine.settings.startofline = true;
+    engine.set_viewport_lines(10);
+    engine.ensure_cursor_visible();
+    send_keys(&mut engine, "<C-d>");
+    assert_eq!(
+        engine.view().cursor.col,
+        0,
+        "on: <C-d> lands on first non-blank, not the pre-jump column 2"
+    );
+    let line_after_first = engine.view().cursor.line;
+    send_keys(&mut engine, "<C-d>");
+    assert!(engine.view().cursor.line > line_after_first);
+    assert_eq!(
+        engine.view().cursor.col,
+        0,
+        "on: a second <C-d> keeps landing on first non-blank (curswant reset)"
+    );
+}
+
+#[test]
+fn test_set_startofline_via_colon_set() {
+    let mut engine = setup_engine("  a\nb", 1, 0);
+    engine.execute_command("set startofline");
+    assert!(engine.settings.startofline);
+    engine.execute_command("set nostartofline");
+    assert!(!engine.settings.startofline);
+}
+
 #[test]
 fn test_set_option_splitbelow_behavior() {
     // splitbelow: :split puts new window below current
@@ -21912,7 +24207,7 @@ fn test_set_option_auto_pairs_behavior() {
     let mut engine = Engine::new();
     engine.buffer_mut().insert(0, "");
     engine.update_syntax();
-    engine.settings.auto_pairs = true;
+    engine.settings.auto_pairs = Some(true);
 
     send_keys(&mut engine, "i(<Esc>");
     let content = engine.buffer().to_string();
@@ -21924,7 +24219,7 @@ fn test_set_option_auto_pairs_disabled() {
     let mut engine = Engine::new();
     engine.buffer_mut().insert(0, "");
     engine.update_syntax();
-    engine.settings.auto_pairs = false;
+    engine.settings.auto_pairs = Some(false);
 
     send_keys(&mut engine, "i(<Esc>");
     let content = engine.buffer().to_string();
@@ -22021,7 +24316,7 @@ fn test_3yy_P_pastes_above_line_not_inline() {
     // Verify register is linewise
     let (content, is_lw) = engine.registers.get(&'"').unwrap().clone();
     assert_eq!(content, "aaa\nbbb\nccc\n");
-    assert!(is_lw, "3yy should set is_linewise=true");
+    assert!(is_lw.is_linewise(), "3yy should set is_linewise=true");
 
     // Move to line 3 (ddd), col 1 (middle of line)
     press_char(&mut engine, 'j');
@@ -22112,7 +24407,7 @@ fn test_3yy_P_via_clipboard_crlf_round_trip() {
     // Register has "aaa\nbbb\nccc\n" with is_linewise=true
     let (reg, lw) = engine.registers.get(&'"').unwrap().clone();
     assert_eq!(reg, "aaa\nbbb\nccc\n");
-    assert!(lw);
+    assert!(lw.is_linewise());
 
     // Simulate Windows clipboard round-trip: \r\n line endings, trailing \r\n stripped
     engine.load_clipboard_for_paste("aaa\r\nbbb\r\nccc".to_string());
@@ -22124,7 +24419,7 @@ fn test_3yy_P_via_clipboard_crlf_round_trip() {
         "CRLF should be normalized to LF with trailing newline"
     );
     assert!(
-        is_lw,
+        is_lw.is_linewise(),
         "is_linewise should survive CRLF clipboard round-trip"
     );
 
@@ -22155,11 +24450,17 @@ fn test_load_clipboard_foreign_content_not_linewise() {
     let mut engine = engine_with_text("aaa\nbbb\n");
     press_char(&mut engine, 'y');
     press_char(&mut engine, 'y');
-    assert!(engine.registers.get(&'"').unwrap().1, "should be linewise");
+    assert!(
+        engine.registers.get(&'"').unwrap().1.is_linewise(),
+        "should be linewise"
+    );
 
     engine.load_clipboard_for_paste("completely different text".to_string());
     let (_, is_lw) = engine.registers.get(&'"').unwrap();
-    assert!(!is_lw, "foreign clipboard content should not be linewise");
+    assert!(
+        !is_lw.is_linewise(),
+        "foreign clipboard content should not be linewise"
+    );
 }
 
 // ── feed_keys tests ──────────────────────────────────────────────────────
@@ -22205,7 +24506,7 @@ fn test_feed_keys_yank_and_paste() {
     engine.feed_keys("yy");
     let (content, is_lw) = engine.registers.get(&'"').unwrap().clone();
     assert_eq!(content, "aaa\n");
-    assert!(is_lw);
+    assert!(is_lw.is_linewise());
     // Paste below
     engine.feed_keys("p");
     assert_eq!(engine.buffer().to_string(), "aaa\naaa\nbbb\nccc\n");
@@ -22308,7 +24609,7 @@ fn test_lua_eval_register() {
     }
     engine
         .registers
-        .insert('a', ("test content".to_string(), false));
+        .insert('a', ("test content".to_string(), RegType::Charwise));
     engine.execute_command("EvalReg");
     assert_eq!(engine.message, "reg:test content");
 }
@@ -22610,6 +24911,47 @@ fn test_nvim_dd_last_line() {
     nvim_case("first\nsecond\n", 1, 0, "dd", "first\n", 0, 0);
 }
 
+// ── #882: operator counts (`2cc`, `5dd` past end, `c3c`, `2dd` on last
+// line, count beyond buffer) — verified directly against the oracle
+// (`tests/nvim_conformance.rs`, cases "op:2cc" / "op:5dd from last line" /
+// "misc:c3c" / "misc:2dd on last" / "misc:cc with count beyond").
+
+#[test]
+fn test_nvim_2cc_changes_two_lines() {
+    // `2cc` changes 2 lines, preserving the first line's indent
+    // ('autoindent' defaults on, matching Neovim) and dropping the rest.
+    nvim_case("  a\n  b\nc\n", 0, 0, "2ccX<Esc>", "  X\nc\n", 0, 2);
+}
+
+#[test]
+fn test_nvim_c3c_count_between_operator_and_doubled_letter() {
+    // `c3c` puts the count *between* the operator and its doubled letter —
+    // legal, and equivalent to `3cc`. If only a leading count parsed, this
+    // would behave like plain `cc` (changing just the first line).
+    nvim_case("a\nb\nc\nd\n", 0, 0, "c3cX<Esc>", "X\nd\n", 0, 0);
+}
+
+#[test]
+fn test_nvim_cc_count_beyond_buffer_clamps_not_aborts() {
+    // Unlike `[count]dd`, `[count]cc` clamps to however many lines exist
+    // rather than aborting the whole command.
+    nvim_case("a\nb\n", 0, 0, "5ccX<Esc>", "X\n", 0, 0);
+}
+
+#[test]
+fn test_nvim_5dd_from_last_line_aborts() {
+    // `[count]dd` acts like `dd` plus `count - 1` applications of `j` under
+    // the hood: already on the last line, that `j` can't move at all, so
+    // the whole command aborts (Vim beeps) rather than deleting fewer lines.
+    nvim_case("a\nb\nc\n", 2, 0, "5dd", "a\nb\nc\n", 2, 0);
+}
+
+#[test]
+fn test_nvim_2dd_on_last_line_aborts() {
+    // Smallest-count version of the same "already on the last line" abort.
+    nvim_case("a\nb\n", 1, 0, "2dd", "a\nb\n", 1, 0);
+}
+
 #[test]
 fn test_nvim_yy_does_not_move_cursor() {
     nvim_case("aaa\nbbb\nccc\n", 1, 2, "yy", "aaa\nbbb\nccc\n", 1, 2);
@@ -22807,7 +25149,7 @@ fn test_nvim_visual_line_yank_count() {
     engine.feed_keys("2Vy");
     let (content, is_lw) = engine.registers.get(&'"').unwrap().clone();
     assert_eq!(content, "aaa\nbbb\n");
-    assert!(is_lw, "visual line yank should be linewise");
+    assert!(is_lw.is_linewise(), "visual line yank should be linewise");
 }
 
 #[test]
@@ -23431,6 +25773,21 @@ fn test_nvim_dot_register() {
 }
 
 #[test]
+fn test_nvim_last_command_register() {
+    // ": holds the most recent `:` command line, with no leading colon
+    // (`:h quote_:`, #890).
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "a a\n");
+    engine.update_syntax();
+    engine.feed_keys(":s/a/b/<CR>");
+    let (content, _) = engine.get_register_content(':').unwrap();
+    assert_eq!(content, "s/a/b/");
+    // And it pastes like any other charwise register.
+    engine.feed_keys("\":p");
+    assert_eq!(engine.buffer().to_string(), "bs/a/b/ a\n");
+}
+
+#[test]
 fn test_nvim_yank_does_not_set_numbered() {
     // yy should NOT shift numbered registers (only deletes do)
     let mut engine = Engine::new();
@@ -23721,7 +26078,7 @@ fn test_nvim_y_big_yank_line() {
     engine.feed_keys("Y");
     let (content, is_lw) = engine.registers.get(&'"').unwrap().clone();
     assert_eq!(content, "hello world\n");
-    assert!(is_lw, "Y should be linewise");
+    assert!(is_lw.is_linewise(), "Y should be linewise");
 }
 
 #[test]
@@ -23740,6 +26097,38 @@ fn test_nvim_ex_delete_line() {
     engine.update_syntax();
     engine.execute_command("2d");
     assert_eq!(engine.buffer().to_string(), "aaa\nccc\n");
+}
+
+#[test]
+fn test_nvim_ex_put_bang_before_current_line() {
+    // :pu! puts the default register *before* the current line (`:put`
+    // without `!` puts after) — issue #877.
+    nvim_case("a\nb\n", 0, 0, "yy:pu!<CR>", "a\na\nb\n", 0, 0);
+}
+
+#[test]
+fn test_nvim_ex_put_with_line_address() {
+    // :2put puts after line 2, not after the cursor line — issue #877.
+    nvim_case("a\nb\nc\n", 0, 0, "yy:2put<CR>", "a\nb\na\nc\n", 2, 0);
+}
+
+#[test]
+fn test_nvim_ex_put_address_zero() {
+    // Address 0 is legal for :put and means "before the first line".
+    nvim_case("a\nb\n", 1, 0, "yy:0put<CR>", "b\na\nb\n", 0, 0);
+}
+
+#[test]
+fn test_nvim_ex_k_with_line_address() {
+    // :2ka (the no-space :k spelling of :mark) sets mark 'a' on line 2, not
+    // the cursor line — issue #877.
+    nvim_case("a\nb\nc\n", 0, 0, ":2ka<CR>'a", "a\nb\nc\n", 1, 0);
+}
+
+#[test]
+fn test_nvim_ex_mark_with_line_address() {
+    // :2mark a sets mark 'a' on line 2, not the cursor line — issue #877.
+    nvim_case("a\nb\nc\n", 0, 0, ":2mark a<CR>'a", "a\nb\nc\n", 1, 0);
 }
 
 #[test]
@@ -23802,8 +26191,10 @@ fn test_nvim_double_quote_jump_previous() {
 
 #[test]
 fn test_nvim_di_paren_empty() {
-    // di( on "()" is a no-op (nothing inside)
-    nvim_case("()\n", 0, 0, "di(", "()\n", 0, 0);
+    // di( on "()" deletes nothing, but Vim still parks the cursor *between*
+    // the delimiters — verified against nvim, which is why the trailing `0, 0`
+    // this test used to assert became `0, 1` in #807.
+    nvim_case("()\n", 0, 0, "di(", "()\n", 0, 1);
 }
 
 #[test]
@@ -23824,8 +26215,9 @@ fn test_nvim_da_paren_nested_from_inner() {
 
 #[test]
 fn test_nvim_di_quote_empty() {
-    // di" on empty quotes "" is a no-op
-    nvim_case("say \"\" end\n", 0, 4, "di\"", "say \"\" end\n", 0, 4);
+    // di" on empty quotes "" deletes nothing but moves the cursor between
+    // them — see `test_nvim_di_paren_empty` (#807).
+    nvim_case("say \"\" end\n", 0, 4, "di\"", "say \"\" end\n", 0, 5);
 }
 
 // ── Phase 4 Batch 6: J edge cases ───────────────────────────────────────
@@ -23838,9 +26230,11 @@ fn test_nvim_j_join_strips_indent() {
 
 #[test]
 fn test_nvim_j_join_trailing_space() {
-    // J on line with trailing spaces: Neovim doesn't add another space.
-    // VimCode adds one, giving "aaa    bbb" instead of "aaa   bbb".
-    nvim_case("aaa   \nbbb\n", 0, 0, "J", "aaa   bbb\n", 0, 5);
+    // J on line with trailing spaces: Neovim doesn't add another space, and
+    // the cursor lands on the first char of the appended line (col 6, on
+    // 'b'), not on the last of the pre-existing trailing spaces (#880;
+    // verified directly against `nvim --headless` with this exact buffer).
+    nvim_case("aaa   \nbbb\n", 0, 0, "J", "aaa   bbb\n", 0, 6);
 }
 
 // ── Phase 4 Batch 6: Tilde at EOL ───────────────────────────────────────
@@ -24161,7 +26555,7 @@ fn test_nvim_3yy_register() {
     engine.feed_keys("3yy");
     let (content, is_lw) = engine.registers.get(&'"').unwrap().clone();
     assert_eq!(content, "aaa\nbbb\nccc\n");
-    assert!(is_lw);
+    assert!(is_lw.is_linewise());
 }
 
 #[test]
@@ -24361,7 +26755,7 @@ fn test_nvim_visual_line_join_count() {
     engine.feed_keys("Vy");
     let (content, is_lw) = engine.registers.get(&'"').unwrap().clone();
     assert_eq!(content, "hello world\n");
-    assert!(is_lw);
+    assert!(is_lw.is_linewise());
 }
 
 #[test]
@@ -24965,7 +27359,7 @@ fn test_nvim_x_fills_unnamed_register() {
     engine.feed_keys("x");
     let (text, is_linewise) = engine.registers.get(&'"').cloned().unwrap_or_default();
     assert_eq!(text, "A");
-    assert!(!is_linewise);
+    assert!(!is_linewise.is_linewise());
 }
 
 #[test]
@@ -24977,7 +27371,7 @@ fn test_nvim_dd_fills_unnamed_linewise() {
     engine.feed_keys("jdd");
     let (text, is_linewise) = engine.registers.get(&'"').cloned().unwrap_or_default();
     assert_eq!(text, "second\n");
-    assert!(is_linewise);
+    assert!(is_linewise.is_linewise());
 }
 
 #[test]
@@ -25042,14 +27436,14 @@ fn test_nvim_J_last_line_noop() {
 
 #[test]
 fn test_nvim_J_with_empty_next_line() {
-    // J joining with an empty next line
-    let mut engine = Engine::new();
-    engine.buffer_mut().insert(0, "hello\n\nworld\n");
-    engine.update_syntax();
-    engine.feed_keys("J");
-    // Vim joins "hello" with empty line, producing "hello " (trailing space)
-    // then "world" remains on the next line
-    assert_eq!(engine.buffer().to_string(), "hello \nworld\n");
+    // J joining with an empty next line inserts NO space — the previous
+    // expectation here ("hello " with a trailing space) encoded the #880
+    // bug, not Vim. Verified directly against `nvim --headless -u NONE`
+    // (0.12.5) on this exact buffer: the result is "hello\nworld\n" and the
+    // cursor clamps back onto the last char of the merged line (1-based
+    // line 1, col 5 → 0-based line 0, col 4). Same case as the
+    // `tests/nvim_conformance.rs` oracle case "op:J next blank".
+    nvim_case("hello\n\nworld\n", 0, 0, "J", "hello\nworld\n", 0, 4);
 }
 
 #[test]
@@ -25137,10 +27531,12 @@ fn test_nvim_search_basic_n() {
     let mut engine = Engine::new();
     engine.buffer_mut().insert(0, "foo bar foo baz\n");
     engine.update_syntax();
+    // #801: `/` starts searching *after* the cursor, so the match at col 0 is
+    // skipped and `n` wraps back to it. Both values verified against Neovim.
     engine.feed_keys("/foo<CR>");
-    assert_eq!(engine.view().cursor.col, 0);
-    engine.feed_keys("n");
     assert_eq!(engine.view().cursor.col, 8);
+    engine.feed_keys("n");
+    assert_eq!(engine.view().cursor.col, 0);
 }
 
 #[test]
@@ -25150,10 +27546,12 @@ fn test_nvim_search_N_reverse() {
     engine.buffer_mut().insert(0, "foo bar foo baz foo\n");
     engine.update_syntax();
     engine.view_mut().cursor.col = 16;
+    // #801: from the last match, `/` wraps to col 0; `N` then wraps back.
+    // Verified against Neovim.
     engine.feed_keys("/foo<CR>");
-    assert_eq!(engine.view().cursor.col, 16);
+    assert_eq!(engine.view().cursor.col, 0);
     engine.feed_keys("N");
-    assert_eq!(engine.view().cursor.col, 8);
+    assert_eq!(engine.view().cursor.col, 16);
 }
 
 #[test]
@@ -25196,10 +27594,12 @@ fn test_nvim_search_count_prefix_n() {
     let mut engine = Engine::new();
     engine.buffer_mut().insert(0, "x x x x x\n");
     engine.update_syntax();
+    // #801: `/x` from col 0 lands on the *next* match (col 2), so `3n` from
+    // there reaches col 8. Verified against Neovim.
     engine.feed_keys("/x<CR>");
-    assert_eq!(engine.view().cursor.col, 0);
+    assert_eq!(engine.view().cursor.col, 2);
     engine.feed_keys("3n");
-    assert_eq!(engine.view().cursor.col, 6);
+    assert_eq!(engine.view().cursor.col, 8);
 }
 
 // -- Scroll commands --
@@ -25248,6 +27648,12 @@ fn test_nvim_ctrl_b_page_up() {
     engine.buffer_mut().insert(0, &lines);
     engine.update_syntax();
     engine.view_mut().cursor.line = 80;
+    // #805: `<C-b>` is a true no-op (real Vim beeps) when `scroll_top` is
+    // already 0 -- which it still would be here without this, an
+    // inconsistent state a real session never reaches because every motion
+    // keeps the viewport following the cursor. `ensure_cursor_visible`
+    // restores that invariant the same way the conformance harness does.
+    engine.ensure_cursor_visible();
     engine.feed_keys("<C-b>");
     assert!(engine.view().cursor.line < 80);
 }
@@ -25993,9 +28399,11 @@ fn test_nvim_slash_reuses_prev_pattern_with_n() {
     let mut engine = Engine::new();
     engine.buffer_mut().insert(0, "foo bar foo baz foo\n");
     engine.update_syntax();
+    // #801: `/foo` skips the match under the cursor, so the three positions
+    // visited are 8, 16 and (wrapping) 0. Verified against Neovim.
     engine.feed_keys("/foo<CR>");
     engine.feed_keys("nn");
-    assert_eq!(engine.view().cursor.col, 16);
+    assert_eq!(engine.view().cursor.col, 0);
 }
 
 // -- Ex command ranges --
@@ -26065,13 +28473,18 @@ fn test_nvim_sort_basic() {
 }
 
 #[test]
-fn test_nvim_sort_reverse_r_flag() {
-    // :sort r (VimCode flag form) reverses alphabetical order
+fn test_nvim_sort_r_flag_without_pattern_is_a_no_op() {
+    // Real Vim's `r` flag only means anything alongside a `/pattern/` (sort
+    // on the match itself rather than the text after it) — with no pattern
+    // there's nothing to select, so `r` has no effect and the sort is a
+    // plain alphabetical one. Reversing is `:sort!`, a separate axis (#879 —
+    // this repo used to conflate the two, so `:sort /pat/ r` sorted on whole
+    // lines instead of the match).
     let mut engine = Engine::new();
-    engine.buffer_mut().insert(0, "alpha\nbravo\ncharlie\n");
+    engine.buffer_mut().insert(0, "charlie\nalpha\nbravo\n");
     engine.update_syntax();
     engine.feed_keys(":sort r<CR>");
-    assert_eq!(engine.buffer().to_string(), "charlie\nbravo\nalpha\n");
+    assert_eq!(engine.buffer().to_string(), "alpha\nbravo\ncharlie\n");
 }
 
 #[test]
@@ -26082,6 +28495,55 @@ fn test_nvim_sort_unique() {
     engine.update_syntax();
     engine.feed_keys(":sort u<CR>");
     assert_eq!(engine.buffer().to_string(), "a\nb\nc\n");
+}
+
+// -- :r[ead] {file} / :r[ead] !{cmd} --
+//
+// The shell-out itself is only exercised by the real `nvim --headless`
+// oracle case (`ex:r !echo` in tests/nvim_conformance.rs, which is not built
+// with `cfg(test)` and so actually spawns the process) — mirroring how
+// `try_execute_filter_command`'s `%!cmd` shell-out is `#[cfg(test)]`-gated
+// to a no-op so unit tests stay hermetic. These tests instead drive
+// `insert_read_content` directly, which is the part of #879's fix that
+// isn't the subprocess call: reusing `:put`'s "land on the last inserted
+// line" cursor rule (`:h :read` says the same, verified against nvim above).
+
+#[test]
+fn test_insert_read_content_leaves_cursor_on_last_inserted_line() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "a\n");
+    engine.update_syntax();
+    let inserted = engine.insert_read_content("hi\n");
+    assert_eq!(inserted, 1);
+    assert_eq!(engine.buffer().to_string(), "a\nhi\n");
+    assert_eq!(engine.view().cursor.line, 1);
+    assert_eq!(engine.view().cursor.col, 0);
+}
+
+#[test]
+fn test_insert_read_content_multiple_lines_lands_on_the_last_one() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "x\ny\n");
+    engine.update_syntax();
+    engine.view_mut().cursor.line = 0;
+    let inserted = engine.insert_read_content("l1\nl2\nl3\n");
+    assert_eq!(inserted, 3);
+    assert_eq!(engine.buffer().to_string(), "x\nl1\nl2\nl3\ny\n");
+    assert_eq!(engine.view().cursor.line, 3);
+}
+
+// -- `*` ex range: shorthand for `'<,'>`, the last visual selection --
+
+#[test]
+fn test_star_range_is_last_visual_selection() {
+    // `*` must still resolve after leaving visual mode, the same way `'<`
+    // and `'>` do (`test_substitute_visual_range` above) — #879.
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "a\nb\nc\n");
+    engine.update_syntax();
+    engine.feed_keys("Vj<Esc>:*d<CR>");
+    assert_eq!(engine.buffer().to_string(), "c\n");
+    assert_eq!(engine.view().cursor.line, 0);
 }
 
 // -- gi: restart insert at last position --
@@ -26398,7 +28860,8 @@ fn test_nvim_co_concat_form() {
 
 #[test]
 fn test_nvim_sort_bang_reverses() {
-    // :sort! reverses alphabetical order (synonym for :sort r)
+    // :sort! reverses alphabetical order. The bang is the *only* way to
+    // reverse — `r` is the "sort on the /pattern/ match" flag (#879).
     let mut engine = Engine::new();
     engine.buffer_mut().insert(0, "alpha\nbravo\ncharlie\n");
     engine.update_syntax();
@@ -26430,13 +28893,35 @@ fn test_nvim_colon_zero_still_goes_to_first() {
 }
 
 #[test]
-fn test_nvim_sort_with_existing_r_flag_still_works() {
-    // :sort r (old form) should keep working unchanged.
+fn test_nvim_sort_pattern_r_flag_sorts_on_the_match() {
+    // :sort /pat/ r sorts on the text the pattern *matches*, not on the text
+    // after the match (that's the plain, `r`-less `:sort /pat/` case, see
+    // `test_nvim_sort_pattern_sorts_on_text_after_match` below). #879.
     let mut engine = Engine::new();
-    engine.buffer_mut().insert(0, "alpha\nbravo\ncharlie\n");
+    engine.buffer_mut().insert(0, "b 2\na 1\n");
     engine.update_syntax();
-    engine.feed_keys(":sort r<CR>");
-    assert_eq!(engine.buffer().to_string(), "charlie\nbravo\nalpha\n");
+    engine.feed_keys(":sort /\\d/ r<CR>");
+    assert_eq!(engine.buffer().to_string(), "a 1\nb 2\n");
+}
+
+#[test]
+fn test_nvim_sort_pattern_sorts_on_text_after_match() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "x2 b\nx1 a\n");
+    engine.update_syntax();
+    engine.feed_keys(":sort /x\\d /<CR>");
+    assert_eq!(engine.buffer().to_string(), "x1 a\nx2 b\n");
+}
+
+#[test]
+fn test_nvim_sort_range_leaves_lines_outside_it_untouched() {
+    // :2,3sort sorts only lines 2-3, leaving line 1 where it is.
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "c\nb\na\n");
+    engine.update_syntax();
+    engine.feed_keys(":2,3sort<CR>");
+    assert_eq!(engine.buffer().to_string(), "c\na\nb\n");
+    assert_eq!(engine.view().cursor.line, 1);
 }
 
 // ── #114 follow-up: 1-based line addresses ─────────────────────────────
@@ -26561,6 +29046,105 @@ fn test_nvim_retab_converts_tabs_to_spaces() {
     engine.update_syntax();
     engine.feed_keys(":retab<CR>");
     assert_eq!(engine.buffer().to_string(), "    hello\n");
+}
+
+#[test]
+fn test_nvim_retab_bang_converts_spaces_to_tabs() {
+    // With noexpandtab, `:retab!` (but not bare `:retab`) turns a
+    // tabstop-wide run of spaces into a tab.
+    let mut engine = Engine::new();
+    engine.settings.expand_tab = false;
+    engine.settings.tabstop = 4;
+    engine.buffer_mut().insert(0, "    hello\n");
+    engine.update_syntax();
+    engine.feed_keys(":retab<CR>");
+    assert_eq!(
+        engine.buffer().to_string(),
+        "    hello\n",
+        "bare :retab must not touch a pure-space run"
+    );
+    engine.feed_keys(":retab!<CR>");
+    assert_eq!(engine.buffer().to_string(), "\thello\n");
+}
+
+#[test]
+fn test_nvim_retab_arg_uses_old_tabstop_to_measure_existing_tabs() {
+    // `:retab N` sets 'tabstop' to N, but must use the *old* tabstop to
+    // measure the width of tabs already in the buffer, not the new one
+    // (the old vimcode bug this guards: retabbing "\ta" at ts=4 to ts=2
+    // produced "  a" instead of nvim's "    a").
+    let mut engine = Engine::new();
+    engine.settings.expand_tab = true;
+    engine.settings.tabstop = 4;
+    engine.buffer_mut().insert(0, "\ta\n");
+    engine.update_syntax();
+    engine.feed_keys(":retab 2<CR>");
+    assert_eq!(engine.buffer().to_string(), "    a\n");
+    assert_eq!(engine.settings.tabstop, 2, ":retab N must set 'tabstop'");
+}
+
+#[test]
+fn test_nvim_retab_only_touches_given_range() {
+    let mut engine = Engine::new();
+    engine.settings.expand_tab = true;
+    engine.settings.tabstop = 4;
+    engine.buffer_mut().insert(0, "\ta\n\tb\n\tc\n");
+    engine.update_syntax();
+    engine.feed_keys(":2retab<CR>");
+    assert_eq!(engine.buffer().to_string(), "\ta\n    b\n\tc\n");
+}
+
+// -- :left / :right / :center --
+
+#[test]
+fn test_nvim_left_strips_indent() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "    a\n");
+    engine.update_syntax();
+    engine.feed_keys(":le<CR>");
+    assert_eq!(engine.buffer().to_string(), "a\n");
+}
+
+#[test]
+fn test_nvim_left_with_arg_sets_exact_indent() {
+    let mut engine = Engine::new();
+    engine.settings.expand_tab = true;
+    engine.buffer_mut().insert(0, "a\n");
+    engine.update_syntax();
+    engine.feed_keys(":le 4<CR>");
+    assert_eq!(engine.buffer().to_string(), "    a\n");
+    assert_eq!(
+        engine.view().cursor.col,
+        4,
+        ":left leaves the cursor at the first non-blank"
+    );
+}
+
+#[test]
+fn test_nvim_right_aligns_to_width() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "a\n");
+    engine.update_syntax();
+    engine.feed_keys(":ri 10<CR>");
+    assert_eq!(engine.buffer().to_string(), "         a\n");
+}
+
+#[test]
+fn test_nvim_center_pads_left_half() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "a\n");
+    engine.update_syntax();
+    engine.feed_keys(":ce 10<CR>");
+    assert_eq!(engine.buffer().to_string(), "    a\n");
+}
+
+#[test]
+fn test_nvim_left_over_range() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "  a\n  b\n  c\n");
+    engine.update_syntax();
+    engine.feed_keys(":1,2le<CR>");
+    assert_eq!(engine.buffer().to_string(), "a\nb\n  c\n");
 }
 
 // -- Marks --
@@ -27290,6 +29874,118 @@ fn test_activity_bar_resolve_extension_panels() {
     assert_eq!(resolve_activity_bar_click(9, 30, &ext_names), None);
 }
 
+/// #557: `ext_activity_panels` is the shared list both backends' `ShellConfig`
+/// builders append to the activity bar, so its **order** has to be the same
+/// name-sorted order `resolve_activity_bar_click` (above) and
+/// `activity_bar_activate`'s `8 + idx` arm assume — otherwise a click on the
+/// painted icon opens a different extension's panel. `ext_panels` is a
+/// `HashMap`, so insertion order is explicitly not it.
+#[test]
+fn ext_activity_panels_are_sorted_by_name_with_ext_prefixed_ids() {
+    use crate::core::plugin::PanelRegistration;
+    let mut engine = Engine::new();
+    engine.ext_panels.clear();
+    for (name, title, icon) in [
+        ("todo-panel", "Todo", 'T'),
+        ("git-insights", "Git Insights", 'G'),
+    ] {
+        engine.ext_panels.insert(
+            name.to_string(),
+            PanelRegistration {
+                name: name.to_string(),
+                title: title.to_string(),
+                icon,
+                fallback_icon: Some(icon),
+                sections: vec![],
+            },
+        );
+    }
+
+    let defs = engine.ext_activity_panels();
+    assert_eq!(
+        defs.iter().map(|d| d.id.as_str()).collect::<Vec<_>>(),
+        vec!["ext:git-insights", "ext:todo-panel"]
+    );
+    assert_eq!(
+        defs.iter().map(|d| d.title.as_str()).collect::<Vec<_>>(),
+        vec!["Git Insights", "Todo"]
+    );
+    // Every panel must carry a non-empty glyph — an empty `icon` is exactly
+    // what "the icon is missing from the activity bar" looks like from here.
+    assert!(defs.iter().all(|d| !d.icon.is_empty()));
+}
+
+#[test]
+fn test_ext_panel_h_focuses_activity_bar() {
+    use crate::core::plugin::PanelRegistration;
+    let mut engine = Engine::new();
+    // Register two ext panels (sorted: "alpha", "beta").
+    engine.ext_panels.insert(
+        "beta".to_string(),
+        PanelRegistration {
+            name: "beta".to_string(),
+            title: "Beta".to_string(),
+            icon: 'B',
+            fallback_icon: None,
+            sections: vec![],
+        },
+    );
+    engine.ext_panels.insert(
+        "alpha".to_string(),
+        PanelRegistration {
+            name: "alpha".to_string(),
+            title: "Alpha".to_string(),
+            icon: 'A',
+            fallback_icon: None,
+            sections: vec![],
+        },
+    );
+    // Simulate "beta" ext panel being focused (sorted index 1 → toolbar idx 9).
+    engine.ext_panel_has_focus = true;
+    engine.ext_panel_active = Some("beta".to_string());
+
+    engine.handle_ext_panel_key("h", false, None);
+
+    assert!(
+        !engine.ext_panel_has_focus,
+        "ext_panel_has_focus should be cleared"
+    );
+    assert!(
+        engine.activity_bar_focused,
+        "activity_bar_focused should be set"
+    );
+    // "beta" is sorted index 1 (["alpha", "beta"]) → toolbar index 9.
+    assert_eq!(
+        engine.activity_bar_selected, 9,
+        "toolbar index should be 8 + sorted_idx"
+    );
+}
+
+#[test]
+fn test_ext_panel_left_focuses_activity_bar() {
+    use crate::core::plugin::PanelRegistration;
+    let mut engine = Engine::new();
+    // Register one ext panel (sorted index 0 → toolbar idx 8).
+    engine.ext_panels.insert(
+        "mypanel".to_string(),
+        PanelRegistration {
+            name: "mypanel".to_string(),
+            title: "My Panel".to_string(),
+            icon: 'M',
+            fallback_icon: None,
+            sections: vec![],
+        },
+    );
+    engine.ext_panel_has_focus = true;
+    engine.ext_panel_active = Some("mypanel".to_string());
+
+    engine.handle_ext_panel_key("Left", false, None);
+
+    assert!(!engine.ext_panel_has_focus);
+    assert!(engine.activity_bar_focused);
+    assert_eq!(engine.activity_bar_selected, 8);
+}
+
 // --- Context menu hit regions ---
 
 #[test]
@@ -27365,49 +30061,6 @@ fn test_context_menu_disabled_item() {
     assert_eq!(
         resolve_context_menu_click(&items, 10, 5, 80, 24, 15, 6),
         ContextMenuClickResult::InsidePopup
-    );
-}
-
-// --- Dialog hit regions ---
-
-#[test]
-fn test_dialog_click_button() {
-    use crate::core::engine::{resolve_dialog_click, DialogButton, DialogClickResult};
-    let buttons = vec![
-        DialogButton {
-            label: "Cancel".to_string(),
-            hotkey: 'c',
-            action: "cancel".to_string(),
-        },
-        DialogButton {
-            label: "OK".to_string(),
-            hotkey: 'o',
-            action: "ok".to_string(),
-        },
-    ];
-    // Dialog at (20, 10), width 40, height 6, buttons on row 14
-    let layout = DialogLayout {
-        x: 20,
-        y: 10,
-        width: 40,
-        height: 6,
-        btn_y: 14,
-    };
-    let fmt = |label: &str, _hotkey: char| label.to_string();
-    // Button 0 "Cancel" starts at col 22 (layout.x + 2), width ~10
-    assert_eq!(
-        resolve_dialog_click(&buttons, &layout, 23, 14, &fmt),
-        DialogClickResult::Button(0)
-    );
-    // Outside dialog
-    assert_eq!(
-        resolve_dialog_click(&buttons, &layout, 0, 0, &fmt),
-        DialogClickResult::Outside
-    );
-    // Inside but not on buttons
-    assert_eq!(
-        resolve_dialog_click(&buttons, &layout, 30, 12, &fmt),
-        DialogClickResult::InsideDialog
     );
 }
 
@@ -27513,4 +30166,395 @@ fn test_existing_markdown_link_behavior_unchanged() {
     for link in &ph.links {
         assert!(is_safe_url(&link.3), "unsafe URL in links: {}", link.3);
     }
+}
+
+// ── #585: :saveas with no argument ──────────────────────────────────────
+// GTK/TUI "File: Save As…" menu item and command palette entry both
+// resolve to `execute_command("saveas")`. It used to just print a status
+// message and do nothing visible. It should now pre-fill Command mode
+// with the current path for interactive editing (same pattern as
+// `:Rename` with no argument), fully platform-neutral.
+
+#[test]
+fn test_saveas_no_arg_prefills_command_line_with_current_path() {
+    let mut engine = Engine::new();
+    engine.active_buffer_state_mut().file_path = Some(PathBuf::from("/tmp/existing.rs"));
+
+    let action = engine.execute_command("saveas");
+
+    assert_eq!(action, EngineAction::None);
+    assert_eq!(engine.mode, Mode::Command);
+    assert_eq!(engine.command_buffer, "saveas /tmp/existing.rs");
+    assert_eq!(engine.command_cursor, engine.command_buffer.chars().count());
+}
+
+#[test]
+fn test_saveas_no_arg_on_unnamed_buffer_prefills_empty_path() {
+    let mut engine = Engine::new();
+    // Fresh buffer has no file_path.
+    assert!(engine.file_path().is_none());
+
+    let action = engine.execute_command("saveas");
+
+    assert_eq!(action, EngineAction::None);
+    assert_eq!(engine.mode, Mode::Command);
+    assert_eq!(engine.command_buffer, "saveas ");
+}
+
+#[test]
+fn test_saveas_no_arg_via_menu_dispatch() {
+    // Menu bar / command palette both route through dispatch_menu_action,
+    // which forces Mode::Normal before calling execute_command — verify
+    // execute_command's Mode::Command still wins so the command line
+    // actually opens.
+    let mut engine = Engine::new();
+    engine.active_buffer_state_mut().file_path = Some(PathBuf::from("/tmp/existing.rs"));
+
+    let action = engine.dispatch_menu_action("saveas");
+
+    assert_eq!(action, EngineAction::None);
+    assert_eq!(engine.mode, Mode::Command);
+    assert_eq!(engine.command_buffer, "saveas /tmp/existing.rs");
+}
+
+#[test]
+fn test_saveas_with_explicit_arg_still_saves_directly() {
+    // Existing `:saveas {file}` behavior (with an explicit argument) must
+    // be unaffected by the no-arg prefill change.
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "hello");
+    let dir = std::env::temp_dir();
+    let target = dir.join(format!("vimcode_saveas_test_{}.txt", std::process::id()));
+    let target_str = target.to_string_lossy().to_string();
+
+    let action = engine.execute_command(&format!("saveas {target_str}"));
+
+    assert_eq!(action, EngineAction::None);
+    // Mode is untouched by this path — no Command-mode prefill happens
+    // when an explicit path is given.
+    assert_eq!(engine.mode, Mode::Normal);
+    assert_eq!(engine.file_path(), Some(&target));
+    assert!(target.exists());
+    let _ = std::fs::remove_file(&target);
+}
+
+/// #804: `handle_insert_key`'s catch-all (`_ => { ... } else if ctrl { }`)
+/// exists precisely so an unrecognised ctrl combo can never fall through to
+/// the character-insert branch and type the literal letter — proven here
+/// with an arbitrary combo (`<C-z>`) the function has no dedicated arm for,
+/// not one of the four named in the issue. If this regresses, so does every
+/// future unhandled ctrl combo, silently.
+#[test]
+fn insert_mode_unrecognized_ctrl_combo_inserts_nothing() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "ab");
+    press_char(&mut engine, 'i');
+    press_ctrl(&mut engine, 'z');
+    assert_eq!(
+        engine.buffer().to_string(),
+        "ab",
+        "an unrecognised ctrl combo must not insert its letter"
+    );
+    assert_eq!(
+        engine.view().cursor.col,
+        0,
+        "an unrecognised ctrl combo must not move the cursor either"
+    );
+}
+
+/// #804 review: the terminal-ctrl-alias remap in `handle_insert_key` must
+/// accept `key_name == "["` (the literal-character name), not only
+/// `"bracketleft"` (the crossterm/X11 keysym name) — `src/core/engine/
+/// vscode.rs` already treats `"bracketleft" | "["` as synonyms elsewhere,
+/// and `tests/nvim_conformance.rs`'s own `press_ctrl('[')` sends the literal
+/// `"["` name, so matching only `"bracketleft"` would leave `<C-[>` (Vim's
+/// other spelling of Escape) permanently unreachable through that harness.
+#[test]
+fn insert_mode_ctrl_bracket_left_literal_name_leaves_insert() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "ab");
+    press_char(&mut engine, 'i');
+    assert_eq!(engine.mode, Mode::Insert);
+    press_ctrl(&mut engine, '[');
+    assert_eq!(
+        engine.mode,
+        Mode::Normal,
+        "<C-[> sent as the literal \"[\" key name must leave insert mode like Escape"
+    );
+    assert_eq!(
+        engine.buffer().to_string(),
+        "ab",
+        "<C-[> must not insert a literal '[' character"
+    );
+}
+
+/// #804 CI fix: `0<C-d>` (`:h i_0_CTRL-D`) keys off Vim's `lastc` — the
+/// character of the *previous keystroke* — not off the buffer text before the
+/// cursor. Here the '0' was never typed: it was already in the line and the
+/// cursor was merely placed after it, so `<C-d>` is an ordinary shiftwidth
+/// dedent that leaves the '0' (and the rest of the line) untouched.
+///
+/// The nvim oracle pins this exact scenario as `ins:C-d with untyped 0 before
+/// cursor` in `tests/nvim_conformance.rs`.
+#[test]
+fn test_insert_ctrl_d_with_untyped_trailing_zero_is_normal_dedent() {
+    let mut engine = engine_with_text("    foo0\n");
+    engine.settings.shift_width = 4;
+    engine.handle_key("i", Some('i'), false);
+    engine.view_mut().cursor.col = 8; // end of "    foo0"
+    engine.handle_key("d", Some('d'), true); // <C-d>
+
+    let buf = engine.buffer().to_string();
+    assert_eq!(
+        buf, "foo0\n",
+        "a '0' that was never typed must not trigger the i_0_CTRL-D \
+         strip-all-indent special case — only the indent should be removed; got {buf:?}"
+    );
+    assert_eq!(
+        engine.view().cursor.col,
+        4,
+        "cursor should shift left by exactly the removed indent (4), not also lose the '0'"
+    );
+}
+
+/// #804 CI fix (the regression the nvim oracle caught at the merge gate):
+/// a *typed* '0' immediately before `<C-d>` deletes that '0' and strips ALL
+/// indent, even when non-blank text precedes it. The previous implementation
+/// required only indent before the '0', so `A0<C-d>` on `"    afoo"` left the
+/// '0' behind and did a plain shiftwidth dedent. Neovim (0.9.5) gives
+/// `"afoo"` with the cursor on the final 'o'.
+#[test]
+fn test_insert_typed_zero_ctrl_d_strips_all_indent_after_text() {
+    let mut engine = engine_with_text("    afoo\n");
+    engine.settings.shift_width = 2; // deliberately != the 4-space indent
+    engine.handle_key("A", Some('A'), false);
+    engine.handle_key("0", Some('0'), false);
+    engine.handle_key("d", Some('d'), true); // <C-d>
+
+    let buf = engine.buffer().to_string();
+    assert_eq!(
+        buf, "afoo\n",
+        "a typed '0' before <C-d> must delete the '0' and ALL indent regardless \
+         of what precedes it (`:h i_0_CTRL-D` keys off the last keystroke); got {buf:?}"
+    );
+    assert_eq!(
+        engine.view().cursor.col,
+        4,
+        "cursor should end just past 'afoo' — the typed '0' and 4 indent chars are gone"
+    );
+}
+
+/// #804 CI fix: `:h i_^_CTRL-D` — a typed `^` is the other signal prefix and
+/// behaves the same way as `0` for the strip-all-indent part. Oracle case
+/// `ins:caret C-d`.
+#[test]
+fn test_insert_typed_caret_ctrl_d_strips_all_indent() {
+    let mut engine = engine_with_text("    a\n");
+    engine.settings.shift_width = 4;
+    engine.handle_key("A", Some('A'), false);
+    engine.handle_key("asciicircum", Some('^'), false);
+    engine.handle_key("d", Some('d'), true); // <C-d>
+
+    assert_eq!(
+        engine.buffer().to_string(),
+        "a\n",
+        "a typed '^' before <C-d> must delete the '^' and all indent"
+    );
+    assert_eq!(engine.view().cursor.col, 1);
+}
+
+/// #804 CI fix: the signal is the *previous* keystroke, so it is consumed by
+/// the first `<C-d>`. A second `<C-d>` sees `lastc == <C-d>` and must fall
+/// back to an ordinary shiftwidth dedent instead of eating another character.
+/// Oracle case `ins:0 C-d twice` (8-space indent, sw=4 → `<C-d><C-d>` after
+/// the strip leaves nothing more to remove).
+#[test]
+fn test_insert_zero_ctrl_d_signal_is_not_reused_by_second_ctrl_d() {
+    let mut engine = engine_with_text("    abc\n");
+    engine.settings.shift_width = 4;
+    engine.handle_key("A", Some('A'), false);
+    engine.handle_key("0", Some('0'), false);
+    engine.handle_key("d", Some('d'), true); // <C-d> — strips '0' + all indent
+    assert_eq!(engine.buffer().to_string(), "abc\n");
+    engine.handle_key("d", Some('d'), true); // <C-d> again — plain dedent, no indent left
+    assert_eq!(
+        engine.buffer().to_string(),
+        "abc\n",
+        "the second <C-d> must not delete the 'c': the 0/^ signal only applies \
+         to the keystroke immediately before it"
+    );
+    assert_eq!(engine.view().cursor.col, 3);
+}
+
+/// #804 CI fix: `insert_last_key_char` must not survive across Insert
+/// sessions. Typing a '0', leaving Insert, then re-entering and pressing
+/// `<C-d>` is a plain dedent — otherwise the stale signal would eat the
+/// character before the cursor.
+#[test]
+fn test_insert_zero_signal_does_not_survive_leaving_insert_mode() {
+    let mut engine = engine_with_text("    a\n");
+    engine.settings.shift_width = 2;
+    engine.handle_key("A", Some('A'), false);
+    engine.handle_key("0", Some('0'), false);
+    engine.handle_key("Escape", None, false);
+    engine.handle_key("A", Some('A'), false);
+    engine.handle_key("d", Some('d'), true); // <C-d>
+
+    assert_eq!(
+        engine.buffer().to_string(),
+        "  a0\n",
+        "re-entering Insert clears the 0/^ signal — this <C-d> is a plain \
+         shiftwidth (2) dedent that keeps the '0'"
+    );
+}
+
+/// #804 review: the `<C-o>` resume-insert cursor special-casing keyed off
+/// `unicode == Some('$')`/`Some('p')` — the *last* keystroke of whatever
+/// command just ran — rather than "was the whole command a bare `$`/`p`".
+/// `<C-o>y$` yanks to end-of-line, which per `:h y` must not move the
+/// cursor at all; the bare-`$` "snap to end-of-line" special case must not
+/// fire just because the operator's motion happened to be `$`.
+#[test]
+fn test_ctrl_o_y_dollar_does_not_get_bare_dollar_cursor_shift() {
+    let mut engine = engine_with_text("abcdef\n");
+    engine.view_mut().cursor.col = 2;
+    engine.handle_key("i", Some('i'), false);
+    engine.handle_key("o", Some('o'), true); // <C-o>
+    engine.handle_key("y", Some('y'), false); // pending_operator = 'y'
+    engine.handle_key("$", Some('$'), false); // completes y$
+    assert_eq!(
+        engine.mode,
+        Mode::Insert,
+        "y$ is one complete command; <C-o> should resume Insert"
+    );
+    assert_eq!(
+        engine.view().cursor.col,
+        2,
+        "y$ must not move the cursor — it must not be treated as a bare `$`"
+    );
+}
+
+/// #804 review, companion case: `<C-o>r p` replaces a character *with* 'p'.
+/// The completed command's defining/last keystroke is 'p', but it is the
+/// `r` command, not the bare `p` paste command — resuming Insert must not
+/// apply the bare-`p` "advance one column past what was pasted" shift.
+#[test]
+fn test_ctrl_o_r_p_does_not_get_bare_p_cursor_shift() {
+    let mut engine = engine_with_text("abc\n");
+    engine.view_mut().cursor.col = 0;
+    engine.handle_key("i", Some('i'), false);
+    engine.handle_key("o", Some('o'), true); // <C-o>
+    engine.handle_key("r", Some('r'), false); // pending_key = 'r'
+    engine.handle_key("p", Some('p'), false); // replacement char, completes r
+    assert_eq!(
+        engine.mode,
+        Mode::Insert,
+        "r p is one complete command; <C-o> should resume Insert"
+    );
+    assert_eq!(
+        engine.buffer().to_string(),
+        "pbc\n",
+        "r should have replaced 'a' with 'p'"
+    );
+    assert_eq!(
+        engine.view().cursor.col,
+        0,
+        "`r`'s replacement char being 'p' must not trigger the bare-`p` cursor shift \
+         (`r` leaves the cursor ON the replaced character, it doesn't advance past it)"
+    );
+}
+
+/// #892: `S`'s deleted line content must go into the unnamed register
+/// *linewise* (`:h registers`), same as `cc` (#806) — even though the buffer
+/// edit itself only clears the line's content and leaves the newline in
+/// place. If it were recorded charwise, a subsequent `P` would paste it back
+/// inline instead of as a whole line above the cursor.
+#[test]
+fn test_s_register_is_linewise() {
+    let mut engine = setup_engine("a\nb", 0, 0);
+    send_keys(&mut engine, "SX<Esc>");
+    let (content, ty) = engine
+        .registers
+        .get(&'"')
+        .expect("FAIL: no register content after S");
+    assert_eq!(content, "a\n", "FAIL: S register content mismatch");
+    assert!(
+        ty.is_linewise(),
+        "FAIL: S register must be linewise, was charwise"
+    );
+}
+
+/// #892: `S` then `P` — `S` yanks the substituted line linewise, so `P` must
+/// put it back as a whole line above the cursor, not splice it into the
+/// following line's text.
+#[test]
+fn test_s_then_p_pastes_whole_line() {
+    let mut engine = setup_engine("a\nb", 0, 0);
+    send_keys(&mut engine, "SX<Esc>jP");
+    assert_eq!(
+        engine.buffer().to_string(),
+        "X\na\nb",
+        "FAIL: `S` then `P` must paste the substituted line back as its own line"
+    );
+}
+
+/// #892: `cw` on trailing whitespace at the very end of the buffer (no word
+/// and no further line to land on). The shared `dw`-style `w`-motion clamps
+/// back onto the same last character instead of advancing (nothing to move
+/// to), which used to make `cw` a total no-op here — it must still consume
+/// the trailing whitespace and enter insert mode, matching a plain `dw`'s
+/// deletion but *not* joining any line (there is none to join).
+#[test]
+fn test_cw_on_trailing_space_at_eol() {
+    let mut engine = setup_engine("ab ", 0, 2);
+    send_keys(&mut engine, "cwX<Esc>");
+    assert_eq!(
+        engine.buffer().to_string(),
+        "abX",
+        "FAIL: cw on trailing eol whitespace should replace just that whitespace"
+    );
+}
+
+/// #892: `cw` on a completely empty line must not delete anything (there is
+/// nothing to change) and must NOT join the empty line with the next one —
+/// unlike plain `dw`, which does join an empty line with the next (real
+/// Neovim behavior). `cw` just enters insert mode on the still-empty line.
+#[test]
+fn test_cw_on_empty_line_does_not_join_next_line() {
+    let mut engine = setup_engine("\na", 0, 0);
+    send_keys(&mut engine, "cwX<Esc>");
+    assert_eq!(
+        engine.buffer().to_string(),
+        "X\na",
+        "FAIL: cw on an empty line must not join it with the next line"
+    );
+}
+
+/// #892: `gp` with a charwise register spanning multiple lines must leave
+/// the cursor just after the pasted text — which, when the last pasted
+/// character is immediately followed by what used to continue the original
+/// line, lands on that line's own trailing newline. A normal-mode cursor can
+/// never rest on/after a newline, so it must clamp back to the last real
+/// column instead (here: the pasted-in "c", not one past it).
+#[test]
+fn test_gp_charwise_multiline_cursor_lands_after_pasted_text() {
+    let mut engine = setup_engine("ab\ncd", 0, 0);
+    // vjy$: visually select "ab\nc" and yank it charwise, then `$` to the
+    // last column of line 0, then `gp` to paste after and land past it.
+    send_keys(&mut engine, "vjy$gp");
+    assert_eq!(
+        engine.buffer().to_string(),
+        "abab\nc\ncd",
+        "FAIL: gp charwise multi-line paste produced the wrong buffer"
+    );
+    assert_eq!(
+        engine.view().cursor.line,
+        1,
+        "FAIL: gp should land on the line holding the last pasted char"
+    );
+    assert_eq!(
+        engine.view().cursor.col,
+        0,
+        "FAIL: gp must not leave the cursor resting on the line's trailing newline"
+    );
 }

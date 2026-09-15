@@ -57,6 +57,34 @@ pub fn crash_log_path() -> PathBuf {
     std::env::temp_dir().join("vimcode-crash.log")
 }
 
+/// Append `msg` to the crash log file, creating it if necessary. Returns
+/// the path on success.
+///
+/// Appends rather than truncating (#857): a `panic in a function that
+/// cannot unwind` abort runs the panic hook *twice* on the same crash —
+/// once for the originating panic, whose message names the actual bug,
+/// and again for the `panic_cannot_unwind` wrapper that aborts the
+/// process. `fs::write` would let the second call's generic message
+/// overwrite the first call's diagnostic one, leaving the log naming only
+/// "panic in a function that cannot unwind" with the root cause gone.
+/// Opening in append mode keeps every hook invocation's report in the
+/// file, most recent last.
+///
+/// Broken out of [`write_crash_log`] so this behavior is unit-testable
+/// with a plain string — `std::panic::PanicHookInfo` has no public
+/// constructor, so a test can't build one to call `write_crash_log`
+/// directly.
+fn append_to_crash_log(msg: &str) -> Option<PathBuf> {
+    let path = crash_log_path();
+    fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .and_then(|mut f| f.write_all(msg.as_bytes()))
+        .ok()
+        .map(|_| path)
+}
+
 /// Write a crash report to the crash log file.  Returns the path on success.
 pub fn write_crash_log(info: &std::panic::PanicHookInfo<'_>) -> Option<PathBuf> {
     let bt = std::backtrace::Backtrace::force_capture();
@@ -65,8 +93,40 @@ pub fn write_crash_log(info: &std::panic::PanicHookInfo<'_>) -> Option<PathBuf> 
         .map(|l| format!("  at {}:{}:{}\n", l.file(), l.line(), l.column()))
         .unwrap_or_default();
     let crash_msg = format!("PANIC: {}\n{}backtrace:\n{}\n", info, loc_str, bt);
-    let path = crash_log_path();
-    fs::write(&path, &crash_msg).ok().map(|_| path)
+    append_to_crash_log(&crash_msg)
+}
+
+/// Install the crash-recovery panic hook shared by every *GUI* entry point
+/// (GTK, macOS, Win-GUI): flush every dirty buffer to its swap file, write a
+/// crash log, print where to find it, then chain to whatever hook was
+/// already installed. `src/gtk/mod.rs::run`, `src/macos/mod.rs::run`, and
+/// `src/win/mod.rs::run` used to each carry an identical copy of this
+/// closure — one of the drift items #950 catalogued ("the panic hook copied
+/// four times"). Centralizing the three identical copies here means a
+/// change to the message or the flush/log call order only has to be made
+/// once, and it can never be made in only two of the three by accident.
+///
+/// **Not shared with the TUI entry point** (`tui_main::mod::run`) — that is
+/// an essential difference, not a fourth accidental copy to fold in here.
+/// TUI's hook writes via `debug_log!` instead of `eprintln!`, because a
+/// terminal backend runs in raw mode / the alternate screen: writing to
+/// stderr mid-panic there is invisible to the user (or corrupts the
+/// terminal state they're looking at) in a way that isn't a concern for any
+/// GUI backend. See #950's decomposition doc for the full essential-vs-
+/// accidental accounting.
+pub fn install_gui_crash_hook() {
+    let prev_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        // Emergency: flush swap files for all dirty buffers.
+        run_emergency_flush();
+
+        if let Some(path) = write_crash_log(info) {
+            eprintln!("VimCode crashed. Details written to {}", path.display());
+            eprintln!("Unsaved buffers written to swap files for recovery.");
+            eprintln!("Please report this at https://github.com/JDonaghy/vimcode/issues");
+        }
+        prev_hook(info);
+    }));
 }
 
 /// Parsed swap-file header.
@@ -173,12 +233,10 @@ pub fn is_pid_alive(pid: u32) -> bool {
     #[cfg(target_os = "windows")]
     {
         // Use tasklist to check if the PID exists.
-        use std::os::windows::process::CommandExt;
-        std::process::Command::new("tasklist")
+        crate::core::git::hidden_command("tasklist")
             .args(["/FI", &format!("PID eq {}", pid), "/NH"])
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
-            .creation_flags(0x08000000) // CREATE_NO_WINDOW
             .output()
             .map(|o| {
                 let out = String::from_utf8_lossy(&o.stdout);
@@ -271,6 +329,40 @@ mod tests {
         let p1 = swap_path_for(Path::new("/home/user/a.rs"));
         let p2 = swap_path_for(Path::new("/home/user/b.rs"));
         assert_ne!(p1, p2);
+    }
+
+    /// #857: `append_to_crash_log` must accumulate every call's report
+    /// rather than each new call wiping out the previous one — the defect
+    /// that made the double-panic-hook-invocation crash log for the
+    /// titlebar-close abort name only "panic in a function that cannot
+    /// unwind" (the second, generic panic) instead of the `BorrowMutError`
+    /// that actually caused it (the first, diagnostic panic).
+    ///
+    /// **Verified RED against unfixed `develop`:** with `append_to_crash_log`
+    /// reverted to `fs::write(&path, msg.as_bytes())` (truncating), the
+    /// second call below overwrites the first and this test's
+    /// `contains("FIRST")` assertion fails.
+    #[test]
+    fn append_to_crash_log_appends_rather_than_truncates() {
+        let path = crash_log_path();
+        let _ = fs::remove_file(&path);
+
+        append_to_crash_log("FIRST PANIC REPORT\n");
+        append_to_crash_log("SECOND PANIC REPORT\n");
+
+        let contents = fs::read_to_string(&path)
+            .expect("append_to_crash_log must have created the crash log file");
+        assert!(
+            contents.contains("FIRST PANIC REPORT"),
+            "the first call's report must survive a second call — a \
+             truncating write would have erased it; contents were: {contents:?}"
+        );
+        assert!(
+            contents.contains("SECOND PANIC REPORT"),
+            "the second call's report must also be present; contents were: {contents:?}"
+        );
+
+        let _ = fs::remove_file(&path);
     }
 
     #[test]

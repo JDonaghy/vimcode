@@ -66,6 +66,55 @@ fn test_word_motion_w_b() {
 }
 
 #[test]
+fn test_jj_col_memory_over_short_line() {
+    // #805: Vim remembers the "desired" column (`curswant`) across a chain of
+    // vertical motions, even when an intervening line is too short to hold
+    // it — the column comes back once a line long enough to hold it is
+    // reached again, instead of staying clamped to the shortest line seen.
+    let mut e = engine_with("abcdef\nab\nabcdef\n");
+    e.view_mut().cursor.col = 4; // sits on 'e'
+    press(&mut e, 'j'); // "ab" is too short: clamps to its last column
+    assert_cursor(&e, 1, 1);
+    press(&mut e, 'j'); // back to a full-length line: column 4 is restored
+    assert_cursor(&e, 2, 4);
+}
+
+#[test]
+fn test_dollar_then_jj_sticks_to_end_of_line() {
+    // `$` sets curswant to "always end of line" (Vim's MAXCOL), so every
+    // subsequent `j` lands on the last character regardless of line length.
+    let mut e = engine_with("abcdef\nab\nabcdef\n");
+    press(&mut e, '$');
+    assert_cursor(&e, 0, 5);
+    press(&mut e, 'j');
+    assert_cursor(&e, 1, 1); // "ab" — last column is 1
+    press(&mut e, 'j');
+    assert_cursor(&e, 2, 5); // back to the long line — "$" memory restored
+}
+
+#[test]
+fn test_word_motion_w_onto_blank_line() {
+    // #805: an empty line is itself a "word" in Vim — `w` must stop there
+    // instead of skipping straight through to the next non-blank line.
+    let mut e = engine_with("foo\n\nbar\n");
+    press(&mut e, 'w');
+    assert_cursor(&e, 1, 0); // stops on the blank line
+    press(&mut e, 'w');
+    assert_cursor(&e, 2, 0); // next w reaches "bar"
+}
+
+#[test]
+fn test_paragraph_forward_whitespace_only_line_is_not_blank() {
+    // #805: Vim's `}`/`{` require a *completely* empty line to count as a
+    // paragraph boundary — a whitespace-only line does not qualify.
+    let mut e = engine_with("a\n   \nb\n\n");
+    press(&mut e, '}');
+    // The whitespace-only line must be skipped over, landing on the buffer's
+    // one genuinely blank (trailing) line, not the "   " line.
+    assert_cursor(&e, 3, 0);
+}
+
+#[test]
 fn test_line_bounds_0_dollar() {
     let mut e = engine_with("hello world\n");
     // '$' moves to end of line (last char)
@@ -283,6 +332,13 @@ fn test_named_register_yank_paste() {
 
 #[test]
 fn test_black_hole_register() {
+    // #806 (#2132/#553 lineage): the old version of this test asserted only
+    // `lines.contains(&"keep")`, which stays true even if `"_dd` is treated
+    // as a plain `dd` — "keep" was never touched by the delete either way,
+    // so the assertion could not distinguish "black hole worked" from
+    // "black hole is ignored". Assert the exact buffer instead, at each
+    // step, so a reinstated `"_` bug (falling through to the unnamed
+    // register) actually fails this test.
     let mut e = engine_with("keep\ndelete\n");
     // Yank "keep" into unnamed register first
     press(&mut e, 'y');
@@ -293,12 +349,23 @@ fn test_black_hole_register() {
     press(&mut e, '_');
     press(&mut e, 'd');
     press(&mut e, 'd');
-    // Paste — should still paste "keep", not "delete"
+    // The delete itself still happens — "_ only redirects the register,
+    // it doesn't disable the command.
+    let lines = get_lines(&e);
+    assert_eq!(
+        lines,
+        vec!["keep".to_string()],
+        "\"_dd must still delete the line, lines: {lines:?}"
+    );
+    // Paste — must reproduce "keep" (from `yy`), never "delete": a `"_dd`
+    // that (incorrectly) also wrote the unnamed register would paste
+    // "delete" here instead.
     press(&mut e, 'p');
     let lines = get_lines(&e);
-    assert!(
-        lines.contains(&"keep".to_string()),
-        "unnamed register should still have 'keep', lines: {lines:?}"
+    assert_eq!(
+        lines,
+        vec!["keep".to_string(), "keep".to_string()],
+        "\"_dd must not clobber the unnamed register, lines: {lines:?}"
     );
 }
 
@@ -474,4 +541,396 @@ fn test_ce_dot_repeat() {
     press(&mut e, 'w');
     press(&mut e, '.');
     assert_buf(&e, "XXX XXX baz\n");
+}
+
+// #803: `.` records the *command* (replayed through the same key dispatcher
+// that produced it), not the inserted text. Each test below is a family the
+// old text-replay design got wrong — the assertion is the exact buffer, so a
+// regression to "insert the same text at the cursor" fails loudly.
+
+#[test]
+fn test_dot_repeat_a_appends_at_new_eol_not_old_text() {
+    // A appends at end-of-line. `.` on a new line must re-append there, not
+    // insert ";" wherever the cursor happens to sit.
+    let mut e = engine_with("a\nb\n");
+    press(&mut e, 'A');
+    press(&mut e, ';');
+    press_key(&mut e, "Escape");
+    assert_buf(&e, "a;\nb\n");
+
+    press(&mut e, 'j');
+    press(&mut e, '.');
+    assert_buf(&e, "a;\nb;\n");
+}
+
+#[test]
+fn test_dot_repeat_i_inserts_at_new_line_start() {
+    let mut e = engine_with("a\nb\n");
+    press(&mut e, 'I');
+    press(&mut e, 'x');
+    press_key(&mut e, "Escape");
+    assert_buf(&e, "xa\nb\n");
+
+    press(&mut e, 'j');
+    press(&mut e, '.');
+    assert_buf(&e, "xa\nxb\n");
+}
+
+#[test]
+fn test_dot_repeat_o_opens_a_new_line_each_time() {
+    // `o` then `.` must open a SECOND new line, not re-insert the text at
+    // the cursor (the old bug: `ob<Esc>.` produced "bb").
+    let mut e = engine_with("a\n");
+    press(&mut e, 'o');
+    press(&mut e, 'b');
+    press_key(&mut e, "Escape");
+    assert_buf(&e, "a\nb\n");
+
+    press(&mut e, '.');
+    assert_buf(&e, "a\nb\nb\n");
+}
+
+#[test]
+fn test_dot_repeat_big_o_opens_a_new_line_above_each_time() {
+    let mut e = engine_with("a\n");
+    press(&mut e, 'O');
+    press(&mut e, 'b');
+    press_key(&mut e, "Escape");
+    assert_buf(&e, "b\na\n");
+
+    press(&mut e, '.');
+    assert_buf(&e, "b\nb\na\n");
+}
+
+#[test]
+fn test_dot_repeat_cc_deletes_then_inserts() {
+    // The old design re-inserted "X" without deleting the line first
+    // (`cc j .` gave "Xb" instead of two lines of just "X").
+    let mut e = engine_with("a\nb\n");
+    press(&mut e, 'c');
+    press(&mut e, 'c');
+    press(&mut e, 'X');
+    press_key(&mut e, "Escape");
+    assert_buf(&e, "X\nb\n");
+
+    press(&mut e, 'j');
+    press(&mut e, '.');
+    assert_buf(&e, "X\nX\n");
+}
+
+#[test]
+fn test_dot_repeat_big_c_changes_to_new_eol() {
+    let mut e = engine_with("abc\ndef\n");
+    e.view_mut().cursor.col = 1;
+    press(&mut e, 'C');
+    press(&mut e, 'X');
+    press_key(&mut e, "Escape");
+    assert_buf(&e, "aX\ndef\n");
+
+    press(&mut e, 'j');
+    press(&mut e, '.');
+    assert_buf(&e, "aX\ndX\n");
+}
+
+#[test]
+fn test_dot_repeat_s_substitutes_char_then_inserts() {
+    let mut e = engine_with("abcd\n");
+    press(&mut e, 's');
+    press(&mut e, 'X');
+    press_key(&mut e, "Escape");
+    assert_buf(&e, "Xbcd\n");
+
+    press(&mut e, 'l');
+    press(&mut e, '.');
+    assert_buf(&e, "XXcd\n");
+}
+
+#[test]
+fn test_dot_repeat_p_repeats_the_paste_not_the_yank() {
+    // `.` after `p` must repeat only the paste — not "yl" too, which would
+    // yank different text each time. Was entirely non-repeatable before #803.
+    let mut e = engine_with("ab\n");
+    press(&mut e, 'y');
+    press(&mut e, 'l');
+    press(&mut e, 'p');
+    assert_buf(&e, "aab\n");
+
+    press(&mut e, '.');
+    assert_buf(&e, "aaab\n");
+}
+
+#[test]
+fn test_dot_repeat_indent_gtgt() {
+    // `>>` was entirely non-repeatable before #803.
+    let mut e = engine_with("a\n");
+    e.settings.shift_width = 4;
+    e.settings.expand_tab = true;
+    press(&mut e, '>');
+    press(&mut e, '>');
+    assert_buf(&e, "    a\n");
+
+    press(&mut e, '.');
+    assert_buf(&e, "        a\n");
+}
+
+#[test]
+fn test_dot_repeat_ctrl_a_increment() {
+    // `<C-a>` (increment number under cursor) was entirely non-repeatable
+    // before #803.
+    let mut e = engine_with("1\n2\n");
+    ctrl(&mut e, 'a');
+    assert_buf(&e, "2\n2\n");
+
+    press(&mut e, 'j');
+    press(&mut e, '.');
+    assert_buf(&e, "2\n3\n");
+}
+
+#[test]
+fn test_dot_repeat_visual_line_delete_same_size_new_cursor() {
+    // `:h visual-repeat`: `.` after a visual operator reselects a
+    // same-sized region at the *new* cursor, not a fixed one-line delete.
+    let mut e = engine_with("a\nb\nc\nd\ne\n");
+    press(&mut e, 'V');
+    press(&mut e, 'j');
+    press(&mut e, 'd');
+    assert_buf(&e, "c\nd\ne\n");
+
+    press(&mut e, '.');
+    assert_buf(&e, "e\n");
+}
+
+#[test]
+fn test_dot_repeat_dap_text_object() {
+    let mut e = engine_with("a\n\nb\n\nc\n");
+    press(&mut e, 'd');
+    press(&mut e, 'a');
+    press(&mut e, 'p');
+    assert_buf(&e, "b\n\nc\n");
+
+    press(&mut e, '.');
+    assert_buf(&e, "c\n");
+}
+
+#[test]
+fn test_dot_repeat_visual_block_insert() {
+    let mut e = engine_with("ab\nab\nab\nab\n");
+    ctrl(&mut e, 'v');
+    press(&mut e, 'j');
+    press(&mut e, 'I');
+    press(&mut e, 'x');
+    press_key(&mut e, "Escape");
+    assert_buf(&e, "xab\nxab\nab\nab\n");
+
+    press(&mut e, 'j');
+    press(&mut e, 'j');
+    press(&mut e, '.');
+    assert_buf(&e, "xab\nxab\nxab\nxab\n");
+}
+
+#[test]
+fn test_dot_repeat_visual_block_change() {
+    // Named exact-buffer coverage for `vb:c then .` (previously covered only
+    // implicitly via its removal from KNOWN_DEVIATIONS in
+    // nvim_conformance.rs — see #803 review nits). Blockwise `c` is a
+    // blockwise delete followed by a blockwise insert at the same column
+    // (reusing `visual_block_insert_info`, the same mechanism block `I`/`A`
+    // use), so it should repeat the same way block `I` does.
+    let mut e = engine_with("abc\nabc\nabc\nabc\n");
+    ctrl(&mut e, 'v');
+    press(&mut e, 'j');
+    press(&mut e, 'c');
+    press(&mut e, 'Z');
+    press_key(&mut e, "Escape");
+    assert_buf(&e, "Zbc\nZbc\nabc\nabc\n");
+
+    press(&mut e, 'j');
+    press(&mut e, 'j');
+    press(&mut e, '.');
+    assert_buf(&e, "Zbc\nZbc\nZbc\nZbc\n");
+}
+
+#[test]
+fn test_dot_repeat_count_override_replaces_not_multiplies() {
+    // `:h .`: a count given to `.` *replaces* the original count.
+    let mut e = engine_with("abcdefghij\n");
+    press(&mut e, '3');
+    press(&mut e, 'x');
+    assert_buf(&e, "defghij\n");
+
+    press(&mut e, '2');
+    press(&mut e, '.');
+    // 3 + 2 = 5 characters deleted in total, not 3 + 3 or 3*2.
+    assert_buf(&e, "fghij\n");
+}
+
+#[test]
+fn test_dot_repeat_count_override_dd() {
+    let mut e = engine_with("a\nb\nc\nd\ne\nf\n");
+    press(&mut e, '2');
+    press(&mut e, 'd');
+    press(&mut e, 'd');
+    assert_buf(&e, "c\nd\ne\nf\n");
+
+    press(&mut e, '3');
+    press(&mut e, '.');
+    assert_buf(&e, "f\n");
+}
+
+#[test]
+fn test_dot_repeat_count_override_then_bare_dot_uses_override_not_stale_prefix() {
+    // Regression for #803 review: a count-override repeat (`2.`) must not
+    // corrupt the remembered dot-count for a *later* bare `.`. Before the
+    // fix, the "2" typed just before `.` leaked into the nested replay's own
+    // dot-recording and got concatenated onto the replayed "2", leaving the
+    // remembered count as 22 instead of 2 — so this third `.` would delete
+    // far more than the 2 characters Vim's `:h .` promises ("Count ... [is]
+    // remembered ... Use "4." ... Use "." to [repeat] again").
+    let mut e = engine_with("abcdefghij\n");
+    press(&mut e, '3');
+    press(&mut e, 'x');
+    assert_buf(&e, "defghij\n");
+
+    press(&mut e, '2');
+    press(&mut e, '.');
+    assert_buf(&e, "fghij\n");
+
+    press(&mut e, '.');
+    // Exactly 2 more characters deleted (matching the "2." override that's
+    // now remembered), not 22 (which would wipe the rest of the line).
+    assert_buf(&e, "hij\n");
+}
+
+#[test]
+fn test_dot_repeat_count_override_dd_then_bare_dot_uses_override_not_stale_prefix() {
+    // Same regression as above, for the linewise `dd` family: `2dd` then
+    // `3.` must leave `3` (not `33`) as the count a further bare `.` uses.
+    let mut e = engine_with("a\nb\nc\nd\ne\nf\ng\nh\ni\nj\nk\n");
+    press(&mut e, '2');
+    press(&mut e, 'd');
+    press(&mut e, 'd');
+    assert_buf(&e, "c\nd\ne\nf\ng\nh\ni\nj\nk\n");
+
+    press(&mut e, '3');
+    press(&mut e, '.');
+    assert_buf(&e, "f\ng\nh\ni\nj\nk\n");
+
+    press(&mut e, '.');
+    // Exactly 3 more lines deleted, not 33 (which would wipe every
+    // remaining line in the buffer).
+    assert_buf(&e, "i\nj\nk\n");
+}
+
+// ── #803 CI follow-up: regressions the first cut of the keystroke-replay
+// dot-repeat introduced, each caught by the nvim conformance oracle. These
+// pin the behaviour with plain engine-level assertions so a re-break fails
+// even on a machine without `nvim` installed.
+
+#[test]
+fn test_insert_count_is_abandoned_when_an_arrow_key_moves_the_cursor() {
+    // `:h i_<Left>`: moving the cursor during a count-prefixed insert drops
+    // the repeat. Vim yields "yxa" for `3ix<Left>y<Esc>`, not "yxyxyxa".
+    let mut e = engine_with("a\n");
+    press(&mut e, '3');
+    press(&mut e, 'i');
+    press(&mut e, 'x');
+    press_key(&mut e, "Left");
+    press(&mut e, 'y');
+    press_key(&mut e, "Escape");
+    assert_buf(&e, "yxa\n");
+}
+
+#[test]
+fn test_insert_count_still_repeats_without_a_cursor_key() {
+    // Guard the other side of the fix: an undisturbed `3ix<Esc>` still
+    // repeats, so the cancellation above isn't just disabling the feature.
+    let mut e = engine_with("a\n");
+    press(&mut e, '3');
+    press(&mut e, 'i');
+    press(&mut e, 'x');
+    press_key(&mut e, "Escape");
+    assert_buf(&e, "xxxa\n");
+}
+
+#[test]
+fn test_dot_inside_a_recorded_macro_does_not_pollute_the_register() {
+    // `qax.jq` records exactly "x.j". Before the fix, the keys `.` replayed
+    // were themselves appended to the recording buffer ("x.xj"), so `@a`
+    // deleted one character too many on every line it ran over.
+    let mut e = engine_with("abc\ndef\n");
+    press(&mut e, 'q');
+    press(&mut e, 'a');
+    press(&mut e, 'x');
+    press(&mut e, '.');
+    press(&mut e, 'j');
+    press(&mut e, 'q');
+    assert_buf(&e, "c\ndef\n");
+    assert_register(&e, 'a', "x.j", false);
+
+    press(&mut e, '@');
+    press(&mut e, 'a');
+    drain_macro_queue(&mut e);
+    assert_buf(&e, "c\nf\n");
+}
+
+#[test]
+fn test_dot_after_at_colon_does_not_repeat_the_ex_command() {
+    // `@:` re-runs the last ex command; `.` repeats the last *change*, and an
+    // ex command is not one. `:d<CR>@:.` deletes exactly two lines in Vim.
+    let mut e = engine_with("a\nb\nc\nd\n");
+    exec(&mut e, "d");
+    assert_buf(&e, "b\nc\nd\n");
+    press(&mut e, '@');
+    press(&mut e, ':');
+    assert_buf(&e, "c\nd\n");
+    press(&mut e, '.');
+    assert_buf(&e, "c\nd\n");
+}
+
+#[test]
+fn test_dot_after_at_register_repeats_the_macros_own_change() {
+    // The `@a` keystrokes are dropped from the dot candidate, but the macro's
+    // *contents* still record normally as they are pumped — so `.` after `@a`
+    // repeats the macro's last change (`x`), exactly as Vim does.
+    let mut e = engine_with("abcd\nefgh\n");
+    press(&mut e, 'q');
+    press(&mut e, 'a');
+    press(&mut e, 'x');
+    press(&mut e, 'q');
+    assert_buf(&e, "bcd\nefgh\n");
+
+    press(&mut e, 'j');
+    press(&mut e, '@');
+    press(&mut e, 'a');
+    drain_macro_queue(&mut e);
+    assert_buf(&e, "bcd\nfgh\n");
+
+    press(&mut e, '.');
+    assert_buf(&e, "bcd\ngh\n");
+}
+
+#[test]
+fn test_dip_on_final_paragraph_removes_the_preceding_line_separator() {
+    // `ip`/`ap` are linewise: deleting the buffer's last paragraph must take
+    // a line separator with it. Leaving the one *before* it behind produced a
+    // stray blank line and parked the cursor on a line Vim had removed.
+    let mut e = engine_with("a\n\nb");
+    press(&mut e, 'j');
+    press(&mut e, 'j');
+    press(&mut e, 'd');
+    press(&mut e, 'i');
+    press(&mut e, 'p');
+    assert_buf(&e, "a\n");
+    assert_cursor(&e, 1, 0);
+}
+
+#[test]
+fn test_dip_on_a_middle_paragraph_is_unaffected() {
+    // The EOF-only rule must not fire when a following separator exists.
+    let mut e = engine_with("a\n\nb\n");
+    press(&mut e, 'd');
+    press(&mut e, 'i');
+    press(&mut e, 'p');
+    assert_buf(&e, "\nb\n");
+    assert_cursor(&e, 0, 0);
 }

@@ -411,12 +411,23 @@ impl Engine {
         let vp = self.effective_viewport_lines().max(1);
         let cur = self.view().cursor.line;
         let new_top = self.view().scroll_top;
-        if cur < new_top + scrolloff {
-            self.view_mut().cursor.line = (new_top + scrolloff).min(lines);
-            self.clamp_cursor_col();
+        let forced_line = if cur < new_top + scrolloff {
+            Some((new_top + scrolloff).min(lines))
         } else if cur >= new_top + vp.saturating_sub(scrolloff) {
-            self.view_mut().cursor.line = (new_top + vp.saturating_sub(scrolloff + 1)).min(lines);
-            self.clamp_cursor_col();
+            Some((new_top + vp.saturating_sub(scrolloff + 1)).min(lines))
+        } else {
+            None
+        };
+        if let Some(line) = forced_line {
+            // #805 review: this is a *vertical* cursor move (scrolloff pushed
+            // the cursor onto a different line), so it must land on the
+            // remembered `curswant` column exactly like `j`/`k`/`<C-d>`/
+            // `<C-f>` do — a bare `clamp_cursor_col()` here would drop a
+            // `$`-set `CURSWANT_EOL` on the floor, so `$` followed by
+            // `<C-e>`/`<C-y>` would stop sticking to end-of-line.
+            let want = self.curswant();
+            self.view_mut().cursor.line = line;
+            self.apply_curswant(want);
         }
     }
 
@@ -559,7 +570,6 @@ impl Engine {
     // =======================================================================
 
     /// Returns true if any sidebar panel currently has keyboard focus.
-    #[allow(dead_code)]
     pub fn sidebar_has_focus(&self) -> bool {
         self.explorer_has_focus
             || self.search_has_focus
@@ -572,16 +582,44 @@ impl Engine {
             || self.activity_bar_focused
     }
 
-    /// Clear all sidebar panel focus flags at once.
+    /// Clear all sidebar panel focus flags at once, including the activity bar.
     pub fn clear_sidebar_focus(&mut self) {
         self.explorer_has_focus = false;
         self.search_has_focus = false;
-        self.sc_has_focus = false;
+        // #823 item 8: was a direct `self.sc_has_focus = false`, which
+        // skipped `sc_set_focus`'s other two effects — clearing
+        // `sc_button_focused` and syncing `sc_sidebar_system`'s own
+        // focus flag. TUI's mouse.rs open-coded this same 9-flag clear
+        // and, unlike this method, already called `sc_set_focus(false)`
+        // here — so GTK's two call sites (both "clicking the editor clears
+        // every sidebar's focus") were the ones carrying the bug: an SC
+        // action button could stay visually focused after focus moved to
+        // the editor.
+        self.sc_set_focus(false);
         self.dap_sidebar_has_focus = false;
         self.ext_sidebar_has_focus = false;
         self.ai_has_focus = false;
         self.settings_has_focus = false;
         self.ext_panel_has_focus = false;
+        self.activity_bar_focused = false;
+    }
+
+    /// Collapse (hide) the sidebar: hide it in `app_shell`, clear every
+    /// sidebar panel's keyboard focus, mark the explorer no longer visible
+    /// in session state, and persist the session.
+    ///
+    /// Shared by both backends (#823 item 8) — this exact 4-statement
+    /// sequence (`app_shell.hide_sidebar()`, `clear_sidebar_focus()`,
+    /// `session.explorer_visible = false`, `session.save()`) was pasted at
+    /// five call sites in `tui_main/shell_app.rs` and once in `app.rs`.
+    /// TUI additionally resets its own `TuiSidebar::has_focus` around each
+    /// call — that's TUI-local UI state, not `Engine`'s, so it stays at the
+    /// call site rather than becoming a parameter here.
+    pub fn collapse_sidebar(&mut self) {
+        self.app_shell.hide_sidebar();
+        self.clear_sidebar_focus();
+        self.session.explorer_visible = false;
+        let _ = self.session.save();
     }
 
     /// Returns true if any user-focused modal popup is currently open
@@ -594,6 +632,16 @@ impl Engine {
     /// behaviour on modal state — e.g. GTK suppresses the LSP hover
     /// trigger and hides native scrollbar widgets when this returns
     /// true.
+    ///
+    /// #731 (vimcode): both GTK call sites were inside dead code deleted
+    /// by that issue (`App::tick`'s hover-polling block and the
+    /// `sync_scrollbar`/`sync_scrollbar_positions` native-widget path) —
+    /// both were already gated on Relm4-era widget handles permanently
+    /// `None` under the ShellApp runner, so this had no live caller before
+    /// the deletion either. Kept `pub` (not deleted) because it is
+    /// documented, generically useful core API that the hover-polling
+    /// restoration work #731 flags as follow-up will need again.
+    #[allow(dead_code)]
     pub fn is_blocking_modal_open(&self) -> bool {
         self.picker_open
             || self.tab_switcher_open

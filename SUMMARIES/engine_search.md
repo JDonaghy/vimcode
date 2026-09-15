@@ -10,7 +10,9 @@ Cursor helpers, search helpers (word under cursor, word-bounded search), the uni
 - `ensure_cursor_visible()`, `ensure_cursor_visible_wrap()` — viewport scroll
 - `scroll_cursor_center()`, `scroll_cursor_top()`, `scroll_cursor_bottom()` — viewport centering
 - `word_under_cursor()` — extract word at cursor position
-- `search_word_under_cursor()` — `*` / `#` word search
+- `star_word_under_cursor()` — the "word nearest the cursor" for `*` / `#` (scans forward when the cursor is not on a keyword)
+- `search_word_under_cursor_generic(forward, whole_word)` — shared body of `*` / `#` / `g*` / `g#`; sets a real `\<word\>` pattern and disables `'smartcase'`
+- `search_word_under_cursor(forward)` — `*` / `#` word search
 - `build_word_bounded_matches()` — whole-word match filtering
 
 ## Key Methods — Find/Replace Overlay
