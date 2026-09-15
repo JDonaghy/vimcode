@@ -3130,6 +3130,23 @@ impl App {
                         .map(|l| l.content_bounds)
                         .unwrap_or(slab_rect);
                     engine.sc_sidebar_body_rect.set(body_rect);
+                    // #971: without this, `sc_sidebar_system.handle_cached`
+                    // returns `Ignored` unconditionally and every
+                    // content-row press (header collapse, row select) is a
+                    // silent no-op — see `render::gui_sidebar_system_metrics`'s
+                    // own doc for the full story. Reads `backend.line_height()`
+                    // directly — not the `lh` parameter above, whose
+                    // `self.cached_line_height.max(backend.line_height())`
+                    // derivation (`render_content`'s own top) can lag behind
+                    // what `backend` reports by the time `render()` a few
+                    // lines down actually reads it — so the metrics
+                    // `handle_cached` hit-tests against can never disagree
+                    // with what this exact `render()` call paints.
+                    let sc_lh = backend.line_height();
+                    engine
+                        .sc_sidebar_system
+                        .borrow_mut()
+                        .set_backend_info(sc_lh, render::gui_sidebar_system_metrics(sc_lh));
                     render::populate_sc_sidebar_system(engine, theme);
                     engine.sc_sidebar_system.borrow().render(backend, body_rect);
 
@@ -3175,6 +3192,16 @@ impl App {
                 }
             }
             PANEL_EXTENSIONS => {
+                // #971: see `render::gui_sidebar_system_metrics`'s own doc —
+                // without this, every content-row press on this panel
+                // (header collapse, row select) is a silent no-op. Reads
+                // `backend.line_height()` directly — see the `PANEL_GIT`
+                // arm's identical comment on why, above.
+                let ext_lh = backend.line_height();
+                engine
+                    .ext_sidebar_system
+                    .borrow_mut()
+                    .set_backend_info(ext_lh, render::gui_sidebar_system_metrics(ext_lh));
                 render::populate_ext_sidebar_system(engine);
                 engine.ext_sidebar_body_rect.set(q_sb);
                 engine.ext_sidebar_system.borrow().render(backend, q_sb);
@@ -3187,7 +3214,14 @@ impl App {
                     .render_and_cache(backend, q_sb);
             }
             id if id.starts_with("ext:") => {
-                // Extension panel — render via ext_sidebar_system.
+                // Extension panel — render via ext_sidebar_system. #971:
+                // same `set_backend_info` fix as the `PANEL_EXTENSIONS` arm
+                // just above.
+                let ext_lh = backend.line_height();
+                engine
+                    .ext_sidebar_system
+                    .borrow_mut()
+                    .set_backend_info(ext_lh, render::gui_sidebar_system_metrics(ext_lh));
                 render::populate_ext_sidebar_system(engine);
                 engine.ext_sidebar_body_rect.set(q_sb);
                 engine.ext_sidebar_system.borrow().render(backend, q_sb);

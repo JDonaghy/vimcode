@@ -1209,12 +1209,17 @@ impl Engine {
                 true
             }
             quadraui::SidebarEvent::RowSelected { .. } => true,
-            quadraui::SidebarEvent::HeaderActivated { section } => {
-                let mut sys = self.sc_sidebar_system.borrow_mut();
-                let collapsed = sys.is_collapsed(section);
-                sys.set_collapsed(section, !collapsed);
-                true
-            }
+            // #971: `SidebarSystem::click` already flips `collapsed[section]`
+            // itself before returning this event (when `allow_collapse` is
+            // set, which `Engine::new`'s `sc_sidebar_system` does) —
+            // `HeaderActivated` is a *notification*, not an instruction to
+            // toggle again. Re-toggling here canceled the click's own
+            // toggle out on every press, so a header click looked like it
+            // took focus (the active-section chevron moved) but never
+            // actually collapsed/expanded anything — caught by
+            // `src/macos/mod.rs`'s `sc_panel_header_click_hit_band_matches_the_painted_row`
+            // sanity check, added alongside this fix.
+            quadraui::SidebarEvent::HeaderActivated { .. } => true,
             quadraui::SidebarEvent::Ignored => false,
             _ => true,
         }

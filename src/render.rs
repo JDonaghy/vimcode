@@ -14409,6 +14409,55 @@ pub fn populate_ext_sidebar_system(engine: &Engine) {
     engine.populate_ext_sidebar_system();
 }
 
+/// `MsvLayoutMetrics` for a pixel-unit GUI backend's `SidebarSystem`
+/// instances (Source Control, plugin ext panels).
+///
+/// #971: `SidebarSystem::handle_cached` returns `SidebarEvent::Ignored`
+/// unconditionally until `set_backend_info` has been called at least once,
+/// and nothing on GTK/macOS ever called it — TUI's own one-time
+/// `set_backend_info(1.0, ..)` at startup (`tui_main/shell_app.rs`'s
+/// `App::from_engine`) is the *only* call site in the whole crate before
+/// this one. So every content-row press on the Source Control and plugin
+/// ext panels (header collapse, row select/activate) silently did nothing
+/// on both GUI backends — it just looked like the feature had never been
+/// wired up rather than "the same bug on every backend", because the one
+/// existing GTK test for this panel (`sidebar_panel_clicks::
+/// git_panel_click_activates_the_commit_box_but_not_the_header`) only
+/// exercises the header/commit-input bands, which return early in
+/// `route_sc_sidebar_click` before ever reaching `handle_cached`. #971's
+/// own sweep tests are what surfaced it: `src/macos/mod.rs`'s
+/// `sc_panel_header_click_hit_band_matches_the_painted_row` /
+/// `ext_panel_header_click_hit_band_matches_the_painted_row` sanity-check
+/// that one header click actually toggles the section *before* trusting
+/// the sweep's own cross-sample comparison — a sweep whose probe silently
+/// does nothing passes just as cleanly as one that works, since every
+/// sample would agree with the (unchanged) baseline either way.
+///
+/// Called fresh every frame from each GTK/macOS `paint_sidebar_panel_rung`
+/// call site, not once at startup like TUI's fixed metrics — a pixel
+/// backend's `line_height` can change (zoom, font settings) where TUI's
+/// cell grid cannot, the same #540/#967 drift class every other
+/// pixel-backend hit-test in this file re-applies its metrics against
+/// rather than trusting a stale snapshot.
+pub fn gui_sidebar_system_metrics(line_height: f32) -> quadraui::MsvLayoutMetrics {
+    quadraui::MsvLayoutMetrics {
+        // Matches `SidebarSystem::compute_tree_layout`'s own row-height
+        // formula (`(lh * 1.4).round()`) — headers paint at the same
+        // height as a content row, and the two must agree since
+        // `compute_layout`'s header band and `compute_tree_layout`'s row
+        // pitch are what stack to build the panel's total content height,
+        // both starting from the same `rect`.
+        header_size: (line_height * 1.4).round(),
+        divider_size: 0.0,
+        // Matches the picker's own GTK/macOS scrollbar gutter width
+        // (`gtk_picker_rows`'s `scrollbar_w`).
+        scrollbar_size: 6.0,
+        // Sub-pixel layout — quadraui's own doc on this field: "GTK leaves
+        // it 0.0" (`MsvLayoutMetrics::cell_quantum`).
+        cell_quantum: 0.0,
+    }
+}
+
 /// Populate the `SidebarSystem` on `engine.sc_sidebar_system` with current
 /// row data for all 4 SC sections. Call once per frame before
 /// `sidebar_system.render()` or `.handle_cached()`.
