@@ -605,6 +605,126 @@ pub fn folder_picker_click_outside_dismisses_it<D: ConformanceDriver + DriverInp
     );
 }
 
+/// #984: v0.11.0 bug report — a single click on the file explorer's
+/// expand/collapse chevron does nothing; expanding the directory needs a
+/// *second* click, while a single click anywhere on the same row's text
+/// label expands it immediately. The two zones must not have different
+/// click arities — this scenario encodes that parity requirement on one
+/// row, not just "the chevron eventually works".
+///
+/// # Root cause (confirmed by reading, not guessed)
+///
+/// `quadraui::TreeController::click` (`compose/tree_controller.rs`)
+/// resolves a chevron-zone hit to `TreeControllerEvent::RowToggleExpand`
+/// — a different enum variant than the `RowSelected` a label-zone hit
+/// (`TreeViewHit::Row`) produces. `Engine::handle_explorer_mouse_event`
+/// (`src/core/engine/explorer_ops.rs`) special-cases `RowSelected`,
+/// toggling the directory for it, but forwards every other variant —
+/// `RowToggleExpand` included — to `Engine::dispatch_explorer_tree_event`,
+/// whose `match` has no arm for `RowToggleExpand`: it falls through the
+/// catch-all `_ => true`, a silent no-op that still reports the event as
+/// consumed (so nothing downstream retries it). A *second* click at the
+/// same point resolves through quadraui's `DoubleClickDetector` into
+/// `RowActivated` instead, which **is** handled (both
+/// `handle_explorer_mouse_event`'s own dispatch and
+/// `dispatch_explorer_tree_event`'s `RowActivated` arm toggle a directory)
+/// — hence "the chevron needs two clicks".
+///
+/// This routing lives entirely in `src/core/engine/explorer_ops.rs` —
+/// shared engine code reached identically from GTK's and TUI's mouse
+/// handlers via `render::route_explorer_tree_event` — not in either
+/// backend's own hit-testing. So the bug, and this scenario, reproduce
+/// identically on every backend wired through `ConformanceDriver +
+/// DriverInput`: there is no backend-specific chevron geometry to fix,
+/// per the Platform-Neutrality Rule.
+///
+/// # Locating the chevron without a hardcoded x
+///
+/// `▸` (`quadraui::TreeStyle::chevron_collapsed`'s default glyph) is
+/// painted as its own standalone text run by both backends' tree
+/// rasterisers — GTK's `draw_tree` calls `layout.set_text(chevron)` then
+/// paints it alone, recorded verbatim by `painted_text::show_layout`;
+/// TUI's `draw_tree` writes it between a leading indent space and a
+/// trailing separator space, so `TuiDriver::inventory`'s
+/// whitespace-delimited run scan also sees it as its own run. `dir_name`
+/// must be the *only* collapsed branch row painted, so searching
+/// `text_runs()` for the literal glyph unambiguously names this row's own
+/// chevron — the same "locate via `inventory().text_runs()`, never a
+/// literal coordinate" rule every other scenario in this module follows.
+///
+/// # Why the twin assertion collapses `dir_name` back down, not a second directory
+///
+/// After the chevron click expands `dir_name` (`child_name` becomes
+/// painted), a single click on `dir_name`'s own label — the *same* row,
+/// re-located from the frame the chevron click just repainted — must
+/// collapse it back (`child_name` stops being painted). That is the
+/// actual parity requirement #984 asks for: not "the chevron works" in
+/// isolation, but "the chevron and the label need the same one click,
+/// on the same row" — which also makes this resistant to a "fix" that
+/// only stops being buggy by making the label need two clicks too (the
+/// label assertion below would fail that just as loudly as the chevron
+/// assertion catches today's bug).
+pub fn explorer_chevron_click_toggles_dir_with_same_arity_as_label_click<
+    D: ConformanceDriver + DriverInput,
+>(
+    driver: &mut D,
+    dir_name: &str,
+    child_name: &str,
+) {
+    let locate = |d: &mut D, text: &str| -> quadraui::Rect {
+        d.inventory()
+            .text_runs()
+            .iter()
+            .find(|r| r.text == text)
+            .unwrap_or_else(|| {
+                panic!(
+                    "explorer_chevron_click_toggles_dir_with_same_arity_as_label_click: \
+                     {text:?} not painted; painted: {:?}",
+                    d.inventory().text_runs()
+                )
+            })
+            .bounds
+    };
+
+    assert!(
+        driver.screen_has(dir_name) && !driver.screen_has(child_name),
+        "precondition: {dir_name:?} must be painted collapsed — {child_name:?} \
+         (one of its children) must not be painted yet"
+    );
+
+    let chevron_bounds = locate(driver, "▸");
+    let (cx, cy) = (
+        chevron_bounds.x + chevron_bounds.width / 2.0,
+        chevron_bounds.y + chevron_bounds.height / 2.0,
+    );
+    driver.click(cx, cy);
+
+    assert!(
+        driver.screen_has(child_name),
+        "a single click on {dir_name:?}'s chevron (x={cx:.1}, y={cy:.1}) must \
+         expand it exactly as a single click on its label does — {child_name:?} \
+         is still not painted after one chevron click (#984)"
+    );
+
+    // Twin assertion (same row, re-located after the repaint above): a
+    // single click on the label must collapse it back with the same
+    // arity the chevron just needed.
+    let label_bounds = locate(driver, dir_name);
+    let (lx, ly) = (
+        label_bounds.x + label_bounds.width / 2.0,
+        label_bounds.y + label_bounds.height / 2.0,
+    );
+    driver.click(lx, ly);
+
+    assert!(
+        !driver.screen_has(child_name),
+        "a single click on {dir_name:?}'s own label (x={lx:.1}, y={ly:.1}) must \
+         collapse it back with the same single-click arity the chevron click \
+         above needed to expand it (#984 parity requirement) — {child_name:?} \
+         is still painted after one label click"
+    );
+}
+
 /// #969: conformance assertion for [`TextMetricsBackend`]'s two load-bearing
 /// setters — `set_current_line_height`/`set_current_char_width`. Both are
 /// `&mut self` methods with no return value, so an empty ("stub") body
@@ -697,6 +817,15 @@ pub(crate) const KNOWN_BUGS: &[&str] = &[
     // plumbing that panel id actually routes through today (see this
     // scenario's own fixture doc for why). GTK-only, same reason as above.
     "ext_panel_row_click_selects_the_clicked_row_not_the_row_below::gtk", // #983
+    // #984: v0.11.0 bug report -- the file explorer's expand/collapse
+    // chevron needs a double click, while its row's text label needs one.
+    // The root cause is a missing `TreeControllerEvent::RowToggleExpand`
+    // match arm in `Engine::dispatch_explorer_tree_event` (shared core
+    // code, not backend-specific) -- see
+    // `explorer_chevron_click_toggles_dir_with_same_arity_as_label_click`'s
+    // own doc. Reproduces on both backends, unlike #983's GTK-only gap.
+    "explorer_chevron_click_toggles_dir_with_same_arity_as_label_click::gtk", // #984
+    "explorer_chevron_click_toggles_dir_with_same_arity_as_label_click::tui", // #984
 ];
 
 /// A saved `std::panic::set_hook`/`take_hook` closure — named so
@@ -1494,5 +1623,138 @@ mod issue_983_row_click_selects_the_row_below {
             },
             |d| ConformanceDriver::screen_has(d, "Zqxw983Avail"),
         );
+    }
+}
+
+// #984: v0.11.0 bug report -- the file explorer's expand/collapse chevron
+// needs a double click, while its row's text label needs one. See
+// `explorer_chevron_click_toggles_dir_with_same_arity_as_label_click`'s own
+// doc for the root cause (a missing `TreeControllerEvent::RowToggleExpand`
+// match arm in `Engine::dispatch_explorer_tree_event`, shared core code) and
+// why it reproduces on both backends -- unlike #983's GTK-only row-pitch gap,
+// this bug lives entirely above the backend split, so both gated tests below
+// are listed in `KNOWN_BUGS`, not just one.
+#[cfg(test)]
+mod issue_984_explorer_chevron_needs_a_double_click {
+    use super::*;
+
+    /// An explorer rooted at a scratch dir with one collapsed directory,
+    /// `kkxxqq_dir984`, holding one child, `child984_marker` -- the root
+    /// itself is expanded (so `kkxxqq_dir984`'s own row paints) but
+    /// `kkxxqq_dir984` is deliberately left out of `explorer_expanded`, so
+    /// it starts collapsed, matching this scenario's own precondition.
+    ///
+    /// `tag` must be distinct per caller (each backend's `#[test]` below
+    /// calls this once) -- combined with the calling thread's id, same
+    /// disambiguation rule `backend_conformance!`'s own doc spells out for
+    /// every other filesystem-touching fixture in this module.
+    fn engine_with_collapsed_explorer_dir(tag: &str) -> crate::core::Engine {
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_test_984_explorer_chevron_{tag}_{:?}",
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("kkxxqq_dir984")).unwrap();
+        std::fs::write(dir.join("kkxxqq_dir984").join("child984_marker"), b"").unwrap();
+
+        let mut engine = crate::core::Engine::new_for_test();
+        engine.settings.use_nerd_fonts = false;
+        engine.cwd = dir.clone();
+        engine.explorer_expanded.insert(dir.clone());
+        engine.explorer_rebuild_rows();
+        engine.session.explorer_visible = true;
+        engine
+    }
+
+    // ── Deliverables 1+2: chevron/label click-arity parity on the same
+    // row (the horizontal axis of the row) ─────────────────────────────
+    //
+    // Not via `backend_conformance!`: unlike #983's GTK-only gated
+    // scenarios (which only ever need one backend arm, so the label
+    // string is a single literal), this bug reproduces on *both*
+    // backends, and each arm needs its own `KNOWN_BUGS` label suffix
+    // (`::gtk` / `::tui`) baked into the body -- the macro expands one
+    // `$body` token stream verbatim into every listed backend arm, with
+    // no way for that body to know which arm it's in. Hand-written here,
+    // mirroring the macro's own `@arm` expansion shape 1:1 (same
+    // `conformance_harness` call, same `let driver = &mut __h.driver`)
+    // so the only real difference from a macro-generated test is the
+    // label string -- the same reason #983's `_resetting` sweep tests are
+    // hand-written instead of macro-generated.
+    //
+    // RED-verification (#984): with both `KNOWN_BUGS` entries below
+    // removed, `cargo test --lib
+    // issue_984_explorer_chevron_needs_a_double_click` fails both tests on
+    // the first assertion inside
+    // `explorer_chevron_click_toggles_dir_with_same_arity_as_label_click`
+    // -- "child984_marker" is still not painted after one chevron click,
+    // on both backends. Restored (entries back in place) and confirmed
+    // green again -- see this issue's PR notes for the captured failure.
+    #[cfg(feature = "gui")]
+    #[test]
+    fn explorer_chevron_click_toggles_dir_with_same_arity_as_label_click_gtk() {
+        let mut __h = crate::gtk::testing::conformance_harness(
+            engine_with_collapsed_explorer_dir("chevron_gtk"),
+            800,
+            480,
+        );
+        let driver = &mut __h.driver;
+        crate::harness::known_bug_gate(
+            "explorer_chevron_click_toggles_dir_with_same_arity_as_label_click::gtk",
+            || {
+                crate::harness::explorer_chevron_click_toggles_dir_with_same_arity_as_label_click(
+                    driver,
+                    "kkxxqq_dir984",
+                    "child984_marker",
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn explorer_chevron_click_toggles_dir_with_same_arity_as_label_click_tui() {
+        let mut __h = crate::tui_main::testing::conformance_harness(
+            engine_with_collapsed_explorer_dir("chevron_tui"),
+            800,
+            480,
+        );
+        let driver = &mut __h.driver;
+        crate::harness::known_bug_gate(
+            "explorer_chevron_click_toggles_dir_with_same_arity_as_label_click::tui",
+            || {
+                crate::harness::explorer_chevron_click_toggles_dir_with_same_arity_as_label_click(
+                    driver,
+                    "kkxxqq_dir984",
+                    "child984_marker",
+                );
+            },
+        );
+    }
+
+    // ── Deliverable 3: sweep_hit_band_integrity across the directory
+    // row's own painted label (the vertical axis of the same row) ──────
+    //
+    // Ungated -- passes on both backends today, with no `KNOWN_BUGS`
+    // entry. This is not a duplicate of the horizontal parity check
+    // above: it samples multiple y-offsets strictly inside the label's
+    // own painted glyph bounds (the zone `sweep_hit_band_integrity`'s own
+    // #967 family lives in), proving no #967-style vertical hit-band
+    // drift on the explorer's own expand/collapse toggle -- exactly the
+    // self-restoring toggle that helper's doc names as the reference
+    // case it was built for.
+    crate::backend_conformance! {
+        label: explorer_row_sweep_hit_band_integrity,
+        backends: [gtk, tui],
+        engine: engine_with_collapsed_explorer_dir("sweep"),
+        size: (800, 480),
+        body: |driver| {
+            assert!(
+                driver.screen_has("kkxxqq_dir984"),
+                "precondition: the collapsed directory must be painted"
+            );
+            crate::harness::sweep_hit_band_integrity(driver, "kkxxqq_dir984", 5, |d| {
+                d.screen_has("child984_marker")
+            });
+        },
     }
 }
