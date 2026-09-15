@@ -109,6 +109,24 @@ use crate::core::Engine;
 pub struct ConformanceHarness<D> {
     pub driver: D,
     pub engine: Rc<RefCell<Engine>>,
+    /// The `App`'s own painted `render::ScreenLayout` cache (#987), or
+    /// `None` if the harness was built via [`Self::new`] rather than
+    /// [`Self::new_with_screen_layout`] (every existing caller predating
+    /// #987 — the field defaults to empty for them rather than making this
+    /// a breaking change to [`Self::new`]'s signature).
+    ///
+    /// `crate::gtk::testing::Harness::screen_layout` is the GTK-only
+    /// precedent this mirrors (`RenderedWindow.rect` per window, `f32`
+    /// pixels there vs `f32` cells here on TUI) — the difference is this
+    /// field is on the backend-neutral [`ConformanceHarness`] itself, so a
+    /// scenario that needs a window's own painted rect (not just a text
+    /// run's) can do so on *either* backend, not just GTK. Needed because
+    /// a scrollbar thumb has no text to hand to
+    /// `inventory().text_runs()` — locating it means locating the *window*
+    /// it belongs to instead, then deriving the thumb's own band from that
+    /// window's `RenderedWindow` fields (`total_lines`, `scroll_top`, …)
+    /// the same arithmetic `quadraui::Editor::layout`/`fit_thumb` uses.
+    pub screen_layout: Rc<RefCell<Option<crate::render::ScreenLayout>>>,
     /// Held for the harness's whole lifetime — see
     /// `crate::test_paint::PaintGuard`'s own doc for why a headless paint
     /// harness must never run concurrently with another one on a second
@@ -128,6 +146,11 @@ impl<D> ConformanceHarness<D> {
     /// only the per-backend `conformance_harness*` functions (one per
     /// backend module) call this — a test never builds one directly, so it
     /// can never forget to acquire the two guards above.
+    ///
+    /// [`Self::screen_layout`] is left empty (`None`, and never populated —
+    /// there is no live `App` handle left to clone it from after
+    /// construction) — callers that need it use
+    /// [`Self::new_with_screen_layout`] instead.
     pub(crate) fn new(
         driver: D,
         engine: Rc<RefCell<Engine>>,
@@ -137,6 +160,28 @@ impl<D> ConformanceHarness<D> {
         Self {
             driver,
             engine,
+            screen_layout: Rc::new(RefCell::new(None)),
+            _paint: paint,
+            _cwd: cwd,
+        }
+    }
+
+    /// [`Self::new`], plus a live [`Self::screen_layout`] handle (#987) —
+    /// `screen_layout` must be `Rc::clone`d from the `App`'s own
+    /// `cached_screen_layout` field *before* that `App` is moved into
+    /// `driver_with_shell` (see `crate::gtk::testing::conformance_harness`
+    /// for the call-site shape this expects).
+    pub(crate) fn new_with_screen_layout(
+        driver: D,
+        engine: Rc<RefCell<Engine>>,
+        screen_layout: Rc<RefCell<Option<crate::render::ScreenLayout>>>,
+        paint: crate::test_paint::PaintGuard,
+        cwd: crate::test_cwd::CwdReadGuard,
+    ) -> Self {
+        Self {
+            driver,
+            engine,
+            screen_layout,
             _paint: paint,
             _cwd: cwd,
         }
@@ -725,6 +770,191 @@ pub fn explorer_chevron_click_toggles_dir_with_same_arity_as_label_click<
     );
 }
 
+/// A window's own painted rect from a [`ScreenLayout`](crate::render::ScreenLayout),
+/// or a panic naming what *was* painted — the #987 scrollbar scenarios'
+/// equivalent of `inventory().text_runs()`'s "locate via what was painted,
+/// never a literal coordinate" rule, applied to a window that has no text
+/// of its own to search for (a scrollbar thumb isn't a text run).
+fn window_rect(
+    layout: &crate::render::ScreenLayout,
+    id: crate::core::WindowId,
+) -> crate::core::window::WindowRect {
+    layout
+        .windows
+        .iter()
+        .find(|w| w.window_id == id)
+        .unwrap_or_else(|| {
+            panic!("window_rect: {id:?} not painted; painted: {:?}", {
+                layout
+                    .windows
+                    .iter()
+                    .map(|w| w.window_id)
+                    .collect::<Vec<_>>()
+            })
+        })
+        .rect
+}
+
+/// What [`drag_group_scrollbar_column`] observed, in terms a caller can
+/// assert directly against #987's own two-halves report — never a raw
+/// `view.scroll_top`/ratio read (CLAUDE.md's "assert on rendered output"
+/// rule): [`Self::top_line_still_painted`] comes from
+/// [`quadraui::testing::ConformanceDriver::screen_has`], and the two
+/// `_resized` fields come from the same painted
+/// [`crate::render::ScreenLayout`] rects every other scenario in this
+/// module locates windows through.
+#[derive(Debug, Clone, Copy)]
+pub struct ScrollbarDragOutcome {
+    /// `true` if `target`'s own first visible line is *still* painted after
+    /// the drag — i.e. the drag did **not** scroll `target`. A working
+    /// scrollbar drag must make this `false`.
+    pub top_line_still_painted: bool,
+    /// `true` if `target`'s own painted rect (position or width) changed —
+    /// i.e. the drag resized the split `target` sits in. A correct
+    /// scrollbar drag must leave this `false`.
+    pub target_resized: bool,
+    /// The same resize check for the *other* window in the split — a
+    /// vertical-group resize always moves both sides' rects together, so
+    /// this is redundant with [`Self::target_resized`] in practice, but
+    /// checking it independently means a future split-geometry change that
+    /// somehow decoupled the two would still be caught by at least one of
+    /// them.
+    pub other_resized: bool,
+}
+
+fn rect_moved(a: crate::core::window::WindowRect, b: crate::core::window::WindowRect) -> bool {
+    (a.x - b.x).abs() > 0.01 || (a.width - b.width).abs() > 0.01
+}
+
+/// #987: v0.11.0 bug report — "the scrollbar in the left editor tab group
+/// doesn't work, and clicking it instead triggers a resize between tab
+/// groups". Drags `target`'s own painted vertical-scrollbar column (its
+/// window's own rightmost unit-wide slice, near the top of its track,
+/// where `quadraui::Editor::layout`'s `v_scrollbar_bounds` always sits
+/// regardless of backend — see this function's own doc for how that
+/// column was confirmed, not assumed) downward, and reports what actually
+/// happened so the caller can assert the two independent halves of the
+/// report: did `target` scroll, and did the drag also resize the split
+/// `target`/`other` share.
+///
+/// # Locating the scrollbar without a hardcoded coordinate
+///
+/// There is no `inventory().text_runs()` entry for a scrollbar thumb (it
+/// paints no text), so this locates the *window* instead, via
+/// [`window_rect`] against the harness's own painted
+/// `ConformanceHarness::screen_layout` (#987 grew that field onto the
+/// backend-neutral harness for exactly this — see its own doc). The click
+/// point is then derived purely from that rect:
+/// `x = target.rect.x + target.rect.width - 1.0` (one unit inside the
+/// window's own right edge — the last column/pixel belonging to it, where
+/// `quadraui::Editor::layout_with_options` always reserves exactly one
+/// `cell_width`-wide `v_scrollbar_bounds` slice whenever
+/// `total_lines > visible_lines`, on *both* backends — confirmed by
+/// reading that shared quadraui primitive, not GTK/TUI-specific code) and
+/// `y = target.rect.y + 1.0` down to `target.rect.y + height * 0.6` (well
+/// within the track, and — since every caller here scrolls from the very
+/// top with a large enough buffer that the thumb starts at the track's own
+/// top — within the thumb itself for the first sample, exactly where a
+/// user would actually grab it).
+///
+/// # Why a *vertical-only* drag, not a horizontal one
+///
+/// A real user reaching for a vertical scrollbar drags **down**, not
+/// sideways — this reproduces that motion exactly (`x` never changes
+/// between mouse-down and mouse-up). That the *group divider* still
+/// resizes the split from a drag whose `x` never moves is not a mistake in
+/// this helper: `render::divider_ratio_from_pos` reads whatever `x` the
+/// press landed at (here, deliberately inside `target`'s own scrollbar
+/// column, one unit off whatever the split's exact boundary is) and writes
+/// that back as the new ratio on every subsequent move event, even one
+/// that only ever restates the same `x` — so a vertical-only gesture that
+/// starts inside the divider's grab band still perturbs the ratio by
+/// however far off-center the press happened to land. That is precisely
+/// the "click resizes" half of #987's report, reproduced faithfully rather
+/// than avoided.
+///
+/// `top_line_needle` must be the exact text of `target`'s own first
+/// visible line (e.g. its buffer's line 0) — unique enough that it cannot
+/// also match `other`'s content (give the two windows distinct buffers, as
+/// every caller here does), so [`ScrollbarDragOutcome::top_line_still_painted`]
+/// unambiguously reads `target`'s own scroll position, not `other`'s.
+pub fn drag_group_scrollbar_column<D: ConformanceDriver + DriverInput>(
+    h: &mut ConformanceHarness<D>,
+    target: crate::core::WindowId,
+    other: crate::core::WindowId,
+    top_line_needle: &str,
+) -> ScrollbarDragOutcome {
+    let (target_rect, other_rect) = {
+        let layout = h.screen_layout.borrow();
+        let l = layout
+            .as_ref()
+            .expect("drag_group_scrollbar_column: no frame painted yet");
+        (window_rect(l, target), window_rect(l, other))
+    };
+    assert!(
+        ConformanceDriver::screen_has(&h.driver, top_line_needle),
+        "precondition: {top_line_needle:?} (target's own top line) must be \
+         painted before the drag"
+    );
+
+    let x = (target_rect.x + target_rect.width - 1.0) as f32;
+    let y0 = (target_rect.y + 1.0) as f32;
+    let y1 = (target_rect.y + target_rect.height * 0.6) as f32;
+    h.driver.drag(x, y0, x, y1);
+
+    let (target_rect2, other_rect2) = {
+        let layout = h.screen_layout.borrow();
+        let l = layout
+            .as_ref()
+            .expect("drag_group_scrollbar_column: no frame painted after the drag");
+        (window_rect(l, target), window_rect(l, other))
+    };
+
+    ScrollbarDragOutcome {
+        top_line_still_painted: ConformanceDriver::screen_has(&h.driver, top_line_needle),
+        target_resized: rect_moved(target_rect, target_rect2),
+        other_resized: rect_moved(other_rect, other_rect2),
+    }
+}
+
+/// #987 negative-space case: a drag on the group divider **itself** (not
+/// near a scrollbar) must still resize the split — the check that catches
+/// a "fix" which makes [`drag_group_scrollbar_column`]'s report pass by
+/// deleting the divider's hit zone outright rather than by reordering hit
+/// tests or adding the missing scrollbar one. Unlike
+/// [`drag_group_scrollbar_column`], this drag moves `x` by a real amount
+/// (`+20.0`) — a vertical-only drag exactly *on* the mathematical split
+/// centre reproduces the same ratio it started from (confirmed while
+/// developing this scenario: `divider_ratio_from_pos` at the exact centre
+/// is a no-op), which would make this negative-space check pass for the
+/// wrong reason.
+pub fn drag_group_divider_resizes<D: ConformanceDriver + DriverInput>(
+    h: &mut ConformanceHarness<D>,
+    left: crate::core::WindowId,
+) -> bool {
+    let (divider_x, y, left_before) = {
+        let layout = h.screen_layout.borrow();
+        let l = layout
+            .as_ref()
+            .expect("drag_group_divider_resizes: no frame painted yet");
+        let lrect = window_rect(l, left);
+        (l.group_dividers[0].position, lrect.y + 1.0, lrect)
+    };
+
+    h.driver.drag(
+        divider_x as f32,
+        y as f32,
+        (divider_x + 20.0) as f32,
+        y as f32,
+    );
+
+    let left_after = {
+        let layout = h.screen_layout.borrow();
+        window_rect(layout.as_ref().unwrap(), left)
+    };
+    rect_moved(left_before, left_after)
+}
+
 /// #969: conformance assertion for [`TextMetricsBackend`]'s two load-bearing
 /// setters — `set_current_line_height`/`set_current_char_width`. Both are
 /// `&mut self` methods with no return value, so an empty ("stub") body
@@ -826,6 +1056,27 @@ pub(crate) const KNOWN_BUGS: &[&str] = &[
     // own doc. Reproduces on both backends, unlike #983's GTK-only gap.
     "explorer_chevron_click_toggles_dir_with_same_arity_as_label_click::gtk", // #984
     "explorer_chevron_click_toggles_dir_with_same_arity_as_label_click::tui", // #984
+    // #987: v0.11.0 bug report -- a group's own vertical scrollbar is inert
+    // (no `EditorHit::VScrollbar` hit-test exists anywhere in
+    // `src/app.rs`'s shared mouse dispatch, on either backend), and when
+    // that group sits immediately left of a group divider, the same click
+    // also silently perturbs the split ratio via
+    // `render::divider_ratio_from_pos`. Reproduces identically on both
+    // backends -- `crate::harness`'s "tui" conformance arm drives the same
+    // shared `crate::app::App` dispatch code as GTK, not the separately
+    // hand-written production TUI stack -- see
+    // `drag_group_scrollbar_column`'s own doc.
+    "left_group_scrollbar_drag_scrolls_without_resizing::gtk", // #987
+    "left_group_scrollbar_drag_scrolls_without_resizing::tui", // #987
+    // #987 deliverable 3: the same inertness generalizes to *any* group,
+    // not just one beside a divider -- the right group's scrollbar (no
+    // divider on its own right edge in a two-group layout) is inert too,
+    // just without the resize side effect. See
+    // `right_group_scrollbar_drag_scrolls_without_resizing`'s own doc for
+    // the RED-verification distinguishing this from the left-group case
+    // above (only one assertion fails here, not both).
+    "right_group_scrollbar_drag_scrolls_without_resizing::gtk", // #987
+    "right_group_scrollbar_drag_scrolls_without_resizing::tui", // #987
 ];
 
 /// A saved `std::panic::set_hook`/`take_hook` closure — named so
@@ -1756,5 +2007,319 @@ mod issue_984_explorer_chevron_needs_a_double_click {
                 d.screen_has("child984_marker")
             });
         },
+    }
+}
+
+// #987: v0.11.0 bug report -- "the scrollbar in the left editor tab group
+// doesn't work, and clicking it instead triggers a resize between tab
+// groups". `SCROLLBAR_IMPLEMENTATION.md`'s own "Known Limitations" section
+// already named the first half ("non-active window scrollbars are
+// visual-only") -- this issue is test-only (no fix), pinning both halves as
+// one conformance case per the Platform-Neutrality Rule's "prove it before
+// you fix it" posture.
+//
+// # Root cause, confirmed by driving the harness (not guessed)
+//
+// `crate::app::App` -- the one shared `ShellApp` both the real GTK backend
+// and this harness's own "tui" conformance arm dispatch mouse events
+// through (see this module's own "Which trait bound a scenario needs" doc:
+// `crate::tui_main::testing::conformance_harness` wraps `App`, not the
+// production `TuiShellApp`/`tui_main::mouse.rs` -- a separate, hand-written
+// stack that has its own, independently-written version of this same bug
+// shape, out of this issue's `src/harness.rs` scope) has **no vertical
+// scrollbar hit-test at all** in `handle_mouse_click_msg`: it hit-tests the
+// horizontal scrollbar (`h_scrollbar_hit_test`), then the group/window
+// dividers (`render::route_divider_grab`), then falls through to ordinary
+// editor click handling -- there is no third rung for
+// `quadraui::EditorLayout::hit_test`'s `EditorHit::VScrollbar` arm, even
+// though quadraui has painted a real per-window vertical scrollbar since
+// quadraui#968 (`quadraui::Editor::layout_with_options` reserves exactly
+// one `cell_width`-wide column at the window's own right edge whenever
+// `total_lines > visible_lines`, on both backends).
+//
+// That gap makes the scrollbar inert on **every** window, active or not --
+// not just "non-active" as the stale doc above says (confirmed: the bug
+// reproduces identically whether the window being dragged is
+// `engine.active_window_id()` or not; this suite's own fixtures focus the
+// *other* group precisely to rule out "maybe it only breaks when focused"
+// as the explanation). Whether that inert click also **resizes** depends on
+// nothing more than geometry: `render::divider_ratio_from_pos` reads
+// whatever `x` a press landed at and re-derives the ratio from it on every
+// later move event, and a window's own scrollbar column is always the last
+// `cell_width` before that window's edge -- which, for any window sitting
+// immediately left of a group divider (the reported "left group"), is
+// within `GTK_DIVIDER_METRICS`'s 6-unit grab band around the divider's own
+// `position` (confirmed: with the default minimap painting a wide strip
+// between a window's own rect and the next group's divider, the two don't
+// overlap and the resize half does not fire -- every fixture below
+// explicitly disables the minimap, `engine.settings.minimap = false`, to
+// reproduce the adjacency the report describes). A window with no divider
+// on its scrollbar-adjacent side (the **right** group in a two-group
+// layout) is simply inert, with no resize side effect -- deliverable 3
+// below pins exactly that distinction.
+//
+// # TUI reproduces too -- this is shared-code, not backend-specific
+//
+// Per this issue's own "report whether TUI reproduces" acceptance item:
+// **yes**, identically, because both `backend_conformance!` arms below
+// drive the exact same `src/app.rs` dispatch code (`ConformanceHarness`'s
+// "tui" arm wraps `App`, not `TuiShellApp` -- see above). That is good news
+// under the Platform-Neutrality Rule: there is no backend-specific
+// scrollbar hit-test to delete, because neither backend has *any*
+// vertical-scrollbar hit-test in the shared dispatch path the fix would add
+// to -- one `EditorHit::VScrollbar` rung in `src/app.rs`'s divider-rung
+// neighbourhood fixes both at once. (The real production TUI stack,
+// `tui_main::mouse.rs`, has its own separately hand-written vertical
+// scrollbar hit-test that runs *after* its own `route_divider_grab` call --
+// an independently-arrived-at instance of the identical ordering bug, left
+// undisturbed here since fixing it is out of this test-only issue's scope
+// and its own file is not part of `src/harness.rs` + per-backend
+// registration.)
+#[cfg(test)]
+mod issue_987_group_scrollbar_inert_and_click_resizes {
+    use super::*;
+    use crate::core::window::SplitDirection;
+    use crate::core::{Engine, WindowId};
+
+    /// A two-group vertical split, each group showing a distinct 2000-line
+    /// buffer (`{left,right}line{0..2000}_{tag}`) so
+    /// [`drag_group_scrollbar_column`]'s `top_line_needle` can never
+    /// ambiguously match the other window's content, and so each window
+    /// genuinely needs a vertical scrollbar (`total_lines` far exceeds any
+    /// viewport this harness paints). `focus_left` picks which group ends
+    /// up active -- deliverable 3 needs the *other* group focused from
+    /// whichever one its own scrollbar drag targets, so both directions
+    /// share this one fixture rather than two near-identical copies.
+    ///
+    /// `engine.settings.minimap = false` reproduces the adjacency the
+    /// report describes -- see this module's own top doc for why a
+    /// default-on minimap would put ~50 columns of unrelated space between
+    /// a window's own scrollbar and the group divider, hiding the "click
+    /// resizes" half entirely.
+    fn engine_two_groups(tag: &str, focus_left: bool) -> (Engine, WindowId, WindowId) {
+        let mut engine = Engine::new_for_test();
+        engine.settings.use_nerd_fonts = false;
+        engine.settings.minimap = false;
+
+        let buf_left = engine.active_buffer_id();
+        let left_content: String = (0..2000).map(|i| format!("leftline{i}_{tag}\n")).collect();
+        if let Some(st) = engine.buffer_manager.get_mut(buf_left) {
+            st.buffer.content = ropey::Rope::from_str(&left_content);
+        }
+        let left_window = engine.active_window_id();
+        let left_group = engine.active_group;
+
+        engine.open_editor_group(SplitDirection::Vertical);
+        let right_window = engine.active_window_id();
+        let buf_right = engine.buffer_manager.create();
+        let right_content: String = (0..2000).map(|i| format!("rightline{i}_{tag}\n")).collect();
+        if let Some(st) = engine.buffer_manager.get_mut(buf_right) {
+            st.buffer.content = ropey::Rope::from_str(&right_content);
+        }
+        if let Some(w) = engine.windows.get_mut(&right_window) {
+            w.buffer_id = buf_right;
+        }
+        // `open_editor_group` already focused the new (right) group --
+        // matches the reported scenario ("click the left group's scrollbar
+        // while the right group has focus") without any extra step.
+        if focus_left {
+            engine.active_group = left_group;
+        }
+        (engine, left_window, right_window)
+    }
+
+    // ── Deliverable 1: the left group's own scrollbar, right focused ────
+    //
+    // RED-verification (#987): both assertions below were observed to fail
+    // against unfixed `develop` -- `top_line_still_painted` was `true`
+    // (the drag never scrolled `left_window` at all: "leftline0_left_gtk"/
+    // "leftline0_left_tui" stayed painted) *and* `target_resized` was
+    // `true` (the drag silently changed the group split ratio by the
+    // fraction of a unit between the press's `x` and the split's exact
+    // centre) -- i.e. **both** halves of the report reproduce, not just
+    // one. That distinction (both fail, vs. only one) is exactly what this
+    // issue's acceptance bar asks a RED run to state.
+    #[cfg(feature = "gui")]
+    #[test]
+    fn left_group_scrollbar_drag_scrolls_without_resizing_gtk() {
+        let (engine, left, right) = engine_two_groups("left_gtk", false);
+        let mut h = crate::gtk::testing::conformance_harness(engine, 800, 480);
+        assert_eq!(
+            h.engine.borrow().active_window_id(),
+            right,
+            "precondition: the right group must hold focus"
+        );
+        crate::harness::known_bug_gate(
+            "left_group_scrollbar_drag_scrolls_without_resizing::gtk",
+            || {
+                let outcome =
+                    drag_group_scrollbar_column(&mut h, left, right, "leftline0_left_gtk");
+                assert!(
+                    !outcome.top_line_still_painted,
+                    "dragging the left group's own scrollbar must scroll it \
+                     (#987) -- \"leftline0_left_gtk\" is still painted"
+                );
+                assert!(
+                    !outcome.target_resized && !outcome.other_resized,
+                    "dragging the left group's own scrollbar must never \
+                     change the group split ratio (#987) -- target_resized=\
+                     {} other_resized={}",
+                    outcome.target_resized,
+                    outcome.other_resized
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn left_group_scrollbar_drag_scrolls_without_resizing_tui() {
+        let (engine, left, right) = engine_two_groups("left_tui", false);
+        let mut h = crate::tui_main::testing::conformance_harness(engine, 800, 480);
+        assert_eq!(
+            h.engine.borrow().active_window_id(),
+            right,
+            "precondition: the right group must hold focus"
+        );
+        crate::harness::known_bug_gate(
+            "left_group_scrollbar_drag_scrolls_without_resizing::tui",
+            || {
+                let outcome =
+                    drag_group_scrollbar_column(&mut h, left, right, "leftline0_left_tui");
+                assert!(
+                    !outcome.top_line_still_painted,
+                    "dragging the left group's own scrollbar must scroll it \
+                     (#987) -- \"leftline0_left_tui\" is still painted"
+                );
+                assert!(
+                    !outcome.target_resized && !outcome.other_resized,
+                    "dragging the left group's own scrollbar must never \
+                     change the group split ratio (#987) -- target_resized=\
+                     {} other_resized={}",
+                    outcome.target_resized,
+                    outcome.other_resized
+                );
+            },
+        );
+    }
+
+    // ── Deliverable 3: the right group's own scrollbar, left focused ────
+    //
+    // Generalizes deliverable 1 from "the left one" to "any group": the
+    // right group has no divider on its scrollbar-adjacent side (the
+    // screen's own right edge, in a two-group layout), so only the
+    // "inert" half of #987 is expected to reproduce here -- confirmed by
+    // observation (see this test's own RED note) that dragging it changes
+    // *neither* window's rect at all. Still wrapped in one `known_bug_gate`
+    // call (the missing scroll still panics the body), but the resize
+    // assertion is ordered *first* so it is genuinely exercised (and would
+    // fail loudly, independent of the gate, if a future change ever made
+    // this group's scrollbar resize-prone too) before the expected-fail
+    // scroll assertion ends the body.
+    //
+    // RED-verification (#987): with this label's `KNOWN_BUGS` entry
+    // removed, this test fails on the *second* assertion only --
+    // `top_line_still_painted` was `true` ("rightline0_right_gtk"/
+    // "rightline0_right_tui" stayed painted) while `target_resized`/
+    // `other_resized` were both already `false` -- i.e. only the inert
+    // half of the report reproduces here, the resize half does not. That
+    // is the "which of the two assertions fails" distinction this issue's
+    // acceptance bar asks for, and it is *different* from deliverable 1's
+    // "both fail" -- exactly the "hit-test ordering vs. a missing hit zone
+    // entirely" distinction a fix author needs (#987).
+    #[cfg(feature = "gui")]
+    #[test]
+    fn right_group_scrollbar_drag_scrolls_without_resizing_gtk() {
+        let (engine, left, right) = engine_two_groups("right_gtk", true);
+        let mut h = crate::gtk::testing::conformance_harness(engine, 800, 480);
+        assert_eq!(
+            h.engine.borrow().active_window_id(),
+            left,
+            "precondition: the left group must hold focus"
+        );
+        crate::harness::known_bug_gate(
+            "right_group_scrollbar_drag_scrolls_without_resizing::gtk",
+            || {
+                let outcome =
+                    drag_group_scrollbar_column(&mut h, right, left, "rightline0_right_gtk");
+                assert!(
+                    !outcome.target_resized && !outcome.other_resized,
+                    "the right group has no divider on its scrollbar side; \
+                     dragging its scrollbar must not resize anything -- \
+                     target_resized={} other_resized={}",
+                    outcome.target_resized,
+                    outcome.other_resized
+                );
+                assert!(
+                    !outcome.top_line_still_painted,
+                    "dragging the right group's own scrollbar must scroll \
+                     it (#987) -- \"rightline0_right_gtk\" is still painted"
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn right_group_scrollbar_drag_scrolls_without_resizing_tui() {
+        let (engine, left, right) = engine_two_groups("right_tui", true);
+        let mut h = crate::tui_main::testing::conformance_harness(engine, 800, 480);
+        assert_eq!(
+            h.engine.borrow().active_window_id(),
+            left,
+            "precondition: the left group must hold focus"
+        );
+        crate::harness::known_bug_gate(
+            "right_group_scrollbar_drag_scrolls_without_resizing::tui",
+            || {
+                let outcome =
+                    drag_group_scrollbar_column(&mut h, right, left, "rightline0_right_tui");
+                assert!(
+                    !outcome.target_resized && !outcome.other_resized,
+                    "the right group has no divider on its scrollbar side; \
+                     dragging its scrollbar must not resize anything -- \
+                     target_resized={} other_resized={}",
+                    outcome.target_resized,
+                    outcome.other_resized
+                );
+                assert!(
+                    !outcome.top_line_still_painted,
+                    "dragging the right group's own scrollbar must scroll \
+                     it (#987) -- \"rightline0_right_tui\" is still painted"
+                );
+            },
+        );
+    }
+
+    // ── Deliverable 2: negative-space case for the divider itself ───────
+    //
+    // Ungated -- passes today on both backends, and must keep passing
+    // after any real fix: without this, a "fix" that made the two
+    // deliverables above pass by deleting the group divider's own hit zone
+    // (rather than adding the missing scrollbar hit-test, or reordering
+    // the two) would sail through them undetected. Hand-written rather
+    // than via `backend_conformance!`, same reason as the four tests
+    // above: [`drag_group_divider_resizes`] needs the whole
+    // `ConformanceHarness` (for `screen_layout`), not just the bare
+    // `driver` the macro's generated body binds.
+    #[cfg(feature = "gui")]
+    #[test]
+    fn group_divider_click_still_resizes_gtk() {
+        let (engine, left, _right) = engine_two_groups("divider_gtk", false);
+        let mut h = crate::gtk::testing::conformance_harness(engine, 800, 480);
+        assert!(
+            drag_group_divider_resizes(&mut h, left),
+            "a drag on the group divider itself must still resize the \
+             split (#987 negative-space case)"
+        );
+    }
+
+    #[test]
+    fn group_divider_click_still_resizes_tui() {
+        let (engine, left, _right) = engine_two_groups("divider_tui", false);
+        let mut h = crate::tui_main::testing::conformance_harness(engine, 800, 480);
+        assert!(
+            drag_group_divider_resizes(&mut h, left),
+            "a drag on the group divider itself must still resize the \
+             split (#987 negative-space case)"
+        );
     }
 }
