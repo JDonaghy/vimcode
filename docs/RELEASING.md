@@ -250,7 +250,7 @@ it is a code change like any other: branch, edit `rev`, `cargo test` (snapshots
 re-run against the new rev), land through the normal workflow — not something to
 slip into the release PR.
 
-### 2.2 Flatpak is broken and is not shipping
+### 2.2 Flatpak is broken and is not shipping ([#975](https://github.com/JDonaghy/vimcode/issues/975))
 
 `flatpak/cargo-sources.json` predates #691: 635 crates-io entries, **zero
 quadraui**. Worse, the manifest's inline cargo config only replaces
@@ -297,4 +297,4 @@ dated list rather than a habit.
 | 3 pixel/paint probes fail (§1.3b) | macOS GTK | Expected — Core Text vs freetype rasterisation |
 | `install_menu_bar` main-thread panic, caught (§1.3) | macOS native | Expected — test-runner threading; vimcode#901 closed, native menu bar untested |
 | No Win-GUI test suite | Windows | Gap — `src/win/` has zero `#[test]`s |
-| Flatpak bundle unbuildable (§2.2) | Linux | Gap — `cargo-sources.json` predates the #691 git dep; not shipping in v0.11.0 |
+| Flatpak bundle unbuildable (§2.2) | Linux | Gap — #975; `cargo-sources.json` predates the #691 git dep; not shipping in v0.11.0 |
