@@ -237,12 +237,29 @@ impl DeferredQueue {
 /// grid needs none; quadraui's macOS text measurement
 /// (`quadraui::macos::text::measure_text(&CTFont, &str)`) takes the font
 /// per call instead of storing one — can implement this as a no-op.
+///
+/// #969: `set_text_measurement_context` has a default (empty) body —
+/// genuinely optional, per its own doc above, for any backend with no
+/// persistent-context concept. `set_current_line_height`/
+/// `set_current_char_width` deliberately have **no default**: both are
+/// load-bearing for click correctness (`App::explorer_ui_event` /
+/// `App::route_ai_chat_event` re-apply them, immediately before hit-testing,
+/// to undo the #540/#819 drift guard's namesake drift), so every impl must
+/// write *something* for them rather than silently inheriting a no-op. That
+/// alone does not stop an impl from writing an empty body anyway — #967 did
+/// exactly that on `MacBackend` — which is what
+/// [`crate::harness::assert_text_metrics_backend_applies_metrics`] is for:
+/// it round-trips a value through the trait object and the
+/// `quadraui::Backend` getter these setters are supposed to feed, so a stub
+/// fails a test instead of shipping silently.
 pub(crate) trait TextMetricsBackend: quadraui::Backend {
     // Only called from the `gui`-gated editor-click-context block in
     // `render_content` today (its one producer,
-    // `click::build_editor_click_context`, is GTK-only).
+    // `click::build_editor_click_context`, is GTK-only). Default body: a
+    // backend with no persistent-context concept (TUI, macOS, Win-GUI —
+    // see the trait doc above) can simply not override this.
     #[cfg_attr(not(feature = "gui"), allow(dead_code))]
-    fn set_text_measurement_context(&mut self, ctx: Box<dyn std::any::Any>);
+    fn set_text_measurement_context(&mut self, _ctx: Box<dyn std::any::Any>) {}
     fn set_current_line_height(&mut self, line_height: f64);
     fn set_current_char_width(&mut self, char_width: f64);
 }
@@ -285,7 +302,9 @@ impl TextMetricsBackend for backend::GtkBackend {
 ///   rev `9eede7fd`.
 #[cfg(feature = "win")]
 impl TextMetricsBackend for win_backend::WinBackend {
-    fn set_text_measurement_context(&mut self, _ctx: Box<dyn std::any::Any>) {}
+    // `set_text_measurement_context` is deliberately not overridden here —
+    // the trait's default (empty) body is exactly this backend's no-op, per
+    // the reasoning above (#969).
 
     fn set_current_line_height(&mut self, line_height: f64) {
         win_backend::WinBackend::set_current_line_height(self, line_height as f32);
