@@ -71,9 +71,9 @@ made cargo **silently omit the whole bin**. Every GTK assertion lives in that bi
 so the Test stage compiled zero of them and reported green — no error, no warning.
 Check the test counts in the output, not just the exit code.
 
-Rough expected magnitudes at v0.10.0: `cargo test` ≈ 2,830 lib tests plus 30+
-integration targets; `--no-default-features` ≈ 2,554 lib tests plus the same
-integration targets; the macOS lane, 4 tests.
+Rough expected magnitudes at 648f2dd (2026-09-14): `cargo test` ≈ 2,855 lib tests
+plus 30+ integration targets; `--no-default-features` ≈ 2,700 lib tests plus the
+same integration targets; the macOS lane, 4 tests.
 
 ### 1.1 Linux GTK + TUI — the reference lane
 
@@ -133,13 +133,15 @@ claims macOS GUI behaviour, smoke the menu bar by hand (§1.5).
 ### 1.3b macOS GTK — opt-in, known-red
 
 `macmini` carries gtk4 4.22.4, so `cargo test` runs there — but it is **not clean**.
-Measured at 64316c8: **2833 passed, 3 failed**.
+Measured at 648f2dd (2026-09-14): **2855 passed, 12 failed** — three GTK pixel
+probes plus nine `tui_main::shell_app` driver tests (#976, separate cause, red on
+the TUI lane too). The three GTK ones are:
 
 - `gtk::chrome_paint_tests::window_control_buttons_are_visible_against_their_background_in_every_theme`
 - `gtk::testing::minimap::minimap_click_at_the_middle_scrolls_to_half_the_file`
 - `gtk::testing::tests::window_split_divider_drag_repaints_the_line_at_the_new_position`
 
-All three are pixel/paint probes on in-memory Cairo surfaces. On quartz, pangocairo
+All three are pixel/paint probes on in-memory Cairo surfaces (#934). On quartz, pangocairo
 rasterises via Core Text rather than freetype, so glyph ink and colour compositing
 differ from the Linux reference. **Treat these three as expected-red on Darwin and
 green on Linux — but confirm they are green on the Linux lane at the same SHA before
@@ -294,7 +296,8 @@ dated list rather than a habit.
 
 | Symptom | Lane | Status |
 |---|---|---|
-| 3 pixel/paint probes fail (§1.3b) | macOS GTK | Expected — Core Text vs freetype rasterisation |
+| 3 pixel/paint probes fail (§1.3b) | macOS GTK | Expected — #934, Core Text vs freetype rasterisation |
+| 9 `tui_main::shell_app` driver tests fail | macOS (both lanes) | Under investigation — #976; Darwin-only, green on Linux CI at the same SHA; **not** caused by the quadraui pin |
 | `install_menu_bar` main-thread panic, caught (§1.3) | macOS native | Expected — test-runner threading; vimcode#901 closed, native menu bar untested |
 | No Win-GUI test suite | Windows | Gap — `src/win/` has zero `#[test]`s |
 | Flatpak bundle unbuildable (§2.2) | Linux | Gap — #975; `cargo-sources.json` predates the #691 git dep; not shipping in v0.11.0 |
