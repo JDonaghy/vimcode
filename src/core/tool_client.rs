@@ -33,8 +33,6 @@
 //! thread or a channel itself — it is the synchronous primitive that
 //! pattern wraps, kept separate so it stays trivially mockable.
 
-use std::process::Command;
-
 use crate::core::git::hidden_command;
 
 // ─── Errors ─────────────────────────────────────────────────────────────────
@@ -113,7 +111,7 @@ impl ToolClient for SubprocessToolClient {
     fn run_json(&self, argv: &[String]) -> Result<serde_json::Value, ToolError> {
         let (program, args) = argv.split_first().ok_or(ToolError::EmptyCommand)?;
 
-        let mut cmd: Command = hidden_command(program);
+        let mut cmd = hidden_command(program);
         let output = cmd.args(args).output().map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
                 ToolError::BinaryNotFound(program.clone())

@@ -25,13 +25,25 @@ name to an argv template with `{id}` substitution) — documented in `EXTENSIONS
 `[board]` section. Generic: no particular provider is named.
 
 **No-coord-in-core gate:** `tests/no_coord_vocabulary_in_core.rs` asserts (not just by
-inspection) that `src/core/` and `src/render.rs` carry no coordinator vocabulary, via a
-`\bcoord\b` word-boundary regex — "coordinate"/"coordinator" as plain English keep passing;
-standalone "coord" (CLI name, `coord-tui`, `coordinator.yml`, ...) fails it. Confirmed 0
-matches on the current tree; the regex's own incidental-vs-forbidden split has its own test.
+inspection) that `src/core/` and `src/render.rs` carry no coordinator vocabulary. Fixed in
+review (iteration 1): a plain `\bcoord\b` regex only breaks at non-word characters, so it
+missed "coord" glued to another word via `_` or a case transition — `coord_client`,
+`CoordClient`, `CoordGate` all sailed through undetected, which is exactly the idiomatic-Rust
+naming style a future PR would use to reintroduce coordinator vocabulary. The gate now
+tokenizes each line into identifier-like runs and splits each token into words on `_`
+boundaries and lowercase→uppercase case transitions, flagging any token whose word list
+contains "coord" case-insensitively. "coordinate"/"coordinator" have no internal `_`/case
+transition so they stay single words and keep passing; `coord_client`/`CoordClient`/
+`CoordGate` split into ["coord", ...] and are caught. Confirmed 0 matches on the current tree;
+the tokenizer's own incidental-vs-forbidden split has its own test
+(`line_has_coord_word_distinguishes_incidental_from_forbidden`).
 
 Board panel wiring (engine fields, GTK/TUI activity entry, actual poll_idle integration) and
-the coordinator extension bundle itself are out of scope here — next up is #521.
+the coordinator extension bundle itself are out of scope here — next up is #521. This PR is
+internal-only: `ExtensionManifest` gains an unused-elsewhere `Option<BoardProviderConfig>`
+field and `tool_client.rs`/`fetch_board_model` are not yet called from the engine or either
+backend, so per CLAUDE.md's black-box-coverage rule no driver test is added — there is no
+engine/GTK/TUI codepath yet for one to exercise.
 
 ## #970 — the two "failing" GTK click-geometry tests are the #926/#933 Darwin font divergence, already documented; no fix needed
 
