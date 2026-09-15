@@ -10503,3 +10503,252 @@ mod issue_969_text_metrics_backend_conformance {
         crate::harness::assert_text_metrics_backend_applies_metrics(&mut backend);
     }
 }
+
+// ── #971: hit-band integrity sweep, the GTK half ────────────────────────
+//
+// #971's review requested GTK-side coverage proving the SC/ext-panel
+// `set_backend_info` wiring fix and the `HeaderActivated` double-toggle fix
+// both hold on this backend too — the fix sites in `src/app.rs` and
+// `src/core/engine/{source_control,ext_panel}.rs` have no backend gate, so
+// the macOS-only coverage `src/macos/mod.rs::mac_driver_tests` originally
+// shipped was a real gap, not redundant with it. These two tests are the
+// GTK twins of `mac_driver_tests::sc_panel_header_click_hit_band_matches_the_painted_row`
+// and `::ext_panel_header_click_hit_band_matches_the_painted_row` — same
+// fixtures, same `crate::harness::sweep_hit_band_integrity_resetting` call,
+// same sanity-check shape — built on `conformance_harness`
+// (`quadraui::testing::ConformanceDriver`) rather than this module's own
+// `Harness`, since the sweep helpers in `crate::harness` are written once
+// against that backend-neutral trait.
+#[cfg(test)]
+mod hit_band_sweep_971 {
+    use quadraui::testing::ConformanceDriver;
+
+    use super::conformance_harness;
+    use crate::core::engine::sidebar::PANEL_GIT;
+    use crate::core::Engine;
+
+    /// Surface size in pixels — arbitrary, matches `src/macos/mod.rs`'s own
+    /// `W`/`H` for this issue's fixtures so painted layouts are directly
+    /// comparable between the two backends' test failures.
+    const W: i32 = 1400;
+    const H: i32 = 900;
+
+    /// Same nerd-fonts-off rationale as every other `plain_engine()` twin in
+    /// this repo (`src/macos/mod.rs`, `conformance_proof_slice` above):
+    /// icon glyphs are a separate painted run from the text labels these
+    /// tests' `screen_has` checks look for.
+    fn plain_engine() -> Engine {
+        let mut engine = Engine::new_for_test();
+        engine.settings.use_nerd_fonts = false;
+        engine
+    }
+
+    /// Mirrors `src/macos/mod.rs::mac_driver_tests::engine_with_sc_recent_commits`
+    /// exactly: three filler unstaged files (pushes "RECENT COMMITS" a few
+    /// rows down — a row-index-dependent hit-band bug can pass on row 0 and
+    /// only surface further down) and two log entries, so there is a content
+    /// row directly beneath the header a mis-hit could land on.
+    fn engine_with_sc_recent_commits() -> Engine {
+        let mut engine = plain_engine();
+        engine
+            .app_shell
+            .show_panel(&quadraui::WidgetId::new(PANEL_GIT));
+        engine.sc_file_statuses = (0..3)
+            .map(|i| crate::core::git::FileStatus {
+                path: format!("filler_971_{i}.rs"),
+                staged: None,
+                unstaged: Some(crate::core::git::StatusKind::Modified),
+            })
+            .collect();
+        engine.sc_log = (0..2)
+            .map(|i| crate::core::git::GitLogEntry {
+                hash: format!("{i:07x}"),
+                message: format!("ZQXW971SCLOG{i}"),
+            })
+            .collect();
+        engine
+    }
+
+    /// Mirrors `src/macos/mod.rs::mac_driver_tests::engine_with_marketplace_as_ext_panel`
+    /// exactly.
+    fn engine_with_marketplace_as_ext_panel() -> Engine {
+        let mut engine = plain_engine();
+        engine.ext_registry = Some(vec![crate::core::extensions::ExtensionManifest {
+            name: "zqxw971-avail".to_string(),
+            display_name: "ZQXW971 Available Ext".to_string(),
+            ..Default::default()
+        }]);
+        engine.ext_panel_active = Some("zqxw971-marketplace-via-ext-panel".to_string());
+        engine.ext_panel_has_focus = true;
+        if !engine.app_shell.sidebar_visible() {
+            engine.app_shell.toggle_sidebar();
+        }
+        engine
+    }
+
+    /// Centre point of the first painted text run containing `needle` —
+    /// mirrors `src/macos/mod.rs::mac_driver_tests::center_of` exactly.
+    fn center_of<D: ConformanceDriver>(driver: &D, needle: &str) -> (f32, f32) {
+        let bounds = driver
+            .inventory()
+            .text_runs()
+            .iter()
+            .find(|r| r.text.contains(needle))
+            .unwrap_or_else(|| panic!("center_of: {needle:?} not painted"))
+            .bounds;
+        (
+            bounds.x + bounds.width / 2.0,
+            bounds.y + bounds.height / 2.0,
+        )
+    }
+
+    /// #971: the source-control panel's "RECENT COMMITS" section header,
+    /// clicked anywhere inside its own painted glyphs, must always toggle
+    /// *that* section — never the log row painted immediately below it. The
+    /// GTK twin of `mac_driver_tests::sc_panel_header_click_hit_band_matches_the_painted_row`
+    /// — see that test's own doc for the full rationale (the cached
+    /// `SidebarSystem` routing pattern this pins, and why
+    /// `sweep_hit_band_integrity_resetting` rather than
+    /// `sweep_hit_band_integrity` is needed here: quadraui's
+    /// `DoubleClickDetector` folds two same-spot `MouseDown`s in quick
+    /// succession into a `DoubleClick` on **every** backend — GTK included,
+    /// not just `MacBackend` — and `SidebarSystem::double_click` has no
+    /// header case).
+    ///
+    /// **RED-verification (#971):** reverting `App::paint_sidebar_panel_rung`'s
+    /// `PANEL_GIT` arm to drop its `set_backend_info` call (this issue's own
+    /// fix) takes this test red on GTK exactly as it does on macOS — the
+    /// very first sanity click stops collapsing the section at all, so the
+    /// "`!screen_contains(...)`" sanity assertion fires before the sweep is
+    /// even reached. Confirmed locally with `cargo test --features gui
+    /// sc_panel_header_click_hit_band_matches_the_painted_row_gtk` before
+    /// restoring the fix.
+    #[test]
+    fn sc_panel_header_click_hit_band_matches_the_painted_row_gtk() {
+        let mut h = conformance_harness(engine_with_sc_recent_commits(), W, H);
+
+        assert!(
+            h.driver.screen_contains("RECENT COMMITS") && h.driver.screen_contains("ZQXW971SCLOG0"),
+            "precondition: the SC panel must paint both the RECENT COMMITS \
+             header and its first log entry; painted text was {:?}",
+            h.driver.painted_texts()
+        );
+
+        // Sanity: the sweep below only compares samples against *each
+        // other*, so a header click that silently did nothing would still
+        // pass every sample uniformly. Prove the click has real effect
+        // first, so the sweep cannot pass vacuously.
+        let center = center_of(&h.driver, "RECENT COMMITS");
+        h.driver.click(center.0, center.1);
+        assert!(
+            !h.driver.screen_contains("ZQXW971SCLOG0"),
+            "sanity: a header click must actually collapse the section, \
+             hiding the log entry; painted text was {:?}",
+            h.driver.painted_texts()
+        );
+        h.engine
+            .borrow_mut()
+            .sc_sidebar_system
+            .borrow_mut()
+            .set_collapsed(3, false);
+        h.driver.render();
+        assert!(
+            h.driver.screen_contains("ZQXW971SCLOG0"),
+            "sanity restore: re-expanding the section directly must bring \
+             the log entry back; painted text was {:?}",
+            h.driver.painted_texts()
+        );
+
+        let engine = h.engine.clone();
+        crate::harness::sweep_hit_band_integrity_resetting(
+            &mut h.driver,
+            "RECENT COMMITS",
+            5,
+            |d| {
+                // Break the `DoubleClickDetector`'s position match before
+                // every real probe — see this test's own doc.
+                d.click(W as f32 - 20.0, H as f32 - 20.0);
+                engine
+                    .borrow_mut()
+                    .sc_sidebar_system
+                    .borrow_mut()
+                    .set_collapsed(3, false);
+                d.render();
+            },
+            |d| ConformanceDriver::inventory(d).screen_has("ZQXW971SCLOG0"),
+        );
+    }
+
+    /// #971: the ext-panel body's "AVAILABLE" section header, clicked
+    /// anywhere inside its own painted glyphs, must always toggle *that*
+    /// section — never the row painted immediately below it. The GTK twin
+    /// of `mac_driver_tests::ext_panel_header_click_hit_band_matches_the_painted_row`
+    /// — see that test's own doc for the full rationale, including why it
+    /// does not exercise `render::SidebarBodyGeometry::content_row` (out of
+    /// scope — that formula is wired only to a currently-disconnected hover
+    /// path).
+    ///
+    /// **RED-verification (#971):** reverting `App::paint_sidebar_panel_rung`'s
+    /// `PANEL_EXTENSIONS`/`ext:` arms to drop their `set_backend_info` call
+    /// takes this test red on GTK the same way it does on macOS — the
+    /// sanity click stops collapsing the section, so the sanity assertion
+    /// fires before the sweep runs. Confirmed locally with `cargo test
+    /// --features gui ext_panel_header_click_hit_band_matches_the_painted_row_gtk`
+    /// before restoring the fix.
+    #[test]
+    fn ext_panel_header_click_hit_band_matches_the_painted_row_gtk() {
+        let mut h = conformance_harness(engine_with_marketplace_as_ext_panel(), W, H);
+
+        assert!(
+            h.driver.screen_contains("AVAILABLE")
+                && h.driver.screen_contains("ZQXW971 Available Ext"),
+            "precondition: the ext panel must paint the AVAILABLE header \
+             and its one row; painted text was {:?}",
+            h.driver.painted_texts()
+        );
+
+        // Sanity — see `sc_panel_header_click_hit_band_matches_the_painted_row_gtk`'s
+        // own comment on why this is needed before trusting the sweep below.
+        let center = center_of(&h.driver, "AVAILABLE");
+        h.driver.click(center.0, center.1);
+        assert!(
+            !h.driver.screen_contains("ZQXW971 Available Ext"),
+            "sanity: a header click must actually collapse the AVAILABLE \
+             section, hiding its one row; painted text was {:?}",
+            h.driver.painted_texts()
+        );
+        h.engine
+            .borrow_mut()
+            .ext_sidebar_system
+            .borrow_mut()
+            .set_collapsed(1, false);
+        h.driver.render();
+        assert!(
+            h.driver.screen_contains("ZQXW971 Available Ext"),
+            "sanity restore: re-expanding the section directly must bring \
+             its row back; painted text was {:?}",
+            h.driver.painted_texts()
+        );
+
+        let engine = h.engine.clone();
+        crate::harness::sweep_hit_band_integrity_resetting(
+            &mut h.driver,
+            "AVAILABLE",
+            5,
+            |d| {
+                // Break the `DoubleClickDetector`'s position match before
+                // every real probe — see
+                // `sc_panel_header_click_hit_band_matches_the_painted_row_gtk`'s
+                // identical comment for the full story.
+                d.click(W as f32 - 20.0, H as f32 - 20.0);
+                engine
+                    .borrow_mut()
+                    .ext_sidebar_system
+                    .borrow_mut()
+                    .set_collapsed(1, false);
+                d.render();
+            },
+            |d| ConformanceDriver::inventory(d).screen_has("ZQXW971 Available Ext"),
+        );
+    }
+}
