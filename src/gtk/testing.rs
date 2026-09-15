@@ -537,8 +537,15 @@ pub fn conformance_harness(
     let backend: Rc<RefCell<Box<dyn crate::app::TextMetricsBackend>>> =
         Rc::new(RefCell::new(Box::new(super::backend::GtkBackend::new())));
     let (app, config) = crate::harness::build_app_and_config(Rc::clone(&engine), backend);
+    let screen_layout = Rc::clone(&app.cached_screen_layout);
     let driver = driver_with_shell(app, config, width, height);
-    crate::harness::ConformanceHarness::new(driver, engine, paint, cwd)
+    crate::harness::ConformanceHarness::new_with_screen_layout(
+        driver,
+        engine,
+        screen_layout,
+        paint,
+        cwd,
+    )
 }
 
 /// The same as [`conformance_harness`], but with `dir`'s shared

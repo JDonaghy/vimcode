@@ -127,8 +127,9 @@ pub mod testing {
         let backend: Rc<RefCell<Box<dyn TextMetricsBackend>>> =
             Rc::new(RefCell::new(Box::new(TuiBackend::new())));
         let (app, config) = crate::harness::build_app_and_config(Rc::clone(&engine), backend);
+        let screen_layout = Rc::clone(&app.cached_screen_layout);
         let driver = driver_with_shell(app, config, width, height);
-        ConformanceHarness::new(driver, engine, paint, cwd)
+        ConformanceHarness::new_with_screen_layout(driver, engine, screen_layout, paint, cwd)
     }
 }
 
