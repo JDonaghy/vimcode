@@ -796,6 +796,39 @@ mod tests {
         }
     }
 
+    /// Poll, *accumulating* across drains, until `done` is satisfied by the
+    /// events collected so far or the deadline passes.
+    ///
+    /// Use this instead of a second `poll_until` whenever the events under
+    /// test are produced by the agent back-to-back. `AcpClient::poll` drains
+    /// whatever the reader thread has queued at that instant, so how many
+    /// events land in one call is pure scheduling luck: with
+    /// `ACP_FAKE_DIE_AFTER_INIT` the fixture writes its `initialize` response
+    /// and exits immediately, so the `Initialized` event and the `AgentExited`
+    /// that its EOF produces may arrive in *one* drain or in two. Asserting
+    /// "the first poll returns Initialized, the second returns AgentExited"
+    /// therefore passes or fails at random — it was the flake seen at #984's
+    /// test stage. Nothing about the client's contract promises a one-event-
+    /// per-poll cadence, so the fix belongs here rather than in a wider
+    /// deadline: the property under test is that both events *arrive*, in
+    /// order, not how they are batched.
+    #[cfg(unix)]
+    fn poll_collecting_until(
+        client: &mut AcpClient,
+        deadline: std::time::Duration,
+        done: impl Fn(&[AcpEvent]) -> bool,
+    ) -> Vec<AcpEvent> {
+        let start = std::time::Instant::now();
+        let mut all = Vec::new();
+        loop {
+            all.extend(client.poll());
+            if done(&all) || start.elapsed() > deadline {
+                return all;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
     #[cfg(unix)]
     const TEST_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
 
@@ -889,21 +922,31 @@ mod tests {
         let mut client = spawn_fixture(&[("ACP_FAKE_DIE_AFTER_INIT", "1")]);
         client.initialize();
 
+        // The fixture answers `initialize` and exits in the same breath, so
+        // `Initialized` and the `AgentExited` its EOF produces may be drained
+        // together or separately — see `poll_collecting_until`'s doc. Collect
+        // until the death shows up, then assert on the ordered sequence.
+        let events = poll_collecting_until(&mut client, TEST_DEADLINE, |seen| {
+            seen.iter()
+                .any(|e| matches!(e, AcpEvent::AgentExited { .. }))
+        });
+
         // First event: Initialized (the fixture replies before dying).
-        let events = poll_until(&mut client, TEST_DEADLINE);
         assert!(
             matches!(events.first(), Some(AcpEvent::Initialized { .. })),
-            "{events:?}"
+            "expected Initialized first, got {events:?}"
         );
 
-        // Second: the process death must surface as AgentExited, not a hang
+        // Then: the process death must surface as AgentExited, not a hang
         // or a panic in this test thread.
-        let events = poll_until(&mut client, TEST_DEADLINE);
-        match events.first() {
+        match events
+            .iter()
+            .find(|e| matches!(e, AcpEvent::AgentExited { .. }))
+        {
             Some(AcpEvent::AgentExited {
                 was_initialized, ..
             }) => assert!(*was_initialized),
-            other => panic!("expected AgentExited, got {other:?}"),
+            _ => panic!("expected an AgentExited event, got {events:?}"),
         }
 
         // No orphan process left behind.
