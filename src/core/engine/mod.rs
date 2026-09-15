@@ -3110,6 +3110,11 @@ pub struct Engine {
     /// True while a DAP debug session is active.
     pub dap_session_active: bool,
 
+    // --- ACP (Agent Client Protocol) state (#951, ACP-0 — transport only, no UI) ---
+    /// The live ACP agent subprocess + session, if one has been started.
+    /// `None` until a later slice starts one; `poll_acp` is a no-op then.
+    pub acp_client: Option<crate::core::acp::AcpClient>,
+
     // --- DAP (Debug Adapter Protocol) state ---
     /// Multi-adapter DAP coordinator. None until first debug session is started.
     pub dap_manager: Option<DapManager>,
@@ -4052,6 +4057,7 @@ impl Engine {
             debug_button_hovered: None,
             debug_button_pressed: None,
             dap_session_active: false,
+            acp_client: None,
             dap_manager: None,
             dap_stopped_thread: None,
             dap_breakpoints: HashMap::new(),
@@ -4414,6 +4420,7 @@ impl Engine {
         redraw |= self.flush_cursor_move_hook();
         self.lsp_flush_changes();
         redraw |= self.poll_lsp();
+        redraw |= self.poll_acp();
         if self.poll_project_search() {
             self.search_switch_to_results();
             redraw = true;
@@ -5114,6 +5121,7 @@ pub(crate) fn diff_state_from_hunks(
 }
 
 mod accessors;
+mod acp_ops;
 mod buffers;
 mod dap_ops;
 pub use dap_ops::DEBUG_BUTTON_IDS;
