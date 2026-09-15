@@ -125,42 +125,12 @@ jobs:
           ```
           Statically linked with musl — runs on any Linux (Ubuntu 20.04+, CentOS 7+, Alpine, etc.). No GTK4 or other libraries needed.
 
-          **Option D — Flatpak** (see attached `vimcode.flatpak` asset)
-          ```
-          flatpak install vimcode.flatpak
-          flatpak run io.github.jdonaghy.VimCode
-          ```
-
           > GUI binary requires GTK 4.10+. Ubuntu 22.04 ships GTK 4.6 which is too old; Ubuntu 24.04+ recommended.
 
-          ### Windows
-
-          **TUI-only binary (no installer needed)**
-          Download `vcd-windows-x86_64.exe`, place anywhere on your PATH, and run:
-          ```
-          vcd-windows-x86_64.exe
-          ```
-          Or rename to `vcd.exe` for convenience. Works in Windows Terminal, PowerShell, and cmd.exe.
-
-          > No GUI binary for Windows (requires GTK4 which is not available on Windows).
-
-          ### macOS (Apple Silicon)
-
-          **Option A — Homebrew (recommended)**
-          ```
-          brew tap JDonaghy/vimcode
-          brew install vimcode    # GTK4 GUI + TUI
-          # or
-          brew install vcd        # TUI only (no GTK4 dependency)
-          ```
-
-          **Option B — direct download**
-          Download `vimcode-macos-arm64.tar.gz` (GUI) or `vcd-macos-arm64.tar.gz` (TUI only), extract, and run:
-          ```
-          tar xzf vcd-macos-arm64.tar.gz
-          ./vcd
-          ```
-          > GUI binary requires GTK4 via Homebrew: `brew install gtk4`
+          <!-- macOS / Windows / Flatpak install sections live in git history
+               (pre-v0.11.0 revisions of this file). Restore them here when the
+               matching RELEASE_MACOS / RELEASE_WINDOWS / RELEASE_FLATPAK repo
+               variable is turned on, so the notes match the attached assets. -->
         prerelease: false
         make_latest: true
         files: |
@@ -172,6 +142,9 @@ jobs:
   build-macos:
     name: Build macOS ARM64 binaries
     runs-on: macos-latest     # Apple Silicon (M1+)
+    # Opt-in: set repo variable RELEASE_MACOS=true to ship macOS artifacts.
+    # Unset (the default, and the state for v0.11.0) skips this job.
+    if: ${{ vars.RELEASE_MACOS == 'true' }}
     needs: build-and-release  # wait for release to be created
 
     permissions:
@@ -231,6 +204,8 @@ jobs:
   build-windows:
     name: Build Windows TUI binary
     runs-on: windows-latest
+    # Opt-in: set repo variable RELEASE_WINDOWS=true.
+    if: ${{ vars.RELEASE_WINDOWS == 'true' }}
     needs: build-and-release  # wait for release to be created
 
     permissions:
@@ -268,6 +243,14 @@ jobs:
   flatpak:
     name: Build Flatpak bundle
     runs-on: ubuntu-24.04
+    # Opt-in: set repo variable RELEASE_FLATPAK=true.
+    # BROKEN as of v0.11.0 — flatpak/cargo-sources.json predates #691 (it holds
+    # 635 crates-io entries and zero quadraui) and the manifest's inline cargo
+    # config only replaces [source.crates-io], so the rev-pinned quadraui git
+    # dep would still need the network inside flatpak-builder's offline build.
+    # Fixing it needs BOTH a regenerated cargo-sources.json and a git-source
+    # replacement stanza in flatpak/io.github.jdonaghy.VimCode.yml.
+    if: ${{ vars.RELEASE_FLATPAK == 'true' }}
 
     permissions:
       contents: write
@@ -306,6 +289,8 @@ jobs:
   update-homebrew:
     name: Update Homebrew tap
     runs-on: ubuntu-latest
+    # Skipped automatically whenever build-macos/build-windows are skipped.
+    if: ${{ vars.RELEASE_MACOS == 'true' && vars.RELEASE_WINDOWS == 'true' }}
     needs: [build-and-release, build-macos, build-windows]
 
     steps:

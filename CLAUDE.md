@@ -45,14 +45,13 @@ line-level confirmation — not the first move.
 
 ### quadraui is a pinned git dependency, not a sibling checkout (#691)
 
-Vimcode depends on `quadraui` via a **git dependency pinned to a `rev`** in `Cargo.toml` — `quadraui = { git = "https://github.com/JDonaghy/quadraui.git", rev = "<sha>", ... }`, and `[patch.crates-io] vt100` is pinned the same way. Cargo clones the pinned rev into `~/.cargo/git/` itself and locks the resolved SHA in `Cargo.lock`. **`~/src/quadraui` is not consulted by a normal build at all** — a plain `cargo build` is reproducible regardless of what's checked out there, including on a machine running several agents concurrently.
+Vimcode depends on `quadraui` via a **git dependency pinned to a `rev`** in `Cargo.toml` — `quadraui = { git = "https://github.com/JDonaghy/quadraui.git", rev = "<sha>", ... }`. (There is **one** pin now: the `[patch.crates-io] vt100` entry that used to shadow it was removed once quadraui#795 dropped the vendored shim upstream — see the comment above `[patch...]` in `Cargo.toml`.) The repo is public, so cargo resolves the pin anonymously with no token — which is what lets GitHub-hosted CI and release runners build it. Cargo clones the pinned rev into `~/.cargo/git/` itself and locks the resolved SHA in `Cargo.lock`. **`~/src/quadraui` is not consulted by a normal build at all** — a plain `cargo build` is reproducible regardless of what's checked out there, including on a machine running several agents concurrently.
 
 ```bash
 # Build against the pin (the normal case, and the only case for a plain checkout):
 cargo build
 
-# Bump the pin: edit `rev = "..."` in Cargo.toml (the quadraui dependency AND
-# the [patch.crates-io] vt100 entry — they must match), then:
+# Bump the pin: edit `rev = "..."` in Cargo.toml, then:
 cargo test    # updates Cargo.lock and re-runs snapshots against the new rev
 
 # Co-developing quadraui on a local branch? Opt in per-checkout, not per-env-var:

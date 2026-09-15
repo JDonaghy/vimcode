@@ -12,15 +12,20 @@ and the per-PR CI covers exactly one of them.
 
 ## 0. What a release actually ships
 
-`.github/workflows/release.yml` (see §2.0 — it is currently `.disabled`) produces:
+`.github/workflows/release.yml` produces, on a push to `main`:
 
-| Artifact | Built on | Backend | Build command |
+| Artifact | Built on | Backend | Ships in v0.11.0? |
 |---|---|---|---|
-| `vimcode-linux-x86_64`, `vimcode_*.deb`, `vimcode.flatpak` | ubuntu-24.04 | GTK4 (glibc) | `cargo build --release --bin vimcode` |
-| `vcd-linux-x86_64` | ubuntu-24.04 | TUI (musl, static) | `cargo build --release --bin vcd --no-default-features --target x86_64-unknown-linux-musl` |
-| `vimcode-macos-arm64.tar.gz` | macos-latest | **GTK4 via Homebrew** | `cargo build --release --bin vimcode` |
-| `vcd-macos-arm64.tar.gz` | macos-latest | TUI | `cargo build --release --bin vcd --no-default-features` |
-| `vcd-windows-x86_64.exe` | windows-latest | TUI | `cargo build --release --bin vcd --no-default-features` |
+| `vimcode-linux-x86_64`, `vimcode_*.deb` | ubuntu-24.04 | GTK4 (glibc) | **yes** |
+| `vcd-linux-x86_64` | ubuntu-24.04 | TUI (musl, static) | **yes** |
+| `vimcode-macos-arm64.tar.gz`, `vcd-macos-arm64.tar.gz` | macos-latest | GTK4 via Homebrew / TUI | no — `RELEASE_MACOS` unset |
+| `vcd-windows-x86_64.exe` | windows-latest | TUI | no — `RELEASE_WINDOWS` unset |
+| `vimcode.flatpak` | ubuntu-24.04 | GTK4 | no — `RELEASE_FLATPAK` unset, and **broken**, see §2.2 |
+
+Each non-Linux job carries `if: ${{ vars.<NAME> == 'true' }}`, so an unset repo
+variable skips it. Turning a platform back on is a repo-variable change, not a
+workflow edit — but re-run its §1 lane first, and restore its install section in
+the release-notes body (the jobs were gated, the notes were trimmed).
 
 **Two things that surprise people, both true as of v0.10.0:**
 
@@ -39,6 +44,14 @@ the gate is where you find out they regressed — not after you've promised them
 ## 1. The pre-release architecture gate
 
 **Run every lane. Record every result.** Four backends, four lanes, three machines.
+
+> **Scoping the gate to a platform-limited release.** v0.11.0 ships Linux only
+> (§0), so the macOS and Windows lanes are *out of scope*, not *skipped* — the
+> "a lane you skipped is a lane that failed" rule below governs platforms you are
+> shipping. Write **"out of scope — not shipping this platform"** against those
+> rows in §1.6 rather than leaving them blank. The Linux lane (§1.1) and the
+> TUI-only lane (§1.2) are both mandatory for a Linux-only release, and §1.1 must
+> be fully green.
 
 | Lane | Machine | Command |
 |---|---|---|
@@ -187,6 +200,16 @@ Paste into the `develop` → `main` PR body:
 - [ ] Manual smoke — Linux / macOS / Windows: <what you opened, what you saw>
 ```
 
+For a Linux-only release the same block collapses to:
+
+```markdown
+## Architecture gate (docs/RELEASING.md §1)
+- [ ] Linux GTK + TUI — `cargo test` on <machine> @ <sha> — <N> passed
+- [ ] TUI-only — `cargo test --no-default-features` @ <sha> — <N> passed
+- [ ] Manual smoke — `./target/release/vimcode` and `vcd` on <machine>: <what you saw>
+- [ ] macOS / Windows / Flatpak — out of scope, not shipping (§0, §2.2)
+```
+
 > **This section collapses to one command when [vimcode#926](https://github.com/JDonaghy/vimcode/issues/926)
 > lands.** That issue builds `scripts/platform-conformance.sh`: one entrypoint that
 > probes the host, runs the lanes it supports, prints a matrix, and exits non-zero
@@ -196,30 +219,71 @@ Paste into the `develop` → `main` PR body:
 
 ## 2. Shipping
 
-### 2.0 The release workflow is currently disabled
+### 2.0 The release runs in GitHub Actions, not locally
 
-`.github/workflows/release.yml.disabled` was renamed in 3abd5ec —
-*"disable GitHub Actions workflows until quadraui sibling-checkout resolved"*.
-**That premise is stale.** #691 moved quadraui to a `rev`-pinned git dependency;
-cargo clones the pinned rev into `~/.cargo/git/` and a plain build does not consult
-`~/src/quadraui` at all. Re-enabling it is a decision someone should make
-deliberately — not a blocker. Until then, a release means building the §0 matrix by
-hand and attaching the artifacts.
+`release.yml` was disabled in 3abd5ec — *"disable GitHub Actions workflows until
+quadraui sibling-checkout resolved"*. That premise died with #691, and the file was
+re-enabled for v0.11.0. **Merging the `develop` → `main` PR is the release**: the
+push to `main` triggers the workflow, which reads the version out of `Cargo.toml`,
+builds, and publishes the GitHub Release tagged `v$VERSION`. Nothing is built on
+your laptop. The §1 gate is the only part you run by hand.
 
-### 2.1 Steps
+### 2.1 The quadraui pin needs nothing — it is a public git dep
+
+The recurring worry is that a `rev`-pinned git dependency can't be resolved by a
+hosted runner. It can, and already is:
+
+- `JDonaghy/quadraui` is a **public** repo — `git ls-remote` over anonymous HTTPS
+  succeeds, so cargo needs no token, no secret, no submodule, no deploy key.
+- The pinned rev is an **ancestor of quadraui's `develop`** (check with
+  `gh api repos/JDonaghy/quadraui/compare/develop...<rev> --jq .status` — `behind`
+  or `identical` is good, `diverged` is not). It is permanently reachable, so a
+  fresh clone can fetch it even after the feature branch that carried it is deleted.
+- Per-PR CI on `develop` is green today on GitHub-hosted runners, which *is* the
+  proof that a clean checkout resolves the pin.
+
+`[patch.crates-io] vt100` is gone — quadraui#795 removed the vendored shim upstream.
+`CLAUDE.md` still mentions keeping the two pins in sync; there is only one pin now.
+
+**Bumping the pin before a release is optional, not required.** If you do bump it,
+it is a code change like any other: branch, edit `rev`, `cargo test` (snapshots
+re-run against the new rev), land through the normal workflow — not something to
+slip into the release PR.
+
+### 2.2 Flatpak is broken and is not shipping
+
+`flatpak/cargo-sources.json` predates #691: 635 crates-io entries, **zero
+quadraui**. Worse, the manifest's inline cargo config only replaces
+`[source.crates-io]`, so even a regenerated file would leave the rev-pinned
+quadraui git dep reaching for the network inside flatpak-builder's offline build.
+Fixing it needs two things, not one:
+
+1. Regenerate with a generator that emits git sources —
+   `python3 flatpak-cargo-generator.py Cargo.lock -o flatpak/cargo-sources.json`
+   (the script is **not in this repo**; fetch it from flathub/flatpak-builder-tools).
+2. Add the generator's `[source."git+https://github.com/JDonaghy/quadraui.git?rev=…"]`
+   replacement stanza to the inline `config` block in
+   `flatpak/io.github.jdonaghy.VimCode.yml`.
+
+Until both land, leave `RELEASE_FLATPAK` unset. Do not regenerate the JSON and
+assume it works — it needs a real flatpak-builder run on a Linux host to prove it.
+
+### 2.3 Steps
 
 1. **Run the §1 gate.** All lanes, results recorded.
 2. **Bump the version** in `Cargo.toml`.
-3. **If `Cargo.lock` changed**, regenerate the flatpak manifest:
-   ```bash
-   python3 flatpak-cargo-generator.py Cargo.lock -o flatpak/cargo-sources.json
-   ```
+3. **Flatpak:** skip — see §2.2. (`Cargo.lock` has moved a long way since v0.10.0,
+   but regenerating `cargo-sources.json` alone does not make the bundle buildable.)
 4. **Open the `develop` → `main` PR**, with the §1.6 checklist in the body. CI runs
    on the PR.
-5. **Merge.** With `release.yml` enabled this triggers the build and creates a
-   GitHub Release tagged `v$VERSION`. Disabled, build and upload the §0 matrix
-   yourself.
+5. **Merge.** The push to `main` triggers `release.yml`, which builds the Linux
+   artifacts and creates the GitHub Release tagged `v$VERSION`. Watch the run —
+   this is the first release since the workflow was re-enabled, so treat a red
+   run as expected-possible rather than alarming, and fix forward on `develop`.
 6. **Never push directly to `main`.**
+7. **Verify the release**: download `vimcode-linux-x86_64` and `vcd-linux-x86_64`
+   from the Release page and run `--version` on a Linux box. The banner prints the
+   resolved quadraui rev, so it also confirms the pin baked in as expected.
 
 ---
 
@@ -233,3 +297,4 @@ dated list rather than a habit.
 | 3 pixel/paint probes fail (§1.3b) | macOS GTK | Expected — Core Text vs freetype rasterisation |
 | `install_menu_bar` main-thread panic, caught (§1.3) | macOS native | Expected — test-runner threading; vimcode#901 closed, native menu bar untested |
 | No Win-GUI test suite | Windows | Gap — `src/win/` has zero `#[test]`s |
+| Flatpak bundle unbuildable (§2.2) | Linux | Gap — `cargo-sources.json` predates the #691 git dep; not shipping in v0.11.0 |
