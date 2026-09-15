@@ -3192,16 +3192,7 @@ impl App {
                 }
             }
             PANEL_EXTENSIONS => {
-                // #971: see `render::gui_sidebar_system_metrics`'s own doc —
-                // without this, every content-row press on this panel
-                // (header collapse, row select) is a silent no-op. Reads
-                // `backend.line_height()` directly — see the `PANEL_GIT`
-                // arm's identical comment on why, above.
-                let ext_lh = backend.line_height();
-                engine
-                    .ext_sidebar_system
-                    .borrow_mut()
-                    .set_backend_info(ext_lh, render::gui_sidebar_system_metrics(ext_lh));
+                Self::refresh_ext_sidebar_metrics(backend, engine);
                 render::populate_ext_sidebar_system(engine);
                 engine.ext_sidebar_body_rect.set(q_sb);
                 engine.ext_sidebar_system.borrow().render(backend, q_sb);
@@ -3214,14 +3205,8 @@ impl App {
                     .render_and_cache(backend, q_sb);
             }
             id if id.starts_with("ext:") => {
-                // Extension panel — render via ext_sidebar_system. #971:
-                // same `set_backend_info` fix as the `PANEL_EXTENSIONS` arm
-                // just above.
-                let ext_lh = backend.line_height();
-                engine
-                    .ext_sidebar_system
-                    .borrow_mut()
-                    .set_backend_info(ext_lh, render::gui_sidebar_system_metrics(ext_lh));
+                // Extension panel — render via ext_sidebar_system.
+                Self::refresh_ext_sidebar_metrics(backend, engine);
                 render::populate_ext_sidebar_system(engine);
                 engine.ext_sidebar_body_rect.set(q_sb);
                 engine.ext_sidebar_system.borrow().render(backend, q_sb);
@@ -3255,6 +3240,30 @@ impl App {
         // `panel_hover_popup_rect` pinned at its last painted
         // value and `handle_mouse_press` went on arbitrating
         // clicks against a popup that was no longer on screen.
+    }
+
+    /// Re-derive `ext_sidebar_system`'s backend metrics from what `backend`
+    /// is about to paint with (#971).
+    ///
+    /// Without this, `ext_sidebar_system.handle_cached` returns `Ignored`
+    /// unconditionally and every content-row press on the plugin ext panel
+    /// (header collapse, row select) is a silent no-op — see
+    /// `render::gui_sidebar_system_metrics`'s own doc for the full story.
+    /// Reads `backend.line_height()` directly rather than accepting a
+    /// cached `lh` parameter — see the `PANEL_GIT` arm's identical comment
+    /// in [`Self::paint_sidebar_panel_rung`] on why: a cached value can lag
+    /// behind what `backend` reports by the time `render()` actually reads
+    /// it, so the metrics `handle_cached` hit-tests against could disagree
+    /// with what this exact `render()` call paints. Shared by the
+    /// `PANEL_EXTENSIONS` arm and the `id if id.starts_with("ext:")` arm
+    /// above, which were previously two verbatim copies of this same
+    /// four-line snippet.
+    fn refresh_ext_sidebar_metrics(backend: &mut dyn quadraui::Backend, engine: &Engine) {
+        let ext_lh = backend.line_height();
+        engine
+            .ext_sidebar_system
+            .borrow_mut()
+            .set_backend_info(ext_lh, render::gui_sidebar_system_metrics(ext_lh));
     }
 
     /// Compose the editor-anchored popups: completion menu, LSP hover, editor

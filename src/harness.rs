@@ -447,7 +447,7 @@ pub fn sweep_hit_band_integrity_resetting<D: ConformanceDriver + DriverInput>(
             baseline,
             "sweep_hit_band_integrity_resetting: point {i}/{} inside {needle:?}'s \
              painted band resolved to a different target than the top of the row \
-             (#967 hit-band drift) — outcomes were {outcomes:?} at y-offsets {ys:?}",
+             (#971 hit-band drift) — outcomes were {outcomes:?} at y-offsets {ys:?}",
             samples - 1,
         );
     }
