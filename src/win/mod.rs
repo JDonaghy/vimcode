@@ -110,6 +110,30 @@ pub fn run(file_path: Option<PathBuf>) -> ExitCode {
     quadraui::win::shell_runner::run_with_shell(app, config)
 }
 
+// ── #969: `TextMetricsBackend` conformance (`WinBackend`) ──────────────────
+//
+// Unlike `win_driver_tests` below, this needs no `WinDriver`/
+// `quadraui::win::testing` at all — only `WinBackend::new()` plus the two
+// `TextMetricsBackend` setters and the `quadraui::Backend` getters they
+// feed, none of which are `target_os`-gated (see this module's own "Why
+// `feature = "win"` alone" doc above — `current_line_height`/
+// `current_char_width` and their setters/getters are plain fields, not
+// WinAPI calls). So this runs on an ordinary Linux host under `cargo test
+// --features win`, with no Windows target and no cross toolchain — closing
+// the same gap #967 found on macOS (a `TextMetricsBackend` impl whose
+// metric setters silently no-op, disabling the #540/#819 click drift
+// guard) for this backend too, and doing it without needing Windows
+// hardware to run at all. See `crate::harness::assert_text_metrics_backend_applies_metrics`'s
+// doc for the full mechanism.
+#[cfg(all(test, feature = "win"))]
+mod win_backend_conformance {
+    #[test]
+    fn win_backend_applies_line_height_and_char_width() {
+        let mut backend = super::backend::WinBackend::new();
+        crate::harness::assert_text_metrics_backend_applies_metrics(&mut backend);
+    }
+}
+
 // ── #928: `crate::harness::ConformanceHarness` on `WinDriver` ──────────────
 //
 // `quadraui::win::testing` (the module holding `WinDriver`/`driver_with_shell`)

@@ -98,7 +98,9 @@ use crate::app::{App, TextMetricsBackend};
 ///   bands by a pixel per row, growing with row index until clicks
 ///   resolved to the row below.
 impl TextMetricsBackend for quadraui::macos::MacBackend {
-    fn set_text_measurement_context(&mut self, _ctx: Box<dyn std::any::Any>) {}
+    // `set_text_measurement_context` is deliberately not overridden here —
+    // the trait's default (empty) body is exactly this backend's no-op, per
+    // the reasoning above (#969).
 
     fn set_current_line_height(&mut self, line_height: f64) {
         quadraui::macos::MacBackend::set_current_line_height(self, line_height);
@@ -866,5 +868,19 @@ mod mac_driver_tests {
         });
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #969: the direct, driver-free half of the coverage above —
+    /// `explorer_click_hit_band_matches_the_painted_row` proves #967's
+    /// *symptom* (a mis-hit row) is fixed; this proves the *mechanism* is
+    /// sound by round-tripping a value through `TextMetricsBackend` and
+    /// `quadraui::Backend` directly, no paint or click involved. See
+    /// `crate::harness::assert_text_metrics_backend_applies_metrics`'s doc
+    /// for why a `&mut self`-with-no-return setter needs exactly this kind
+    /// of check to catch a silent stub — the class of bug #967 was.
+    #[test]
+    fn mac_backend_applies_line_height_and_char_width() {
+        let mut backend = MacBackend::new();
+        crate::harness::assert_text_metrics_backend_applies_metrics(&mut backend);
     }
 }

@@ -50,7 +50,7 @@ use std::path::PathBuf;
 use std::rc::Rc;
 
 use quadraui::testing::{ConformanceDriver, DriverInput};
-use quadraui::NamedKey;
+use quadraui::{Backend, NamedKey};
 
 use crate::app::{App, TextMetricsBackend};
 use crate::core::Engine;
@@ -391,5 +391,55 @@ pub fn folder_picker_click_outside_dismisses_it<D: ConformanceDriver + DriverInp
         !driver.screen_has(distinctive) && !driver.screen_has(other),
         "a click outside the popup must dismiss the picker \
          (route_folder_picker_click's Dismiss arm)"
+    );
+}
+
+/// #969: conformance assertion for [`TextMetricsBackend`]'s two load-bearing
+/// setters — `set_current_line_height`/`set_current_char_width`. Both are
+/// `&mut self` methods with no return value, so an empty ("stub") body
+/// type-checks identically to a correct forwarding one; nothing short of
+/// setting a value through the trait object and reading it back through the
+/// `quadraui::Backend` getter it is supposed to feed
+/// (`Backend::line_height`/`Backend::char_width`) can tell the two apart.
+///
+/// This is exactly the gap #967 fell into: `quadraui::macos::MacBackend`'s
+/// `TextMetricsBackend` impl stubbed both setters (correct when #859 wrote
+/// it — the inherent setters did not exist yet on that backend), quadraui#934
+/// later added them, and the impl was never updated to forward to them. That
+/// shipped for two days with clicks landing on the wrong explorer row before
+/// #967 found and fixed it (see `src/macos/mod.rs`'s `TextMetricsBackend for
+/// quadraui::macos::MacBackend` doc for the full mechanism). This function is
+/// the seam that would have caught it on the commit that landed
+/// quadraui#934's setters with no matching vimcode-side update: call it once
+/// per concrete backend, in whatever driver-tier (or lighter) lane that
+/// backend already has — see `crate::gtk` / `src/macos/mod.rs` /
+/// `src/win/mod.rs` for the three call sites this issue adds.
+///
+/// The two probe values are distinctive and deliberately unlike any
+/// backend's `::new()` default (`WinBackend::new()`'s is `16.0`/`8.0`; GTK's
+/// and macOS's are effectively `0.0` until a real paint sets them), so a
+/// stubbed setter that silently no-ops leaves the getter reporting its own
+/// construction-time default instead of the probe value — which fails the
+/// assertions below exactly the way #967's stub would have.
+pub(crate) fn assert_text_metrics_backend_applies_metrics<B: TextMetricsBackend>(backend: &mut B) {
+    const LINE_HEIGHT: f64 = 971.25;
+    const CHAR_WIDTH: f64 = 483.5;
+
+    backend.set_current_line_height(LINE_HEIGHT);
+    backend.set_current_char_width(CHAR_WIDTH);
+
+    assert_eq!(
+        backend.line_height(),
+        LINE_HEIGHT as f32,
+        "TextMetricsBackend::set_current_line_height did not reach \
+         Backend::line_height() — a stubbed setter silently disables the \
+         #540/#819 click drift guard (#967); see #969"
+    );
+    assert_eq!(
+        backend.char_width(),
+        CHAR_WIDTH as f32,
+        "TextMetricsBackend::set_current_char_width did not reach \
+         Backend::char_width() — a stubbed setter silently disables the \
+         #540/#819 click drift guard (#967); see #969"
     );
 }

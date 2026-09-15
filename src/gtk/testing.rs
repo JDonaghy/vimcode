@@ -10487,3 +10487,19 @@ mod conformance_proof_slice {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+/// #969: the GTK leg of the `TextMetricsBackend` conformance assertion —
+/// see `crate::harness::assert_text_metrics_backend_applies_metrics`'s doc
+/// for the #967 stub this guards against and why the check has to round-trip
+/// through the trait object rather than inspect state. No driver needed
+/// here: `GtkBackend::new()` is a plain struct construction (no display, no
+/// `gtk4::init`), so this runs in the same headless CI lane as every other
+/// test in this file.
+#[cfg(test)]
+mod issue_969_text_metrics_backend_conformance {
+    #[test]
+    fn gtk_backend_applies_line_height_and_char_width() {
+        let mut backend = crate::gtk::backend::GtkBackend::new();
+        crate::harness::assert_text_metrics_backend_applies_metrics(&mut backend);
+    }
+}
