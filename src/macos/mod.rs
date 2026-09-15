@@ -933,6 +933,7 @@ mod mac_driver_tests {
                 path: format!("filler_971_{i}.rs"),
                 staged: None,
                 unstaged: Some(crate::core::git::StatusKind::Modified),
+                unmerged: None,
             })
             .collect();
         engine.sc_log = (0..2)
@@ -963,11 +964,11 @@ mod mac_driver_tests {
     /// delay between them, unlike a real user) gets coalesced into a
     /// double-click that silently does nothing, rather than toggling back
     /// the way it does for #967's tree row. `setup` instead re-expands the
-    /// section directly (`set_collapsed(3, false)`) before every sample —
-    /// no second click involved at all.
+    /// section directly (`set_collapsed(SC_SECTION_LOG, false)`) before every
+    /// sample — no second click involved at all.
     ///
     /// Fingerprint: is the first log entry's distinctive message still
-    /// painted? A correct hit collapses section 3, hiding the log rows; a
+    /// painted? A correct hit collapses the log section, hiding the log rows; a
     /// mis-hit lands on the log row itself (`SidebarEvent::RowSelected`),
     /// which changes nothing painted, disagreeing with the header-hit
     /// baseline.
@@ -1000,7 +1001,7 @@ mod mac_driver_tests {
             .borrow_mut()
             .sc_sidebar_system
             .borrow_mut()
-            .set_collapsed(3, false);
+            .set_collapsed(crate::core::engine::SC_SECTION_LOG, false);
         driver.render();
         assert!(
             driver.screen_contains("ZQXW971SCLOG0"),
@@ -1027,7 +1028,7 @@ mod mac_driver_tests {
                     .borrow_mut()
                     .sc_sidebar_system
                     .borrow_mut()
-                    .set_collapsed(3, false);
+                    .set_collapsed(crate::core::engine::SC_SECTION_LOG, false);
                 d.render();
             },
             |d| ConformanceDriver::inventory(d).screen_has("ZQXW971SCLOG0"),

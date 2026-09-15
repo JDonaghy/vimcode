@@ -10558,6 +10558,7 @@ mod hit_band_sweep_971 {
                 path: format!("filler_971_{i}.rs"),
                 staged: None,
                 unstaged: Some(crate::core::git::StatusKind::Modified),
+                unmerged: None,
             })
             .collect();
         engine.sc_log = (0..2)
@@ -10650,7 +10651,7 @@ mod hit_band_sweep_971 {
             .borrow_mut()
             .sc_sidebar_system
             .borrow_mut()
-            .set_collapsed(3, false);
+            .set_collapsed(crate::core::engine::SC_SECTION_LOG, false);
         h.driver.render();
         assert!(
             h.driver.screen_contains("ZQXW971SCLOG0"),
@@ -10672,7 +10673,7 @@ mod hit_band_sweep_971 {
                     .borrow_mut()
                     .sc_sidebar_system
                     .borrow_mut()
-                    .set_collapsed(3, false);
+                    .set_collapsed(crate::core::engine::SC_SECTION_LOG, false);
                 d.render();
             },
             |d| ConformanceDriver::inventory(d).screen_has("ZQXW971SCLOG0"),
@@ -10750,5 +10751,173 @@ mod hit_band_sweep_971 {
             },
             |d| ConformanceDriver::inventory(d).screen_has("ZQXW971 Available Ext"),
         );
+    }
+}
+
+// ─── #991: merge-conflict rows in the Source Control panel (GTK) ─────────
+//
+// The GTK twin of `src/tui_main/shell_app.rs`'s
+// `sc_panel_paints_every_unmerged_xy_code_under_merge_changes` and
+// friends — the multi-backend rule applies to the tests too, and the SC
+// panel's sections are painted through the shared
+// `render::populate_sc_sidebar_system` on both backends, so a section
+// inserted at index 0 has to be proven on both.
+//
+// Every assertion reads *painted* content (`text_runs()` / `screen_has`),
+// never `engine.sc_file_statuses`.
+//
+// **RED against unfixed `develop`:** there is no "MERGE CHANGES" section
+// at all, so `painted_row_y(.., "MERGE CHANGES")` is `None` and the
+// `.expect(..)` fires in all three conflict tests; for `UU`/`UA` the file
+// row is additionally absent from the frame entirely.
+#[cfg(test)]
+mod issue_991_merge_conflicts {
+    use quadraui::testing::ConformanceDriver;
+
+    use super::conformance_harness;
+    use crate::core::engine::sidebar::PANEL_GIT;
+    use crate::core::Engine;
+
+    const W: i32 = 1400;
+    const H: i32 = 900;
+
+    /// Nerd-fonts off for the same reason every other `plain_engine()`
+    /// twin in this repo does it: icon glyphs are a separate painted run
+    /// from the text labels these assertions look for.
+    fn plain_engine() -> Engine {
+        let mut engine = Engine::new_for_test();
+        engine.settings.use_nerd_fonts = false;
+        engine
+            .app_shell
+            .show_panel(&quadraui::WidgetId::new(PANEL_GIT));
+        engine
+    }
+
+    /// An engine whose SC statuses come from a literal `git status
+    /// --porcelain` block, parsed by the **real** parser — lets one test
+    /// drive all seven unmerged `XY` codes without seven real conflicts.
+    fn engine_with_porcelain(porcelain: &str) -> Engine {
+        let mut engine = plain_engine();
+        engine.sc_file_statuses = crate::core::git::parse_status_porcelain(porcelain);
+        engine
+    }
+
+    /// Top y of the first painted text run containing `needle`, or `None`
+    /// when nothing painted it.
+    fn painted_row_y<D: ConformanceDriver>(driver: &D, needle: &str) -> Option<f32> {
+        driver
+            .inventory()
+            .text_runs()
+            .iter()
+            .find(|r| r.text.contains(needle))
+            .map(|r| r.bounds.y)
+    }
+
+    /// #991, the whole table from the issue: one case per unmerged `XY`
+    /// code. `UU`/`UA` used to vanish from the panel entirely; the other
+    /// five used to be painted as ordinary staged/unstaged changes.
+    /// Section membership is asserted geometrically from the painted row's
+    /// own y against the two painted section headers.
+    #[test]
+    fn sc_panel_paints_every_unmerged_xy_code_under_merge_changes_gtk() {
+        for (code, path) in [
+            ("UU", "zqxw991uu.txt"),
+            ("UA", "zqxw991ua.txt"),
+            ("AU", "zqxw991au.txt"),
+            ("DU", "zqxw991du.txt"),
+            ("UD", "zqxw991ud.txt"),
+            ("AA", "zqxw991aa.txt"),
+            ("DD", "zqxw991dd.txt"),
+        ] {
+            let h = conformance_harness(engine_with_porcelain(&format!("{code} {path}\n")), W, H);
+            let painted = h.driver.painted_texts();
+
+            let merge = painted_row_y(&h.driver, "MERGE CHANGES").unwrap_or_else(|| {
+                panic!(
+                    "{code}: the SC panel must paint a MERGE CHANGES section for \
+                     a conflicted file; painted: {painted:?}"
+                )
+            });
+            let staged = painted_row_y(&h.driver, "STAGED CHANGES").unwrap_or_else(|| {
+                panic!("{code}: STAGED CHANGES header missing; painted: {painted:?}")
+            });
+            let row = painted_row_y(&h.driver, path).unwrap_or_else(|| {
+                panic!("{code}: the conflicted file row was never painted; painted: {painted:?}")
+            });
+
+            assert!(
+                merge < row && row < staged,
+                "{code}: the conflicted row must paint *inside* MERGE CHANGES \
+                 (header y={merge}, STAGED CHANGES y={staged}), but painted at \
+                 y={row}; painted: {painted:?}"
+            );
+            // VS Code's conflict marker, from `StatusKind::Unmerged::label()`.
+            assert!(
+                h.driver
+                    .inventory()
+                    .text_runs()
+                    .iter()
+                    .any(|r| r.text.trim() == "!" && (r.bounds.y - row).abs() < 1.0),
+                "{code}: the conflicted row must carry the '!' conflict marker \
+                 on its own line; painted: {painted:?}"
+            );
+        }
+    }
+
+    /// #991 regression case: a non-conflicted tree must still render
+    /// exactly the two file sections it always did — Merge Changes is not
+    /// always-on.
+    #[test]
+    fn sc_panel_without_conflicts_paints_no_merge_changes_section_gtk() {
+        let h = conformance_harness(
+            engine_with_porcelain("M  zqxw991stg.txt\n M zqxw991drt.txt\n"),
+            W,
+            H,
+        );
+        let painted = h.driver.painted_texts();
+        assert!(
+            !h.driver.screen_contains("MERGE CHANGES"),
+            "a conflict-free tree must not paint a MERGE CHANGES section; \
+             painted: {painted:?}"
+        );
+        assert!(
+            h.driver.screen_contains("STAGED CHANGES")
+                && h.driver.screen_contains("zqxw991stg.txt"),
+            "the ordinary staged row must still paint; painted: {painted:?}"
+        );
+        assert!(
+            h.driver.screen_contains("zqxw991drt.txt"),
+            "the ordinary unstaged row must still paint; painted: {painted:?}"
+        );
+    }
+
+    /// #991 end-to-end on GTK: a **real** `git merge` conflict read back
+    /// through `Engine::sc_refresh` → `git status --porcelain` → the
+    /// painted panel.
+    #[test]
+    fn sc_panel_paints_a_real_merge_conflict_under_merge_changes_gtk() {
+        let dir = crate::harness::make_conflicted_repo("gtk991");
+        let mut engine = plain_engine();
+        engine.cwd = dir.clone();
+        engine.sc_refresh();
+
+        let h = conformance_harness(engine, W, H);
+        let painted = h.driver.painted_texts();
+
+        let merge = painted_row_y(&h.driver, "MERGE CHANGES").unwrap_or_else(|| {
+            panic!("a real merge conflict must paint MERGE CHANGES; painted: {painted:?}")
+        });
+        let staged = painted_row_y(&h.driver, "STAGED CHANGES")
+            .unwrap_or_else(|| panic!("STAGED CHANGES header missing; painted: {painted:?}"));
+        let row =
+            painted_row_y(&h.driver, crate::harness::CONFLICT_FIXTURE_FILE).unwrap_or_else(|| {
+                panic!("the conflicted row was never painted; painted: {painted:?}")
+            });
+        assert!(
+            merge < row && row < staged,
+            "the conflicted row must paint inside MERGE CHANGES; painted: {painted:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
