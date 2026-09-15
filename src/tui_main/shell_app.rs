@@ -6532,11 +6532,11 @@ mod tests {
         );
         let mut driver = driver_with_shell(app, config(), 100, 24);
 
-        // `minimap_reserved_width` gives a 100-column pane a 15-column strip
-        // (`min(MINIMAP_TARGET_COLS, 100 * MINIMAP_WIDTH_FRACTION)`, clamped
-        // into `[MINIMAP_MIN_COLS, MINIMAP_MAX_COLS]`), painted flush against
-        // the pane's right edge — so column 97 is inside the strip with room
-        // to spare on either side of the exact width.
+        // #989: `minimap_reserved_width` gives a 100-column pane
+        // `MINIMAP_TARGET_COLS_TUI` (12 columns) — the fixed VS-Code-parity
+        // width, not a fraction of the pane — painted flush against the
+        // pane's right edge, so column 97 is inside the strip with room to
+        // spare on either side of the exact width.
         let strip_col = 97.0;
 
         driver.mouse_down(strip_col, 6.0);
@@ -12006,6 +12006,78 @@ mod tests {
                  for the same pane width ({expected}); screen:\n{screen}"
             );
         }
+    }
+
+    /// #989 acceptance: the TUI minimap strip's painted width must be the
+    /// **same** at 100, 150 and 200 terminal columns — VS Code parity means
+    /// the strip holds a fixed width across ordinary terminal sizes and
+    /// only narrows when a pane genuinely can't afford it, not that it
+    /// tracks the pane width the way
+    /// `minimap_strip_width_matches_the_formula_at_narrow_and_wide_terminal_widths_via_shell_app`
+    /// above checks (that test cross-checks the *painted* strip against
+    /// `TUI_MINIMAP_SIZING`'s own formula, so it would pass identically
+    /// whether or not that formula was itself proportional — it cannot
+    /// catch this bug). This test instead compares three independently
+    /// painted widths directly against each other, with no formula in the
+    /// loop, which is exactly the property the bug report names.
+    ///
+    /// **Verified RED against unfixed `develop`:** before #989,
+    /// `TUI_MINIMAP_SIZING` reused the pixel-flavoured `MINIMAP_TARGET_COLS`
+    /// (120), a value no ordinary terminal width ever reaches, so
+    /// `resolve_width`'s `fraction` term always won and the three widths
+    /// below came out as three different numbers (~15, ~22, ~30 columns) —
+    /// the `assert_eq!` on `at_150`/`at_200` against `at_100` failed,
+    /// confirmed by hand (reverting `MINIMAP_TARGET_COLS_TUI` back to
+    /// `MINIMAP_TARGET_COLS` in `TUI_MINIMAP_SIZING`) before restoring the
+    /// fix.
+    #[test]
+    fn minimap_strip_width_is_fixed_across_ordinary_terminal_widths_via_shell_app() {
+        fn painted_strip_width(screen: &str, row: usize, total_cols: usize) -> usize {
+            let start = braille_col(screen, row).unwrap_or_else(|| {
+                panic!("row {row} must paint minimap braille; screen:\n{screen}")
+            });
+            total_cols - start
+        }
+
+        let row = 12usize;
+        let mut widths = Vec::new();
+        for total_cols in [100u16, 150u16, 200u16] {
+            let mut driver = driver_with_shell(
+                app_with_shaped_buffer_no_sidebar(),
+                config(),
+                total_cols,
+                24,
+            );
+            // Warm-up dispatch — see
+            // `minimap_strip_does_not_double_the_scrollbar_via_shell_app`'s doc
+            // comment on `app_with_shaped_buffer_no_sidebar`: the pinned
+            // hidden sidebar only takes effect after one dispatch.
+            driver.press_named(quadraui::NamedKey::Escape);
+            let screen = driver.screen();
+            widths.push((
+                total_cols,
+                painted_strip_width(&screen, row, total_cols as usize),
+                screen,
+            ));
+        }
+
+        let (_, at_100, screen_100) = &widths[0];
+        let (_, at_150, screen_150) = &widths[1];
+        let (_, at_200, screen_200) = &widths[2];
+        assert_eq!(
+            at_100, at_150,
+            "the painted minimap strip must be the same width at 100 and \
+             150 terminal columns (100-col width={at_100}, 150-col \
+             width={at_150}); 100-col screen:\n{screen_100}\n150-col \
+             screen:\n{screen_150}"
+        );
+        assert_eq!(
+            at_100, at_200,
+            "the painted minimap strip must be the same width at 100 and \
+             200 terminal columns (100-col width={at_100}, 200-col \
+             width={at_200}); 100-col screen:\n{screen_100}\n200-col \
+             screen:\n{screen_200}"
+        );
     }
 
     // ── #733 slice 1: the shared modal-overlay mouse rung ────────────────
