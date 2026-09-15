@@ -131,7 +131,8 @@ impl BoardProviderConfig {
     /// Resolve the argv to run for `action_name` (a `quadraui::BoardAction`
     /// variant name) against `card_id`, substituting `{id}` in every
     /// argument. Returns `None` if this provider declared no command for
-    /// that action.
+    /// that action, or if it declared one as an explicit empty array
+    /// (equivalent to "not runnable").
     pub fn action_argv(&self, action_name: &str, card_id: &str) -> Option<Vec<String>> {
         let template = self.actions.get(action_name)?;
         if template.is_empty() {
