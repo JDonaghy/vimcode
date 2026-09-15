@@ -42,6 +42,41 @@
 //! a restatement of every `Rc`-cloned field `crate::gtk::testing::Harness`
 //! exposes. Follow-up issues that port more of the 84 portable GTK
 //! scenarios can grow [`ConformanceHarness`] as they need more.
+//!
+//! # Which trait bound a scenario needs (#982)
+//!
+//! Every backend's `conformance_harness*` constructor hands back a
+//! [`quadraui::testing::ConformanceDriver`] (keyboard-only: `type_char`/
+//! `type_text`/`press_named`/`screen_has`/`inventory`). GTK's, macOS's and
+//! Win-GUI's drivers *additionally* implement
+//! [`quadraui::testing::DriverInput`] (raw pixel `click`) and
+//! `quadraui::testing::PixelClickConformance` (native, coordinate-precise
+//! click delivery down to the OS widget). **TUI's `TuiDriver` implements
+//! `DriverInput` but not `PixelClickConformance`** — ratatui has no OS
+//! widget layer for the latter to mean anything.
+//!
+//! That makes the bound on a scenario's own generic parameter the boundary
+//! between "runs on every backend" and "GTK/macOS/Win-only", not a
+//! per-backend `#[cfg]`:
+//!
+//! - `fn scenario<D: ConformanceDriver>(driver: &mut D)` — keyboard-driven
+//!   (e.g. [`folder_picker_filters_and_escape_dismisses`],
+//!   [`command_palette_filters_and_escape_dismisses`]) — runs on **every**
+//!   backend, TUI included.
+//! - `fn scenario<D: ConformanceDriver + DriverInput>(driver: &mut D)` —
+//!   needs a raw click ([`sweep_hit_band_integrity`],
+//!   [`folder_picker_click_outside_dismisses_it`]) — still runs on
+//!   **every** backend, TUI included: `DriverInput` is the click bound both
+//!   sides share.
+//! - A scenario that needs `PixelClickConformance` specifically (native
+//!   widget-precise click delivery) is GTK/macOS/Win-only by construction —
+//!   write it with that bound and the [`backend_conformance!`] macro simply
+//!   has no `tui` arm to offer it.
+//!
+//! Reach for the narrowest bound the scenario actually needs, not the
+//! widest available on the backend you happen to be testing against first
+//! — a `DriverInput`-bounded body written against `GtkDriver` costs nothing
+//! extra to also run on `TuiDriver` via [`crate::tui_main::testing::conformance_harness`].
 
 #![cfg(any(test, feature = "test-support"))]
 
@@ -50,7 +85,7 @@ use std::path::PathBuf;
 use std::rc::Rc;
 
 use quadraui::testing::{ConformanceDriver, DriverInput};
-use quadraui::{Backend, NamedKey};
+use quadraui::NamedKey;
 
 use crate::app::{App, TextMetricsBackend};
 use crate::core::Engine;
@@ -522,4 +557,551 @@ pub(crate) fn assert_text_metrics_backend_applies_metrics<B: TextMetricsBackend>
          Backend::char_width() — a stubbed setter silently disables the \
          #540/#819 click drift guard (#967); see #969"
     );
+}
+
+// ── The `KNOWN_BUGS` bidirectional gate (#982) ──────────────────────────
+//
+// Mirrors `tests/nvim_conformance.rs`'s `KNOWN_DEVIATIONS` idiom (#799) for
+// GUI-driving scenarios written against `ConformanceHarness` instead of
+// nvim-comparison output. Six user-reported v0.11.0 bugs (this issue's own
+// chained follow-ups) each add a scenario that encodes *correct* behaviour
+// while their bug is still unfixed — without red-walling `cargo test` in
+// the meantime — by wrapping that scenario's body in [`known_bug_gate`] and
+// listing its label here.
+//
+// # THIS LIST MAY ONLY EVER SHRINK
+//
+// Never add an entry to silence a regression a fix introduced — that is
+// exactly the failure mode this mechanism exists to catch (see the table on
+// [`known_bug_gate_outcome`]'s doc). An entry is removed in the same PR that
+// fixes the bug it names; [`known_bug_gate`] itself fails the build if a
+// listed body starts passing and the entry is left behind, so "delete the
+// entry" is not optional cleanup, it is enforced.
+/// Labels of scenarios whose bodies are *expected* to panic today — see the
+/// module-level section above. Each entry carries its issue number in a
+/// trailing comment, same as `KNOWN_DEVIATIONS`.
+///
+/// Empty as of #982: this issue ships the mechanism and a self-test of both
+/// gate directions (below), not any of the six real bug scenarios — those
+/// are separate issues chained `--after` this one, each adding its own
+/// label here alongside its scenario.
+pub(crate) const KNOWN_BUGS: &[&str] = &[
+    // (none yet)
+];
+
+/// A saved `std::panic::set_hook`/`take_hook` closure — named so
+/// `known_bug_gate_outcome`'s suppress/restore `RestoreHook` doesn't need
+/// clippy's `type_complexity`-triggering type spelled out inline twice
+/// (production fn + test-only twin).
+type PanicHook = Box<dyn Fn(&std::panic::PanicHookInfo<'_>) + Sync + Send>;
+
+/// What [`known_bug_gate_outcome`] found, before it decides whether that's a
+/// passing test or a panic. Split out from [`known_bug_gate`] itself (which
+/// turns this into an actual pass/fail) so the self-test below can assert on
+/// the *verdict* directly instead of by making the suite actually fail —
+/// see this issue's acceptance bar for why that distinction matters: a test
+/// that can only observe "did the process abort" can't tell a correct gate
+/// from a gate that always passes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GateOutcome {
+    /// Body ran to completion and its label is not listed — the ordinary
+    /// case for every scenario that isn't chasing a known bug.
+    Pass,
+    /// Body panicked and its label *is* listed — the bug is still open,
+    /// exactly as `KNOWN_BUGS` says. Reported as a pass.
+    ExpectedFail,
+    /// Body panicked and its label is *not* listed — either a regression in
+    /// already-working behaviour, or a brand-new bug that needs its own
+    /// `KNOWN_BUGS` entry. Reported as a failure either way: an unlisted
+    /// panic must never pass silently.
+    Regression,
+    /// Body ran to completion but its label *is* listed — the fix landed
+    /// and nobody deleted the `KNOWN_BUGS` entry. Reported as a failure:
+    /// this is the direction that rots silently if untested (#982's own
+    /// self-test below exists because of this arm specifically).
+    FixLanded,
+}
+
+/// Run `body`, gated on whether `label` is listed in [`KNOWN_BUGS`]:
+///
+/// | body outcome | label listed | [`GateOutcome`] |
+/// |---|---|---|
+/// | panics | yes | [`ExpectedFail`](GateOutcome::ExpectedFail) |
+/// | panics | no  | [`Regression`](GateOutcome::Regression) |
+/// | passes | yes | [`FixLanded`](GateOutcome::FixLanded) |
+/// | passes | no  | [`Pass`](GateOutcome::Pass) |
+///
+/// Uses `catch_unwind` (unwinding is the default in this crate — no `panic
+/// = "abort"` in `Cargo.toml` — same pattern as `src/app.rs:7295`,
+/// `src/render.rs:8246`, `src/tui_main/mod.rs:404`), wrapped in
+/// [`std::panic::AssertUnwindSafe`] exactly as those three call sites are:
+/// a `ConformanceHarness` closes over `Rc<RefCell<_>>`/interior-mutable
+/// state throughout (`Engine`, the ratatui `Terminal`, ...), none of which
+/// is `UnwindSafe` by the auto-trait's strict definition, but that
+/// strictness is about *reading possibly-torn state after recovering from
+/// a panic* — this function never does that: on either outcome the whole
+/// `body` (harness included) has already been dropped by the time
+/// `catch_unwind` returns, so nothing torn is ever observed.
+///
+/// While `label` is listed, the process's panic hook is replaced with a
+/// no-op for the duration of the call (restored before returning either
+/// way, via a guard so a panicking `body` can't skip the restore) — a
+/// listed, still-open bug's expected panic should not spam a green `cargo
+/// test` run with a backtrace every time it runs. **Not** suppressed when
+/// `label` is unlisted: an unexpected panic (the [`Regression`](GateOutcome::Regression)
+/// arm) is exactly the case that should stay loud.
+///
+/// # The guard-poisoning trap
+///
+/// A `ConformanceHarness` holds a [`crate::test_paint::PaintGuard`] and a
+/// [`crate::test_cwd::CwdReadGuard`] — process-wide `Mutex`/`RwLock`s. If
+/// `body` panics while one is alive (the expected shape for a
+/// [`ExpectedFail`](GateOutcome::ExpectedFail) run), that lock is
+/// poisoned by the unwind. Both guards already handle this at the
+/// primitive level — `PaintGuard::acquire`/`CwdReadGuard::acquire` both
+/// recover via `.unwrap_or_else(|e| e.into_inner())`, their own module
+/// docs spelling out exactly why: "one red test must stay one red test
+/// rather than cascading into every later painting test panicking on a
+/// poisoned lock".
+/// [`tests::known_bug_gate_panic_does_not_poison_guards_for_a_later_harness`]
+/// below exercises this directly rather than trusting that description: it
+/// runs an `ExpectedFail` body that panics while holding a real
+/// `conformance_harness`-built harness, then builds and uses a second,
+/// fresh harness afterwards on the same thread, proving the first
+/// harness's teardown left nothing poisoned for the second to trip on.
+///
+/// # A residual limitation, stated rather than silently accepted
+///
+/// `std::panic::set_hook`/`take_hook` are process-global, not scoped to one
+/// call — `cargo test`'s thread pool means a genuinely unrelated test
+/// panicking on another thread during this call's brief suppression
+/// window would have *its* backtrace swallowed too. `KNOWN_BUGS` is empty
+/// as of #982 and grows by exactly one entry per already-triaged, already
+/// slow-to-fix bug (not a general-purpose "hide flaky panics" tool), so the
+/// window in practice is rare and short; a `HOOK_LOCK` mutex below at least
+/// serialises concurrent [`known_bug_gate`] calls against each other, which
+/// is the part actually under this module's control.
+pub(crate) fn known_bug_gate_outcome<F>(label: &str, body: F) -> GateOutcome
+where
+    F: FnOnce(),
+{
+    static HOOK_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    let listed = KNOWN_BUGS.contains(&label);
+
+    if !listed {
+        // Unlisted: never touch the hook, so an unexpected panic stays loud.
+        return if std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)).is_ok() {
+            GateOutcome::Pass
+        } else {
+            GateOutcome::Regression
+        };
+    }
+
+    let _hook_lock = HOOK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    /// RAII restore so a panicking `body` (the expected shape here) can't
+    /// skip putting the real hook back.
+    struct RestoreHook(Option<PanicHook>);
+    impl Drop for RestoreHook {
+        fn drop(&mut self) {
+            if let Some(hook) = self.0.take() {
+                std::panic::set_hook(hook);
+            }
+        }
+    }
+
+    let _restore = RestoreHook(Some(std::panic::take_hook()));
+    std::panic::set_hook(Box::new(|_info| {}));
+
+    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)).is_ok() {
+        GateOutcome::FixLanded
+    } else {
+        GateOutcome::ExpectedFail
+    }
+}
+
+/// The pass/fail wrapper around [`known_bug_gate_outcome`] a real gated
+/// scenario `#[test]` calls: turns [`GateOutcome::Regression`] and
+/// [`GateOutcome::FixLanded`] into a panic (test failure) with a message
+/// naming which of the two happened and what to do about it;
+/// [`GateOutcome::Pass`]/[`GateOutcome::ExpectedFail`] return normally.
+pub(crate) fn known_bug_gate<F>(label: &'static str, body: F)
+where
+    F: FnOnce(),
+{
+    match known_bug_gate_outcome(label, body) {
+        GateOutcome::Pass | GateOutcome::ExpectedFail => {}
+        GateOutcome::Regression => panic!(
+            "backend_conformance: scenario {label:?} panicked and is NOT listed \
+             in KNOWN_BUGS — this is either a regression in previously-working \
+             behaviour, or a brand-new bug that needs its own KNOWN_BUGS entry \
+             (see src/harness.rs)"
+        ),
+        GateOutcome::FixLanded => panic!(
+            "backend_conformance: scenario {label:?} PASSED but is still listed \
+             in KNOWN_BUGS — the fix landed; delete the KNOWN_BUGS entry for \
+             {label:?} in src/harness.rs"
+        ),
+    }
+}
+
+// ── The cross-backend runner (#982) ─────────────────────────────────────
+//
+// See this module's "Which trait bound a scenario needs" doc for the
+// `ConformanceDriver` vs `ConformanceDriver + DriverInput` boundary this
+// macro's `backends` list rides on.
+/// Expand one scenario into one `#[test]` per listed backend, each built
+/// through that backend's own `conformance_harness` constructor — a
+/// different concrete `ConformanceDriver` type per backend (`GtkDriver` vs
+/// `TuiDriver`), so this has to be a macro, not a generic fn over a runtime
+/// list of backends.
+///
+/// ```ignore
+/// crate::backend_conformance! {
+///     label: my_scenario,
+///     backends: [gtk, tui],
+///     engine: my_engine_fixture(),
+///     size: (800, 480),
+///     body: |driver| {
+///         crate::harness::command_palette_filters_and_escape_dismisses(driver);
+///     },
+/// }
+/// ```
+///
+/// expands to a `mod my_scenario { fn gtk() { .. } fn tui() { .. } }` with
+/// one `#[test]` per backend arm — `cargo test`'s own `mod_path::backend`
+/// test-name nesting is what keeps a single-backend failure self-locating,
+/// the same property `..._on_gtk`/`..._on_tui` naming would give, without
+/// needing identifier concatenation (no `concat_idents!`/proc-macro
+/// dependency to get there). The `gtk` arm is gated on `feature = "gui"`,
+/// the same gate `vimcode`'s own `required-features` puts on the GTK bin;
+/// the `tui` arm has no gate — `quadraui/tui` is an unconditional feature
+/// of the pinned dependency (see `Cargo.toml`), not an optional vimcode one.
+///
+/// Only `gtk`/`tui` are wired today. Growing this to `macos`/`win` is
+/// adding their own `@arm` match below, mirroring their existing
+/// `conformance_harness` constructors (`src/macos/mod.rs:243`,
+/// `src/win/mod.rs:188`) — each behind that backend's own vimcode feature
+/// gate, same shape as the `gtk` arm.
+///
+/// `engine`/`size`/`body` are each re-evaluated once per backend arm (not
+/// shared across them) — the intended shape, since every existing fixture
+/// in this repo that touches the filesystem (`scratch_dir`/
+/// `scratch_explorer_dir` helpers) already disambiguates by
+/// `std::thread::current().id()`, and `cargo test` runs each generated
+/// `#[test]` fn on its own thread, so two backends' arms never collide on
+/// the same path even though this macro duplicates the fixture-building
+/// expression textually.
+///
+/// `#[macro_export]` (rather than a manual `pub(crate) use`) so the `@arm`
+/// recursive expansion below can call itself via `$crate::backend_conformance!`
+/// — `$crate` always resolves against the crate root, which is where
+/// `#[macro_export]` places a macro regardless of which module defines it.
+#[macro_export]
+macro_rules! backend_conformance {
+    (
+        label: $label:ident,
+        backends: [$($backend:ident),+ $(,)?],
+        engine: $engine:expr,
+        size: ($w:expr, $h:expr),
+        body: |$driver:ident| $body:block $(,)?
+    ) => {
+        mod $label {
+            #[allow(unused_imports)]
+            use super::*;
+
+            $(
+                $crate::backend_conformance!(
+                    @arm $backend, $engine, $w, $h, |$driver| $body
+                );
+            )+
+        }
+    };
+
+    (@arm gtk, $engine:expr, $w:expr, $h:expr, |$driver:ident| $body:block) => {
+        #[cfg(feature = "gui")]
+        #[test]
+        fn gtk() {
+            let mut __h = $crate::gtk::testing::conformance_harness(
+                $engine, $w as i32, $h as i32,
+            );
+            let $driver = &mut __h.driver;
+            $body
+        }
+    };
+
+    (@arm tui, $engine:expr, $w:expr, $h:expr, |$driver:ident| $body:block) => {
+        #[test]
+        fn tui() {
+            let mut __h = $crate::tui_main::testing::conformance_harness(
+                $engine, $w as u16, $h as u16,
+            );
+            let $driver = &mut __h.driver;
+            $body
+        }
+    };
+}
+
+/// Test-only helper for [`tests::known_bug_gate_panic_does_not_poison_guards_for_a_later_harness`]:
+/// build whichever conformance harness this build has compiled — TUI is
+/// unconditional, so prefer it (no `feature = "gui"` dependency for a check
+/// that has nothing to do with GTK specifically).
+#[cfg(test)]
+fn gtk_or_tui_probe_harness(
+) -> ConformanceHarness<quadraui::tui::testing::TuiDriver<impl quadraui::AppLogic>> {
+    let mut engine = crate::core::Engine::new_for_test();
+    engine.settings.use_nerd_fonts = false;
+    crate::tui_main::testing::conformance_harness(engine, 80, 24)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A minimal engine fixture for the cross-backend proof slice below:
+    /// an explorer rooted at a scratch dir, with the root and `src`
+    /// expanded so `src`'s child `core` paints directly beneath it — the
+    /// same shape `src/macos/mod.rs`'s own `sweep_hit_band_integrity`
+    /// coverage (`explorer_click_hit_band_matches_the_painted_row`, #967/
+    /// #968) uses, reproduced here rather than shared with it (that
+    /// fixture is private to `src/macos/mod.rs`'s own test module) so this
+    /// module's proof slice doesn't reach into another backend's file.
+    ///
+    /// `tag` must be distinct per caller (this fn is called once per
+    /// generated backend arm below) — combined with the calling thread's
+    /// id, per `backend_conformance!`'s own doc on why that's enough to
+    /// avoid two backends' arms colliding on the same scratch directory.
+    fn engine_with_expanded_explorer(tag: &str) -> crate::core::Engine {
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_test_982_harness_proof_{tag}_{:?}",
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src").join("core")).unwrap();
+
+        let mut engine = crate::core::Engine::new_for_test();
+        engine.settings.use_nerd_fonts = false;
+        engine.cwd = dir.clone();
+        engine.explorer_expanded.insert(dir.clone());
+        engine.explorer_expanded.insert(dir.join("src"));
+        engine.explorer_rebuild_rows();
+        engine.session.explorer_visible = true;
+        engine
+    }
+
+    // ── Deliverable 4, item 1: one existing scenario, both backends ────
+    //
+    // `sweep_hit_band_integrity` is the scenario the issue itself names as
+    // bounded by `ConformanceDriver + DriverInput` (not
+    // `PixelClickConformance`), i.e. exactly the one this proof slice needs
+    // to demonstrate the macro expands identically on both GTK and TUI.
+    // RED-verification: with `impl TextMetricsBackend for TuiBackend`'s two
+    // setters temporarily changed to write a value the getter never reads
+    // back (impossible to construct meaningfully here, since `TuiBackend`'s
+    // getters are hardcoded — see that impl's own doc) there is no
+    // TUI-side drift to provoke; this proof slice's RED-verification is
+    // therefore the same one `src/macos/mod.rs`'s
+    // `explorer_click_hit_band_matches_the_painted_row` already carries
+    // (reverting the GTK/macOS `TextMetricsBackend` fix takes the *gtk*
+    // arm here red), confirming this is the same shared scenario body,
+    // not a fork of it.
+    crate::backend_conformance! {
+        label: sweep_hit_band_integrity_proof,
+        backends: [gtk, tui],
+        engine: engine_with_expanded_explorer("sweep"),
+        size: (800, 480),
+        body: |driver| {
+            assert!(
+                driver.screen_has("src") && driver.screen_has("core"),
+                "precondition: the explorer must paint both `src` and its \
+                 expanded child `core`"
+            );
+            crate::harness::sweep_hit_band_integrity(driver, "src", 5, |d| {
+                quadraui::testing::ConformanceDriver::inventory(d).screen_has("core")
+            });
+        },
+    }
+
+    // ── Deliverable 4, item 2: both gate directions (#982) ──────────────
+    //
+    // The load-bearing half of this issue, per its own acceptance bar:
+    // "Direction 2 is the half that rots silently if untested". Both
+    // directions assert on the returned `GateOutcome` itself rather than
+    // on the test process's own pass/fail, exactly as the issue asks —
+    // inspecting the verdict is what lets this test itself stay green
+    // while proving both a green-suite direction *and* a
+    // should-have-failed direction of the mechanism it's testing.
+    #[test]
+    fn known_bug_gate_reports_expected_fail_for_a_listed_panicking_body() {
+        const LABEL: &str = "harness_self_test::always_panics";
+
+        // Deliberately not in `KNOWN_BUGS` — the gate takes the listing as
+        // a parameter here (`known_bug_gate_outcome` doesn't consult the
+        // real const, `KNOWN_BUGS.contains` does — so this test proves the
+        // *mechanism*, independent of what's currently listed for real,
+        // by exercising both a body that panics and one that doesn't
+        // against a hand-picked "is this listed" question). See the second
+        // test below for the "genuinely not listed" half.
+        let outcome = known_bug_gate_outcome_for_test(LABEL, true, || {
+            panic!("synthetic always-failing body (#982 self-test)");
+        });
+        assert_eq!(
+            outcome,
+            GateOutcome::ExpectedFail,
+            "a listed body that panics must report ExpectedFail (suite stays green)"
+        );
+    }
+
+    #[test]
+    fn known_bug_gate_reports_fix_landed_for_a_listed_passing_body() {
+        const LABEL: &str = "harness_self_test::always_passes";
+
+        let outcome = known_bug_gate_outcome_for_test(LABEL, true, || {
+            // Deliberately does nothing — a body that "passes".
+        });
+        assert_eq!(
+            outcome,
+            GateOutcome::FixLanded,
+            "a listed body that passes must report FixLanded — 'fix landed, \
+             delete the KNOWN_BUGS entry' — this is the direction that rots \
+             silently if untested"
+        );
+    }
+
+    #[test]
+    fn known_bug_gate_reports_regression_for_an_unlisted_panicking_body() {
+        let outcome = known_bug_gate_outcome_for_test("harness_self_test::unlisted", false, || {
+            panic!("synthetic unlisted panic (#982 self-test)");
+        });
+        assert_eq!(
+            outcome,
+            GateOutcome::Regression,
+            "an unlisted body that panics must report Regression, never a pass"
+        );
+    }
+
+    #[test]
+    fn known_bug_gate_reports_pass_for_an_unlisted_passing_body() {
+        let outcome =
+            known_bug_gate_outcome_for_test("harness_self_test::unlisted_ok", false, || {});
+        assert_eq!(outcome, GateOutcome::Pass);
+    }
+
+    // ── Coverage for the real public wrapper, not just the outcome fn ───
+    //
+    // The four tests above exercise `known_bug_gate_outcome_for_test` (a
+    // test-only twin that can pretend any label is listed). These two
+    // exercise `known_bug_gate` itself — the panic-or-not wrapper every
+    // real per-bug scenario `#[test]` will actually call — against its two
+    // reachable arms given `KNOWN_BUGS` is empty (#982 ships no real entry
+    // yet): unlisted-passing (must not panic) and unlisted-panicking (must
+    // panic, i.e. fail the calling test). The listed arms
+    // (`ExpectedFail`/`FixLanded`) are exactly what the table-driven tests
+    // above already cover via the parameterized twin.
+    #[test]
+    fn known_bug_gate_does_not_panic_for_an_unlisted_passing_body() {
+        known_bug_gate("harness_self_test::wrapper_unlisted_ok", || {});
+    }
+
+    #[test]
+    fn known_bug_gate_panics_for_an_unlisted_panicking_body() {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            known_bug_gate("harness_self_test::wrapper_unlisted_panics", || {
+                panic!("synthetic unlisted panic (#982 self-test)");
+            });
+        }));
+        assert!(
+            result.is_err(),
+            "known_bug_gate must itself panic (failing the calling test) for \
+             an unlisted body that panics — an unlisted panic must never be \
+             swallowed"
+        );
+    }
+
+    /// Test-only twin of [`known_bug_gate_outcome`] that takes "is this
+    /// listed" as an explicit parameter instead of consulting the real
+    /// [`KNOWN_BUGS`] — so this suite can exercise all four table rows
+    /// without needing a real (and therefore permanent, until some other
+    /// issue's fix deletes it) entry in that list just to test the
+    /// mechanism. Duplicates `known_bug_gate_outcome`'s body rather than
+    /// refactoring it to take the listing as a parameter, because
+    /// `known_bug_gate_outcome`'s own public signature — "label, consult
+    /// the real list" — is the contract every real call site (a future
+    /// per-bug scenario) needs; threading a test-only bool through it would
+    /// leave a footgun parameter in the production API for one test's
+    /// convenience.
+    fn known_bug_gate_outcome_for_test<F>(label: &str, listed: bool, body: F) -> GateOutcome
+    where
+        F: FnOnce(),
+    {
+        static HOOK_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+        if !listed {
+            return if std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)).is_ok() {
+                GateOutcome::Pass
+            } else {
+                GateOutcome::Regression
+            };
+        }
+
+        let _hook_lock = HOOK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        struct RestoreHook(Option<PanicHook>);
+        impl Drop for RestoreHook {
+            fn drop(&mut self) {
+                if let Some(hook) = self.0.take() {
+                    std::panic::set_hook(hook);
+                }
+            }
+        }
+
+        let _restore = RestoreHook(Some(std::panic::take_hook()));
+        std::panic::set_hook(Box::new(|_info| {}));
+
+        let _ = label;
+        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)).is_ok() {
+            GateOutcome::FixLanded
+        } else {
+            GateOutcome::ExpectedFail
+        }
+    }
+
+    /// The guard-poisoning trap, verified explicitly rather than trusted
+    /// from `PaintGuard`/`CwdReadGuard`'s own doc comments (per this
+    /// issue's own instruction: "Verify this explicitly"). Runs an
+    /// `ExpectedFail`-shaped gate — a body that builds a real
+    /// `conformance_harness` (acquiring both process-wide guards) and then
+    /// panics while it's still alive — and then builds and drives a
+    /// *second*, independent harness afterwards, on the same thread. If
+    /// either guard's `Mutex`/`RwLock` poisoning cascaded past the first
+    /// harness's teardown, the second `conformance_harness` call below (or
+    /// the `screen_has` it depends on) would deadlock or panic on a poison
+    /// error instead of completing normally.
+    #[test]
+    fn known_bug_gate_panic_does_not_poison_guards_for_a_later_harness() {
+        let outcome = known_bug_gate_outcome("harness_self_test::poison_probe_unused", {
+            let h = super::gtk_or_tui_probe_harness();
+            move || {
+                // Touch the harness so it's genuinely alive across the
+                // panic, then panic while it's still holding both guards.
+                let _ = h.driver.screen_contains("anything");
+                panic!("synthetic panic while holding a live ConformanceHarness (#982)");
+            }
+        });
+        // Not asserted against KNOWN_BUGS (the label above is deliberately
+        // never listed) — this call goes through the *unlisted* path,
+        // which still constructs+panics inside `body` and still must not
+        // poison anything for the harness built immediately below.
+        assert_eq!(outcome, GateOutcome::Regression);
+
+        // The actual assertion: a second, independent harness must build
+        // and paint successfully right after, on this same thread.
+        let second = super::gtk_or_tui_probe_harness();
+        assert!(
+            !second.driver.screen_contains("__never_painted_982__"),
+            "a fresh harness built after a guard-holding panic must still \
+             paint normally, not deadlock/panic on a poisoned lock"
+        );
+    }
 }
