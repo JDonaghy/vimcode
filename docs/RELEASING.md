@@ -45,6 +45,51 @@ the gate is where you find out they regressed — not after you've promised them
 
 **Run every lane. Record every result.** Four backends, four lanes, three machines.
 
+### 1.0 Run it with `scripts/platform-conformance.sh` — and with a clean `HOME`
+
+[#926](https://github.com/JDonaghy/vimcode/issues/926) shipped the runner this
+section used to describe by hand. Prefer it: it probes the host, runs every lane
+that host supports, prints a matrix, and **exits non-zero if a supported lane did
+not run or ran zero tests** — the #645 vacuous-green trap, enforced rather than
+remembered.
+
+```bash
+scripts/platform-conformance.sh --print-plan   # resolve the matrix, run nothing
+scripts/platform-conformance.sh                # run every supported lane
+```
+
+**Run it under a throwaway `HOME`.** As of [#976](https://github.com/JDonaghy/vimcode/issues/976)
+the `shell_app` driver tests read — and write — the real `~/.config/vimcode`, so
+a machine that has ever run the editor fails tests that are green in CI, whose
+`HOME` is always pristine. This is not a platform difference and not a
+regression; it is ambient state:
+
+```bash
+env HOME=$(mktemp -d) RUSTUP_HOME=~/.rustup CARGO_HOME=~/.cargo PATH=~/.cargo/bin:$PATH \
+  scripts/platform-conformance.sh
+```
+
+Measured at d6e0ed3 on `dellserver`: with the real `HOME`, one failure
+(`ctrl_o_activates_original_tab_via_shell_app`); with a clean one, **tui 4129
+passed / gtk 4294 passed across 49 binaries, exit 0**. Drop the `HOME` override
+once #976 lands and the fixtures stop touching the user's config.
+
+**The oracle is load-bearing.** `tests/nvim_conformance.rs` hard-fails when `nvim`
+is missing rather than skipping — 1,436 Vim-behaviour cases that did not run are
+not a pass. The fleet standard is the version `NVIM_ORACLE_VERSION` pins in
+`.github/workflows/ci.yml` (v0.12.5 today). A machine without it is not a gate
+machine:
+
+```bash
+curl -fsSL -o /tmp/nvim.tar.gz \
+  https://github.com/neovim/neovim/releases/download/v0.12.5/nvim-linux-x86_64.tar.gz
+tar -C ~/.local -xzf /tmp/nvim.tar.gz && ln -sf ~/.local/nvim-linux-x86_64/bin/nvim ~/.local/bin/nvim
+```
+
+The manual per-lane commands below remain correct and are what the runner
+invokes; keep them for reading a single lane in isolation, or when the runner
+itself is what you doubt.
+
 > **Scoping the gate to a platform-limited release.** v0.11.0 ships Linux only
 > (§0), so the macOS and Windows lanes are *out of scope*, not *skipped* — the
 > "a lane you skipped is a lane that failed" rule below governs platforms you are
@@ -212,10 +257,9 @@ For a Linux-only release the same block collapses to:
 - [ ] macOS / Windows / Flatpak — out of scope, not shipping (§0, §2.2)
 ```
 
-> **This section collapses to one command when [vimcode#926](https://github.com/JDonaghy/vimcode/issues/926)
-> lands.** That issue builds `scripts/platform-conformance.sh`: one entrypoint that
-> probes the host, runs the lanes it supports, prints a matrix, and exits non-zero
-> on a skipped or zero-test lane. Update this section to call it when it ships.
+> **#926 has shipped** — `scripts/platform-conformance.sh` is the entrypoint, see
+> §1.0. The per-lane commands above are what it runs; read them when you want one
+> lane in isolation.
 
 ---
 
@@ -297,7 +341,7 @@ dated list rather than a habit.
 | Symptom | Lane | Status |
 |---|---|---|
 | 3 pixel/paint probes fail (§1.3b) | macOS GTK | Expected — #934, Core Text vs freetype rasterisation |
-| 9 `tui_main::shell_app` driver tests fail | macOS (both lanes) | Under investigation — #976; Darwin-only, green on Linux CI at the same SHA; **not** caused by the quadraui pin |
+| `shell_app` driver tests fail on a used machine | any host with a real `~/.config/vimcode` | Root-caused — #976; the fixtures read and write the real user config, so CI (pristine `HOME`) is green and developer machines are not. Run the gate under `HOME=$(mktemp -d)` (§1.0) until it lands. **Not** platform-specific and **not** the quadraui pin |
 | `install_menu_bar` main-thread panic, caught (§1.3) | macOS native | Expected — test-runner threading; vimcode#901 closed, native menu bar untested |
 | No Win-GUI test suite | Windows | Gap — `src/win/` has zero `#[test]`s |
 | Flatpak bundle unbuildable (§2.2) | Linux | Gap — #975; `cargo-sources.json` predates the #691 git dep; not shipping in v0.11.0 |
