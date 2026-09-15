@@ -373,6 +373,86 @@ pub fn sweep_hit_band_integrity<D: ConformanceDriver + DriverInput>(
     }
 }
 
+/// Like [`sweep_hit_band_integrity`], for a probe whose click is not
+/// self-restoring (#971).
+///
+/// [`sweep_hit_band_integrity`]'s click-then-click-to-restore pattern
+/// depends on the *second* click undoing whatever the first one did — true
+/// for a directory row's expand/collapse flip, and for a `SidebarSystem`
+/// section header's identical flip (#971's source-control and ext-panel
+/// sweeps). It is **not** true for the unified picker's row click
+/// (`render::apply_picker_row_click`): the first click on a not-yet-selected
+/// row only selects it, but the second click at that same point now lands on
+/// an *already*-selected row, which confirms it (`Engine::picker_confirm`)
+/// and closes the popup outright — unless the row is `expandable`, the one
+/// documented escape hatch, and no `PickerItem` in this codebase ever sets
+/// `expandable: true` (see `Engine::build_symbol_tree_items`'s own #262
+/// comment), so that branch is unreachable in practice. Reusing
+/// `sweep_hit_band_integrity` here would close the popup after sample 0's
+/// restore click, leaving every later sample clicking dead space behind a
+/// dismissed modal.
+///
+/// `setup` rebuilds a fresh, comparable starting state before **every**
+/// sample (not just once) instead of relying on a self-cancelling second
+/// click — e.g. re-opening the picker with nothing yet selected on the
+/// target row. Unlike [`sweep_hit_band_integrity`], `needle`'s bounds are
+/// re-located after every `setup()` call rather than once up front — a
+/// modal popup that gets torn down and rebuilt this many times is not
+/// guaranteed to repaint at the exact same pixel position each time (a
+/// picker popup was observed centering itself a few pixels differently
+/// after its first couple of opens in this repo's own #971 development —
+/// unrelated to hit-testing, but enough to make a once-only bounds lookup
+/// flaky), and re-locating costs nothing `setup` was not already going to
+/// pay for with its own repaint.
+pub fn sweep_hit_band_integrity_resetting<D: ConformanceDriver + DriverInput>(
+    driver: &mut D,
+    needle: &str,
+    samples: usize,
+    mut setup: impl FnMut(&mut D),
+    mut fingerprint: impl FnMut(&mut D) -> bool,
+) {
+    assert!(
+        samples >= 2,
+        "sweep_hit_band_integrity_resetting: need at least 2 samples to compare, got {samples}"
+    );
+
+    let mut outcomes = Vec::with_capacity(samples);
+    let mut ys = Vec::with_capacity(samples);
+    for i in 0..samples {
+        setup(driver);
+        let bounds = driver
+            .inventory()
+            .text_runs()
+            .iter()
+            .find(|r| r.text.contains(needle))
+            .map(|r| r.bounds)
+            .unwrap_or_else(|| {
+                panic!("sweep_hit_band_integrity_resetting: {needle:?} not painted")
+            });
+        let x = bounds.x + bounds.width / 2.0;
+        let top = bounds.y + 0.5;
+        let bottom = (bounds.y + bounds.height - 0.5).max(top);
+
+        let t = i as f32 / (samples - 1) as f32;
+        let y = top + (bottom - top) * t;
+        driver.click(x, y);
+        outcomes.push(fingerprint(driver));
+        ys.push(y);
+    }
+
+    let baseline = outcomes[0];
+    for (i, outcome) in outcomes.iter().enumerate() {
+        assert_eq!(
+            *outcome,
+            baseline,
+            "sweep_hit_band_integrity_resetting: point {i}/{} inside {needle:?}'s \
+             painted band resolved to a different target than the top of the row \
+             (#967 hit-band drift) — outcomes were {outcomes:?} at y-offsets {ys:?}",
+            samples - 1,
+        );
+    }
+}
+
 pub fn folder_picker_click_outside_dismisses_it<D: ConformanceDriver + DriverInput>(
     driver: &mut D,
     distinctive: &str,

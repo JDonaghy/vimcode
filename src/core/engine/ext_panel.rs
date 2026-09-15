@@ -1709,12 +1709,14 @@ impl Engine {
                 self.ext_sidebar_input_active = false;
                 true
             }
-            quadraui::SidebarEvent::HeaderActivated { section } => {
-                let mut sys = self.ext_sidebar_system.borrow_mut();
-                let collapsed = sys.is_collapsed(section);
-                sys.set_collapsed(section, !collapsed);
-                true
-            }
+            // #971: `SidebarSystem::click` already flips `collapsed[section]`
+            // itself before returning this event — see
+            // `Engine::dispatch_sc_sidebar_event`'s identical fix for the
+            // full story (same double-toggle-cancels-out bug, same fix,
+            // caught by this panel's own
+            // `ext_panel_header_click_hit_band_matches_the_painted_row`
+            // sanity check in `src/macos/mod.rs`).
+            quadraui::SidebarEvent::HeaderActivated { .. } => true,
             quadraui::SidebarEvent::Ignored => false,
             _ => true,
         }
