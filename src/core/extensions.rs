@@ -77,6 +77,10 @@ pub struct ExtensionManifest {
     /// Derived at fetch time; not serialized to JSON/TOML.
     #[serde(skip)]
     pub registry_base_url: String,
+    /// Declares this extension as a Board-panel data provider (#522).
+    /// `None` means this extension doesn't provide a board.
+    #[serde(default)]
+    pub board: Option<BoardProviderConfig>,
 }
 
 /// Comment style override specified in an extension manifest `[comment]` section.
@@ -88,6 +92,58 @@ pub struct CommentConfig {
     pub block_open: String,
     #[serde(default)]
     pub block_close: String,
+}
+
+/// Declares an extension as a Board-panel data provider (#522).
+///
+/// Generic on purpose — this struct names no particular provider. Any
+/// extension can point `refresh_command` at an external tool that emits
+/// vimcode's board JSON contract (`quadraui::BoardModel`, see
+/// `crate::core::tool_client::fetch_board_model`) on stdout and get a
+/// working Board panel. A pipeline-management bundle is one such
+/// provider, not the only one — nothing here names any particular
+/// external tool or its subcommands.
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct BoardProviderConfig {
+    /// Argv to run for a board refresh. `refresh_command[0]` is the
+    /// binary, the rest are arguments. Must emit a `quadraui::BoardModel`
+    /// JSON document on stdout and exit zero.
+    #[serde(default)]
+    pub refresh_command: Vec<String>,
+    /// Seconds between automatic background refreshes.
+    #[serde(default = "default_board_poll_interval_secs")]
+    pub poll_interval_secs: u64,
+    /// Maps a `quadraui::BoardAction` variant name (e.g. `"OpenIssue"`,
+    /// `"OpenReview"`) to an argv template to run when that action fires.
+    /// The literal token `{id}` in any argument is replaced with the
+    /// acted-on card id at dispatch time. Actions with no entry here are
+    /// simply not runnable — the panel host should no-op rather than
+    /// error.
+    #[serde(default)]
+    pub actions: std::collections::HashMap<String, Vec<String>>,
+}
+
+fn default_board_poll_interval_secs() -> u64 {
+    30
+}
+
+impl BoardProviderConfig {
+    /// Resolve the argv to run for `action_name` (a `quadraui::BoardAction`
+    /// variant name) against `card_id`, substituting `{id}` in every
+    /// argument. Returns `None` if this provider declared no command for
+    /// that action.
+    pub fn action_argv(&self, action_name: &str, card_id: &str) -> Option<Vec<String>> {
+        let template = self.actions.get(action_name)?;
+        if template.is_empty() {
+            return None;
+        }
+        Some(
+            template
+                .iter()
+                .map(|arg| arg.replace("{id}", card_id))
+                .collect(),
+        )
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
@@ -683,6 +739,63 @@ binary = "test-lsp"
         assert_eq!(cfg.install_cmd_for(Platform::MacOS), "brew install llvm");
         // No install_windows and no generic `install` fallback set → empty.
         assert_eq!(cfg.install_cmd_for(Platform::Windows), "");
+    }
+
+    #[test]
+    fn board_provider_config_defaults_when_absent_from_toml() {
+        // A manifest with no [board] section should parse to `None`, not
+        // an error — most extensions never touch the board panel.
+        let toml = r#"
+name = "rust"
+display_name = "Rust Language Support"
+"#;
+        let m = ExtensionManifest::parse(toml).expect("should parse");
+        assert!(m.board.is_none());
+    }
+
+    #[test]
+    fn board_provider_config_parses_from_toml() {
+        let toml = r#"
+name = "example-provider"
+display_name = "Example Board Provider"
+
+[board]
+refresh_command = ["example-tool", "board", "--json"]
+poll_interval_secs = 15
+
+[board.actions]
+OpenIssue = ["example-tool", "open", "{id}"]
+"#;
+        let m = ExtensionManifest::parse(toml).expect("should parse");
+        let board = m.board.expect("board provider config should be present");
+        assert_eq!(
+            board.refresh_command,
+            vec!["example-tool", "board", "--json"]
+        );
+        assert_eq!(board.poll_interval_secs, 15);
+        assert_eq!(
+            board.action_argv("OpenIssue", "card:42"),
+            Some(vec![
+                "example-tool".to_string(),
+                "open".to_string(),
+                "card:42".to_string()
+            ])
+        );
+        assert_eq!(board.action_argv("Merge", "card:42"), None);
+    }
+
+    #[test]
+    fn board_provider_config_poll_interval_defaults_when_unset() {
+        let toml = r#"
+name = "example-provider"
+display_name = "Example Board Provider"
+
+[board]
+refresh_command = ["example-tool", "board", "--json"]
+"#;
+        let m = ExtensionManifest::parse(toml).expect("should parse");
+        let board = m.board.expect("board provider config should be present");
+        assert_eq!(board.poll_interval_secs, 30);
     }
 
     #[test]
