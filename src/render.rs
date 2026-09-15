@@ -10298,13 +10298,39 @@ pub struct ScreenLayout {
 /// `MINIMAP_MIN_TEXT_COLS`).
 pub const MINIMAP_WIDTH_FRACTION: f64 = 0.15;
 
-/// Target minimap width, in the caller's own native unit (px for GTK,
-/// columns for TUI) — VS Code's `minimap.maxColumn` default (#728), shared
-/// by both backends' `MinimapSizing` below since VS Code renders its
-/// minimap at one pixel per assumed source column, so at 120px this is
-/// "precisely 1px per column", and TUI's column-native units make the same
-/// constant trivially the column count directly.
+/// Target minimap width for **GTK**, in raw pixels — VS Code's
+/// `minimap.maxColumn` default (#728): VS Code renders its minimap at one
+/// pixel per assumed source column, so at 120px this is "precisely 1px per
+/// column".
+///
+/// #989: despite the name, this is GTK-only — it used to be reused for TUI's
+/// `TUI_MINIMAP_SIZING` too on the theory that "columns for TUI" made the
+/// same number trivially portable, but 120 *terminal columns* is wider than
+/// almost any real terminal, so in `resolve_width` the fraction term always
+/// won and the TUI strip scaled with the pane instead of holding steady. See
+/// [`MINIMAP_TARGET_COLS_TUI`] for TUI's own, deliberately much smaller,
+/// value.
 const MINIMAP_TARGET_COLS: f64 = 120.0;
+
+/// Target minimap width for TUI, in cell columns — **not** `MINIMAP_TARGET_COLS`
+/// (#989). `MINIMAP_TARGET_COLS` (120) is meaningful only in GTK's pixel unit:
+/// at 120*px* it is VS Code's "precisely 1px per column" parity, but the same
+/// number read as 120 *columns* is wider than almost any real terminal, so in
+/// `resolve_width`'s `target_cols.min(pane_width_cols * fraction)` the
+/// `fraction` term always won instead — the strip scaled with the pane on
+/// every ordinary terminal width, the exact bug #989 reports. This is the
+/// same pixels-vs-columns unit split `gtk_minimap_sizing`'s doc comment
+/// covers, just seen from the TUI side: reusing the pixel-flavoured constant
+/// here is the defect, not a redundancy to "simplify" back.
+///
+/// Chosen so `target_cols.min(pane_width_cols * MINIMAP_WIDTH_FRACTION)`
+/// resolves to this fixed value — not the fraction — across ordinary
+/// terminal widths (80..200 cols): at the narrow end (80 cols),
+/// `80 * 0.15 = 12`, so any target at or below 12 makes the target win from
+/// 80 cols up. Below 80 cols the fraction (and eventually `MINIMAP_MIN_COLS`)
+/// still take over, so the strip keeps narrowing smoothly on panes that
+/// genuinely can't afford it.
+const MINIMAP_TARGET_COLS_TUI: f64 = 12.0;
 
 /// Floor on the reserved width for TUI, in cell columns directly — see
 /// `gtk_minimap_sizing`'s doc comment for why GTK needs its own, separate
@@ -10336,7 +10362,7 @@ const MINIMAP_MIN_TEXT_COLS: f64 = 30.0;
 /// shaped after [`TUI_PICKER_SIZING`]/[`gtk_picker_sizing`] above — the same
 /// established pattern for a genuine per-backend sizing difference.
 pub const TUI_MINIMAP_SIZING: quadraui::MinimapSizing = quadraui::MinimapSizing::VsCodeParity {
-    target_cols: MINIMAP_TARGET_COLS as f32,
+    target_cols: MINIMAP_TARGET_COLS_TUI as f32,
     fraction: MINIMAP_WIDTH_FRACTION as f32,
     min: MINIMAP_MIN_COLS as f32,
     max: MINIMAP_MAX_COLS as f32,
@@ -23693,25 +23719,55 @@ mod tests {
         );
     }
 
-    /// #722 acceptance: the reserved width is a proportion of the *pane's*
-    /// width, so widening the pane must widen the strip too — unlike the
-    /// old fixed `MINIMAP_COLS` constant, which stayed put as the window
-    /// grew. `char_width == 1.0` (TUI-shaped) keeps `resolve_width`'s
-    /// column-normalisation a no-op, so both widths land `want = width *
-    /// MINIMAP_WIDTH_FRACTION` strictly inside `[MINIMAP_MIN_COLS,
-    /// MINIMAP_MAX_COLS]` (9 and 18, against a 6..30 band) and the clamp
-    /// can't be masking the scaling either assertion exercises.
+    /// #722 acceptance (narrowed by #989): below the point where
+    /// `MINIMAP_TARGET_COLS_TUI` becomes affordable, the reserved width is
+    /// still a proportion of the *pane's* width, so widening a genuinely
+    /// narrow pane must still widen the strip. `char_width == 1.0`
+    /// (TUI-shaped) keeps `resolve_width`'s column-normalisation a no-op, so
+    /// both widths land `want = width * MINIMAP_WIDTH_FRACTION` strictly
+    /// inside `[MINIMAP_MIN_COLS, MINIMAP_MAX_COLS]` (6 and 10.5, against a
+    /// 6..30 band) and below `MINIMAP_TARGET_COLS_TUI` (12) — both widths
+    /// stay in the pre-#989 proportional regime, unlike an *ordinary*
+    /// terminal width (see `minimap_reserved_width_holds_steady_across_ordinary_pane_widths`
+    /// below for the #989 fix itself, where the strip stops scaling).
     #[test]
-    fn minimap_reserved_width_scales_with_pane_width() {
+    fn minimap_reserved_width_scales_with_a_narrow_pane_width() {
         let e = minimap_engine();
-        let narrow = minimap_reserved_width(&e, 60.0, 1.0, TUI_MINIMAP_SIZING);
-        let wide = minimap_reserved_width(&e, 120.0, 1.0, TUI_MINIMAP_SIZING);
-        assert_eq!(narrow, 60.0 * MINIMAP_WIDTH_FRACTION);
-        assert_eq!(wide, 120.0 * MINIMAP_WIDTH_FRACTION);
+        let narrow = minimap_reserved_width(&e, 40.0, 1.0, TUI_MINIMAP_SIZING);
+        let wide = minimap_reserved_width(&e, 70.0, 1.0, TUI_MINIMAP_SIZING);
+        assert_eq!(narrow, 40.0 * MINIMAP_WIDTH_FRACTION);
+        assert_eq!(wide, 70.0 * MINIMAP_WIDTH_FRACTION);
         assert!(
             wide > narrow * 1.5,
-            "doubling the pane width must substantially widen the strip: \
-             narrow(60)={narrow}, wide(120)={wide}"
+            "widening a pane still too narrow to afford the fixed target must \
+             substantially widen the strip: \
+             narrow(40)={narrow}, wide(70)={wide}"
+        );
+    }
+
+    /// #989 fix: on ordinary terminal widths (80..200 cols) the TUI minimap
+    /// must hold steady at `MINIMAP_TARGET_COLS_TUI`, not scale with the
+    /// pane. RED against the pre-#989 shape (`TUI_MINIMAP_SIZING` reusing
+    /// the pixel-flavoured `MINIMAP_TARGET_COLS` = 120, which can never bind
+    /// in columns): at those same three widths this would have returned
+    /// `15`, `22.5` and `30` (the `fraction`-driven, then max-clamped,
+    /// values) respectively — three different widths instead of one.
+    #[test]
+    fn minimap_reserved_width_holds_steady_across_ordinary_pane_widths() {
+        let e = minimap_engine();
+        let at_100 = minimap_reserved_width(&e, 100.0, 1.0, TUI_MINIMAP_SIZING);
+        let at_150 = minimap_reserved_width(&e, 150.0, 1.0, TUI_MINIMAP_SIZING);
+        let at_200 = minimap_reserved_width(&e, 200.0, 1.0, TUI_MINIMAP_SIZING);
+        assert_eq!(
+            (at_100, at_150, at_200),
+            (
+                MINIMAP_TARGET_COLS_TUI,
+                MINIMAP_TARGET_COLS_TUI,
+                MINIMAP_TARGET_COLS_TUI
+            ),
+            "the TUI minimap must hold a fixed width across ordinary \
+             terminal widths, not scale with the pane: \
+             100={at_100}, 150={at_150}, 200={at_200}"
         );
     }
 
