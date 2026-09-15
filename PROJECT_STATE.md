@@ -1,6 +1,37 @@
 # VimCode Project State
 
-**Last updated:** September 14, 2026 (#970 — confirmed the two "failing GTK click-geometry tests" are the already-known/already-documented Darwin font-rasteriser divergence from #926/#933, not a new bug; no code change). Prior revisions: September 14 (#950 review fix round — driver-tier pixel test added for the SEARCH_COD→SEARCH glyph change, self-contradictory pure-refactor claim corrected), September 14 (#950 — ShellApp convergence decomposition + cheap wins), September 14 (#949 review fix round — driver-tier test added, macOS/Win-GUI claim corrected), September 14 (#949 — GTK-only settings-reload watcher deleted), September 11 (macOS native-menu audit — #901/#902 filed, milestone #7 reopened), September 10 (#862 — `src/app.rs` no longer needs the `gui` feature to compile), September 5 (#827 correction pass), September 4 (#801), September 3 (platform-neutrality chain drained). Milestone #7 is **2 open** (#901, #902 — 2026-09-11 macOS native-menu audit). **#47 is reopened, in milestone #5** — its blocker (quadraui#699/#704) closed 2026-09-03, and #811 already ported the TUI side onto the new API. See `GOALS.md` for the full correction history.
+**Last updated:** September 14, 2026 (#522 — Track A foundation: generic external-tool JSON seam, `src/core/tool_client.rs`, no coordinator vocabulary in core). Prior revisions: September 14 (#970 — confirmed the two "failing GTK click-geometry tests" are the already-known/already-documented Darwin font-rasteriser divergence from #926/#933, not a new bug; no code change), September 14 (#950 review fix round — driver-tier pixel test added for the SEARCH_COD→SEARCH glyph change, self-contradictory pure-refactor claim corrected), September 14 (#950 — ShellApp convergence decomposition + cheap wins), September 14 (#949 review fix round — driver-tier test added, macOS/Win-GUI claim corrected), September 14 (#949 — GTK-only settings-reload watcher deleted), September 11 (macOS native-menu audit — #901/#902 filed, milestone #7 reopened), September 10 (#862 — `src/app.rs` no longer needs the `gui` feature to compile), September 5 (#827 correction pass), September 4 (#801), September 3 (platform-neutrality chain drained). Milestone #7 is **2 open** (#901, #902 — 2026-09-11 macOS native-menu audit). **#47 is reopened, in milestone #5** — its blocker (quadraui#699/#704) closed 2026-09-03, and #811 already ported the TUI side onto the new API. See `GOALS.md` for the full correction history.
+
+## #522 — Track A foundation: generic external-tool JSON seam (`tool_client.rs`), no coord in core
+
+#522 is the foundation of Track A (coordinator↔vimcode integration, milestone
+`vimcode-coordinator`, epic #531, `docs/COORDINATOR_INTEGRATION.md` §3/§5/§6). Per the
+2026-09-13 owner decision, vimcode core must not depend on, or even name, `coord` — so the
+seam is **generic**, not coordinator-aware.
+
+**New `src/core/tool_client.rs`:** a `ToolClient` trait (`run_json(argv) ->
+Result<serde_json::Value, ToolError>`, blocking — callers thread it the same way
+`Engine::ext_refresh`/`poll_ext_registry` already thread registry fetches), a real
+`SubprocessToolClient` impl (spawns via `core::git::hidden_command`, maps missing-binary /
+non-zero-exit / bad-JSON to typed `ToolError` variants), and a `MockToolClient` test impl.
+`fetch_board_model()` runs an argv and parses stdout into `quadraui::BoardModel` — vimcode's
+board-data contract *is* quadraui's existing `Board` primitive types (`BoardModel`/
+`BoardColumn`/`BoardCard`/`CardBadge`/`BadgeStatus`, quadraui#638, already `Serialize`/
+`Deserialize`), reused directly rather than duplicated.
+
+**Extension manifest:** `ExtensionManifest` gained an optional `board: BoardProviderConfig`
+(`refresh_command` argv, `poll_interval_secs`, an `actions` map from `BoardAction` variant
+name to an argv template with `{id}` substitution) — documented in `EXTENSIONS.md`'s new
+`[board]` section. Generic: no particular provider is named.
+
+**No-coord-in-core gate:** `tests/no_coord_vocabulary_in_core.rs` asserts (not just by
+inspection) that `src/core/` and `src/render.rs` carry no coordinator vocabulary, via a
+`\bcoord\b` word-boundary regex — "coordinate"/"coordinator" as plain English keep passing;
+standalone "coord" (CLI name, `coord-tui`, `coordinator.yml`, ...) fails it. Confirmed 0
+matches on the current tree; the regex's own incidental-vs-forbidden split has its own test.
+
+Board panel wiring (engine fields, GTK/TUI activity entry, actual poll_idle integration) and
+the coordinator extension bundle itself are out of scope here — next up is #521.
 
 ## #970 — the two "failing" GTK click-geometry tests are the #926/#933 Darwin font divergence, already documented; no fix needed
 
