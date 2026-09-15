@@ -5935,6 +5935,25 @@ impl Engine {
         }
     }
 
+    /// Test-support accessor (#985): a public snapshot of the jump list —
+    /// `(file, line, col)` per entry, 0-indexed like the rest of the engine's
+    /// cursor API. `JumpEntry`/`jump_list` are `pub(crate)`, so an external
+    /// integration test (`tests/nvim_conformance.rs`) has no other way to
+    /// compare vimcode's jumplist contents against Neovim's `getjumplist()`
+    /// oracle. Read-only; no behaviour change.
+    pub fn jump_list_snapshot(&self) -> Vec<(Option<std::path::PathBuf>, usize, usize)> {
+        self.jump_list
+            .iter()
+            .map(|e| (e.file.clone(), e.line, e.col))
+            .collect()
+    }
+
+    /// Test-support accessor (#985): the jump list's current position —
+    /// see [`Engine::jump_list_snapshot`].
+    pub fn jump_list_position(&self) -> usize {
+        self.jump_list_pos
+    }
+
     /// Push the current cursor position onto the jump list, and set it as
     /// the `''`/`` `` `` mark (pcmark).
     pub fn push_jump_location(&mut self) {

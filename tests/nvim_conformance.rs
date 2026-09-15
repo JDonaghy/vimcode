@@ -145,8 +145,10 @@ mod common;
 use common::engine_with;
 use serde::Deserialize;
 use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use vimcode_core::Engine;
+use vimcode_core::core::OpenMode;
+use vimcode_core::{Engine, EngineAction};
 
 #[derive(Deserialize)]
 struct NvimResult {
@@ -287,9 +289,20 @@ fn press_ctrl(engine: &mut Engine, ch: char) {
     pump(engine);
 }
 
-/// Parse and send a key sequence to the engine.
-/// Supports `<Esc>`, `<CR>`, `<C-x>`, named keys, and literal characters.
-fn send_keys(engine: &mut Engine, keys: &str) {
+/// One tokenized unit of a Vim-style key sequence.
+enum KeyUnit {
+    Char(char),
+    Special(String),
+    Ctrl(char),
+}
+
+/// Tokenize a key sequence (`<Esc>`, `<CR>`, `<C-x>`, named keys, and literal
+/// characters) into discrete units, without sending them anywhere. Shared by
+/// `send_keys` (single-buffer harness) and `send_keys_multi` (#985 multi-file
+/// harness) so the two harnesses can never drift on what a given `keys`
+/// string means — extracted from the pre-#985 `send_keys` body verbatim.
+fn parse_keys(keys: &str) -> Vec<KeyUnit> {
+    let mut units = Vec::new();
     let mut chars = keys.chars().peekable();
     while let Some(ch) = chars.next() {
         if ch == '<' {
@@ -301,29 +314,39 @@ fn send_keys(engine: &mut Engine, keys: &str) {
                 .unwrap_or(false);
             if has_closing && starts_special {
                 let name: String = chars.by_ref().take_while(|&c| c != '>').collect();
-                match name.as_str() {
-                    "Esc" => press_special(engine, "Escape"),
-                    "CR" | "Enter" => press_special(engine, "Return"),
-                    "BS" => press_special(engine, "BackSpace"),
-                    "Tab" => press_special(engine, "Tab"),
-                    "Del" | "Delete" => press_special(engine, "Delete"),
-                    "Up" => press_special(engine, "Up"),
-                    "Down" => press_special(engine, "Down"),
-                    "Left" => press_special(engine, "Left"),
-                    "Right" => press_special(engine, "Right"),
-                    "Home" => press_special(engine, "Home"),
-                    "End" => press_special(engine, "End"),
-                    n if n.starts_with("C-") => {
-                        let c = n.chars().nth(2).unwrap();
-                        press_ctrl(engine, c);
-                    }
-                    other => press_special(engine, other),
-                }
+                units.push(match name.as_str() {
+                    "Esc" => KeyUnit::Special("Escape".to_string()),
+                    "CR" | "Enter" => KeyUnit::Special("Return".to_string()),
+                    "BS" => KeyUnit::Special("BackSpace".to_string()),
+                    "Tab" => KeyUnit::Special("Tab".to_string()),
+                    "Del" | "Delete" => KeyUnit::Special("Delete".to_string()),
+                    "Up" => KeyUnit::Special("Up".to_string()),
+                    "Down" => KeyUnit::Special("Down".to_string()),
+                    "Left" => KeyUnit::Special("Left".to_string()),
+                    "Right" => KeyUnit::Special("Right".to_string()),
+                    "Home" => KeyUnit::Special("Home".to_string()),
+                    "End" => KeyUnit::Special("End".to_string()),
+                    n if n.starts_with("C-") => KeyUnit::Ctrl(n.chars().nth(2).unwrap()),
+                    other => KeyUnit::Special(other.to_string()),
+                });
             } else {
-                press_char(engine, '<');
+                units.push(KeyUnit::Char('<'));
             }
         } else {
-            press_char(engine, ch);
+            units.push(KeyUnit::Char(ch));
+        }
+    }
+    units
+}
+
+/// Parse and send a key sequence to the engine.
+/// Supports `<Esc>`, `<CR>`, `<C-x>`, named keys, and literal characters.
+fn send_keys(engine: &mut Engine, keys: &str) {
+    for unit in parse_keys(keys) {
+        match unit {
+            KeyUnit::Char(c) => press_char(engine, c),
+            KeyUnit::Special(name) => press_special(engine, &name),
+            KeyUnit::Ctrl(c) => press_ctrl(engine, c),
         }
     }
 }
@@ -356,8 +379,555 @@ fn run_in_vimcode(
 }
 
 // ---------------------------------------------------------------------------
-// Test cases — add new conformance checks to the per-area arrays below
+// Multi-file harness (#985) — the single-buffer harness above compares only
+// buffer text + cursor within *one* buffer, so it structurally cannot express
+// "which file is current". The reported bug this issue tracks is specifically
+// cross-buffer/cross-tab `<C-o>`/`<C-i>`, which needs real files on disk
+// opened via real `:e`/`:tabnew`/`:split` on both the Neovim and Engine side.
+//
+// `:e`/`:edit` returns `EngineAction::OpenFile` rather than opening the file
+// itself — normally the UI layer (`handle_action` in `src/tui_main/mod.rs`)
+// does the actual `open_file_with_mode` call after `handle_key` returns. This
+// harness has no UI layer, so `press_*_multi`/`send_keys_multi` below do that
+// interception themselves; `send_keys` above deliberately does not, since no
+// single-buffer case ever changes files.
 // ---------------------------------------------------------------------------
+
+fn handle_multi_action(engine: &mut Engine, action: EngineAction) {
+    if let EngineAction::OpenFile(path) = action {
+        let _ = engine.open_file_with_mode(&path, OpenMode::Permanent);
+    }
+}
+
+fn press_char_multi(engine: &mut Engine, ch: char) {
+    let action = engine.handle_key(&ch.to_string(), Some(ch), false);
+    handle_multi_action(engine, action);
+    pump(engine);
+}
+
+fn press_special_multi(engine: &mut Engine, name: &str) {
+    let action = engine.handle_key(name, None, false);
+    handle_multi_action(engine, action);
+    pump(engine);
+}
+
+fn press_ctrl_multi(engine: &mut Engine, ch: char) {
+    let action = engine.handle_key(&ch.to_string(), Some(ch), true);
+    handle_multi_action(engine, action);
+    pump(engine);
+}
+
+/// Same key-sequence grammar as `send_keys` (built on the same `parse_keys`
+/// tokenizer), but intercepting `EngineAction::OpenFile` the way the UI layer
+/// normally would — see the module doc above.
+fn send_keys_multi(engine: &mut Engine, keys: &str) {
+    for unit in parse_keys(keys) {
+        match unit {
+            KeyUnit::Char(c) => press_char_multi(engine, c),
+            KeyUnit::Special(name) => press_special_multi(engine, &name),
+            KeyUnit::Ctrl(c) => press_ctrl_multi(engine, c),
+        }
+    }
+}
+
+/// One scenario for the multi-file jumplist harness: `files` are written to a
+/// fresh temp dir before the case runs, `files[start_file]` is opened first,
+/// and `{F0}`, `{F1}`, ... in `keys` are substituted with each file's absolute
+/// path (see `resolve_multi_keys`) before the keys are sent to either side.
+struct MultiFileCase {
+    label: &'static str,
+    files: &'static [(&'static str, &'static [&'static str])],
+    start_file: usize,
+    start_line: usize,
+    start_col: usize,
+    keys: &'static str,
+}
+
+const fn mfc(
+    label: &'static str,
+    files: &'static [(&'static str, &'static [&'static str])],
+    start_file: usize,
+    start_line: usize,
+    start_col: usize,
+    keys: &'static str,
+) -> MultiFileCase {
+    MultiFileCase {
+        label,
+        files,
+        start_file,
+        start_line,
+        start_col,
+        keys,
+    }
+}
+
+/// Write `case.files` to a fresh temp dir; returns the dir (caller must clean
+/// it up) and each file's absolute path in `files` order.
+fn write_multi_fixture(case: &MultiFileCase) -> (PathBuf, Vec<PathBuf>) {
+    let dir = std::env::temp_dir().join(format!("vimcode_multi_probe_{}", probe_id()));
+    std::fs::create_dir_all(&dir).expect("create temp dir for multi-file probe");
+    let paths = case
+        .files
+        .iter()
+        .map(|(name, lines)| {
+            let path = dir.join(name);
+            std::fs::write(&path, lines.join("\n")).expect("write multi-file fixture");
+            path
+        })
+        .collect();
+    (dir, paths)
+}
+
+/// Substitute `{F0}`, `{F1}`, ... in `keys` with the absolute path of the
+/// correspondingly-indexed file.
+fn resolve_multi_keys(keys: &str, paths: &[PathBuf]) -> String {
+    let mut out = keys.to_string();
+    for (i, path) in paths.iter().enumerate() {
+        out = out.replace(&format!("{{F{i}}}"), &path.to_string_lossy());
+    }
+    out
+}
+
+/// Best-effort path normalization so a symlinked temp dir (or trailing-slash
+/// difference) doesn't register as a file mismatch. Falls back to the raw
+/// path when the file no longer exists (already cleaned up).
+fn canon_opt(p: &Option<PathBuf>) -> Option<PathBuf> {
+    p.as_ref()
+        .map(|p| p.canonicalize().unwrap_or_else(|_| p.clone()))
+}
+
+struct MultiNvimResult {
+    file: Option<PathBuf>,
+    line: usize,
+    col: usize,
+}
+
+/// Like `run_in_neovim`, but opens a real file from disk (`:edit`) instead of
+/// synthesizing buffer content via `nvim_buf_set_lines`, and reports which
+/// file ends up current rather than buffer text.
+fn run_multi_in_neovim(
+    start_path: &Path,
+    start_line: usize,
+    start_col: usize,
+    resolved_keys: &str,
+    cwd: &Path,
+) -> Option<MultiNvimResult> {
+    #[derive(Deserialize)]
+    struct Raw {
+        file: String,
+        line: usize,
+        col: usize,
+    }
+
+    let id = probe_id();
+    let mut lua = String::new();
+    lua.push_str("vim.o.compatible = false\n");
+    // Splits/tabs land in :e/:split/:vsplit over an unmodified buffer in
+    // every case below, but 'hidden' still matters once a case abandons an
+    // unsaved change mid-sequence.
+    lua.push_str("vim.o.hidden = true\n");
+    let escaped_start = start_path
+        .to_string_lossy()
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"");
+    lua.push_str(&format!(
+        "vim.cmd(\"edit \" .. vim.fn.fnameescape(\"{escaped_start}\"))\n"
+    ));
+    lua.push_str(&format!(
+        "vim.api.nvim_win_set_cursor(0, {{{}, {}}})\n",
+        start_line,
+        start_col.saturating_sub(1)
+    ));
+    let escaped_keys = resolved_keys.replace('\\', "\\\\").replace('"', "\\\"");
+    lua.push_str(&format!(
+        "pcall(function() vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes(\"{escaped_keys}\", true, false, true), \"ntx\", false) end)\n"
+    ));
+    let result_path = std::env::temp_dir().join(format!("vimcode_multi_nvim_probe_{id}.json"));
+    let result_path_str = result_path.to_string_lossy().replace('\\', "/");
+    lua.push_str(&format!(
+        "local name = vim.api.nvim_buf_get_name(0)\n\
+         local pos = vim.api.nvim_win_get_cursor(0)\n\
+         local result = vim.fn.json_encode({{file = name, line = pos[1], col = pos[2] + 1}})\n\
+         local f = io.open(\"{result_path_str}\", \"w\")\n\
+         f:write(result)\n\
+         f:close()\n\
+         vim.cmd(\"qa!\")\n"
+    ));
+    let script_path = std::env::temp_dir().join(format!("vimcode_multi_nvim_probe_{id}.lua"));
+    {
+        let mut f = std::fs::File::create(&script_path).ok()?;
+        f.write_all(lua.as_bytes()).ok()?;
+    }
+    let _ = std::fs::remove_file(&result_path);
+    let output = std::process::Command::new("nvim")
+        .arg("--headless")
+        .arg("-u")
+        .arg("NONE")
+        .arg("-i")
+        .arg("NONE")
+        .arg("-l")
+        .arg(script_path.to_string_lossy().as_ref())
+        .current_dir(cwd)
+        .output()
+        .ok();
+    let raw: Option<Raw> = match &output {
+        Some(o) => {
+            let raw: Option<Raw> = std::fs::read_to_string(&result_path)
+                .ok()
+                .and_then(|json| serde_json::from_str(&json).ok());
+            if raw.is_none() && !o.status.success() {
+                eprintln!(
+                    "nvim stderr (multi-file probe): {}",
+                    String::from_utf8_lossy(&o.stderr)
+                );
+            }
+            raw
+        }
+        None => None,
+    };
+    let _ = std::fs::remove_file(&script_path);
+    let _ = std::fs::remove_file(&result_path);
+    raw.map(|r| MultiNvimResult {
+        file: if r.file.is_empty() {
+            None
+        } else {
+            Some(PathBuf::from(r.file))
+        },
+        line: r.line,
+        col: r.col,
+    })
+}
+
+fn run_multi_in_vimcode(
+    start_path: &Path,
+    start_line: usize,
+    start_col: usize,
+    resolved_keys: &str,
+) -> (Option<PathBuf>, usize, usize) {
+    let mut engine = engine_with("");
+    engine
+        .open_file_with_mode(start_path, OpenMode::Permanent)
+        .expect("open start file for multi-file probe");
+    engine.view_mut().cursor.line = start_line.saturating_sub(1);
+    engine.view_mut().cursor.col = start_col.saturating_sub(1);
+    engine.ensure_cursor_visible();
+    send_keys_multi(&mut engine, resolved_keys);
+    let file = engine.active_buffer_state().file_path.clone();
+    let line = engine.view().cursor.line + 1;
+    let col = engine.view().cursor.col + 1;
+    (file, line, col)
+}
+
+fn run_multi_case(case: &MultiFileCase) -> Outcome {
+    let (dir, paths) = write_multi_fixture(case);
+    let resolved_keys = resolve_multi_keys(case.keys, &paths);
+    let start_path = paths[case.start_file].clone();
+
+    let nvim = match run_multi_in_neovim(
+        &start_path,
+        case.start_line,
+        case.start_col,
+        &resolved_keys,
+        &dir,
+    ) {
+        Some(r) => r,
+        None => {
+            let _ = std::fs::remove_dir_all(&dir);
+            return Outcome::NvimBroke;
+        }
+    };
+    let (vc_file, vc_line, vc_col) =
+        run_multi_in_vimcode(&start_path, case.start_line, case.start_col, &resolved_keys);
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let file_match = canon_opt(&nvim.file) == canon_opt(&vc_file);
+    let pos_match = nvim.line == vc_line && nvim.col == vc_col;
+    if file_match && pos_match {
+        return Outcome::Pass;
+    }
+    Outcome::Fail(format!(
+        "[{}] keys={:?} start={:?}@({},{})\n  file: nvim={:?} vimcode={:?}\n  cursor: nvim=({},{}) vimcode=({},{})",
+        case.label,
+        case.keys,
+        start_path.file_name(),
+        case.start_line,
+        case.start_col,
+        nvim.file.as_ref().map(|p| p.display().to_string()),
+        vc_file.as_ref().map(|p| p.display().to_string()),
+        nvim.line,
+        nvim.col,
+        vc_line,
+        vc_col
+    ))
+}
+
+// ---------------------------------------------------------------------------
+// `:jumps` list-content harness (#985) — a second multi-file shape: instead
+// of "where did the cursor end up", this compares the jump list's *contents*
+// (count, ordering, which entry is current, and each entry's file) against
+// Neovim's `getjumplist()` oracle. Deliberately does not compare `col`: the
+// issue's own acceptance list asks for "count, ordering, the current-position
+// marker, and the file column" — not column-number precision — and Neovim's
+// jumplist is documented as per-*window*, while vimcode's is deliberately
+// global (see `apply_jump_list_entry`'s doc comment) so column-perfect parity
+// isn't the property under test here.
+// ---------------------------------------------------------------------------
+
+struct MultiJumpsCase {
+    label: &'static str,
+    files: &'static [(&'static str, &'static [&'static str])],
+    start_file: usize,
+    start_line: usize,
+    start_col: usize,
+    keys: &'static str,
+}
+
+const fn mjc(
+    label: &'static str,
+    files: &'static [(&'static str, &'static [&'static str])],
+    start_file: usize,
+    start_line: usize,
+    start_col: usize,
+    keys: &'static str,
+) -> MultiJumpsCase {
+    MultiJumpsCase {
+        label,
+        files,
+        start_file,
+        start_line,
+        start_col,
+        keys,
+    }
+}
+
+/// `(file, 1-indexed line)` per jumplist entry, plus which index (if any) is
+/// "current".
+type JumpsSnapshot = (Vec<(Option<PathBuf>, usize)>, Option<usize>);
+
+fn run_jumps_in_neovim(
+    start_path: &Path,
+    start_line: usize,
+    start_col: usize,
+    resolved_keys: &str,
+    cwd: &Path,
+) -> Option<JumpsSnapshot> {
+    #[derive(Deserialize)]
+    struct RawEntry {
+        file: String,
+        line: usize,
+    }
+    #[derive(Deserialize)]
+    struct Raw {
+        entries: Vec<RawEntry>,
+        // getjumplist()'s second return value (baseline-adjusted, see below):
+        // index of the *current* position within `entries`, `entries.len()`
+        // when "live" past the newest entry (mirrors
+        // `Engine::jump_list_position`), or negative when Neovim's raw index
+        // still points at or before the baseline.
+        current: i64,
+    }
+
+    let id = probe_id();
+    let mut lua = String::new();
+    lua.push_str("vim.o.compatible = false\n");
+    lua.push_str("vim.o.hidden = true\n");
+    let escaped_start = start_path
+        .to_string_lossy()
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"");
+    lua.push_str(&format!(
+        "vim.cmd(\"edit \" .. vim.fn.fnameescape(\"{escaped_start}\"))\n"
+    ));
+    lua.push_str(&format!(
+        "vim.api.nvim_win_set_cursor(0, {{{}, {}}})\n",
+        start_line,
+        start_col.saturating_sub(1)
+    ));
+    // Verified empirically (see PR description): even a bare `nvim file -c
+    // 'lua print(#vim.fn.getjumplist()[1])'` with no keys sent at all reports
+    // one pre-existing entry (the just-opened file's own line 1) -- an
+    // artifact of how Neovim's startup opens the first file, not anything
+    // `keys` does. `Engine::jump_list_snapshot` starts genuinely empty, so
+    // comparing raw counts/indices would forever misreport this harness
+    // artifact as a vimcode deviation. Snapshotting this baseline and
+    // diffing it out below isolates exactly what `keys` added.
+    lua.push_str("local baseline_len = #vim.fn.getjumplist()[1]\n");
+    let escaped_keys = resolved_keys.replace('\\', "\\\\").replace('"', "\\\"");
+    lua.push_str(&format!(
+        "pcall(function() vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes(\"{escaped_keys}\", true, false, true), \"ntx\", false) end)\n"
+    ));
+    let result_path = std::env::temp_dir().join(format!("vimcode_jumps_nvim_probe_{id}.json"));
+    let result_path_str = result_path.to_string_lossy().replace('\\', "/");
+    lua.push_str(
+        "local list, curidx = unpack(vim.fn.getjumplist())\n\
+         local entries = {}\n\
+         for i, e in ipairs(list) do\n\
+         \x20 if i > baseline_len then\n\
+         \x20   table.insert(entries, {file = vim.api.nvim_buf_get_name(e.bufnr), line = e.lnum})\n\
+         \x20 end\n\
+         end\n\
+         local current = curidx - baseline_len\n\
+         if current < 0 then current = -1 end\n",
+    );
+    lua.push_str(&format!(
+        "local result = vim.fn.json_encode({{entries = entries, current = current}})\n\
+         local f = io.open(\"{result_path_str}\", \"w\")\n\
+         f:write(result)\n\
+         f:close()\n\
+         vim.cmd(\"qa!\")\n"
+    ));
+    let script_path = std::env::temp_dir().join(format!("vimcode_jumps_nvim_probe_{id}.lua"));
+    {
+        let mut f = std::fs::File::create(&script_path).ok()?;
+        f.write_all(lua.as_bytes()).ok()?;
+    }
+    let _ = std::fs::remove_file(&result_path);
+    let output = std::process::Command::new("nvim")
+        .arg("--headless")
+        .arg("-u")
+        .arg("NONE")
+        .arg("-i")
+        .arg("NONE")
+        .arg("-l")
+        .arg(script_path.to_string_lossy().as_ref())
+        .current_dir(cwd)
+        .output()
+        .ok();
+    let raw: Option<Raw> = match &output {
+        Some(o) => {
+            let raw: Option<Raw> = std::fs::read_to_string(&result_path)
+                .ok()
+                .and_then(|json| serde_json::from_str(&json).ok());
+            if raw.is_none() && !o.status.success() {
+                eprintln!(
+                    "nvim stderr (jumps-list probe): {}",
+                    String::from_utf8_lossy(&o.stderr)
+                );
+            }
+            raw
+        }
+        None => None,
+    };
+    let _ = std::fs::remove_file(&script_path);
+    let _ = std::fs::remove_file(&result_path);
+    raw.map(|r| {
+        let len = r.entries.len();
+        let entries = r
+            .entries
+            .into_iter()
+            .map(|e| {
+                (
+                    if e.file.is_empty() {
+                        None
+                    } else {
+                        Some(PathBuf::from(e.file))
+                    },
+                    e.line,
+                )
+            })
+            .collect();
+        let current = if r.current < 0 || r.current as usize >= len {
+            None
+        } else {
+            Some(r.current as usize)
+        };
+        (entries, current)
+    })
+}
+
+fn run_jumps_in_vimcode(
+    start_path: &Path,
+    start_line: usize,
+    start_col: usize,
+    resolved_keys: &str,
+) -> JumpsSnapshot {
+    let mut engine = engine_with("");
+    engine
+        .open_file_with_mode(start_path, OpenMode::Permanent)
+        .expect("open start file for jumps-list probe");
+    engine.view_mut().cursor.line = start_line.saturating_sub(1);
+    engine.view_mut().cursor.col = start_col.saturating_sub(1);
+    engine.ensure_cursor_visible();
+    send_keys_multi(&mut engine, resolved_keys);
+    let snapshot = engine.jump_list_snapshot();
+    let pos = engine.jump_list_position();
+    let entries: Vec<(Option<PathBuf>, usize)> = snapshot
+        .into_iter()
+        .map(|(file, line, _col)| (file, line + 1))
+        .collect();
+    let current = if pos >= entries.len() {
+        None
+    } else {
+        Some(pos)
+    };
+    (entries, current)
+}
+
+fn run_jumps_case(case: &MultiJumpsCase) -> Outcome {
+    let (dir, paths) = write_multi_fixture(&MultiFileCase {
+        label: case.label,
+        files: case.files,
+        start_file: case.start_file,
+        start_line: case.start_line,
+        start_col: case.start_col,
+        keys: case.keys,
+    });
+    let resolved_keys = resolve_multi_keys(case.keys, &paths);
+    let start_path = paths[case.start_file].clone();
+
+    let nvim = match run_jumps_in_neovim(
+        &start_path,
+        case.start_line,
+        case.start_col,
+        &resolved_keys,
+        &dir,
+    ) {
+        Some(r) => r,
+        None => {
+            let _ = std::fs::remove_dir_all(&dir);
+            return Outcome::NvimBroke;
+        }
+    };
+    let vc = run_jumps_in_vimcode(&start_path, case.start_line, case.start_col, &resolved_keys);
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let (nvim_entries, nvim_current) = nvim;
+    let (vc_entries, vc_current) = vc;
+    let nvim_norm: Vec<(Option<PathBuf>, usize)> = nvim_entries
+        .iter()
+        .map(|(f, l)| (canon_opt(f), *l))
+        .collect();
+    let vc_norm: Vec<(Option<PathBuf>, usize)> =
+        vc_entries.iter().map(|(f, l)| (canon_opt(f), *l)).collect();
+
+    if nvim_norm == vc_norm && nvim_current == vc_current {
+        return Outcome::Pass;
+    }
+    let fmt = |entries: &[(Option<PathBuf>, usize)], current: Option<usize>| {
+        entries
+            .iter()
+            .enumerate()
+            .map(|(i, (f, l))| {
+                let marker = if current == Some(i) { ">" } else { " " };
+                format!(
+                    "{marker} {l:4}  {}",
+                    f.as_ref()
+                        .and_then(|p| p.file_name())
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    Outcome::Fail(format!(
+        "[{}] keys={:?}\n  nvim jumps:\n{}\n  vimcode jumps:\n{}",
+        case.label,
+        case.keys,
+        fmt(&nvim_entries, nvim_current),
+        fmt(&vc_entries, vc_current)
+    ))
+}
 
 struct Case {
     label: &'static str,
@@ -3620,6 +4190,131 @@ const CASES_MISC: &[Case] = &[
     c("misc:count then o with indent", &["  a"], 1, 1, "2ox<Esc>"),
 ];
 
+// ─────────────────── H. multi-file jumplist (#985) ───────────────────
+//
+// Cross-buffer/cross-tab/cross-split `<C-o>`/`<C-i>`, plus `:jumps` list
+// contents — see the `MultiFileCase`/`MultiJumpsCase` harness above. Unlike
+// every other `CASES_*` array, these do not feed `CATEGORIES`/`run_case`
+// (wrong shape); `nvim_conformance_jumplist_multi_file` below runs them
+// through `run_multi_case`/`run_jumps_case` instead, but reuses the same
+// `classify` bidirectional-gate function as `KNOWN_DEVIATIONS` above.
+
+const MFA: &[&str] = &["a1", "a2", "a3", "a4", "a5"];
+const MFB: &[&str] = &["b1", "b2", "b3"];
+const MFC: &[&str] = &["c1", "c2"];
+
+const CASES_MULTI_JUMP: &[MultiFileCase] = &[
+    // "<C-o> after opening file B from file A returns to A, at A's recorded
+    // position." (issue's first minimum case.)
+    mfc(
+        "jump:multi C-o after :e returns to A",
+        &[("a.txt", MFA), ("b.txt", MFB)],
+        0,
+        3,
+        1,
+        ":e {F1}<CR><C-o>",
+    ),
+    // "<C-i> from there returns forward to B."
+    mfc(
+        "jump:multi C-i forward to B",
+        &[("a.txt", MFA), ("b.txt", MFB)],
+        0,
+        3,
+        1,
+        ":e {F1}<CR><C-o><C-i>",
+    ),
+    // "The same across a tab boundary".
+    mfc(
+        "jump:multi C-o across tab",
+        &[("a.txt", MFA), ("b.txt", MFB)],
+        0,
+        3,
+        1,
+        ":tabnew {F1}<CR><C-o>",
+    ),
+    mfc(
+        "jump:multi C-i across tab",
+        &[("a.txt", MFA), ("b.txt", MFB)],
+        0,
+        3,
+        1,
+        ":tabnew {F1}<CR><C-o><C-i>",
+    ),
+    // "...and across a split."
+    mfc(
+        "jump:multi C-o across split",
+        &[("a.txt", MFA), ("b.txt", MFB)],
+        0,
+        3,
+        1,
+        ":split {F1}<CR><C-o>",
+    ),
+    mfc(
+        "jump:multi C-o across vsplit",
+        &[("a.txt", MFA), ("b.txt", MFB)],
+        0,
+        3,
+        1,
+        ":vsplit {F1}<CR><C-o>",
+    ),
+    // "<C-o> when the recorded pane still exists but its buffer was swapped
+    // in place (:e over it)" -- `jump_pane_buffer_matches`. A single window,
+    // buffer swapped twice via :e, exercises exactly that path.
+    mfc(
+        "jump:multi C-o after buffer swap in place",
+        &[("a.txt", MFA), ("b.txt", MFB), ("c.txt", MFC)],
+        0,
+        2,
+        1,
+        ":e {F1}<CR>G:e {F2}<CR><C-o>",
+    ),
+    mfc(
+        "jump:multi C-o twice across three files",
+        &[("a.txt", MFA), ("b.txt", MFB), ("c.txt", MFC)],
+        0,
+        1,
+        1,
+        ":e {F1}<CR>:e {F2}<CR><C-o><C-o>",
+    ),
+    // "A jump that does not change line but does change file" -- the
+    // `record_jump_from` same-line early-return the issue calls out as the
+    // single most likely culprit. Both files' line 1 read identically so a
+    // line-only comparison could not tell the files apart.
+    mfc(
+        "jump:multi C-o same line different file",
+        &[("a.txt", &["same", "a2"]), ("b.txt", &["same", "b2"])],
+        0,
+        1,
+        1,
+        ":e {F1}<CR><C-o>",
+    ),
+];
+
+const CASES_MULTI_JUMPS_LIST: &[MultiJumpsCase] = &[
+    // ":jumps output: count, ordering, ... and the file column." Single
+    // window, two :e's -- deliberately avoids the documented global-vs-
+    // per-window jumplist divergence (see the harness doc comment above),
+    // so this isolates the file-recording question the issue asks about.
+    mjc(
+        "jumps:multi list after two :e",
+        &[("a.txt", MFA), ("b.txt", MFB), ("c.txt", MFC)],
+        0,
+        2,
+        1,
+        ":e {F1}<CR>G:e {F2}<CR>",
+    ),
+    // Same, but with the "> current-position marker" exercised by walking
+    // one step back into the list instead of staying at the live end.
+    mjc(
+        "jumps:multi list after C-o marker",
+        &[("a.txt", MFA), ("b.txt", MFB), ("c.txt", MFC)],
+        0,
+        2,
+        1,
+        ":e {F1}<CR>G:e {F2}<CR><C-o>",
+    ),
+];
+
 // ---------------------------------------------------------------------------
 // Categories — the runner flattens these; the split is for editability only.
 // ---------------------------------------------------------------------------
@@ -4558,6 +5253,207 @@ fn nvim_conformance() {
         problems.push(format!(
             "{} case(s) listed in KNOWN_DEVIATIONS now PASS. \
              Good — delete these entries from KNOWN_DEVIATIONS so the list keeps shrinking:\n{}",
+            verdict.fixed.len(),
+            bullet_list(&verdict.fixed)
+        ));
+    }
+    panic!("\n\n{}\n", problems.join("\n\n"));
+}
+
+// ---------------------------------------------------------------------------
+// KNOWN_DEVIATIONS_MULTI — same bidirectional-gate idiom as KNOWN_DEVIATIONS
+// above (`classify`), applied to CASES_MULTI_JUMP / CASES_MULTI_JUMPS_LIST.
+// Reusing `classify` here rather than the `CATEGORIES`/`Case` scaffolding
+// keeps the (well-exercised, 1,400+ case) single-buffer harness above
+// untouched while still going through the identical bidirectional mechanism:
+// an unlisted label that fails is a regression, and a listed label that
+// starts passing must have its entry deleted. May only ever SHRINK.
+// ---------------------------------------------------------------------------
+
+const KNOWN_DEVIATIONS_MULTI: &[&str] = &[
+    // #985: opening a file into a pane -- `:e`/`:edit` (`EngineAction::
+    // OpenFile` -> `open_file_with_mode`), `:tabnew`/`:tabe` (`new_tab`),
+    // `:split`/`:vsplit` (`split_window`) -- never calls
+    // `push_jump_location`/`record_jump_from` at all: verified by reading
+    // every call site in `src/core/engine/buffers.rs`, `windows.rs`'s
+    // `new_tab`/`split_window_with_new_first`, and `execute.rs`'s `:e`/
+    // `:tabnew`/`:split`/`:vsplit` handlers, and confirmed against the real
+    // oracle: opening a different file this way is jump-worthy in Neovim
+    // regardless of line (`getjumplist()` gains an entry), but vimcode's
+    // jumplist is untouched, so every `<C-o>`/`<C-i>` case whose only
+    // jump-worthy event is one of these finds nothing to jump to. This is
+    // the fix issue's spec, not something to paper over here -- see the PR
+    // description for the full divergence list.
+    "jump:multi C-o after :e returns to A",
+    "jump:multi C-o across tab",
+    "jump:multi C-o across split",
+    "jump:multi C-o across vsplit",
+    "jump:multi C-o after buffer swap in place",
+    "jump:multi C-o twice across three files",
+    "jump:multi C-o same line different file",
+    "jumps:multi list after two :e",
+    "jumps:multi list after C-o marker",
+    // NOT listed: "jump:multi C-i forward to B" / "jump:multi C-i across
+    // tab" currently PASS, but vacuously -- with the bug above, `<C-o>` is a
+    // complete no-op (nothing recorded to jump to), so the immediately-
+    // following `<C-i>` is *also* a no-op, and the two cancel out to the
+    // exact position `:e`/`:tabnew` already left the cursor at, matching the
+    // oracle's genuine round trip by coincidence. Real forward-jump coverage
+    // for the fix issue comes from re-running "jump:multi C-o ..." (which
+    // DOES fail today) once a fix lands, not from these two.
+];
+
+#[test]
+fn nvim_conformance_jumplist_multi_file() {
+    let version_output = std::process::Command::new("nvim")
+        .arg("--version")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned());
+    let resolved = resolve_on_path("nvim");
+    let resolved_display = resolved
+        .as_deref()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "nvim (resolved by PATH lookup)".to_string());
+    let probe = version_output
+        .as_deref()
+        .map(|out| (resolved_display.as_str(), out));
+
+    let allow_skip = std::env::var_os(ALLOW_SKIP_VAR).is_some();
+    let nvim_version = match preflight(probe, allow_skip) {
+        Preflight::Refuse { reason } => panic!("\n\n{reason}\n"),
+        Preflight::Skip { reason } => {
+            eprintln!("SKIP ({ALLOW_SKIP_VAR} set): {reason}");
+            return;
+        }
+        Preflight::Run { banner, version } => {
+            print_unmissable(&banner);
+            Some(version)
+        }
+    };
+
+    let filter = std::env::var("PROBE_FILTER").ok();
+    let verbose = std::env::var_os("PROBE_VERBOSE").is_some();
+
+    let mut outcomes: Vec<(&str, bool)> = Vec::new();
+    let mut detail: std::collections::HashMap<&str, String> = std::collections::HashMap::new();
+    let mut nvim_broke: Vec<&str> = Vec::new();
+
+    for case in CASES_MULTI_JUMP
+        .iter()
+        .filter(|c| filter.as_deref().is_none_or(|f| c.label.contains(f)))
+    {
+        match run_multi_case(case) {
+            Outcome::NvimBroke => nvim_broke.push(case.label),
+            Outcome::Pass => {
+                outcomes.push((case.label, true));
+                if verbose {
+                    println!("PASS [{}]", case.label);
+                }
+            }
+            Outcome::Fail(msg) => {
+                outcomes.push((case.label, false));
+                if verbose {
+                    println!("FAIL {msg}");
+                }
+                detail.insert(case.label, msg);
+            }
+        }
+    }
+    for case in CASES_MULTI_JUMPS_LIST
+        .iter()
+        .filter(|c| filter.as_deref().is_none_or(|f| c.label.contains(f)))
+    {
+        match run_jumps_case(case) {
+            Outcome::NvimBroke => nvim_broke.push(case.label),
+            Outcome::Pass => {
+                outcomes.push((case.label, true));
+                if verbose {
+                    println!("PASS [{}]", case.label);
+                }
+            }
+            Outcome::Fail(msg) => {
+                outcomes.push((case.label, false));
+                if verbose {
+                    println!("FAIL {msg}");
+                }
+                detail.insert(case.label, msg);
+            }
+        }
+    }
+
+    println!("\n=== Neovim Conformance Results: multi-file jumplist (#985) ===");
+    println!(
+        "cases run: {}  pass: {}  known-fail: {}",
+        outcomes.len(),
+        outcomes.iter().filter(|(_, p)| *p).count(),
+        outcomes
+            .iter()
+            .filter(|(l, p)| !*p && KNOWN_DEVIATIONS_MULTI.contains(l))
+            .count(),
+    );
+    if !nvim_broke.is_empty() {
+        println!(
+            "\nnvim execution failed for {} case(s): {:?}",
+            nvim_broke.len(),
+            nvim_broke
+        );
+    }
+
+    let all_labels: Vec<&str> = CASES_MULTI_JUMP
+        .iter()
+        .map(|c| c.label)
+        .chain(CASES_MULTI_JUMPS_LIST.iter().map(|c| c.label))
+        .collect();
+    let mut verdict = classify(
+        &outcomes,
+        KNOWN_DEVIATIONS_MULTI,
+        filter.is_none().then_some(all_labels.as_slice()),
+    );
+
+    if !verdict.fixed.is_empty() && !fixes_are_enforced(nvim_version) {
+        println!(
+            "\nNOTE: {} KNOWN_DEVIATIONS_MULTI entr(y/ies) pass against this run's \
+             Neovim but the list was captured against {}.{}.x, so this is oracle-version \
+             skew, not a landed fix — do NOT delete them. Not failing the run:\n{}",
+            verdict.fixed.len(),
+            DEVIATIONS_ORACLE.0,
+            DEVIATIONS_ORACLE.1,
+            bullet_list(&verdict.fixed)
+        );
+        verdict.fixed.clear();
+    }
+
+    if verdict.is_clean() {
+        return;
+    }
+
+    let mut problems: Vec<String> = Vec::new();
+    if !verdict.stale.is_empty() {
+        problems.push(format!(
+            "{} KNOWN_DEVIATIONS_MULTI entr(y/ies) match no case label — delete them:\n{}",
+            verdict.stale.len(),
+            bullet_list(&verdict.stale)
+        ));
+    }
+    if !verdict.regressions.is_empty() {
+        problems.push(format!(
+            "{} multi-file jumplist REGRESSION(S) — cases not in KNOWN_DEVIATIONS_MULTI \
+             that do not match Neovim:\n\n{}",
+            verdict.regressions.len(),
+            verdict
+                .regressions
+                .iter()
+                .map(|l| detail.get(l).cloned().unwrap_or_else(|| (*l).to_string()))
+                .collect::<Vec<_>>()
+                .join("\n\n")
+        ));
+    }
+    if !verdict.fixed.is_empty() {
+        problems.push(format!(
+            "{} case(s) listed in KNOWN_DEVIATIONS_MULTI now PASS. \
+             Good — delete these entries so the list keeps shrinking:\n{}",
             verdict.fixed.len(),
             bullet_list(&verdict.fixed)
         ));
