@@ -49,6 +49,87 @@ mod shell_app;
 #[cfg(any(test, feature = "test-support"))]
 pub mod testing {
     pub use super::shell_app::TuiShellApp;
+
+    // ── #982: TUI wiring for `crate::harness::ConformanceHarness` ──────────
+    //
+    // GTK, macOS and Win-GUI each have their own `conformance_harness`
+    // (`crate::gtk::testing::conformance_harness`, `src/macos/mod.rs`,
+    // `src/win/mod.rs`) that wraps the shared `crate::app::App` in that
+    // backend's own `driver_with_shell`. Nothing did the same for TUI, which
+    // is why no `crate::harness` scenario has ever run against it — this is
+    // that missing wiring, thin on purpose (mirrors the other three).
+    //
+    // Note this is deliberately *not* `TuiShellApp` (the production TUI
+    // `ShellApp`, used by `tui_main::run` and this module's own in-crate
+    // `#[cfg(test)]` suite in `shell_app.rs`). `crate::app::App`'s `impl
+    // quadraui::ShellApp for App` (`src/app.rs`) is unconditionally
+    // compiled — no `feature = "gui"` gate on the impl block itself, only on
+    // the display-dependent innards it reaches through `dyn
+    // quadraui::Backend` — which is exactly what makes it, and not
+    // `TuiShellApp`, the *cross-backend-shared* shell a `crate::harness`
+    // scenario needs: the same `App` a GTK/macOS/Win conformance test drives
+    // is what gets wrapped here, so a scenario written once genuinely
+    // exercises the same dispatch/paint code on every backend, rather than
+    // running against a second, TUI-only reimplementation.
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    use quadraui::tui::testing::{driver_with_shell, TuiDriver};
+    use quadraui::tui::TuiBackend;
+
+    use crate::app::TextMetricsBackend;
+    use crate::core::Engine;
+    use crate::harness::ConformanceHarness;
+
+    /// [`TextMetricsBackend`] for quadraui's `TuiBackend` (#982) — the TUI
+    /// sibling of `impl TextMetricsBackend for GtkBackend`/`WinBackend`
+    /// (`src/app.rs`) and `MacBackend` (`src/macos/mod.rs`).
+    ///
+    /// Both setters are genuine no-ops, not stubs of the #967/#969 kind:
+    /// `TuiBackend::line_height`/`char_width` (`quadraui::Backend` impl)
+    /// are hardcoded to `1.0` — one ratatui cell is one row/column by
+    /// construction, so there is no pixel metric here for the #540/#819
+    /// drift guard to ever disagree with. That is also why TUI is exempt
+    /// from `crate::harness::assert_text_metrics_backend_applies_metrics`
+    /// (only GTK/macOS/Win call it): that assertion round-trips a probe
+    /// value through the setter and back through the getter, which would
+    /// necessarily fail here even though nothing is broken — TUI's getters
+    /// never vary.
+    impl TextMetricsBackend for TuiBackend {
+        fn set_current_line_height(&mut self, _line_height: f64) {}
+        fn set_current_char_width(&mut self, _char_width: f64) {}
+    }
+
+    /// The `TuiDriver` instantiation of `crate::harness::ConformanceHarness`
+    /// (#982) — mirrors `crate::gtk::testing::conformance_harness`
+    /// (`src/gtk/testing.rs:529`) exactly, modulo the backend-specific
+    /// pieces: `TuiBackend` instead of `GtkBackend`, and `width`/`height` in
+    /// terminal cells (`u16`) rather than pixels (`i32`), matching
+    /// `quadraui::tui::testing::driver_with_shell`'s own signature.
+    ///
+    /// `TuiDriver` does not implement `quadraui::testing::PixelClickConformance`
+    /// (only `GtkDriver`/`MacDriver`/`WinDriver` do — pixel-precise native
+    /// click delivery has no ratatui equivalent). A scenario bounded by
+    /// `ConformanceDriver + DriverInput` (e.g.
+    /// `crate::harness::sweep_hit_band_integrity`, which only needs
+    /// `DriverInput::click`) still runs on both; one that needs
+    /// `PixelClickConformance` specifically stays GTK-only. See
+    /// `crate::harness`'s own module doc for this boundary spelled out once,
+    /// rather than re-explained at every call site.
+    pub fn conformance_harness(
+        engine: Engine,
+        width: u16,
+        height: u16,
+    ) -> ConformanceHarness<TuiDriver<impl quadraui::AppLogic>> {
+        let paint = crate::test_paint::PaintGuard::acquire();
+        let cwd = crate::test_cwd::CwdReadGuard::acquire();
+        let engine = Rc::new(RefCell::new(engine));
+        let backend: Rc<RefCell<Box<dyn TextMetricsBackend>>> =
+            Rc::new(RefCell::new(Box::new(TuiBackend::new())));
+        let (app, config) = crate::harness::build_app_and_config(Rc::clone(&engine), backend);
+        let driver = driver_with_shell(app, config, width, height);
+        ConformanceHarness::new(driver, engine, paint, cwd)
+    }
 }
 
 #[allow(unused_imports)]
