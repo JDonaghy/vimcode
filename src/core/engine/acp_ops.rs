@@ -100,13 +100,24 @@ mod tests {
         engine
     }
 
-    /// Poll `engine` until `done` holds or five seconds pass.
+    /// How long the fixture-backed tests below wait before giving up.
+    ///
+    /// Kept in step with `core::acp::tests::TEST_DEADLINE` (private to that
+    /// module, hence the duplicate) and generous for the same reason: these
+    /// loops exit the moment their condition holds, so the bound is only
+    /// reached on a failing run and a loaded `cargo test` — GTK harness, the
+    /// nvim oracles and ~2.7k lib tests all at once — can deschedule a `sh`
+    /// fork+exec for far longer than the milliseconds it takes standalone.
+    #[cfg(unix)]
+    const TEST_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
+    /// Poll `engine` until `done` holds or [`TEST_DEADLINE`] passes.
     #[cfg(unix)]
     fn poll_acp_until(engine: &mut Engine, done: impl Fn(&Engine) -> bool) {
         let start = std::time::Instant::now();
         loop {
             engine.poll_acp();
-            if done(engine) || start.elapsed() > std::time::Duration::from_secs(5) {
+            if done(engine) || start.elapsed() > TEST_DEADLINE {
                 return;
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
@@ -132,7 +143,9 @@ mod tests {
         poll_acp_until(&mut engine, |e| e.acp_client.is_none());
         assert!(
             engine.acp_client.is_none(),
-            "agent exit should clear the client"
+            "agent exit should clear the client within {TEST_DEADLINE:?} \
+             (message was {:?})",
+            engine.message
         );
         assert_eq!(engine.message, "ACP agent exited");
     }
@@ -152,7 +165,7 @@ mod tests {
         // vacuously by running before the agent ever answered.
         let start = std::time::Instant::now();
         let mut redrew = false;
-        while !redrew && start.elapsed() < std::time::Duration::from_secs(5) {
+        while !redrew && start.elapsed() < TEST_DEADLINE {
             redrew = engine.poll_acp();
             if !redrew {
                 std::thread::sleep(std::time::Duration::from_millis(20));
