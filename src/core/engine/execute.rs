@@ -3463,7 +3463,6 @@ impl Engine {
             }
             self.confirm_sub = Some(ConfirmSubState {
                 body: body.to_string(),
-                trailing: trailing.to_string(),
                 matches: candidates,
                 idx: 0,
                 copied: 0,
@@ -3723,6 +3722,14 @@ impl Engine {
 
     /// Show the prompt for the confirm loop's current candidate, or finish
     /// the loop (as a "ran off the end" completion) if there isn't one.
+    ///
+    /// The candidate's line/col is *not* trusted from its frozen (original,
+    /// pre-edit) `sline`/`scol` here -- every earlier confirmed answer has
+    /// already been spliced into the real buffer (see `confirm_sub_apply_current`),
+    /// which can shift both the line count (a multiline match, or a `\r` in
+    /// the replacement, changes how many newlines precede this candidate)
+    /// and the column. Instead this asks the *live* buffer where this
+    /// candidate's match now actually sits, via `confirm_sub_live_char_pos`.
     fn begin_confirm_sub_prompt(&mut self) -> EngineAction {
         let Some(state) = self.confirm_sub.as_ref() else {
             return EngineAction::None;
@@ -3730,9 +3737,11 @@ impl Engine {
         let Some(m) = state.matches.get(state.idx) else {
             return self.finish_confirm_sub(true, true);
         };
-        let line = m.sline;
-        let col = m.scol;
         let rendered = m.rendered.clone();
+        let live_pos = confirm_sub_live_char_pos(state, m.mstart);
+        let line = self.buffer().content.char_to_line(live_pos);
+        let line_start = self.buffer().line_to_char(line);
+        let col = live_pos - line_start;
         self.view_mut().cursor.line = line;
         self.view_mut().cursor.col = col;
         self.clamp_cursor_col();
@@ -3750,6 +3759,15 @@ impl Engine {
         unicode: Option<char>,
         ctrl: bool,
     ) -> EngineAction {
+        // `<C-c>`/`<C-[>` aren't in `:h :s_c`'s documented answer set, but
+        // they're the same "get me out of here" aliases for `<Esc>` that
+        // `handle_insert_key` already recognizes (#804) -- without this a
+        // user's habitual escape hatch would silently re-prompt instead of
+        // quitting the loop like every other Escape-shaped key in this
+        // codebase does.
+        if ctrl && matches!(key_name, "c" | "bracketleft" | "[") {
+            return self.finish_confirm_sub(false, false);
+        }
         if ctrl && (unicode == Some('e') || key_name == "e") {
             self.scroll_viewport_with_cursor(1, 1);
             return EngineAction::None;
@@ -3797,25 +3815,51 @@ impl Engine {
     }
 
     /// Fold the current candidate's rendered replacement into the
-    /// in-progress `out` string, mirroring exactly what the non-confirm
-    /// scan does per match (`run_substitute`'s own comment on the
-    /// equivalent code explains the bookkeeping).
+    /// in-progress `out` string (mirroring exactly what the non-confirm
+    /// scan does per match -- `run_substitute`'s own comment on the
+    /// equivalent code explains the bookkeeping) *and* splice that same
+    /// change into the real, live buffer right now.
+    ///
+    /// #1031 review: the confirm loop used to only ever touch `state.out`,
+    /// leaving the visible buffer frozen until the whole loop ended (`a`,
+    /// `q`/`<Esc>`, or running off the end) at which point `finish_confirm_sub`
+    /// applied every decided candidate in one shot. That's backwards from
+    /// the entire point of an interactive confirm prompt -- a user answering
+    /// `y` should watch that match change in place before deciding on the
+    /// next one. This now performs the live edit immediately, as part of a
+    /// single undo group spanning the whole loop (opened here, lazily, on
+    /// the first applied answer; closed once in `finish_confirm_sub`) so `u`
+    /// still undoes the entire `:s///c` invocation in one step rather than
+    /// one keystroke at a time.
     fn confirm_sub_apply_current(&mut self) {
-        let Some(state) = self.confirm_sub.as_mut() else {
+        let Some(mut state) = self.confirm_sub.take() else {
             return;
         };
         let Some(m) = state.matches.get(state.idx).cloned() else {
+            self.confirm_sub = Some(state);
             return;
         };
+
+        // Where this candidate's match currently sits in the *live* buffer
+        // -- everything up to `state.copied` has already been folded into
+        // the live buffer exactly as `state.out` records it (verbatim
+        // copies and any earlier confirmed replacements alike), so this is
+        // `state.out`'s length plus however much *unchanged* original text
+        // sits between `state.copied` and this match's start.
+        let live_start = confirm_sub_live_char_pos(&state, m.mstart);
+        let matched_chars = state.body[m.mstart..m.mend].chars().count();
+        let is_first_apply = state.n_subs == 0;
+        let first_cursor = Cursor {
+            line: m.sline,
+            col: m.scol,
+        };
+
         state.out.push_str(&state.body[state.copied..m.mstart]);
         state.out.push_str(&m.rendered);
         state.copied = m.mend;
         state.n_subs += 1;
         if state.first_change_cursor.is_none() {
-            state.first_change_cursor = Some(Cursor {
-                line: m.sline,
-                col: m.scol,
-            });
+            state.first_change_cursor = Some(first_cursor);
         }
         state.last_end_in_out = Some(state.out.len());
         state.last_was_multiline = m.eline > m.sline;
@@ -3826,6 +3870,18 @@ impl Engine {
         if m.eline == m.sline && state.done_lines.last() != Some(&m.sline) {
             state.done_lines.push(m.sline);
         }
+
+        if is_first_apply {
+            self.start_undo_group_at(first_cursor);
+        }
+        if matched_chars > 0 {
+            self.delete_with_undo(live_start, live_start + matched_chars);
+        }
+        if !m.rendered.is_empty() {
+            self.insert_with_undo(live_start, &m.rendered);
+        }
+
+        self.confirm_sub = Some(state);
     }
 
     /// Move to the next candidate (without deciding anything about it),
@@ -3842,8 +3898,10 @@ impl Engine {
         }
     }
 
-    /// End the confirm loop: splice whatever got decided into the real
-    /// buffer, then handle the cursor and message independently —
+    /// End the confirm loop: close out the undo group spanning whatever got
+    /// decided (each answer already spliced its own change into the real
+    /// buffer live, in `confirm_sub_apply_current` -- there is nothing left
+    /// to apply here), then handle the cursor and message independently —
     /// verified against real Neovim (see this section's own doc above),
     /// the two don't always travel together:
     ///
@@ -3860,16 +3918,16 @@ impl Engine {
         let Some(state) = self.confirm_sub.take() else {
             return EngineAction::None;
         };
+        // `state.out` + the still-untouched tail of `state.body` from
+        // `state.copied` onward is, by construction, exactly what the live
+        // buffer already holds at this point (every earlier answer kept
+        // this invariant true via its own live splice) -- rebuilt here
+        // purely to derive the report cursor below, not to be written back.
         let mut out = state.out;
         out.push_str(&state.body[state.copied..]);
 
         if state.n_subs > 0 {
-            let new_full = format!("{out}{}", state.trailing);
-            let first_change_cursor = state.first_change_cursor.unwrap_or(Cursor {
-                line: state.cur,
-                col: 0,
-            });
-            self.splice_buffer_text_at(&new_full, first_change_cursor);
+            self.finish_undo_group();
         }
 
         if reposition && state.n_subs > 0 {
@@ -4239,7 +4297,10 @@ impl Engine {
     /// range: None = current line, Some((start_line, end_line)) = line range
     /// pattern: string to find (will use simple substring matching for now)
     /// replacement: string to replace with
-    /// flags: "g" (all), "c" (confirm), "i" (case-insensitive)
+    /// flags: "g" (all), "i" (case-insensitive) -- `c` (confirm) is handled
+    /// by `run_substitute`'s own `:s///c` loop before this function is ever
+    /// reached; this legacy per-line path's only caller (`search.rs`'s
+    /// `find_replace_replace_all`) never passes it.
     /// Returns: (num_replacements, modified_text_preview)
     pub fn replace_in_range(
         &mut self,
@@ -4253,7 +4314,6 @@ impl Engine {
         }
 
         let global = flags.contains('g');
-        let _confirm = flags.contains('c'); // For Phase 2
         let case_insensitive = flags.contains('i');
 
         // Determine line range
@@ -4923,12 +4983,14 @@ pub(crate) struct ConfirmSubMatch {
 /// `Engine::confirm_sub` between keystrokes; see that field's doc and the
 /// "confirm loop" section of `impl Engine` in this file for how it's driven.
 pub(crate) struct ConfirmSubState {
-    /// The buffer's text at the moment `:s///c` was invoked, sans a
-    /// trailing `\n` (see `trailing`) — frozen for the whole loop; matches'
-    /// offsets are only ever valid against this copy, not the live buffer.
+    /// The buffer's text at the moment `:s///c` was invoked, sans its
+    /// trailing `\n` (that trailing newline, if any, is never touched by
+    /// the confirm loop -- every match lives inside `body`, and each
+    /// confirmed answer is spliced live into the real buffer in place, so
+    /// there is no need to track or ever reassemble the suffix separately)
+    /// — frozen for the whole loop; matches' offsets are only ever valid
+    /// against this copy, not the live buffer.
     body: String,
-    /// `"\n"` if `body` ends the buffer's actual trailing newline, else `""`.
-    trailing: String,
     /// Every match `:s///c` will offer to confirm, in order, precomputed
     /// against `body`.
     matches: Vec<ConfirmSubMatch>,
@@ -4966,6 +5028,23 @@ pub(crate) struct ConfirmSubState {
     /// A `|`-chained follow-up ex command (`:s/a/x/|s/b/y/c`), run once the
     /// loop ends, same as the non-confirm path.
     chained: Option<String>,
+}
+
+/// Char position, in the *live* buffer as it currently stands, that a byte
+/// offset into the frozen `body` corresponds to.
+///
+/// Everything up to `state.copied` has already been folded into the live
+/// buffer exactly as `state.out` records it (verbatim copies of
+/// not-yet-decided text and any earlier confirmed replacements alike -- see
+/// `Engine::confirm_sub_apply_current`'s doc for why that invariant holds),
+/// so a later offset's live position is `state.out`'s length plus however
+/// much *unchanged* original text sits between `state.copied` and it.
+/// `body_byte_offset` must be `>= state.copied` (true of every candidate's
+/// `mstart`/`mend`, since candidates are processed strictly in document
+/// order and `state.copied` only ever advances to a just-applied match's
+/// `mend`).
+fn confirm_sub_live_char_pos(state: &ConfirmSubState, body_byte_offset: usize) -> usize {
+    state.out.chars().count() + state.body[state.copied..body_byte_offset].chars().count()
 }
 
 /// Scan `body` for every match `:s///c` should offer to confirm, applying
