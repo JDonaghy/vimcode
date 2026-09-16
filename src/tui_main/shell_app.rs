@@ -5422,10 +5422,25 @@ mod tests {
     /// special-case in `Self::on_shell_event_ctx`) and re-running — the
     /// `!screen_contains("File")` assertion below fails; the menu row is
     /// still painted after the second, correctly re-located click.
+    ///
+    /// Built with [`TuiShellApp::new_for_test`], not `TuiShellApp::new(None)`
+    /// (#868): the latter is ambient in exactly the way that method's own doc
+    /// comment warns about — `Engine::new()` reads the developer's real
+    /// `~/.config/vimcode/{settings,session}.json`, and a machine that has
+    /// ever opened the explorer has a persisted `explorer_visible: true` that
+    /// boots this app with the sidebar *showing*. This scenario is about the
+    /// hamburger's own reserved-but-contentless sidebar region, so it only
+    /// holds from the "no real panel open" state a fresh checkout and CI
+    /// boot into: with an ambient sidebar already visible the second click
+    /// takes the real-panel path instead and the menu row stays painted,
+    /// which made this test red on a dev box and green in CI. `new_for_test`
+    /// substitutes in-memory `Settings::default()`/`SessionState::default()`
+    /// and skips the per-workspace session restore, so the starting state is
+    /// the same everywhere.
     #[test]
     fn hamburger_relocated_click_after_reveal_hides_menu_bar() {
         let mut driver = driver_with_shell(
-            TuiShellApp::new(None),
+            TuiShellApp::new_for_test(),
             TuiShellApp::shell_config(false),
             80,
             24,
@@ -7624,11 +7639,15 @@ mod tests {
     /// which points the new group's window at the *same* buffer id — the
     /// same "two views, one buffer" shape #1038 reports.
     ///
-    /// `hide_single_tab` is pinned off: after the first close only one
-    /// group remains, and if a developer's ambient `~/.config/vimcode`
-    /// settings had that flag on, `is_tab_bar_hidden` would suppress the
-    /// second click's tab bar entirely (see `app_with_sidebar_open`'s doc
-    /// comment on `Engine::new` reading real on-disk settings).
+    /// Built with [`TuiShellApp::new_for_test`], not `TuiShellApp::new(None)`
+    /// (#868): the production constructor reads the developer's real
+    /// `~/.config/vimcode/{settings,session}.json` and restores that
+    /// workspace's session files, so the number of painted `[No Name]` tabs
+    /// this test counts would depend on whose machine it runs on.
+    /// `hide_single_tab` is additionally pinned off regardless of what
+    /// `Settings::default()` says: after the first close only one group
+    /// remains, and with that flag on `is_tab_bar_hidden` would suppress the
+    /// second click's tab bar entirely.
     ///
     /// RED-verified: with the `buffer_has_other_views` guard removed from
     /// `handle_tab_bar_click`'s `CloseTab` arm (i.e. prompting on
@@ -7638,7 +7657,7 @@ mod tests {
     /// before committing.
     #[test]
     fn tab_bar_close_dirty_tab_with_other_view_does_not_confirm_via_shell_app() {
-        let mut app = TuiShellApp::new(None);
+        let mut app = TuiShellApp::new_for_test();
         app.engine.settings.hide_single_tab = false;
         app.engine.buffer_mut().insert(0, "short\n");
         app.engine.open_editor_group(SplitDirection::Vertical);
