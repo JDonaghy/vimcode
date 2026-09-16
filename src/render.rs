@@ -5936,9 +5936,12 @@ pub fn apply_scroll_offset(
         // Owned by quadraui's `SidebarSystem` — consume without applying.
         "tui:search_results" => true,
         other if other.starts_with("debug_sidebar:") => true,
-        // Editor window scrollbars. TUI encodes both axes as
-        // `tui:editor:<window_id>:<vsb|hsb>`; GTK only paints a horizontal one
-        // and encodes it as `editor:h_sb:<window_id>`.
+        // Editor window scrollbars. TUI's production `mouse.rs` drag path
+        // encodes both axes as `tui:editor:<window_id>:<vsb|hsb>`; the
+        // shared `crate::app::App` dispatch (both backends, via
+        // `handle_mouse_click_msg`'s h/v-scrollbar rungs — #825/#1026)
+        // encodes them as `editor:h_sb:<window_id>` / `editor:v_sb:<window_id>`
+        // instead, one arm per axis below.
         other if other.starts_with("tui:editor:") => {
             let Some((wid_str, axis)) = other["tui:editor:".len()..].split_once(':') else {
                 return false;
@@ -5965,6 +5968,17 @@ pub fn apply_scroll_offset(
                 return false;
             };
             engine.set_scroll_left_for_window(crate::core::WindowId(wid), new_offset);
+            true
+        }
+        // GTK's own v-scrollbar rung (#1026/#987) — mirrors `editor:h_sb:`
+        // immediately above, one id per axis.
+        other if other.starts_with("editor:v_sb:") => {
+            let Ok(wid) = other["editor:v_sb:".len()..].parse::<usize>() else {
+                return false;
+            };
+            let window_id = crate::core::WindowId(wid);
+            engine.set_scroll_top_for_window(window_id, new_offset);
+            engine.sync_scroll_binds();
             true
         }
         _ => false,

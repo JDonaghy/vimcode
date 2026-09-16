@@ -1139,27 +1139,6 @@ pub(crate) const KNOWN_BUGS: &[&str] = &[
     // own doc. Reproduces on both backends, unlike #983's GTK-only gap.
     "explorer_chevron_click_toggles_dir_with_same_arity_as_label_click::gtk", // #984 — fix: #1027
     "explorer_chevron_click_toggles_dir_with_same_arity_as_label_click::tui", // #984 — fix: #1027
-    // #987: v0.11.0 bug report -- a group's own vertical scrollbar is inert
-    // (no `EditorHit::VScrollbar` hit-test exists anywhere in
-    // `src/app.rs`'s shared mouse dispatch, on either backend), and when
-    // that group sits immediately left of a group divider, the same click
-    // also silently perturbs the split ratio via
-    // `render::divider_ratio_from_pos`. Reproduces identically on both
-    // backends -- `crate::harness`'s "tui" conformance arm drives the same
-    // shared `crate::app::App` dispatch code as GTK, not the separately
-    // hand-written production TUI stack -- see
-    // `drag_group_scrollbar_column`'s own doc.
-    "left_group_scrollbar_drag_scrolls_without_resizing::gtk", // #987 — fix: #1026
-    "left_group_scrollbar_drag_scrolls_without_resizing::tui", // #987 — fix: #1026
-    // #987 deliverable 3: the same inertness generalizes to *any* group,
-    // not just one beside a divider -- the right group's scrollbar (no
-    // divider on its own right edge in a two-group layout) is inert too,
-    // just without the resize side effect. See
-    // `right_group_scrollbar_drag_scrolls_without_resizing`'s own doc for
-    // the RED-verification distinguishing this from the left-group case
-    // above (only one assertion fails here, not both).
-    "right_group_scrollbar_drag_scrolls_without_resizing::gtk", // #987 — fix: #1026
-    "right_group_scrollbar_drag_scrolls_without_resizing::tui", // #987 — fix: #1026
     // #986: v0.11.0 bug report -- `:s///c` (confirm-prompt) is #801 Phase 2,
     // which was never built: `execute.rs`'s `flags.contains('c')` check
     // always errors loudly ("E-vimcode: ... not implemented") instead of

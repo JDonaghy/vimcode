@@ -271,6 +271,119 @@ pub(crate) fn h_scrollbar_hit_test(
     None
 }
 
+/// Compute the thumb geometry for one window's v scrollbar.
+///
+/// Mirrors [`h_scrollbar_geometry`], but the reserved column is exactly the
+/// `cell_width`-wide slice `quadraui::Editor::layout_with_options` reserves
+/// at the window's own right edge whenever the buffer overflows the
+/// viewport (quadraui#968), rather than an independently-guessed pixel
+/// constant — so this hit-test can never drift from what the shared
+/// rasteriser actually painted (#1026/#987).
+///
+/// Returns `(track_x, track_y, track_w, track_h, thumb_y, thumb_h, scroll_range, px_per_row)`.
+/// Returns `None` when no scrollbar is needed (content fits).
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+pub(crate) fn v_scrollbar_geometry(
+    engine: &Engine,
+    window_id: core::WindowId,
+    rect: &core::WindowRect,
+    char_width: f64,
+    line_height: f64,
+) -> Option<(f64, f64, f64, f64, f64, f64, f64, f64)> {
+    let window = engine.windows.get(&window_id)?;
+    let buffer_state = engine.buffer_manager.get(window.buffer_id)?;
+
+    let total_lines = buffer_state.buffer.len_lines().max(1);
+
+    let status_offset = if render::window_status_row_reserved(engine) {
+        line_height
+    } else {
+        0.0
+    };
+    let content_h = (rect.height - status_offset).max(1.0);
+    // The h-scrollbar (when present) also eats one row off the bottom of
+    // this window's v-scrollbar track — asked via the same helper that
+    // decides whether the h-scrollbar itself exists, so the two never
+    // disagree about how much vertical room is left.
+    let has_h_scrollbar =
+        h_scrollbar_geometry(engine, window_id, rect, char_width, line_height).is_some();
+    let track_h = (content_h - if has_h_scrollbar { line_height } else { 0.0 }).max(1.0);
+    let visible_lines = if line_height > 0.0 {
+        (track_h / line_height).floor().max(1.0)
+    } else {
+        1.0
+    };
+
+    if (total_lines as f64) <= visible_lines {
+        return None;
+    }
+
+    let track_x = rect.x + rect.width - char_width;
+    let track_y = rect.y;
+    let scroll_range = (total_lines as f64 - visible_lines).max(1.0);
+    let scroll_top = window.view.scroll_top as f64;
+    let (thumb_y_rel, thumb_h) = quadraui::fit_thumb(
+        scroll_top as f32,
+        total_lines as f32,
+        visible_lines as f32,
+        track_h as f32,
+        1.0,
+    );
+    let thumb_y = track_y + thumb_y_rel as f64;
+    let thumb_h = thumb_h as f64;
+    let px_per_row = (track_h - thumb_h) / scroll_range;
+
+    Some((
+        track_x,
+        track_y,
+        char_width,
+        track_h,
+        thumb_y,
+        thumb_h,
+        scroll_range,
+        px_per_row,
+    ))
+}
+
+/// Hit-test a point against all v scrollbars. Returns `(window_id,
+/// scroll_top_at_click)` when the point is on any v scrollbar track (not
+/// only the thumb), so the caller can decide between thumb-drag and
+/// track-page — mirrors [`h_scrollbar_hit_test`].
+pub(crate) fn v_scrollbar_hit_test(
+    engine: &Engine,
+    x: f64,
+    y: f64,
+    window_rects: &[(core::WindowId, core::WindowRect)],
+    char_width: f64,
+    line_height: f64,
+) -> Option<(core::WindowId, usize)> {
+    for (window_id, rect) in window_rects {
+        if let Some((track_x, track_y, track_w, track_h, _, _, _, _)) =
+            v_scrollbar_geometry(engine, *window_id, rect, char_width, line_height)
+        {
+            // Half-open on the upper `x` bound (unlike `h_scrollbar_hit_test`'s
+            // `<=`) — this column's right edge coincides with the window's own
+            // right edge, which for any window sitting left of a group divider
+            // is also the divider's own hit-test coordinate
+            // (`render::route_divider_grab`'s `position`). An inclusive `<=`
+            // here would let this rung swallow a click aimed at the divider
+            // itself, failing the #987 negative-space case
+            // (`drag_group_divider_resizes`) that pins the divider's own hit
+            // zone must survive this fix. `quadraui::EditorLayout::hit_test`
+            // uses the same half-open convention for its `VScrollbar` arm.
+            if x >= track_x && x < track_x + track_w && y >= track_y && y < track_y + track_h {
+                let scroll_top = engine
+                    .windows
+                    .get(window_id)
+                    .map(|w| w.view.scroll_top)
+                    .unwrap_or(0);
+                return Some((*window_id, scroll_top));
+            }
+        }
+    }
+    None
+}
+
 /// Open a URL in the default browser (only https/http).
 pub(crate) fn open_url(url: &str) {
     crate::core::engine::open_url_in_browser(url);
