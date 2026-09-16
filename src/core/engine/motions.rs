@@ -3215,6 +3215,21 @@ impl Engine {
             return;
         }
         let end_line = (start_line + count).min(num_lines);
+        // Fold-aware (#1006): extend to cover the full range of any closed
+        // fold either boundary touches — `dd` on a closed fold's header
+        // removes every line inside it, not just the header
+        // (`:h fold-behavior`, verified against `nvim --headless`).
+        let start_line = self
+            .view()
+            .enclosing_closed_fold(start_line)
+            .map(|f| f.start)
+            .unwrap_or(start_line);
+        let end_line = self
+            .view()
+            .enclosing_closed_fold(end_line.saturating_sub(1).max(start_line))
+            .map(|f| f.end + 1)
+            .unwrap_or(end_line)
+            .min(num_lines);
         let actual_count = end_line - start_line;
 
         if actual_count == 0 {
@@ -3975,6 +3990,124 @@ impl Engine {
         }
     }
 
+    // ── 'foldmethod' "indent" ───────────────────────────────────────────────
+    //
+    // The block below implements Vim's real indent-fold algorithm
+    // (`:h fold-indent`), which is deliberately a *different, more faithful*
+    // computation than `detect_fold_range` above: `detect_fold_range` treats
+    // the less-indented line immediately before a block as that block's
+    // header (the right heuristic for "fold what's under the cursor" — used
+    // by the VSCode-style progressive fold and as the historical z-command
+    // fallback), but that's not what Vim's indent method does. Vim assigns
+    // each line its OWN level (`indent / shiftwidth`) independent of its
+    // neighbors, so an unindented `fn foo() {` is level 0 and — unlike
+    // `detect_fold_range`'s header — is never itself inside a fold. A
+    // level-N fold is a maximal run of >= 2 consecutive lines all at level
+    // >= N (a single elevated line does not become its own fold). Verified
+    // line-for-line against `nvim --headless -u NONE` with
+    // `foldmethod=indent` on a two-level nested fixture (#1006).
+
+    /// A line's indent-fold level: `indent / shiftwidth`, rounded down.
+    fn indent_fold_level(&self, line_idx: usize) -> usize {
+        let shift_width = (self.settings.shift_width as usize).max(1);
+        self.line_indent(line_idx) / shift_width
+    }
+
+    /// Compute the full nested indent-fold hierarchy: every foldable
+    /// region, with its 1-based nesting depth (1 = outermost). See the
+    /// module comment above for why this doesn't reuse `detect_fold_range`.
+    pub(crate) fn compute_indent_folds(&self) -> Vec<(usize, usize, usize)> {
+        let total = self.buffer().len_lines();
+        let levels: Vec<usize> = (0..total).map(|i| self.indent_fold_level(i)).collect();
+        let mut out = Vec::new();
+        Self::collect_level_folds(&levels, 0, total, 1, &mut out);
+        out
+    }
+
+    /// Recursive helper for `compute_indent_folds`: within `[from, to)`,
+    /// find every maximal run of >= 2 consecutive lines at `level` or
+    /// deeper, record it, then recurse one level deeper over that same
+    /// sub-range to find the folds nested inside it.
+    fn collect_level_folds(
+        levels: &[usize],
+        from: usize,
+        to: usize,
+        level: usize,
+        out: &mut Vec<(usize, usize, usize)>,
+    ) {
+        let mut i = from;
+        while i < to {
+            if levels[i] >= level {
+                let start = i;
+                let mut end = i;
+                while end + 1 < to && levels[end + 1] >= level {
+                    end += 1;
+                }
+                if end > start {
+                    out.push((start, end, level));
+                    Self::collect_level_folds(levels, start, end + 1, level + 1, out);
+                }
+                i = end + 1;
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    /// The innermost indent-computed fold containing `line`, if any.
+    fn indent_fold_containing(&self, line: usize) -> Option<(usize, usize)> {
+        self.compute_indent_folds()
+            .into_iter()
+            .filter(|(start, end, _)| *start <= line && line <= *end)
+            .min_by_key(|(start, end, _)| end - start)
+            .map(|(start, end, _)| (start, end))
+    }
+
+    /// The nearest indent-fold header strictly after `line`, skipping
+    /// headers already hidden inside another closed fold.
+    fn indent_fold_after(&self, line: usize) -> Option<usize> {
+        self.compute_indent_folds()
+            .into_iter()
+            .map(|(start, _, _)| start)
+            .filter(|&start| start > line && !self.view().is_line_hidden(start))
+            .min()
+    }
+
+    /// The *end* of the nearest indent fold strictly before `line` — `zk`
+    /// moves to the end of the previous fold, not its start (`:h zk`;
+    /// verified against `nvim --headless`, #1006), unlike `zj`'s `:h zj`
+    /// "start of the next fold". Skips folds already hidden inside another
+    /// closed fold.
+    fn indent_fold_end_before(&self, line: usize) -> Option<usize> {
+        self.compute_indent_folds()
+            .into_iter()
+            .filter(|(start, end, _)| *end < line && !self.view().is_line_hidden(*start))
+            .map(|(_, end, _)| end)
+            .max()
+    }
+
+    /// Apply `'foldlevel'` under `'foldmethod'` `"indent"`: compute the
+    /// nested indent-fold hierarchy and close every fold nested deeper than
+    /// `level`, processing deepest-first. Deepest-first matters when both a
+    /// fold and its child need closing (`level` 0 with 2+ nesting levels):
+    /// closing the child first and the parent second lets `close_fold`'s
+    /// "drop folds fully contained in the new one" rule fold the child's
+    /// closed entry into the parent's, leaving one clean closed range
+    /// instead of two overlapping ones. Folds at or above `level` are still
+    /// recorded via `define_fold` (not closed) so a later `zo`/`zc` on them
+    /// works from a real definition.
+    pub fn apply_foldlevel(&mut self, level: usize) {
+        let mut ranges = self.compute_indent_folds();
+        ranges.sort_by_key(|(_, _, level)| std::cmp::Reverse(*level));
+        for (start, end, fold_level) in ranges {
+            if fold_level > level {
+                self.view_mut().close_fold(start, end);
+            } else {
+                self.view_mut().define_fold(start, end);
+            }
+        }
+    }
+
     /// Toggle the fold at `line_idx` regardless of cursor position.
     /// Used by click handlers when the user clicks the fold indicator.
     pub fn toggle_fold_at_line(&mut self, line_idx: usize) {
@@ -3997,16 +4130,43 @@ impl Engine {
         }
     }
 
+    /// Close a fold, then (matching Vim) pull the cursor up to the header if
+    /// it just got hidden.
+    fn close_fold_and_clamp(&mut self, start: usize, end: usize) {
+        self.view_mut().close_fold(start, end);
+        if self.view().is_line_hidden(self.view().cursor.line) {
+            self.view_mut().cursor.line = start;
+            self.clamp_cursor_col();
+        }
+    }
+
+    /// zc — close the fold enclosing the cursor.
+    ///
+    /// Prefers an already-*defined* fold (`fold_defs`, however it was
+    /// created and whether currently open or closed) so a manual `zf` fold
+    /// round-trips through `zo`/`zc` back to the same region (#1006) rather
+    /// than trying to rediscover it. With `'foldmethod'` `"indent"` and
+    /// nothing defined yet at the cursor, falls back to the real indent-fold
+    /// computation (`compute_indent_folds`) — Vim computes that method's
+    /// hierarchy automatically, without a `zf`. In `"manual"` mode with
+    /// nothing defined, matches Vim: nothing happens (`E490`), verified
+    /// against `nvim --headless` (#1006) — vimcode used to invent a fold
+    /// from indentation here even in the default manual method, which real
+    /// Vim never does.
     pub(crate) fn cmd_fold_close(&mut self) {
         let line = self.view().cursor.line;
-        if let Some((start, end)) = self.detect_fold_range(line) {
-            self.view_mut().close_fold(start, end);
-            // If cursor ended up inside the fold, move it to the header.
-            if self.view().is_line_hidden(self.view().cursor.line) {
-                self.view_mut().cursor.line = start;
-                self.clamp_cursor_col();
+        if let Some(range) = self.view().enclosing_fold_def(line) {
+            let (start, end) = (range.start, range.end);
+            self.close_fold_and_clamp(start, end);
+            return;
+        }
+        if self.settings.foldmethod == "indent" {
+            if let Some((start, end)) = self.indent_fold_containing(line) {
+                self.close_fold_and_clamp(start, end);
+                return;
             }
         }
+        self.message = "E490: No fold found".to_string();
     }
 
     /// Find the enclosing foldable block for `line` by walking upward to find
@@ -4097,27 +4257,48 @@ impl Engine {
         self.view_mut().open_fold(line);
     }
 
-    /// zM — close all folds in the buffer using indent-based detection.
+    /// zM — close every fold in the buffer.
+    ///
+    /// With `'foldmethod'` `"indent"` this first computes the whole
+    /// indent-fold hierarchy (Vim derives that method's folds automatically,
+    /// there's no `zf` step) and closes it down to `'foldlevel'` 0 — i.e.
+    /// closes everything (`apply_foldlevel(0)`). Otherwise (`"manual"`) it
+    /// only closes folds that already exist via `zf`; matching Vim, `zM`
+    /// never invents a manual fold (#1006, verified against `nvim
+    /// --headless`).
     pub(crate) fn cmd_fold_close_all(&mut self) {
-        let total = self.buffer().len_lines();
-        let mut i = 0;
-        while i < total {
-            if let Some((start, end)) = self.detect_fold_range(i) {
+        if self.settings.foldmethod == "indent" {
+            self.apply_foldlevel(0);
+        } else {
+            let mut defs: Vec<(usize, usize)> = self
+                .view()
+                .fold_defs
+                .iter()
+                .map(|f| (f.start, f.end))
+                .collect();
+            // Innermost (narrowest) first, so `close_fold`'s "drop folds
+            // fully contained in the new one" rule folds a closed child into
+            // its closed parent instead of leaving two overlapping entries.
+            defs.sort_by_key(|(start, end)| end - start);
+            for (start, end) in defs {
                 self.view_mut().close_fold(start, end);
-                i = end + 1;
-            } else {
-                i += 1;
             }
         }
         // Clamp cursor if it ended up hidden.
         let cursor_line = self.view().cursor.line;
         if self.view().is_line_hidden(cursor_line) {
-            // Move cursor to the nearest fold header above.
-            for f in self.view().folds.iter().rev() {
-                if f.start <= cursor_line && cursor_line <= f.end {
-                    self.view_mut().cursor.line = f.start;
-                    break;
-                }
+            // Move cursor to the outermost enclosing fold's header — nested
+            // closed folds can both contain `cursor_line` (#1006), and only
+            // the outermost header is actually visible.
+            if let Some(start) = self
+                .view()
+                .folds
+                .iter()
+                .filter(|f| f.start <= cursor_line && cursor_line <= f.end)
+                .map(|f| f.start)
+                .min()
+            {
+                self.view_mut().cursor.line = start;
             }
             self.clamp_cursor_col();
         }
@@ -4178,6 +4359,33 @@ impl Engine {
         self.message = format!("{lines} lines folded");
     }
 
+    /// zf{a/i}{object} (e.g. `zfap`, `zfi{`) — fold the line range of a text
+    /// object, the same grammar `d`/`c`/`y` use (#1006). Reuses
+    /// `find_text_object_range` rather than duplicating its per-object
+    /// logic; converts the returned char range to a line range the way
+    /// `cmd_fold_create`'s other callers already work in.
+    pub(crate) fn apply_fold_text_object(&mut self, modifier: char, obj_type: char) {
+        let cursor = self.view().cursor;
+        let cursor_pos = self.buffer().line_to_char(cursor.line) + cursor.col;
+        let count = self.take_count().max(1);
+        let Some((start_pos, end_pos)) =
+            self.find_text_object_range(modifier, obj_type, cursor_pos, count)
+        else {
+            return;
+        };
+        if start_pos >= end_pos {
+            return;
+        }
+        let start_line = self.buffer().content.char_to_line(start_pos);
+        // `end_pos` is exclusive (points just past the object), so resolve
+        // the line of the last character actually *in* the object.
+        let end_line = self
+            .buffer()
+            .content
+            .char_to_line((end_pos - 1).max(start_pos));
+        self.cmd_fold_create(start_line, end_line);
+    }
+
     /// zv — open enough folds to make cursor line visible.
     pub(crate) fn cmd_fold_open_cursor_visible(&mut self) {
         loop {
@@ -4202,28 +4410,25 @@ impl Engine {
         self.cmd_fold_close_all();
     }
 
-    /// zj — move to the start of the next fold.
+    /// zj — move to the start of the next fold (open or closed — any
+    /// defined fold, not just closed ones, matches Vim). With
+    /// `'foldmethod'` `"indent"`, also considers folds not yet materialized
+    /// in `fold_defs` (Vim computes that method's hierarchy on demand, not
+    /// just from prior `zf`/`zc`/`zM` calls).
     pub(crate) fn cmd_fold_move_next(&mut self) {
         let cursor_line = self.view().cursor.line;
-        let total = self.buffer().len_lines();
-        // First check existing closed folds.
         let next_fold = self
             .view()
-            .folds
+            .fold_defs
             .iter()
-            .find(|f| f.start > cursor_line)
-            .map(|f| f.start);
-        // Also scan for potential fold starts (lines with children indented deeper).
-        let mut next_detectable = None;
-        for i in (cursor_line + 1)..total {
-            if self.view().is_line_hidden(i) {
-                continue;
-            }
-            if self.detect_fold_range(i).is_some() {
-                next_detectable = Some(i);
-                break;
-            }
-        }
+            .filter(|f| f.start > cursor_line)
+            .map(|f| f.start)
+            .min();
+        let next_detectable = if self.settings.foldmethod == "indent" {
+            self.indent_fold_after(cursor_line)
+        } else {
+            None
+        };
         let target = match (next_fold, next_detectable) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (Some(a), None) => Some(a),
@@ -4236,28 +4441,23 @@ impl Engine {
         }
     }
 
-    /// zk — move to the end of the previous fold.
+    /// zk — move to the *end* of the previous fold (`:h zk`; not its start —
+    /// that asymmetry with `zj` is real Vim behavior, verified against
+    /// `nvim --headless`, #1006).
     pub(crate) fn cmd_fold_move_prev(&mut self) {
         let cursor_line = self.view().cursor.line;
-        // Check existing closed folds.
         let prev_fold = self
             .view()
-            .folds
+            .fold_defs
             .iter()
-            .rev()
-            .find(|f| f.start < cursor_line)
-            .map(|f| f.start);
-        // Also scan for potential fold starts.
-        let mut prev_detectable = None;
-        for i in (0..cursor_line).rev() {
-            if self.view().is_line_hidden(i) {
-                continue;
-            }
-            if self.detect_fold_range(i).is_some() {
-                prev_detectable = Some(i);
-                break;
-            }
-        }
+            .filter(|f| f.end < cursor_line)
+            .map(|f| f.end)
+            .max();
+        let prev_detectable = if self.settings.foldmethod == "indent" {
+            self.indent_fold_end_before(cursor_line)
+        } else {
+            None
+        };
         let target = match (prev_fold, prev_detectable) {
             (Some(a), Some(b)) => Some(a.max(b)),
             (Some(a), None) => Some(a),
@@ -4935,6 +5135,19 @@ impl Engine {
         let start_line = self.view().cursor.line;
         let total_lines = self.buffer().len_lines();
         let end_line = (start_line + count).min(total_lines);
+        // Fold-aware (#1006): see `delete_lines`'s identical fix — `yy` on a
+        // closed fold's header yanks every line inside it.
+        let start_line = self
+            .view()
+            .enclosing_closed_fold(start_line)
+            .map(|f| f.start)
+            .unwrap_or(start_line);
+        let end_line = self
+            .view()
+            .enclosing_closed_fold(end_line.saturating_sub(1).max(start_line))
+            .map(|f| f.end + 1)
+            .unwrap_or(end_line)
+            .min(total_lines);
         let actual_count = end_line - start_line;
 
         if actual_count == 0 {
@@ -5972,7 +6185,12 @@ impl Engine {
         // real interactive Neovim's `zz`, which was landing one line lower
         // than vimcode did (see scripts/nvim_headless_vs_interactive_repro.sh).
         let half = self.viewport_lines().saturating_sub(1) / 2;
-        let new_top = cursor_line.saturating_sub(half);
+        // Fold-aware (#1006): step back `half` *visible* rows, not buffer
+        // lines — plain subtraction can land `scroll_top` inside a closed
+        // fold's hidden body, and undercounts how far up the buffer a
+        // closed fold above the cursor actually reaches (a fold spanning
+        // many buffer lines is still only one screen row).
+        let new_top = self.view().prev_visible_line(cursor_line, half);
         self.view_mut().scroll_top = new_top;
     }
 
@@ -6551,26 +6769,39 @@ impl Engine {
     /// `H`'s target: the `count`'th line from the top of the window, kept at
     /// least 'scrolloff' lines below the top edge (#805). Shared with `dH` so
     /// the operator form honours its count too (#807).
+    /// `H`'s target: the `count`'th line from the top of the window.
+    ///
+    /// Fold-aware (#1006): a closed fold occupies exactly one screen row
+    /// regardless of how many buffer lines it spans, so "the window's last
+    /// row" is a *buffer* line only `next_visible_line` can find — plain
+    /// `scroll_top + viewport_lines - 1` arithmetic under-counts by however
+    /// many lines are folded away, landing `H`/`L`/`zt`+`L`/`zz`+`H` short
+    /// of where Neovim actually puts them (verified against `nvim
+    /// --headless`).
     pub(crate) fn screen_top_target(&self, count: usize) -> usize {
         let scroll_top = self.view().scroll_top;
         let viewport = self.view().viewport_lines.max(1);
         let max_line = self.buffer().len_lines().saturating_sub(1);
         let offset = count.saturating_sub(1).max(self.settings.scrolloff);
-        (scroll_top + offset)
-            .min(scroll_top + viewport.saturating_sub(1))
+        let rows = offset.min(viewport.saturating_sub(1));
+        self.view()
+            .next_visible_line(scroll_top, rows, max_line)
             .min(max_line)
     }
 
     /// `L`'s target: the `count`'th line from the bottom of the window — the
-    /// mirror of [`Engine::screen_top_target`].
+    /// mirror of [`Engine::screen_top_target`], and fold-aware for the same
+    /// reason (see its doc).
     pub(crate) fn screen_bottom_target(&self, count: usize) -> usize {
         let scroll_top = self.view().scroll_top;
         let viewport = self.view().viewport_lines.max(1);
         let max_line = self.buffer().len_lines().saturating_sub(1);
-        let window_bottom = scroll_top + viewport - 1;
+        let window_bottom =
+            self.view()
+                .next_visible_line(scroll_top, viewport.saturating_sub(1), max_line);
         let offset = count.saturating_sub(1).max(self.settings.scrolloff);
-        window_bottom
-            .saturating_sub(offset)
+        self.view()
+            .prev_visible_line(window_bottom, offset)
             .max(scroll_top)
             .min(max_line)
     }

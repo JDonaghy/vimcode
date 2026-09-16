@@ -272,10 +272,15 @@ fn test_g_apostrophe_mark_without_jumplist() {
 #[test]
 fn test_bracket_z_fold_start() {
     let mut e = engine_with("fn main() {\n    inner\n    code\n}\n");
-    // Create a fold from line 0 to line 2
-    e.view_mut()
-        .folds
-        .push(vimcode_core::core::view::FoldRegion { start: 0, end: 2 });
+    // Create a fold from line 0 to line 2 through the real API — `[z`/`]z`
+    // read the *defined* fold hierarchy (`fold_defs`, #1006), not just the
+    // closed-fold list, so a raw push onto `.folds` (bypassing
+    // `close_fold`) would leave that hierarchy empty and make this test
+    // vacuously fail to exercise anything.
+    e.view_mut().close_fold(0, 2);
+    // Reopen it — `[z`/`]z` land inside the *current open* fold (`:h [z`),
+    // and a closed fold's body isn't reachable by the cursor at all.
+    e.view_mut().open_fold(0);
     // Move cursor into the fold (line 1)
     e.view_mut().cursor.line = 1;
     // [z should go to fold start
@@ -286,9 +291,8 @@ fn test_bracket_z_fold_start() {
 #[test]
 fn test_bracket_z_fold_end() {
     let mut e = engine_with("fn main() {\n    inner\n    code\n}\n");
-    e.view_mut()
-        .folds
-        .push(vimcode_core::core::view::FoldRegion { start: 0, end: 2 });
+    e.view_mut().close_fold(0, 2);
+    e.view_mut().open_fold(0);
     e.view_mut().cursor.line = 1;
     // ]z should go to fold end
     type_chars(&mut e, "]z");

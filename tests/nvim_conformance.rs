@@ -438,6 +438,20 @@ fn apply_setup(settings: &mut Settings, setup: &str) -> Result<(), String> {
                      handling in apply_setup"
                 ));
             }
+            "foldmethod" | "fdm" => {
+                if value != "manual" && value != "indent" {
+                    return Err(format!(
+                        "'foldmethod' only 'manual'/'indent' are modeled in apply_setup; \
+                         {raw_value:?} needs real handling there"
+                    ));
+                }
+                settings.foldmethod = value.to_string();
+            }
+            "foldlevel" | "fdl" => {
+                settings.foldlevel = value.parse::<usize>().map_err(|_| {
+                    format!("'foldlevel' expects a non-negative integer, got {raw_value:?}")
+                })?;
+            }
             other => {
                 return Err(format!(
                     "no vimcode Settings mapping for option '{other}' (from {stmt:?}) — add one \
@@ -472,6 +486,14 @@ fn run_in_vimcode(
     // Screen-relative motions (H/M/L, <C-d>, zt) are meaningless unless both
     // sides agree on the window height, so mirror nvim's.
     engine.set_viewport_lines(rows);
+    // Neovim computes the whole 'foldmethod'=indent fold hierarchy (down to
+    // 'foldlevel') as soon as the buffer is loaded, with no explicit `zf` —
+    // mirror that here rather than leaving it for the key sequence to
+    // trigger, since a case may probe fold state without ever pressing a
+    // z-command (e.g. plain `j`/`G` motions across an already-closed fold).
+    if engine.settings.foldmethod == "indent" {
+        engine.apply_foldlevel(engine.settings.foldlevel);
+    }
     engine.view_mut().cursor.line = cursor_line_1.saturating_sub(1);
     engine.view_mut().cursor.col = cursor_col_1.saturating_sub(1);
     // nvim_win_set_cursor scrolls the window to show the cursor; a raw engine
@@ -4736,6 +4758,238 @@ const CASES_MISC: &[Case] = &[
     ),
 ];
 
+// ─────────────────────────── Q. folds (#1006) ───────────────────────────
+//
+// Folds are established through the case `setup` mechanism (#1002's
+// `apply_setup`, extended here to map `'foldmethod'`/`'foldlevel'` onto
+// `Settings`), applied to both sides — never a bespoke runner escape hatch.
+// Manual folds (`'foldmethod'` defaults to `"manual"`, matching Vim) are
+// created in-band by the case's own `keys` (`zf{motion}`); indent folds set
+// `vim.o.foldmethod='indent'` (+ optionally `vim.o.foldlevel=N`) in `setup`,
+// which `run_in_vimcode` applies via `Engine::apply_foldlevel` once the
+// buffer exists (mirroring how Neovim computes that method's hierarchy as
+// soon as the option is set, with no `zf` involved).
+//
+// Folding never changes buffer text, so every case here is read through the
+// cursor position after a motion/operator whose result depends on fold
+// state — that's what actually exercises vimcode's fold-aware
+// `next_visible_line`/`prev_visible_line` (used by `scroll_and_move_by` and
+// scroll-top snapping in `src/core/engine/motions.rs`/`accessors.rs`), not
+// just the fold commands in isolation.
+//
+// Verified by hand against `nvim --headless -u NONE` before trusting the
+// harness (#1006's "verify by hand" note): both the `foldmethod=manual`
+// zf/zo/zc round trip and the `foldmethod=indent`/`foldlevel` nested-range
+// math below were probed directly against a real Neovim process, not just
+// inferred from `:h fold` — see the two nested/#1006 engine fixes in
+// `src/core/view.rs` and `src/core/engine/motions.rs` this issue's slice
+// shipped as a result (folds no longer forget their definition on `zo`, and
+// a nested closed fold no longer gets silently absorbed by its parent).
+
+const FOLDTXT: &[&str] = &[
+    "one", "two", "three", "four", "five", "six", "seven", "eight",
+];
+
+const FOLDPARA: &[&str] = &["alpha", "beta", "", "gamma", "delta", ""];
+
+// Two-level nested indent fixture (shiftwidth 4, both harnesses set it) —
+// verified line-for-line against `nvim --headless` with
+// `foldmethod=indent`: at `foldlevel=0` lines 2-7 close as one fold (the
+// "fn main() {" header on line 1 is NOT itself folded — Vim's indent method
+// gives every line its own level, `indent/shiftwidth`, independent of its
+// neighbors, so an unindented header is level 0); at `foldlevel=1` that
+// fold is open but the nested lines 4-5 are still closed; at
+// `foldlevel=2` nothing is closed.
+const FOLDNEST: &[&str] = &[
+    "fn main() {",
+    "    let a = 1;",
+    "    if true {",
+    "        x();",
+    "        y();",
+    "    }",
+    "    let b = 2;",
+    "}",
+];
+
+const CASES_FOLD: &[Case] = &[
+    // ── manual folds: zf{motion} ─────────────────────────────────────────
+    c("fold:zfj hides one line", FOLDTXT, 1, 1, "zfjj"),
+    c("fold:zf2j hides two lines", FOLDTXT, 1, 1, "zf2jj"),
+    c("fold:zfap folds paragraph", FOLDPARA, 1, 1, "zfapj"),
+    // ── zo/zc/za round trip (#1006) ──────────────────────────────────────
+    c("fold:zo reopens a closed fold", FOLDTXT, 1, 1, "zfjzoj"),
+    c(
+        "fold:zo then zc recloses the same fold",
+        FOLDTXT,
+        1,
+        1,
+        "zfjzozcj",
+    ),
+    c(
+        "fold:za closes an open defined fold",
+        FOLDTXT,
+        1,
+        1,
+        "zfjzozaj",
+    ),
+    c("fold:za opens a closed fold", FOLDTXT, 1, 1, "zfjzaj"),
+    // ── zR/zM ─────────────────────────────────────────────────────────────
+    c("fold:zR opens all folds", FOLDTXT, 1, 1, "zfjzRj"),
+    c("fold:zM recloses a defined fold", FOLDTXT, 1, 1, "zfjzozMj"),
+    // ── zO/zC ─────────────────────────────────────────────────────────────
+    c("fold:zO opens recursively", FOLDTXT, 1, 1, "zfjzOj"),
+    c("fold:zC recloses recursively", FOLDTXT, 1, 1, "zfjzozCj"),
+    // ── zj/zk fold navigation ────────────────────────────────────────────
+    c(
+        "fold:zj moves to the defined fold header",
+        FOLDTXT,
+        3,
+        1,
+        "zfjggzj",
+    ),
+    c(
+        "fold:zk moves to the defined fold header",
+        FOLDTXT,
+        3,
+        1,
+        "zfjGzk",
+    ),
+    // ── [z/]z: boundaries of the current open fold ───────────────────────
+    c(
+        "fold:]z moves to end of open fold",
+        FOLDTXT,
+        3,
+        1,
+        "zf2jzoj]z",
+    ),
+    c(
+        "fold:[z moves to start of open fold",
+        FOLDTXT,
+        3,
+        1,
+        "zf2jzo2j[z",
+    ),
+    // ── zd/zD ─────────────────────────────────────────────────────────────
+    c("fold:zd deletes a fold", FOLDTXT, 1, 1, "zfjzdj"),
+    c(
+        "fold:zD deletes a fold recursively",
+        FOLDTXT,
+        1,
+        1,
+        "jzfjkzf3jzDj",
+    ),
+    // ── operators on a closed fold ───────────────────────────────────────
+    c(
+        "fold:dd on closed fold deletes every line",
+        FOLDTXT,
+        1,
+        1,
+        "zfjdd",
+    ),
+    c(
+        "fold:yy p on closed fold yanks every line",
+        FOLDTXT,
+        1,
+        1,
+        "zfjyyGp",
+    ),
+    c(
+        "fold:J on closed fold joins every line",
+        FOLDTXT,
+        1,
+        1,
+        "zfjJ",
+    ),
+    // ── scroll interaction (next_visible_line is load-bearing here) ──────
+    c(
+        "fold:C-d skips a closed fold in the viewport",
+        LONG,
+        10,
+        1,
+        "zf10j<C-d>",
+    ),
+    c(
+        "fold:C-e with a closed fold in the viewport",
+        LONG,
+        10,
+        1,
+        "zf10j<C-e>",
+    ),
+    c("fold:zt then L past a closed fold", LONG, 10, 1, "zf10jztL"),
+    c(
+        "fold:zz then H before a closed fold",
+        LONG,
+        30,
+        1,
+        "10Gzf10j30GzzH",
+    ),
+    // ── foldmethod=indent / foldlevel ────────────────────────────────────
+    cs(
+        "fold:indent:foldlevel0 j crosses the whole outer fold",
+        FOLDNEST,
+        1,
+        1,
+        "j",
+        "vim.o.foldmethod='indent'\nvim.o.foldlevel=0",
+    ),
+    cs(
+        "fold:indent:foldlevel1 j steps to the nested fold header",
+        FOLDNEST,
+        1,
+        1,
+        "jjj",
+        "vim.o.foldmethod='indent'\nvim.o.foldlevel=1",
+    ),
+    cs(
+        "fold:indent:foldlevel1 j skips the closed nested fold",
+        FOLDNEST,
+        1,
+        1,
+        "jjjj",
+        "vim.o.foldmethod='indent'\nvim.o.foldlevel=1",
+    ),
+    cs(
+        "fold:indent:foldlevel2 nothing is folded",
+        FOLDNEST,
+        1,
+        1,
+        "jjjj",
+        "vim.o.foldmethod='indent'\nvim.o.foldlevel=2",
+    ),
+    cs(
+        "fold:indent:zR opens everything",
+        FOLDNEST,
+        1,
+        1,
+        "zRjjjj",
+        "vim.o.foldmethod='indent'",
+    ),
+    cs(
+        "fold:indent:zM recloses after zR",
+        FOLDNEST,
+        1,
+        1,
+        "zRzMj",
+        "vim.o.foldmethod='indent'",
+    ),
+    cs(
+        "fold:indent:zo opens the level-1 fold, inner stays closed",
+        FOLDNEST,
+        2,
+        1,
+        "zoj",
+        "vim.o.foldmethod='indent'",
+    ),
+    cs(
+        "fold:indent:zc recloses the level-1 fold",
+        FOLDNEST,
+        2,
+        1,
+        "zozcj",
+        "vim.o.foldmethod='indent'",
+    ),
+];
+
 // ─────────────────── H. multi-file jumplist (#985) ───────────────────
 //
 // Cross-buffer/cross-tab/cross-split `<C-o>`/`<C-i>`, plus `:jumps` list
@@ -4882,6 +5136,7 @@ const CATEGORIES: &[(&str, &[Case])] = &[
     ("word    word & misc motions", CASES_WORD),
     ("to      text objects", CASES_TO),
     ("misc    misc", CASES_MISC),
+    ("fold    folds (#1006)", CASES_FOLD),
 ];
 
 // ---------------------------------------------------------------------------

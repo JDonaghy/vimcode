@@ -301,6 +301,22 @@ pub struct Settings {
     #[serde(default = "default_nrformats")]
     pub nrformats: Vec<String>,
 
+    /// How folds are found: `"manual"` (only `zf`-created folds — nothing is
+    /// closeable until the user explicitly folds a range) or `"indent"`
+    /// (folds are derived from indentation and recomputed on demand).
+    /// Corresponds to Vim's `'foldmethod'` / `'fdm'`. Default `"manual"`,
+    /// matching Vim (`:h 'foldmethod'`) — a fresh buffer has no folds at all
+    /// until one is created.
+    #[serde(default = "default_foldmethod")]
+    pub foldmethod: String,
+
+    /// When `'foldmethod'` is `"indent"`, folds nested deeper than this level
+    /// start closed; folds at or above it start open. Corresponds to Vim's
+    /// `'foldlevel'` / `'fdl'`. Default `0`, matching Vim: every indent fold
+    /// starts closed until raised (`:h 'foldlevel'`).
+    #[serde(default)]
+    pub foldlevel: usize,
+
     /// Highlight the line the cursor is on (default true).
     #[serde(default = "default_cursorline")]
     pub cursorline: bool,
@@ -662,6 +678,10 @@ fn default_smarttab() -> bool {
 
 fn default_nrformats() -> Vec<String> {
     vec!["bin".to_string(), "hex".to_string()]
+}
+
+fn default_foldmethod() -> String {
+    "manual".to_string()
 }
 
 fn default_colorscheme() -> String {
@@ -1056,6 +1076,8 @@ impl Default for Settings {
             joinspaces: false,
             smarttab: default_smarttab(),
             nrformats: default_nrformats(),
+            foldmethod: default_foldmethod(),
+            foldlevel: 0,
             cursorline: default_cursorline(),
             window_status_line: default_window_status_line(),
             status_line_above_terminal: default_status_line_above_terminal(),
