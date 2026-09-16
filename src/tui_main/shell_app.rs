@@ -17373,6 +17373,30 @@ mod tests {
         colors
     }
 
+    /// The minimap strip's real width **in braille cells**, measured off
+    /// the painted frame (the widest run of braille glyphs on any row,
+    /// blank `\u{2800}` cells included — those are cells the rasteriser
+    /// touched too) rather than recomputed from
+    /// `render::minimap_reserved_width`'s formula.
+    ///
+    /// Multiplied by `render::MINIMAP_COLS_PER_CELL` this is exactly the
+    /// range of *source character columns* the strip can represent, since
+    /// quadraui's TUI rasteriser maps one braille dot column to one source
+    /// column at a fixed scale (`braille_char_for_cell`'s
+    /// `cols_per_dot = (COLS_PER_CELL / 2).max(1)`, i.e. 1) — see
+    /// [`minimap_paints_syntax_colour_for_indented_code`]'s doc.
+    fn minimap_strip_width_cells(screen: &str) -> usize {
+        screen
+            .lines()
+            .map(|line| {
+                line.chars()
+                    .filter(|c| ('\u{2800}'..='\u{28FF}').contains(c))
+                    .count()
+            })
+            .max()
+            .unwrap_or(0)
+    }
+
     /// A `TuiShellApp` with the ambient panel state pinned so the minimap
     /// strip's geometry is the same on every machine — same reasoning as
     /// [`app_with_split_shaped_buffer`]'s own doc comment.
@@ -17633,14 +17657,57 @@ mod tests {
     fn minimap_colors_for_indent(
         indent: usize,
     ) -> (std::collections::HashMap<String, usize>, usize, String) {
+        minimap_colors_for_fixture(indent, "colour990.rs")
+    }
+
+    /// The theme-default foreground the TUI rasteriser falls back to for a
+    /// minimap cell with no aggregated syntax span behind it
+    /// (`quadraui::tui::minimap::cell_color`'s `unwrap_or(default_fg)`,
+    /// where `default_fg` is the painting theme's own `foreground`).
+    ///
+    /// **Measured, not hardcoded**, and measured through the same painted
+    /// frame every other assertion here reads: the identical fixture in a
+    /// `.txt` file, which tree-sitter does not highlight at all, so *every*
+    /// dot it paints is by construction a fallback dot. That keeps the
+    /// "this dot carries its own syntax colour, not the fallback"
+    /// assertions below theme-independent — they never name an RGB triple,
+    /// exactly as [`minimap_dot_fg_colors`]'s own doc requires — and it is
+    /// what makes them falsifiable: the #990 symptom was a strip painted
+    /// **entirely** in this one colour.
+    fn minimap_fallback_dot_color() -> String {
+        let (colors, highlights, screen) = minimap_colors_for_fixture(0, "colour990.txt");
+        assert_eq!(
+            highlights, 0,
+            "probe precondition: the `.txt` fixture must produce no \
+             highlights at all, or its painted colours are not purely \
+             fallback ones; screen:\n{screen}"
+        );
+        assert_eq!(
+            colors.len(),
+            1,
+            "probe precondition: an unhighlighted buffer must paint every \
+             minimap dot in exactly one colour (the theme fallback); got \
+             {colors:?}; screen:\n{screen}"
+        );
+        colors.into_keys().next().expect("length checked above")
+    }
+
+    /// Shared body of [`minimap_colors_for_indent`] and
+    /// [`minimap_fallback_dot_color`] — `name`'s extension is what decides
+    /// whether tree-sitter highlights the fixture, and therefore whether
+    /// the painted dots can carry a syntax colour at all.
+    fn minimap_colors_for_fixture(
+        indent: usize,
+        name: &str,
+    ) -> (std::collections::HashMap<String, usize>, usize, String) {
         let dir = std::env::temp_dir().join(format!(
-            "vimcode_test_990_minimap_colour_{}_{:?}_{indent}",
+            "vimcode_test_990_minimap_colour_{}_{:?}_{indent}_{name}",
             std::process::id(),
             std::thread::current().id()
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let file = dir.join("colour990.rs");
+        let file = dir.join(name);
         let pad = " ".repeat(indent);
         let text: String = (0..100)
             .map(|i| format!("{pad}let value_{i} = 1;\n"))
@@ -17710,32 +17777,122 @@ mod tests {
     /// exactly the same `width_cells * COLS_PER_CELL` boundary colour
     /// already used. Dots and colour now agree: a line indented past the
     /// strip's real width paints **no** dots at all (nothing to colour),
-    /// rather than stretched-but-wrongly-coloured ones. This is VS Code's
-    /// own minimap behaviour for a line wider than the strip — clipped,
-    /// not squeezed to fit — so "colour must survive indent 40" was the
-    /// wrong bar once dots stopped lying about where indent 40 landed;
-    /// "colour must never again paint a fallback dot with nothing real
-    /// behind it" is the bar this test now holds.
+    /// rather than stretched-but-wrongly-coloured ones.
     ///
-    /// **RED against unfixed `develop`:** confirmed by running this
-    /// scenario against the unbumped pin (`ed402b4`, pre-quadraui#993) with
-    /// its `KNOWN_BUGS` entry removed — the `colors.is_empty()` assertion
-    /// below fails with:
+    /// # What this scenario asserts, and where it stops
+    ///
+    /// Measured on the pinned rev at 100x24 (this test's own fixture: 100
+    /// lines of `let value_N = 1;` at a given indent, 400 highlights
+    /// throughout), the strip is **11 braille cells** wide and therefore
+    /// represents source columns `0..22` — one dot column per source
+    /// column, fixed scale. Distinct painted dot colours by indent:
     ///
     /// ```text
-    /// a line indented past the minimap strip's own real width must paint
-    /// no dots at all, not dots stretched into view and painted in a
-    /// fallback colour that doesn't belong to them (400 highlights exist
-    /// for this buffer) — got 1: {"Rgb(229, 229, 229)": 80}
+    /// indent   0   4   8  12  16  18  20 | 22  24  28  40  80
+    /// colours  5   5   3   2   2   1   1 |  0   0   0   0   0
+    /// dot rows 20  20  20  20  20  20  20|  0   0   0   0   0
     /// ```
     ///
-    /// — `colors.len() == 1`, the stretched-dot fallback colour described
-    /// above, not the `0` this scenario now asserts.
+    /// Two separate properties fall out of that, and this test asserts
+    /// both:
+    ///
+    /// 1. **Inside the strip's own column range, colour survives at every
+    ///    depth — not just near column 0.** The shrinking count is not a
+    ///    colour failure: it is the *visible window of the line* shrinking
+    ///    as indentation pushes content right (fewer tokens left in view,
+    ///    each still painted in its own colour). The assertion below is
+    ///    therefore not "N distinct colours" but the property that
+    ///    discriminates against #990's actual symptom: at every indent up
+    ///    to and including the deepest one the strip can show, at least one
+    ///    painted dot carries a real **syntax** colour rather than the
+    ///    theme fallback ([`minimap_fallback_dot_color`], measured, not
+    ///    hardcoded). #990's symptom was a strip painted *entirely* in that
+    ///    fallback.
+    /// 2. **The cut-off is exactly the strip's own width**, derived here as
+    ///    `minimap_strip_width_cells * render::MINIMAP_COLS_PER_CELL`, not
+    ///    a hardcoded 22/24. Indent `covered - 2` still paints; indent
+    ///    `covered` paints nothing at all. That pins the boundary from both
+    ///    sides, so neither a narrower strip nor a rasteriser that resumed
+    ///    stretching could slip through.
+    ///
+    /// # ⚠️ #1030 deliverable 2 is met on GTK, NOT on TUI, and is left open
+    ///
+    /// Issue #1030's written deliverable 2 says "colour must survive at
+    /// indent 40 and 80, not only near column 0". On **GTK that holds
+    /// literally and is asserted** —
+    /// `gtk::testing::minimap::minimap_paints_distinct_syntax_colors_at_indentation_via_gtk_driver`
+    /// measures 7 distinct painted colours at indents 0, 20, 40 *and* 80,
+    /// because GTK's strip is 120px wide and its rasteriser paints one 1px
+    /// block per character column out to `COLUMN_CAPACITY` (120).
+    ///
+    /// On **TUI** property 1 above is as far as it is achievable, and the
+    /// gap is **not** a vimcode defect and **not** something this test is
+    /// entitled to redefine away: the TUI strip physically represents 22
+    /// source columns (11 cells x 2), because quadraui's TUI rasteriser
+    /// hardcodes
+    /// `COLS_PER_CELL = 2` with `cols_per_dot = (COLS_PER_CELL / 2).max(1)`
+    /// = **1 source column per dot column** in both
+    /// `braille_char_for_cell` and `cell_color`. Nothing vimcode passes in
+    /// — including the `MinimapGrid` this issue resized — can change that,
+    /// and the vimcode-side alternative (raise
+    /// `render::MINIMAP_TARGET_COLS_TUI` from 12 cells to the 60 needed to
+    /// cover GTK's/VS Code's 120 columns) would hand 60 of an 80-column
+    /// terminal to the minimap, which is not a real option.
+    ///
+    /// The missing upstream API — an optional *shared* horizontal scale, so
+    /// a narrow braille strip can represent N source columns per dot
+    /// column without reintroducing quadraui#993's per-line normalisation —
+    /// is drafted in full in `docs/PENDING_QUADRAUI_ISSUES.md` ("TUI
+    /// minimap has no horizontal downsampling"). Per the Platform-Neutrality
+    /// Rule it is quadraui's to build, and per `GOALS.md`'s
+    /// milestone-discipline rule #1030's deliverable 2 stays **open behind
+    /// it** — the coordinator/human owns either filing that issue and
+    /// amending #1030's acceptance text to match the clip-not-stretch
+    /// behaviour verified here, or explicitly waiving the deliverable. This
+    /// test does not silently assert the deliverable away: the assertion
+    /// that a line past the boundary paints nothing carries that pointer,
+    /// so the unmet deliverable is findable by grep from the code that
+    /// depends on it.
+    ///
+    /// **RED against unfixed `develop`:** confirmed twice — by the original
+    /// fix round and again, on this exact test body, in fix iteration 2 — by
+    /// pointing `Cargo.toml`'s `rev` back at the unbumped pin
+    /// (`ed402b4ae0d9b753279bebe1bba4284dbe515d8a`, pre-quadraui#993) and
+    /// re-running `cargo test --no-default-features --lib
+    /// minimap_paints_syntax_colour_for_indented_code`. Property **2** is
+    /// the discriminator, and it fails at the very first past-boundary
+    /// indent:
+    ///
+    /// ```text
+    /// indent 22 is past the strip's own 22-column range (11 braille cells
+    /// x 2 columns), so it must paint NO dots at all — not dots stretched
+    /// into view (quadraui#993) and painted in a fallback colour that does
+    /// not belong to them. 400 highlights exist for this buffer. Got 1
+    /// distinct colour(s) on painted dots: {"Rgb(229, 229, 229)": 100}
+    /// ```
+    ///
+    /// — `Rgb(229, 229, 229)` is exactly the fallback colour
+    /// [`minimap_fallback_dot_color`] measures, and the painted strip in
+    /// that failure's screen dump reads `⠀⠀⠀⠀⠀⠀⣿⣿⣿⣿⣿` on all 20 rows:
+    /// 100 fully-set dot cells with nothing real behind them, stretched in
+    /// from a line whose content starts 22 columns off the right edge of an
+    /// 11-cell strip, against the `0` asserted now.
+    ///
+    /// Property **1** is *not* the discriminator and is not claimed to be:
+    /// it passes against the old pin too (stretching happened to leave real
+    /// tokens overlapping literal columns `0..22` at these indents). It is
+    /// there to stop the opposite regression — a future change that makes
+    /// the strip paint nothing, or paint only fallback dots, inside its own
+    /// column range — and to hold the achievable half of deliverable 2.
     #[test]
     fn minimap_paints_syntax_colour_for_indented_code() {
-        // Ungated, and the reason this test can't be green for the wrong
-        // reason: un-indented code *is* coloured today, so the probe works
-        // and the assertion below is about indentation alone.
+        // Ungated (#1030 deleted this scenario's `KNOWN_BUGS` entry, and
+        // fix iteration 2 dropped the now-vestigial `known_bug_gate`
+        // wrapper with it — an unlisted label's gate is just a plain
+        // assertion with extra indirection). The reason it can't be green
+        // for the wrong reason: un-indented code *is* coloured today, so
+        // the probe demonstrably works, and every assertion below is about
+        // indentation alone.
         let (flat_colors, flat_highlights, flat_screen) = minimap_colors_for_indent(0);
         assert!(
             flat_highlights > 0,
@@ -17749,30 +17906,78 @@ mod tests {
              {flat_colors:?}; screen:\n{flat_screen}"
         );
 
-        let (colors, highlights, screen) = minimap_colors_for_indent(40);
-        // Candidate 1 stays disproven — the highlights are there even
-        // though indent 40 is past the strip's own real width.
+        let fallback = minimap_fallback_dot_color();
+        let cols_per_cell = crate::render::MINIMAP_COLS_PER_CELL;
+        let strip_cells = minimap_strip_width_cells(&flat_screen);
         assert!(
-            highlights > 0,
-            "precondition: indenting the fixture must not stop tree-sitter \
-             highlighting it (candidate 1 of this issue's diagnosis); got \
-             {highlights} highlights"
+            strip_cells >= 4,
+            "precondition: the minimap strip must be at least 4 braille \
+             cells wide for the indent sweep below to have any depth to \
+             sweep; got {strip_cells}; screen:\n{flat_screen}"
         );
+        let covered = strip_cells * cols_per_cell;
 
-        crate::harness::known_bug_gate(
-            "minimap_paints_syntax_colour_for_indented_code::tui",
-            || {
-                assert!(
-                    colors.is_empty(),
-                    "a line indented past the minimap strip's own real \
-                 width must paint no dots at all, not dots stretched into \
-                 view and painted in a fallback colour that doesn't belong \
-                 to them ({highlights} highlights exist for this buffer) — \
-                 got {}: {colors:?}; screen:\n{screen}",
-                    colors.len()
-                );
-            },
-        );
+        // Property 1 — colour survives at every depth the strip can show,
+        // right out to its last cell, and is the code's own syntax colour
+        // rather than the theme fallback (#990's symptom).
+        let deepest = covered - cols_per_cell;
+        let mut sweep = vec![0, 4, 8, deepest / 2, deepest];
+        sweep.sort_unstable();
+        sweep.dedup();
+        for indent in sweep {
+            let (colors, highlights, screen) = minimap_colors_for_indent(indent);
+            // Candidate 1 of the issue's diagnosis ("highlights are empty
+            // under the TUI") stays disproven at every depth, ungated.
+            assert!(
+                highlights > 0,
+                "precondition: indenting the fixture by {indent} must not \
+                 stop tree-sitter highlighting it (candidate 1 of this \
+                 issue's diagnosis); got {highlights} highlights"
+            );
+            let syntax_coloured: Vec<&String> = colors.keys().filter(|c| **c != fallback).collect();
+            assert!(
+                !syntax_coloured.is_empty(),
+                "indent {indent} is inside the strip's own {covered}-column \
+                 range ({strip_cells} braille cells x {cols_per_cell} \
+                 columns), so the code painted there must still carry its \
+                 own syntax colour — a strip painted *only* in the theme \
+                 fallback ({fallback}) is #990's symptom. Got {colors:?}; \
+                 screen:\n{screen}"
+            );
+        }
+
+        // Property 2 — and nothing past the strip's own width, in either
+        // direction: clipped, never stretched into view under a fallback
+        // colour that doesn't belong to it.
+        //
+        // ⚠️ This is also where #1030's deliverable 2 ("colour must survive
+        // at indent 40 and 80") stands **unmet and open** — see this test's
+        // doc comment and the drafted upstream issue in
+        // `docs/PENDING_QUADRAUI_ISSUES.md` ("TUI minimap has no horizontal
+        // downsampling"). Do not read this assertion as the deliverable
+        // being satisfied or withdrawn; it is the measurement that shows
+        // the deliverable needs an upstream API vimcode does not have.
+        for indent in [covered, covered + 18, 80] {
+            let (colors, highlights, screen) = minimap_colors_for_indent(indent);
+            assert!(
+                highlights > 0,
+                "precondition: indenting the fixture by {indent} must not \
+                 stop tree-sitter highlighting it (candidate 1 of this \
+                 issue's diagnosis); got {highlights} highlights"
+            );
+            assert!(
+                colors.is_empty(),
+                "indent {indent} is past the strip's own {covered}-column \
+                 range ({strip_cells} braille cells x {cols_per_cell} \
+                 columns), so it must paint NO dots at all — not dots \
+                 stretched into view (quadraui#993) and painted in a \
+                 fallback colour that does not belong to them. \
+                 {highlights} highlights exist for this buffer. Got {} \
+                 distinct colour(s) on painted dots: {colors:?}; \
+                 screen:\n{screen}",
+                colors.len()
+            );
+        }
     }
 
     /// #1008 review: `page_up` (`<C-b>`)'s clamped-scroll cursor landing
