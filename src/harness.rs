@@ -1544,7 +1544,7 @@ macro_rules! backend_conformance {
 fn gtk_or_tui_probe_harness(
 ) -> ConformanceHarness<quadraui::tui::testing::TuiDriver<impl quadraui::AppLogic>> {
     let mut engine = crate::core::Engine::new_for_test();
-    engine.settings.use_nerd_fonts = false;
+    engine.settings.use_nerd_fonts = Some(false);
     crate::tui_main::testing::conformance_harness(engine, 80, 24)
 }
 
@@ -1574,7 +1574,7 @@ mod tests {
         std::fs::create_dir_all(dir.join("src").join("core")).unwrap();
 
         let mut engine = crate::core::Engine::new_for_test();
-        engine.settings.use_nerd_fonts = false;
+        engine.settings.use_nerd_fonts = Some(false);
         engine.cwd = dir.clone();
         engine.explorer_expanded.insert(dir.clone());
         engine.explorer_expanded.insert(dir.join("src"));
@@ -1832,7 +1832,7 @@ mod issue_983_row_click_selects_the_row_below {
     /// own "does the child label vanish" technique, just pointed lower.
     fn engine_settings_scrolled_to_lsp() -> Engine {
         let mut engine = Engine::new_for_test();
-        engine.settings.use_nerd_fonts = false;
+        engine.settings.use_nerd_fonts = Some(false);
         engine
             .app_shell
             .show_panel(&quadraui::WidgetId::new(PANEL_SETTINGS));
@@ -1862,7 +1862,7 @@ mod issue_983_row_click_selects_the_row_below {
     /// panel would use for its own rows once that other gap is closed.
     fn engine_git_insights_scrolled_to_available() -> Engine {
         let mut engine = Engine::new_for_test();
-        engine.settings.use_nerd_fonts = false;
+        engine.settings.use_nerd_fonts = Some(false);
         let mut manifests: Vec<ExtensionManifest> = (0..20)
             .map(|i| ExtensionManifest {
                 name: format!("zqxw983installed{i}"),
@@ -2112,7 +2112,7 @@ mod issue_984_explorer_chevron_needs_a_double_click {
         std::fs::write(dir.join("kkxxqq_dir984").join("child984_marker"), b"").unwrap();
 
         let mut engine = crate::core::Engine::new_for_test();
-        engine.settings.use_nerd_fonts = false;
+        engine.settings.use_nerd_fonts = Some(false);
         engine.cwd = dir.clone();
         engine.explorer_expanded.insert(dir.clone());
         engine.explorer_rebuild_rows();
@@ -2301,7 +2301,7 @@ mod issue_987_group_scrollbar_inert_and_click_resizes {
     /// resizes" half entirely.
     fn engine_two_groups(tag: &str, focus_left: bool) -> (Engine, WindowId, WindowId) {
         let mut engine = Engine::new_for_test();
-        engine.settings.use_nerd_fonts = false;
+        engine.settings.use_nerd_fonts = Some(false);
         engine.settings.minimap = false;
 
         let buf_left = engine.active_buffer_id();
@@ -2593,7 +2593,7 @@ mod issue_986_confirm_prompt_never_built {
     /// never accidentally match unrelated painted chrome.
     fn engine_with_multi_match_buffer() -> Engine {
         let mut engine = Engine::new_for_test();
-        engine.settings.use_nerd_fonts = false;
+        engine.settings.use_nerd_fonts = Some(false);
         engine
             .buffer_mut()
             .insert(0, "zqxw986abc zqxw986abc\nzqxw986abc\nxyz zqxw986abc\n");
@@ -2605,7 +2605,7 @@ mod issue_986_confirm_prompt_never_built {
     /// post-substitute report read "3 substitutions on 3 lines", not "4".
     fn engine_with_four_single_match_lines() -> Engine {
         let mut engine = Engine::new_for_test();
-        engine.settings.use_nerd_fonts = false;
+        engine.settings.use_nerd_fonts = Some(false);
         engine
             .buffer_mut()
             .insert(0, "zqxw986abc\nzqxw986abc\nzqxw986abc\nzqxw986abc\n");

@@ -26,6 +26,7 @@ use std::cell::Cell;
 
 thread_local! {
     static USE_NERD_FONTS: Cell<bool> = const { Cell::new(true) };
+    static IS_GUI_BACKEND: Cell<bool> = const { Cell::new(false) };
 }
 
 /// Enable or disable Nerd Font glyphs on the current thread. When disabled,
@@ -36,6 +37,31 @@ pub fn set_nerd_fonts(val: bool) {
 
 pub fn nerd_fonts_enabled() -> bool {
     USE_NERD_FONTS.with(|f| f.get())
+}
+
+/// Record whether the current thread belongs to a GUI backend (GTK, macOS,
+/// Win-GUI) as opposed to the TUI. Read by
+/// [`crate::core::settings::Settings::use_nerd_fonts`] to resolve its
+/// backend-derived default (issue #999) — GUI bundles the icon font and
+/// always has it available; TUI cannot detect its terminal's glyph coverage
+/// and keeps the conservative `target_os` guess.
+///
+/// Every GUI entry point (`App::new`, `App::new_portable`,
+/// `App::new_headless_with_backend`) calls `set_gui_backend(true)` once at
+/// startup, in the same place it already calls `set_nerd_fonts(...)`. TUI
+/// entry points leave this at its default, `false`.
+///
+/// Thread-local for the same reason `USE_NERD_FONTS` is (see the module
+/// doc's "#618" section): rendering never crosses threads in this
+/// codebase, so a test that flips this can only affect other tests
+/// scheduled on that same worker thread, never tests running concurrently
+/// on other threads in the shared `cargo test` process.
+pub fn set_gui_backend(val: bool) {
+    IS_GUI_BACKEND.with(|f| f.set(val));
+}
+
+pub fn is_gui_backend() -> bool {
+    IS_GUI_BACKEND.with(|f| f.get())
 }
 
 /// A UI icon with a Nerd Font glyph and a standard-Unicode fallback.
@@ -480,45 +506,6 @@ pub fn file_icon_for_name(name: &str) -> &'static str {
 /// way [`file_icon_color`] pairs with [`file_icon`].
 pub fn file_icon_color_for_name(name: &str) -> (u8, u8, u8) {
     filename_icon_color(name).unwrap_or_else(|| file_icon_color(&extension_of(name)))
-}
-
-/// Check whether a Nerd Font is installed on Windows by scanning the user and
-/// system font directories for font files with "Nerd" in the name.
-/// Returns `false` on non-Windows platforms.
-#[cfg(target_os = "windows")]
-pub fn detect_nerd_font_windows() -> bool {
-    use std::fs;
-    use std::path::PathBuf;
-    // User fonts (Windows 10 1803+, no admin required)
-    if let Ok(local) = std::env::var("LOCALAPPDATA") {
-        let user_fonts = PathBuf::from(&local).join("Microsoft\\Windows\\Fonts");
-        if let Ok(entries) = fs::read_dir(&user_fonts) {
-            for entry in entries.flatten() {
-                if let Some(name) = entry.file_name().to_str() {
-                    if name.to_lowercase().contains("nerd") {
-                        return true;
-                    }
-                }
-            }
-        }
-    }
-    // System fonts
-    let sys_fonts = PathBuf::from("C:\\Windows\\Fonts");
-    if let Ok(entries) = fs::read_dir(&sys_fonts) {
-        for entry in entries.flatten() {
-            if let Some(name) = entry.file_name().to_str() {
-                if name.to_lowercase().contains("nerd") {
-                    return true;
-                }
-            }
-        }
-    }
-    false
-}
-
-#[cfg(not(target_os = "windows"))]
-pub fn detect_nerd_font_windows() -> bool {
-    true // On non-Windows, assume available (GTK bundles, Linux has fontconfig)
 }
 
 #[cfg(test)]

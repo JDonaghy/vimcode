@@ -959,12 +959,31 @@ impl TuiShellApp {
             .borrow_mut()
             .set_backend_info(1.0, msv_metrics);
 
-        let nerd_font_missing =
-            engine.settings.use_nerd_fonts && !icons::detect_nerd_font_windows();
-        if nerd_font_missing {
-            engine.settings.use_nerd_fonts = false;
-        }
-        icons::set_nerd_fonts(engine.settings.use_nerd_fonts);
+        // #999: this is the TUI, not a GUI backend — record that explicitly
+        // rather than relying on the thread-local's `false` default. `cargo
+        // test` reuses a pool of worker threads across every test in the
+        // process, GTK/macOS driver-tier tests included, each of which calls
+        // `icons::set_gui_backend(true)`; without an explicit `false` here,
+        // a TUI test scheduled on a worker thread right after one of those
+        // would silently inherit `true` and resolve `use_nerd_fonts()` as if
+        // it were a GUI backend. See `crate::icons::set_gui_backend`'s doc
+        // for why this mirrors the existing `set_nerd_fonts` call below
+        // rather than trusting the default.
+        icons::set_gui_backend(false);
+
+        // There is no reliable way to detect terminal glyph support from
+        // inside the terminal (a CSI-6n width probe measures advance, not
+        // whether a real glyph painted — see the issue), so this no longer
+        // probes or silently overrides the user's setting. When
+        // `use_nerd_fonts` has never been explicitly set *and* the
+        // backend-derived default resolves to fallback icons, nudge the
+        // user toward `:CheckNerdFonts` once at startup instead — asking the
+        // one oracle that can actually see the difference, rather than
+        // guessing on their behalf.
+        let resolved_nerd_fonts = engine.settings.use_nerd_fonts();
+        let nerd_fonts_undiscovered =
+            engine.settings.use_nerd_fonts.is_none() && !resolved_nerd_fonts;
+        icons::set_nerd_fonts(resolved_nerd_fonts);
         if restore_session {
             engine.startup(file_path.as_deref());
         } else {
@@ -972,10 +991,10 @@ impl TuiShellApp {
         }
         setup_tui_clipboard(&mut engine);
 
-        let pending_startup_msg = if nerd_font_missing {
+        let pending_startup_msg = if nerd_fonts_undiscovered {
             Some(
-                "No Nerd Font detected — using fallback icons. Install a Nerd Font and run \
-                 :set nerdfonts to enable."
+                "Using ASCII fallback icons. If your terminal has a Nerd Font, run \
+                 :CheckNerdFonts to check and enable them."
                     .to_string(),
             )
         } else {
@@ -4532,7 +4551,7 @@ mod tests {
     /// of this fixture.
     fn app_with_ext_panel() -> TuiShellApp {
         let mut app = TuiShellApp::new(None);
-        app.engine.settings.use_nerd_fonts = false;
+        app.engine.settings.use_nerd_fonts = Some(false);
         crate::icons::set_nerd_fonts(false);
         app.engine.ext_panels.clear();
         app.engine.ext_panels.insert(
@@ -7289,7 +7308,7 @@ mod tests {
     #[test]
     fn tui_ext_panel_double_click_on_a_section_header_does_not_toggle_it() {
         let mut app = TuiShellApp::new_for_test();
-        app.engine.settings.use_nerd_fonts = false;
+        app.engine.settings.use_nerd_fonts = Some(false);
         crate::icons::set_nerd_fonts(false);
         app.engine.ext_panels.clear();
         app.engine.ext_panels.insert(
@@ -8867,7 +8886,7 @@ mod tests {
     /// Mirrors `gtk/testing.rs`'s `engine_with_every_editor_rung`.
     fn app_with_every_editor_rung() -> TuiShellApp {
         let mut app = TuiShellApp::new(None);
-        app.engine.settings.use_nerd_fonts = false;
+        app.engine.settings.use_nerd_fonts = Some(false);
         app.engine.settings.breadcrumbs = true;
         app.engine.settings.minimap = true;
         let cwd = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -9054,7 +9073,7 @@ mod tests {
     /// Mirrors `gtk/testing.rs`'s `engine_with_every_bottom_rung`.
     fn app_with_every_bottom_rung() -> TuiShellApp {
         let mut app = TuiShellApp::new(None);
-        app.engine.settings.use_nerd_fonts = false;
+        app.engine.settings.use_nerd_fonts = Some(false);
         // `separated_status_line` is `Some` only for
         // `window_status_line && !status_line_above_terminal && panel open`.
         app.engine.settings.window_status_line = true;
@@ -12003,7 +12022,7 @@ mod tests {
         std::fs::write(&beta, "fn other() {}\n").unwrap();
 
         let mut app = TuiShellApp::new(None);
-        app.engine.settings.use_nerd_fonts = on;
+        app.engine.settings.use_nerd_fonts = Some(on);
         crate::icons::set_nerd_fonts(on);
         app.engine
             .open_file_with_mode(&alpha, crate::core::engine::OpenMode::Permanent)
@@ -12113,6 +12132,149 @@ mod tests {
         row[..byte].chars().count()
     }
 
+    // ── `:CheckNerdFonts` (#999), driver-tier ────────────────────────────
+    //
+    // `core/engine/tests.rs`'s `test_check_nerd_fonts_*` cover the dialog's
+    // content and all three outcomes against a bare `Engine` — useful for
+    // the decision logic, but per `CLAUDE.md`'s "Testing (CRITICAL)" rule
+    // ("assert on rendered output, never on state being populated") that is
+    // not proof any backend actually paints the dialog or that the
+    // persisted override changes what gets drawn next. The two tests below
+    // close that gap through `TuiDriver`, reading `driver.screen()` rather
+    // than `Engine::dialog` state.
+
+    /// #999 acceptance (TUI): `:CheckNerdFonts` must paint on a real
+    /// `TuiDriver` frame, with both the Nerd Font glyph row and the ASCII
+    /// fallback row visible **on the same screen** — the whole point of the
+    /// command is putting both in front of the user at once so they can
+    /// compare, not asserting a `Vec<String>` that happens to contain both
+    /// strings.
+    ///
+    /// # Why this fails against unfixed `develop`
+    ///
+    /// Before this issue there was no `:CheckNerdFonts` command at all —
+    /// `execute_command("CheckNerdFonts")` fell through the `_ =>
+    /// EngineAction::None` arm, `engine.dialog` stayed `None`, and this
+    /// screen would show nothing but the ordinary editor chrome. Confirmed
+    /// red by temporarily commenting out the `"check_nerd_fonts"` dispatch
+    /// arm in `core/engine/panels.rs` and re-running: both `screen_contains`
+    /// assertions below fail. Restored before committing.
+    #[test]
+    fn check_nerd_fonts_dialog_paints_both_variants_via_shell_app() {
+        let mut app = TuiShellApp::new_for_test();
+        app.engine.execute_command("CheckNerdFonts");
+        assert!(
+            app.engine.dialog.is_some(),
+            "fixture must actually open the dialog"
+        );
+
+        let driver = driver_with_shell(app, config(), 100, 30);
+        let screen = driver.screen();
+        assert!(
+            driver.screen_contains(crate::icons::FILE_RUST.nerd),
+            "the painted dialog must show the Nerd Font glyph row; \
+             screen:\n{screen}"
+        );
+        assert!(
+            driver.screen_contains(crate::icons::FILE_RUST.fallback),
+            "the painted dialog must show the ASCII fallback row; \
+             screen:\n{screen}"
+        );
+        assert!(
+            driver.screen_contains("Check Nerd Fonts"),
+            "the painted dialog must show its own title; screen:\n{screen}"
+        );
+    }
+
+    /// #999 acceptance (TUI): choosing "Fallback row looks right" must not
+    /// just flip a field — the very next frame must actually stop painting
+    /// Nerd Font glyphs, proving the persisted `Some(false)` override is
+    /// wired into the same rendering path a real user would see, not only
+    /// into `Settings` state (`core/settings.rs`'s
+    /// `test_check_nerd_fonts_disable_persists_explicit_override`'s
+    /// engine-level twin already covers the state half).
+    ///
+    /// Leaves `use_nerd_fonts` unset going in (not `Some(true)`) so the
+    /// *before* frame is exercising the real default-resolution path this
+    /// issue changed, not a pre-seeded override.
+    ///
+    /// # Why this fails against unfixed `develop`
+    ///
+    /// Same missing-command gap as the test above: pressing `f` would do
+    /// nothing (no dialog to close, no action to run), so the "before" and
+    /// "after" tab rows would be byte-identical rather than losing the Rust
+    /// glyph.
+    #[test]
+    fn check_nerd_fonts_disable_stops_painting_glyphs_next_frame_via_shell_app() {
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_check_nerd_fonts_999_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let alpha = dir.join("alpha999.rs");
+        std::fs::write(&alpha, "fn main() {}\n").unwrap();
+
+        let mut app = TuiShellApp::new_for_test();
+        assert!(
+            app.engine.settings.use_nerd_fonts.is_none(),
+            "fixture must start from the unset default"
+        );
+        app.engine
+            .open_file_with_mode(&alpha, crate::core::engine::OpenMode::Permanent)
+            .unwrap();
+
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        let before = driver.screen();
+        assert!(
+            before.contains(crate::icons::FILE_RUST.nerd),
+            "fixture must start out painting the Rust glyph (unset resolves \
+             true off Windows); before:\n{before}"
+        );
+
+        // Drive everything from here through real keystrokes, not a
+        // post-construction `Engine` handle — `TuiDriver::app()` returns an
+        // opaque `impl AppLogic` (see `ai_panel_typed_text_supports_
+        // multiline_input_via_shell_app`'s doc comment above for the same
+        // constraint), which is itself the point: proving the persisted
+        // override changes what a real keystroke sequence paints, with no
+        // side door back into engine state.
+        driver.press_named(quadraui::NamedKey::Escape);
+        driver.type_char(':');
+        for c in "CheckNerdFonts".chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
+        driver.render();
+        let mid = driver.screen();
+        assert!(
+            mid.contains("Check Nerd Fonts"),
+            "the dialog must actually open before its buttons mean \
+             anything; screen:\n{mid}"
+        );
+
+        driver.press(quadraui::Key::Char('f')); // "Fallback row looks right"
+        driver.render();
+
+        let after = driver.screen();
+        assert!(
+            !after.contains("Check Nerd Fonts"),
+            "the dialog must close once the choice is made; after:\n{after}"
+        );
+        assert!(
+            !after.contains(crate::icons::FILE_RUST.nerd),
+            "with the override persisted, the very next frame must stop \
+             painting the Nerd Font glyph; after:\n{after}"
+        );
+        assert!(
+            after.contains(crate::icons::FILE_RUST.fallback),
+            "…and paint the ASCII fallback instead; after:\n{after}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// #703: with Nerd Fonts off, `build_tab_bar_icons` returns `&[]` rather
     /// than ASCII fallbacks (a bare `R` before every label is noise, not
     /// parity) — and `&[]` makes `draw_tab_bar_icons` byte-identical to
@@ -12188,7 +12350,7 @@ mod tests {
             std::fs::write(&path, "// marker\n").unwrap();
 
             let mut app = TuiShellApp::new(None);
-            app.engine.settings.use_nerd_fonts = true;
+            app.engine.settings.use_nerd_fonts = Some(true);
             crate::icons::set_nerd_fonts(true);
             app.engine
                 .open_file_with_mode(&path, crate::core::engine::OpenMode::Permanent)
@@ -13711,7 +13873,7 @@ mod tests {
     /// presence on the painted grid with.
     fn app_with_editor_hover_link() -> TuiShellApp {
         let mut app = TuiShellApp::new(None);
-        app.engine.settings.use_nerd_fonts = false;
+        app.engine.settings.use_nerd_fonts = Some(false);
         crate::icons::set_nerd_fonts(false);
         app.engine.session.explorer_visible = false;
         app.engine.buffer_mut().insert(0, "fn main() {}\n");
@@ -13836,7 +13998,7 @@ mod tests {
     #[test]
     fn driver_editor_hover_renders_code_and_bare_url_link_via_quadraui_markdown() {
         let mut app = TuiShellApp::new(None);
-        app.engine.settings.use_nerd_fonts = false;
+        app.engine.settings.use_nerd_fonts = Some(false);
         crate::icons::set_nerd_fonts(false);
         app.engine.session.explorer_visible = false;
         app.engine.buffer_mut().insert(0, "fn main() {}\n");

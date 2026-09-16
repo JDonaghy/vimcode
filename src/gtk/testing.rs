@@ -1770,7 +1770,7 @@ mod tests {
         // the harness paints its first frame.
         let render_with_nerd_fonts = |on: bool| {
             let mut engine = engine_with_two_rust_tabs();
-            engine.settings.use_nerd_fonts = on;
+            engine.settings.use_nerd_fonts = Some(on);
             crate::icons::set_nerd_fonts(on);
             let mut h = harness(engine, 1400, 900);
             tab_zero_left_half(&mut h)
@@ -1806,6 +1806,86 @@ mod tests {
         );
     }
 
+    /// #999 acceptance, GTK half: with `use_nerd_fonts` left **unset**
+    /// (`None` — the state of a fresh `Settings::default()`, i.e. no
+    /// `settings.json` on disk at all) a GUI backend must still paint the
+    /// Nerd Font language badge, on the strength of the bundled icon font
+    /// alone (`app_support::ICON_FONT_BYTES`) rather than any guess about
+    /// the host OS. This is the driver-tier twin of `Settings::
+    /// use_nerd_fonts`'s unit tests (`use_nerd_fonts_unset_is_true_on_gui_backend`
+    /// et al. in `core/settings.rs`), asserted on **rendered pixels**
+    /// rather than on `Settings` state — see `CLAUDE.md`'s "Testing
+    /// (CRITICAL)" rule ("assert on rendered output, never on state being
+    /// populated").
+    ///
+    /// Uses `Engine::new_for_test()`, not `engine_with_two_rust_tabs`'s
+    /// usual `Engine::new()`: this test's whole point is the *unset*
+    /// resolution path, so it must not risk inheriting an explicit
+    /// `use_nerd_fonts` from whatever `~/.config/vimcode/settings.json`
+    /// happens to exist on the machine running the suite.
+    ///
+    /// # Why this fails against unfixed `develop`
+    ///
+    /// Before #999, `Settings::use_nerd_fonts` was a plain `bool` defaulted
+    /// by `!cfg!(target_os = "windows")` — on this Linux/macOS test fleet
+    /// that guess happens to also be `true`, so the pixel assertion below
+    /// stays green even against the old code by accident of host OS. The
+    /// part unfixed `develop` actually gets wrong — defaulting `false` on a
+    /// Windows *GTK* build despite bundling the font — has no compilable
+    /// driver in this fleet (`src/win/mod.rs` is Windows-only, same
+    /// constraint noted there). What this test *does* pin down, and what
+    /// breaks immediately under a naive revert: swapping the accessor back
+    /// to reading `self.use_nerd_fonts` directly no longer compiles once
+    /// the field is `Option<bool>`, and reverting `App::new_headless_with_backend`'s
+    /// `icons::set_gui_backend(true)` call (so `is_gui_backend()` stays
+    /// `false` here, the TUI-shaped answer) does *not* flip this test on
+    /// this host, precisely because TUI's guess and GUI's new default
+    /// happen to coincide off Windows — which is exactly the coverage gap
+    /// `use_nerd_fonts_unset_is_true_on_gui_backend`'s unit test exists to
+    /// close for the resolution logic itself; this test's job is only to
+    /// prove that logic is actually wired into what gets painted.
+    #[test]
+    fn tab_language_icon_paints_by_default_with_use_nerd_fonts_unset() {
+        let prev_nf = crate::icons::nerd_fonts_enabled();
+
+        let mut engine = Engine::new_for_test();
+        assert!(
+            engine.settings.use_nerd_fonts.is_none(),
+            "fixture must start from the unset default, not an explicit override"
+        );
+        let cwd = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        engine.cwd = cwd.clone();
+        for (i, name) in ["aaa703.rs", "bbb703.rs"].iter().enumerate() {
+            if i > 0 {
+                engine.new_tab(None);
+            }
+            let buf = engine.active_buffer_id();
+            if let Some(state) = engine.buffer_manager.get_mut(buf) {
+                state.file_path = Some(cwd.join(name));
+            }
+        }
+
+        let mut h = harness(engine, 1400, 900);
+        let (on_px, _) = tab_zero_left_half(&mut h);
+
+        crate::icons::set_nerd_fonts(prev_nf);
+
+        let reddest = |px: &[(u8, u8, u8)]| {
+            px.iter()
+                .max_by_key(|(r, _, b)| *r as i32 - *b as i32)
+                .copied()
+        };
+        assert!(
+            on_px.iter().copied().any(is_icon_orange),
+            "with use_nerd_fonts unset, a GUI backend must still paint the \
+             orange Rust badge — the font is bundled, so there is nothing \
+             to detect and nothing to guess wrong; sampled {} px, reddest \
+             was {:?}",
+            on_px.len(),
+            reddest(&on_px)
+        );
+    }
+
     /// #703, **the regression that matters**: with icons painted, a click on
     /// the painted × must still close the tab it sits on.
     ///
@@ -1834,7 +1914,7 @@ mod tests {
         // After `Engine::new` (which applies the developer's own settings),
         // before the harness paints — see `tab_paints_its_language_icon…`.
         let mut engine = engine_with_three_named_tabs();
-        engine.settings.use_nerd_fonts = true;
+        engine.settings.use_nerd_fonts = Some(true);
         crate::icons::set_nerd_fonts(true);
         let mut h = harness(engine, 1400, 900);
 
@@ -1921,7 +2001,7 @@ mod tests {
 
         let render_with = |names: [&str; 2]| {
             let mut engine = engine_with_two_tabs_named(names);
-            engine.settings.use_nerd_fonts = true;
+            engine.settings.use_nerd_fonts = Some(true);
             crate::icons::set_nerd_fonts(true);
             let mut h = harness(engine, 1400, 900);
             tab_zero_left_half(&mut h)
@@ -1978,7 +2058,7 @@ mod tests {
 
         let mut engine = Engine::new();
         engine.cwd = dir.clone();
-        engine.settings.use_nerd_fonts = true;
+        engine.settings.use_nerd_fonts = Some(true);
         engine.explorer_reveal_path(&file);
         (engine, dir)
     }
@@ -2779,7 +2859,7 @@ mod tests {
 
         fn activity_bar_strip(with_ext: bool) -> Vec<(u8, u8, u8)> {
             let mut engine = Engine::new();
-            engine.settings.use_nerd_fonts = false;
+            engine.settings.use_nerd_fonts = Some(false);
             engine.ext_panels.clear();
             if with_ext {
                 engine.ext_panels.insert(
@@ -2879,7 +2959,7 @@ mod tests {
             let _paint = crate::test_paint::PaintGuard::acquire();
             let _cwd = crate::test_cwd::CwdReadGuard::acquire();
             let mut engine = Engine::new();
-            engine.settings.use_nerd_fonts = true;
+            engine.settings.use_nerd_fonts = Some(true);
             let engine = Rc::new(RefCell::new(engine));
             let app = App::new_headless(Rc::clone(&engine));
             let mut config = crate::gtk::build_shell_config(&app);
@@ -3223,7 +3303,7 @@ mod sidebar_panel_clicks {
     /// a Nerd Font installed.
     fn panel_harness(panel: &str) -> Harness<impl AppLogic> {
         let mut engine = Engine::new();
-        engine.settings.use_nerd_fonts = false;
+        engine.settings.use_nerd_fonts = Some(false);
         engine.app_shell.show_panel(&quadraui::WidgetId::new(panel));
         harness(engine, 1400, 900)
     }
@@ -3409,7 +3489,7 @@ mod sidebar_panel_clicks {
     #[test]
     fn bottom_panel_tab_strip_click_switches_the_painted_panel() {
         let mut engine = Engine::new();
-        engine.settings.use_nerd_fonts = false;
+        engine.settings.use_nerd_fonts = Some(false);
         engine.terminal_new_tab(80, 10);
         engine
             .dap_output_lines
@@ -3475,7 +3555,7 @@ mod sidebar_panel_clicks {
     #[test]
     fn terminal_ctrl_f_opens_the_painted_find_bar() {
         let mut engine = Engine::new_for_test();
-        engine.settings.use_nerd_fonts = false;
+        engine.settings.use_nerd_fonts = Some(false);
         // `terminal_new_tab` opens the panel and focuses it.
         engine.terminal_new_tab(80, 10);
 
@@ -3521,7 +3601,7 @@ mod sidebar_panel_clicks {
     fn focused_terminal_swallows_editor_keys_on_gtk() {
         let build = |focused: bool| {
             let mut engine = Engine::new_for_test();
-            engine.settings.use_nerd_fonts = false;
+            engine.settings.use_nerd_fonts = Some(false);
             engine.buffer_mut().insert(0, "ZQXWTERMGTK758\n");
             engine.terminal_new_tab(80, 6);
             engine.terminal_has_focus = focused;
@@ -3736,7 +3816,7 @@ mod sidebar_panel_clicks {
     #[test]
     fn switching_to_a_plugin_panel_clears_stale_marketplace_focus() {
         let mut engine = Engine::new();
-        engine.settings.use_nerd_fonts = false;
+        engine.settings.use_nerd_fonts = Some(false);
         engine.ext_panels.clear();
         engine.ext_panels.insert(
             "git-insights".to_string(),
@@ -3809,7 +3889,7 @@ mod sidebar_panel_clicks {
     #[test]
     fn an_editor_drag_crossing_the_sidebar_is_not_stolen_by_a_panel() {
         let mut engine = Engine::new();
-        engine.settings.use_nerd_fonts = false;
+        engine.settings.use_nerd_fonts = Some(false);
         engine.buffer_mut().insert(
             0,
             "alpha beta gamma
@@ -3845,7 +3925,7 @@ second line here
     #[test]
     fn an_editor_text_drag_paints_a_selection_through_the_shared_drag_router() {
         let mut engine = Engine::new();
-        engine.settings.use_nerd_fonts = false;
+        engine.settings.use_nerd_fonts = Some(false);
         let mut text = String::new();
         for _ in 0..60 {
             text.push_str("alpha beta gamma delta epsilon\n");
@@ -3922,7 +4002,7 @@ second line here
     #[test]
     fn a_sidebar_drag_keeps_its_grab_once_it_crosses_into_the_editor() {
         let mut engine = Engine::new();
-        engine.settings.use_nerd_fonts = false;
+        engine.settings.use_nerd_fonts = Some(false);
         engine.buffer_mut().insert(
             0,
             "alpha beta gamma
@@ -7650,7 +7730,7 @@ mod overlay_band_z_order {
     #[test]
     fn frame_sequence_matches_across_backends_via_gtk_driver() {
         let mut engine = Engine::new();
-        engine.settings.use_nerd_fonts = false;
+        engine.settings.use_nerd_fonts = Some(false);
         engine.buffer_mut().insert(0, "fn main() {}\n");
         // Explicit, not ambient (#762): a global status bar exists only when
         // per-window status lines are off, and the default is on.
@@ -7780,7 +7860,7 @@ mod chrome_band_order {
     #[test]
     fn chrome_band_composes_in_canonical_order_via_gtk_driver() {
         let mut engine = Engine::new();
-        engine.settings.use_nerd_fonts = false;
+        engine.settings.use_nerd_fonts = Some(false);
         // Explicit, not ambient: a global status bar exists only when
         // per-window status lines are off, and the default is on.
         engine.settings.window_status_line = false;
@@ -7833,7 +7913,7 @@ mod chrome_band_order {
     #[test]
     fn chrome_band_drops_the_wildmenu_rung_when_no_completion_is_up_via_gtk_driver() {
         let mut engine = Engine::new();
-        engine.settings.use_nerd_fonts = false;
+        engine.settings.use_nerd_fonts = Some(false);
         engine.settings.window_status_line = false;
         engine.app_shell.show_panel(&quadraui::WidgetId::new(
             crate::core::engine::sidebar::PANEL_SETTINGS,
@@ -7860,7 +7940,7 @@ mod chrome_band_order {
     #[test]
     fn chrome_band_drops_the_status_bar_rung_with_per_window_status_lines_via_gtk_driver() {
         let mut engine = Engine::new();
-        engine.settings.use_nerd_fonts = false;
+        engine.settings.use_nerd_fonts = Some(false);
         engine.settings.window_status_line = true;
         engine.app_shell.show_panel(&quadraui::WidgetId::new(
             crate::core::engine::sidebar::PANEL_SETTINGS,
@@ -7911,7 +7991,7 @@ mod editor_band_order {
     /// this from a seven-rung assertion into a five-rung one.
     fn engine_with_every_editor_rung() -> Engine {
         let mut engine = Engine::new_for_test();
-        engine.settings.use_nerd_fonts = false;
+        engine.settings.use_nerd_fonts = Some(false);
         engine.settings.breadcrumbs = true;
         engine.settings.minimap = true;
         let cwd = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -8106,7 +8186,7 @@ mod editor_band_order {
     #[test]
     fn unsplit_editor_composes_no_group_divider_rung_via_gtk_driver() {
         let mut engine = Engine::new_for_test();
-        engine.settings.use_nerd_fonts = false;
+        engine.settings.use_nerd_fonts = Some(false);
         engine.buffer_mut().insert(0, "fn main() {}\n");
 
         let h = harness(engine, 1400, 900);
@@ -8153,7 +8233,7 @@ mod bottom_band_order {
     /// `app_with_every_bottom_rung`.
     fn engine_with_every_bottom_rung() -> Engine {
         let mut engine = Engine::new_for_test();
-        engine.settings.use_nerd_fonts = false;
+        engine.settings.use_nerd_fonts = Some(false);
         // `separated_status_line` is `Some` only for
         // `window_status_line && !status_line_above_terminal && panel open`.
         engine.settings.window_status_line = true;
@@ -10594,7 +10674,7 @@ mod conformance_proof_slice {
     /// less thing to double-check when a scenario body moves between them.
     fn plain_engine() -> Engine {
         let mut engine = Engine::new_for_test();
-        engine.settings.use_nerd_fonts = false;
+        engine.settings.use_nerd_fonts = Some(false);
         engine
     }
 
@@ -10733,7 +10813,7 @@ mod hit_band_sweep_971 {
     /// tests' `screen_has` checks look for.
     fn plain_engine() -> Engine {
         let mut engine = Engine::new_for_test();
-        engine.settings.use_nerd_fonts = false;
+        engine.settings.use_nerd_fonts = Some(false);
         engine
     }
 
@@ -10980,7 +11060,7 @@ mod issue_991_merge_conflicts {
     /// from the text labels these assertions look for.
     fn plain_engine() -> Engine {
         let mut engine = Engine::new_for_test();
-        engine.settings.use_nerd_fonts = false;
+        engine.settings.use_nerd_fonts = Some(false);
         engine
             .app_shell
             .show_panel(&quadraui::WidgetId::new(PANEL_GIT));

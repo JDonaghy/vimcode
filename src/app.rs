@@ -1076,7 +1076,11 @@ impl App {
 
         let mut engine = {
             let mut e = Engine::new();
-            icons::set_nerd_fonts(e.settings.use_nerd_fonts);
+            // #999: record this as a GUI backend *before* resolving
+            // `use_nerd_fonts()` — GUI bundles the icon font, so an unset
+            // setting inherits `true` regardless of OS.
+            icons::set_gui_backend(true);
+            icons::set_nerd_fonts(e.settings.use_nerd_fonts());
             e.startup(file_path.as_deref());
             e
         };
@@ -1192,7 +1196,11 @@ impl App {
 
         let mut engine = {
             let mut e = Engine::new();
-            crate::icons::set_nerd_fonts(e.settings.use_nerd_fonts);
+            // #999: same GUI-backend-then-resolve ordering as `App::new`
+            // above — every non-GTK GUI backend this constructor serves
+            // (macOS, Win-GUI) bundles the icon font too.
+            crate::icons::set_gui_backend(true);
+            crate::icons::set_nerd_fonts(e.settings.use_nerd_fonts());
             e.startup(file_path.as_deref());
             e
         };
@@ -1539,9 +1547,14 @@ impl App {
         engine: Rc<RefCell<Engine>>,
         backend: Rc<RefCell<Box<dyn TextMetricsBackend>>>,
     ) -> Self {
+        // #999: this constructor is the shared headless `App` test seam for
+        // every GUI backend (GTK, and the macOS driver-tier test per this
+        // fn's own doc), so it's a GUI backend for `use_nerd_fonts()`
+        // resolution purposes the same as `App::new`/`App::new_portable`.
+        crate::icons::set_gui_backend(true);
         let (use_nerd_fonts, last_colorscheme) = {
             let e = engine.borrow();
-            (e.settings.use_nerd_fonts, e.settings.colorscheme.clone())
+            (e.settings.use_nerd_fonts(), e.settings.colorscheme.clone())
         };
         // Path-qualified rather than via the `use` at the top of this file —
         // that import is `gui`-gated and this constructor is not (#896).
