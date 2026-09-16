@@ -3599,8 +3599,27 @@ impl Engine {
         let step = viewport.saturating_sub(overlap);
         let new_top = self.view().prev_visible_line(old_top, step);
         self.view_mut().scroll_top = new_top;
+        // Vim lands `<C-b>` on the **last line of the new window**
+        // (`onepage()` sets `w_cursor.lnum = w_botline - 1`), not a fixed
+        // offset from where the window used to be. The two are the same
+        // number whenever a whole page was actually scrolled — which is why
+        // the old `old_top + 1` form was right for every single `<C-b>` — and
+        // they part company the moment the scroll is clamped at the top of
+        // the buffer, because then the window moved less than a page but the
+        // cursor still belongs at its bottom edge.
+        //
+        // Measured against both a headless and a real interactive Neovim
+        // (`scripts/nvim_headless_vs_interactive_repro.sh`), 60-line buffer,
+        // 22-row window, cursor on line 60: `2<C-b>` ends on line 22. The old
+        // form answered 20. This was `tests/nvim_conformance.rs`'s last
+        // `HARNESS_LIMITED` entry, excused for three issues as a broken-oracle
+        // artifact; #1008's attached-UI oracle showed the oracle had been
+        // right all along (see that file's `HARNESS_LIMITED` doc comment).
+        let bottom = self
+            .view()
+            .next_visible_line(new_top, viewport.saturating_sub(1), max_line);
         let scrolloff = self.settings.scrolloff;
-        let target = (old_top + scrolloff + 1).min(max_line);
+        let target = bottom.saturating_sub(scrolloff).max(new_top).min(max_line);
         self.land_vertical_scroll_cursor(target);
     }
 

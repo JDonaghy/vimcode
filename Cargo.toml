@@ -235,6 +235,18 @@ notify = { version = "7", default-features = false, features = ["macos_kqueue"] 
 
 [dev-dependencies]
 insta = "1.39"
+# #1008: msgpack values for the `tests/nvim_conformance.rs` oracle, which
+# drives `nvim --embed` over msgpack-RPC with a UI attached (`nvim_ui_attach`)
+# instead of the old `nvim --headless -l script.lua`. Deliberately a
+# **dev**-dependency: nothing vimcode ships touches msgpack.
+#
+# `rmpv` (values + reader/writer), not `nvim-rs` (the transport #27 names):
+# nvim-rs is an async client that would drag `tokio` into the test graph for a
+# suite whose every call is a blocking request/response over one pipe. The
+# ~100-line `NvimRpc` in that file speaks the same three-frame msgpack-RPC
+# protocol synchronously; #27's fuzzing loop can build on it or swap in
+# nvim-rs then without touching anything else.
+rmpv = "1.3"
 
 [build-dependencies]
 cc = "1.0"

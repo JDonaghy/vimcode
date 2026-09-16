@@ -2,7 +2,7 @@
 //!
 //! Each case defines an initial buffer, a cursor position (1-indexed line and
 //! col — Neovim convention), an optional per-case `setup` snippet of Lua, and a
-//! key sequence.  The same scenario is run through `nvim --headless` and through
+//! key sequence.  The same scenario is run through a real Neovim and through
 //! `Engine`, and the resulting buffer + cursor are compared.  **Nothing here is
 //! hand-authored**: Neovim is the oracle, so a case cannot encode the author's
 //! misconception about what Vim does the way an expectation-based test can.
@@ -44,16 +44,45 @@
 //! literals) instead of asserting.  Never regenerate to paper over a regression:
 //! the point of the list is that it does not grow.
 //!
+//! ## The oracle transport: an attached-UI RPC session (#1008)
+//!
+//! The oracle is `nvim --headless --embed` driven over msgpack-RPC with a UI
+//! attached (`nvim_ui_attach`, 80x24 — see [`NvimRpc`]), and the case's keys
+//! are typed **one at a time** through `nvim_input`, with the window's scroll
+//! bookkeeping re-validated between each.
+//!
+//! It used to be `nvim --headless -l script.lua` handed the whole key
+//! sequence in one `nvim_feedkeys()` burst. That oracle attaches no UI, so no
+//! redraw ever runs, so `w_topline` / `w_botline` / `w_empty_rows` are never
+//! re-validated between keystrokes — and `nvim_feedkeys(.., "x")` executes
+//! inside `exec_normal()`, which never returns to the main loop where that
+//! re-validation lives. Window-relative reads after a scroll therefore
+//! answered against stale state, which is why the `scroll:` group carried a
+//! long list of excuses for three issues (#805, #875, #867). Swapping the
+//! transport deleted all of them; what it also did, less comfortably, is show
+//! that the last surviving excuse ("scroll:2<C-b>") had been covering a real
+//! vimcode bug — see `HARNESS_LIMITED`.
+//!
+//! Typing keys for real brings Neovim's *interactive* behaviour with it, and
+//! three pieces of that are deliberately turned back off in the fixture
+//! preamble (`oracle_probe`) so the corpus keeps measuring vimcode against
+//! **Vim**, not against Neovim's UI defaults:
+//!
+//! | Turned off | Why |
+//! |---|---|
+//! | default mappings (`mapclear`, `mapclear!`) | Neovim maps `Y` to `y$` and `&` to `:&&<CR>`; `feedkeys(.., "n..")` used to bypass mappings, real typing does not |
+//! | `'inccommand'` | a live `:s` preview, typed a character at a time, runs real substitutions that clobber the flags `:s/a/c/&` then asks for |
+//! | swap files (`-n`) | every case modifies the unnamed buffer, and a few hundred concurrent swap files exhaust the suffix space; `E326` under an attached UI is a `hit-enter` prompt that blocks every deferred API call |
+//!
 //! ## `HARNESS_LIMITED` (#875)
 //!
 //! A separate, smaller list next to `KNOWN_DEVIATIONS` for cases this *test*
-//! cannot faithfully probe — a harness gap or a broken headless oracle, not a
-//! vimcode bug. These are reported but never enter the bidirectional gate: they
-//! can fail forever without being a regression, and cannot force an entry
-//! deletion by passing. See the array's own doc comment for the single harness
-//! gap it still covers — the headless-scroll artifact. (Its other gap,
-//! `run_in_vimcode` dropping a case's `setup`, was closed by #1002; see
-//! `apply_setup`.)
+//! cannot faithfully probe — a harness gap or a broken oracle, not a vimcode
+//! bug. These are reported but never enter the bidirectional gate: they can
+//! fail forever without being a regression, and cannot force an entry
+//! deletion by passing. It is **empty** as of #1008; the array's own doc
+//! comment explains why both entries it ever held are gone and what the bar
+//! is for adding another.
 //!
 //! ## Debugging a single area
 //!
@@ -68,7 +97,7 @@
 //! | Detail | Why |
 //! |---|---|
 //! | `vim.o.undolevels = -1` around the fixture write, restored to `1000` | `nvim_buf_set_lines` is itself an undo step, so `u` undid the *fixture* and the buffer became `""` (41 spurious undo failures) |
-//! | `feedkeys(.., "ntx")`, not `"nx"` | without `t`, keys count as mapping-sourced: `q` records nothing (every `@a` was a silent no-op on the nvim side) and undo is not synced between commands |
+//! | keys typed one at a time via `nvim_input`, never `nvim_feedkeys` | `feedkeys(.., "x")` runs `exec_normal()`, which force-`<Esc>`s an unfinished command and never redraws between keys — the #1008 transport swap |
 //! | capture `nvim_win_get_height(0)`, mirror via `engine.set_viewport_lines(rows)` | `H`/`M`/`L`/`<C-d>`/`zt` are meaningless with mismatched window heights |
 //! | `engine.ensure_cursor_visible()` after placing the start cursor | `nvim_win_set_cursor` scrolls the window; a raw engine cursor write does not (12 spurious scroll failures) |
 //! | pump `macro_playback_queue` after every key | the UI normally pumps it, so the harness must too, or `@a` never executes on the VimCode side |
@@ -97,7 +126,7 @@
 //! (`.github/workflows/ci.yml`, both jobs).
 //!
 //! The version floor exists for the same reason the `cs(..)` Lua `setup` hook
-//! does: Neovim's own option defaults and headless behaviour move between
+//! does: Neovim's own option defaults and behaviour move between
 //! releases, so a verdict from 0.9.x is not comparable with one from 0.12.x.  The
 //! fleet standard — every agent host and both CI jobs — is upstream stable
 //! **v0.12.5**, which CI installs from a pinned release tarball rather than apt
@@ -148,9 +177,11 @@
 mod common;
 
 use common::engine_with;
+use rmpv::Value;
 use serde::Deserialize;
-use std::io::Write;
+use std::io::{BufReader, Write};
 use std::path::{Path, PathBuf};
+use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use vimcode_core::core::OpenMode;
 use vimcode_core::{Engine, EngineAction, Settings};
@@ -161,6 +192,13 @@ struct NvimResult {
     line: usize,
     col: usize,
     rows: usize,
+    /// `line('w0')` sampled after **every** key (#1008), never deserialized —
+    /// [`run_in_neovim`] fills it in as it feeds the sequence. It is the
+    /// evidence that the redraw between keystrokes actually happened, and it
+    /// is printed on a failure so "which keystroke moved the window wrongly"
+    /// is answerable without re-running by hand.
+    #[serde(default)]
+    toplines: Vec<i64>,
 }
 
 /// Unique suffix for this probe's temp files, so probes can run concurrently.
@@ -173,15 +211,454 @@ fn probe_id() -> String {
     )
 }
 
-fn run_in_neovim(
+// ---------------------------------------------------------------------------
+// The oracle transport (#1008): `nvim --embed` over msgpack-RPC, UI attached.
+//
+// This replaced `nvim --headless -l script.lua`. See the module docs for the
+// measurements; the short version is that `-l` attaches no UI, so no redraw
+// ever runs, so `w_topline`/`w_botline`/`w_empty_rows` are never re-validated
+// and any window-relative read afterwards answers against stale state.
+// ---------------------------------------------------------------------------
+
+/// The terminal geometry the oracle attaches.
+///
+/// 80x24 is the screen a `nvim --headless` process already assumed, so the
+/// **window** height the corpus mirrors — `nvim_win_get_height`, 22 once the
+/// status line and the command line are taken off — is unchanged by the
+/// transport swap. Every case reads `rows` back out of nvim rather than
+/// assuming it (and [`run_in_vimcode`] mirrors that value via
+/// `set_viewport_lines`), so the two sides cannot drift even if a future
+/// Neovim changes what it subtracts.
+const UI_WIDTH: u64 = 80;
+const UI_HEIGHT: u64 = 24;
+
+/// How long the oracle will wait for one request to be answered before the
+/// case is declared broken.
+///
+/// This is a stall detector, not a performance budget: every answer is
+/// produced by a local process in microseconds, so anything near this bound
+/// means nvim is wedged. Without it a wedged oracle is an indefinite hang in
+/// CI; with it, the case reports as `NvimBroke`, which is already a hard
+/// failure on a CI lane.
+const RPC_STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How long a keystroke's post-redraw barrier waits before concluding that
+/// nvim is part-way through a command and cannot answer (see
+/// [`NvimRpc::type_key`]), and equally the slice length between prompt checks
+/// in [`NvimRpc::request_pumped`].
+///
+/// Generous against the thing it races: nvim is a local process answering a
+/// one-line `nvim_eval` in tens of microseconds, and a machine loaded enough
+/// to miss 250ms would fail the surrounding test suite on its own.
+const RPC_KEY_BARRIER: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// A minimal synchronous msgpack-RPC client for one `nvim --embed` process.
+///
+/// msgpack-RPC has exactly three frame shapes and this speaks all three:
+/// request `[0, id, method, params]`, response `[1, id, error, result]`,
+/// notification `[2, method, params]`. With a UI attached nvim streams
+/// `redraw` notifications continuously; draining them is not incidental
+/// bookkeeping, it is what keeps nvim's stdout from filling and deadlocking
+/// the case.
+///
+/// Frames are read on a dedicated thread into a channel rather than straight
+/// off the pipe so that every wait can carry a deadline. A blocking `read` on
+/// a pipe has no portable timeout, and "the suite hangs forever" is a far
+/// worse failure mode on a CI lane than "this case reports broken".
+struct NvimRpc {
+    child: Child,
+    stdin: ChildStdin,
+    frames: std::sync::mpsc::Receiver<Result<Value, String>>,
+    next_id: u64,
+    /// Responses that arrived while a *different* request was being awaited.
+    /// Needed because [`NvimRpc::request_pumped`] interleaves prompt probes
+    /// with the wait for a long-running request; without this, the probe's
+    /// read loop would throw away the very answer it is waiting for.
+    responses: std::collections::HashMap<u64, Result<Value, String>>,
+    /// 1-indexed `w_topline`, straight from the UI protocol's own
+    /// `win_viewport` event — the value nvim computed *during a redraw*, which
+    /// is a number a `-l` script could never observe.
+    topline: i64,
+}
+
+impl NvimRpc {
+    /// Spawn nvim, attach a UI, and wait until it will answer API calls.
+    ///
+    /// `--headless` alongside `--embed` is deliberate. On its own, `--embed`
+    /// makes nvim pause startup until a UI attaches, which sounds like the
+    /// stronger guarantee but in practice races: the fixture lands mid-startup
+    /// on roughly one spawn in five under a 16-way parallel run. `--headless
+    /// --embed` starts immediately, `nvim_ui_attach` below gives the window a
+    /// real screen anyway (this is the same pairing Neovim's own UI test
+    /// harness uses), and the one thing it costs — the intro screen arriving
+    /// as scrolled message output, so the first buffer modification hits a
+    /// `hit-enter` prompt — is deterministic rather than intermittent, and is
+    /// handled by [`NvimRpc::wait_until_ready`].
+    fn spawn() -> Option<Self> {
+        let mut child = Command::new("nvim")
+            .arg("--headless")
+            .arg("--embed")
+            .arg("-u")
+            .arg("NONE")
+            .arg("-i")
+            .arg("NONE")
+            // `-n`: no swap file. Not hygiene — load-bearing. Every case
+            // modifies the unnamed buffer, which makes nvim write a swap file
+            // named after the *working directory*; a few hundred concurrent
+            // cases exhaust the `.saa`..`.svz` suffix space and the next one
+            // stops on `E326: Too many swap files found`, an error message,
+            // which under an attached UI is a `hit-enter` prompt that blocks
+            // every deferred API call until it is answered. The `-l` oracle
+            // never hit this because it never redrew.
+            .arg("-n")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            // Deliberately discarded rather than piped-and-ignored: an unread
+            // pipe fills and blocks nvim. Anything that matters comes back as
+            // an RPC error instead.
+            .stderr(Stdio::null())
+            .spawn()
+            .ok()?;
+        let stdin = child.stdin.take()?;
+        let mut stdout = BufReader::new(child.stdout.take()?);
+        let (tx, frames) = std::sync::mpsc::channel();
+        std::thread::spawn(move || loop {
+            match rmpv::decode::read_value(&mut stdout) {
+                Ok(value) => {
+                    if tx.send(Ok(value)).is_err() {
+                        return; // the case finished; nobody is listening
+                    }
+                }
+                Err(e) => {
+                    let _ = tx.send(Err(e.to_string()));
+                    return;
+                }
+            }
+        });
+        let mut rpc = NvimRpc {
+            child,
+            stdin,
+            frames,
+            next_id: 0,
+            responses: std::collections::HashMap::new(),
+            topline: 1,
+        };
+        rpc.request(
+            "nvim_ui_attach",
+            vec![
+                Value::from(UI_WIDTH),
+                Value::from(UI_HEIGHT),
+                Value::Map(vec![(Value::from("ext_linegrid"), Value::Boolean(true))]),
+            ],
+        )
+        .ok()?;
+        rpc.wait_until_ready().ok()?;
+        Some(rpc)
+    }
+
+    /// Next frame, or `Ok(None)` if `deadline` passes first. An error here is
+    /// always fatal for the case: the reader thread only reports one when the
+    /// pipe breaks.
+    fn next_frame_by(&mut self, deadline: std::time::Instant) -> Result<Option<Value>, String> {
+        let window = deadline.saturating_duration_since(std::time::Instant::now());
+        match self.frames.recv_timeout(window) {
+            Ok(Ok(value)) => Ok(Some(value)),
+            Ok(Err(e)) => Err(format!("oracle stdout: {e}")),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Ok(None),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                Err("oracle stdout closed".to_string())
+            }
+        }
+    }
+
+    /// Fold a `redraw` notification into the one piece of UI state this
+    /// harness keeps. Everything else about the screen is discarded.
+    fn absorb_notification(&mut self, frame: &[Value]) {
+        if frame.get(1).and_then(Value::as_str) != Some("redraw") {
+            return;
+        }
+        let Some(Value::Array(events)) = frame.get(2) else {
+            return;
+        };
+        for event in events {
+            let Value::Array(parts) = event else { continue };
+            // `["win_viewport", [grid, win, topline, botline, ...], ...]` —
+            // one trailing array per batched call, so take the last.
+            if parts.first().and_then(Value::as_str) == Some("win_viewport") {
+                if let Some(Value::Array(args)) = parts.iter().skip(1).next_back() {
+                    if let Some(top) = args.get(2).and_then(Value::as_i64) {
+                        self.topline = top + 1; // the event is 0-indexed
+                    }
+                }
+            }
+        }
+    }
+
+    /// Write a request and return its id, without waiting for the answer.
+    fn send(&mut self, method: &str, params: Vec<Value>) -> Result<u64, String> {
+        self.next_id += 1;
+        let id = self.next_id;
+        let msg = Value::Array(vec![
+            Value::from(0u64),
+            Value::from(id),
+            Value::from(method),
+            Value::Array(params),
+        ]);
+        rmpv::encode::write_value(&mut self.stdin, &msg).map_err(|e| e.to_string())?;
+        self.stdin.flush().map_err(|e| e.to_string())?;
+        Ok(id)
+    }
+
+    /// Read frames until `id` is answered or `deadline` passes, absorbing
+    /// redraws and stashing any other request's answer on the way.
+    fn await_response(
+        &mut self,
+        method: &str,
+        id: u64,
+        deadline: std::time::Instant,
+    ) -> Result<Option<Value>, String> {
+        if let Some(done) = self.responses.remove(&id) {
+            return done.map(Some).map_err(|e| format!("{method}: {e}"));
+        }
+        loop {
+            let frame = match self.next_frame_by(deadline)? {
+                Some(frame) => frame,
+                None => return Ok(None),
+            };
+            let arr = match frame {
+                Value::Array(a) => a,
+                other => return Err(format!("msgpack-rpc frame is not an array: {other}")),
+            };
+            match arr.first().and_then(Value::as_u64) {
+                Some(2) => self.absorb_notification(&arr),
+                Some(1) => {
+                    let Some(other_id) = arr.get(1).and_then(Value::as_u64) else {
+                        return Err("msgpack-rpc response with no id".to_string());
+                    };
+                    let err = arr.get(2).cloned().unwrap_or(Value::Nil);
+                    let answer = if err.is_nil() {
+                        Ok(arr.into_iter().nth(3).unwrap_or(Value::Nil))
+                    } else {
+                        Err(err.to_string())
+                    };
+                    if other_id == id {
+                        return answer.map(Some).map_err(|e| format!("{method}: {e}"));
+                    }
+                    self.responses.insert(other_id, answer);
+                }
+                // nvim calling *us*. Nothing we attach asks for this, but an
+                // unanswered request would block nvim forever, so answer nil.
+                Some(0) => {
+                    let their_id = arr.get(1).cloned().unwrap_or(Value::Nil);
+                    let reply =
+                        Value::Array(vec![Value::from(1u64), their_id, Value::Nil, Value::Nil]);
+                    rmpv::encode::write_value(&mut self.stdin, &reply)
+                        .map_err(|e| e.to_string())?;
+                    self.stdin.flush().map_err(|e| e.to_string())?;
+                }
+                _ => return Err("malformed msgpack-rpc frame".to_string()),
+            }
+        }
+    }
+
+    /// Send a request and wait at most `window` for its response. `Ok(None)`
+    /// means the deadline passed.
+    ///
+    /// Abandoning a request is safe: responses carry their id and land in
+    /// `responses` rather than being discarded. That matters because the
+    /// caller *deliberately* abandons one on every mid-command keystroke —
+    /// see [`NvimRpc::type_key`].
+    fn request_bounded(
+        &mut self,
+        method: &str,
+        params: Vec<Value>,
+        window: std::time::Duration,
+    ) -> Result<Option<Value>, String> {
+        let id = self.send(method, params)?;
+        self.await_response(method, id, std::time::Instant::now() + window)
+    }
+
+    fn request(&mut self, method: &str, params: Vec<Value>) -> Result<Value, String> {
+        self.request_bounded(method, params, RPC_STALL_TIMEOUT)?
+            .ok_or_else(|| format!("{method}: no response within the stall timeout"))
+    }
+
+    /// Send a request, and keep answering `hit-enter` / `-- More --` prompts
+    /// until it comes back.
+    ///
+    /// Neovim serves **no** deferred API call while one of those prompts is
+    /// up, so without this a single over-long message turns into a 30-second
+    /// stall and a broken case. That is not hypothetical: with a UI attached,
+    /// the intro screen alone puts nvim there as soon as the buffer is first
+    /// modified, so the fixture install needs it every single time.
+    ///
+    /// Only `r` (hit-enter) and `rm` (more) are answered — never `r?`, the
+    /// `:confirm` query, whose answer is a real editing decision that belongs
+    /// to the case's own keystrokes. Pressing `<CR>` at the two that *are*
+    /// answered changes no buffer, cursor or register: it dismisses output.
+    fn request_pumped(&mut self, method: &str, params: Vec<Value>) -> Result<Value, String> {
+        let id = self.send(method, params)?;
+        let give_up = std::time::Instant::now() + RPC_STALL_TIMEOUT;
+        // Start with a short slice and back off. The common case — the
+        // fixture install, which hits the startup prompt every single time —
+        // is then ~1ms of waiting rather than a fixed quarter-second per case,
+        // which is worth roughly half this suite's wall clock.
+        let mut slice = std::time::Duration::from_millis(1);
+        while std::time::Instant::now() < give_up {
+            let until = std::time::Instant::now() + slice;
+            if let Some(answer) = self.await_response(method, id, until)? {
+                return Ok(answer);
+            }
+            self.dismiss_message_prompt()?;
+            slice = (slice * 2).min(RPC_KEY_BARRIER);
+        }
+        Err(format!("{method}: no response within the stall timeout"))
+    }
+
+    /// If nvim is parked on a message prompt, press `<CR>`. Returns whether it
+    /// did.
+    ///
+    /// `nvim_get_mode` and `nvim_input` are two of the few API calls Neovim
+    /// marks "fast", i.e. served even while it is blocked — which is the only
+    /// reason this is observable and fixable from the client side at all.
+    fn dismiss_message_prompt(&mut self) -> Result<bool, String> {
+        let Some(mode) = self.request_bounded("nvim_get_mode", Vec::new(), RPC_KEY_BARRIER)? else {
+            return Ok(false);
+        };
+        let Value::Map(entries) = mode else {
+            return Ok(false);
+        };
+        let get = |key: &str| {
+            entries
+                .iter()
+                .find(|(k, _)| k.as_str() == Some(key))
+                .map(|(_, v)| v.clone())
+        };
+        let blocking = get("blocking").and_then(|v| v.as_bool()).unwrap_or(false);
+        let mode = get("mode")
+            .and_then(|v| v.as_str().map(str::to_string))
+            .unwrap_or_default();
+        if blocking && (mode == "r" || mode == "rm") {
+            self.request_bounded("nvim_input", vec![Value::from("<CR>")], RPC_KEY_BARRIER)?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    /// Block until nvim will actually answer an API request, dismissing the
+    /// startup prompt described on [`NvimRpc::spawn`] if one is in the way.
+    fn wait_until_ready(&mut self) -> Result<(), String> {
+        self.request_pumped("nvim_eval", vec![Value::from("1")])?;
+        Ok(())
+    }
+
+    /// Type one key, then wait for nvim to come back to a state where it has
+    /// re-validated the window. Returns that window's top line.
+    ///
+    /// Three choices here are load-bearing and none of them is the obvious one:
+    ///
+    /// * **`nvim_input`, not `nvim_feedkeys`.** `feedkeys(.., "x")` runs
+    ///   nvim's `exec_normal` machinery, which force-`<Esc>`s an incomplete
+    ///   command the moment typeahead drains — so feeding `dw` one key at a
+    ///   time that way would cancel the `d` before its motion ever arrived.
+    ///   `nvim_input` goes through the real input path, where a half-finished
+    ///   command simply waits, exactly as it does for a human. It is also what
+    ///   puts the keys through the **main loop**, whose `normal_check()` runs
+    ///   `update_topline()` / `validate_cursor()` / `update_screen()` between
+    ///   commands. `exec_normal` never returns to that loop, which is the
+    ///   whole reason the old `-l` oracle could not see a chained `<C-d>`
+    ///   correctly.
+    ///
+    /// * **The barrier is a deferred request, not a redraw notification.**
+    ///   `nvim_eval` is served only from a safe point, so its answer is proof
+    ///   that the key was consumed *and* that the redraw on the way back to
+    ///   idle ran; `line('w0')` is then read from the freshly-validated
+    ///   `w_topline`. Waiting on the UI's `flush` event instead looks tempting
+    ///   and is wrong twice over: `remote_ui_flush()` emits nothing when a
+    ///   keystroke changed nothing on screen (so the wait can hang forever),
+    ///   and the flush that *does* arrive is the one `display_showcmd()`
+    ///   emits when the key is read, i.e. **before** the command it starts has
+    ///   run. Both were measured the hard way.
+    ///
+    /// * **The wait is bounded, and timing out is not an error.** nvim cannot
+    ///   serve a deferred request while it is part-way through a Normal-mode
+    ///   command, so every key that leaves a count or an operator pending —
+    ///   the `3` of `3<C-e>`, the `2` of `25jH`, the `d` of `dw` — would
+    ///   otherwise hang the case forever. A timeout here *is* the answer "nvim
+    ///   is waiting for the rest of this command", and a command that has not
+    ///   run yet has no window state to re-validate; the previous key's
+    ///   topline (kept current from the UI's own `win_viewport` events)
+    ///   stands.
+    fn type_key(&mut self, key: &str) -> Result<i64, String> {
+        let mut rest = key;
+        while !rest.is_empty() {
+            let written = self
+                .request("nvim_input", vec![Value::from(rest)])?
+                .as_u64()
+                .ok_or_else(|| "nvim_input did not return a byte count".to_string())?
+                as usize;
+            if written == 0 {
+                return Err(format!("nvim_input refused to consume {rest:?}"));
+            }
+            rest = rest
+                .get(written..)
+                .ok_or_else(|| "nvim_input split a multi-byte key".to_string())?;
+        }
+        if let Some(w0) = self.request_bounded(
+            "nvim_eval",
+            vec![Value::from("line('w0')")],
+            RPC_KEY_BARRIER,
+        )? {
+            self.topline = w0
+                .as_i64()
+                .ok_or_else(|| format!("line('w0') was not an integer: {w0}"))?;
+        }
+        Ok(self.topline)
+    }
+}
+
+impl Drop for NvimRpc {
+    fn drop(&mut self) {
+        // Not `:qa!` over RPC: a case can leave nvim mid-command, mid-prompt
+        // or in Insert mode, where that would need its own escaping dance for
+        // no benefit. The process is disposable — and killing it closes the
+        // pipe, which is what retires the reader thread.
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// Run one case through the oracle, reporting *why* it failed rather than
+/// collapsing every failure into `None`.
+///
+/// The old `-l` oracle printed nvim's stderr when a probe produced no
+/// parseable result; keeping an equivalent is not optional now that the
+/// transport has more ways to go wrong (a stalled redraw, an RPC error, a
+/// killed process), and `Outcome::NvimBroke` on its own says none of them.
+fn oracle_probe(
     lines: &[&str],
     cursor_line_1: usize,
     cursor_col_1: usize,
     keys: &str,
     setup: &str,
-) -> Option<NvimResult> {
-    let id = probe_id();
+) -> Result<NvimResult, String> {
+    let mut nvim = NvimRpc::spawn().ok_or_else(|| "could not spawn `nvim --embed`".to_string())?;
     let mut lua = String::new();
+    // Neovim ships *default mappings* (`:h default-mappings`) that redefine
+    // keys this corpus probes — `Y` is `y$`, `&` is `:&&<CR>`. The `-l` oracle
+    // never saw them because `nvim_feedkeys(.., "ntx")` carries `n`, "do not
+    // remap"; real typing through `nvim_input` does. Clearing them keeps this
+    // a Vim-conformance suite rather than a Neovim-defaults one, and keeps
+    // every case meaning what it meant when it was captured (#1008).
+    lua.push_str("vim.cmd('mapclear')\nvim.cmd('mapclear!')\n");
+    // `'inccommand'` defaults to "nosplit", i.e. Neovim live-previews a `:s`
+    // *as it is typed*. Harmless when the command arrives as one feedkeys
+    // burst; not harmless when it is typed a character at a time at an
+    // attached UI, where the preview runs a real substitution that clobbers
+    // the remembered flags `:s/a/c/&` then asks for. Off, like the `-l` oracle
+    // effectively had it — vimcode has no live preview to compare against
+    // either (#1008).
+    lua.push_str("vim.o.inccommand = ''\n");
     lua.push_str("vim.o.compatible = false\n");
     lua.push_str("vim.o.shiftwidth = 4\n");
     lua.push_str("vim.o.expandtab = true\n");
@@ -211,58 +688,56 @@ fn run_in_neovim(
         cursor_line_1,
         cursor_col_1.saturating_sub(1)
     ));
-    let escaped_keys = keys.replace('\\', "\\\\").replace('"', "\\\"");
-    // Mode "ntx", not "nx": without `t` the keys count as mapping-sourced, so
-    // `q` records nothing and undo is not synced between commands.
-    lua.push_str(&format!(
-        "pcall(function() vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes(\"{escaped_keys}\", true, false, true), \"ntx\", false) end)\n"
-    ));
-    let result_path = std::env::temp_dir().join(format!("vimcode_nvim_probe_{id}.json"));
-    let result_path_str = result_path.to_string_lossy().replace('\\', "/");
-    lua.push_str(&format!(
-        "local buf = vim.api.nvim_buf_get_lines(0, 0, -1, false)\n\
-         local pos = vim.api.nvim_win_get_cursor(0)\n\
-         local rows = vim.api.nvim_win_get_height(0)\n\
-         local result = vim.fn.json_encode({{buf = buf, line = pos[1], col = pos[2] + 1, rows = rows}})\n\
-         local f = io.open(\"{result_path_str}\", \"w\")\n\
-         f:write(result)\n\
-         f:close()\n\
-         vim.cmd(\"qa!\")\n"
-    ));
-    let script_path = std::env::temp_dir().join(format!("vimcode_nvim_probe_{id}.lua"));
-    {
-        let mut f = std::fs::File::create(&script_path).ok()?;
-        f.write_all(lua.as_bytes()).ok()?;
+    nvim.request_pumped(
+        "nvim_exec_lua",
+        vec![Value::from(lua.as_str()), Value::Array(Vec::new())],
+    )?;
+
+    // One key at a time, each waiting for the redraw it caused (#1008). A
+    // single `nvim_feedkeys` burst — even under an attached UI — reproduces
+    // the very bug this transport exists to fix: the whole sequence executes
+    // inside `exec_normal`, which never returns to the main loop, so no redraw
+    // separates the keys and the second `<C-d>` of a chain still inherits an
+    // un-revalidated `w_botline`/`w_empty_rows` from the first.
+    let mut toplines = Vec::new();
+    for key in nvim_key_tokens(keys) {
+        toplines.push(nvim.type_key(&key)?);
     }
-    let _ = std::fs::remove_file(&result_path);
-    let output = std::process::Command::new("nvim")
-        .arg("--headless")
-        .arg("-u")
-        .arg("NONE")
-        .arg("-i")
-        .arg("NONE")
-        .arg("-l")
-        .arg(script_path.to_string_lossy().as_ref())
-        .output()
-        .ok();
-    // Judge the probe by whether it produced a parseable result, not by nvim's
-    // exit status: some keys (`<C-n>` keyword completion, for one) leave nvim
-    // exiting non-zero even though `qa!` ran and the result file is complete.
-    let parsed = match output {
-        Some(o) => {
-            let parsed: Option<NvimResult> = std::fs::read_to_string(&result_path)
-                .ok()
-                .and_then(|json| serde_json::from_str(&json).ok());
-            if parsed.is_none() && !o.status.success() {
-                eprintln!("nvim stderr: {}", String::from_utf8_lossy(&o.stderr));
-            }
-            parsed
+
+    // Read the verdict out over the same channel, from whatever state the
+    // sequence ended in — Insert mode, an unfinished operator, a `:s///c`
+    // confirm prompt.
+    let dump = "local buf = vim.api.nvim_buf_get_lines(0, 0, -1, false)\n\
+                local pos = vim.api.nvim_win_get_cursor(0)\n\
+                local rows = vim.api.nvim_win_get_height(0)\n\
+                return vim.fn.json_encode({buf = buf, line = pos[1], col = pos[2] + 1, rows = rows})";
+    let json = nvim.request_pumped(
+        "nvim_exec_lua",
+        vec![Value::from(dump), Value::Array(Vec::new())],
+    )?;
+    let json = json
+        .as_str()
+        .ok_or_else(|| format!("oracle dump was not a string: {json}"))?;
+    let mut parsed: NvimResult =
+        serde_json::from_str(json).map_err(|e| format!("oracle dump {json:?}: {e}"))?;
+    parsed.toplines = toplines;
+    Ok(parsed)
+}
+
+fn run_in_neovim(
+    lines: &[&str],
+    cursor_line_1: usize,
+    cursor_col_1: usize,
+    keys: &str,
+    setup: &str,
+) -> Option<NvimResult> {
+    match oracle_probe(lines, cursor_line_1, cursor_col_1, keys, setup) {
+        Ok(result) => Some(result),
+        Err(why) => {
+            eprintln!("oracle failed for keys={keys:?}: {why}");
+            None
         }
-        None => None,
-    };
-    let _ = std::fs::remove_file(&script_path);
-    let _ = std::fs::remove_file(&result_path);
-    parsed
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -301,13 +776,31 @@ enum KeyUnit {
     Ctrl(char),
 }
 
-/// Tokenize a key sequence (`<Esc>`, `<CR>`, `<C-x>`, named keys, and literal
-/// characters) into discrete units, without sending them anywhere. Shared by
-/// `send_keys` (single-buffer harness) and `send_keys_multi` (#985 multi-file
-/// harness) so the two harnesses can never drift on what a given `keys`
-/// string means — extracted from the pre-#985 `send_keys` body verbatim.
-fn parse_keys(keys: &str) -> Vec<KeyUnit> {
-    let mut units = Vec::new();
+/// One token of a key sequence, still in **Neovim's** notation.
+///
+/// Deliberately distinct from [`KeyUnit`], which has already been translated
+/// into vimcode's key names (`<Esc>` → `"Escape"`) and so cannot be turned
+/// back into something `nvim_input` understands.
+#[derive(Debug, PartialEq, Eq)]
+enum KeyToken {
+    /// A literal character.
+    Char(char),
+    /// An angle-bracket key, *without* its brackets: `Esc`, `C-d`, `CR`, …
+    Angle(String),
+}
+
+/// Split a Vim-style key sequence into tokens, without sending them anywhere
+/// or renaming anything.
+///
+/// This is the single place the corpus's `keys` strings are given meaning:
+/// [`parse_keys`] maps these onto vimcode key names for the engine side, and
+/// [`nvim_key_tokens`] renders them straight back out for the oracle side, so
+/// the two sides cannot disagree about where one keystroke ends and the next
+/// begins. That matters much more since #1008 than it did before — the oracle
+/// now feeds keys **individually**, so a tokenizer split that differs from
+/// vimcode's would silently compare two different key sequences.
+fn tokenize_keys(keys: &str) -> Vec<KeyToken> {
+    let mut tokens = Vec::new();
     let mut chars = keys.chars().peekable();
     while let Some(ch) = chars.next() {
         if ch == '<' {
@@ -319,29 +812,63 @@ fn parse_keys(keys: &str) -> Vec<KeyUnit> {
                 .unwrap_or(false);
             if has_closing && starts_special {
                 let name: String = chars.by_ref().take_while(|&c| c != '>').collect();
-                units.push(match name.as_str() {
-                    "Esc" => KeyUnit::Special("Escape".to_string()),
-                    "CR" | "Enter" => KeyUnit::Special("Return".to_string()),
-                    "BS" => KeyUnit::Special("BackSpace".to_string()),
-                    "Tab" => KeyUnit::Special("Tab".to_string()),
-                    "Del" | "Delete" => KeyUnit::Special("Delete".to_string()),
-                    "Up" => KeyUnit::Special("Up".to_string()),
-                    "Down" => KeyUnit::Special("Down".to_string()),
-                    "Left" => KeyUnit::Special("Left".to_string()),
-                    "Right" => KeyUnit::Special("Right".to_string()),
-                    "Home" => KeyUnit::Special("Home".to_string()),
-                    "End" => KeyUnit::Special("End".to_string()),
-                    n if n.starts_with("C-") => KeyUnit::Ctrl(n.chars().nth(2).unwrap()),
-                    other => KeyUnit::Special(other.to_string()),
-                });
+                tokens.push(KeyToken::Angle(name));
             } else {
-                units.push(KeyUnit::Char('<'));
+                tokens.push(KeyToken::Char('<'));
             }
         } else {
-            units.push(KeyUnit::Char(ch));
+            tokens.push(KeyToken::Char(ch));
         }
     }
-    units
+    tokens
+}
+
+/// Render each token the way `nvim_input` wants to receive it, one keystroke
+/// per string.
+///
+/// A literal `<` becomes `<lt>`: fed on its own it would otherwise look to
+/// nvim like the start of an unfinished key name and hang the case waiting for
+/// the rest of it. The corpus really does contain bare `<` — `<<` (shift left)
+/// is two of them.
+fn nvim_key_tokens(keys: &str) -> Vec<String> {
+    tokenize_keys(keys)
+        .into_iter()
+        .map(|t| match t {
+            KeyToken::Char('<') => "<lt>".to_string(),
+            KeyToken::Char(c) => c.to_string(),
+            KeyToken::Angle(name) => format!("<{name}>"),
+        })
+        .collect()
+}
+
+/// Tokenize a key sequence (`<Esc>`, `<CR>`, `<C-x>`, named keys, and literal
+/// characters) into discrete units, without sending them anywhere. Shared by
+/// `send_keys` (single-buffer harness) and `send_keys_multi` (#985 multi-file
+/// harness) so the two harnesses can never drift on what a given `keys`
+/// string means — extracted from the pre-#985 `send_keys` body verbatim, and
+/// since #1008 sharing its scanner with the oracle via [`tokenize_keys`].
+fn parse_keys(keys: &str) -> Vec<KeyUnit> {
+    tokenize_keys(keys)
+        .into_iter()
+        .map(|token| match token {
+            KeyToken::Char(c) => KeyUnit::Char(c),
+            KeyToken::Angle(name) => match name.as_str() {
+                "Esc" => KeyUnit::Special("Escape".to_string()),
+                "CR" | "Enter" => KeyUnit::Special("Return".to_string()),
+                "BS" => KeyUnit::Special("BackSpace".to_string()),
+                "Tab" => KeyUnit::Special("Tab".to_string()),
+                "Del" | "Delete" => KeyUnit::Special("Delete".to_string()),
+                "Up" => KeyUnit::Special("Up".to_string()),
+                "Down" => KeyUnit::Special("Down".to_string()),
+                "Left" => KeyUnit::Special("Left".to_string()),
+                "Right" => KeyUnit::Special("Right".to_string()),
+                "Home" => KeyUnit::Special("Home".to_string()),
+                "End" => KeyUnit::Special("End".to_string()),
+                n if n.starts_with("C-") => KeyUnit::Ctrl(n.chars().nth(2).unwrap()),
+                other => KeyUnit::Special(other.to_string()),
+            },
+        })
+        .collect()
 }
 
 /// Parse and send a key sequence to the engine.
@@ -3914,7 +4441,15 @@ const CASES_SCROLL: &[Case] = &[
         "3<C-d><C-u>",
     ),
     c("scroll:3<C-f>", LONG, 1, 1, "3<C-f>"),
+    // #1008: `2<C-b>` is the case the attached-UI oracle was built for. The
+    // second `<C-b>` cannot scroll a whole page (it clamps at the top of the
+    // buffer), which is exactly where "cursor to the last line of the new
+    // window" stops agreeing with "cursor to a fixed offset from the old
+    // window" — see `page_up` in `src/core/engine/motions.rs`. The three
+    // two below pin the clamped form; the unclamped one is `scroll:C-b`
+    // above, which passed before and still does.
     c("scroll:2<C-b>", LONG, 60, 1, "2<C-b>"),
+    c("scroll:3<C-b> clamped at top", LONG, 60, 1, "3<C-b>"),
     c(
         "scroll:z<CR> col first nonblank",
         &["a", "   b", "c"],
@@ -5200,80 +5735,50 @@ const KNOWN_DEVIATIONS: &[&str] = &[
     // matching force-Escape-on-drain to vimcode's own macro playback would
     // "fix" this label by breaking that real, load-bearing behaviour for
     // every other macro that intentionally ends in Insert mode.
-    "mac:\"ay then @a executes text",
     // "ins:BS over indent (nosmarttab)", "ins:Tab at start (nosmarttab)",
     // "num:octal nf=octal 007" and "num:alpha" were moved to HARNESS_LIMITED
     // by #875 and deleted outright by #1002 — the `setup`-is-dropped harness
     // gap they were pinned to is closed and all four pass. (Note "num:octal
     // not default 007" — no `setup`, plain Neovim defaults — was never
     // affected and still passes as `008`.)
-    // ── #805: headless-oracle scroll artifacts ──────────────────────────
+    // ── #805 / #1008: the scroll group is gone, and so is its excuse ────
     //
-    // The `scroll:*` entries from here down to "word:gg indented (sol)" are
-    // NOT vimcode bugs. They share one proximate cause — `nvim --headless -l
-    // script.lua` never attaches a UI, so no redraw ever runs and the
-    // window's scroll bookkeeping (`w_topline` / `w_botline` /
-    // `w_empty_rows`) is never validated between the keystrokes of a single
-    // `nvim_feedkeys()` burst — but it surfaces in **two distinguishable
-    // ways**, and they are listed as two separate groups below because the
-    // first version of this comment (see #805 review) described the second
-    // group wrongly.
+    // Everything between here and the `sub:c` block used to be a long
+    // explanation of why `scroll:*` labels could not pass: `nvim --headless
+    // -l script.lua` attaches no UI, so no redraw runs, so the window's
+    // `w_topline` / `w_botline` / `w_empty_rows` are never re-validated
+    // between the keystrokes of one `nvim_feedkeys()` burst. That was real,
+    // it was measured, and the comment closed by saying the remainder "needs
+    // either a non-headless oracle for window-relative state or explicit
+    // sign-off to close them as a tracked harness limitation".
     //
-    // "Group A" — window-relative *reads* right after any cursor move
-    // (`H`/`M`/`L`/`<C-b>`/`zz`/etc.) — was the other half of this and is
-    // fully excused; its sole surviving case, "scroll:2<C-b>", moved to
-    // HARNESS_LIMITED (#875) along with the measurements backing it. See
-    // that array.
+    // #1008 built the non-headless oracle (see the module docs and
+    // `NvimRpc`), and there is nothing left to list: every `scroll:` case in
+    // the corpus passes, including the four chained sequences #805 measured
+    // (`<C-d><C-d>`, `5<C-d><C-d>`, `<C-d><C-d><C-u>`, `<C-f><C-f>`) and the
+    // `2<C-b>` that outlived them in `HARNESS_LIMITED`.
     //
-    // ── Group B: the 2nd and later scroll command in one burst ──
+    // Two things worth keeping, because they are easy to re-derive wrongly:
     //
-    // A *single* `<C-d>`/`<C-u>`/`<C-f>` conforms, and that is not luck:
-    // these commands move the cursor by exactly as much as they scroll the
-    // window, so a wrong topline cancels out of the cursor result. Hence
-    // `scroll:C-d`, `scroll:C-u`, `scroll:C-f`, `scroll:3<C-f>`,
-    // `scroll:C-d near end`, `scroll:3C-d sets scroll then C-u` etc. all
-    // pass and are *not* listed.
+    //   * The direct engine tests that pinned vimcode to the *interactive*
+    //     column while the oracle was wrong — `test_ctrl_d_chain_*`,
+    //     `test_ctrl_f_chain_*` and now `test_ctrl_b_chain_*` in
+    //     `tests/new_vim_features.rs` — are deliberately **kept**. They are
+    //     what holds the line if the oracle transport ever regresses again,
+    //     and they cost nothing.
     //
-    // What does not survive is the **second and subsequent** such command in
-    // the same `feedkeys()` burst: nvim's `halfpage()`/`onepage()` advance
-    // `w_botline` incrementally from the `w_empty_rows` left over by the
-    // previous command, and with no redraw in between nothing ever
-    // re-validates that, so the scroll loop terminates against stale state.
-    // Measured (60-line buffer, 22-row window, `'scroll'` = 11, start line
-    // 1; final cursor line):
-    //
-    //     keys                headless   interactive   vimcode
-    //     <C-d>                     12            12        12   (passes)
-    //     <C-d><C-d>                22            23        23
-    //     5<C-d><C-d>               10            11        11
-    //     <C-d><C-d><C-u>           11            12        12
-    //     <C-f>                     21            21        21   (passes)
-    //     <C-f><C-f>                19            41        41
-    //
-    // Note `<C-f><C-f>` lands *above* where a single `<C-f>` lands in the
-    // oracle — this is corrupted harness state, not an off-by-one in
-    // vimcode. Direct engine coverage pinning vimcode to the interactive
-    // column for exactly these four sequences lives in
-    // `tests/new_vim_features.rs` (`test_ctrl_d_chain_*`,
-    // `test_ctrl_f_chain_*`).
-    //
-    // RETRACTED: an earlier revision of this comment claimed "`<C-d>`/`<C-u>`
-    // are the outliers that DO force a real topline update". That is wrong.
-    // It explains why an *isolated* `<C-d>` conforms, but it predicts that a
-    // pure `<C-d>` chain would conform too, and the table above shows it
-    // does not.
+    //   * `2<C-b>` turned out **not** to be an oracle artifact at all.
+    //     Headless and interactive Neovim 0.12 agree on it (60-line buffer,
+    //     22-row window, cursor on line 60: both answer 22), and vimcode
+    //     answered 20. It had been excused as a broken oracle for three
+    //     issues. #1008 fixed `page_up` in `src/core/engine/motions.rs`; see
+    //     that function's comment. An excuse that nobody can falsify is how
+    //     that happens, which is the whole argument for owning the oracle.
     //
     // `page_up`/`page_down`/`scroll_cursor_center` in
-    // `src/core/engine/motions.rs` carry the #805 fixes that *were* real
-    // (the 2-line buffer-start/end no-op guards, the post-clamp cursor
-    // formula for `<C-b>`, and the `zz`/`z.` centering off-by-one), each
-    // with a source comment pointing back here.
-    //
-    // Group A and Group B are a partial miss against #805's literal
-    // acceptance bar ("every label above deleted from KNOWN_DEVIATIONS and
-    // passing") — see the #805 PR discussion; the remainder needs either a
-    // non-headless oracle for window-relative state or explicit sign-off to
-    // close them as a tracked harness limitation.
+    // `src/core/engine/motions.rs` also carry the #805 fixes that were always
+    // real (the 2-line buffer-start/end no-op guards and the `zz`/`z.`
+    // centering off-by-one), each with a source comment pointing back here.
     //
     // ── RESOLVED (#1002): the 'startofline' group was never either ──
     //
@@ -5290,6 +5795,17 @@ const KNOWN_DEVIATIONS: &[&str] = &[
     // #1002 wired `setup` through and deleted all four entries. Left as a
     // note, not an excuse: a stale "feature is missing" claim cost a future
     // reader the whole re-derivation once already.
+    //
+    // ── RESOLVED (#1008): "mac:\"ay then @a executes text" ──
+    //
+    // Deleted, and it was never a vimcode bug either. The entry documented a
+    // one-column cursor difference caused by `nvim_feedkeys(.., "ntx")`
+    // sharing Neovim's `exec_normal()` machinery, which force-`<Esc>`s an
+    // unterminated Insert mode once typeahead drains. The note said, in as
+    // many words, that a real interactive session leaves the editor in Insert
+    // mode exactly where vimcode leaves it. #1008's oracle types the keys
+    // through `nvim_input` instead of `feedkeys`, so there is no synthetic
+    // `<Esc>` and the case simply passes.
     //
     // ── #986: v0.11.0 bug suite -- `:s///c` confirm-prompt spec (#801
     // Phase 2 never built). `execute.rs`'s `flags.contains('c')` check
@@ -5317,70 +5833,46 @@ const KNOWN_DEVIATIONS: &[&str] = &[
 // ---------------------------------------------------------------------------
 // HARNESS_LIMITED (#875) — cases this harness cannot faithfully probe.
 //
-// One gap remains, and it is in the *oracle process*, not in this file:
-// `nvim --headless -l` attaches no UI, so window-relative scroll bookkeeping is
-// never revalidated mid-burst and `scroll:2<C-b>` reads a topline no
-// interactive Neovim ever shows. Closing it needs a non-headless oracle.
-// (#875's other gap — `run_in_vimcode` dropping a case's Lua `setup` — was
-// closed by #1002; see the entry-level note below for the four labels that
-// left this array as a result.)
+// **Currently empty, and that is the point.** An entry here is not a claim
+// that vimcode differs from Vim; it is a claim that *this test* cannot tell,
+// because the failure traces to a gap in the harness (`run_in_vimcode` /
+// `oracle_probe`) or to the oracle process itself rather than to `Engine`.
+// Counting those against the "how far from Neovim is vimcode" number would be
+// dishonest bookkeeping, so the runner reports them separately and excludes
+// them from the KNOWN_DEVIATIONS bidirectional gate entirely — they can fail
+// forever without being a regression, and pass without being "a fix landed"
+// that forces an entry deletion.
 //
-// Distinct from KNOWN_DEVIATIONS: an entry here is not a claim that vimcode
-// differs from Vim. It is a claim that *this test* cannot tell — the failure
-// traces to a gap in the harness (`run_in_vimcode` / `run_in_neovim`) or to
-// the oracle process itself, not to `Engine`. Counting these against the
-// "how far from Neovim is vimcode" number would be dishonest bookkeeping, so
-// the runner reports them separately and excludes them from the
-// KNOWN_DEVIATIONS bidirectional gate entirely — they can fail forever
-// without being a regression, and pass without being "a fix landed" that
-// forces an entry deletion.
+// That exemption is exactly why the array has to stay empty unless something
+// genuinely unprobeable turns up. Both gaps it ever held are closed, and
+// **neither turned out to be what its entry said it was**:
 //
-// This array must only ever change for one of two reasons: the harness gap
-// it names gets closed (fix the harness, delete the entry, and the case
-// rejoins the ordinary pass/regress accounting), or a case gets removed from
-// the corpus (delete the stale entry). Like KNOWN_DEVIATIONS, never add an
-// entry to paper over a real regression.
+//   * #1002's gap was real — `run_in_vimcode` dropped a case's Lua `setup`,
+//     so every `cs(..)` case drove vimcode's defaults against a
+//     differently-configured Neovim and could not pass by construction. Four
+//     labels left when `apply_setup` landed ("ins:BS over indent
+//     (nosmarttab)", "ins:Tab at start (nosmarttab)", "num:octal nf=octal
+//     007", "num:alpha").
+//
+//   * #875's gap — "scroll:2<C-b>", excused since #805 as a headless-oracle
+//     artifact — was **not real**. The entry asserted at length, with a
+//     measured table, that headless nvim's topline collapses to the cursor
+//     line so `<C-b>` reads a window position no interactive session shows.
+//     Upstream fixed that in 0.12, and on the pinned oracle headless and
+//     interactive agree: 60-line buffer, 22-row window, cursor on line 60,
+//     `2<C-b>` lands on line 22 in both. vimcode answered 20. The entry had
+//     been excusing a genuine vimcode bug for three issues; #1008 fixed
+//     `page_up` (`src/core/engine/motions.rs`) and the case passes as an
+//     ordinary one.
+//
+// So: an entry here must name a mechanism *and* an experiment that would
+// falsify it, and the array must only ever change because such a gap is
+// closed (fix it, delete the entry, the case rejoins ordinary accounting) or
+// because a case left the corpus. Never add an entry to paper over a failure
+// you have not falsified.
 // ---------------------------------------------------------------------------
 
-const HARNESS_LIMITED: &[&str] = &[
-    // #1002 closed the other gap this array used to cover and deleted its four
-    // entries ("ins:BS over indent (nosmarttab)", "ins:Tab at start
-    // (nosmarttab)", "num:octal nf=octal 007", "num:alpha"). They were excused
-    // because `run_in_vimcode` never read a case's Lua `setup` — only
-    // `run_in_neovim` did — so every `cs(..)` case drove vimcode's defaults
-    // against a differently-configured Neovim and could not pass by
-    // construction. `Settings::smarttab`/`nrformats` landed in #1001 and
-    // `apply_setup` (next to `run_in_vimcode`) now applies the case's `setup`
-    // to the vimcode side, so all four pass as ordinary cases.
-    //
-    // #875 (originally #805): "scroll:2<C-b>" is the sole survivor of the
-    // #805 headless-scroll-artifact group. `nvim --headless -l script.lua`
-    // never attaches a UI, so no redraw ever runs and the window's scroll
-    // bookkeeping (`w_topline` / `w_botline` / `w_empty_rows`) is never
-    // validated between the keystrokes of one `nvim_feedkeys()` burst.
-    // Concretely (60-line buffer, 22-row window, start at line 1) headless
-    // nvim's topline silently collapses to *the cursor's own line* after any
-    // cursor move, so window-relative reads like `<C-b>` behave as if the
-    // window had never scrolled:
-    //
-    //     keys    headless line('w0')    interactive line('w0')
-    //     22j            23  (== cursor)          2
-    //     G              60  (== cursor)         39
-    //     50%            30  (== cursor)          9
-    //
-    // Measured, not assumed: `scripts/nvim_headless_vs_interactive_repro.sh`
-    // runs the same buffer + cursor + keys through headless nvim (exactly as
-    // `run_in_neovim` above does) and through a *real* interactive nvim in a
-    // tmux pane with an 80x24 terminal attached, so the window genuinely
-    // redraws. Both sides report the same window height (22) and the same
-    // `'scroll'` (11), so the comparison is apples-to-apples. vimcode's
-    // value matches the **interactive** column and never the headless one —
-    // "fixing" this would mean deliberately breaking vimcode's real,
-    // correctly-tracked scroll position to imitate a broken oracle. Closing
-    // it for real needs a non-headless oracle for window-relative state,
-    // which is a much bigger piece of work than this issue.
-    "scroll:2<C-b>",
-];
+const HARNESS_LIMITED: &[&str] = &[];
 
 // ---------------------------------------------------------------------------
 // Coverage ratchet (#1007) — what the corpus does NOT reach
@@ -6931,7 +7423,7 @@ fn run_case(case: &Case) -> Outcome {
         _ => "CUR",
     };
     Outcome::Fail(format!(
-        "{} [{}] keys={:?} start={:?}@({},{})\n  buffer: nvim={:?} vimcode={:?}\n  cursor: nvim=({},{}) vimcode=({},{})",
+        "{} [{}] keys={:?} start={:?}@({},{})\n  buffer: nvim={:?} vimcode={:?}\n  cursor: nvim=({},{}) vimcode=({},{})\n  nvim line('w0') after each key: {:?}",
         what,
         case.label,
         case.keys,
@@ -6943,7 +7435,11 @@ fn run_case(case: &Case) -> Outcome {
         nvim.line,
         nvim.col,
         vc_line,
-        vc_col
+        vc_col,
+        // #1008: the post-redraw `w_topline` the oracle saw between
+        // keystrokes. A scroll failure is usually readable straight off this
+        // trace — which key moved the window, and by how much.
+        nvim.toplines,
     ))
 }
 
@@ -8563,5 +9059,89 @@ fn the_real_compatibility_doc_parses_with_no_dropped_rows() {
             commands.iter().any(|c| c.id == *id),
             "stale PROSE_ROWS entry {id:?}"
         );
+    }
+}
+
+/// #1008: prove the oracle is what it claims to be — an **attached UI**, fed
+/// **one key at a time**, re-validating the window between keystrokes.
+///
+/// Every assertion below was red against the `nvim --headless -l script.lua`
+/// oracle this replaced, and for three distinct reasons, so this is not one
+/// fact asserted three ways:
+///
+///   * the per-key `line('w0')` trace did not exist at all — the old oracle
+///     handed nvim the whole sequence in one `nvim_feedkeys()` call and could
+///     not have sampled between keys;
+///   * `<C-d><C-d>` answered 22, because the second `<C-d>` inherited an
+///     un-revalidated `w_botline`/`w_empty_rows` from the first. Real Neovim,
+///     headless or interactive, answers 23;
+///   * the window top moved between the two keystrokes, which is precisely
+///     the state change the old oracle never performed.
+///
+/// Deliberately *not* folded into the `scroll:` corpus: those cases compare
+/// vimcode against the oracle and would stay green if both sides regressed
+/// together. This one pins the oracle's own answer to a number measured from
+/// a real interactive Neovim session
+/// (`scripts/nvim_headless_vs_interactive_repro.sh`).
+#[test]
+fn oracle_revalidates_the_window_between_keystrokes() {
+    let Some(()) = oracle_available_for_unit_test() else {
+        return;
+    };
+
+    let probe = oracle_probe(LONG, 1, 1, "<C-d><C-d>", "").expect("oracle probe failed");
+    assert_eq!(
+        probe.rows, 22,
+        "the attached UI must give the same 22-row window the corpus assumes"
+    );
+    assert_eq!(
+        probe.toplines.len(),
+        2,
+        "one `line('w0')` sample per keystroke — a burst oracle cannot produce this"
+    );
+    assert!(
+        probe.toplines[0] < probe.toplines[1],
+        "the window must move between the two keystrokes, not only after both: {:?}",
+        probe.toplines
+    );
+    assert_eq!(
+        probe.line, 23,
+        "chained <C-d> lands on line 23 in a real Neovim; the headless-burst oracle said 22"
+    );
+
+    // The case that outlived every other #805 excuse, and the reason
+    // `HARNESS_LIMITED` is empty: clamped `<C-b>` lands on the window bottom.
+    let probe = oracle_probe(LONG, 60, 1, "2<C-b>", "").expect("oracle probe failed");
+    assert_eq!(probe.line, 22, "2<C-b> from line 60 lands on line 22");
+    assert_eq!(
+        probe.toplines,
+        vec![39, 1],
+        "the count keystroke leaves the window alone; the <C-b> clamps it to the top"
+    );
+}
+
+/// Shared guard for the unit tests that drive a real oracle: honour the same
+/// version floor and the same explicit opt-out the suite itself does (#865),
+/// rather than inventing a third skip rule.
+fn oracle_available_for_unit_test() -> Option<()> {
+    let version_output = std::process::Command::new("nvim")
+        .arg("--version")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned());
+    let resolved = resolve_on_path("nvim")
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "nvim".to_string());
+    let probe = version_output
+        .as_deref()
+        .map(|out| (resolved.as_str(), out));
+    match preflight(probe, std::env::var_os(ALLOW_SKIP_VAR).is_some()) {
+        Preflight::Run { .. } => Some(()),
+        Preflight::Skip { reason } => {
+            eprintln!("SKIP ({ALLOW_SKIP_VAR} set): {reason}");
+            None
+        }
+        Preflight::Refuse { reason } => panic!("\n\n{reason}\n"),
     }
 }

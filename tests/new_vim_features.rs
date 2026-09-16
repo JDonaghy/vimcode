@@ -193,6 +193,41 @@ fn test_counted_ctrl_d_then_bare_ctrl_d_full_window() {
 }
 
 #[test]
+fn test_ctrl_b_chain_lands_on_the_window_bottom_when_clamped() {
+    // #1008: real Neovim — headless *and* interactive, they agree on 0.12 —
+    // puts `2<C-b>` from line 60 on line 22. The second `<C-b>` cannot scroll
+    // a whole page, so "cursor to the last line of the new window" (what Vim
+    // does) stops agreeing with "cursor to a fixed offset from the old
+    // window" (what `page_up` used to compute, giving 20).
+    let mut e = scroll_fixture();
+    e.view_mut().cursor.line = 59;
+    e.ensure_cursor_visible();
+    ctrl(&mut e, 'b');
+    assert_cursor(&e, 39, 0); // a full page back: unchanged by the fix
+    ctrl(&mut e, 'b');
+    assert_cursor(&e, 21, 0); // clamped at the top; window bottom is line 22
+}
+
+#[test]
+fn test_ctrl_b_keeps_the_cursor_scrolloff_above_the_window_bottom() {
+    // #1008: `<C-b>` lands on the window's last line, so `'scrolloff'` pushes
+    // the cursor *up* from it — the pre-#1008 formula moved it down instead,
+    // which no test and no conformance case exercised. Real Neovim on the
+    // same geometry (`:set so=5`, 60 lines, 22 rows, topline 19) answers 35.
+    let mut e = scroll_fixture();
+    e.settings.scrolloff = 5;
+    // Placed directly rather than via `ensure_cursor_visible`, which has a
+    // separate bug at the buffer end with `'scrolloff'` set (it scrolls past
+    // the last line); that is not what this test is about.
+    e.view_mut().scroll_top = 38;
+    e.view_mut().cursor.line = 59;
+    ctrl(&mut e, 'b');
+    // new topline 19 (0-indexed 18), window bottom line 40, minus scrolloff.
+    assert_eq!(e.view().scroll_top, 18);
+    assert_cursor(&e, 34, 0);
+}
+
+#[test]
 fn test_ctrl_f_chain_pages_forward_twice() {
     // interactive nvim: <C-f><C-f> from line 1 lands on line 41. headless
     // says 19 — i.e. *above* where a single <C-f> (line 21) lands.
