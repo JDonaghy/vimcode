@@ -1187,10 +1187,22 @@ pub(crate) const KNOWN_BUGS: &[&str] = &[
     // reachable via the `DoubleClick` fold above).
     //
     // Defect 1 -- hit-target-moved-out-from-under-the-click: revealing the
-    // menu shifts the hamburger down one screen row, and a second click at
+    // menu shifts the hamburger down one screen row, so a second click at
     // the *same physical position* the first click used (what a user's
-    // muscle memory would reach for) lands in the now-relocated title-bar
-    // band instead and is silently swallowed. See
+    // muscle memory would reach for) no longer lands on the hamburger.
+    // What it lands on instead, confirmed empirically at 80x24 with the
+    // double-click fold disabled (review, fix iteration 2): the hamburger
+    // paints at cell (1.5, 0.5) while hidden and moves to (1.5, 1.5) once
+    // the reveal reserves row 0 -- and row 0 is now the menu bar itself,
+    // whose first item `File` occupies exactly those columns. So the stale
+    // click is NOT silently swallowed by the title-bar band (as an earlier
+    // version of this comment claimed, a claim that only ever held for the
+    // folded `DoubleClick` the test used to accidentally send): it OPENS
+    // THE `File` DROPDOWN. The menu row stays visible *and* an unwanted
+    // `menu-system-dropdown` overlay now covers the activity bar and
+    // swallows the next click too -- so the fix must restore all three
+    // properties the gated body asserts (menu hidden, no dropdown, next
+    // click reaches its target). See
     // `hamburger_stale_click_position_after_reveal_misses_the_shifted_button`'s
     // own doc in `src/tui_main/shell_app.rs`.
     "hamburger_second_click_at_stale_position_does_not_hide_menu_bar::tui", // #988
