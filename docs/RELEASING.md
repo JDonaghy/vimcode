@@ -132,7 +132,7 @@ itself is what you doubt.
 |---|---|---|
 | Linux GTK + TUI | `precision` / `dellserver` | `cargo test` |
 | TUI-only (no-GTK build hygiene) | any | `cargo test --no-default-features` |
-| macOS native (AppKit) | `macmini` (or any Darwin host) | `cargo test --lib --no-default-features --features macos` |
+| macOS native (AppKit) | **CI** (`test-macos` job, #1042) — re-run by hand only to double-check | `cargo test --lib --no-default-features --features macos` |
 | macOS GTK | `macmini` | `cargo test` — **known-red, see §1.3b** |
 | Windows GUI | `dell64` **only** | see §1.4 |
 
@@ -148,7 +148,14 @@ Check the test counts in the output, not just the exit code.
 
 Rough expected magnitudes at 648f2dd (2026-09-14): `cargo test` ≈ 2,855 lib tests
 plus 30+ integration targets; `--no-default-features` ≈ 2,700 lib tests plus the
-same integration targets; the macOS lane, 4 tests.
+same integration targets; the macOS-specific slice within the macOS lane's own
+suite (`macos::mac_driver_tests::*`), 18 tests (was 4 at 648f2dd; grown since via
+#928's `conformance_proof_slice` and later additions). #1042's `test-macos` CI job
+asserts *that* count specifically is non-zero on every run — not just the lane's
+much larger aggregate total, which would stay positive even if the 18 macOS-
+specific tests silently failed to run at all (see §1.3) — instead of a human
+eyeballing it once per release, so treat the job's own output as authoritative
+over this number.
 
 ### 1.1 Linux GTK + TUI — the reference lane
 
@@ -177,17 +184,50 @@ says **nothing** about GTK code; see §1's zero-test warning.
 
 ### 1.3 macOS native (AppKit)
 
+**As of #1042, CI runs this lane on every push/PR** — the `test-macos` job in
+`.github/workflows/ci.yml`, on a `macos-latest` GitHub-hosted runner. Before #1042
+this was a `macmini`-only manual step and `src/macos/` was never compiled anywhere
+in CI; check the job's own run for the actual count rather than trusting a stale
+number here. It also runs `cargo fmt -- --check` and
+`cargo clippy --no-default-features --features macos -- -D warnings`, so a
+macOS-only lint or format issue is now caught without anyone owning a Mac.
+
+You can still run it by hand, e.g. to reproduce a CI failure locally on `macmini`
+or any other Darwin host:
+
 ```bash
-# on macmini, or any Darwin host
 cargo test --lib --no-default-features --features macos
 ```
 
-Expect **4 passed**, sub-second once compiled. The suite is
-`src/macos/mod.rs::mac_driver_tests`, double-gated on `feature = "macos"` **and**
-`target_os = "macos"` — on Linux it is not merely skipped, it does not exist, so
-only a Mach-O host can run it.
+**Correction to this line's old claim ("expect 4 passed, sub-second"): that was
+never accurate for this command.** `--no-default-features --features macos` still
+compiles and runs the *entire portable lib suite* — on Linux, the equivalent
+`--no-default-features` flags produce ~2,845 tests, multiple seconds, not four,
+not sub-second. On a macOS runner that same portable suite runs, **plus** the 18
+macOS-specific cases in `src/macos/mod.rs::mac_driver_tests` (including its
+`conformance_proof_slice` submodule), double-gated on `feature = "macos"` **and**
+`target_os = "macos"` — on Linux those 18 are not merely skipped, they do not
+exist, so only a Mach-O host (or runner) can run them. Because the overall count
+is dominated by the portable suite, "the total went up" is not proof the 18
+macOS-specific tests ran at all — see the CI job's own `test-macos` step, which
+greps the output for `macos::mac_driver_tests::` specifically rather than trusting
+the aggregate `test result:` line, for exactly this reason. Read that job's output
+for the current, authoritative macOS-specific count.
 
-**Known, expected, not a failure:** all four tests print
+The CI job is scoped to `--lib` rather than the full `cargo test`, because
+`tests/nvim_conformance.rs` hard-fails without an installed `nvim` oracle and the
+job installs none — `--lib` runs the unit tests (where `mac_driver_tests` lives)
+without pulling in that integration target.
+
+**What CI still does not cover**, unchanged by #1042: the real `NSMenu` bar (the
+`install_menu_bar` main-thread panic noted just below) and any real
+windowed/interactive smoke. Those stay a `macmini` / Darwin-host manual step —
+see §1.5.
+
+**Known, expected, not a failure:** every one of the 18 `mac_driver_tests` cases
+(`ShellApp::setup` tries to install the native menu bar on every driver
+construction it builds, so this fires once per test in that module — not on the
+thousands of unrelated portable tests the same command also runs) prints
 
 ```
 thread '...' panicked at quadraui/src/macos/backend.rs:652:
@@ -283,7 +323,7 @@ Paste into the `develop` → `main` PR body:
 ## Architecture gate (docs/RELEASING.md §1)
 - [ ] Linux GTK + TUI — `cargo test` on <machine> @ <sha> — <N> passed
 - [ ] TUI-only — `cargo test --no-default-features` @ <sha> — <N> passed
-- [ ] macOS native — `--features macos` on <machine> @ <sha> — 4 passed
+- [ ] macOS native — CI's `test-macos` job @ <sha> (see the run) — <N> passed; confirm the native menu bar by hand (§1.3)
 - [ ] macOS GTK — opt-in; 3 known-red (§1.3b) / not run, because: <reason>
 - [ ] Windows — `cargo check --features win` / built + smoked: <result>
 - [ ] Manual smoke — Linux / macOS / Windows: <what you opened, what you saw>
