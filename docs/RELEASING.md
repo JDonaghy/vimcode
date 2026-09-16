@@ -74,6 +74,36 @@ Measured at d6e0ed3 on `dellserver`: with the real `HOME`, one failure
 passed / gtk 4294 passed across 49 binaries, exit 0**. Drop the `HOME` override
 once #976 lands and the fixtures stop touching the user's config.
 
+**The contamination runs both ways — give the manual smoke (§1.5) its own
+throwaway `HOME` too.** The rule above is usually read as "tests can be poisoned
+by a machine that *has* run the editor". The other direction bites harder: a
+smoke run *is* that poisoning event, so smoking first and testing afterwards on
+the same host makes the gate lie, and smoking under a dirty `HOME` makes the
+*smoke* lie.
+
+```bash
+env HOME=$(mktemp -d) ./target/release/vcd /path/to/fixture   # smoke, isolated
+```
+
+Measured at `ea894db` on `dellserver`, both failure modes in one session:
+
+- **Tests poisoned by a smoke.** A `vcd` smoke ran first, writing
+  `~/.config/vimcode`. The next `cargo test` reported **5 failures** — including
+  `hamburger_relocated_click_after_reveal_hides_menu_bar`, the scenario that
+  release's headline fix had just ungated. Re-run under a clean `HOME`: **4477
+  passed, 0 failed.** CI was green throughout. Read literally, that run said a
+  just-shipped fix was still broken.
+- **Smoke poisoned by a smoke.** Restored session state left a *different*
+  sidebar panel active, which moves every activity-bar row. The hamburger
+  toggle therefore appeared dead at its relocated position — a clean-`HOME`
+  re-run of the identical click sequence toggled it correctly. Read literally,
+  that run said a fixed bug was only half fixed.
+
+Both readings were wrong, in opposite directions, from the same ambient state.
+If a lane disagrees with CI, or a smoke disagrees with a merged fix's own
+black-box test, **suspect `HOME` before you suspect the code** — and say in §1.6
+which `HOME` each result came from.
+
 **The oracle is load-bearing.** `tests/nvim_conformance.rs` hard-fails when `nvim`
 is missing rather than skipping — 1,436 Vim-behaviour cases that did not run are
 not a pass. The fleet standard is the version `NVIM_ORACLE_VERSION` pins in
@@ -232,6 +262,18 @@ you are shipping and confirm it starts, paints a first frame, and takes input:
   native build if you are exercising it, with **the native menu bar** specifically
   (§1.3 — nothing automated covers it)
 - **Windows** — `vcd.exe`, plus `win-smoke-tests.md` if shipping any GUI build
+
+**Run every one of these under a throwaway `HOME`** (`env HOME=$(mktemp -d) ...`),
+for both reasons in §1.0: a smoke inherits whatever session state the last run
+left — restored panels move the activity bar, so a control can look dead when it
+is fine — and the smoke then leaves that state behind for the next `cargo test`
+on the same host. If you smoke a TUI build, `tmux` is the harness: `script -qec`
+gives a pty for output but leaves stdin a pipe, so the TUI's `^[[c` / `^[[6n`
+terminal queries go unanswered and it exits on EOF after a couple of hundred
+bytes. Mouse behaviour can be driven for real by injecting SGR sequences as pane
+input (`tmux send-keys -H`, `\033[<0;COL;ROWM` press / `m` release, `<2;` for the
+right button), which is how the v0.12.0 post-release smoke exercised the explorer
+and the editor scrollbar.
 
 ### 1.6 Record the results
 
