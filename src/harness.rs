@@ -2593,7 +2593,7 @@ mod issue_986_confirm_prompt_never_built {
     /// never accidentally match unrelated painted chrome.
     fn engine_with_multi_match_buffer() -> Engine {
         let mut engine = Engine::new_for_test();
-        engine.settings.use_nerd_fonts = false;
+        engine.settings.use_nerd_fonts = Some(false);
         engine
             .buffer_mut()
             .insert(0, "zqxw986abc zqxw986abc\nzqxw986abc\nxyz zqxw986abc\n");
@@ -2605,7 +2605,7 @@ mod issue_986_confirm_prompt_never_built {
     /// post-substitute report read "3 substitutions on 3 lines", not "4".
     fn engine_with_four_single_match_lines() -> Engine {
         let mut engine = Engine::new_for_test();
-        engine.settings.use_nerd_fonts = false;
+        engine.settings.use_nerd_fonts = Some(false);
         engine
             .buffer_mut()
             .insert(0, "zqxw986abc\nzqxw986abc\nzqxw986abc\nzqxw986abc\n");
