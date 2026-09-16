@@ -1860,6 +1860,193 @@ mod tests {
         );
     }
 
+    // ── #992: file-type icon coverage (.cs via the expanded extension
+    // table) ─────────────────────────────────────────────────────────────
+
+    /// True for a pixel painted near `target` — the identity colour of some
+    /// file type's badge. A *tighter* ±10-per-channel tolerance than
+    /// `is_icon_orange`'s ±25 above: `ICON_BLUE` (#519aba) sits much closer
+    /// than orange does to this theme's ordinary antialiased text-on-dark-
+    /// background fringe colours, so ±25 picked up false "blue" matches on
+    /// tabs with no badge at all (verified by hand: a `.zz` control tab's
+    /// unbadged slot had pixels ±16-24 off ICON_BLUE, all antialiasing
+    /// fringe, while the glyph body itself paints the exact RGB triple with
+    /// no tolerance needed at all). ±10 still comfortably covers the glyph's
+    /// own edge antialiasing without reaching into that fringe.
+    fn pixel_near((r, g, b): (u8, u8, u8), target: (u8, u8, u8)) -> bool {
+        let near = |a: u8, b: u8| (a as i32 - b as i32).abs() <= 10;
+        near(r, target.0) && near(g, target.1) && near(b, target.2)
+    }
+
+    /// Two tabs, backed by the given (equal-length, so their painted slots
+    /// are equal-width) filenames. Mirrors `engine_with_two_rust_tabs` but
+    /// parameterised so the #992 `.cs` coverage tests below can reuse the
+    /// same `tab_zero_left_half` trick for any extension pairing.
+    fn engine_with_two_tabs_named(names: [&str; 2]) -> Engine {
+        let mut engine = Engine::new();
+        let cwd = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        engine.cwd = cwd.clone();
+        for (i, name) in names.iter().enumerate() {
+            if i > 0 {
+                engine.new_tab(None);
+            }
+            let buf = engine.active_buffer_id();
+            if let Some(state) = engine.buffer_manager.get_mut(buf) {
+                state.file_path = Some(cwd.join(name));
+            }
+        }
+        engine
+    }
+
+    /// A `.cs` tab paints its badge in `ICON_BLUE` (C#'s Seti-UI colour),
+    /// and a same-shaped tab with an unrecognised extension does not. The
+    /// two-case comparison is what actually proves "non-generic badge, not
+    /// just some badge": a single render showing a blue-ish pixel somewhere
+    /// could also be an antialiasing fringe of unrelated chrome, and a
+    /// render that only checked "some Nerd Font glyph painted" would have
+    /// passed against the #992 bug report, where `.json` painted a badge
+    /// while `.cs` silently fell through to the generic one because no
+    /// extension-table arm existed for it.
+    ///
+    /// # Why this fails against unfixed `develop`
+    ///
+    /// Before #992 added a `"cs"` arm to `icons::file_icon_color`, `.cs`
+    /// fell through the same `_ => ICON_NEUTRAL` catch-all as the
+    /// unrecognised-extension control case — both tabs would paint
+    /// `ICON_NEUTRAL` (off-white), never `ICON_BLUE`, and the first
+    /// assertion below fails.
+    #[test]
+    fn tab_paints_a_distinct_icon_for_cs_files() {
+        let prev_nf = crate::icons::nerd_fonts_enabled();
+
+        let render_with = |names: [&str; 2]| {
+            let mut engine = engine_with_two_tabs_named(names);
+            engine.settings.use_nerd_fonts = true;
+            crate::icons::set_nerd_fonts(true);
+            let mut h = harness(engine, 1400, 900);
+            tab_zero_left_half(&mut h)
+        };
+
+        // Tab 0 is `.cs` in the first render, an unrecognised extension in
+        // the second — `tab_zero_left_half` always samples tab 0.
+        let (cs_px, _) = render_with(["aaa992.cs", "bbb992.zz"]);
+        let (generic_px, _) = render_with(["ccc992.zz", "ddd992.cs"]);
+
+        crate::icons::set_nerd_fonts(prev_nf);
+
+        assert!(
+            cs_px
+                .iter()
+                .copied()
+                .any(|p| pixel_near(p, crate::icons::ICON_BLUE)),
+            "a .cs tab must paint its blue C# badge inside its own slot; \
+             sampled: {:?}",
+            cs_px
+        );
+        assert!(
+            !generic_px
+                .iter()
+                .copied()
+                .any(|p| pixel_near(p, crate::icons::ICON_BLUE)),
+            "an unrecognised extension must not paint the C# blue badge; \
+             matches: {:?}",
+            generic_px
+                .iter()
+                .copied()
+                .filter(|p| pixel_near(*p, crate::icons::ICON_BLUE))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// A fresh temp dir containing a single file named `file_name`, with an
+    /// `Engine` whose explorer sidebar has revealed it (the default active
+    /// panel is Explorer, per `App::new_headless`/`Engine::new`). Returns
+    /// the engine and the directory (the caller must clean the directory up
+    /// once done with the harness built from it).
+    fn engine_revealing_one_explorer_file(
+        file_name: &str,
+        tag: &str,
+    ) -> (Engine, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_test_992_gtk_explorer_{tag}_{:?}",
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join(file_name);
+        std::fs::write(&file, "marker\n").unwrap();
+
+        let mut engine = Engine::new();
+        engine.cwd = dir.clone();
+        engine.settings.use_nerd_fonts = true;
+        engine.explorer_reveal_path(&file);
+        (engine, dir)
+    }
+
+    /// The explorer-tree counterpart to `tab_paints_a_distinct_icon_for_cs_
+    /// files` above: a `.cs` file's row paints the C# badge glyph, and a
+    /// sibling file with an unrecognised extension does not — rendered in
+    /// **separate** fixtures (one file per render) rather than side by side,
+    /// because `GtkDriver::find_bounds` returns only the *first* match for a
+    /// needle and `FILE_GENERIC`'s glyph is also painted elsewhere in this
+    /// fixture's chrome (verified by hand: it resolves to an unrelated
+    /// widget, not the row under test), so a shared-screen comparison could
+    /// silently pass by matching the wrong occurrence. There is no per-icon
+    /// *colour* to probe here unlike the tab bar: `build_explorer_tree_rows`
+    /// constructs `QIcon::new(glyph, fallback)` with no colour parameter at
+    /// all (unlike `quadraui::TabIcon`), so the glyph identity itself is the
+    /// only thing to assert on — via `find_bounds` locating the raw glyph
+    /// string, the same way `find_bounds("Paste")` locates ordinary text.
+    ///
+    /// # Why this fails against unfixed `develop`
+    ///
+    /// Before #992 added a `"cs"` arm to `icons::file_icon`, `.cs` fell
+    /// through to `FILE_GENERIC` just like the unrecognised-extension
+    /// control case, so `find_bounds(FILE_CSHARP.nerd)` would find nothing
+    /// in the first fixture — the first assertion fails.
+    #[test]
+    fn explorer_tree_paints_a_distinct_icon_for_cs_files() {
+        let prev_nf = crate::icons::nerd_fonts_enabled();
+        crate::icons::set_nerd_fonts(true);
+
+        let (cs_engine, cs_dir) = engine_revealing_one_explorer_file("cs992.cs", "cs");
+        let h_cs = harness(cs_engine, 1400, 900);
+        let cs_glyph = h_cs.driver.find_bounds(crate::icons::FILE_CSHARP.nerd);
+        let _ = std::fs::remove_dir_all(&cs_dir);
+
+        let (generic_engine, generic_dir) =
+            engine_revealing_one_explorer_file("zz992.zqx", "generic");
+        let h_generic = harness(generic_engine, 1400, 900);
+        let generic_has_cs_glyph = h_generic
+            .driver
+            .find_bounds(crate::icons::FILE_CSHARP.nerd)
+            .is_some();
+        let generic_has_generic_glyph = h_generic
+            .driver
+            .find_bounds(crate::icons::FILE_GENERIC.nerd)
+            .is_some();
+        let _ = std::fs::remove_dir_all(&generic_dir);
+
+        crate::icons::set_nerd_fonts(prev_nf);
+
+        assert!(
+            cs_glyph.is_some(),
+            "the cs992.cs file's explorer-tree row must paint the C# badge \
+             glyph somewhere on screen"
+        );
+        assert!(
+            !generic_has_cs_glyph,
+            "an unrecognised-extension file's row must not paint the C# \
+             badge glyph"
+        );
+        assert!(
+            generic_has_generic_glyph,
+            "an unrecognised-extension file's row must still paint the \
+             generic badge (proving the difference above is real, not just \
+             'nothing painted')"
+        );
+    }
+
     /// An engine whose active buffer has a real (multi-component) file path
     /// under `cwd`, so `build_breadcrumbs_for_group` produces one clickable
     /// segment per path component.

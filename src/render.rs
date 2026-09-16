@@ -513,33 +513,35 @@ pub fn build_tab_bar_icons(tabs: &[TabInfo]) -> Vec<Option<quadraui::TabIcon>> {
     tabs.iter()
         .map(|t| {
             // `TabInfo::name` carries a deliberate trailing space (see its
-            // doc); the extension has to be read from the trimmed name.
-            let ext = tab_name_extension(&t.name);
+            // doc); the filename lookup has to read the trimmed name so a
+            // filename-badged file (`Dockerfile`, `.gitignore`, #992) can
+            // still match exactly, not just its (often absent) extension.
+            let name = tab_name_filename(&t.name);
             Some(quadraui::TabIcon {
-                glyph: icons::file_icon(&ext).to_string(),
-                color: tab_icon_color(&ext),
+                glyph: icons::file_icon_for_name(name).to_string(),
+                color: tab_icon_color(name),
             })
         })
         .collect()
 }
 
-/// Extract the lowercase file extension from a [`TabInfo::name`] label.
-/// Scratch/special buffers (`"[Keymaps]"`, `"[No Name]"`) yield `""`, which
-/// [`icons::file_icon`] maps to the generic file glyph — matching VS Code,
-/// which badges untitled editors with a plain file icon rather than nothing.
-fn tab_name_extension(name: &str) -> String {
-    std::path::Path::new(name.trim())
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("")
-        .to_lowercase()
+/// Extract the trimmed base filename from a [`TabInfo::name`] label, for
+/// [`icons::file_icon_for_name`]/[`icons::file_icon_color_for_name`].
+/// Scratch/special buffers (`"[Keymaps]"`, `"[No Name]"`) pass through
+/// unmatched by the filename table and fall back to the (empty) extension
+/// lookup, which [`icons::file_icon`] maps to the generic file glyph —
+/// matching VS Code, which badges untitled editors with a plain file icon
+/// rather than nothing.
+fn tab_name_filename(name: &str) -> &str {
+    name.trim()
 }
 
 /// The language identity colour for a tab icon. Thin adapter over
-/// [`icons::file_icon_color`] so no rendering call site names an RGB literal
-/// (see that function's design note for why this is not a `Theme` token).
-fn tab_icon_color(ext: &str) -> Color {
-    let (r, g, b) = icons::file_icon_color(ext);
+/// [`icons::file_icon_color_for_name`] so no rendering call site names an
+/// RGB literal (see [`icons::file_icon_color`]'s design note for why this is
+/// not a `Theme` token).
+fn tab_icon_color(name: &str) -> Color {
+    let (r, g, b) = icons::file_icon_color_for_name(name);
     Color::from_rgb(r, g, b)
 }
 
@@ -14940,8 +14942,11 @@ fn build_explorer_tree_rows(
                 icons::FOLDER.fallback.to_string(),
             ))
         } else {
-            let ext = row.path.extension().and_then(|e| e.to_str()).unwrap_or("");
-            let glyph = icons::file_icon(ext).to_string();
+            // #992: filename-matched first (`Dockerfile`, `.gitignore`, ...
+            // -- `Path::extension()` is `None` for both a no-dot filename
+            // and a leading-dot dotfile, so an extension-only lookup can
+            // never badge either), falling back to the extension table.
+            let glyph = icons::file_icon_for_name(&row.name).to_string();
             Some(QIcon::new(glyph, ".".to_string()))
         };
 

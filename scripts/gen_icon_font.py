@@ -86,7 +86,7 @@ def nerd_codepoints() -> list[int]:
 # the same mis-parse is mirrored on the Rust side). Update this constant
 # whenever `src/icons.rs` gains or loses an `Icon::new` call whose nerd
 # literal is >= U+E000.
-EXPECTED_NERD_CODEPOINT_COUNT = 62
+EXPECTED_NERD_CODEPOINT_COUNT = 95
 
 
 def _self_check() -> None:
