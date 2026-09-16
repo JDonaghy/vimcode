@@ -791,7 +791,33 @@ pub(super) fn render_all_windows(
     windows: &[RenderedWindow],
     theme: &Theme,
 ) {
-    for window in windows {
+    // #1039: paint the active window *last*.
+    //
+    // `render_window`'s own `frame: Some(_)` branch below already gates
+    // correctly (it only calls `Frame::set_cursor_position` when
+    // `cursor_position_native` is `Some`, and `render::build_rendered_window`
+    // already only ever gives a non-active `RenderedWindow` a `None` cursor)
+    // — but that branch is dead in the live app today: both call sites of
+    // `render_all_windows` (this module's own live path and
+    // `TuiShellApp::render_content`) pass `frame: None`, so real cursor
+    // placement happens entirely through quadraui's `TuiBackend`, which
+    // caches the *last* `Backend::draw_editor` call's `cursor_position` on
+    // itself (`last_cursor_position`) and applies it to the real `Frame`
+    // once `render_content` returns (see this fn's own doc comment for the
+    // #604 handoff). That cache is overwritten unconditionally on *every*
+    // `draw_editor` call — including ones for inactive windows, which
+    // always report `cursor_position: None` — so whichever window happens
+    // to paint last decides the whole frame's caret, active or not. Since
+    // exactly one window is ever active, and only the active one ever
+    // reports a `Bar`/`Underline` position, painting it last guarantees
+    // its position is the one still standing when the frame's done — no
+    // new state, just reordering against data (`is_active`) already on
+    // `RenderedWindow`. The real fix belongs in quadraui (the cache should
+    // not let a `None` clobber a `Some` within one frame); this is the
+    // vimcode-side workaround pending that.
+    let (active, inactive): (Vec<&RenderedWindow>, Vec<&RenderedWindow>) =
+        windows.iter().partition(|w| w.is_active);
+    for window in inactive.into_iter().chain(active) {
         // #550: `window.rect` is already absolute terminal-screen coordinates.
         let win_rect = Rect {
             x: window.rect.x as u16,
