@@ -5648,6 +5648,83 @@ mod tests {
         );
     }
 
+    /// #1000: with `'joinspaces'` on, `J` onto a line whose last non-blank
+    /// char is `.`, `!` or `?` inserts **two** spaces instead of one (`:h
+    /// 'joinspaces'`). The engine-side tests in `engine::tests`
+    /// (`test_joinspaces_on_period_two_spaces` etc.) drive a raw `Engine`
+    /// and poke `engine.settings.joinspaces` directly, asserting on
+    /// `engine.buffer()` — none of them render a frame or exercise the
+    /// `:set`/`SETTING_DEFS` wiring, exactly the gap CLAUDE.md's "Testing
+    /// (CRITICAL)" section calls out (the same gap
+    /// `startofline_setting_moves_the_rendered_cursor_to_first_non_blank_via_shell_app`
+    /// was added to close for the `startofline` option). This types
+    /// `:set joinspaces` through the driver's real command line — not
+    /// `engine.settings` directly — so the `SETTING_DEFS`/`:set` plumbing is
+    /// exercised too, then presses `J` and asserts the *rendered* screen
+    /// shows two spaces.
+    ///
+    /// **Verified RED against unfixed `develop`:** with the `joinspaces`
+    /// field and its `:set` wiring absent, `:set joinspaces` is an unknown
+    /// setting (a no-op error, not a crash) and `J` always inserts exactly
+    /// one space, so the screen painted `ZQXW1000J_A. ZQXW1000J_B` instead
+    /// of `ZQXW1000J_A.  ZQXW1000J_B` — confirmed by hand (temporarily
+    /// forcing `insert_space && false` in place of the `joinspaces &&
+    /// sentence_end` check in `join_lines`) before restoring the fix.
+    #[test]
+    fn joinspaces_setting_makes_j_insert_two_spaces_after_period_via_shell_app() {
+        let mut app = TuiShellApp::new_for_test();
+        assert!(
+            !app.engine.settings.joinspaces,
+            "precondition: joinspaces defaults off"
+        );
+        app.engine
+            .buffer_mut()
+            .insert(0, "ZQXW1000J_A.\nZQXW1000J_B\n");
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        driver.press_named(quadraui::NamedKey::Escape);
+        driver.render();
+
+        driver.type_char('J');
+        driver.render();
+
+        let off_screen = driver.screen();
+        assert!(
+            off_screen.contains("ZQXW1000J_A. ZQXW1000J_B"),
+            "joinspaces off (the default) must insert exactly one space \
+             after the period; screen:\n{off_screen}"
+        );
+        assert!(
+            !off_screen.contains("ZQXW1000J_A.  ZQXW1000J_B"),
+            "joinspaces off must not insert two spaces; screen:\n{off_screen}"
+        );
+
+        // Undo the join, then flip 'joinspaces' on through the real command
+        // line and repeat.
+        driver.type_char('u');
+        driver.render();
+
+        for c in ":set joinspaces".chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
+        driver.render();
+
+        driver.type_char('J');
+        driver.render();
+
+        let on_screen = driver.screen();
+        assert!(
+            on_screen.contains("ZQXW1000J_A.  ZQXW1000J_B"),
+            "with 'joinspaces' on, J onto a line ending in '.' must insert \
+             two spaces; screen:\n{on_screen}"
+        );
+        assert!(
+            !on_screen.contains("ZQXW1000J_A. ZQXW1000J_B"),
+            "with 'joinspaces' on the join must not paint only a single \
+             space; screen:\n{on_screen}"
+        );
+    }
+
     /// #882: `2cc` changes exactly the two lines the count names, not just
     /// the first one. Verified against `nvim --headless -u NONE` (0.12.5) as
     /// the `tests/nvim_conformance.rs` oracle case "op:2cc".
