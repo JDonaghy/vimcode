@@ -12413,6 +12413,140 @@ mod tests {
         );
     }
 
+    /// #1039 fixture: two editor **groups** (`open_editor_group` —
+    /// VSCode-style split panes — not `:split`'s in-tab window split), each
+    /// showing a *different* file. Distinct files (rather than the same
+    /// buffer split two ways, as `app_with_split_shaped_buffer` uses) mean
+    /// each pane's content is unambiguous on screen: a marker typed into
+    /// one pane can never collide with the other pane's own text, so the
+    /// two tests below can locate it with a plain `TuiDriver::find` instead
+    /// of the split-column arithmetic `focus_change_does_not_move_either_
+    /// panes_text_via_shell_app` needs for a same-buffer split.
+    ///
+    /// `open_editor_group` leaves the *new* (right) group focused — callers
+    /// that want the left group active call `Engine::focus_other_group`
+    /// themselves, exactly as a real `<C-w>w` keybinding would.
+    ///
+    /// Returns the temp dir alongside the app so callers can remove it once
+    /// the driver built from the app is done with it.
+    fn app_with_two_file_groups(tag: &str) -> (TuiShellApp, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_test_1039_{tag}_{:?}",
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_left = dir.join("left1039.txt");
+        let file_right = dir.join("right1039.txt");
+        std::fs::write(&file_left, "left file\n").unwrap();
+        std::fs::write(&file_right, "right file\n").unwrap();
+
+        let mut app = TuiShellApp::new(None);
+        app.engine
+            .open_file_with_mode(&file_left, crate::core::engine::OpenMode::Permanent)
+            .unwrap();
+        app.engine.open_editor_group(SplitDirection::Vertical);
+        // `open_editor_group` focuses the new (right) group, so this opens
+        // into the right pane only — the left pane keeps showing file_left.
+        app.engine
+            .open_file_with_mode(&file_right, crate::core::engine::OpenMode::Permanent)
+            .unwrap();
+        (app, dir)
+    }
+
+    /// #1039 acceptance, painted-output tier: with two editor groups open
+    /// and the **left** one focused, insert mode's `Bar` cursor must land
+    /// inside the left pane — not vanish, and not land in the right pane.
+    ///
+    /// Root cause (see the issue): quadraui's `TuiBackend` caches the most
+    /// recent `Backend::draw_editor` call's cursor position on itself and
+    /// applies it to the real `Frame` once the frame's done painting, but
+    /// that cache is overwritten unconditionally on *every* `draw_editor`
+    /// call in the frame — including calls for inactive windows, which
+    /// always report `cursor_position: None`. `render_all_windows` used to
+    /// paint windows in a fixed (layout) order regardless of which one was
+    /// active, so painting the left pane (active here) *before* the right
+    /// pane (inactive) meant the right pane's `None` clobbered the left
+    /// pane's real position last — no caret at all, anywhere.
+    ///
+    /// RED against unfixed develop (confirmed by hand, reverting
+    /// `render_all_windows`'s active-last reordering back to plain
+    /// iteration order): `driver.terminal_cursor_position()` comes back
+    /// `None` instead of `Some(expected)`, because the left pane is
+    /// `window_rects`' first entry and the right pane paints after it.
+    #[test]
+    fn insert_mode_bar_cursor_focuses_left_group_of_split_via_shell_app() {
+        const MARKER: &str = "ZQXW_LEFT_1039";
+
+        let (mut app, dir) = app_with_two_file_groups("left");
+        app.engine.focus_other_group(); // right -> left (only two groups)
+
+        let mut driver = driver_with_shell(app, config(), 160, 30);
+        driver.type_char('i'); // Normal -> Insert, Bar cursor shape.
+        for c in MARKER.chars() {
+            driver.type_char(c);
+        }
+
+        let (marker_x, marker_y) = driver
+            .find(MARKER)
+            .expect("left-group marker should be visible on screen");
+        let marker_col = (marker_x - 0.5).round() as u16;
+        let expected = (
+            marker_col + MARKER.chars().count() as u16,
+            (marker_y - 0.5).round() as u16,
+        );
+
+        assert_eq!(
+            driver.terminal_cursor_position(),
+            Some(expected),
+            "the focused left group's Bar cursor should reach the terminal \
+             frame, not be clobbered by the unfocused right group's paint; \
+             screen:\n{}",
+            driver.screen()
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1039 acceptance, mirror case: same fixture, **right** group
+    /// focused (the default after `open_editor_group`, so no explicit
+    /// focus change needed here) — the caret must land in the right pane.
+    /// Paired with `insert_mode_bar_cursor_focuses_left_group_of_split_
+    /// via_shell_app` above so a fix that just hardcodes "paint window 0
+    /// last" or "first window always wins" can't pass both.
+    #[test]
+    fn insert_mode_bar_cursor_focuses_right_group_of_split_via_shell_app() {
+        const MARKER: &str = "ZQXW_RIGHT_1039";
+
+        let (app, dir) = app_with_two_file_groups("right");
+        // `app_with_two_file_groups` already leaves the right group active.
+
+        let mut driver = driver_with_shell(app, config(), 160, 30);
+        driver.type_char('i');
+        for c in MARKER.chars() {
+            driver.type_char(c);
+        }
+
+        let (marker_x, marker_y) = driver
+            .find(MARKER)
+            .expect("right-group marker should be visible on screen");
+        let marker_col = (marker_x - 0.5).round() as u16;
+        let expected = (
+            marker_col + MARKER.chars().count() as u16,
+            (marker_y - 0.5).round() as u16,
+        );
+
+        assert_eq!(
+            driver.terminal_cursor_position(),
+            Some(expected),
+            "the focused right group's Bar cursor should reach the terminal \
+             frame; screen:\n{}",
+            driver.screen()
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// #603 acceptance: once the command palette is open
     /// (`engine.picker_open`), `Engine::handle_key` resolves it internally
     /// (`keys.rs:152`) — the same "i" + marker keystrokes that insert text
