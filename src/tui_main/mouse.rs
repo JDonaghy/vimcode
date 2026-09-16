@@ -1326,7 +1326,41 @@ pub(super) fn handle_mouse(
                 };
                 let theme = render::Theme::from_name(&engine.settings.colorscheme);
                 let mut tui_backend = super::backend::TuiBackend::default();
-                render::route_explorer_tree_event(
+                // #1025 review: intentional, discussed behavior change —
+                // the pre-fix hand-rolled arithmetic this replaced had an
+                // `else` fallback for a miss (added deliberately in
+                // `19eabbe`): right-clicking empty space below the last row
+                // opened a context menu for the root/`cwd` folder. That
+                // fallback does not survive this fix, and it is not being
+                // silently dropped — it's being called out here.
+                //
+                // `TreeController::right_click` (quadraui
+                // `compose/tree_controller.rs`) resolves a
+                // `TreeViewHit::Empty` — the empty-space case — to
+                // `TreeControllerEvent::Consumed`, not
+                // `ContextMenuRequested`, so `route_explorer_tree_event`
+                // has nothing to turn into an `open_explorer_context_menu`
+                // call; the binding below is genuinely `Consumed` (or
+                // `Ignored`, if the click missed `rect` entirely) in that
+                // case, not a return value being thrown away. GTK's
+                // `explorer_ui_event` (`src/app.rs`) already goes through
+                // this same shared function and never had the fallback
+                // either, so dropping it here makes the two backends match
+                // — consistent with this repo's Platform-Neutrality Rule,
+                // which forbids adding TUI-only geometry/logic to restore
+                // it here. Restoring the old UX (if still wanted) belongs
+                // in quadraui itself — e.g. `right_click` returning a
+                // container-level `ContextMenuRequested` for `Empty` — so
+                // both backends would pick it up identically; that has not
+                // been filed as a quadraui issue yet.
+                //
+                // Right-click no longer needs anything back from this call
+                // (unlike the left-click arm below, which still dispatches
+                // `Row`/`Chevron`/scrollbar-drag results itself) — a
+                // `ContextMenuRequested` is fully resolved inside
+                // `route_explorer_tree_event`, and every other variant is a
+                // no-op for a bare right-click.
+                let _tree_event = render::route_explorer_tree_event(
                     engine,
                     &click_ev,
                     rect,
@@ -1914,6 +1948,20 @@ pub(super) fn handle_mouse(
             };
             let content_start = 1 + input_rows; // header + optional input
 
+            // #1025 review (deliverable 5): checked whether this arm has
+            // the same off-by-one the Explorer right-click arm above had.
+            // It does not. Unlike Explorer, the ext panel has no shared
+            // `route_*_event` geometry function to drift out of sync with
+            // — both this right-click arm and its left-click sibling below
+            // (`sidebar_row >= content_start` again, a few lines down) hand-
+            // roll the identical `sidebar_row`/`content_start` arithmetic
+            // from the *same* `sidebar_row` computed once above, at the top
+            // of this `if` block. There is no second, independently-
+            // computed row index for right-click to disagree with — so
+            // left and right necessarily stay resolved to the same row
+            // here, and #1025's divergence bug does not reproduce in this
+            // arm.
+            //
             // Right-click fires panel_context_menu event.
             // #451: accept Up(Right) too (Alacritty/crossterm-0.28 only sends Up).
             if matches!(
@@ -2980,6 +3028,60 @@ mod tests {
         assert!(
             engine.context_menu.is_some(),
             "right-click in the Explorer panel must still open its context menu"
+        );
+    }
+
+    /// #1025 review: pins an intentional, discussed behavior change.
+    ///
+    /// Pre-fix, this arm hand-rolled its own row arithmetic and had an
+    /// `else` fallback (added deliberately in `19eabbe`) for a miss:
+    /// right-clicking empty space below the last explorer row opened a
+    /// context menu for the root/`cwd` folder. Routing the right-click arm
+    /// through the shared `render::route_explorer_tree_event` — the same
+    /// function the left-click arm and GTK's `explorer_ui_event` already
+    /// use, and which never had this fallback — drops it:
+    /// `TreeController::right_click` resolves a `TreeViewHit::Empty` to
+    /// `TreeControllerEvent::Consumed`, not `ContextMenuRequested`, so
+    /// there is nothing left to turn into an `open_explorer_context_menu`
+    /// call.
+    ///
+    /// This brings TUI in line with GTK (which never had the fallback
+    /// either) and with this repo's Platform-Neutrality Rule, which
+    /// forbids re-adding TUI-only geometry/logic to restore it. See the
+    /// comment at the `mouse.rs` call site for the full rationale and the
+    /// quadraui-side path that *would* restore it for both backends at
+    /// once, if that UX is still wanted.
+    #[test]
+    fn right_click_below_last_explorer_row_is_a_no_op() {
+        let mut engine = Engine::new();
+        engine.focus_sidebar_panel(PANEL_EXPLORER);
+        // `Engine::new()` calls `explorer_rebuild_rows()` internally,
+        // populating `explorer_rows` from this test process's *real* cwd —
+        // an arbitrary, environment-dependent row count. Overwrite (not
+        // push onto) that so the fixture is exactly one row, with rows
+        // 1..10 of the rect below genuinely empty space.
+        engine.explorer_rows = vec![crate::core::engine::ExplorerRow {
+            depth: 0,
+            name: "foo.txt".into(),
+            path: std::path::PathBuf::from("/tmp/foo.txt"),
+            is_dir: false,
+            is_expanded: false,
+        }];
+        assert!(engine.active_panel_is(PANEL_EXPLORER));
+        // Same painted rect as the sanity-counterpart test above: 10 rows
+        // tall, but only one explorer row (index 0) is populated — rows
+        // 1..10 are empty space below the last real row.
+        engine
+            .explorer_tree_rect
+            .set(quadraui::Rect::new(0.0, 0.0, 40.0, 10.0));
+
+        dispatch_right_click(&mut engine, ACTIVITY_BAR_WIDTH + 1, 5);
+
+        assert!(
+            engine.context_menu.is_none(),
+            "right-clicking empty space below the last explorer row must \
+             not open any context menu — the pre-#754 root-folder fallback \
+             was intentionally dropped by #1025's fix, not silently lost"
         );
     }
 
