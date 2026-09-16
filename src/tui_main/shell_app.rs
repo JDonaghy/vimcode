@@ -5052,19 +5052,56 @@ mod tests {
     /// physical position* that worked to reveal the menu — the position a
     /// user's eye and muscle memory would reach for, since nothing about a
     /// click *tells* you the button under it moved — no longer lands on the
-    /// hamburger. It lands in the now-relocated title-bar band instead (the
-    /// activity bar starts one row lower than before), which silently
-    /// swallows the click: no dropdown opens, no modal is left behind
-    /// (confirmed below), the menu row simply stays visible. This
-    /// reproduces the exact reported symptom ("pressing that same button
-    /// again does not hide it") via the row-shift path specifically; the
-    /// sibling test above reproduces the same symptom even when this
-    /// row-shift is accounted for, via a second, independent defect.
+    /// hamburger.
     ///
-    /// **RED against unfixed `develop`:** the final assertion (`File` no
-    /// longer painted) fails — the menu row is still visible after the
-    /// stale-position second click. Gated via [`crate::harness::known_bug_gate`]
-    /// so the suite stays green while this is documented as test-only.
+    /// # What the stale click actually resolves to (the issue's acceptance ask)
+    ///
+    /// Confirmed empirically by probing the painted frame at this exact
+    /// geometry, **with the double-click fold disabled** (see below) so the
+    /// click takes the same `ShellAdapter` path a real user's second click
+    /// takes. At 80x24 the hamburger paints at cell `(1.5, 0.5)` with the
+    /// menu hidden and moves to `(1.5, 1.5)` once the reveal reserves row 0.
+    /// The stale click therefore lands on row 0 — and row 0 is now the menu
+    /// bar, whose first item `File` occupies exactly those columns
+    /// (` File  Edit  View  Go  …`). So the second click does **not** hit
+    /// the activity bar at all, and is **not** silently swallowed: it
+    /// **opens the `File` dropdown**, painting a `New Tab / Open File… /
+    /// Quit` overlay over the top-left of the screen.
+    ///
+    /// That makes the user-visible symptom strictly worse than "the button
+    /// didn't work": the menu row stays visible *and* an unwanted dropdown
+    /// is now covering the activity bar, swallowing the next click too. The
+    /// gated body below asserts all three post-fix properties together —
+    /// menu row hidden, no `File` dropdown, and a following click on an
+    /// unrelated icon still reaching its own target (the issue's
+    /// deliverable 2) — because today the stale click breaks all three.
+    ///
+    /// (An earlier version of this doc comment claimed the click "lands in
+    /// the now-relocated title-bar band … which silently swallows the click:
+    /// no dropdown opens, no modal is left behind". That was wrong on both
+    /// counts, and was only ever consistent with the *folded* `DoubleClick`
+    /// this test used to accidentally send — see below.)
+    ///
+    /// # Why the fold has to be disabled here
+    ///
+    /// This scenario's two clicks are at the *identical* coordinate, so with
+    /// folding left on they collapse into one `UiEvent::DoubleClick` with
+    /// certainty (distance 0, inside `DoubleClickDetector`'s 1.5-cell radius
+    /// and 400ms window). A folded `DoubleClick` bypasses `ShellAdapter`'s
+    /// semantic `AppShellEvent` dispatch and falls through to
+    /// `TuiShellApp::handle`'s legacy `MouseDown | … | DoubleClick` arm into
+    /// `mouse::handle_mouse` — a different code path from the one a real
+    /// second click takes, and the reason the old mechanism write-up above
+    /// was wrong. [`quadraui::tui::testing::TuiDriver::set_double_click_folding`]
+    /// is what stops that.
+    ///
+    /// **RED against unfixed `develop`:** confirmed by running this
+    /// scenario's gated body with `KNOWN_BUGS` temporarily emptied — the
+    /// first assertion in the gate (`File` no longer painted) fails, and the
+    /// two that follow it would fail too; the menu row is still visible and
+    /// the `File` dropdown is open after the stale-position second click.
+    /// Gated via [`crate::harness::known_bug_gate`] so the suite stays green
+    /// while this is documented as test-only.
     #[test]
     fn hamburger_stale_click_position_after_reveal_misses_the_shifted_button() {
         let mut driver = driver_with_shell(
@@ -5073,8 +5110,23 @@ mod tests {
             80,
             24,
         );
+        // Real, independent clicks. This matters far more here than in the
+        // sibling test: this scenario's two clicks are at the *identical*
+        // coordinate, so without this they fold into a single
+        // `UiEvent::DoubleClick` with certainty (distance 0, well inside
+        // `DoubleClickDetector`'s 1.5-cell radius and 400ms window) and the
+        // second click would take the legacy `mouse::handle_mouse` path
+        // instead of the `ShellAdapter` semantic dispatch a real user's
+        // second click takes. See this test's doc comment.
+        driver.set_double_click_folding(false);
         driver.dispatch(quadraui::UiEvent::WindowFocused(true));
         driver.render();
+
+        assert!(
+            !driver.screen_contains("File"),
+            "precondition: menu bar starts hidden; screen:\n{}",
+            driver.screen()
+        );
 
         let hamburger = crate::icons::HAMBURGER.s();
         let (hx1, hy1) = driver
@@ -5087,6 +5139,19 @@ mod tests {
             driver.screen_contains("File"),
             "first hamburger click must reveal the menu row; screen:\n{}",
             driver.screen()
+        );
+
+        // Sanity: the reveal really did shift the hamburger off `(hx1, hy1)`,
+        // or "stale position" is a meaningless label for the click below.
+        let (hx2, hy2) = driver
+            .find(hamburger)
+            .expect("hamburger icon must still paint with the menu bar open");
+        assert_ne!(
+            (hx1, hy1),
+            (hx2, hy2),
+            "sanity: revealing the menu bar must shift the hamburger's own \
+             row, or this test isn't exercising the row-shift this issue is \
+             about"
         );
 
         crate::harness::known_bug_gate(
@@ -5105,27 +5170,45 @@ mod tests {
                      screen:\n{}",
                     driver.screen()
                 );
-            },
-        );
 
-        // Deliverable 2, restated for this scenario: the stale click must
-        // not have opened (and left stuck) a menu dropdown either — a
-        // subsequent click on an unrelated icon must still reach its own
-        // normal target.
-        let search = crate::icons::SEARCH.s();
-        let (sx, sy) = driver
-            .find(search)
-            .expect("search icon must paint on the activity bar");
-        driver.click(sx, sy);
-        driver.dispatch(quadraui::UiEvent::WindowFocused(true));
-        driver.render();
-        assert!(
-            driver.screen_contains("Replace…"),
-            "a click on the Search icon after the stale hamburger click \
-             above must still open the Search panel — a stuck \
-             `menu-system-dropdown` modal would swallow this click instead; \
-             screen:\n{}",
-            driver.screen()
+                // Deliverable 2, restated for this scenario, and asserted
+                // *inside* the gate because today the stale click actively
+                // breaks it: the click lands on the menu bar's `File` item
+                // (see this test's doc comment) and opens its dropdown,
+                // which then covers the activity bar. Post-fix, the click
+                // belongs to the hamburger and no dropdown may appear.
+                assert!(
+                    !driver.screen_contains("New Tab"),
+                    "the stale second click must not open the `File` \
+                     dropdown — post-fix it belongs to the hamburger, and a \
+                     stuck `menu-system-dropdown` overlay would swallow \
+                     later input; screen:\n{}",
+                    driver.screen()
+                );
+
+                // …and behaviourally: a following click on an unrelated
+                // activity-bar icon must still reach its own normal target.
+                // Located from the painted frame, never a stored coordinate.
+                let search = crate::icons::SEARCH.s();
+                let (sx, sy) = driver.find(search).unwrap_or_else(|| {
+                    panic!(
+                        "search icon must still paint on the activity bar \
+                         after the stale hamburger click — an overlay \
+                         covering it is itself the #988 symptom; screen:\n{}",
+                        driver.screen()
+                    )
+                });
+                driver.click(sx, sy);
+                driver.dispatch(quadraui::UiEvent::WindowFocused(true));
+                driver.render();
+                assert!(
+                    driver.screen_contains("Replace…"),
+                    "a click on the Search icon after the stale hamburger \
+                     click above must still open the Search panel; \
+                     screen:\n{}",
+                    driver.screen()
+                );
+            },
         );
     }
 
