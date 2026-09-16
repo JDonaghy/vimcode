@@ -814,7 +814,15 @@ pub(super) fn render_all_windows(
     // new state, just reordering against data (`is_active`) already on
     // `RenderedWindow`. The real fix belongs in quadraui (the cache should
     // not let a `None` clobber a `Some` within one frame); this is the
-    // vimcode-side workaround pending that.
+    // vimcode-side workaround pending that. That gap is drafted, ready to
+    // file, in `docs/PENDING_QUADRAUI_ISSUES.md` ("`TuiBackend` lets a
+    // `None` cursor_position clobber a `Some` within one frame", blocks
+    // vimcode#1039); it is not filed yet because filing GitHub issues is a
+    // coordinator/human action this worker session cannot perform
+    // (`git`-only). Once that lands upstream, this partition-and-reorder
+    // becomes redundant (order stops mattering) and can be deleted as a
+    // deliberate follow-up — don't assume it's still needed without
+    // rechecking.
     let (active, inactive): (Vec<&RenderedWindow>, Vec<&RenderedWindow>) =
         windows.iter().partition(|w| w.is_active);
     for window in inactive.into_iter().chain(active) {
