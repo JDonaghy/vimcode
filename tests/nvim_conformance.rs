@@ -13,8 +13,12 @@
 //! (or `cs(..)` when the case needs Lua `setup` to pin a Vim-vs-Neovim option
 //! default such as `startofline`, `joinspaces`, `nrformats` or `smarttab` —
 //! without that you cannot distinguish "vimcode differs from Vim" from "Neovim
-//! differs from Vim").  The arrays are per-area purely for editability; the
-//! runner flattens them.
+//! differs from Vim").  A `cs(..)` case's `setup` is applied to **both** sides
+//! — spliced into the oracle's Lua by `run_in_neovim` and mapped onto
+//! `Settings` by `apply_setup` for `run_in_vimcode` — so naming an option
+//! `apply_setup` has no mapping for fails loudly rather than quietly running
+//! vimcode at its defaults (#1002).  The arrays are per-area purely for
+//! editability; the runner flattens them.
 //!
 //! ## `KNOWN_DEVIATIONS` (#799)
 //!
@@ -46,9 +50,10 @@
 //! cannot faithfully probe — a harness gap or a broken headless oracle, not a
 //! vimcode bug. These are reported but never enter the bidirectional gate: they
 //! can fail forever without being a regression, and cannot force an entry
-//! deletion by passing. See the array's own doc comment for the two harness
-//! gaps it currently covers (`run_in_vimcode` dropping a case's `setup`, and
-//! the headless-scroll artifact).
+//! deletion by passing. See the array's own doc comment for the single harness
+//! gap it still covers — the headless-scroll artifact. (Its other gap,
+//! `run_in_vimcode` dropping a case's `setup`, was closed by #1002; see
+//! `apply_setup`.)
 //!
 //! ## Debugging a single area
 //!
@@ -148,7 +153,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use vimcode_core::core::OpenMode;
-use vimcode_core::{Engine, EngineAction};
+use vimcode_core::{Engine, EngineAction, Settings};
 
 #[derive(Deserialize)]
 struct NvimResult {
@@ -351,18 +356,119 @@ fn send_keys(engine: &mut Engine, keys: &str) {
     }
 }
 
+/// Strip one layer of matching Lua string quotes, if present.
+fn unquote_lua(value: &str) -> Option<&str> {
+    for q in ['"', '\''] {
+        if let Some(inner) = value.strip_prefix(q) {
+            return inner.strip_suffix(q);
+        }
+    }
+    Some(value)
+}
+
+fn parse_lua_bool(name: &str, value: &str) -> Result<bool, String> {
+    match value {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        other => Err(format!(
+            "'{name}' expects a Lua boolean, got {other:?} — extend apply_setup if a \
+             non-boolean form is now needed"
+        )),
+    }
+}
+
+/// Apply a conformance case's Lua `setup` snippet to vimcode's [`Settings`]
+/// (#1002).
+///
+/// Before #1002 `run_in_vimcode` took no `setup` at all, so every `cs(..)` case
+/// drove a *configured* Neovim against a *default* vimcode — not a Vim-compat
+/// comparison but a comparison of two differently-configured editors. That one
+/// gap accounted for nine excused labels.
+///
+/// **No Lua interpreter is involved, and none must be introduced.** The corpus
+/// uses exactly one narrow statement form — `vim.o.<name>=<value>`, one per
+/// line — so this parses that form directly and maps each option onto its
+/// `Settings` field.
+///
+/// Anything unrecognised or unparseable is an `Err`, never a silent fallback to
+/// defaults: that silent fallback *is* the bug #1002 fixed, and re-introducing
+/// it in the error path would hide the next instance. Adding a `cs(..)` case
+/// that names an option not handled here is therefore a loud failure telling
+/// you to extend this function.
+fn apply_setup(settings: &mut Settings, setup: &str) -> Result<(), String> {
+    for raw in setup.lines() {
+        let stmt = raw.trim();
+        if stmt.is_empty() {
+            continue;
+        }
+        let body = stmt.strip_prefix("vim.o.").ok_or_else(|| {
+            format!("unsupported setup statement {stmt:?} — only `vim.o.<name>=<value>` is parsed")
+        })?;
+        let (name, value) = body.split_once('=').ok_or_else(|| {
+            format!("unparseable setup statement {stmt:?} — expected `name=value`")
+        })?;
+        let name = name.trim();
+        let raw_value = value.trim();
+        let value = unquote_lua(raw_value)
+            .ok_or_else(|| format!("unterminated string in setup statement {stmt:?}"))?;
+        match name {
+            "autoindent" | "ai" => settings.auto_indent = parse_lua_bool(name, value)?,
+            "startofline" | "sol" => settings.startofline = parse_lua_bool(name, value)?,
+            "joinspaces" | "js" => settings.joinspaces = parse_lua_bool(name, value)?,
+            "smarttab" | "sta" => settings.smarttab = parse_lua_bool(name, value)?,
+            "nrformats" | "nf" => {
+                settings.nrformats = value
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+            }
+            // 'completeopt' has no vimcode counterpart and deliberately maps to
+            // nothing: vimcode's `<C-n>`/`<C-p>` insert the match inline with no
+            // popup menu, which is exactly what `completeopt=""` makes Neovim do.
+            // The empty value is therefore a *recognised* no-op, not a skip —
+            // and only the empty value, since any non-empty `completeopt`
+            // (`menuone`, `noselect`, …) genuinely changes Neovim's behaviour
+            // and would need real handling here.
+            "completeopt" | "cot" if value.is_empty() => {}
+            "completeopt" | "cot" => {
+                return Err(format!(
+                    "'completeopt' is only handled as the empty string (vimcode has no popup \
+                     menu); {raw_value:?} would change the oracle's behaviour and needs real \
+                     handling in apply_setup"
+                ));
+            }
+            other => {
+                return Err(format!(
+                    "no vimcode Settings mapping for option '{other}' (from {stmt:?}) — add one \
+                     to apply_setup rather than letting the case run with vimcode defaults"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn run_in_vimcode(
+    label: &str,
     lines: &[&str],
     cursor_line_1: usize,
     cursor_col_1: usize,
     keys: &str,
     rows: usize,
+    setup: &str,
 ) -> (String, usize, usize) {
     let text = lines.join("\n");
     let mut engine = engine_with(&text);
     engine.settings.shift_width = 4;
     engine.settings.expand_tab = true;
     engine.settings.tabstop = 4;
+    // The case's own `setup` goes on last so it overrides those three shared
+    // defaults, mirroring `run_in_neovim`, which likewise splices `setup` in
+    // after its `shiftwidth`/`expandtab`/`tabstop` preamble.
+    if let Err(why) = apply_setup(&mut engine.settings, setup) {
+        panic!("conformance case {label:?}: bad `setup` — {why}");
+    }
     // Screen-relative motions (H/M/L, <C-d>, zt) are meaningless unless both
     // sides agree on the window height, so mirror nvim's.
     engine.set_viewport_lines(rows);
@@ -4559,29 +4665,15 @@ const CATEGORIES: &[(&str, &[Case])] = &[
 // ---------------------------------------------------------------------------
 
 const KNOWN_DEVIATIONS: &[&str] = &[
-    // #880: `run_in_vimcode` never reads a case's Lua `setup` (see
-    // `HARNESS_LIMITED`/#875 below) — this case's `setup` turns on
-    // `vim.o.joinspaces` on the Neovim oracle side only, so vimcode always
-    // runs with `joinspaces` at its default (off) regardless of whether the
-    // engine implements the option. It cannot pass by construction until
-    // `setup` is wired through `run_in_vimcode`. The other three "op:J"
-    // labels this issue owned (next starts with `)`, next blank, current
-    // ends with space) are fixed and deleted from this list.
-    "op:J after period (vim joinspaces)",
-    // #883: this is a `cs(..)` case pinning `vim.o.startofline = true` on the
-    // Neovim oracle side. `run_in_vimcode` never reads a case's `setup` (see
-    // the `HARNESS_LIMITED` doc comment below and #875) — the vimcode side
-    // always runs with `startofline` at its default (off), so this case
-    // drives the *same* keys against a Neovim configured differently than
-    // vimcode is. It cannot pass by construction regardless of vimcode's
-    // 'startofline' support, which `indent_lines`/`dedent_lines` do
-    // correctly implement now (verified directly against a real Neovim, not
-    // through this harness: `nvim --headless` with `startofline` on lands
-    // `>>`/`<<` on the first non-blank, matching vimcode). Left here rather
-    // than moved to `HARNESS_LIMITED` — that reclassification is judged out
-    // of scope for this label; a future pass wiring `setup` through
-    // `run_in_vimcode` should move it there or delete it outright.
-    "op:>> cursor sol",
+    // #1002 deleted the six `setup`-dependent entries that used to head this
+    // list ("op:J after period (vim joinspaces)", "op:>> cursor sol",
+    // "scroll:C-d col sol", "word:gg indented (sol)", "word:G indented (sol)",
+    // "word:5G then j col (sol)"). None was ever a vimcode deviation: they were
+    // excused because `run_in_vimcode` took no `setup` parameter at all, so
+    // every `cs(..)` case drove a *configured* Neovim against a *default*
+    // vimcode. With `setup` wired through (`apply_setup`, next to
+    // `run_in_vimcode`), all six pass.
+    //
     // Remaining `dot:` deviations: each fails for a reason outside `.` itself
     // -- linewise-`p` cursor placement (see "op:p linewise cursor first
     // nonblank"), past-eol cursor clamping on entering insert, and `2>>`
@@ -4627,14 +4719,12 @@ const KNOWN_DEVIATIONS: &[&str] = &[
     // every other macro that intentionally ends in Insert mode.
     "mac:\"ay then @a executes text",
     "search:/\\(foo\\)\\1",
-    // "ins:BS over indent (nosmarttab)" and "ins:Tab at start (nosmarttab)"
-    // moved to HARNESS_LIMITED (#875) — the harness gap they were pinned to,
-    // not vimcode's Vim-compat, is the reason they fail. See that array.
-    // "num:octal nf=octal 007" and "num:alpha" moved to HARNESS_LIMITED
-    // (#875) — same `setup`-is-dropped harness gap as the `nosmarttab` pair
-    // above. See that array. (Note "num:octal not default 007" — no
-    // `setup`, plain Neovim defaults — is unaffected and still passes as
-    // `008`; only the two `setup`-dependent cases are excused.)
+    // "ins:BS over indent (nosmarttab)", "ins:Tab at start (nosmarttab)",
+    // "num:octal nf=octal 007" and "num:alpha" were moved to HARNESS_LIMITED
+    // by #875 and deleted outright by #1002 — the `setup`-is-dropped harness
+    // gap they were pinned to is closed and all four pass. (Note "num:octal
+    // not default 007" — no `setup`, plain Neovim defaults — was never
+    // affected and still passes as `008`.)
     // ── #805: headless-oracle scroll artifacts ──────────────────────────
     //
     // The `scroll:*` entries from here down to "word:gg indented (sol)" are
@@ -4703,17 +4793,22 @@ const KNOWN_DEVIATIONS: &[&str] = &[
     // non-headless oracle for window-relative state or explicit sign-off to
     // close them as a tracked harness limitation.
     //
-    // ── Not a harness artifact: 'startofline' ──
+    // ── RESOLVED (#1002): the 'startofline' group was never either ──
     //
-    // Separate, genuine root cause: vimcode doesn't implement Vim's
-    // 'startofline' option at all, so `<C-d>` never moves the cursor to the
-    // first non-blank column the way this case's `vim.o.startofline=true`
-    // setup expects — confirmed against real interactive Neovim too. Out of
-    // scope for #805; file a follow-up if 'startofline' support is wanted.
-    "scroll:C-d col sol",
-    "word:gg indented (sol)",
-    "word:G indented (sol)",
-    "word:5G then j col (sol)",
+    // An earlier revision of this comment claimed, above "scroll:C-d col sol"
+    // and the three "word:...(sol)" labels, that they had a "separate, genuine
+    // root cause: vimcode doesn't implement Vim's 'startofline' option at
+    // all". That was wrong by the time it was read: `Settings::startofline`
+    // landed in #876 and is honoured by `land_line_jump_cursor` /
+    // `land_vertical_scroll_cursor` (`src/core/engine/motions.rs`), with the
+    // `gg`/`G` call sites in `src/core/engine/keys.rs` — which is why the
+    // `(nosol)` twin of every one of those cases already passed. The real and
+    // only cause was that `run_in_vimcode` dropped the case's `setup`, so the
+    // vimcode side ran with `startofline` off no matter what the option did.
+    // #1002 wired `setup` through and deleted all four entries. Left as a
+    // note, not an excuse: a stale "feature is missing" claim cost a future
+    // reader the whole re-derivation once already.
+    //
     // ── #986: v0.11.0 bug suite -- `:s///c` confirm-prompt spec (#801
     // Phase 2 never built). `execute.rs`'s `flags.contains('c')` check
     // always errors loudly instead of entering a confirm loop, so the
@@ -4740,6 +4835,14 @@ const KNOWN_DEVIATIONS: &[&str] = &[
 // ---------------------------------------------------------------------------
 // HARNESS_LIMITED (#875) — cases this harness cannot faithfully probe.
 //
+// One gap remains, and it is in the *oracle process*, not in this file:
+// `nvim --headless -l` attaches no UI, so window-relative scroll bookkeeping is
+// never revalidated mid-burst and `scroll:2<C-b>` reads a topline no
+// interactive Neovim ever shows. Closing it needs a non-headless oracle.
+// (#875's other gap — `run_in_vimcode` dropping a case's Lua `setup` — was
+// closed by #1002; see the entry-level note below for the four labels that
+// left this array as a result.)
+//
 // Distinct from KNOWN_DEVIATIONS: an entry here is not a claim that vimcode
 // differs from Vim. It is a claim that *this test* cannot tell — the failure
 // traces to a gap in the harness (`run_in_vimcode` / `run_in_neovim`) or to
@@ -4758,30 +4861,16 @@ const KNOWN_DEVIATIONS: &[&str] = &[
 // ---------------------------------------------------------------------------
 
 const HARNESS_LIMITED: &[&str] = &[
-    // #875: `run_in_vimcode` never reads a case's Lua `setup` — only
-    // `run_in_neovim` (the oracle side) does. A `cs(..)` case exists
-    // specifically to pin a Vim-vs-Neovim option default that differs from
-    // vimcode's hardcoded behaviour, so any such case drives the *same*
-    // vimcode keys against a Neovim configured differently than vimcode is.
-    // It cannot pass by construction, regardless of vimcode's correctness.
+    // #1002 closed the other gap this array used to cover and deleted its four
+    // entries ("ins:BS over indent (nosmarttab)", "ins:Tab at start
+    // (nosmarttab)", "num:octal nf=octal 007", "num:alpha"). They were excused
+    // because `run_in_vimcode` never read a case's Lua `setup` — only
+    // `run_in_neovim` did — so every `cs(..)` case drove vimcode's defaults
+    // against a differently-configured Neovim and could not pass by
+    // construction. `Settings::smarttab`/`nrformats` landed in #1001 and
+    // `apply_setup` (next to `run_in_vimcode`) now applies the case's `setup`
+    // to the vimcode side, so all four pass as ordinary cases.
     //
-    // "ins:BS over indent (nosmarttab)" / "ins:Tab at start (nosmarttab)":
-    // vimcode has no 'smarttab' setting; it always behaves as Vim's actual
-    // default (smarttab **on**), matching the "(nvim smarttab)" sibling case
-    // and never "(nosmarttab)". Implementing a real 'smarttab' toggle nobody
-    // has asked for is not worth doing just to chase this pair to zero — if
-    // vimcode ever grows one, wire `setup` through `run_in_vimcode` and move
-    // these back to ordinary cases (deleting the entries here).
-    "ins:BS over indent (nosmarttab)",
-    "ins:Tab at start (nosmarttab)",
-    // "num:octal nf=octal 007" / "num:alpha": same shape, for 'nrformats'.
-    // VimCode pins Neovim's default, `bin,hex` (see `NrFormats::default()`
-    // in `src/core/engine/motions.rs`) — note Vim's own default additionally
-    // includes `octal`, which is why "num:octal not default 007" (no
-    // `setup`, so plain Neovim defaults) passes as `008` while this one
-    // wants the `setup`-pinned octal `010`. Same resolution path as above.
-    "num:octal nf=octal 007",
-    "num:alpha",
     // #875 (originally #805): "scroll:2<C-b>" is the sole survivor of the
     // #805 headless-scroll-artifact group. `nvim --headless -l script.lua`
     // never attaches a UI, so no redraw ever runs and the window's scroll
@@ -4862,11 +4951,13 @@ fn run_case(case: &Case) -> Outcome {
         None => return Outcome::NvimBroke,
     };
     let (vc_buf, vc_line, vc_col) = run_in_vimcode(
+        case.label,
         case.lines,
         case.cursor_line,
         case.cursor_col,
         case.keys,
         nvim.rows,
+        case.setup,
     );
     let nvim_buf = nvim.buf.join("\n");
     let buf_match = vc_buf.trim_end_matches('\n') == nvim_buf.trim_end_matches('\n');
@@ -5693,6 +5784,138 @@ fn nvim_conformance_jumplist_multi_file() {
         ));
     }
     panic!("\n\n{}\n", problems.join("\n\n"));
+}
+
+// ---------------------------------------------------------------------------
+// #1002: `setup` must actually reach the vimcode side.
+//
+// These need no nvim — they drive `run_in_vimcode` directly, which is the
+// function that used to drop `setup` entirely. Each one is written so that
+// *deleting the `apply_setup` call* makes it fail: the "with setup" and
+// "without setup" arms of every pair assert different results, so a refactor
+// that silently reverts to defaults collapses the pair and the test goes red.
+// A test that passes whether or not `setup` is wired would be worthless here —
+// that is exactly the shape of the bug being guarded against.
+// ---------------------------------------------------------------------------
+
+/// Probe the vimcode side the way a `cs(..)` case does, with and without the
+/// option, and return `(cursor_line, cursor_col)` for each.
+fn sol_probe(setup: &str) -> (usize, usize) {
+    let (_, line, col) = run_in_vimcode(
+        "self-test:setup probe",
+        &["a", "    b"],
+        1,
+        1,
+        "G",
+        24,
+        setup,
+    );
+    (line, col)
+}
+
+/// `'startofline'` changes where `G` lands: on with it, the first non-blank
+/// column; off, the column is kept. If `setup` is dropped, both arms return the
+/// default (off) answer and the inequality assert below fails.
+#[test]
+fn case_setup_reaches_the_vimcode_side() {
+    let with_sol = sol_probe("vim.o.startofline=true");
+    let without_sol = sol_probe("");
+    assert_ne!(
+        with_sol, without_sol,
+        "`setup` is being dropped on the vimcode side again (#1002): `G` landed at \
+         {with_sol:?} both with and without `vim.o.startofline=true`"
+    );
+    // Pin the actual values too, so "different" can't be satisfied by a
+    // regression that moves the wrong arm.
+    assert_eq!(
+        with_sol,
+        (2, 5),
+        "startofline=true lands on the first non-blank"
+    );
+    assert_eq!(without_sol, (2, 1), "startofline off keeps the column");
+}
+
+/// The other options the corpus pins, each proved to flip a real behaviour.
+#[test]
+fn every_setup_option_the_corpus_uses_changes_vimcode_behaviour() {
+    // 'joinspaces' — two spaces after a `.` when joining.
+    let joined =
+        |setup: &str| run_in_vimcode("self-test:js", &["end.", "next"], 1, 1, "J", 24, setup).0;
+    assert_eq!(joined("vim.o.joinspaces=true"), "end.  next");
+    assert_eq!(joined(""), "end. next");
+
+    // 'smarttab' — <BS> at the start of indent eats a whole shiftwidth with it
+    // on, one column with it off.
+    let bs =
+        |setup: &str| run_in_vimcode("self-test:sta", &["    a"], 1, 5, "i<BS><Esc>", 24, setup).0;
+    assert_eq!(bs("vim.o.smarttab=false"), "   a");
+    assert_eq!(bs(""), "a");
+
+    // 'nrformats' — octal must be opted into; alpha likewise.
+    let inc = |lines: &'static [&'static str], setup: &str| {
+        run_in_vimcode("self-test:nf", lines, 1, 1, "<C-a>", 24, setup).0
+    };
+    assert_eq!(inc(&["007"], "vim.o.nrformats='bin,octal,hex'"), "010");
+    assert_eq!(inc(&["007"], ""), "008");
+    assert_eq!(inc(&["a"], "vim.o.nrformats='alpha'"), "b");
+    assert_eq!(inc(&["a"], ""), "a");
+
+    // 'autoindent' — `o` off a `    foo` line.
+    let open =
+        |setup: &str| run_in_vimcode("self-test:ai", &["    foo"], 1, 1, "ox<Esc>", 24, setup).0;
+    assert_eq!(open("vim.o.autoindent=false"), "    foo\nx");
+    assert_eq!(open(""), "    foo\n    x");
+}
+
+/// An option `apply_setup` has no mapping for must be a hard, named failure —
+/// never a silent fall-back to vimcode's defaults, which is the entire bug
+/// #1002 fixed. The message has to name the offending statement so the reader
+/// knows what to add.
+#[test]
+fn unrecognised_setup_is_a_hard_failure_naming_the_statement() {
+    let mut s = Settings::default();
+    let err = apply_setup(&mut s, "vim.o.virtualedit='all'").expect_err("must not be accepted");
+    assert!(err.contains("virtualedit"), "must name the option: {err}");
+
+    // Not the `vim.o.` statement form at all.
+    let err = apply_setup(&mut s, "vim.cmd('set sol')").expect_err("must not be accepted");
+    assert!(
+        err.contains("vim.cmd('set sol')"),
+        "must quote the statement: {err}"
+    );
+
+    // Recognised option, unparseable value.
+    let err = apply_setup(&mut s, "vim.o.startofline=1").expect_err("must not be accepted");
+    assert!(err.contains("startofline"), "must name the option: {err}");
+
+    // Recognised statement form, missing `=`.
+    assert!(apply_setup(&mut s, "vim.o.startofline").is_err());
+
+    // A non-empty 'completeopt' is not the no-op the empty one is.
+    assert!(apply_setup(&mut s, "vim.o.completeopt='menuone'").is_err());
+    assert!(apply_setup(&mut s, "vim.o.completeopt=\"\"").is_ok());
+
+    // ...and none of the rejected statements left a partial mutation behind
+    // that would quietly reconfigure a later case.
+    assert_eq!(s.startofline, Settings::default().startofline);
+}
+
+/// Every `setup` string in the corpus must be one `apply_setup` understands —
+/// otherwise the failure only surfaces on a host with nvim installed. Runs
+/// without an oracle, so CI's no-nvim lane catches a bad `cs(..)` too.
+#[test]
+fn every_corpus_setup_is_understood() {
+    let mut bad = Vec::new();
+    for case in CATEGORIES.iter().flat_map(|(_, cases)| cases.iter()) {
+        if let Err(why) = apply_setup(&mut Settings::default(), case.setup) {
+            bad.push(format!("  [{}] {}", case.label, why));
+        }
+    }
+    assert!(
+        bad.is_empty(),
+        "conformance case(s) with a `setup` apply_setup cannot map:\n{}",
+        bad.join("\n")
+    );
 }
 
 /// The gate itself, exercised without needing nvim: both directions must be
