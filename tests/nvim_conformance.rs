@@ -5383,6 +5383,1478 @@ const HARNESS_LIMITED: &[&str] = &[
 ];
 
 // ---------------------------------------------------------------------------
+// Coverage ratchet (#1007) — what the corpus does NOT reach
+//
+// `KNOWN_DEVIATIONS` above holds ground already taken: it is excellent at
+// noticing a command that used to match Neovim and stopped. It says nothing
+// about ground never entered — a command with *zero* oracle cases is
+// indistinguishable, to every other gate in this file, from a well-covered
+// one. The two artifacts that look like they measure reach don't:
+// `VIM_COMPATIBILITY.md` is a hand-maintained checklist of command
+// *existence* (it reads 422/424, "Remaining Missing Commands: None"), and
+// `COVERAGE_PHASE5.md` is a partial audit, 2 of 6 focus areas done.
+//
+// So this gate measures it, with the same shape `KNOWN_DEVIATIONS` proved:
+//
+//   * [`parse_compatibility_doc`] reads every ✅/⚠️ row of
+//     `VIM_COMPATIBILITY.md` into a `<section>:<keystroke>` id;
+//   * [`COMMAND_PROBES`] gives every one of those ids an **explicit**
+//     label-substring or keys-substring predicate — the readable answer to
+//     "why does this command count as covered";
+//   * [`COVERAGE_EXEMPT`] lists the ids whose probe is expected to match
+//     *nothing*: today's measured gap, seeded so this lands green.
+//
+// The gate is **bidirectional**, exactly like `KNOWN_DEVIATIONS`:
+//
+//   * an id not in `COVERAGE_EXEMPT` whose probe matches no case → fail;
+//   * an id *in* `COVERAGE_EXEMPT` whose probe now matches a case → fail
+//     until the entry is deleted.
+//
+// So the list may only ever SHRINK, and adding oracle cases for an exempt
+// command is forced to prove itself by deleting its entry.
+//
+// ## The probe is deliberately dumb
+//
+// The command→case mapping is the part that could quietly make this test
+// worse than nothing. A fuzzy match that counted `dw` as covering `d}` would
+// manufacture coverage that does not exist. So there is no inference at all:
+// every id carries a hand-written needle, and a human reading
+// `p("move:}", Keys("d}"))` can check the claim in one grep. Prefer a needle
+// that cannot match a *different* command — `Label("to:i( ")` over
+// `Keys("i(")` — and when in doubt leave the id exempt. Over-crediting is the
+// failure mode this test exists to prevent; under-crediting just leaves a
+// shrinkable entry behind.
+//
+// ## The doc is read, never written
+//
+// `VIM_COMPATIBILITY.md` is a shared doc owned by the coordinator. This test
+// only reads it (`include_str!`, so a doc edit rebuilds the test), and it
+// refuses to *silently* skip anything it cannot parse: an unrecognised table
+// header, a row with the wrong cell count, an unknown Status marker or a
+// Command cell with no inline-code span all fail by naming the file and line.
+// A lenient parser would drop rows, and dropped rows understate the gap —
+// which is the exact failure mode of the status quo.
+// ---------------------------------------------------------------------------
+
+/// How one `VIM_COMPATIBILITY.md` command is proven to be exercised by the
+/// oracle corpus. Substring, not regex, not fuzzy — see the section doc.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Probe {
+    /// At least one case whose **label** contains this substring.
+    Label(&'static str),
+    /// At least one case whose **keys** contain this substring.
+    Keys(&'static str),
+}
+
+impl Probe {
+    fn matches(&self, label: &str, keys: &str) -> bool {
+        match self {
+            Probe::Label(n) => label.contains(n),
+            Probe::Keys(n) => keys.contains(n),
+        }
+    }
+
+    fn needle(&self) -> &'static str {
+        match self {
+            Probe::Label(n) | Probe::Keys(n) => n,
+        }
+    }
+}
+
+// Imported so [`COMMAND_PROBES`] reads as `Label("…")` / `Keys("…")`: the table
+// is ~560 rows and the whole point is that a human can skim it.
+use crate::Probe::{Keys, Label};
+
+struct CommandProbe {
+    /// `"<section>:<keystroke>"`, exactly as [`parse_compatibility_doc`]
+    /// derives it from a `VIM_COMPATIBILITY.md` row.
+    id: &'static str,
+    probe: Probe,
+}
+
+const fn p(id: &'static str, probe: Probe) -> CommandProbe {
+    CommandProbe { id, probe }
+}
+
+// ---------------------------------------------------------------------------
+// VIM_COMPATIBILITY.md parsing
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DocStatus {
+    /// ✅ — claimed implemented.
+    Implemented,
+    /// ⚠️ — claimed partially implemented. Still in scope: a partial
+    /// implementation is exactly the kind that benefits from an oracle case.
+    Partial,
+    /// ❌ — claimed not implemented. Out of scope for this gate.
+    Missing,
+    /// N/A — deliberately not in scope (VimScript, digraphs, spelling…).
+    NotApplicable,
+}
+
+impl DocStatus {
+    fn in_scope(self) -> bool {
+        matches!(self, DocStatus::Implemented | DocStatus::Partial)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DocCommand {
+    /// `"<section>:<keystroke>"` — the id [`COMMAND_PROBES`] and
+    /// [`COVERAGE_EXEMPT`] key off. Split on the *first* `:` (a keystroke may
+    /// itself be `:wq`).
+    id: String,
+    /// 1-indexed line in `VIM_COMPATIBILITY.md`, so a failure can point at it.
+    line: usize,
+    status: DocStatus,
+}
+
+/// Table headers that introduce a command inventory. `Motion` is the
+/// Operator-Pending table's spelling of the same column.
+const COMMAND_TABLE_HEADERS: &[&[&str]] = &[
+    &["Command", "Description", "Status", "Notes"],
+    &["Motion", "Description", "Status", "Notes"],
+];
+
+/// Tables in the doc that deliberately are *not* command inventories. Listed
+/// explicitly (rather than "anything without a Status column") so that a new
+/// table shape shows up as a parse failure to be triaged, not as silence.
+const NON_COMMAND_TABLE_HEADERS: &[(&[&str], &str)] = &[
+    (
+        &["Supported", "Notes"],
+        "`Search pattern syntax` — regex features, not keystrokes; no Status column",
+    ),
+    (
+        &["Command", "Description"],
+        "`VimCode-Specific Ex Commands` — not Vim commands, and no Status column, so it marks nothing implemented",
+    ),
+    (
+        &["Category", "Implemented", "Total", "Coverage"],
+        "the Summary roll-up — counts, already covered by the rows they total",
+    ),
+];
+
+/// `VIM_COMPATIBILITY.md` heading → the short section key used in command ids.
+/// A command table under an unlisted heading is a hard parse failure: silently
+/// inventing a key would make ids unstable, and a renamed heading must be a
+/// visible, reviewable change to this list.
+const SECTION_KEYS: &[(&str, &str)] = &[
+    ("Insert Mode", "ins"),
+    ("Normal Mode — Movement", "move"),
+    ("Normal Mode — Editing", "edit"),
+    ("Normal Mode — Search & Marks", "search"),
+    ("Normal Mode — Other", "other"),
+    ("Text Objects", "textobj"),
+    ("g-Commands", "g"),
+    ("z-Commands", "z"),
+    ("Window Commands (CTRL-W)", "win"),
+    ("Bracket Commands ([ and ])", "bracket"),
+    ("Operator-Pending Mode", "oppend"),
+    ("Visual Mode", "visual"),
+    ("Core Vim Ex Commands", "ex"),
+];
+
+/// Rows whose Command cell is prose rather than a `` `keystroke` `` span.
+/// They are real, in-scope entries — not noise — so they are allowlisted with
+/// a reason and still have to carry a probe, rather than being dropped.
+const PROSE_ROWS: &[(&str, &str)] = &[
+    (
+        "visual:Movement keys",
+        "\"every motion extends the selection\" — a class of keys, not one keystroke",
+    ),
+    (
+        "ex:Ex ranges",
+        "the range grammar accepted by :s/:g/:d/… — a syntax, not one keystroke",
+    ),
+];
+
+fn run_len(chars: &[char], i: usize) -> usize {
+    let mut n = 0;
+    while i + n < chars.len() && chars[i + n] == '`' {
+        n += 1;
+    }
+    n
+}
+
+/// Extract the inline code spans from a markdown cell, CommonMark-style: an
+/// opening run of N backticks closes on the next run of *exactly* N, and a
+/// span padded with one space on both sides has it stripped. The doc needs
+/// both forms — `` `gt` `` and the double-backtick ``` `` g` `` ``` used
+/// wherever the keystroke itself contains a backtick.
+///
+/// `Err` on an unclosed run: better a named failure than a dropped command.
+fn code_spans(cell: &str) -> Result<Vec<String>, &'static str> {
+    let chars: Vec<char> = cell.chars().collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] != '`' {
+            i += 1;
+            continue;
+        }
+        let open = run_len(&chars, i);
+        let mut j = i + open;
+        let close = loop {
+            if j >= chars.len() {
+                return Err("unterminated inline code span");
+            }
+            if chars[j] == '`' {
+                let n = run_len(&chars, j);
+                if n == open {
+                    break j;
+                }
+                j += n;
+            } else {
+                j += 1;
+            }
+        };
+        let span: String = chars[i + open..close].iter().collect();
+        let trimmed = match span.strip_prefix(' ').and_then(|s| s.strip_suffix(' ')) {
+            Some(t) if !t.is_empty() => t.to_string(),
+            _ => span,
+        };
+        out.push(trimmed);
+        i = close + open;
+    }
+    Ok(out)
+}
+
+/// Split a markdown table row on its *unescaped* `|` separators. The doc
+/// writes a literal pipe inside a code span as `\|` (`` `\|` `` — "go to
+/// column N"; `` `CTRL-W \|` `` — "maximize width"), and splitting naively
+/// would tear those rows into the wrong number of cells.
+fn split_table_row(line: &str) -> Vec<String> {
+    let mut cells: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut it = line.chars().peekable();
+    while let Some(ch) = it.next() {
+        match ch {
+            '\\' if it.peek() == Some(&'|') => {
+                cur.push('\\');
+                cur.push(it.next().expect("peeked"));
+            }
+            '|' => cells.push(std::mem::take(&mut cur)),
+            _ => cur.push(ch),
+        }
+    }
+    cells.push(cur);
+    // The row's outer pipes yield one empty cell at each end — drop exactly
+    // one from each, never more: a trailing *empty Notes column* is the
+    // overwhelmingly common case and must survive as a real cell.
+    if cells.first().is_some_and(|c| c.trim().is_empty()) {
+        cells.remove(0);
+    }
+    if cells.last().is_some_and(|c| c.trim().is_empty()) {
+        cells.pop();
+    }
+    cells.iter().map(|c| c.trim().to_string()).collect()
+}
+
+fn is_separator_row(cells: &[String]) -> bool {
+    !cells.is_empty()
+        && cells
+            .iter()
+            .all(|c| !c.is_empty() && c.chars().all(|ch| ch == '-' || ch == ':'))
+}
+
+fn parse_status(cell: &str) -> Option<DocStatus> {
+    // U+FE0F (variation selector-16) rides along with ⚠️ in the doc; strip it
+    // so the marker compares equal either way.
+    let c: String = cell.chars().filter(|ch| *ch != '\u{fe0f}').collect();
+    match c.trim() {
+        "✅" => Some(DocStatus::Implemented),
+        "⚠" => Some(DocStatus::Partial),
+        "❌" => Some(DocStatus::Missing),
+        "N/A" => Some(DocStatus::NotApplicable),
+        _ => None,
+    }
+}
+
+enum TableKind {
+    /// A command inventory, under the named section key.
+    Commands(&'static str),
+    /// A known non-command table — rows are skipped deliberately.
+    Ignored,
+}
+
+fn classify_header(
+    cells: &[String],
+    section: Option<&str>,
+    lineno: usize,
+) -> Result<TableKind, String> {
+    let as_strs: Vec<&str> = cells.iter().map(|s| s.as_str()).collect();
+    if COMMAND_TABLE_HEADERS.contains(&as_strs.as_slice()) {
+        let heading = section.ok_or_else(|| {
+            format!("VIM_COMPATIBILITY.md:{lineno}: command table before any heading")
+        })?;
+        let key = SECTION_KEYS
+            .iter()
+            .find(|(h, _)| *h == heading)
+            .map(|(_, k)| *k)
+            .ok_or_else(|| {
+                format!(
+                    "VIM_COMPATIBILITY.md:{lineno}: command table under unknown heading {heading:?} \
+                     — add it to SECTION_KEYS in tests/nvim_conformance.rs (with the id prefix \
+                     you want its commands to use). Guessing a key would make command ids \
+                     unstable and silently orphan every COMMAND_PROBES entry under it."
+                )
+            })?;
+        return Ok(TableKind::Commands(key));
+    }
+    if NON_COMMAND_TABLE_HEADERS
+        .iter()
+        .any(|(h, _)| *h == as_strs.as_slice())
+    {
+        return Ok(TableKind::Ignored);
+    }
+    Err(format!(
+        "VIM_COMPATIBILITY.md:{lineno}: unrecognised table header {as_strs:?}. Either it is a new \
+         command inventory (add its header to COMMAND_TABLE_HEADERS) or it is not (add it to \
+         NON_COMMAND_TABLE_HEADERS with a reason). Skipping unknown tables is how a coverage gap \
+         goes unmeasured (#1007)."
+    ))
+}
+
+/// Parse every command row of `VIM_COMPATIBILITY.md`.
+///
+/// Tolerant of the doc's existing formatting — mid-table blank lines, escaped
+/// pipes, double-backtick spans, `/`-joined aliases in one cell — and
+/// intolerant of anything it does not recognise: every failure names the line.
+fn parse_compatibility_doc(doc: &str) -> Result<Vec<DocCommand>, String> {
+    let mut out: Vec<DocCommand> = Vec::new();
+    let mut section: Option<String> = None;
+    let mut table: Option<TableKind> = None;
+
+    for (idx, raw) in doc.lines().enumerate() {
+        let lineno = idx + 1;
+        let line = raw.trim();
+
+        if let Some(rest) = line.strip_prefix('#') {
+            section = Some(rest.trim_start_matches('#').trim().to_string());
+            table = None;
+            continue;
+        }
+        if !line.starts_with('|') {
+            // A blank line does NOT close a table: `Core Vim Ex Commands` has
+            // one in the middle of its table, before the `:Explore` rows.
+            if !line.is_empty() {
+                table = None;
+            }
+            continue;
+        }
+
+        let cells = split_table_row(line);
+        let kind = match &table {
+            Some(k) => k,
+            None => {
+                table = Some(classify_header(&cells, section.as_deref(), lineno)?);
+                continue;
+            }
+        };
+        if is_separator_row(&cells) {
+            continue;
+        }
+        let sec = match kind {
+            TableKind::Ignored => continue,
+            TableKind::Commands(s) => *s,
+        };
+
+        if cells.len() != 4 {
+            return Err(format!(
+                "VIM_COMPATIBILITY.md:{lineno}: command row has {} cell(s), expected 4 \
+                 (Command | Description | Status | Notes): {line}",
+                cells.len()
+            ));
+        }
+        let status = parse_status(&cells[2]).ok_or_else(|| {
+            format!(
+                "VIM_COMPATIBILITY.md:{lineno}: unrecognised Status cell {:?} \
+                 (expected ✅, ⚠️, ❌ or N/A): {line}",
+                cells[2]
+            )
+        })?;
+        let spans = code_spans(&cells[0]).map_err(|e| {
+            format!("VIM_COMPATIBILITY.md:{lineno}: {e} in the Command cell: {line}")
+        })?;
+
+        let keystrokes: Vec<String> = if spans.is_empty() {
+            let id = format!("{sec}:{}", cells[0]);
+            if !PROSE_ROWS.iter().any(|(p, _)| *p == id) {
+                return Err(format!(
+                    "VIM_COMPATIBILITY.md:{lineno}: Command cell {:?} has no `code span` and is \
+                     not in PROSE_ROWS. Add it there with a reason (it still needs a probe), or \
+                     fix the row — dropping it would understate the coverage gap (#1007): {line}",
+                    cells[0]
+                ));
+            }
+            vec![cells[0].clone()]
+        } else {
+            spans
+        };
+
+        for k in keystrokes {
+            let id = format!("{sec}:{k}");
+            if let Some(prev) = out.iter().find(|d| d.id == id) {
+                return Err(format!(
+                    "VIM_COMPATIBILITY.md:{lineno}: duplicate command id {id:?} (first seen at \
+                     line {}). Ids must be unique — they key COMMAND_PROBES.",
+                    prev.line
+                ));
+            }
+            out.push(DocCommand {
+                id,
+                line: lineno,
+                status,
+            });
+        }
+    }
+    Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// The bidirectional coverage gate
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct CoverageVerdict {
+    /// In-scope doc commands with no [`COMMAND_PROBES`] entry — unmeasurable.
+    unprobed: Vec<String>,
+    /// [`COMMAND_PROBES`] entries naming no in-scope doc command — stale.
+    stale_probes: Vec<String>,
+    /// [`COVERAGE_EXEMPT`] entries with no probe, or naming nothing — stale.
+    stale_exempt: Vec<String>,
+    /// Ids appearing more than once in [`COMMAND_PROBES`]/[`COVERAGE_EXEMPT`].
+    duplicates: Vec<String>,
+    /// Not exempt, but the probe matches no case — coverage went backwards.
+    uncovered: Vec<String>,
+    /// Exempt, but the probe now matches a case — delete the entry.
+    newly_covered: Vec<String>,
+}
+
+impl CoverageVerdict {
+    fn is_clean(&self) -> bool {
+        self.unprobed.is_empty()
+            && self.stale_probes.is_empty()
+            && self.stale_exempt.is_empty()
+            && self.duplicates.is_empty()
+            && self.uncovered.is_empty()
+            && self.newly_covered.is_empty()
+    }
+
+    /// A readable diff naming the specific commands — never a bare count.
+    /// Same reasoning as `bullet_list`/`print_unmissable` above: this has to
+    /// survive being read in a CI log by someone who did not write it.
+    fn report(&self) -> String {
+        let mut out = String::new();
+        let mut section = |title: &str, fix: &str, items: &[String]| {
+            if items.is_empty() {
+                return;
+            }
+            out.push_str(&format!("\n{title} ({}):\n  -> {fix}\n", items.len()));
+            for i in items {
+                out.push_str(&format!("    {i}\n"));
+            }
+        };
+        section(
+            "UNCOVERED — implemented, but no case exercises it",
+            "add an oracle case, or add the id to COVERAGE_EXEMPT only if you \
+             are seeding a newly-documented command",
+            &self.uncovered,
+        );
+        section(
+            "NEWLY COVERED — a case now exercises an exempt command",
+            "delete these from COVERAGE_EXEMPT; that is how the list shrinks",
+            &self.newly_covered,
+        );
+        section(
+            "UNPROBED — implemented, but no COMMAND_PROBES entry",
+            "add `p(\"<id>\", Label(..)|Keys(..))` naming the case that proves \
+             it (or the case that would)",
+            &self.unprobed,
+        );
+        section(
+            "STALE PROBES — named command is not marked implemented",
+            "the doc row was renamed, removed or downgraded — update the id",
+            &self.stale_probes,
+        );
+        section(
+            "STALE EXEMPTIONS — no such implemented command, or no probe",
+            "delete the COVERAGE_EXEMPT entry, or give the id a probe",
+            &self.stale_exempt,
+        );
+        section(
+            "DUPLICATES — an id listed twice",
+            "ids are unique keys; remove the duplicate",
+            &self.duplicates,
+        );
+        out
+    }
+}
+
+/// `cases` is `(label, keys)` for the whole corpus.
+fn classify_coverage(
+    commands: &[DocCommand],
+    probes: &[CommandProbe],
+    exempt: &[&str],
+    cases: &[(&str, &str)],
+) -> CoverageVerdict {
+    use std::collections::{HashMap, HashSet};
+    let mut v = CoverageVerdict::default();
+
+    let mut probe_by_id: HashMap<&str, &Probe> = HashMap::new();
+    for cp in probes {
+        if probe_by_id.insert(cp.id, &cp.probe).is_some() {
+            v.duplicates.push(format!("COMMAND_PROBES: {}", cp.id));
+        }
+    }
+    let mut exempt_set: HashSet<&str> = HashSet::new();
+    for e in exempt {
+        if !exempt_set.insert(e) {
+            v.duplicates.push(format!("COVERAGE_EXEMPT: {e}"));
+        }
+    }
+
+    let in_scope: HashSet<&str> = commands
+        .iter()
+        .filter(|c| c.status.in_scope())
+        .map(|c| c.id.as_str())
+        .collect();
+
+    for id in probe_by_id.keys() {
+        if !in_scope.contains(id) {
+            v.stale_probes.push((*id).to_string());
+        }
+    }
+    for id in &exempt_set {
+        if !in_scope.contains(id) || !probe_by_id.contains_key(id) {
+            v.stale_exempt.push((*id).to_string());
+        }
+    }
+
+    for cmd in commands.iter().filter(|c| c.status.in_scope()) {
+        let Some(probe) = probe_by_id.get(cmd.id.as_str()) else {
+            v.unprobed
+                .push(format!("{}  (VIM_COMPATIBILITY.md:{})", cmd.id, cmd.line));
+            continue;
+        };
+        let hit = cases.iter().find(|(l, k)| probe.matches(l, k));
+        match (exempt_set.contains(cmd.id.as_str()), hit) {
+            (false, None) => v.uncovered.push(format!(
+                "{}  probe {:?} matched 0 cases  (VIM_COMPATIBILITY.md:{})",
+                cmd.id,
+                probe.needle(),
+                cmd.line
+            )),
+            (true, Some((label, _))) => v.newly_covered.push(format!(
+                "{}  probe {:?} now matches {label:?}",
+                cmd.id,
+                probe.needle()
+            )),
+            _ => {}
+        }
+    }
+
+    v.unprobed.sort();
+    v.stale_probes.sort();
+    v.stale_exempt.sort();
+    v.duplicates.sort();
+    v.uncovered.sort();
+    v.newly_covered.sort();
+    v
+}
+
+/// Every `(label, keys)` in the corpus — the single-buffer cases plus the
+/// multi-file jumplist ones, which are oracle-backed the same way.
+fn all_corpus_cases() -> Vec<(&'static str, &'static str)> {
+    let mut out: Vec<(&str, &str)> = CATEGORIES
+        .iter()
+        .flat_map(|(_, g)| g.iter())
+        .map(|c| (c.label, c.keys))
+        .collect();
+    out.extend(CASES_MULTI_JUMP.iter().map(|c| (c.label, c.keys)));
+    out.extend(CASES_MULTI_JUMPS_LIST.iter().map(|c| (c.label, c.keys)));
+    out
+}
+
+// ---------------------------------------------------------------------------
+// COMMAND_PROBES — one explicit predicate per implemented command.
+//
+// Every ✅/⚠️ row of `VIM_COMPATIBILITY.md` appears here exactly once, in doc
+// order, keyed `<section>:<keystroke>`. The predicate is the *readable proof*:
+//
+//     p("edit:dd", Label("op:dd last line cursor")),
+//
+// says "`dd` is exercised by the case labelled `op:dd last line cursor`" — one
+// grep to check. Where the command is **not** covered (its id is in
+// [`COVERAGE_EXEMPT`]) the predicate instead describes the case that *would*
+// cover it, so adding one trips the gate:
+//
+//     p("win:CTRL-W h", Keys("<C-w>h")),   // no case presses this today
+//
+// Rules of thumb, learned while seeding this list:
+//
+//   * A `Keys` needle is a **substring of the key sequence**, so it credits
+//     anything containing it. `Keys("w")` would count `dw` as covering the `w`
+//     motion; `Keys("gh")` matched `i<Right><Right>X<Esc>`; `Keys("do")`
+//     matches `:undo`. Prefer `Label`, which names one case by its unique id.
+//   * Distinct spellings are distinct ids on purpose: `:split` having a case
+//     does **not** cover `:sp`, and `:normal` does not cover `:norm`. That
+//     strictness is the point — an honest number, not a flattering one.
+// ---------------------------------------------------------------------------
+
+const COMMAND_PROBES: &[CommandProbe] = &[
+    // --- Insert Mode (ins) ---
+    p("ins:<Esc>", Label("ins:Esc cursor left")),
+    p("ins:<CR>", Label("ins:CR autoindent")),
+    p("ins:<BS>", Label("ins:BS at col1 joins")),
+    p("ins:<Del>", Label("ins:Del")),
+    p("ins:<Tab>", Label("ins:Tab at start (smarttab)")),
+    p("ins:<Up>/<Down>/<Left>/<Right>", Label("ins:Right Right X")),
+    p("ins:<Home>/<End>", Label("ins:End Home")),
+    p("ins:CTRL-H", Label("ins:C-h as BS")),
+    p("ins:CTRL-W", Label("ins:C-w")),
+    p("ins:CTRL-U", Label("ins:C-u inserted")),
+    p("ins:CTRL-T", Label("ins:C-t")),
+    p("ins:CTRL-D", Label("ins:C-d")),
+    p(
+        "ins:CTRL-R {reg}",
+        Label("ins:C-r register linewise mid line"),
+    ),
+    p("ins:CTRL-N", Label("ins:C-n completion")),
+    p("ins:CTRL-P", Label("ins:C-p completion")),
+    p("ins:CTRL-O", Label("ins:C-o dw")),
+    p("ins:CTRL-E", Label("ins:C-e")),
+    p("ins:CTRL-Y", Label("ins:C-y")),
+    p("ins:CTRL-A", Label("ins:C-a reinsert")),
+    p("ins:CTRL-@", Keys("<C-@>")),
+    p("ins:CTRL-V {char}", Label("ins:C-v Tab")),
+    p("ins:CTRL-G u", Label("undo:C-g u splits")),
+    p("ins:CTRL-G j/k", Keys("<C-g>j")),
+    // --- Normal Mode - Movement (move) ---
+    p("move:h", Label("word:h at start")),
+    p("move:j", Label("word:j col memory short")),
+    p("move:k", Label("word:10k beyond")),
+    p("move:l", Label("word:l")),
+    p("move:w", Label("word:w punctuation")),
+    p("move:b", Label("word:b at start")),
+    p("move:e", Label("word:e")),
+    p("move:ge", Label("word:ge")),
+    p("move:W", Label("word:W")),
+    p("move:B", Label("word:B")),
+    p("move:E", Label("word:E")),
+    p("move:gE", Label("word:gE")),
+    p("move:0", Label("op:mb:0 from mid multi-byte line")),
+    p("move:^", Label("word:^")),
+    p("move:$", Label("word:2$")),
+    p("move:g_", Label("word:g_")),
+    p("move:g0", Label("word:g0")),
+    p("move:gm", Keys("gm")),
+    p("move:gM", Keys("gM")),
+    p("move:f{char}", Label("op:f, then ;")),
+    p("move:F{char}", Label("op:F, F, then ,")),
+    p("move:t{char}", Label("op:t; then ; repeat")),
+    p("move:T{char}", Label("op:T, then ;")),
+    p("move:;", Label("op:t; then ; repeat")),
+    p("move:,", Label("op:F, F, then ,")),
+    p("move:gg", Label("word:gg indented (nosol)")),
+    p("move:G", Label("word:G indented (nosol)")),
+    p("move:{", Label("word:{")),
+    p("move:}", Label("word:}")),
+    p("move:(", Label("word:( sentence")),
+    p("move:)", Label("word:) sentences")),
+    p("move:H", Label("scroll:H from 30")),
+    p("move:M", Label("scroll:M from 30")),
+    p("move:L", Label("scroll:L from 30")),
+    p("move:%", Label("word:% on (")),
+    p("move:+", Label("word:+")),
+    p("move:-", Label("word:-")),
+    p("move:_", Label("word:_")),
+    p("move:\\|", Label("word:|")),
+    p("move:N%", Label("jump:C-o after 50%")),
+    p("move:gj", Label("word:gj gk nowrap")),
+    p("move:gk", Label("word:gj gk nowrap")),
+    p("move:CTRL-D", Label("scroll:C-d")),
+    p("move:CTRL-U", Label("scroll:C-u")),
+    p("move:CTRL-F", Label("scroll:C-f")),
+    p("move:CTRL-B", Label("scroll:C-b")),
+    p("move:CTRL-E", Label("scroll:C-e pushes cursor")),
+    p("move:CTRL-Y", Label("scroll:G C-y")),
+    // --- Normal Mode - Editing (edit) ---
+    p("edit:i", Label("op:i at eol esc")),
+    p("edit:I", Label("op:I indented")),
+    p("edit:a", Label("op:3a")),
+    p("edit:A", Label("op:A esc cursor")),
+    p("edit:o", Label("op:o esc removes indent")),
+    p("edit:O", Label("op:O autoindent")),
+    p("edit:x", Label("op:x at eol")),
+    p("edit:X", Label("op:X at col1")),
+    p("edit:d{motion}", Label("op:d) sentence")),
+    p("edit:dd", Label("op:dd last line cursor")),
+    p("edit:D", Label("op:D on empty")),
+    p("edit:c{motion}", Label("op:c$")),
+    p("edit:cc", Label("op:cc keeps indent")),
+    p("edit:C", Label("op:C")),
+    p("edit:s", Label("op:s")),
+    p("edit:S", Label("op:S keeps indent")),
+    p("edit:y{motion}", Label("op:y$ then P")),
+    p("edit:yy", Label("op:yy 3p")),
+    p("edit:Y", Label("op:Y is linewise")),
+    p("edit:p", Label("op:p linewise cursor first nonblank")),
+    p("edit:P", Label("op:P linewise cursor")),
+    p("edit:]p", Label("op:]p")),
+    p("edit:[p", Keys("[p")),
+    p("edit:gp", Label("op:gp linewise")),
+    p("edit:gP", Label("op:gP linewise")),
+    p("edit:r{char}", Label("op:r<CR>")),
+    p("edit:R", Label("op:R")),
+    p("edit:J", Label("op:J basic")),
+    p("edit:gJ", Label("op:gJ")),
+    p("edit:u", Label("undo:u on unchanged")),
+    p("edit:U", Label("undo:U")),
+    p("edit:CTRL-R", Label("undo:xxx uu C-r")),
+    p("edit:.", Label("dot:cw . next word")),
+    p("edit:~", Label("op:~")),
+    p("edit:g~{motion}", Label("op:g~~ cursor")),
+    p("edit:gu{motion}", Label("op:gu$")),
+    p("edit:gU{motion}", Label("op:gUU")),
+    p("edit:>{motion}", Label("op:>>")),
+    p("edit:>>", Label("op:>>")),
+    p("edit:<{motion}", Label("op:<< partial indent")),
+    p("edit:<<", Label("op:<< partial indent")),
+    p("edit:={motion}", Label("op:== single")),
+    p("edit:==", Label("op:== single")),
+    p("edit:CTRL-A", Label("num:C-a on number")),
+    p("edit:CTRL-X", Label("num:C-x to negative")),
+    p("edit:gq{motion}", Label("op:gqq tw0 no wrap")),
+    p("edit:gw{motion}", Label("op:gwip cursor")),
+    p("edit:!{motion}{filter}", Label("op:!!tr")),
+    p("edit:&", Label("dot:& repeat sub")),
+    p("edit:g&", Label("dot:g&")),
+    // --- Normal Mode - Search & Marks (search) ---
+    p("search:/pattern", Label("search:/ n")),
+    p("search:?pattern", Label("search:? then n backward")),
+    p(
+        "search:/pat/{offset}",
+        Label("search:/pat/e then n keeps offset"),
+    ),
+    p("search://", Label("search:// repeat")),
+    p("search:/<CR>", Label("search:// repeat")),
+    p("search:n", Label("search:/ n")),
+    p("search:N", Label("search:/ N wraps")),
+    p("search:*", Label("search:*")),
+    p("search:#", Label("search:#")),
+    p("search:g*", Label("search:g*")),
+    p("search:g#", Label("search:g#")),
+    p("search:gn", Label("search:gn selects")),
+    p("search:gN", Label("search:gN")),
+    p("search:m{a-z}", Label("mark:'a first nonblank")),
+    p("search:m{A-Z}", Label("mark:mA global")),
+    p("search:'{a-z}", Label("mark:'a first nonblank")),
+    p("search:`{a-z}", Label("mark:`a exact")),
+    p("search:'{A-Z}", Label("mark:mA global")),
+    p("search:`{A-Z}", Keys("`A")),
+    p("search:''", Label("mark:'' after G")),
+    p("search:``", Label("mark:`` after gg")),
+    p("search:'.", Label("mark:'.")),
+    p("search:`.", Label("mark:`.")),
+    p("search:'<", Label("mark:'< after v")),
+    p("search:'>", Label("mark:'> after V")),
+    p("search:CTRL-O", Label("jump:C-o at start")),
+    p("search:CTRL-I", Label("jump:gg G C-o C-o C-i")),
+    p("search:g;", Label("jump:g;")),
+    p("search:g,", Label("jump:g; g; g,")),
+    p("search:g'", Label("mark:g'")),
+    p("search:g`", Label("mark:g`")),
+    // --- Normal Mode - Other (other) ---
+    p("other:q{a-z}", Label("mac:qaxjq @a")),
+    p("other:q", Label("mac:qaxjq @a")),
+    p("other:@{a-z}", Label("mac:qaxjq @a")),
+    p("other:@@", Label("mac:@a @@")),
+    p("other:@:", Label("misc:dot after @: ")),
+    p("other:\"{reg}", Label("reg:\"ayy \"ap")),
+    p("other:v", Label("vis:v$d joins")),
+    p("other:V", Label("vis:Vjd")),
+    p("other:CTRL-V", Label("vb:jjd")),
+    p("other:gv", Label("vis:gv")),
+    p("other::", Label("ex:>")),
+    p("other:gt", Keys("gt")),
+    p("other:gT", Keys("gT")),
+    p("other:gd", Label("search:gd")),
+    p("other:gf", Keys("gf")),
+    p("other:gF", Keys("gF")),
+    p("other:K", Label("misc:K")),
+    p("other:ga", Keys("ga")),
+    p("other:g8", Keys("g8")),
+    p("other:go", Label("word:go")),
+    p("other:gx", Keys("gx")),
+    p("other:gi", Label("op:gi")),
+    p("other:gI", Label("op:gI")),
+    p("other:g?{motion}", Label("misc:g?g?")),
+    p("other:CTRL-^", Keys("<C-^>")),
+    p("other:CTRL-]", Keys("<C-]>")),
+    p("other:CTRL-G", Label("misc:C-g")),
+    p("other:CTRL-L", Label("misc:C-l noop")),
+    p("other:do", Label("misc:do diff obtain")),
+    p("other:dp", Label("misc:dp diff put")),
+    p("other:q:", Keys("q:")),
+    p("other:q/", Keys("q/")),
+    p("other:q?", Keys("q?")),
+    p("other:cgn", Label("search:gn selects")),
+    // --- Text Objects (textobj) ---
+    p("textobj:iw", Label("to:diw on whitespace")),
+    p("textobj:aw", Label("to:daw mid")),
+    p("textobj:iW", Label("to:diW")),
+    p("textobj:aW", Label("to:daW")),
+    p("textobj:is", Label("to:dis")),
+    p("textobj:as", Label("to:das")),
+    p("textobj:ip", Label("to:dip")),
+    p("textobj:ap", Label("to:dap")),
+    p("textobj:i\"", Label("to:di\" inside")),
+    p("textobj:a\"", Label("to:da\" before quotes")),
+    p("textobj:i'", Label("to:di'")),
+    p("textobj:a'", Label("to:da'")),
+    p("textobj:i`", Label("to:di`")),
+    p("textobj:a`", Label("to:da`")),
+    p("textobj:i(", Label("to:di( inside")),
+    p("textobj:a(", Label("to:da( nested")),
+    p("textobj:i)", Label("to:di)")),
+    p("textobj:a)", Label("to:da)")),
+    p("textobj:i{", Label("to:di{ multiline")),
+    p("textobj:a{", Label("to:da{ multiline")),
+    p("textobj:i}", Label("to:di}")),
+    p("textobj:a}", Label("to:da}")),
+    p("textobj:i[", Label("to:di[")),
+    p("textobj:a[", Label("to:da[")),
+    p("textobj:i]", Label("to:di]")),
+    p("textobj:a]", Label("to:da]")),
+    p("textobj:i<", Label("to:di< nested")),
+    p("textobj:a<", Label("to:da< outer")),
+    p("textobj:i>", Label("to:di>")),
+    p("textobj:a>", Label("to:da>")),
+    p("textobj:it", Label("to:dit")),
+    p("textobj:at", Label("to:dat")),
+    // --- g-Commands (g) ---
+    p("g:gg", Label("word:gg indented (nosol)")),
+    p("g:g_", Label("word:g_")),
+    p("g:g0", Label("word:g0")),
+    p("g:g<Home>", Keys("g<Home>")),
+    p("g:g^", Keys("g^")),
+    p("g:g$", Keys("g$")),
+    p("g:g<End>", Keys("g<End>")),
+    p("g:gj", Label("word:gj gk nowrap")),
+    p("g:gk", Label("word:gj gk nowrap")),
+    p("g:gE", Label("word:gE")),
+    p("g:ge", Label("word:ge")),
+    p("g:gn", Label("search:gn selects")),
+    p("g:gN", Label("search:gN")),
+    p("g:g*", Label("search:g*")),
+    p("g:g#", Label("search:g#")),
+    p("g:gv", Label("vis:gv")),
+    p("g:gd", Label("search:gd")),
+    p("g:gf", Keys("gf")),
+    p("g:gF", Keys("gF")),
+    p("g:gt", Keys("gt")),
+    p("g:gT", Keys("gT")),
+    p("g:g<Tab>", Keys("g<Tab>")),
+    p("g:g~{motion}", Label("op:g~~ cursor")),
+    p("g:gu{motion}", Label("op:gu$")),
+    p("g:gU{motion}", Label("op:gUU")),
+    p("g:gJ", Label("op:gJ")),
+    p("g:g;", Label("jump:g;")),
+    p("g:g,", Label("jump:g; g; g,")),
+    p("g:g.", Keys("g.")),
+    p("g:gp", Label("op:gp linewise")),
+    p("g:gP", Label("op:gP linewise")),
+    p("g:gq{motion}", Label("op:gqq tw20")),
+    p("g:gw{motion}", Label("op:gwip cursor")),
+    p("g:gx", Keys("gx")),
+    p("g:ga", Keys("ga")),
+    p("g:g8", Keys("g8")),
+    p("g:go", Label("word:go")),
+    p("g:gi", Label("op:gi")),
+    p("g:gI", Label("op:gI")),
+    p("g:gm", Keys("gm")),
+    p("g:gM", Keys("gM")),
+    p("g:g?{motion}", Label("op:g?? rot13")),
+    p("g:g@{motion}", Keys("g@")),
+    p("g:g+", Keys("g+")),
+    p("g:g-", Keys("g-")),
+    p("g:gR", Keys("gR")),
+    p("g:g'", Label("mark:g'")),
+    p("g:g`", Label("mark:g`")),
+    p("g:g&", Label("dot:g&")),
+    p("g:gh", Label("misc:gh")),
+    // --- z-Commands (z) ---
+    p("z:zz", Label("scroll:zzH")),
+    p("z:zt", Label("scroll:zt C-e")),
+    p("z:zb", Label("scroll:zbH")),
+    p("z:z<CR>", Label("scroll:z<CR> col first nonblank")),
+    p("z:z.", Label("scroll:z.H")),
+    p("z:z-", Label("scroll:z-H")),
+    p("z:za", Label("fold:za closes an open defined fold")),
+    p("z:zo", Label("fold:zo reopens a closed fold")),
+    p("z:zc", Label("fold:zo then zc recloses the same fold")),
+    p("z:zR", Label("fold:zR opens all folds")),
+    p("z:zM", Label("fold:zM recloses a defined fold")),
+    p("z:zA", Keys("zA")),
+    p("z:zO", Label("fold:zO opens recursively")),
+    p("z:zC", Label("fold:zC recloses recursively")),
+    p("z:zd", Label("fold:zd deletes a fold")),
+    p("z:zD", Label("fold:zD deletes a fold recursively")),
+    p("z:zf{motion}", Label("fold:zfj hides one line")),
+    p("z:zF", Keys("zF")),
+    p("z:zv", Keys("zv")),
+    p("z:zx", Keys("zx")),
+    p("z:zj", Label("fold:zj moves to the defined fold header")),
+    p("z:zk", Label("fold:zk moves to the defined fold header")),
+    p("z:zh", Keys("zh")),
+    p("z:zl", Keys("zl")),
+    p("z:zH", Label("scroll:zH")),
+    p("z:zL", Keys("zL")),
+    p("z:ze", Label("scroll:ze")),
+    p("z:zs", Label("scroll:zs")),
+    // --- Window Commands (CTRL-W) (win) ---
+    p("win:CTRL-W h", Keys("<C-w>h")),
+    p("win:CTRL-W j", Keys("<C-w>j")),
+    p("win:CTRL-W k", Keys("<C-w>k")),
+    p("win:CTRL-W l", Keys("<C-w>l")),
+    p("win:CTRL-W w", Keys("<C-w>w")),
+    p("win:CTRL-W W", Keys("<C-w>W")),
+    p("win:CTRL-W c", Keys("<C-w>c")),
+    p("win:CTRL-W o", Keys("<C-w>o")),
+    p("win:CTRL-W s", Keys("<C-w>s")),
+    p("win:CTRL-W v", Keys("<C-w>v")),
+    p("win:CTRL-W e/E", Keys("<C-w>e/E")),
+    p("win:CTRL-W +", Keys("<C-w>+")),
+    p("win:CTRL-W -", Keys("<C-w>-")),
+    p("win:CTRL-W <", Label("win:C-w <")),
+    p("win:CTRL-W >", Keys("<C-w>>")),
+    p("win:CTRL-W =", Keys("<C-w>=")),
+    p("win:CTRL-W _", Keys("<C-w>_")),
+    p("win:CTRL-W \\|", Keys("<C-w>\\|")),
+    p("win:CTRL-W H", Keys("<C-w>H")),
+    p("win:CTRL-W J", Keys("<C-w>J")),
+    p("win:CTRL-W K", Keys("<C-w>K")),
+    p("win:CTRL-W L", Keys("<C-w>L")),
+    p("win:CTRL-W T", Keys("<C-w>T")),
+    p("win:CTRL-W x", Keys("<C-w>x")),
+    p("win:CTRL-W r", Keys("<C-w>r")),
+    p("win:CTRL-W R", Keys("<C-w>R")),
+    p("win:CTRL-W p", Keys("<C-w>p")),
+    p("win:CTRL-W n", Keys("<C-w>n")),
+    p("win:CTRL-W t", Keys("<C-w>t")),
+    p("win:CTRL-W b", Keys("<C-w>b")),
+    p("win:CTRL-W q", Keys("<C-w>q")),
+    p("win:CTRL-W f", Keys("<C-w>f")),
+    p("win:CTRL-W d", Keys("<C-w>d")),
+    // --- Bracket Commands (bracket) ---
+    p("bracket:]c", Keys("]c")),
+    p("bracket:[c", Keys("[c")),
+    p("bracket:]d", Keys("]d")),
+    p("bracket:[d", Keys("[d")),
+    p("bracket:]p", Label("op:]p")),
+    p("bracket:[p", Keys("[p")),
+    p("bracket:[[", Label("word:[[")),
+    p("bracket:]]", Label("word:]]")),
+    p("bracket:[]", Keys("[]")),
+    p("bracket:][", Keys("][")),
+    p("bracket:[m", Keys("[m")),
+    p("bracket:]m", Keys("]m")),
+    p("bracket:[M", Keys("[M")),
+    p("bracket:]M", Keys("]M")),
+    p("bracket:[{", Label("word:[{")),
+    p("bracket:]}", Label("word:]}")),
+    p("bracket:[(", Label("word:[(")),
+    p("bracket:])", Label("word:])")),
+    p("bracket:[*", Keys("[*")),
+    p("bracket:]*", Keys("]*")),
+    p("bracket:[/", Label("word:[/")),
+    p("bracket:]/", Label("word:]/")),
+    p("bracket:[#", Keys("[#")),
+    p("bracket:]#", Keys("]#")),
+    p("bracket:[z", Label("fold:[z moves to start of open fold")),
+    p("bracket:]z", Label("fold:]z moves to end of open fold")),
+    // --- Operator-Pending Mode (oppend) ---
+    p("oppend:w", Label("op:dw last word of line does not join")),
+    p("oppend:b", Label("op:cb")),
+    p("oppend:e", Label("op:ce")),
+    p("oppend:ge", Label("op:dge")),
+    p("oppend:W", Label("op:cW")),
+    p("oppend:B", Label("op:dB")),
+    p("oppend:E", Label("op:dE")),
+    p("oppend:gE", Label("op:dgE")),
+    p("oppend:0", Label("op:c0")),
+    p("oppend:^", Label("op:d^")),
+    p("oppend:$", Label("op:c$")),
+    p("oppend:g_", Keys("dg_")),
+    p("oppend:f", Label("op:d2f,")),
+    p("oppend:t", Label("op:dt;")),
+    p("oppend:F", Keys("dF")),
+    p("oppend:T", Keys("dT")),
+    p("oppend:;", Keys("d;")),
+    p("oppend:,", Keys("d,")),
+    p("oppend:h", Label("op:dh at col1")),
+    p("oppend:j", Label("op:dj last line")),
+    p("oppend:k", Label("op:dk first line")),
+    p("oppend:l", Label("op:dl at eol")),
+    p("oppend:{", Keys("d{")),
+    p("oppend:}", Keys("d}")),
+    p("oppend:(", Label("op:d( sentence")),
+    p("oppend:)", Label("op:d) sentence")),
+    p("oppend:H", Label("scroll:dH")),
+    p("oppend:M", Label("scroll:dM")),
+    p("oppend:L", Label("scroll:dL")),
+    p("oppend:gg", Label("op:dgg mid")),
+    p("oppend:G", Label("op:dG mid")),
+    p("oppend:%", Label("op:d% on paren")),
+    p("oppend:iw", Label("op:yiw cursor")),
+    p("oppend:aw", Label("to:daw mid")),
+    p("oppend:iW", Label("to:diW")),
+    p("oppend:aW", Label("to:daW")),
+    p("oppend:i\"", Label("to:di\" inside")),
+    p("oppend:a\"", Label("to:da\" before quotes")),
+    p("oppend:i'", Label("to:di'")),
+    p("oppend:a'", Keys("da'")),
+    p("oppend:i(", Label("to:di( inside")),
+    p("oppend:a(", Label("to:da( nested")),
+    p("oppend:i{", Label("to:di{ multiline")),
+    p("oppend:a{", Label("to:da{ multiline")),
+    p("oppend:i[", Label("to:di[")),
+    p("oppend:a[", Label("to:da[")),
+    p("oppend:ip", Label("op:>ip")),
+    p("oppend:ap", Label("to:dap")),
+    p("oppend:is", Label("op:dis")),
+    p("oppend:as", Label("op:das")),
+    p("oppend:it", Label("to:dit")),
+    p("oppend:at", Label("to:dat")),
+    p("oppend:i<", Label("to:di< nested")),
+    p("oppend:a<", Label("to:da< outer")),
+    p("oppend:i`", Label("to:di`")),
+    p("oppend:a`", Keys("da`")),
+    p("oppend:o_v", Label("op:dvj charwise force")),
+    p("oppend:o_V", Keys("dVj")),
+    p("oppend:o_CTRL-V", Label("op:d<C-v>j blockwise force")),
+    // --- Visual Mode (visual) ---
+    p("visual:v", Label("vis:vjd")),
+    p("visual:V", Label("vis:Vjd")),
+    p("visual:CTRL-V", Label("vb:jjd")),
+    p("visual:o", Label("vis:vllohd")),
+    p("visual:O", Label("vis:v_O charwise same as o")),
+    p("visual:gv", Label("vis:gv after Vjd")),
+    p("visual:d", Label("vis:vjd")),
+    p("visual:x", Label("vis:v x")),
+    p("visual:c", Label("vis:vec")),
+    p("visual:s", Label("vis:v s")),
+    p("visual:y", Label("vis:vjy cursor")),
+    p("visual:>", Label("vis:vj>")),
+    p("visual:<", Label("vis:vj<")),
+    p("visual:~", Label("vis:vj~")),
+    p("visual:u", Label("vis:Vju")),
+    p("visual:U", Label("vis:vjU")),
+    p("visual:=", Label("vis:Vj=")),
+    p("visual:p", Label("vis:vlp linewise reg")),
+    p("visual:P", Label("vis:vjP")),
+    p("visual::", Label("vis:vj: shows range then s")),
+    p("visual:J", Label("vis:vjJ")),
+    p("visual:gJ", Label("vis:v_gJ")),
+    p("visual:D", Label("vis:vjD")),
+    p("visual:X", Label("vis:vjX")),
+    p("visual:C", Label("vis:vjC")),
+    p("visual:S", Label("vis:vjS")),
+    p("visual:R", Label("vis:vjR")),
+    p("visual:Y", Label("vis:vjY p")),
+    p("visual:CTRL-A", Label("num:V C-a")),
+    p("visual:CTRL-X", Label("num:V C-x")),
+    p("visual:%", Label("vis:v% d")),
+    p("visual:r{char}", Label("vis:vjr-")),
+    p("visual:I", Label("vb:jjIx")),
+    p("visual:A", Label("vb:jjAx")),
+    p("visual:gq", Label("vis:vjgq")),
+    p("visual:g CTRL-A", Label("num:V g C-a")),
+    p("visual:g CTRL-X", Label("num:V g C-x")),
+    p("visual:Movement keys", Label("vis:vjd")),
+    // --- Core Vim Ex Commands (ex) ---
+    p("ex::w", Keys(":w")),
+    p("ex::write", Keys(":write")),
+    p("ex::q", Keys(":q")),
+    p("ex::quit", Keys(":quit")),
+    p("ex::q!", Keys(":q!")),
+    p("ex::wq", Keys(":wq")),
+    p("ex::x", Keys(":x")),
+    p("ex::qa", Keys(":qa")),
+    p("ex::qa!", Keys(":qa!")),
+    p("ex::wa", Keys(":wa")),
+    p("ex::wqa", Keys(":wqa")),
+    p("ex::xa", Keys(":xa")),
+    p(
+        "ex::e {file}",
+        Label("jump:multi C-o after :e returns to A"),
+    ),
+    p("ex::edit", Keys(":edit")),
+    p("ex::enew", Keys(":enew")),
+    p("ex::bn", Keys(":bn")),
+    p("ex::bp", Keys(":bp")),
+    p("ex::b#", Keys(":b#")),
+    p("ex::b {N}", Label("ex:b by number")),
+    p("ex::bd", Keys(":bd")),
+    p("ex::bdelete", Keys(":bdelete")),
+    p("ex::ls", Keys(":ls")),
+    p("ex::buffers", Keys(":buffers")),
+    p("ex::split", Label("jump:multi C-o across split")),
+    p("ex::sp", Keys(":sp ")),
+    p("ex::vsplit", Label("jump:multi C-o across vsplit")),
+    p("ex::vs", Keys(":vs ")),
+    p("ex::close", Keys(":close")),
+    p("ex::only", Keys(":only")),
+    p("ex::new", Keys(":new")),
+    p("ex::vnew", Keys(":vnew")),
+    p("ex::tabnew", Label("jump:multi C-o across tab")),
+    p("ex::tabe", Keys(":tabe")),
+    p("ex::tabclose", Keys(":tabclose")),
+    p("ex::tabnext", Keys(":tabnext")),
+    p("ex::tabprevious", Keys(":tabprevious")),
+    p("ex::tabmove", Keys(":tabmove")),
+    p("ex::[range]s/pat/rep/[flags] [count]", Label("sub:basic")),
+    p("ex::%s/pat/rep/", Label("sub:%")),
+    p("ex::[range]g/pat/cmd", Label("g:d")),
+    p("ex::v/pat/cmd", Label("g:v")),
+    p("ex::d", Label("ex:d")),
+    p("ex::delete", Keys(":delete")),
+    p("ex::m", Label("ex:m0")),
+    p("ex::move", Keys(":move")),
+    p("ex::t", Label("ex:t.")),
+    p("ex::co", Label("ex:1co$")),
+    p("ex::copy", Keys(":copy")),
+    p("ex::j", Label("ex:j")),
+    p("ex::join", Keys(":join")),
+    p("ex::y", Label("ex:y a")),
+    p("ex::yank", Keys(":yank")),
+    p("ex::pu", Label("ex:pu")),
+    p("ex::put", Label("ex:put a")),
+    p("ex::sort", Label("ex:sort")),
+    p("ex::norm", Keys(":norm ")),
+    p("ex::normal", Label("ex:normal Ax")),
+    p("ex::noh", Label("ex:noh no effect")),
+    p("ex::nohlsearch", Keys(":nohlsearch")),
+    p("ex:Ex ranges", Label("ex:2;+1d")),
+    p("ex::set {option}", Label("op:cc noautoindent")),
+    p("ex::r {file}", Label("ex:r !echo")),
+    p("ex::read", Keys(":read")),
+    p("ex::!{cmd}", Label("ex:%!sort")),
+    p("ex::reg", Keys(":reg")),
+    p("ex::registers", Keys(":registers")),
+    p("ex::marks", Keys(":marks")),
+    p("ex::jumps", Keys(":jumps")),
+    p("ex::changes", Keys(":changes")),
+    p("ex::history", Keys(":history")),
+    p("ex::echo {text}", Keys(":echo")),
+    p("ex::pwd", Keys(":pwd")),
+    p("ex::file", Keys(":file")),
+    p("ex::>", Label("ex:>")),
+    p("ex::<", Label("ex:<")),
+    p("ex::=", Keys(":=")),
+    p("ex::#", Keys(":#")),
+    p("ex::number", Keys(":number")),
+    p("ex::print", Keys(":print")),
+    p("ex::ma", Keys(":ma ")),
+    p("ex::mark", Label("ex:2mark a")),
+    p("ex::retab", Label("ex:retab")),
+    p("ex::saveas {file}", Keys(":saveas")),
+    p("ex::update", Keys(":update")),
+    p("ex::cquit", Keys(":cquit")),
+    p("ex::version", Keys(":version")),
+    p("ex::help", Keys(":help")),
+    p("ex::h", Keys(":h")),
+    p("ex::windo {cmd}", Keys(":windo")),
+    p("ex::bufdo {cmd}", Keys(":bufdo")),
+    p("ex::tabdo {cmd}", Keys(":tabdo")),
+    p("ex::diffsplit", Keys(":diffsplit")),
+    p("ex::diffthis", Keys(":diffthis")),
+    p("ex::diffoff", Keys(":diffoff")),
+    p("ex::grep", Keys(":grep")),
+    p("ex::vimgrep", Keys(":vimgrep")),
+    p("ex::copen", Keys(":copen")),
+    p("ex::cclose", Keys(":cclose")),
+    p("ex::cn", Keys(":cn")),
+    p("ex::cp", Keys(":cp")),
+    p("ex::cc", Keys(":cc")),
+    p("ex::cd {path}", Keys(":cd")),
+    p("ex::colorscheme", Keys(":colorscheme")),
+    p("ex::make", Keys(":make")),
+    p("ex::b {name}", Label("ex:b by name")),
+    p("ex::Explore", Keys(":Explore")),
+    p("ex::Ex", Keys(":Ex")),
+    p("ex::Sexplore", Keys(":Sexplore")),
+    p("ex::Sex", Keys(":Sex")),
+    p("ex::Vexplore", Keys(":Vexplore")),
+    p("ex::Vex", Keys(":Vex")),
+];
+
+// ---------------------------------------------------------------------------
+// COVERAGE_EXEMPT — this list may only ever SHRINK.
+//
+// **217 of the 563 commands `VIM_COMPATIBILITY.md` marks ✅/⚠️ have no oracle
+// case at all** (38.5%; 346 are covered). That number is the measurement this
+// gate exists to produce, and it is the first one anybody has taken: the doc
+// itself reads "422/424, 100% — Remaining Missing Commands: None", which is a
+// claim about *existence*, and `COVERAGE_PHASE5.md` audits 2 of 6 areas.
+//
+// Where the gap is, at a glance (uncovered / in-scope, seeded 2026-09):
+//
+//     Core Vim ex commands       84/111  :w :q :bn :ls :marks :grep …
+//     Window commands (CTRL-W)   33/33   nothing in the corpus presses <C-w>
+//     g-commands                 23/50   gt gT gf gF ga g8 gx gR g@ g+ g- …
+//     Bracket commands           17/26   ]c [c ]d [d [m ]m [* ]* [# ]# …
+//     Normal — other             16/34   gt gT gf gF K ga g8 gx q: q/ q? …
+//     Text objects               10/32   every closing-bracket alias, a' a`
+//     Operator-pending           10/59   d{ d} d; d, dF dT and the o_ forces
+//     z-commands                 10/28   zA zF zv zx zh zl zH zL ze zs
+//     Normal — search & marks     4/31   // /<CR> aliases, `{A-Z}, '<, g' g`
+//     Normal — movement           4/48   l g0 gm gM
+//     Visual mode                 3/38   P, CTRL-X, g CTRL-X
+//     Insert mode                 2/23   CTRL-@, CTRL-G j/k
+//     Normal — editing            1/50   [p
+//
+// Deleting an entry is how an oracle case proves itself: the gate fails if a
+// listed id's probe starts matching, and fails if an unlisted id's probe
+// matches nothing. Never add an entry to paper over a deleted case.
+// ---------------------------------------------------------------------------
+
+const COVERAGE_EXEMPT: &[&str] = &[
+    // --- Insert Mode (ins) ---
+    "ins:CTRL-@",
+    "ins:CTRL-G j/k",
+    // --- Normal Mode - Movement (move) ---
+    "move:l",
+    "move:g0",
+    "move:gm",
+    "move:gM",
+    // --- Normal Mode - Editing (edit) ---
+    "edit:[p",
+    // --- Normal Mode - Search & Marks (search) ---
+    "search:`{A-Z}",
+    "search:'<",
+    "search:g'",
+    "search:g`",
+    // --- Normal Mode - Other (other) ---
+    "other:gt",
+    "other:gT",
+    "other:gf",
+    "other:gF",
+    "other:K",
+    "other:ga",
+    "other:g8",
+    "other:gx",
+    "other:CTRL-^",
+    "other:CTRL-]",
+    "other:CTRL-G",
+    "other:do",
+    "other:dp",
+    "other:q:",
+    "other:q/",
+    "other:q?",
+    // --- Text Objects (textobj) ---
+    "textobj:a'",
+    "textobj:a`",
+    "textobj:i)",
+    "textobj:a)",
+    "textobj:i}",
+    "textobj:a}",
+    "textobj:i]",
+    "textobj:a]",
+    "textobj:i>",
+    "textobj:a>",
+    // --- g-Commands (g) ---
+    "g:g0",
+    "g:g<Home>",
+    "g:g^",
+    "g:g$",
+    "g:g<End>",
+    "g:gf",
+    "g:gF",
+    "g:gt",
+    "g:gT",
+    "g:g<Tab>",
+    "g:g.",
+    "g:gx",
+    "g:ga",
+    "g:g8",
+    "g:gm",
+    "g:gM",
+    "g:g@{motion}",
+    "g:g+",
+    "g:g-",
+    "g:gR",
+    "g:g'",
+    "g:g`",
+    "g:gh",
+    // --- z-Commands (z) ---
+    "z:zA",
+    "z:zF",
+    "z:zv",
+    "z:zx",
+    "z:zh",
+    "z:zl",
+    "z:zH",
+    "z:zL",
+    "z:ze",
+    "z:zs",
+    // --- Window Commands (CTRL-W) (win) ---
+    "win:CTRL-W h",
+    "win:CTRL-W j",
+    "win:CTRL-W k",
+    "win:CTRL-W l",
+    "win:CTRL-W w",
+    "win:CTRL-W W",
+    "win:CTRL-W c",
+    "win:CTRL-W o",
+    "win:CTRL-W s",
+    "win:CTRL-W v",
+    "win:CTRL-W e/E",
+    "win:CTRL-W +",
+    "win:CTRL-W -",
+    "win:CTRL-W <",
+    "win:CTRL-W >",
+    "win:CTRL-W =",
+    "win:CTRL-W _",
+    "win:CTRL-W \\|",
+    "win:CTRL-W H",
+    "win:CTRL-W J",
+    "win:CTRL-W K",
+    "win:CTRL-W L",
+    "win:CTRL-W T",
+    "win:CTRL-W x",
+    "win:CTRL-W r",
+    "win:CTRL-W R",
+    "win:CTRL-W p",
+    "win:CTRL-W n",
+    "win:CTRL-W t",
+    "win:CTRL-W b",
+    "win:CTRL-W q",
+    "win:CTRL-W f",
+    "win:CTRL-W d",
+    // --- Bracket Commands (bracket) ---
+    "bracket:]c",
+    "bracket:[c",
+    "bracket:]d",
+    "bracket:[d",
+    "bracket:[p",
+    "bracket:[]",
+    "bracket:][",
+    "bracket:[m",
+    "bracket:]m",
+    "bracket:[M",
+    "bracket:]M",
+    "bracket:[*",
+    "bracket:]*",
+    "bracket:[/",
+    "bracket:]/",
+    "bracket:[#",
+    "bracket:]#",
+    // --- Operator-Pending Mode (oppend) ---
+    "oppend:g_",
+    "oppend:F",
+    "oppend:T",
+    "oppend:;",
+    "oppend:,",
+    "oppend:{",
+    "oppend:}",
+    "oppend:a'",
+    "oppend:a`",
+    "oppend:o_V",
+    // --- Visual Mode (visual) ---
+    "visual:P",
+    "visual:CTRL-X",
+    "visual:g CTRL-X",
+    // --- Core Vim Ex Commands (ex) ---
+    "ex::w",
+    "ex::write",
+    "ex::q",
+    "ex::quit",
+    "ex::q!",
+    "ex::wq",
+    "ex::x",
+    "ex::qa",
+    "ex::qa!",
+    "ex::wa",
+    "ex::wqa",
+    "ex::xa",
+    "ex::edit",
+    "ex::enew",
+    "ex::bn",
+    "ex::bp",
+    "ex::b#",
+    "ex::b {N}",
+    "ex::bd",
+    "ex::bdelete",
+    "ex::ls",
+    "ex::buffers",
+    "ex::sp",
+    "ex::vs",
+    "ex::close",
+    "ex::only",
+    "ex::new",
+    "ex::vnew",
+    "ex::tabe",
+    "ex::tabclose",
+    "ex::tabnext",
+    "ex::tabprevious",
+    "ex::tabmove",
+    "ex::delete",
+    "ex::move",
+    "ex::copy",
+    "ex::join",
+    "ex::yank",
+    "ex::norm",
+    "ex::nohlsearch",
+    "ex::read",
+    "ex::reg",
+    "ex::registers",
+    "ex::marks",
+    "ex::jumps",
+    "ex::changes",
+    "ex::history",
+    "ex::echo {text}",
+    "ex::pwd",
+    "ex::file",
+    "ex::=",
+    "ex::#",
+    "ex::number",
+    "ex::print",
+    "ex::ma",
+    "ex::saveas {file}",
+    "ex::update",
+    "ex::cquit",
+    "ex::version",
+    "ex::help",
+    "ex::h",
+    "ex::windo {cmd}",
+    "ex::bufdo {cmd}",
+    "ex::tabdo {cmd}",
+    "ex::diffsplit",
+    "ex::diffthis",
+    "ex::diffoff",
+    "ex::grep",
+    "ex::vimgrep",
+    "ex::copen",
+    "ex::cclose",
+    "ex::cn",
+    "ex::cp",
+    "ex::cc",
+    "ex::cd {path}",
+    "ex::colorscheme",
+    "ex::make",
+    "ex::b {name}",
+    "ex::Explore",
+    "ex::Ex",
+    "ex::Sexplore",
+    "ex::Sex",
+    "ex::Vexplore",
+    "ex::Vex",
+];
+
+// ---------------------------------------------------------------------------
 // Oracle version (#865, #872) — deliberately adjacent to KNOWN_DEVIATIONS
 // above, because a deviation list is only meaningful against the oracle that
 // produced it. If you regenerate the list, move `DEVIATIONS_ORACLE` in the
@@ -6768,4 +8240,328 @@ fn nvim_version_parses_release_and_dev_banners() {
     assert_eq!(parse_nvim_version("NVIM\n"), None);
     assert_eq!(parse_nvim_version("some other tool 1.2.3\n"), None);
     assert_eq!(parse_nvim_version("NVIM vX.Y.Z\n"), None);
+}
+
+/// #1007 — the shrink-only coverage ratchet. Pure: no `nvim`, no subprocess,
+/// so it runs on every lane including `--no-default-features` and a laptop
+/// with no oracle installed.
+#[test]
+fn conformance_corpus_covers_every_implemented_command() {
+    // `include_str!` (not a runtime read) so editing the doc rebuilds this
+    // test, and so it works from any CWD.
+    let doc = include_str!("../VIM_COMPATIBILITY.md");
+    let commands = parse_compatibility_doc(doc).unwrap_or_else(|e| panic!("{e}"));
+    let cases = all_corpus_cases();
+
+    // Regeneration aid, mirroring CONFORMANCE_DUMP_DEVIATIONS: dump the parsed
+    // command inventory and the corpus's (label, keys) pairs as TSV so a human
+    // re-seeding COMMAND_PROBES has the raw material, instead of re-deriving it
+    // by eye from a 6,700-line file.
+    //
+    //   CONFORMANCE_DUMP_COVERAGE=/tmp/cov.tsv \
+    //     cargo test --no-default-features --test nvim_conformance \
+    //       conformance_corpus_covers
+    if let Ok(path) = std::env::var("CONFORMANCE_DUMP_COVERAGE") {
+        let mut s = String::new();
+        for c in &commands {
+            s.push_str(&format!(
+                "CMD\t{}\t{:?}\tVIM_COMPATIBILITY.md:{}\n",
+                c.id, c.status, c.line
+            ));
+        }
+        for (label, keys) in &cases {
+            s.push_str(&format!("CASE\t{label}\t{keys}\n"));
+        }
+        std::fs::write(&path, s).unwrap_or_else(|e| panic!("dump to {path}: {e}"));
+        return;
+    }
+
+    let verdict = classify_coverage(&commands, COMMAND_PROBES, COVERAGE_EXEMPT, &cases);
+    let in_scope = commands.iter().filter(|c| c.status.in_scope()).count();
+    let exempt = COVERAGE_EXEMPT.len();
+
+    assert!(
+        verdict.is_clean(),
+        "\n== conformance coverage ratchet (#1007) =={}\n\
+         COVERAGE_EXEMPT may only ever SHRINK. See COMMAND_PROBES in this file\n\
+         for what each id's probe means.\n",
+        verdict.report()
+    );
+
+    // The headline this gate exists to produce. Printed under libtest's capture
+    // (see `print_unmissable`) so a plain `cargo test` shows it on a *passing*
+    // run, which is the run it is about.
+    print_unmissable(&format!(
+        "\n  conformance coverage: {covered}/{in_scope} implemented commands have \
+         an oracle case ({pct}%), {exempt} in COVERAGE_EXEMPT ({cases} cases)\n",
+        covered = in_scope - exempt,
+        pct = (in_scope - exempt) * 100 / in_scope.max(1),
+        cases = cases.len(),
+    ));
+}
+
+/// The ratchet's two directions, on **synthetic** input so each is observed
+/// failing. A gate that has never been seen to fail is not a gate (#553).
+#[test]
+fn coverage_ratchet_is_bidirectional() {
+    let commands = vec![
+        DocCommand {
+            id: "z:za".to_string(),
+            line: 10,
+            status: DocStatus::Implemented,
+        },
+        DocCommand {
+            id: "win:CTRL-W h".to_string(),
+            line: 11,
+            status: DocStatus::Implemented,
+        },
+        DocCommand {
+            id: "ins:CTRL-K".to_string(),
+            line: 12,
+            status: DocStatus::NotApplicable,
+        },
+    ];
+    let probes = [
+        p("z:za", Label("fold:za closes")),
+        p("win:CTRL-W h", Keys("<C-w>h")),
+    ];
+    let exempt = ["win:CTRL-W h"];
+    let cases = [("fold:za closes", "zfjzozaj")];
+
+    // Steady state: the covered id has a case, the exempt id has none.
+    let steady = classify_coverage(&commands, &probes, &exempt, &cases);
+    assert!(steady.is_clean(), "steady state should pass: {steady:?}");
+
+    // Direction 1 — the entry is deleted but no case was added. Must fail, and
+    // must name the command, not just a count.
+    let deleted = classify_coverage(&commands, &probes, &[], &cases);
+    assert_eq!(deleted.uncovered.len(), 1);
+    assert!(deleted.uncovered[0].starts_with("win:CTRL-W h"));
+    assert!(deleted.uncovered[0].contains("<C-w>h"));
+    assert!(!deleted.is_clean());
+
+    // Direction 2 — a case is added for an exempt command and the entry is left
+    // in place. Must fail until the entry is deleted.
+    let cases_plus = [
+        ("fold:za closes", "zfjzozaj"),
+        ("win:C-w h focuses left", "<C-w>hx"),
+    ];
+    let improved = classify_coverage(&commands, &probes, &exempt, &cases_plus);
+    assert_eq!(improved.newly_covered.len(), 1);
+    assert!(improved.newly_covered[0].starts_with("win:CTRL-W h"));
+    assert!(improved.newly_covered[0].contains("win:C-w h focuses left"));
+    assert!(!improved.is_clean());
+    // …and deleting it then passes, so the list really can shrink.
+    let shrunk = classify_coverage(&commands, &probes, &[], &cases_plus);
+    assert!(
+        shrunk.is_clean(),
+        "after deletion it should pass: {shrunk:?}"
+    );
+
+    // A command with no probe at all is unmeasurable, not "covered".
+    let unprobed = classify_coverage(&commands, &probes[..1], &[], &cases);
+    assert_eq!(unprobed.unprobed.len(), 1);
+    assert!(unprobed.unprobed[0].starts_with("win:CTRL-W h"));
+
+    // A probe (or an exempt entry) naming a command the doc no longer marks
+    // implemented is stale — it would silently excuse the id if it came back.
+    let stale = classify_coverage(
+        &commands,
+        &[p("z:za", Label("fold:za closes")), p("z:zzz", Keys("zzz"))],
+        &["z:zzz"],
+        &cases,
+    );
+    assert_eq!(stale.stale_probes, vec!["z:zzz"]);
+    assert_eq!(stale.stale_exempt, vec!["z:zzz"]);
+    assert!(!stale.is_clean());
+
+    // N/A rows are out of scope: no probe needed, and no complaint.
+    assert!(!classify_coverage(&commands, &probes, &exempt, &cases)
+        .unprobed
+        .iter()
+        .any(|u| u.contains("ins:CTRL-K")));
+}
+
+/// The same two directions, against the **real** tables and the real corpus —
+/// so the demonstration is not confined to a toy fixture.
+#[test]
+fn coverage_ratchet_is_bidirectional_against_the_real_corpus() {
+    let doc = include_str!("../VIM_COMPATIBILITY.md");
+    let commands = parse_compatibility_doc(doc).unwrap_or_else(|e| panic!("{e}"));
+    let cases = all_corpus_cases();
+
+    // Direction 1 — delete a real entry without adding cases.
+    let victim = "win:CTRL-W h";
+    assert!(COVERAGE_EXEMPT.contains(&victim), "fixture drifted");
+    let without: Vec<&str> = COVERAGE_EXEMPT
+        .iter()
+        .copied()
+        .filter(|e| *e != victim)
+        .collect();
+    let deleted = classify_coverage(&commands, COMMAND_PROBES, &without, &cases);
+    assert!(
+        deleted.uncovered.iter().any(|u| u.starts_with(victim)),
+        "deleting {victim:?} from COVERAGE_EXEMPT must fail the gate: {deleted:?}"
+    );
+
+    // Direction 2 — add a case for an exempt command, leave the entry alone.
+    let mut plus = cases.clone();
+    plus.push(("win:C-w h focuses the window to the left", "<C-w>hx"));
+    let improved = classify_coverage(&commands, COMMAND_PROBES, COVERAGE_EXEMPT, &plus);
+    assert!(
+        improved.newly_covered.iter().any(|u| u.starts_with(victim)),
+        "a new case for {victim:?} must fail the gate until its entry is \
+         deleted: {improved:?}"
+    );
+}
+
+/// Criterion 5 of #1007: the doc is parsed strictly. Every one of these is a
+/// row that a lenient parser would drop, understating the gap — which is the
+/// failure mode of the status quo this test replaces.
+#[test]
+fn an_unparseable_compatibility_row_fails_and_names_the_line() {
+    let cases: &[(&str, &str, &str)] = &[
+        (
+            "unknown table header",
+            "## Insert Mode\n\n| Keystroke | Status |\n|---|---|\n| `x` | ✅ |\n",
+            "unrecognised table header",
+        ),
+        (
+            "command table under an unknown heading",
+            "## Brand New Section\n\n| Command | Description | Status | Notes |\n\
+             |---|---|---|---|\n| `x` | d | ✅ | |\n",
+            "unknown heading",
+        ),
+        (
+            "wrong cell count",
+            "## Insert Mode\n\n| Command | Description | Status | Notes |\n\
+             |---|---|---|---|\n| `x` | d | ✅ |\n",
+            "expected 4",
+        ),
+        (
+            "unknown status marker",
+            "## Insert Mode\n\n| Command | Description | Status | Notes |\n\
+             |---|---|---|---|\n| `x` | d | done | |\n",
+            "unrecognised Status cell",
+        ),
+        (
+            "prose command cell that is not allowlisted",
+            "## Insert Mode\n\n| Command | Description | Status | Notes |\n\
+             |---|---|---|---|\n| arrow keys | d | ✅ | |\n",
+            "not in PROSE_ROWS",
+        ),
+        (
+            "unterminated code span",
+            "## Insert Mode\n\n| Command | Description | Status | Notes |\n\
+             |---|---|---|---|\n| `x | d | ✅ | |\n",
+            "unterminated inline code span",
+        ),
+        (
+            "duplicate command id",
+            "## Insert Mode\n\n| Command | Description | Status | Notes |\n\
+             |---|---|---|---|\n| `x` | d | ✅ | |\n| `x` | e | ✅ | |\n",
+            "duplicate command id",
+        ),
+    ];
+    for (what, doc, needle) in cases {
+        let err = parse_compatibility_doc(doc)
+            .err()
+            .unwrap_or_else(|| panic!("{what}: expected a parse failure, got Ok"));
+        assert!(
+            err.contains(needle),
+            "{what}: error should mention {needle:?}, got: {err}"
+        );
+        assert!(
+            err.starts_with("VIM_COMPATIBILITY.md:"),
+            "{what}: error must name the line, got: {err}"
+        );
+    }
+}
+
+/// …and the formatting the doc *does* use parses, rather than being papered
+/// over by a fallback. Each of these is a real row shape from the file.
+#[test]
+fn the_compatibility_doc_formatting_quirks_all_parse() {
+    let doc = "\
+## Normal Mode — Movement
+
+| Command | Description | Status | Notes |
+|---------|-------------|--------|-------|
+| `h` | Left | ✅ | |
+| `\\|` | Go to column N | ✅ | |
+| `gt` / `gT` | Next/prev tab | ✅ | |
+| `` g` `` | Mark without jumplist | ✅ | |
+| `gH` / `gV` | Select mode | N/A | No Select mode |
+| `:b {N}` | Go to buffer N | ⚠️ | By number only |
+
+**Movement: 6/6 (100%)**
+
+## Normal Mode — Editing
+
+| Command | Description | Status | Notes |
+|---------|-------------|--------|-------|
+| `x` | Delete char | ✅ | |
+
+| `y` | Yank | ✅ | after a mid-table blank line |
+";
+    let got = parse_compatibility_doc(doc).unwrap_or_else(|e| panic!("{e}"));
+    let ids: Vec<&str> = got.iter().map(|c| c.id.as_str()).collect();
+    assert_eq!(
+        ids,
+        vec![
+            "move:h",
+            // The escaped pipe survives as one cell, not three.
+            "move:\\|",
+            // `/`-joined aliases become one id each.
+            "move:gt",
+            "move:gT",
+            // A double-backtick span whose content is itself a backtick.
+            "move:g`",
+            "move:gH",
+            "move:gV",
+            "move::b {N}",
+            "edit:x",
+            // A blank line inside a table does not end it (the doc has one
+            // before the `:Explore` rows).
+            "edit:y",
+        ]
+    );
+    let scoped: Vec<&str> = got
+        .iter()
+        .filter(|c| c.status.in_scope())
+        .map(|c| c.id.as_str())
+        .collect();
+    // N/A drops out of scope; ⚠️ stays in — a partial implementation is exactly
+    // the kind that benefits from an oracle case.
+    assert!(!scoped.contains(&"move:gH"));
+    assert!(scoped.contains(&"move::b {N}"));
+}
+
+/// The real doc parses, and the in-scope command count matches what
+/// COMMAND_PROBES was seeded against — so a doc edit that changes the
+/// inventory is a visible, reviewable change here rather than silent drift.
+#[test]
+fn the_real_compatibility_doc_parses_with_no_dropped_rows() {
+    let doc = include_str!("../VIM_COMPATIBILITY.md");
+    let commands = parse_compatibility_doc(doc).unwrap_or_else(|e| panic!("{e}"));
+    let in_scope = commands.iter().filter(|c| c.status.in_scope()).count();
+    assert_eq!(
+        in_scope,
+        COMMAND_PROBES.len(),
+        "every in-scope command needs exactly one COMMAND_PROBES entry"
+    );
+    // Sanity floor: the doc's own Summary claims 422 implemented *rows*, and
+    // rows carrying `/`-joined aliases expand to more than one command each.
+    assert!(
+        in_scope > 422,
+        "expected more command ids than the doc's 422 rows, got {in_scope}"
+    );
+    // Every PROSE_ROWS entry must still correspond to a real row, or it is a
+    // stale allowlist entry that would start swallowing a future prose row.
+    for (id, _) in PROSE_ROWS {
+        assert!(
+            commands.iter().any(|c| c.id == *id),
+            "stale PROSE_ROWS entry {id:?}"
+        );
+    }
 }
