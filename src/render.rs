@@ -10616,17 +10616,41 @@ pub fn build_minimap_data(
     for (i, l) in lines.iter().enumerate() {
         sampled_at.entry(l.line_idx).or_insert(i);
     }
-    // #1030: the colour grid's raw-column budget comes from the strip this
-    // rasteriser actually paints (`rect.width`, already in the caller's own
-    // unit — cells for TUI, pixels for GTK), not a fixed constant. TUI's
-    // braille cell packs `MINIMAP_COLS_PER_CELL` (2) raw columns per
-    // painted cell, so `rect.width` cells of TUI strip only ever consults
-    // `rect.width * 2` raw columns — the previous hardcoded 200-cell grid
-    // covered a character range 8-16x wider than any TUI strip actually
-    // paints, silently generating aggregated cells nothing ever reads.
-    // GTK's strip is dozens to hundreds of pixels wide, so the same
-    // formula lands comfortably above `COLUMN_CAPACITY` (quadraui's own
-    // per-row paint-walk cap) there too.
+    // #1030 (review round 2): the colour grid's raw-column budget comes
+    // from the strip this rasteriser actually paints, not a fixed
+    // constant — but `rect.width` alone cannot answer that for both
+    // backends, because it is in the *caller's own unit*
+    // (`RenderedMinimap::rect`'s doc comment: cells for TUI, pixels for
+    // GTK) and the two backends do not turn that unit into painted
+    // columns the same way:
+    //
+    // - TUI's braille cell packs `MINIMAP_COLS_PER_CELL` (2) raw columns
+    //   per painted cell, so `rect.width` cells of TUI strip consult
+    //   exactly `rect.width * 2` raw columns — `rect.width` really is a
+    //   column count here, and the formula is dimensionally exact.
+    // - GTK's rasteriser (`quadraui::gtk::minimap::draw_minimap`) does
+    //   *not* scale its per-row paint walk with `rect.width`'s pixel value
+    //   at all: every row is capped at a fixed
+    //   `quadraui::primitives::minimap::COLUMN_CAPACITY` (120) character
+    //   columns regardless of how wide the strip is in pixels (see that
+    //   constant's doc comment upstream). There is no formula that
+    //   converts GTK's `rect.width` (px) into "columns painted" — the two
+    //   are unrelated — so treating `rect.width` as a column count for GTK
+    //   the way the first version of this fix did was wrong: at
+    //   `MINIMAP_MIN_PX` (48) it produced a grid of only 96 raw columns,
+    //   under the 120 GTK's own paint walk can reach.
+    //
+    // Rather than branch on backend identity here (Platform-Neutrality
+    // Rule — this is shared code, not per-backend wiring), take the max of
+    // both backends' real requirements: TUI's exact
+    // `rect.width * COLS_PER_CELL` and GTK's fixed `COLUMN_CAPACITY`. An
+    // overestimate only ever costs unreachable aggregation work (bounded,
+    // and far smaller than the old flat 400 either backend ever hit); an
+    // underestimate silently drops colour data for columns a backend does
+    // paint (#990). GTK's real requirement (120) is a constant, so it is
+    // always included in the max — GTK is correct unconditionally,
+    // independent of `rect.width`'s pixel value — while TUI stays as tight
+    // as the strip it actually paints whenever that exceeds 120.
     //
     // Columns are **not** compressed to fit — quadraui#993 (landed in the
     // pin this issue also bumps) made the TUI dot rasteriser stop
@@ -10639,9 +10663,11 @@ pub fn build_minimap_data(
     // wrong (too large to matter, never too small to drop anything in the
     // visible range), so right-sizing it changes nothing about *which*
     // columns are visible, only how much unreachable aggregation work the
-    // old 200-cell grid wasted on columns TUI's `width_cells`-bounded
-    // paint loop was never going to query.
-    let visible_span_cols = ((rect.width.round().max(1.0)) as usize * MINIMAP_COLS_PER_CELL).max(1);
+    // old 200-cell grid wasted on columns neither backend's paint loop was
+    // ever going to query.
+    let visible_span_cols = ((rect.width.round().max(1.0)) as usize * MINIMAP_COLS_PER_CELL)
+        .max(quadraui::primitives::minimap::COLUMN_CAPACITY)
+        .max(1);
 
     let mut raw_spans: Vec<quadraui::SyntaxSpan> = Vec::new();
     for (start, end, scope) in &buffer_state.highlights {

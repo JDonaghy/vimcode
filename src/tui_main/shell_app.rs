@@ -17718,8 +17718,19 @@ mod tests {
     /// behind it" is the bar this test now holds.
     ///
     /// **RED against unfixed `develop`:** confirmed by running this
-    /// scenario against the unbumped pin — `colors.len()` is `1` (the
-    /// stretched-dot fallback above), not the `0` asserted below.
+    /// scenario against the unbumped pin (`ed402b4`, pre-quadraui#993) with
+    /// its `KNOWN_BUGS` entry removed — the `colors.is_empty()` assertion
+    /// below fails with:
+    ///
+    /// ```text
+    /// a line indented past the minimap strip's own real width must paint
+    /// no dots at all, not dots stretched into view and painted in a
+    /// fallback colour that doesn't belong to them (400 highlights exist
+    /// for this buffer) — got 1: {"Rgb(229, 229, 229)": 80}
+    /// ```
+    ///
+    /// — `colors.len() == 1`, the stretched-dot fallback colour described
+    /// above, not the `0` this scenario now asserts.
     #[test]
     fn minimap_paints_syntax_colour_for_indented_code() {
         // Ungated, and the reason this test can't be green for the wrong
