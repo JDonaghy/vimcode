@@ -2181,7 +2181,7 @@ mod issue_987_group_scrollbar_inert_and_click_resizes {
     /// resizes" half entirely.
     fn engine_two_groups(tag: &str, focus_left: bool) -> (Engine, WindowId, WindowId) {
         let mut engine = Engine::new_for_test();
-        engine.settings.use_nerd_fonts = false;
+        engine.settings.use_nerd_fonts = Some(false);
         engine.settings.minimap = false;
 
         let buf_left = engine.active_buffer_id();

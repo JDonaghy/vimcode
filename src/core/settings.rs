@@ -410,16 +410,21 @@ pub struct Settings {
     ///
     /// Backend-derived (issue #999): `None` means "inherit from the running
     /// backend" and is resolved live by the [`Settings::use_nerd_fonts`]
-    /// accessor method — GUI backends (GTK, macOS, Win-GUI) bundle Symbols
-    /// Nerd Font 3.5.1 and install/register it at startup
+    /// accessor method — GTK and macOS bundle Symbols Nerd Font 3.5.1 and
+    /// install/register it at startup
     /// (`app_support::install_bundled_icon_font`,
     /// `render::register_nerd_font_fallback`), so the glyphs are guaranteed
     /// available regardless of what the user has installed, on every OS —
-    /// GUI therefore inherits `true` unconditionally. The TUI renders
-    /// through the user's terminal emulator, which uses its own configured
-    /// font; there is no reliable way to detect that font's glyph coverage
-    /// from inside the terminal (a CSI-6n width probe measures advance, not
-    /// whether a real glyph painted — see the issue), so the TUI keeps the
+    /// those two backends therefore inherit `true` unconditionally. Win-GUI
+    /// shares the same bundled font in principle but has two open,
+    /// unverified bugs (vimcode#178, vimcode#161) suggesting its font
+    /// resolution path may not actually work yet, and there is no Windows
+    /// host in this project's fleet to check — so it keeps the conservative
+    /// guess until those are confirmed fixed. The TUI renders through the
+    /// user's terminal emulator, which uses its own configured font; there
+    /// is no reliable way to detect that font's glyph coverage from inside
+    /// the terminal (a CSI-6n width probe measures advance, not whether a
+    /// real glyph painted — see the issue), so the TUI also keeps the
     /// previous conservative `target_os`-based guess and offers
     /// `:CheckNerdFonts` for the user to check by eye instead. `Some(_)` is
     /// an explicit user override that always wins, including across a
@@ -502,19 +507,31 @@ fn default_hover_delay() -> u32 {
 /// TUI assumption) so a caller that forgets to opt in gets today's
 /// behavior rather than a false "glyphs available".
 ///
-/// GUI is uniform across GTK/macOS/Win-GUI rather than singling Win-GUI
-/// out: `App`'s `impl quadraui::ShellApp` is the one shared implementation
-/// all three GUI backends run (`src/app.rs`), so there is no per-backend
-/// hook to special-case just Win-GUI without adding per-backend code —
-/// forbidden by this repo's Platform-Neutrality Rule. vimcode#178 (diff
-/// toolbar arrows render as `?`) and vimcode#161 (tree-sized icon font)
-/// track whether the DirectWrite fallback path fully resolves on Win-GUI;
-/// those are separate rendering bugs to fix at the font-resolution layer,
-/// not a reason to carve an exception into this default.
+/// GUI is uniform across GTK/macOS/Win-GUI *except* on Windows itself:
+/// `App`'s `impl quadraui::ShellApp` is the one shared implementation all
+/// three GUI backends run (`src/app.rs`), so there is no per-backend hook
+/// to special-case just Win-GUI without adding per-backend code — this
+/// `cfg!(target_os = "windows")` check lives here in core, mirroring the
+/// TUI branch below, rather than in `src/gtk/`/`src/tui_main/`, so it does
+/// not run afoul of this repo's Platform-Neutrality Rule. The reason it
+/// exists at all: vimcode#178 (diff toolbar arrows render as `?`) and
+/// vimcode#161 (tree-sized icon font) are open evidence that Win-GUI's
+/// DirectWrite fallback path may not fully resolve the bundled font yet,
+/// and there is no Windows host anywhere in this project's fleet to verify
+/// it either way. Per the issue: "if Win-GUI genuinely can't resolve it
+/// yet, leave it off and say so" — so Win-GUI keeps the pre-#999
+/// conservative guess until #178/#161 confirm the font path actually
+/// works, while GTK/macOS (verified to bundle and resolve the font) get
+/// the new `true` default on every OS they run on.
 fn default_use_nerd_fonts(gui: bool) -> bool {
-    if gui {
-        // GUI bundles the font (`app_support::ICON_FONT_BYTES`) and
-        // installs/registers it at startup — always available.
+    if gui && cfg!(target_os = "windows") {
+        // Win-GUI: see the doc comment above — #178/#161 are open,
+        // unverified evidence that the bundled font may not resolve here,
+        // so don't claim it's available until they're confirmed fixed.
+        false
+    } else if gui {
+        // GTK/macOS bundle the font (`app_support::ICON_FONT_BYTES`) and
+        // install/register it at startup — always available.
         true
     } else {
         // TUI: on Windows, terminal fonts (Consolas, Cascadia Mono) don't

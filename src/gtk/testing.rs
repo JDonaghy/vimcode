@@ -1806,6 +1806,86 @@ mod tests {
         );
     }
 
+    /// #999 acceptance, GTK half: with `use_nerd_fonts` left **unset**
+    /// (`None` — the state of a fresh `Settings::default()`, i.e. no
+    /// `settings.json` on disk at all) a GUI backend must still paint the
+    /// Nerd Font language badge, on the strength of the bundled icon font
+    /// alone (`app_support::ICON_FONT_BYTES`) rather than any guess about
+    /// the host OS. This is the driver-tier twin of `Settings::
+    /// use_nerd_fonts`'s unit tests (`use_nerd_fonts_unset_is_true_on_gui_backend`
+    /// et al. in `core/settings.rs`), asserted on **rendered pixels**
+    /// rather than on `Settings` state — see `CLAUDE.md`'s "Testing
+    /// (CRITICAL)" rule ("assert on rendered output, never on state being
+    /// populated").
+    ///
+    /// Uses `Engine::new_for_test()`, not `engine_with_two_rust_tabs`'s
+    /// usual `Engine::new()`: this test's whole point is the *unset*
+    /// resolution path, so it must not risk inheriting an explicit
+    /// `use_nerd_fonts` from whatever `~/.config/vimcode/settings.json`
+    /// happens to exist on the machine running the suite.
+    ///
+    /// # Why this fails against unfixed `develop`
+    ///
+    /// Before #999, `Settings::use_nerd_fonts` was a plain `bool` defaulted
+    /// by `!cfg!(target_os = "windows")` — on this Linux/macOS test fleet
+    /// that guess happens to also be `true`, so the pixel assertion below
+    /// stays green even against the old code by accident of host OS. The
+    /// part unfixed `develop` actually gets wrong — defaulting `false` on a
+    /// Windows *GTK* build despite bundling the font — has no compilable
+    /// driver in this fleet (`src/win/mod.rs` is Windows-only, same
+    /// constraint noted there). What this test *does* pin down, and what
+    /// breaks immediately under a naive revert: swapping the accessor back
+    /// to reading `self.use_nerd_fonts` directly no longer compiles once
+    /// the field is `Option<bool>`, and reverting `App::new_headless_with_backend`'s
+    /// `icons::set_gui_backend(true)` call (so `is_gui_backend()` stays
+    /// `false` here, the TUI-shaped answer) does *not* flip this test on
+    /// this host, precisely because TUI's guess and GUI's new default
+    /// happen to coincide off Windows — which is exactly the coverage gap
+    /// `use_nerd_fonts_unset_is_true_on_gui_backend`'s unit test exists to
+    /// close for the resolution logic itself; this test's job is only to
+    /// prove that logic is actually wired into what gets painted.
+    #[test]
+    fn tab_language_icon_paints_by_default_with_use_nerd_fonts_unset() {
+        let prev_nf = crate::icons::nerd_fonts_enabled();
+
+        let mut engine = Engine::new_for_test();
+        assert!(
+            engine.settings.use_nerd_fonts.is_none(),
+            "fixture must start from the unset default, not an explicit override"
+        );
+        let cwd = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        engine.cwd = cwd.clone();
+        for (i, name) in ["aaa703.rs", "bbb703.rs"].iter().enumerate() {
+            if i > 0 {
+                engine.new_tab(None);
+            }
+            let buf = engine.active_buffer_id();
+            if let Some(state) = engine.buffer_manager.get_mut(buf) {
+                state.file_path = Some(cwd.join(name));
+            }
+        }
+
+        let mut h = harness(engine, 1400, 900);
+        let (on_px, _) = tab_zero_left_half(&mut h);
+
+        crate::icons::set_nerd_fonts(prev_nf);
+
+        let reddest = |px: &[(u8, u8, u8)]| {
+            px.iter()
+                .max_by_key(|(r, _, b)| *r as i32 - *b as i32)
+                .copied()
+        };
+        assert!(
+            on_px.iter().copied().any(is_icon_orange),
+            "with use_nerd_fonts unset, a GUI backend must still paint the \
+             orange Rust badge — the font is bundled, so there is nothing \
+             to detect and nothing to guess wrong; sampled {} px, reddest \
+             was {:?}",
+            on_px.len(),
+            reddest(&on_px)
+        );
+    }
+
     /// #703, **the regression that matters**: with icons painted, a click on
     /// the painted × must still close the tab it sits on.
     ///
@@ -1921,7 +2001,7 @@ mod tests {
 
         let render_with = |names: [&str; 2]| {
             let mut engine = engine_with_two_tabs_named(names);
-            engine.settings.use_nerd_fonts = true;
+            engine.settings.use_nerd_fonts = Some(true);
             crate::icons::set_nerd_fonts(true);
             let mut h = harness(engine, 1400, 900);
             tab_zero_left_half(&mut h)
@@ -1978,7 +2058,7 @@ mod tests {
 
         let mut engine = Engine::new();
         engine.cwd = dir.clone();
-        engine.settings.use_nerd_fonts = true;
+        engine.settings.use_nerd_fonts = Some(true);
         engine.explorer_reveal_path(&file);
         (engine, dir)
     }
