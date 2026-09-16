@@ -15,7 +15,12 @@ impl Engine {
 
         let first = self.buffer().content.char(pos);
         if is_word_char(first) {
-            while pos < total_chars && is_word_char(self.buffer().content.char(pos)) {
+            let wide = is_wide_word_char(first);
+            while pos < total_chars {
+                let ch = self.buffer().content.char(pos);
+                if !is_word_char(ch) || is_wide_word_char(ch) != wide {
+                    break;
+                }
                 pos += 1;
             }
         } else if !first.is_whitespace() {
@@ -111,7 +116,12 @@ impl Engine {
             // Landed exactly on a blank line, which Vim counts as its own
             // word — nothing more to extend backward into.
         } else if is_word_char(ch) {
-            while pos > 0 && is_word_char(self.buffer().content.char(pos - 1)) {
+            let wide = is_wide_word_char(ch);
+            while pos > 0 {
+                let prev = self.buffer().content.char(pos - 1);
+                if !is_word_char(prev) || is_wide_word_char(prev) != wide {
+                    break;
+                }
                 pos -= 1;
             }
         } else {
@@ -145,7 +155,9 @@ impl Engine {
         // Check if we're already at the end of a word
         let at_word_end = if pos + 1 < total_chars {
             let next_char = self.buffer().content.char(pos + 1);
-            (is_word_char(current_char) && !is_word_char(next_char))
+            (is_word_char(current_char)
+                && (!is_word_char(next_char)
+                    || is_wide_word_char(next_char) != is_wide_word_char(current_char)))
                 || (!is_word_char(current_char)
                     && !current_char.is_whitespace()
                     && (is_word_char(next_char) || next_char.is_whitespace()))
@@ -172,7 +184,12 @@ impl Engine {
 
         let ch = self.buffer().content.char(pos);
         if is_word_char(ch) {
-            while pos + 1 < total_chars && is_word_char(self.buffer().content.char(pos + 1)) {
+            let wide = is_wide_word_char(ch);
+            while pos + 1 < total_chars {
+                let next = self.buffer().content.char(pos + 1);
+                if !is_word_char(next) || is_wide_word_char(next) != wide {
+                    break;
+                }
                 pos += 1;
             }
         } else if !ch.is_whitespace() {
@@ -206,7 +223,12 @@ impl Engine {
         // If on whitespace, just move back one to begin searching.
         if !ch.is_whitespace() {
             if is_word_char(ch) {
-                while pos > 0 && is_word_char(self.buffer().content.char(pos - 1)) {
+                let wide = is_wide_word_char(ch);
+                while pos > 0 {
+                    let prev = self.buffer().content.char(pos - 1);
+                    if !is_word_char(prev) || is_wide_word_char(prev) != wide {
+                        break;
+                    }
                     pos -= 1;
                 }
             } else {
@@ -4782,6 +4804,58 @@ impl Engine {
         self.message = "1 line yanked".to_string();
     }
 
+    /// Advance `idx` past one "cursor cell" — a base character plus any
+    /// immediately-following zero-display-width characters (Vim's
+    /// "composing" characters: combining marks, and some Hangul jamo — a
+    /// leading consonant is full-width, but the vowel/final jamo that
+    /// combines with it is zero-width) — capped at `limit` (exclusive).
+    /// Shared by [`Engine::cluster_chars_len`] and [`Engine::cluster_count`]
+    /// so the two can't drift on what counts as one cell. (#1005)
+    ///
+    /// Reuses `quadraui::text_util::char_cell_width` (unconditionally
+    /// compiled, no feature gate) rather than re-deriving zero-width
+    /// classification locally — see the Platform-Neutrality Rule in
+    /// CLAUDE.md.
+    fn advance_one_cell(&self, mut idx: usize, limit: usize) -> usize {
+        idx += 1;
+        while idx < limit
+            && quadraui::text_util::char_cell_width(self.buffer().content.char(idx)) == 0
+        {
+            idx += 1;
+        }
+        idx
+    }
+
+    /// Length in chars of `count` "cursor cells" starting at `start`, capped
+    /// at `limit` (exclusive). `x`/`X`/`r` count *cells*, not raw
+    /// codepoints — `:h utf-8-char`, verified against `nvim`: `rX` on
+    /// `e` + U+0301 (combining acute) replaces both codepoints with a single
+    /// `X`, and `x` deletes both as one unit. (#1005)
+    pub(crate) fn cluster_chars_len(&self, start: usize, count: usize, limit: usize) -> usize {
+        let mut idx = start;
+        let mut n = 0;
+        while n < count && idx < limit {
+            idx = self.advance_one_cell(idx, limit);
+            n += 1;
+        }
+        idx - start
+    }
+
+    /// How many whole cursor cells (see [`Engine::cluster_chars_len`]) fit
+    /// between `start` and `limit` — used to fail `Nr{c}`/`Nx` the same way
+    /// Vim does when fewer than `N` cells remain on the line, rather than
+    /// only checking raw codepoint count (which would let a count that
+    /// spans a combining-mark cluster silently succeed short).
+    pub(crate) fn cluster_count(&self, start: usize, limit: usize) -> usize {
+        let mut idx = start;
+        let mut n = 0;
+        while idx < limit {
+            idx = self.advance_one_cell(idx, limit);
+            n += 1;
+        }
+        n
+    }
+
     /// Replace count characters with the replacement character
     pub(crate) fn replace_chars(&mut self, replacement: char, count: usize, changed: &mut bool) {
         let line = self.view().cursor.line;
@@ -4801,11 +4875,12 @@ impl Engine {
         };
 
         // `:h r` — the count must fit on the line, otherwise `r` fails
-        // entirely (`5rx` on `abc` changes nothing).
-        if count > available {
+        // entirely (`5rx` on `abc` changes nothing). Counted in cursor
+        // cells, not raw codepoints (#1005) — see `cluster_count`.
+        if count > self.cluster_count(char_idx, char_idx + available) {
             return;
         }
-        let to_replace = count.min(available);
+        let to_replace = self.cluster_chars_len(char_idx, count, char_idx + available);
 
         if replacement == '\n' {
             // `Nr<CR>` replaces the N characters with a SINGLE line break and
@@ -4837,15 +4912,19 @@ impl Engine {
         }
 
         if to_replace > 0 && char_idx < self.buffer().len_chars() {
-            // Build the replacement string
-            let replacement_str: String = std::iter::repeat_n(replacement, to_replace).collect();
+            // Build the replacement string — one replacement char per
+            // replaced *cell* (`count`), not per deleted codepoint
+            // (`to_replace`): a single combining-mark cluster spans several
+            // codepoints but is exactly one cell, so `rX` on it must produce
+            // one `X`, not one per codepoint (#1005).
+            let replacement_str: String = std::iter::repeat_n(replacement, count).collect();
 
             // Delete the old characters and insert the new ones
             self.delete_with_undo(char_idx, char_idx + to_replace);
             self.insert_with_undo(char_idx, &replacement_str);
 
             // Cursor on last replaced char (Neovim behavior)
-            self.view_mut().cursor.col = col + to_replace - 1;
+            self.view_mut().cursor.col = col + count - 1;
             self.clamp_cursor_col();
             *changed = true;
         }
@@ -6650,12 +6729,35 @@ pub(crate) const CLASS_NL: u8 = 0;
 pub(crate) const CLASS_BLANK: u8 = 1;
 const CLASS_WORD: u8 = 2;
 const CLASS_PUNCT: u8 = 3;
+const CLASS_WIDE: u8 = 4;
+
+/// True for "wide" (double display-cell) word characters — CJK ideographs,
+/// Hiragana, Katakana, Hangul syllables and similar East-Asian-Wide
+/// alphanumerics.
+///
+/// `is_word_char` alone (Rust's `is_alphanumeric`) does not distinguish
+/// these from ASCII/Latin/Cyrillic letters, but Vim does: verified against
+/// `nvim`, `w` on `foo日本語bar` stops between `foo` and `日本語` even though
+/// nothing separates them, while `w` on `helloжworld` (Cyrillic embedded in
+/// ASCII, both narrow) does not stop there at all — the whole thing is one
+/// word. `w`/`e`/`b`/`ge` and the `iw`/`aw` text objects treat a transition
+/// between narrow-word and wide-word as a boundary the same way they treat a
+/// word/punctuation transition. (#1005)
+///
+/// Reuses `quadraui::text_util::is_wide_char` (unconditionally compiled, no
+/// feature gate) rather than re-deriving East Asian Width locally — see the
+/// Platform-Neutrality Rule in CLAUDE.md.
+pub(crate) fn is_wide_word_char(c: char) -> bool {
+    is_word_char(c) && quadraui::text_util::is_wide_char(c)
+}
 
 fn char_class(c: char) -> u8 {
     if c == '\n' {
         CLASS_NL
     } else if c.is_whitespace() {
         CLASS_BLANK
+    } else if is_wide_word_char(c) {
+        CLASS_WIDE
     } else if is_word_char(c) {
         CLASS_WORD
     } else {
@@ -6665,7 +6767,7 @@ fn char_class(c: char) -> u8 {
 
 fn bigword_class(c: char) -> u8 {
     match char_class(c) {
-        CLASS_PUNCT => CLASS_WORD,
+        CLASS_PUNCT | CLASS_WIDE => CLASS_WORD,
         other => other,
     }
 }

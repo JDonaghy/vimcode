@@ -1394,8 +1394,10 @@ impl Engine {
                     let char_idx = self.buffer().line_to_char(line) + col;
                     // Calculate how many chars we can actually delete
                     let line_end = self.buffer().line_to_char(line) + content_len;
-                    let available = line_end - char_idx;
-                    let to_delete = count.min(available);
+                    // Counted in cursor cells, not raw codepoints (#1005):
+                    // `x` on a combining-mark cluster deletes the whole
+                    // cluster as one cell, matching `nvim`.
+                    let to_delete = self.cluster_chars_len(char_idx, count, line_end);
 
                     if to_delete > 0 && char_idx < self.buffer().len_chars() {
                         // Save deleted chars to register (characterwise)
