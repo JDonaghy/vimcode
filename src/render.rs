@@ -10440,7 +10440,13 @@ const MINIMAP_LINES_PER_ROW: usize = 4;
 /// Buffer columns folded into one aggregated colour cell — quadraui's TUI
 /// braille cell width, used for both backends for the same reason as
 /// [`MINIMAP_LINES_PER_ROW`].
-const MINIMAP_COLS_PER_CELL: usize = 2;
+///
+/// `pub(crate)` since #1030 so the TUI black-box scenario
+/// (`tui_main::shell_app`'s `minimap_paints_syntax_colour_for_indented_code`)
+/// can derive "how many source columns does an N-cell braille strip cover"
+/// from the same constant production uses, instead of hardcoding the `22`
+/// that happens to fall out of an 11-cell strip at 100x24.
+pub(crate) const MINIMAP_COLS_PER_CELL: usize = 2;
 
 /// Ceiling on how many characters into a line `build_minimap_data`'s
 /// `to_col` closure ever looks when measuring a highlight's own column.
@@ -10665,9 +10671,12 @@ pub fn build_minimap_data(
     // columns are visible, only how much unreachable aggregation work the
     // old 200-cell grid wasted on columns neither backend's paint loop was
     // ever going to query.
+    //
+    // No trailing `.max(1)`: `COLUMN_CAPACITY` (120) is a non-zero constant
+    // and is always in the max, so the result is positive by construction
+    // (review nit, fix iteration 2 — the extra clamp was unreachable).
     let visible_span_cols = ((rect.width.round().max(1.0)) as usize * MINIMAP_COLS_PER_CELL)
-        .max(quadraui::primitives::minimap::COLUMN_CAPACITY)
-        .max(1);
+        .max(quadraui::primitives::minimap::COLUMN_CAPACITY);
 
     let mut raw_spans: Vec<quadraui::SyntaxSpan> = Vec::new();
     for (start, end, scope) in &buffer_state.highlights {

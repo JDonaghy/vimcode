@@ -168,3 +168,120 @@ instantiation on an ordinary Linux host") is unmet until this lands.
 and known to be inert, on every host but real Windows. Leave #928 open
 behind this one per `GOALS.md`'s milestone-discipline rule; do not treat
 the double gate as a workaround that closes the gap.
+
+---
+
+## TUI minimap has no horizontal downsampling (blocks vimcode#1030 deliverable 2)
+
+**Title:** `tui::minimap` hardcodes one source column per braille dot column
+(`COLS_PER_CELL = 2`), so a VS-Code-proportioned TUI strip can only ever
+represent ~22 source columns
+
+**Body:**
+
+vimcode#1030 (the fix issue for vimcode#990) asked for the TUI minimap to
+keep painting syntax colour for deeply-indented code. Its written
+deliverable 2 is verbatim: *"Colour must survive at indent 40 and 80, not
+only near column 0."*
+
+quadraui#993 (landed at `8abca3a`, the rev vimcode#1030 bumps to) fixed the
+real defect behind that report: the TUI dot rasteriser used to normalise
+each line by its own `chars().len()`, so a deeply-indented line's content
+was stretched across the whole strip and every cell painted *some* dot —
+while `cell_color`'s lookup stayed literal, found no span that far out, and
+fell back to `theme.foreground`. The symptom vimcode#990 reported ("no
+colour past column ~24") was therefore 100 fully-set braille cells painted
+in one fallback colour, with nothing real behind them. `8abca3a` makes
+`braille_char_for_cell` literal too, so dots and colour agree and a line
+wider than the strip clips instead of squeezing — VS Code's own behaviour,
+and the right fix. Confirmed on the vimcode side by
+`src/tui_main/shell_app.rs`'s
+`minimap_paints_syntax_colour_for_indented_code`.
+
+What remains is the **scale**, and it is not reachable from a host.
+`quadraui/src/tui/minimap.rs` hardcodes it:
+
+```rust
+pub const COLS_PER_CELL: usize = 2;
+
+// braille_char_for_cell:
+let dot_col = col * 2 + dc;
+let cols_per_dot = (COLS_PER_CELL / 2).max(1);   // == 1, always
+let c0 = dot_col * cols_per_dot;
+
+// cell_color: same literal grid
+let col_lo = col * COLS_PER_CELL;
+let col_hi = col_lo + COLS_PER_CELL;
+```
+
+One braille dot column is exactly one source character column, so an
+`N`-cell strip represents `2N` source columns and nothing a host passes in
+can widen that — including the `MinimapGrid` handed to `aggregate_spans`,
+which vimcode#1030 right-sized to the painted strip precisely to rule that
+out.
+
+Measured in vimcode at a 100x24 terminal with a VS-Code-proportioned strip
+(`MinimapSizing::VsCodeParity { target_cols: 12, fraction: 0.15, min: 6,
+max: 30 }`), fixture = 100 lines of `let value_N = 1;` at a given indent,
+400 tree-sitter highlights present throughout. The strip paints **11 cells
+= 22 source columns**; distinct painted dot colours by indent:
+
+```text
+indent   0   4   8  12  16  18  20 | 22  24  28  40  80
+colours  5   5   3   2   2   1   1 |  0   0   0   0   0
+dot rows 20  20  20  20  20  20  20|  0   0   0   0   0
+```
+
+Colour is correct and per-token everywhere inside `0..22` — and everything
+from column 22 on is simply not representable. Code at three indent levels
+(12 spaces) is already half-clipped and a four-level-indented block paints
+nothing at all, which is a real usability gap in its own right, not just a
+blocked acceptance criterion.
+
+**This is TUI-only, and the asymmetry is measured, not assumed.** GTK's
+rasteriser paints one 1px block per character column out to
+`primitives::minimap::COLUMN_CAPACITY` (120), and VS Code's own minimap
+reaches ~120 columns; the TUI reaches 22. The same fixture through vimcode's
+GTK driver (1400x900, 120px strip) paints **7 distinct colours at indents 0,
+20, 40 and 80** — see
+`src/gtk/testing.rs`'s
+`minimap_paints_distinct_syntax_colors_at_indentation_via_gtk_driver`. So
+vimcode#1030's deliverable 2 is satisfied literally on GTK and is
+unreachable only on TUI, and only because of the constant above.
+
+Both vimcode-side alternatives are non-options, which is why this is filed
+upstream rather than worked around (Platform-Neutrality Rule): raising
+`render::MINIMAP_TARGET_COLS_TUI` from 12 cells to the 60 needed to cover
+120 columns would hand 60 of an 80-column terminal to the minimap, and
+per-line re-normalisation is exactly the quadraui#993 bug.
+
+**Ask:** make the horizontal scale a **parameter** instead of a constant —
+e.g. a `cols_per_cell` (or `source_cols_per_dot`) carried on
+`MinimapSizing` / accepted by `tui_minimap_layout`, honoured by both
+`braille_char_for_cell` and `cell_color`, defaulting to today's `2`/`1` so
+existing hosts are unchanged. The dot side is nearly free: the code already
+derives `cols_per_dot` from `COLS_PER_CELL`, so with an effective
+`COLS_PER_CELL = 10` an 11-cell strip would cover 110 source columns at 5
+source columns per dot. Note this is a **shared** scale — the same for every
+line in the file — so quadraui#993's property is preserved, not undone: a
+4-space indent still lands at the same dot column on a short line and a long
+one. Colour follows automatically, since hosts already declare their grid's
+`cols_per_cell` to `aggregate_spans`; the host just needs to be able to read
+(or set) the effective value so its `MinimapGrid` matches what the
+rasteriser will read.
+
+**Blocks:** `JDonaghy/vimcode#1030` — deliverable 2 ("Colour must survive at
+indent 40 and 80, not only near column 0") holds on GTK (7 distinct colours
+at both indents, asserted) but is **unmet on TUI** and cannot be met there
+until this lands. Everything else in #1030 is done and verified: colour
+survives at every depth the strip can actually represent (out to its last
+cell), the aggregation grid is derived from the painted strip on both
+backends, and the clip boundary is asserted from both sides in
+`minimap_paints_syntax_colour_for_indented_code`. **Coordinator/human action
+beyond filing:** deliverable 2 needs an explicit decision on the vimcode
+issue — either amend #1030's acceptance text to the clip-not-stretch
+behaviour verified in that test, or waive the deliverable — and per
+`GOALS.md`'s milestone-discipline rule leave it open behind this issue
+rather than closing #1030 as if the criterion had been met. A worker session
+cannot make that call or edit the issue (`git`-only, no `gh`), which is why
+it is recorded here.
