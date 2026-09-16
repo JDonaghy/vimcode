@@ -217,16 +217,13 @@ Extension registry (GitHub-hosted JSON).
 ## vim_regex.rs — 854 lines
 Vim pattern → Rust `regex` translation (#801). The single translation point for
 `/`, `?`, `:s`, `:g` and the ex `/pat/` address. Rejects patterns it cannot
-express (look-around, `\&`, `\_x`) rather than falling back to literal matching.
-Patterns containing a `\1`…`\9` back-reference compile with `fancy-regex`
-instead of `regex`, which cannot express them at all (#1004).
+express (back-references, look-around, `\&`, `\_x`) rather than falling back to
+literal matching.
 ### Types
 - `Magic` — `\v` / `\m` / `\M` / `\V`
 - `CaseOverride` — `\c` / `\C`
-- `Translation` — Rust regex source + case override + `\zs`/`\ze` span group + Vim→Rust group map + `has_backref`
-- `CompiledRegex` — `Fast(regex::Regex)` | `Backref(fancy_regex::Regex)`
-- `Captures` / `CapMatch` — one match and its groups, uniform across both engines
-- `Compiled` — a `CompiledRegex` plus the span group and group map; `is_match` / `captures` / `captures_at` / `match_spans` dispatch over the two engines
+- `Translation` — Rust regex source + case override + `\zs`/`\ze` span group + Vim→Rust group map
+- `Compiled` — compiled `regex::Regex` plus the span group and group map
 ### Key Functions
 - `translate(pattern, magic, last_sub) -> Result<Translation, String>` — pure translation
 - `compile(pattern, ignorecase, smartcase, smartcase_applies, last_sub) -> Result<Compiled, String>` — translate + apply case options + compile
