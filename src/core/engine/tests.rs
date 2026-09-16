@@ -1184,6 +1184,106 @@ fn test_word_end() {
     assert_eq!(engine.view().cursor.col, 10);
 }
 
+// #1005: `w`/`e`/`b`/`ge` must stop at a transition between the generic
+// ASCII/Latin/Cyrillic "word" class and "wide" (CJK/Hiragana/Katakana/Hangul)
+// word characters, even when nothing separates them — verified against
+// `nvim`: `w` on `foo日本語bar` stops between `foo` and `日本語`. Before this
+// fix, `is_word_char` (Rust's `is_alphanumeric`) treated both as the same
+// class, so `w` skipped straight over the whole line as one word.
+#[test]
+fn test_word_forward_stops_at_cjk_boundary() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "foo日本語bar");
+
+    press_char(&mut engine, 'w');
+    assert_eq!(
+        engine.view().cursor.col,
+        3,
+        "w should stop at the start of the CJK run, not skip past it"
+    );
+
+    press_char(&mut engine, 'w');
+    assert_eq!(
+        engine.view().cursor.col,
+        6,
+        "w should stop at the start of `bar`, leaving the CJK run behind"
+    );
+}
+
+/// Companion case: Cyrillic embedded in an ASCII run is *not* wide, so it
+/// must NOT break the word the way CJK does — `w` skips straight over it,
+/// matching `nvim` on `helloжworld next`.
+#[test]
+fn test_word_forward_does_not_split_on_cyrillic() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "helloжworld next");
+
+    press_char(&mut engine, 'w');
+    assert_eq!(
+        engine.view().cursor.col,
+        12,
+        "Cyrillic is a narrow word char like Latin, so `helloжworld` is one word"
+    );
+}
+
+#[test]
+fn test_word_backward_stops_at_cjk_boundary() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "foo日本語bar");
+    press_char(&mut engine, '$');
+
+    press_char(&mut engine, 'b');
+    assert_eq!(
+        engine.view().cursor.col,
+        6,
+        "b should land at `bar`'s start"
+    );
+
+    press_char(&mut engine, 'b');
+    assert_eq!(
+        engine.view().cursor.col,
+        3,
+        "b should land at the CJK run start"
+    );
+
+    press_char(&mut engine, 'b');
+    assert_eq!(
+        engine.view().cursor.col,
+        0,
+        "b should land at `foo`'s start"
+    );
+}
+
+#[test]
+fn test_word_end_stops_at_cjk_boundary() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "foo日本語bar");
+
+    press_char(&mut engine, 'e');
+    assert_eq!(
+        engine.view().cursor.col,
+        2,
+        "e should stop at the last char of `foo`, not run into the CJK"
+    );
+}
+
+#[test]
+fn test_diw_on_cjk_run_leaves_ascii_neighbors() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "foo日本語bar");
+    engine.view_mut().cursor.col = 3; // on 日
+
+    press_char(&mut engine, 'd');
+    press_char(&mut engine, 'i');
+    press_char(&mut engine, 'w');
+
+    assert_eq!(
+        engine.buffer().to_string(),
+        "foobar",
+        "diw on the CJK run must not delete into the adjoining ASCII words"
+    );
+}
+
 #[test]
 fn test_paragraph_forward_basic() {
     let mut engine = Engine::new();
@@ -31103,5 +31203,76 @@ fn test_gp_charwise_multiline_cursor_lands_after_pasted_text() {
         engine.view().cursor.col,
         0,
         "FAIL: gp must not leave the cursor resting on the line's trailing newline"
+    );
+}
+// #1005: `x`/`rX` must treat a base character plus its trailing zero-width
+// "composing" characters (combining marks, and the vowel/final jamo half of
+// a decomposed Hangul syllable) as ONE cursor cell — verified against
+// `nvim`: `x` on `e` + U+0301 (COMBINING ACUTE ACCENT) deletes both
+// codepoints, and `rX` on the same replaces both with a single `X`, not one
+// `X` per codepoint.
+#[test]
+fn test_x_deletes_whole_combining_mark_cluster() {
+    let mut engine = Engine::new();
+    // "e" + U+0301 (COMBINING ACUTE ACCENT) + " world"
+    engine.buffer_mut().insert(0, "e\u{0301} world");
+
+    press_char(&mut engine, 'x');
+
+    assert_eq!(
+        engine.buffer().to_string(),
+        " world",
+        "x must delete the base char AND its combining mark as one cell"
+    );
+    assert_eq!(engine.view().cursor.col, 0);
+}
+
+#[test]
+fn test_rx_replaces_whole_combining_mark_cluster_with_one_char() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "e\u{0301} world");
+
+    press_char(&mut engine, 'r');
+    press_char(&mut engine, 'X');
+
+    assert_eq!(
+        engine.buffer().to_string(),
+        "X world",
+        "rX must replace the whole cluster with a single X, not one X per codepoint"
+    );
+    assert_eq!(engine.view().cursor.col, 0);
+}
+
+/// Companion case: a decomposed Hangul syllable (leading consonant +
+/// vowel jamo, U+1100 U+1161) behaves the same way — the vowel jamo is
+/// zero-width so it combines with the leading consonant into one cell, even
+/// though neither codepoint is a Unicode combining mark.
+#[test]
+fn test_x_deletes_whole_hangul_jamo_cluster() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "\u{1100}\u{1161} next");
+
+    press_char(&mut engine, 'x');
+
+    assert_eq!(
+        engine.buffer().to_string(),
+        " next",
+        "x must delete both jamo codepoints as one cell"
+    );
+}
+
+#[test]
+fn test_x_count_counts_cells_not_codepoints() {
+    let mut engine = Engine::new();
+    // Two combining-mark clusters followed by plain ascii: "e´" "e´" "z"
+    engine.buffer_mut().insert(0, "e\u{0301}e\u{0301}z");
+
+    press_char(&mut engine, '2');
+    press_char(&mut engine, 'x');
+
+    assert_eq!(
+        engine.buffer().to_string(),
+        "z",
+        "2x must delete 2 cells (4 codepoints), not 2 codepoints"
     );
 }

@@ -1594,6 +1594,108 @@ const CASES_OP: &[Case] = &[
         2,
         "d<C-v>j",
     ),
+    // ─────────────── #1005: first UTF-8 multi-byte conformance slice ───────────────
+    //
+    // Every case above this point is pure ASCII. These `mb:`-labelled cases are
+    // the corpus's first multi-byte coverage (see issue #1005). They are
+    // deliberately chosen so the STARTING cursor column never falls after a
+    // multi-byte character on the same line: the `Case.cursor_col` field is
+    // fed to Neovim as a raw BYTE offset (`nvim_win_set_cursor`) and to
+    // VimCode as a raw CHAR offset (`engine.view_mut().cursor.col`) — see
+    // `run_in_neovim`/`run_in_vimcode` above — so any starting column with a
+    // multi-byte character before it lands the two engines on genuinely
+    // different (or, on the Neovim side, invalid mid-byte) positions before a
+    // single key is even pressed. Landing *on* a multi-byte character is
+    // fine; only characters strictly *before* the start column must be
+    // single-byte. The final asserted column is held to the same rule.
+    //
+    // `dl`/`2dl` on CJK below was additionally hand-verified against a live
+    // `nvim --headless -u NONE -i NONE` run (not just this suite's own
+    // harness) per the issue's request to confirm the oracle sees what the
+    // fixture intends, not two mis-encoded buffers that coincidentally
+    // compare equal.
+    c("op:mb:x on latin-1 e-acute", &["café bar"], 1, 4, "x"),
+    c("op:mb:rX on latin-1 e-acute", &["café"], 1, 4, "rX"),
+    c("op:mb:~ on latin-1 e-acute", &["café"], 1, 4, "~"),
+    c("op:mb:s on latin-1 e-acute", &["café bar"], 1, 4, "sX<Esc>"),
+    c("op:mb:dw over latin-1 word", &["café bar"], 1, 1, "dw"),
+    c(
+        "op:mb:cw over latin-1 word",
+        &["café bar"],
+        1,
+        1,
+        "cwXXX<Esc>",
+    ),
+    c("op:mb:x on cyrillic first char", &["мир foo"], 1, 1, "x"),
+    c("op:mb:dw over cyrillic word", &["мир foo"], 1, 1, "dw"),
+    c("op:mb:rX on cyrillic", &["мир"], 1, 1, "rX"),
+    c("op:mb:x on CJK first char", &["日本語 end"], 1, 1, "x"),
+    // Hand-verified against `nvim --headless`: `dl` on `日本語` deletes
+    // exactly the first CJK character (3 bytes, 1 char), leaving `本語`.
+    c("op:mb:dl on CJK", &["日本語"], 1, 1, "dl"),
+    c("op:mb:2dl on CJK", &["日本語"], 1, 1, "2dl"),
+    c("op:mb:rX on CJK", &["日本語"], 1, 1, "rX"),
+    c(
+        "op:mb:cw over CJK word",
+        &["日本語 end"],
+        1,
+        1,
+        "cwXXX<Esc>",
+    ),
+    c(
+        "op:mb:dw ascii word before CJK run",
+        &["foo日本語bar"],
+        1,
+        1,
+        "dw",
+    ),
+    c("op:mb:x on emoji", &["😀 world"], 1, 1, "x"),
+    c("op:mb:rX on emoji", &["😀 world"], 1, 1, "rX"),
+    c("op:mb:dw over emoji word", &["😀 world"], 1, 1, "dw"),
+    c("op:mb:x on astral-plane char", &["𝄞 note"], 1, 1, "x"),
+    // Combining marks written as an escape (not literal UTF-8) plus a
+    // comment naming the codepoint, per #1005's fixture-encoding rule —
+    // a bare U+0301 in source is an invisible byte sequence otherwise.
+    c(
+        "op:mb:x deletes combining-mark cluster",
+        &["e\u{0301} world"], // "e" + U+0301 COMBINING ACUTE ACCENT
+        1,
+        1,
+        "x",
+    ),
+    c(
+        "op:mb:rX replaces combining-mark cluster with one char",
+        &["e\u{0301} world"], // "e" + U+0301 COMBINING ACUTE ACCENT
+        1,
+        1,
+        "rX",
+    ),
+    c(
+        "op:mb:x deletes decomposed hangul jamo cluster",
+        &["\u{1100}\u{1161} next"], // U+1100 HANGUL CHOSEONG KIYEOK + U+1161 HANGUL JUNGSEONG A
+        1,
+        1,
+        "x",
+    ),
+    c(
+        "op:mb:2x counts cells not codepoints",
+        &["e\u{0301}e\u{0301}z"], // two "e" + U+0301 COMBINING ACUTE ACCENT clusters, then "z"
+        1,
+        1,
+        "2x",
+    ),
+    c("op:mb:f finds latin-1 target", &["xxéyy"], 1, 1, "fé"),
+    c(
+        "op:mb:t stops before latin-1 target",
+        &["xxéyy"],
+        1,
+        1,
+        "té",
+    ),
+    c("op:mb:f finds CJK target", &["ab日cd"], 1, 1, "f日"),
+    c("op:mb:t stops before CJK target", &["ab日cd"], 1, 1, "t日"),
+    c("op:mb:0 from mid multi-byte line", &["café bar"], 1, 4, "0"),
+    c("op:mb:3| before latin-1 char", &["café"], 1, 1, "3|"),
 ];
 
 // ─────────────────────────── B. dot repeat ───────────────────────────
@@ -3408,6 +3510,16 @@ const CASES_VIS: &[Case] = &[
         1,
         "v$jyGp",
     ),
+    // #1005: first UTF-8 multi-byte cases — see the CASES_OP `mb:` block for
+    // the starting-column rule these are held to.
+    c(
+        "vis:mb:vld deletes two emoji chars",
+        &["😀😀 world"],
+        1,
+        1,
+        "vld",
+    ),
+    c("vis:mb:vld charwise over CJK", &["日本語"], 1, 1, "vld"),
 ];
 
 // ─────────────────────────── K. visual block ───────────────────────────
@@ -3572,6 +3684,30 @@ const CASES_VB: &[Case] = &[
     c("vb:V then C-v switch", &["abc", "def"], 1, 2, "Vj<C-v>d"),
     c("vb:C-v then v switch", &["abc", "def"], 1, 2, "<C-v>jvd"),
     c("vb:C-v then V", &["abc", "def"], 1, 2, "<C-v>jVd"),
+    // #1005: first UTF-8 multi-byte cases, ragged rows of differing
+    // byte/char length. Both start at col 1 (see the CASES_OP `mb:` block's
+    // doc on why). `<C-v>jjd` over this same fixture was investigated too —
+    // Vim's block mode measures in *screen* columns and widens a
+    // partially-covered wide (CJK) character out to the whole character, so
+    // a block `d` here deletes different amounts per row than a naive
+    // char-count model predicts. That is a real, separate gap (virtual/
+    // screen-column tracking for visual-block, which this engine does not
+    // have) rather than an off-by-one, so it is reported as a follow-up
+    // rather than added here — see the PR description.
+    c(
+        "vb:mb:Ix on ragged CJK rows",
+        &["日ab", "ab", "日日ab"],
+        1,
+        1,
+        "<C-v>jjIx<Esc>",
+    ),
+    c(
+        "vb:mb:$A on ragged CJK rows",
+        &["日ab", "abcd", "a"],
+        1,
+        1,
+        "<C-v>jj$Ax<Esc>",
+    ),
 ];
 
 // ─────────────────────────── L. C-a / C-x ───────────────────────────
@@ -4116,6 +4252,43 @@ const CASES_WORD: &[Case] = &[
     c("word:3e beyond", &["a b"], 1, 1, "3e"),
     c("word:w keyword vs nonkeyword @", &["a@b c"], 1, 1, "w"),
     c("word:w with iskeyword dash? -", &["a-b-c d"], 1, 1, "www"),
+    // #1005: first UTF-8 multi-byte cases — see the CASES_OP `mb:` block
+    // above for why starting columns are held to col 1 here.
+    c(
+        "word:mb:w stops at CJK boundary",
+        &["foo日本語bar"],
+        1,
+        1,
+        "w",
+    ),
+    // A companion "w does not split on cyrillic" case (`helloжworld next`)
+    // was investigated and dropped: nvim's `col()` reports byte offset 14
+    // there, this engine's char-based cursor reports 13 — the byte/char
+    // architecture gap documented in the CASES_OP `mb:` block, hit here
+    // because the Cyrillic char precedes the final cursor position rather
+    // than being it. Reported as a follow-up rather than added — see the PR
+    // description.
+    c(
+        "word:mb:e stops before CJK run",
+        &["foo日本語bar"],
+        1,
+        1,
+        "e",
+    ),
+    c(
+        "word:mb:wb round-trips ascii/CJK boundary",
+        &["foo日本語bar"],
+        1,
+        1,
+        "wb",
+    ),
+    c(
+        "word:mb:w then ge crosses back over CJK",
+        &["foo日本語bar"],
+        1,
+        1,
+        "wge",
+    ),
 ];
 
 // ─────────────────────────── O. text objects ───────────────────────────
@@ -4331,6 +4504,23 @@ const CASES_TO: &[Case] = &[
         1,
         "dap",
     ),
+    // #1005: first UTF-8 multi-byte cases. Cursor starts at col 4, on the
+    // CJK run — the preceding "foo" is pure ASCII, so col 4 is a valid
+    // starting column on both sides (see the CASES_OP `mb:` block's doc).
+    c(
+        "to:mb:diw on CJK run leaves ascii neighbors",
+        &["foo日本語bar"],
+        1,
+        4,
+        "diw",
+    ),
+    c(
+        "to:mb:daw on CJK run leaves ascii neighbors",
+        &["foo日本語bar"],
+        1,
+        4,
+        "daw",
+    ),
 ];
 
 // ─────────────────────────── P. misc ───────────────────────────
@@ -4524,6 +4714,26 @@ const CASES_MISC: &[Case] = &[
     c("misc:d then count then motion 0", &["abc def"], 1, 5, "d0"),
     c("misc:count then i on line start", &["ab"], 1, 1, "2Ix<Esc>"),
     c("misc:count then o with indent", &["  a"], 1, 1, "2ox<Esc>"),
+    // #1005: first UTF-8 multi-byte case for pure cursor-column reporting
+    // (category 7 of the issue). `$` on a line ending in a single 2-byte
+    // char is one of the few multi-byte final-column assertions that does
+    // NOT hit the byte-vs-char architecture gap documented in the CASES_OP
+    // `mb:` block: nvim's `col()` is a byte offset and this engine's cursor
+    // column is a char offset, and the two coincide here because nothing
+    // *before* the final cursor position is multi-byte (the accented char
+    // IS the final position, so only its own multi-byte-ness would matter,
+    // and a character's own width never affects the column *of* that
+    // character — only of anything after it on the line). A case built to
+    // actually cross that boundary (e.g. `$` on an all-Cyrillic line) was
+    // investigated and does diverge — see the PR description for that
+    // follow-up.
+    c(
+        "misc:mb:dollar reports column after multi-byte-final line",
+        &["café"],
+        1,
+        1,
+        "$",
+    ),
 ];
 
 // ─────────────────── H. multi-file jumplist (#985) ───────────────────
