@@ -280,6 +280,27 @@ pub struct Settings {
     #[serde(default)]
     pub joinspaces: bool,
 
+    /// When true, `<Tab>` at or before the first non-blank column of a line
+    /// advances by `'shiftwidth'` (rounded to its next stop) instead of
+    /// `'tabstop'`, and `<BS>` over leading whitespace deletes a whole
+    /// `'shiftwidth'` worth of blanks instead of one character. Corresponds
+    /// to Vim's `'smarttab'` / `'sta'`. Default **true**, matching Neovim
+    /// (real Vim defaults this **off** — see `:h 'smarttab'`); vimcode's
+    /// existing hardcoded Insert-mode Tab/BS behavior already matched
+    /// Neovim's default before this option existed, so flipping the default
+    /// would silently change behavior for every user who never touches this
+    /// setting.
+    #[serde(default = "default_smarttab")]
+    pub smarttab: bool,
+
+    /// Which numeral formats `<C-a>`/`<C-x>` (and Visual-mode `g<C-a>`)
+    /// recognize besides plain decimal: any of `"bin"`, `"octal"`, `"hex"`,
+    /// `"alpha"`. Corresponds to Vim's `'nrformats'` / `'nf'`. Default
+    /// `["bin", "hex"]`, matching Neovim (real Vim's default additionally
+    /// includes `"octal"` — see `:h 'nrformats'`).
+    #[serde(default = "default_nrformats")]
+    pub nrformats: Vec<String>,
+
     /// Highlight the line the cursor is on (default true).
     #[serde(default = "default_cursorline")]
     pub cursorline: bool,
@@ -633,6 +654,14 @@ fn default_leader() -> char {
 
 fn default_extension_registries() -> Vec<String> {
     vec![crate::core::registry::DEFAULT_REGISTRY_URL.to_string()]
+}
+
+fn default_smarttab() -> bool {
+    true
+}
+
+fn default_nrformats() -> Vec<String> {
+    vec!["bin".to_string(), "hex".to_string()]
 }
 
 fn default_colorscheme() -> String {
@@ -1025,6 +1054,8 @@ impl Default for Settings {
             scrolloff: 0,
             startofline: false,
             joinspaces: false,
+            smarttab: default_smarttab(),
+            nrformats: default_nrformats(),
             cursorline: default_cursorline(),
             window_status_line: default_window_status_line(),
             status_line_above_terminal: default_status_line_above_terminal(),
@@ -1388,6 +1419,7 @@ impl Settings {
             "smartcase" | "scs" => self.smartcase = enable,
             "startofline" | "sol" => self.startofline = enable,
             "joinspaces" | "js" => self.joinspaces = enable,
+            "smarttab" | "sta" => self.smarttab = enable,
             "cursorline" | "cul" => self.cursorline = enable,
             "windowstatusline" | "wsl" => self.window_status_line = enable,
             "statuslineaboveterminal" | "slat" => self.status_line_above_terminal = enable,
@@ -1406,7 +1438,11 @@ impl Settings {
             "minimap" => self.minimap = enable,
             "matchbrackets" => self.match_brackets = enable,
             "autopairs" => self.auto_pairs = Some(enable),
-            "nerdfonts" | "nf" => {
+            // `"nf"` is Vim's real abbreviation for `'nrformats'` (a
+            // value-option, handled in `set_value_option` below) — nerdfonts
+            // (a vimcode-only setting with no real-Vim counterpart) keeps
+            // only its full name here to avoid claiming that abbreviation.
+            "nerdfonts" => {
                 self.use_nerd_fonts = Some(enable);
                 crate::icons::set_nerd_fonts(enable);
             }
@@ -1473,6 +1509,13 @@ impl Settings {
             }
             "extension_registries" => {
                 self.extension_registries = value
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+            }
+            "nrformats" | "nf" => {
+                self.nrformats = value
                     .split(',')
                     .map(|s| s.trim().to_string())
                     .filter(|s| !s.is_empty())
@@ -1610,6 +1653,12 @@ impl Settings {
             } else {
                 "nojoinspaces".to_string()
             }),
+            "smarttab" | "sta" => Ok(if self.smarttab {
+                "smarttab".to_string()
+            } else {
+                "nosmarttab".to_string()
+            }),
+            "nrformats" | "nf" => Ok(format!("nrformats={}", self.nrformats.join(","))),
             "cursorline" | "cul" => Ok(if self.cursorline {
                 "cursorline".to_string()
             } else {
@@ -1698,7 +1747,7 @@ impl Settings {
                 self.extension_registries.join(",")
             )),
             "hover_delay" | "hd" => Ok(format!("hover_delay={}", self.hover_delay)),
-            "nerdfonts" | "nf" => Ok(if self.use_nerd_fonts() {
+            "nerdfonts" => Ok(if self.use_nerd_fonts() {
                 "nerdfonts".to_string()
             } else {
                 "nonerdfonts".to_string()
@@ -1802,6 +1851,8 @@ impl Settings {
             "scrolloff" => self.scrolloff.to_string(),
             "startofline" | "sol" => self.startofline.to_string(),
             "joinspaces" | "js" => self.joinspaces.to_string(),
+            "smarttab" | "sta" => self.smarttab.to_string(),
+            "nrformats" | "nf" => self.nrformats.join(","),
             "colorcolumn" => self.colorcolumn.clone(),
             "textwidth" => self.textwidth.to_string(),
             "hlsearch" => self.hlsearch.to_string(),
@@ -1844,7 +1895,7 @@ impl Settings {
             "match_brackets" | "matchbrackets" => self.match_brackets.to_string(),
             "auto_pairs" | "autopairs" => self.auto_pairs().to_string(),
             "hover_delay" => self.hover_delay.to_string(),
-            "use_nerd_fonts" | "nerdfonts" | "nf" => self.use_nerd_fonts().to_string(),
+            "use_nerd_fonts" | "nerdfonts" => self.use_nerd_fonts().to_string(),
             "ctrl_f_action" => self.ctrl_f_action(),
             "extension_registries" => self.extension_registries.join(", "),
             "syntax_max_lines" | "syntaxmaxlines" => self.syntax_max_lines.to_string(),
@@ -1904,6 +1955,14 @@ impl Settings {
             }
             "startofline" | "sol" => self.startofline = value == "true",
             "joinspaces" | "js" => self.joinspaces = value == "true",
+            "smarttab" | "sta" => self.smarttab = value == "true",
+            "nrformats" | "nf" => {
+                self.nrformats = value
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+            }
             "colorcolumn" => self.colorcolumn = value.to_string(),
             "textwidth" => {
                 self.textwidth = value
@@ -1973,7 +2032,7 @@ impl Settings {
                     .parse()
                     .map_err(|_| format!("Invalid hover_delay: {value}"))?;
             }
-            "use_nerd_fonts" | "nerdfonts" | "nf" => {
+            "use_nerd_fonts" | "nerdfonts" => {
                 self.use_nerd_fonts = Some(value == "true");
                 crate::icons::set_nerd_fonts(self.use_nerd_fonts());
             }
@@ -2221,6 +2280,20 @@ pub static SETTING_DEFS: &[SettingDef] = &[
         description: "Insert two spaces instead of one when J joins a line ending in '.', '!' or '?' (Vim's default; Neovim's is off)",
         category: "Editor",
         setting_type: SettingType::Bool,
+    },
+    SettingDef {
+        key: "smarttab",
+        label: "Smart Tab",
+        description: "Tab/Backspace at the start of a line use 'shift_width' instead of 'tabstop' (Vim's default is off; Neovim's is on)",
+        category: "Editor",
+        setting_type: SettingType::Bool,
+    },
+    SettingDef {
+        key: "nrformats",
+        label: "Number Formats",
+        description: "Extra numeral formats <C-a>/<C-x> recognize besides decimal: bin, octal, hex, alpha (comma-separated; Neovim's default is \"bin,hex\")",
+        category: "Editor",
+        setting_type: SettingType::StringVal,
     },
     SettingDef {
         key: "colorcolumn",
@@ -2815,6 +2888,42 @@ mod tests {
         let mut s = Settings::default();
         let msg = s.parse_set_option("ts?").unwrap();
         assert_eq!(msg, "tabstop=4");
+    }
+
+    #[test]
+    fn test_set_smarttab() {
+        let mut s = Settings::default();
+        assert!(s.smarttab);
+        s.parse_set_option("nosmarttab").unwrap();
+        assert!(!s.smarttab);
+        s.parse_set_option("sta").unwrap();
+        assert!(s.smarttab);
+    }
+
+    #[test]
+    fn test_set_nrformats_default_and_nf_alias() {
+        let mut s = Settings::default();
+        assert_eq!(s.nrformats, vec!["bin".to_string(), "hex".to_string()]);
+        let msg = s.parse_set_option("nf=bin,octal,hex").unwrap();
+        assert_eq!(msg, "nf=bin,octal,hex");
+        assert_eq!(
+            s.nrformats,
+            vec!["bin".to_string(), "octal".to_string(), "hex".to_string()]
+        );
+        let query = s.parse_set_option("nrformats?").unwrap();
+        assert_eq!(query, "nrformats=bin,octal,hex");
+    }
+
+    #[test]
+    fn test_nf_abbreviation_is_nrformats_not_nerdfonts() {
+        // `"nf"` is Vim's real 'nrformats' abbreviation. vimcode's own
+        // nerdfonts setting predates this option and had claimed "nf" for
+        // itself; that alias was dropped in favor of the real-Vim meaning —
+        // `:set nf=...` must go to `nrformats`, not toggle `nerdfonts`.
+        let mut s = Settings::default();
+        s.parse_set_option("nf=alpha").unwrap();
+        assert_eq!(s.nrformats, vec!["alpha".to_string()]);
+        assert!(s.use_nerd_fonts()); // untouched
     }
 
     #[test]

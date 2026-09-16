@@ -6574,12 +6574,15 @@ impl Engine {
                     let line_start = self.buffer().line_to_char(line);
                     let leading_blanks = col > 0
                         && self.settings.expand_tab
+                        && self.settings.smarttab
                         && (0..col).all(|i| self.buffer().content.char(line_start + i) == ' ');
                     if leading_blanks {
-                        // `:h smarttab`: backspacing within leading indentation
-                        // removes a whole 'shiftwidth' worth of blanks
-                        // (rounded to the previous stop), not one space at a
-                        // time (#804).
+                        // `:h smarttab`: with 'smarttab' on (checked above),
+                        // backspacing within leading indentation removes a
+                        // whole 'shiftwidth' worth of blanks (rounded to the
+                        // previous stop), not one space at a time (#804).
+                        // Off, a plain one-character BackSpace applies here
+                        // too, via the `col > 0` branch below (#1001).
                         let sw = self.effective_shift_width().max(1);
                         let new_col = ((col - 1) / sw) * sw;
                         self.delete_with_undo(line_start + new_col, char_idx);
@@ -6720,15 +6723,17 @@ impl Engine {
                     let col = self.view().cursor.col;
                     let char_idx = self.buffer().line_to_char(line) + col;
                     if self.settings.expand_tab {
-                        // `:h smarttab`: in front of a line (nothing but
-                        // blanks before the cursor) Tab advances using
-                        // 'shiftwidth'; everywhere else it uses 'tabstop' —
-                        // in both cases advancing to the *next* stop, not
-                        // inserting a fixed count of spaces (#804).
+                        // `:h smarttab`: with 'smarttab' on, in front of a
+                        // line (nothing but blanks before the cursor) Tab
+                        // advances using 'shiftwidth'; everywhere else — and
+                        // always, with 'smarttab' off (#1001) — it uses
+                        // 'tabstop'. In both cases it advances to the *next*
+                        // stop, not a fixed count of spaces (#804).
                         let line_start = self.buffer().line_to_char(line);
-                        let front_of_line = (0..col).all(|i| {
-                            matches!(self.buffer().content.char(line_start + i), ' ' | '\t')
-                        });
+                        let front_of_line = self.settings.smarttab
+                            && (0..col).all(|i| {
+                                matches!(self.buffer().content.char(line_start + i), ' ' | '\t')
+                            });
                         let stop = if front_of_line {
                             self.effective_shift_width().max(1)
                         } else {
