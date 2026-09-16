@@ -913,7 +913,7 @@ pub fn breadcrumb_draw_targets(
 /// #540 ShellApp migration, silently freezing the GTK backend's nerd-fonts
 /// flag at its default (`false`) forever.
 pub fn sync_nerd_fonts(b: &mut dyn quadraui::Backend, engine: &Engine) {
-    b.set_nerd_fonts(engine.settings.use_nerd_fonts);
+    b.set_nerd_fonts(engine.settings.use_nerd_fonts());
 }
 
 /// The family name the bundled Nerd Font icon subset (`ICON_FONT_BYTES`)

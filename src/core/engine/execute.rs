@@ -81,6 +81,19 @@ impl Engine {
             return EngineAction::ToggleTerminalMaximize;
         }
 
+        // Handle :CheckNerdFonts (issue #999) — TUI-discoverability command:
+        // paint a sample row of nerd-font glyphs next to their ASCII
+        // fallbacks and let the user say which one actually rendered,
+        // persisting the answer as an explicit `use_nerd_fonts` override.
+        // Platform-neutral: the dialog it opens is the same generic
+        // `Engine::dialog` system every other confirm dialog uses (both
+        // backends already render/key-handle it), so there is nothing
+        // backend-specific to add here or on either backend's side.
+        if cmd == "CheckNerdFonts" {
+            self.show_check_nerd_fonts_dialog();
+            return EngineAction::None;
+        }
+
         // Handle workspace / folder commands (both user-typed names and menu action strings)
         if cmd == "OpenFolder" || cmd == "open_folder_dialog" {
             return EngineAction::OpenFolderDialog;
