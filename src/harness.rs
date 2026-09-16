@@ -1220,6 +1220,50 @@ pub(crate) const KNOWN_BUGS: &[&str] = &[
     // own doc in `src/tui_main/shell_app.rs` for the full mechanism this
     // entry pins.
     "hamburger_second_click_at_correct_position_does_not_hide_menu_bar::tui", // #988
+    // #990: v0.11.0 bug report -- three separate TUI minimap rendering
+    // defects, each with its own painted-output scenario in
+    // `src/tui_main/shell_app.rs`. TUI-only labels: all three are measured
+    // off the braille strip the TUI rasteriser paints, which has no GTK
+    // analogue to probe the same way.
+    //
+    // Defect 1 -- large gaps for a short file, upstream **quadraui#992**:
+    // `MinimapSizing::Fill` stretches the row pitch up to `MAX_ROW_PITCH`
+    // (8 cells on TUI) while `draw_minimap` paints exactly one cell row per
+    // visible line, so the shorter the file the more untouched rows are
+    // left between painted ones (measured at 100x24: a 400-line file paints
+    // rows 2..=21 contiguously, a 20-line file paints only
+    // [2,5,9,12,15,19]). Per the Platform-Neutrality Rule the fix is
+    // quadraui's rasteriser -- this entry exists so bumping the pinned
+    // `rev` flips the scenario to "fix landed, delete the entry" rather
+    // than the fix (or a regression of it) passing unnoticed on our side of
+    // the pin. See `minimap_paints_contiguous_rows_for_short_files`.
+    "minimap_paints_contiguous_rows_for_short_files::tui", // #990, quadraui#992
+    // Defect 2 -- indentation bears little resemblance to the file's,
+    // upstream **quadraui#993**: each line is normalised by its own
+    // `chars.len()` instead of a scale shared across the file, so every
+    // line is stretched to fill the whole strip -- a 1-character line and a
+    // 300-character line in the same file paint identical full-width runs.
+    // Note the issue's originally-proposed assertion ("adding a long line
+    // must not move the short lines' dots") is trivially TRUE against this
+    // bug and does not discriminate; the scenario's extent assertions are
+    // what actually fail. See
+    // `minimap_indent_marks_track_the_files_own_indentation`.
+    "minimap_indent_marks_track_the_files_own_indentation::tui", // #990, quadraui#993
+    // Defect 3 -- no colouring. Diagnosed as **vimcode's own**, not
+    // quadraui's (the issue's candidate 4): `render::build_minimap_data`
+    // builds its `MinimapGrid` with a hardcoded `cols: MINIMAP_SPAN_COLS`
+    // (200) / `cols_per_cell: 2`, a colour grid covering character columns
+    // 0..400, while the painted TUI strip is ~12 cells wide -- so only
+    // character columns 0..~24 are ever consulted and any token indented
+    // past that falls back to the default colour. Measured collapse with
+    // 400 highlights present throughout: 5 distinct painted colours at
+    // indent 0, 3 at 8, 2 at 20, 1 (fallback only) at 40 and 80. The
+    // issue's candidate 1 ("highlights are empty under the TUI") is
+    // disproven and asserted against, ungated, in the scenario itself.
+    // Test-only here by this issue's own scope; the fix is filed separately
+    // against vimcode. See
+    // `minimap_paints_syntax_colour_for_indented_code`.
+    "minimap_paints_syntax_colour_for_indented_code::tui", // #990
 ];
 
 /// A saved `std::panic::set_hook`/`take_hook` closure — named so
