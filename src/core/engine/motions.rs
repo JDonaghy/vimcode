@@ -5820,9 +5820,24 @@ impl Engine {
             // Insert a space unless the next non-ws char is ')' or next line was empty/only ws.
             // Also don't add space if the current line already ends with whitespace.
             let should_add_space = !matches!(next_non_ws, None | Some(')') | Some(']') | Some('}'));
-            let ends_with_ws = newline_pos > cur_line_start
-                && self.buffer().content.char(newline_pos - 1).is_whitespace();
+            let last_char = if newline_pos > cur_line_start {
+                Some(self.buffer().content.char(newline_pos - 1))
+            } else {
+                None
+            };
+            let ends_with_ws = last_char.is_some_and(|c| c.is_whitespace());
             let insert_space = should_add_space && !ends_with_ws;
+            // Vim's 'joinspaces': when on, joining onto a line whose last
+            // non-blank char is '.', '!' or '?' inserts two spaces instead
+            // of one (`:h 'joinspaces'`). `ends_with_ws` being false here
+            // guarantees `last_char` (when `insert_space` is true) really is
+            // that last non-blank char, not trailing whitespace before it.
+            let sentence_end = matches!(last_char, Some('.') | Some('!') | Some('?'));
+            let space_str = if insert_space && self.settings.joinspaces && sentence_end {
+                "  "
+            } else {
+                " "
+            };
 
             // A join needs the absorbed line's marks to gain a *column*
             // offset (not just shift down a line, which is all the generic
@@ -5833,10 +5848,10 @@ impl Engine {
             self.suppress_mark_line_adjust = true;
             self.delete_with_undo(newline_pos, del_end);
             if insert_space {
-                self.insert_with_undo(newline_pos, " ");
+                self.insert_with_undo(newline_pos, space_str);
             }
             self.suppress_mark_line_adjust = false;
-            let ins_len = if insert_space { 1 } else { 0 };
+            let ins_len = if insert_space { space_str.len() } else { 0 };
             self.restore_marks_from_offsets(
                 local_marks,
                 global_marks,

@@ -272,6 +272,14 @@ pub struct Settings {
     #[serde(default)]
     pub startofline: bool,
 
+    /// When true, `J` (join) inserts two spaces instead of one after a line
+    /// ending in `.`, `!` or `?`. Corresponds to Vim's `'joinspaces'` /
+    /// `'js'`. Default **false**, matching Neovim (real Vim defaults this
+    /// **on** — see `:h 'joinspaces'`). `gJ` is unaffected regardless of this
+    /// setting: it never inserts a space.
+    #[serde(default)]
+    pub joinspaces: bool,
+
     /// Highlight the line the cursor is on (default true).
     #[serde(default = "default_cursorline")]
     pub cursorline: bool,
@@ -1016,6 +1024,7 @@ impl Default for Settings {
             smartcase: false,
             scrolloff: 0,
             startofline: false,
+            joinspaces: false,
             cursorline: default_cursorline(),
             window_status_line: default_window_status_line(),
             status_line_above_terminal: default_status_line_above_terminal(),
@@ -1378,6 +1387,7 @@ impl Settings {
             "ignorecase" | "ic" => self.ignorecase = enable,
             "smartcase" | "scs" => self.smartcase = enable,
             "startofline" | "sol" => self.startofline = enable,
+            "joinspaces" | "js" => self.joinspaces = enable,
             "cursorline" | "cul" => self.cursorline = enable,
             "windowstatusline" | "wsl" => self.window_status_line = enable,
             "statuslineaboveterminal" | "slat" => self.status_line_above_terminal = enable,
@@ -1595,6 +1605,11 @@ impl Settings {
             } else {
                 "nostartofline".to_string()
             }),
+            "joinspaces" | "js" => Ok(if self.joinspaces {
+                "joinspaces".to_string()
+            } else {
+                "nojoinspaces".to_string()
+            }),
             "cursorline" | "cul" => Ok(if self.cursorline {
                 "cursorline".to_string()
             } else {
@@ -1786,6 +1801,7 @@ impl Settings {
             "spelllang" => self.spelllang.clone(),
             "scrolloff" => self.scrolloff.to_string(),
             "startofline" | "sol" => self.startofline.to_string(),
+            "joinspaces" | "js" => self.joinspaces.to_string(),
             "colorcolumn" => self.colorcolumn.clone(),
             "textwidth" => self.textwidth.to_string(),
             "hlsearch" => self.hlsearch.to_string(),
@@ -1887,6 +1903,7 @@ impl Settings {
                     .map_err(|_| format!("Invalid scrolloff: {value}"))?;
             }
             "startofline" | "sol" => self.startofline = value == "true",
+            "joinspaces" | "js" => self.joinspaces = value == "true",
             "colorcolumn" => self.colorcolumn = value.to_string(),
             "textwidth" => {
                 self.textwidth = value
@@ -2195,6 +2212,13 @@ pub static SETTING_DEFS: &[SettingDef] = &[
         key: "startofline",
         label: "Start Of Line",
         description: "Land on the first non-blank column after G, gg, H, M, L, <C-d>, <C-u>, <C-b>, <C-f> (Vim's default; Neovim's is off)",
+        category: "Editor",
+        setting_type: SettingType::Bool,
+    },
+    SettingDef {
+        key: "joinspaces",
+        label: "Join Spaces",
+        description: "Insert two spaces instead of one when J joins a line ending in '.', '!' or '?' (Vim's default; Neovim's is off)",
         category: "Editor",
         setting_type: SettingType::Bool,
     },
