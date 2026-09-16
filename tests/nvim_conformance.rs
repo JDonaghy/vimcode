@@ -2459,6 +2459,23 @@ const CASES_EX: &[Case] = &[
         ":s/\\(a\\)\\(b\\)/\\2\\1/<CR>",
     ),
     c("sub:\\v groups", &["ab"], 1, 1, ":s/\\v(a)(b)/\\2\\1/<CR>"),
+    // #1004: `\1` *inside the pattern* (a backreference to an earlier
+    // `\(...\)` group in the same pattern) — distinct from "sub:backrefs"
+    // above, which is `\1`/`\2` in the *replacement* text referencing groups.
+    c(
+        "sub:pattern backref",
+        &["xx aa yy"],
+        1,
+        1,
+        ":s/\\(a\\)\\1/X/<CR>",
+    ),
+    c(
+        "sub:pattern backref no match",
+        &["xx ab yy"],
+        1,
+        1,
+        ":s/\\(a\\)\\1/X/<CR>",
+    ),
     c("sub:& in replacement", &["foo"], 1, 1, ":s/foo/[&]/<CR>"),
     c("sub:\\0", &["foo"], 1, 1, ":s/foo/[\\0]/<CR>"),
     c("sub:\\U&", &["foo"], 1, 1, ":s/foo/\\U&/<CR>"),
@@ -4719,7 +4736,6 @@ const KNOWN_DEVIATIONS: &[&str] = &[
     // "fix" this label by breaking that real, load-bearing behaviour for
     // every other macro that intentionally ends in Insert mode.
     "mac:\"ay then @a executes text",
-    "search:/\\(foo\\)\\1",
     // "ins:BS over indent (nosmarttab)", "ins:Tab at start (nosmarttab)",
     // "num:octal nf=octal 007" and "num:alpha" were moved to HARNESS_LIMITED
     // by #875 and deleted outright by #1002 — the `setup`-is-dropped harness
