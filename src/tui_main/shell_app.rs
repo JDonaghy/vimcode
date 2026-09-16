@@ -4849,66 +4849,106 @@ mod tests {
     }
 
     /// #988: v0.11.0 bug report — "the hamburger button won't re-hide the
-    /// menu bar once revealed." Confirms the toggle mechanism itself has no
-    /// defect: driven the way a real user actually drives it (each click
-    /// lands on the button *where it's currently painted*), the hamburger
-    /// correctly cycles open → closed → open again, three clicks running.
+    /// menu bar once revealed." **Correction (review, fix iteration 1):** an
+    /// earlier version of this test claimed the toggle *mechanism* had no
+    /// defect at all, supported by a three-click open→closed→open sequence
+    /// that appeared to pass. That claim was wrong and the test that backed
+    /// it was invalid — see "Why the old version was green for the wrong
+    /// reason" below. Driven correctly (below), a second click on the
+    /// hamburger — even when perfectly re-located from the freshly painted
+    /// frame — genuinely fails to hide the menu row. This is a real,
+    /// reproducible defect in the toggle mechanism itself, gated via
+    /// [`crate::harness::known_bug_gate`] under its own label so the suite
+    /// stays green while it remains test-only per this issue's scope.
     ///
-    /// # Mechanism, confirmed by driving the harness (not guessed)
+    /// # Why the old version was green for the wrong reason
+    ///
+    /// `quadraui::tui::testing::TuiDriver::click` delivers a `MouseDown`
+    /// through the backend's `DoubleClickDetector`, which folds two clicks
+    /// landing within its distance/time window into one
+    /// `UiEvent::DoubleClick` — by design, it's what a real double-click
+    /// looks like at the event level. Two back-to-back `driver.click()`
+    /// calls in a test run with no simulated time between them, and the
+    /// hamburger's one-row shift after reveal is well inside the fold
+    /// distance, so the old test's "second click" silently folded into a
+    /// `DoubleClick`. That event bypasses `ShellAdapter`'s activity-bar
+    /// semantic-event dispatch entirely and falls through to the legacy
+    /// `mouse::handle_mouse` path (`mouse.rs:1830`), which *does* correctly
+    /// toggle `engine.menu_bar_visible` off. So the old test passed — but by
+    /// exercising a different, already-correct code path than the one a
+    /// real second click, separated by any real time, actually takes.
+    /// [`quadraui::tui::testing::TuiDriver::set_double_click_folding`]
+    /// (used below) is what stops that from happening.
+    ///
+    /// # The real mechanism, confirmed by driving the harness with folding
+    /// disabled and the dispatch instrumented
     ///
     /// The issue's own "likely shape" section guessed the cause was
     /// `src/tui_main/mouse.rs:1815`-`:1841`'s hand-rolled
     /// `ActivityBarTarget::MenuToggle` arm mis-resolving a shifted row. That
-    /// arm — and the `menu-system-dropdown` modal teardown inside it — is
-    /// **unreachable** for a mouse click on the hamburger in production: the
-    /// hamburger is a registered top-row `PanelDefinition`
+    /// arm is **unreachable** for a genuine single click on the hamburger in
+    /// production: the hamburger is a registered top-row `PanelDefinition`
     /// (`TuiShellApp::shell_config`), so `quadraui`'s own
     /// `ShellAdapter::handle` → `AppShell::handle_activity_click`
-    /// (`compose/app_shell.rs`) hit-tests and consumes the click into a
-    /// semantic `AppShellEvent` *before* the raw `MouseDown` ever reaches
-    /// `TuiShellApp::handle` → `mouse::handle_mouse` — exactly the
-    /// possibility PROJECT_STATE's #825 write-up flagged as unconfirmed
-    /// ("check `build_shell_config`'s activity-bar item registration before
-    /// deleting [the mouse.rs arm as dead] — getting this wrong silently
-    /// breaks the menu-bar toggle"). The arm was dead on arrival for this
-    /// target all along, not a live hazard #825 almost created.
+    /// (`compose/app_shell.rs`) hit-tests and consumes a plain `MouseDown`
+    /// into a semantic `AppShellEvent` before it ever reaches
+    /// `TuiShellApp::handle` → `mouse::handle_mouse` (it's only reachable via
+    /// the `DoubleClick` fold above).
     ///
-    /// `AppShell::handle_activity_click`'s active-panel/sidebar-visible
-    /// bookkeeping and `on_shell_event`'s `PanelChanged { hamburger }` arm
-    /// (which sets `engine.menu_bar_visible = true`) correctly re-derive
-    /// *fresh* geometry every dispatch — there is no stale cache in this
-    /// path (unlike the already-fixed quadraui#552 bug
-    /// `menu_reveal_then_search_icon_click_opens_search_not_explorer` above
-    /// pins) — and this test's own sanity check confirms the hamburger's
-    /// row really does shift down by one the moment the menu row is
-    /// reserved. Clicking the button at that new, correct position hides it
-    /// again exactly as a toggle should; a fourth click (this test's own
-    /// third click) reveals it again. **No toggle-logic defect exists.**
+    /// `on_shell_event`'s `PanelChanged { hamburger }` arm (which reveals the
+    /// menu) never touches the shadow `engine.app_shell`, so
+    /// `engine.app_shell.sidebar_visible()` stays `false` for the hamburger
+    /// for the lifetime of the test. `TuiShellApp::handle`'s own
+    /// end-of-dispatch "keep the runner `AppShell`'s sidebar visibility ==
+    /// the shadow's" sync reads that `false` on *every* intervening
+    /// dispatch — including the benign `WindowFocused` pump this test issues
+    /// after each click purely to land the title-bar sync — and
+    /// force-hides the *runner*'s own `AppShell` sidebar
+    /// (`ctx.shell_mut().hide_sidebar()`) in response. That leaves the
+    /// runner's `AppShell::active_panel == Some(hamburger)` but
+    /// `sidebar_visible == false` by the time the next click lands, so
+    /// `AppShell::handle_activity_click`'s "already active + visible → hide"
+    /// branch is never reached for the hamburger at all: every click —
+    /// first or Nth, correctly located or not — resolves as a fresh
+    /// `PanelChanged` reveal, which unconditionally sets
+    /// `engine.menu_bar_visible = true` again. The flag never gets a chance
+    /// to flip back to `false` through this path. (Confirmed directly by
+    /// temporarily instrumenting `on_shell_event`: the second,
+    /// correctly-relocated click below emits a second
+    /// `PanelChanged { hamburger }`, never a `SidebarHidden`.)
     ///
-    /// So what did the reporter actually hit? See this module's sibling test
-    /// [`hamburger_stale_click_position_after_reveal_misses_the_shifted_button`]
-    /// (#988's real, reproducible finding): the hamburger visually *moves*
-    /// down one row the instant the menu bar appears, and a second click at
-    /// the *same physical position* that worked for the first click no
-    /// longer lands on it — it lands in the now-relocated title-bar row
-    /// instead, which silently swallows the click (no dropdown opens, no
-    /// modal is left behind, nothing happens) rather than hiding the menu.
-    /// That is a real, user-visible defect (the button *looks* like a
-    /// simple toggle but only behaves like one if you track where it moved
-    /// to), just not a defect in the toggle mechanism this test pins.
+    /// This is a deeper defect than the row-shift bug pinned by this
+    /// module's sibling test,
+    /// [`hamburger_stale_click_position_after_reveal_misses_the_shifted_button`]:
+    /// fixing the row-shift alone (making the second click land back on the
+    /// hamburger) would not be sufficient on its own, since a click that
+    /// does land still can't reach the "hide" branch.
+    ///
+    /// **RED against unfixed `develop`:** confirmed by running this
+    /// scenario's gated body with `KNOWN_BUGS` temporarily emptied — the
+    /// `!screen_contains("File")` assertion below fails; the menu row is
+    /// still painted after the second, correctly re-located click.
     #[test]
-    fn hamburger_click_toggles_menu_bar_open_then_closed_then_open_again() {
+    fn hamburger_relocated_click_after_reveal_still_fails_to_hide_menu_bar() {
         let mut driver = driver_with_shell(
             TuiShellApp::new(None),
             TuiShellApp::shell_config(false),
             80,
             24,
         );
-        // Same startup reconciliation as `menu_reveal_then_search_icon_
-        // click_opens_search_not_explorer` above — steers the runner's own
-        // `AppShell.active_panel` onto the shadow's Explorer before any
-        // click, matching a live session's boot sequence (see that test's
-        // comment for why skipping this makes the first click misread).
+        // Real, independent clicks: without this, two `driver.click()`
+        // calls with no simulated time between them fold into a single
+        // `UiEvent::DoubleClick` (see "Why the old version was green for the
+        // wrong reason" above) and this scenario would silently stop
+        // testing what it claims to.
+        driver.set_double_click_folding(false);
+        // Initial pump: `TuiShellApp::handle`'s end-of-dispatch syncs
+        // (title-bar visibility, runner/shadow sidebar-visibility) only run
+        // when a dispatch actually reaches `handle()` — a raw
+        // `AppShellEvent::PanelChanged` from `ShellAdapter` short-circuits
+        // before them (see this file's `on_shell_event` doc comment) — so
+        // every click below is followed by one of these to land its sync
+        // before the next assertion or click reads painted state.
         driver.dispatch(quadraui::UiEvent::WindowFocused(true));
         driver.render();
 
@@ -4924,11 +4964,6 @@ mod tests {
             .find(hamburger)
             .expect("hamburger icon must paint on the activity bar");
         driver.click(hx1, hy1);
-        // The title-bar reservation syncs at the end of `TuiShellApp::handle`
-        // — which `ShellAdapter`'s `PanelChanged` arm returns before
-        // reaching (see `menu_reveal_then_search_icon_click_opens_search_
-        // not_explorer`'s identical comment). Pump one benign event to
-        // cover it, exactly as that test does.
         driver.dispatch(quadraui::UiEvent::WindowFocused(true));
         driver.render();
         assert!(
@@ -4937,11 +4972,12 @@ mod tests {
             driver.screen()
         );
 
-        // ── Click 2: RE-LOCATE from the newly painted frame, then hide ──
+        // ── Click 2: RE-LOCATE from the newly painted frame, then attempt
+        // to hide — #988's real, reproducible defect (see doc above) ─────
         // Revealing the menu row shifted every activity-bar item, including
         // the hamburger itself, down by one — confirmed by the assertion
         // below. A test that reused `(hx1, hy1)` here would be reproducing
-        // the *stale-position* symptom (see the sibling test above) for the
+        // the *stale-position* symptom (the sibling test below) for the
         // wrong reason, under the "assert the button is a toggle" claim
         // this test makes — exactly what the issue's own acceptance bar
         // warns against.
@@ -4955,35 +4991,31 @@ mod tests {
              row, or this test isn't exercising the row-shift this issue is \
              about"
         );
-        driver.click(hx2, hy2);
-        driver.dispatch(quadraui::UiEvent::WindowFocused(true));
-        driver.render();
-        assert!(
-            !driver.screen_contains("File"),
-            "second hamburger click, correctly re-located, must hide the \
-             menu row again; screen:\n{}",
-            driver.screen()
+        crate::harness::known_bug_gate(
+            "hamburger_second_click_at_correct_position_does_not_hide_menu_bar::tui",
+            || {
+                driver.click(hx2, hy2);
+                driver.dispatch(quadraui::UiEvent::WindowFocused(true));
+                driver.render();
+                assert!(
+                    !driver.screen_contains("File"),
+                    "second hamburger click, correctly re-located, must \
+                     hide the menu row again; screen:\n{}",
+                    driver.screen()
+                );
+            },
         );
 
-        // ── Click 3: re-locate again, reveal once more (deliverable 4) ──
-        // A second full on/off cycle — a toggle that works once and then
-        // sticks is a distinct bug from "the second click alone fails",
-        // and the extra click is nearly free.
-        let (hx3, hy3) = driver
-            .find(hamburger)
-            .expect("hamburger icon must still paint with the menu bar hidden again");
-        driver.click(hx3, hy3);
-        driver.dispatch(quadraui::UiEvent::WindowFocused(true));
-        driver.render();
-        assert!(
-            driver.screen_contains("File"),
-            "third hamburger click, correctly re-located, must reveal the \
-             menu row again (second cycle); screen:\n{}",
-            driver.screen()
-        );
+        // Deliverable 4 (a third click completing a second on/off cycle) is
+        // deferred: with the click above already failing to hide the menu,
+        // there is no "closed" state for a third click to reveal from —
+        // testing it now would just re-assert the same root cause the gate
+        // above already pins under a second label. Restore it alongside
+        // deleting the `KNOWN_BUGS` entries once the real fix lands.
 
         // ── No orphaned modal (deliverable 2), asserted via behaviour ───
-        // A subsequent click on an unrelated activity-bar icon must still
+        // Independent of whether click 2 above actually hid the menu: a
+        // subsequent click on an unrelated activity-bar icon must still
         // reach its own normal target rather than being swallowed by a
         // stuck `menu-system-dropdown` overlay. Located from the painted
         // frame, never a stored coordinate, same as every click above.
@@ -5009,22 +5041,25 @@ mod tests {
         );
     }
 
-    /// #988's real, reproducible finding (see
-    /// [`hamburger_click_toggles_menu_bar_open_then_closed_then_open_again`]'s
-    /// doc for the full mechanism write-up and why the toggle logic itself
-    /// is innocent): the hamburger button visually moves down one screen
-    /// row the instant its first click reserves the title-bar row for the
-    /// menu. A second click at the *exact same physical position* that
-    /// worked to reveal the menu — the position a user's eye and muscle
-    /// memory would reach for, since nothing about a click *tells* you the
-    /// button under it moved — no longer lands on the hamburger. It lands
-    /// in the now-relocated title-bar band instead (the activity bar starts
-    /// one row lower than before), which silently swallows the click: no
-    /// dropdown opens, no modal is left behind (confirmed below), the menu
-    /// row simply stays visible. This is the exact reported symptom
-    /// ("pressing that same button again does not hide it") reproduced for
-    /// the right reason — not a toggle-logic bug, a hit-target-moved-out-
-    /// from-under-the-click bug.
+    /// #988's row-shift finding, one of two complementary, independently
+    /// gated defects this issue pins (see this module's sibling test,
+    /// [`hamburger_relocated_click_after_reveal_still_fails_to_hide_menu_bar`],
+    /// for the deeper one and the corrected mechanism write-up — the toggle
+    /// logic is *not* innocent, contrary to what an earlier version of that
+    /// test's doc comment claimed). This one: the hamburger button visually
+    /// moves down one screen row the instant its first click reserves the
+    /// title-bar row for the menu. A second click at the *exact same
+    /// physical position* that worked to reveal the menu — the position a
+    /// user's eye and muscle memory would reach for, since nothing about a
+    /// click *tells* you the button under it moved — no longer lands on the
+    /// hamburger. It lands in the now-relocated title-bar band instead (the
+    /// activity bar starts one row lower than before), which silently
+    /// swallows the click: no dropdown opens, no modal is left behind
+    /// (confirmed below), the menu row simply stays visible. This
+    /// reproduces the exact reported symptom ("pressing that same button
+    /// again does not hide it") via the row-shift path specifically; the
+    /// sibling test above reproduces the same symptom even when this
+    /// row-shift is accounted for, via a second, independent defect.
     ///
     /// **RED against unfixed `develop`:** the final assertion (`File` no
     /// longer painted) fails — the menu row is still visible after the
