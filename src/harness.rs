@@ -1155,66 +1155,6 @@ pub(crate) const KNOWN_BUGS: &[&str] = &[
     // probe for it produced a false pass unrelated to this feature.
     "confirm_prompt_text_is_painted", // #986 — fix: #1031
     "confirm_report_line_excludes_skipped_matches", // #986 — fix: #1031
-    // #988: v0.11.0 bug report -- the TUI hamburger (menu) button won't
-    // re-hide the menu bar once revealed. An earlier version of this entry's
-    // comment claimed (based on a since-invalidated test) that "the toggle
-    // *mechanism* has no defect at all" and only a hit-target-moved-
-    // out-from-under-the-click bug was real. That claim was wrong (review,
-    // fix iteration 1): the "mechanism works" test was silently exercising
-    // a `UiEvent::DoubleClick` fold artifact instead of two genuine clicks
-    // (`quadraui::tui::testing::TuiDriver`'s `DoubleClickDetector` folds two
-    // `click()` calls with no simulated time between them, and the
-    // hamburger's one-row shift was well inside the fold's distance
-    // window), which happened to route through the legacy, already-correct
-    // `mouse::handle_mouse` path (`mouse.rs:1830`) instead of the real
-    // `ShellAdapter`/`on_shell_event` semantic-click path a real,
-    // time-separated second click takes. With double-click folding
-    // disabled, TWO independent, complementary defects reproduce, each with
-    // its own entry below. TUI-only by construction -- GTK has no hamburger
-    // button at all (`render::build_activity_bar`'s `include_hamburger` is
-    // `false` for GTK, which uses a native menu bar widget instead). Not
-    // `mouse.rs`'s hand-rolled `ActivityBarTarget::MenuToggle` arm (the
-    // issue's own "likely shape" guess) -- that arm is unreachable for a
-    // genuine single-click on the hamburger in production, since the
-    // hamburger is a registered `AppShell` `PanelDefinition` and
-    // `ShellAdapter::handle` consumes a plain `MouseDown` into a semantic
-    // `AppShellEvent` before `mouse::handle_mouse` ever runs (it's only
-    // reachable via the `DoubleClick` fold above).
-    //
-    // Defect 1 -- hit-target-moved-out-from-under-the-click: revealing the
-    // menu shifts the hamburger down one screen row, so a second click at
-    // the *same physical position* the first click used (what a user's
-    // muscle memory would reach for) no longer lands on the hamburger.
-    // What it lands on instead, confirmed empirically at 80x24 with the
-    // double-click fold disabled (review, fix iteration 2): the hamburger
-    // paints at cell (1.5, 0.5) while hidden and moves to (1.5, 1.5) once
-    // the reveal reserves row 0 -- and row 0 is now the menu bar itself,
-    // whose first item `File` occupies exactly those columns. So the stale
-    // click is NOT silently swallowed by the title-bar band (as an earlier
-    // version of this comment claimed, a claim that only ever held for the
-    // folded `DoubleClick` the test used to accidentally send): it OPENS
-    // THE `File` DROPDOWN. The menu row stays visible *and* an unwanted
-    // `menu-system-dropdown` overlay now covers the activity bar and
-    // swallows the next click too -- so the fix must restore all three
-    // properties the gated body asserts (menu hidden, no dropdown, next
-    // click reaches its target). See
-    // `hamburger_stale_click_position_after_reveal_misses_the_shifted_button`'s
-    // own doc in `src/tui_main/shell_app.rs`.
-    "hamburger_second_click_at_stale_position_does_not_hide_menu_bar::tui", // #988 — fix: #1029
-    // Defect 2 -- deeper, and present even once defect 1 above is
-    // accounted for: `on_shell_event`'s `PanelChanged { hamburger }` arm
-    // never touches the shadow `engine.app_shell`, so
-    // `engine.app_shell.sidebar_visible()` stays `false` for the hamburger
-    // forever. `TuiShellApp::handle`'s own runner/shadow sidebar-visibility
-    // sync reads that on every intervening dispatch and force-hides the
-    // *runner*'s `AppShell` sidebar in response, so
-    // `AppShell::handle_activity_click`'s "already active + visible -> hide"
-    // branch is never reached for the hamburger at all -- every click,
-    // correctly located or not, resolves as a fresh reveal. See
-    // `hamburger_relocated_click_after_reveal_still_fails_to_hide_menu_bar`'s
-    // own doc in `src/tui_main/shell_app.rs` for the full mechanism this
-    // entry pins.
-    "hamburger_second_click_at_correct_position_does_not_hide_menu_bar::tui", // #988 — fix: #1029
     // #990: v0.11.0 bug report -- three separate TUI minimap rendering
     // defects, each with its own painted-output scenario in
     // `src/tui_main/shell_app.rs`. TUI-only labels: all three are measured
