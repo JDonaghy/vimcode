@@ -4674,12 +4674,13 @@ const KNOWN_DEVIATIONS: &[&str] = &[
     // vimcode. With `setup` wired through (`apply_setup`, next to
     // `run_in_vimcode`), all six pass.
     //
-    // Remaining `dot:` deviations: each fails for a reason outside `.` itself
-    // -- linewise-`p` cursor placement (see "op:p linewise cursor first
-    // nonblank"), past-eol cursor clamping on entering insert, and `2>>`
-    // not aborting when the count exceeds the lines available.
-    "dot:i<C-w> .",
-    "dot:>> 2.",
+    // #1003 deleted the last two `dot:` entries ("dot:i<C-w> .": past-eol
+    // cursor clamping on entering insert via `i`, now fixed by clamping in
+    // the `i` handler; "dot:>> 2.": `2>>` failed to abort when the count
+    // exceeded the lines available, now fixed by aborting the doubled `>>`/
+    // `<<` operator instead of silently clamping). No `dot:` deviations
+    // remain.
+    //
     // "undo:U" / "undo:UU" (#885): verified this is a fixture-loading
     // artifact of the harness's `undolevels = -1` dance around the initial
     // `nvim_buf_set_lines` write (see the "Harness fidelity" doc comment
