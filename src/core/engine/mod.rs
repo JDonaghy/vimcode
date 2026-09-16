@@ -3035,6 +3035,29 @@ pub struct Engine {
     /// #695). Empty rect (`width`/`height` 0) means "not currently painted",
     /// matching GTK's `unwrap_or_default()` convention.
     pub menu_bar_rect: std::cell::Cell<quadraui::Rect>,
+    /// #1029 (review, fix iteration 1): one-shot guard for
+    /// `TuiShellApp::handle`'s "stale hamburger-corner" interception.
+    /// Armed `true` exactly on a genuine `false -> true` transition of
+    /// [`Self::menu_bar_visible`] caused by the hamburger reveal (not on
+    /// the `PanelChanged` echoes `ShellAdapter` re-fires after every
+    /// `handle()`/`tick()` poll — see `on_shell_event`'s hamburger arm,
+    /// which only arms this on the transition, so an echo of an
+    /// already-true flag is a no-op here too). Consumed (set back to
+    /// `false`) by the very next `MouseDown` that reaches
+    /// `TuiShellApp::handle`, whether or not it lands on the stale
+    /// corner.
+    ///
+    /// Purely positional matching (the click lands where the activity
+    /// bar used to be, before the reveal shifted it down a row) can't
+    /// tell the one stale muscle-memory click a reveal leaves behind
+    /// apart from a later, deliberate click on `File` — which paints at
+    /// the exact same columns once the menu bar is open (review, #1029
+    /// iteration 1: "it fires identically for every left-click landing
+    /// on the `File` label for as long as the menu bar stays visible").
+    /// Bounding the corner-check to the single click immediately
+    /// following a reveal fixes the one stale click without permanently
+    /// stealing mouse access to `File`.
+    pub hamburger_stale_click_guard: bool,
     /// Cached global (bottom-of-screen) status bar rect from the last paint
     /// (#752) — the exact twin of [`Self::menu_bar_rect`] one band lower, and
     /// for the same reason.
@@ -4030,6 +4053,7 @@ impl Engine {
                 Vec::new(),
             ))),
             menu_bar_rect: std::cell::Cell::new(quadraui::Rect::default()),
+            hamburger_stale_click_guard: false,
             global_status_rect: std::cell::Cell::new(quadraui::Rect::default()),
             command_line_rect: std::cell::Cell::new(quadraui::Rect::default()),
             cmd_sel: std::cell::Cell::new(None),
