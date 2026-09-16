@@ -1302,21 +1302,38 @@ pub(super) fn handle_mouse(
             // the sidebar body leaves `active_panel_id` pointing at Explorer,
             // so the old gate handed *its* right-clicks to the file tree too.
             if render::sidebar_owner(engine) == render::SidebarOwner::Explorer {
-                let sidebar_row = row.saturating_sub(menu_rows);
-                let tree_row = sidebar_row as usize + engine.explorer_tree.borrow().scroll_offset();
-                if tree_row < engine.explorer_rows.len() {
-                    engine
-                        .explorer_tree
-                        .borrow_mut()
-                        .set_selected_path(Some(vec![tree_row as u16]));
-                    let path = engine.explorer_rows[tree_row].path.clone();
-                    let is_dir = engine.explorer_rows[tree_row].is_dir;
-                    engine.open_explorer_context_menu(path, is_dir, col, row);
-                } else {
-                    // Empty space below last entry → context menu for root folder
-                    let root = engine.cwd.clone();
-                    engine.open_explorer_context_menu(root, true, col, row);
-                }
+                // #1025: this used to hand-roll `row - menu_rows` row
+                // arithmetic that never subtracted the sidebar header row
+                // `explorer_tree_rect` already accounts for (quadraui's
+                // `AppShellLayout::sidebar_content_bounds` puts `content_y`
+                // one row below the band, for the header) — landing every
+                // right-click exactly one row low versus the left-click arm
+                // below, which already routes through the shared
+                // `render::route_explorer_tree_event` + painted
+                // `explorer_tree_rect`. Routing the right button through the
+                // same function (which dispatches `MouseDown { button:
+                // Right, .. }` to `TreeController::right_click` and resolves
+                // the resulting `ContextMenuRequested` itself, including
+                // calling `open_explorer_context_menu`) makes the two
+                // buttons share one geometry instead of two that can drift
+                // apart again.
+                let rect = engine.explorer_tree_rect.get();
+                let click_ev = quadraui::UiEvent::MouseDown {
+                    widget: None,
+                    button: quadraui::MouseButton::Right,
+                    position: quadraui::Point::new(col as f32, row as f32),
+                    modifiers: quadraui::Modifiers::default(),
+                };
+                let theme = render::Theme::from_name(&engine.settings.colorscheme);
+                let mut tui_backend = super::backend::TuiBackend::default();
+                render::route_explorer_tree_event(
+                    engine,
+                    &click_ev,
+                    rect,
+                    (1.0, 1.0),
+                    &theme,
+                    &mut tui_backend,
+                );
             }
             return sidebar_width;
         }
@@ -2948,6 +2965,15 @@ mod tests {
             is_expanded: false,
         });
         assert!(engine.active_panel_is(PANEL_EXPLORER));
+        // #1025: the right-click arm now routes through
+        // `render::route_explorer_tree_event`, the same shared function the
+        // left-click arm already used — which bails out on a zero-width
+        // rect (it has no painted geometry to hit-test against). A real
+        // click can only ever land after a paint has populated this, so
+        // give it one here, containing `(ACTIVITY_BAR_WIDTH + 1, 0)`.
+        engine
+            .explorer_tree_rect
+            .set(quadraui::Rect::new(0.0, 0.0, 40.0, 10.0));
 
         dispatch_right_click(&mut engine, ACTIVITY_BAR_WIDTH + 1, 0);
 

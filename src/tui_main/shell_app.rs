@@ -11195,6 +11195,343 @@ mod tests {
         );
     }
 
+    /// Builds a `TuiShellApp` whose explorer is expanded over `dir` and
+    /// active/visible, for the `#1025` tests below. A fresh instance is
+    /// built per driver (rather than sharing one across a right-click and a
+    /// parity left-click) because `TuiDriver` has no accessor back to the
+    /// concrete `TuiShellApp`/`Engine` (see this module's own doc comment
+    /// on that gap) — so a right-click's effects can only be read back by
+    /// re-painting and inspecting *styles*, never by asking the engine
+    /// directly. Two identically-seeded drivers, each probed once, sidestep
+    /// that entirely.
+    fn app_with_expanded_explorer(dir: &std::path::Path) -> TuiShellApp {
+        let mut app = TuiShellApp::new(None);
+        app.engine.cwd = dir.to_path_buf();
+        app.engine.explorer_expanded.insert(dir.to_path_buf());
+        app.engine.explorer_rebuild_rows();
+        ensure_panel_active(&mut app.engine, PANEL_EXPLORER);
+        app
+    }
+
+    /// #1025: right-clicking an explorer row must select that *same* row,
+    /// not the row painted directly below it — and a left-click on the same
+    /// painted cell must resolve identically.
+    ///
+    /// Before the fix, `mouse::handle_mouse`'s right-click arm hand-rolled
+    /// `row.saturating_sub(menu_rows)` as the tree row directly, never
+    /// subtracting the one-row sidebar header that `explorer_tree_rect`
+    /// (and the left-click arm, via `render::route_explorer_tree_event`)
+    /// already accounts for — landing the selection (and the context menu)
+    /// one row low.
+    ///
+    /// A real terminal click typically delivers **both** `Down(Right)` and
+    /// `Up(Right)`. `TuiShellApp::handle_mouse_event`'s own `TreeController`
+    /// intercept claims the `Down` correctly (button-agnostic, already
+    /// routes through the shared function) — but only its *drag* arm would
+    /// claim a `MouseUp`, and this isn't a drag, so the `Up` falls through
+    /// to `mouse::handle_mouse`'s own `Down(Right) | Up(Right)` block,
+    /// which unconditionally closes whatever menu the `Down` just opened
+    /// and reopens one from its own row math. That second, buggy
+    /// resolution is what the user actually ends up seeing, which is why
+    /// this test dispatches both halves rather than just one.
+    ///
+    /// Reads rendered *style*, not engine state (`TreeRow`'s selected/
+    /// unselected background, `quadraui/src/tui/tree.rs`) — the row a click
+    /// actually resolved to repaints with a different background than its
+    /// neighbours the moment it becomes `TreeController::selected_path`, so
+    /// "did the row below light up instead" is directly observable on
+    /// screen, exactly the failure mode #1025 reports.
+    ///
+    /// RED-verified: reverting the `mouse.rs` explorer right-click arm to
+    /// its pre-fix hand-rolled `sidebar_row`/`tree_row` arithmetic makes
+    /// this fail — `zqxw1025_c.txt` (one row below the clicked
+    /// `zqxw1025_b.txt`) lights up instead, and the parity assertion fails
+    /// the same way.
+    #[test]
+    fn explorer_right_click_targets_the_clicked_row_via_shell_app() {
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_test_1025_shell_app_explorer_{:?}",
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let files = ["zqxw1025_a.txt", "zqxw1025_b.txt", "zqxw1025_c.txt"];
+        for f in files {
+            std::fs::write(dir.join(f), "marker").unwrap();
+        }
+
+        // ── Right-click on "b" ──────────────────────────────────────────
+        let mut driver = driver_with_shell(app_with_expanded_explorer(&dir), config(), 80, 24);
+        driver.render();
+
+        let (bx, by) = driver
+            .find("zqxw1025_b.txt")
+            .expect("the expanded explorer tree must paint the seeded file rows");
+        let (cx, cy) = driver
+            .find("zqxw1025_c.txt")
+            .expect("the expanded explorer tree must paint the seeded file rows");
+        let b_before = driver.style_at(bx as u16, by as u16);
+        let c_before = driver.style_at(cx as u16, cy as u16);
+
+        // A real click: Down(Right) then Up(Right) at the same painted cell
+        // (see doc comment above for why both matter).
+        driver.dispatch(UiEvent::MouseDown {
+            widget: None,
+            button: quadraui::MouseButton::Right,
+            position: quadraui::Point::new(bx, by),
+            modifiers: quadraui::Modifiers::default(),
+        });
+        driver.dispatch(UiEvent::MouseUp {
+            widget: None,
+            button: quadraui::MouseButton::Right,
+            position: quadraui::Point::new(bx, by),
+        });
+        driver.render();
+
+        assert!(
+            driver.screen_contains("Open to the Side"),
+            "right-clicking a file row must open the explorer file context \
+             menu; screen:\n{}",
+            driver.screen()
+        );
+
+        // The open menu floats *over* the tree (it anchors at the click
+        // position, not the resolved row), which would otherwise paint
+        // over both probed cells and make the comparison below vacuous.
+        // Escape closes it (`Engine::handle_context_menu_key`) without
+        // touching `TreeController::selected_path`, so the persisted
+        // selection highlight underneath is what the repaint below reads.
+        driver.press_named(quadraui::NamedKey::Escape);
+        driver.render();
+        assert!(
+            !driver.screen_contains("Open to the Side"),
+            "precondition: Escape must close the context menu so the \
+             selection highlight underneath is observable; screen:\n{}",
+            driver.screen()
+        );
+
+        let b_after_right = driver.style_at(bx as u16, by as u16);
+        let c_after_right = driver.style_at(cx as u16, cy as u16);
+
+        assert_ne!(
+            b_after_right,
+            b_before,
+            "right-clicking zqxw1025_b.txt's painted row must repaint it \
+             with the TreeController's selected-row style (#1025); \
+             screen:\n{}",
+            driver.screen()
+        );
+        assert_eq!(
+            c_after_right,
+            c_before,
+            "right-clicking zqxw1025_b.txt must NOT select \
+             zqxw1025_c.txt — the row directly below — which is exactly \
+             #1025's reported symptom; screen:\n{}",
+            driver.screen()
+        );
+
+        // ── Parity: a fresh, identically-seeded app, left-clicked at the
+        // same painted cell, must resolve to the same row — b lights up,
+        // c doesn't. (Not compared for byte-identical style against the
+        // right-click case: a left click also focuses the tree, which
+        // paints the active- vs inactive-selected background differently
+        // from a right click's `ContextMenuRequested`, which doesn't touch
+        // focus — see `quadraui/src/tui/tree.rs`'s `is_selected`/
+        // `is_inactive_selected`. Both are still "this row is selected",
+        // just two different colors for it.) ─────────────────────────────
+        let mut driver2 = driver_with_shell(app_with_expanded_explorer(&dir), config(), 80, 24);
+        driver2.render();
+        let (bx2, by2) = driver2
+            .find("zqxw1025_b.txt")
+            .expect("the expanded explorer tree must paint the seeded file rows");
+        let (cx2, cy2) = driver2
+            .find("zqxw1025_c.txt")
+            .expect("the expanded explorer tree must paint the seeded file rows");
+        assert_eq!(
+            (bx2, by2),
+            (bx, by),
+            "the fixture must paint identically across the two drivers"
+        );
+        let b2_before = driver2.style_at(bx2 as u16, by2 as u16);
+        let c2_before = driver2.style_at(cx2 as u16, cy2 as u16);
+
+        driver2.dispatch(UiEvent::MouseDown {
+            widget: None,
+            button: quadraui::MouseButton::Left,
+            position: quadraui::Point::new(bx2, by2),
+            modifiers: quadraui::Modifiers::default(),
+        });
+        driver2.render();
+        let b_after_left = driver2.style_at(bx2 as u16, by2 as u16);
+        let c_after_left = driver2.style_at(cx2 as u16, cy2 as u16);
+
+        assert_ne!(
+            b_after_left,
+            b2_before,
+            "left-clicking zqxw1025_b.txt's painted row must repaint it \
+             as selected, exactly like the right-click case above (#1025 \
+             parity invariant); screen:\n{}",
+            driver2.screen()
+        );
+        assert_eq!(
+            c_after_left,
+            c2_before,
+            "left-clicking zqxw1025_b.txt must NOT select \
+             zqxw1025_c.txt either (#1025 parity invariant); screen:\n{}",
+            driver2.screen()
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1025 companion: the same invariant at a non-zero `scroll_offset`, so
+    /// a fix that hardcodes `- 1` into the wrong place (rather than
+    /// deleting the hand-rolled arithmetic in favour of the shared
+    /// `render::route_explorer_tree_event`) doesn't coincidentally pass at
+    /// `scroll_offset == 0` and stay broken everywhere else.
+    #[test]
+    fn explorer_right_click_targets_the_clicked_row_when_scrolled_via_shell_app() {
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_test_1025_scrolled_shell_app_explorer_{:?}",
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Short names: with 30 siblings the tree paints a scrollbar, which
+        // eats one more column than the zero-scrollbar 3-file fixture
+        // above — `zqxw1025s_NN.txt` truncated under it and `find` missed
+        // the match entirely.
+        for i in 0..30 {
+            std::fs::write(dir.join(format!("f{i:02}.txt")), "marker").unwrap();
+        }
+        // Row index 10 (root=0, files 1..=30 sorted by name): "f09" is the
+        // target, "f10" is the row directly below it.
+        let target_name = "f09.txt";
+        let below_name = "f10.txt";
+
+        let build = || {
+            let app = app_with_expanded_explorer(&dir);
+            // Force a non-zero scroll offset — well within range for 30
+            // files in a short (14-row) terminal, see below.
+            app.engine.explorer_tree.borrow_mut().set_scroll_offset(5);
+            app
+        };
+
+        // ── Right-click the target row ──────────────────────────────────
+        // Short terminal so the tree viewport can't show all 31 rows
+        // (root + 30 files) at once — `scroll_offset` actually matters.
+        let mut driver = driver_with_shell(build(), config(), 80, 14);
+        driver.render();
+
+        let (tx, ty) = driver.find(target_name).unwrap_or_else(|| {
+            panic!(
+                "row for {target_name} must be visible at scroll_offset=5; screen:\n{}",
+                driver.screen()
+            )
+        });
+        let (nx, ny) = driver.find(below_name).unwrap_or_else(|| {
+            panic!(
+                "row for {below_name} must be visible at scroll_offset=5; screen:\n{}",
+                driver.screen()
+            )
+        });
+        let target_before = driver.style_at(tx as u16, ty as u16);
+        let below_before = driver.style_at(nx as u16, ny as u16);
+
+        driver.dispatch(UiEvent::MouseDown {
+            widget: None,
+            button: quadraui::MouseButton::Right,
+            position: quadraui::Point::new(tx, ty),
+            modifiers: quadraui::Modifiers::default(),
+        });
+        driver.dispatch(UiEvent::MouseUp {
+            widget: None,
+            button: quadraui::MouseButton::Right,
+            position: quadraui::Point::new(tx, ty),
+        });
+        driver.render();
+
+        assert!(
+            driver.screen_contains("Open to the Side"),
+            "right-clicking a file row must open the explorer file context \
+             menu; screen:\n{}",
+            driver.screen()
+        );
+
+        // See the sibling test's doc comment: the menu floats over the
+        // tree at the click position, so it must be closed before the
+        // underlying selection highlight is observable again.
+        driver.press_named(quadraui::NamedKey::Escape);
+        driver.render();
+        assert!(
+            !driver.screen_contains("Open to the Side"),
+            "precondition: Escape must close the context menu; screen:\n{}",
+            driver.screen()
+        );
+
+        let target_after_right = driver.style_at(tx as u16, ty as u16);
+        let below_after_right = driver.style_at(nx as u16, ny as u16);
+
+        assert_ne!(
+            target_after_right,
+            target_before,
+            "right-clicking {target_name}'s painted row at scroll_offset=5 \
+             must repaint it as selected (#1025); screen:\n{}",
+            driver.screen()
+        );
+        assert_eq!(
+            below_after_right,
+            below_before,
+            "right-clicking {target_name} must NOT select {below_name} — \
+             the row directly below — at a non-zero scroll_offset (#1025); \
+             screen:\n{}",
+            driver.screen()
+        );
+
+        // ── Parity at the same scroll offset (see the sibling test's doc
+        // comment on why this checks "selected vs not", not byte-identical
+        // style against the right-click case). ──────────────────────────
+        let mut driver2 = driver_with_shell(build(), config(), 80, 14);
+        driver2.render();
+        let (tx2, ty2) = driver2
+            .find(target_name)
+            .expect("row must paint identically across the two drivers");
+        let (nx2, ny2) = driver2
+            .find(below_name)
+            .expect("row must paint identically across the two drivers");
+        assert_eq!((tx2, ty2), (tx, ty));
+        let target2_before = driver2.style_at(tx2 as u16, ty2 as u16);
+        let below2_before = driver2.style_at(nx2 as u16, ny2 as u16);
+
+        driver2.dispatch(UiEvent::MouseDown {
+            widget: None,
+            button: quadraui::MouseButton::Left,
+            position: quadraui::Point::new(tx2, ty2),
+            modifiers: quadraui::Modifiers::default(),
+        });
+        driver2.render();
+        let target_after_left = driver2.style_at(tx2 as u16, ty2 as u16);
+        let below_after_left = driver2.style_at(nx2 as u16, ny2 as u16);
+
+        assert_ne!(
+            target_after_left,
+            target2_before,
+            "left-clicking {target_name}'s painted row at scroll_offset=5 \
+             must repaint it as selected, exactly like the right-click \
+             case above (#1025 parity invariant); screen:\n{}",
+            driver2.screen()
+        );
+        assert_eq!(
+            below_after_left,
+            below2_before,
+            "left-clicking {target_name} must NOT select {below_name} \
+             either (#1025 parity invariant); screen:\n{}",
+            driver2.screen()
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// #603 baseline: a plain `KeyPressed` sequence (no modal state open)
     /// must reach `Engine::handle_key` and actually mutate the buffer —
     /// establishes that the general fallback in `handle_key_pressed` is
