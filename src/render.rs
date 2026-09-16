@@ -10442,18 +10442,19 @@ const MINIMAP_LINES_PER_ROW: usize = 4;
 /// [`MINIMAP_LINES_PER_ROW`].
 const MINIMAP_COLS_PER_CELL: usize = 2;
 
-/// Column ceiling for colour aggregation. Syntax past this column does not
-/// influence any painted cell, so aggregating it would be wasted work.
-const MINIMAP_SPAN_COLS: usize = 200;
+/// Ceiling on how many characters into a line `build_minimap_data`'s
+/// `to_col` closure ever looks when measuring a highlight's own column.
+/// Past this many characters, `aggregate_spans` would discard the column
+/// anyway (see `grid.cols` below), so counting further is wasted, unbounded
+/// work on a long (e.g. minified) line (#728). Renamed from
+/// `MINIMAP_SPAN_COLS` by #1030, which stopped using it to size
+/// `grid.cols` itself (that now comes from the painted strip's own width)
+/// — it survives purely as this scan cap.
+const MINIMAP_MAX_RELEVANT_COLS: usize = 400;
 
-/// Character-count ceiling for `build_minimap_data`'s `to_col` closure
-/// (#728). `aggregate_spans` never looks past `MINIMAP_SPAN_COLS` cells of
-/// `MINIMAP_COLS_PER_CELL` raw columns each, so a byte offset past that many
-/// characters always maps to a column `aggregate_spans` discards anyway —
-/// scanning further just to report an exact (and irrelevant) larger number
-/// is wasted, unbounded work on a long line. The `+ 1` keeps the boundary
-/// value itself exact rather than off-by-one short.
-const MINIMAP_COL_SCAN_LIMIT: usize = MINIMAP_SPAN_COLS * MINIMAP_COLS_PER_CELL + 1;
+/// The `+ 1` keeps `to_col`'s boundary value itself exact rather than
+/// off-by-one short (#728).
+const MINIMAP_COL_SCAN_LIMIT: usize = MINIMAP_MAX_RELEVANT_COLS + 1;
 
 /// Buffer line numbers `build_minimap_data` will actually sample, computed
 /// **before** any line text is fetched (#728).
@@ -10615,6 +10616,33 @@ pub fn build_minimap_data(
     for (i, l) in lines.iter().enumerate() {
         sampled_at.entry(l.line_idx).or_insert(i);
     }
+    // #1030: the colour grid's raw-column budget comes from the strip this
+    // rasteriser actually paints (`rect.width`, already in the caller's own
+    // unit — cells for TUI, pixels for GTK), not a fixed constant. TUI's
+    // braille cell packs `MINIMAP_COLS_PER_CELL` (2) raw columns per
+    // painted cell, so `rect.width` cells of TUI strip only ever consults
+    // `rect.width * 2` raw columns — the previous hardcoded 200-cell grid
+    // covered a character range 8-16x wider than any TUI strip actually
+    // paints, silently generating aggregated cells nothing ever reads.
+    // GTK's strip is dozens to hundreds of pixels wide, so the same
+    // formula lands comfortably above `COLUMN_CAPACITY` (quadraui's own
+    // per-row paint-walk cap) there too.
+    //
+    // Columns are **not** compressed to fit — quadraui#993 (landed in the
+    // pin this issue also bumps) made the TUI dot rasteriser stop
+    // per-line-normalising indentation for exactly this reason: a shared,
+    // literal column scale is what makes indentation on one line
+    // comparable to indentation on another, and content past
+    // `width_cells * COLS_PER_CELL` is meant to clip, not squeeze into
+    // view (VS Code parity). Colour aggregation already used literal
+    // columns before this fix and still does — only the grid's `cols` was
+    // wrong (too large to matter, never too small to drop anything in the
+    // visible range), so right-sizing it changes nothing about *which*
+    // columns are visible, only how much unreachable aggregation work the
+    // old 200-cell grid wasted on columns TUI's `width_cells`-bounded
+    // paint loop was never going to query.
+    let visible_span_cols = ((rect.width.round().max(1.0)) as usize * MINIMAP_COLS_PER_CELL).max(1);
+
     let mut raw_spans: Vec<quadraui::SyntaxSpan> = Vec::new();
     for (start, end, scope) in &buffer_state.highlights {
         if end <= start || *start >= rope.len_bytes() {
@@ -10635,13 +10663,12 @@ pub fn build_minimap_data(
         // (GTK converts them back to byte offsets for Pango attributes), so
         // convert here rather than handing over raw byte deltas. Capped at
         // `MINIMAP_COL_SCAN_LIMIT` chars: columns past
-        // `MINIMAP_SPAN_COLS` * `MINIMAP_COLS_PER_CELL` never affect
-        // `aggregate_spans`'s output (it drops any cell at/past
-        // `grid.cols`), so counting further into a long — e.g. minified —
-        // line is wasted, and unbounded: a span's byte offset can land
-        // arbitrarily far into it. Without the cap this was an O(line
-        // length) rescan run up to twice per highlight span on that line
-        // (#728).
+        // `MINIMAP_MAX_RELEVANT_COLS` never affect `aggregate_spans`'s
+        // output (it drops any cell at/past `grid.cols`), so counting
+        // further into a long — e.g. minified — line is wasted, and
+        // unbounded: a span's byte offset can land arbitrarily far into
+        // it. Without the cap this was an O(line length) rescan run up to
+        // twice per highlight span on that line (#728).
         let to_col = |b: usize| -> usize {
             let b = b.min(line_str.len());
             line_str
@@ -10666,7 +10693,7 @@ pub fn build_minimap_data(
 
     let grid = quadraui::MinimapGrid {
         rows: lines.len().div_ceil(MINIMAP_LINES_PER_ROW).max(1),
-        cols: MINIMAP_SPAN_COLS,
+        cols: visible_span_cols.div_ceil(MINIMAP_COLS_PER_CELL).max(1),
         lines_per_row: MINIMAP_LINES_PER_ROW,
         cols_per_cell: MINIMAP_COLS_PER_CELL,
     };
