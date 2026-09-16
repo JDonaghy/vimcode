@@ -15610,4 +15610,236 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    fn diag_990_run(n_lines: usize) {
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_diag_990_{}_{:?}_{n_lines}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("diag990.rs");
+        let mut text = String::new();
+        // A more realistic shape than "every single line has a keyword and
+        // a string": most real source lines are blank, closing braces, or
+        // plain statements with no distinct scope colour at all. If
+        // candidate #2 (sampling drops highlights on unsampled lines) is
+        // the dominant effect, a file this size (heavy downsampling) should
+        // show it much more starkly than the maximally-dense fixture did.
+        for i in 0..(n_lines / 5) {
+            text.push_str(&format!("fn function_{i}(x: i32) -> i32 {{\n"));
+            text.push_str("    let mut acc = x;\n");
+            text.push_str("    acc += 1;\n");
+            text.push_str("}\n");
+            text.push('\n');
+        }
+        std::fs::write(&file, &text).unwrap();
+
+        let mut app = TuiShellApp::new(None);
+        app.engine.settings.autohide_panels = false;
+        app.engine.app_shell.hide_sidebar();
+        app.engine.session.explorer_visible = false;
+        app.engine
+            .open_file_with_mode(&file, crate::core::engine::OpenMode::Permanent)
+            .unwrap();
+
+        let win_id = app.engine.active_window_id();
+        let buf_id = app.engine.windows.get(&win_id).unwrap().buffer_id;
+        let n_highlights = app
+            .engine
+            .buffer_manager
+            .get(buf_id)
+            .unwrap()
+            .highlights
+            .len();
+        eprintln!("DIAG990[{n_lines}]: n_highlights = {n_highlights}");
+
+        let driver = driver_with_shell(app, config(), 100, 24);
+        let screen = driver.screen();
+
+        // Isolate just the minimap strip's own columns (the trailing run of
+        // braille glyphs on a row that paints them) and look at fg colour
+        // only there — the whole-screen scan mixes in sidebar/editor colour
+        // and would tell us nothing about the minimap specifically.
+        let mut mm_colors = std::collections::HashMap::new();
+        let mut default_count = 0usize;
+        let mut total_count = 0usize;
+        for (row_i, line) in screen.lines().enumerate() {
+            let cols: Vec<usize> = line
+                .chars()
+                .enumerate()
+                .filter(|(_, c)| ('\u{2800}'..='\u{28FF}').contains(c))
+                .map(|(i, _)| i)
+                .collect();
+            for col in cols {
+                if let Some(style) = driver.style_at(col as u16, row_i as u16) {
+                    total_count += 1;
+                    let key = format!("{:?}", style.fg);
+                    if key == "Rgb(171, 178, 191)" {
+                        default_count += 1;
+                    }
+                    *mm_colors.entry(key).or_insert(0usize) += 1;
+                }
+            }
+        }
+        eprintln!(
+            "DIAG990[{n_lines}]: distinct fg colors within the minimap strip = {}, \
+             default-colored cells = {default_count}/{total_count}",
+            mm_colors.len()
+        );
+        for (c, n) in &mm_colors {
+            eprintln!("DIAG990[{n_lines}]: minimap color {c}: {n} cells");
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn diag_990_minimap_colour() {
+        diag_990_run(200);
+        diag_990_run(5000);
+        diag_990_run(50000);
+    }
+
+    /// Even sparser than `diag_990_run`: only every 50th "line group" has
+    /// any tokens at all (the rest are truly blank), just under the
+    /// `syntax_max_lines` cap so parsing still runs.
+    #[test]
+    fn diag_990_sparse() {
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_diag_990_sparse_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("diag990sparse.rs");
+        let mut text = String::new();
+        for i in 0..19000usize {
+            if i % 50 == 0 {
+                text.push_str(&format!("fn function_{i}() {{\n"));
+            } else {
+                text.push('\n');
+            }
+        }
+        std::fs::write(&file, &text).unwrap();
+
+        let mut app = TuiShellApp::new(None);
+        app.engine.settings.autohide_panels = false;
+        app.engine.app_shell.hide_sidebar();
+        app.engine.session.explorer_visible = false;
+        app.engine
+            .open_file_with_mode(&file, crate::core::engine::OpenMode::Permanent)
+            .unwrap();
+
+        let win_id = app.engine.active_window_id();
+        let buf_id = app.engine.windows.get(&win_id).unwrap().buffer_id;
+        let n_highlights = app
+            .engine
+            .buffer_manager
+            .get(buf_id)
+            .unwrap()
+            .highlights
+            .len();
+        eprintln!("DIAG990sparse: n_highlights = {n_highlights}");
+
+        let driver = driver_with_shell(app, config(), 100, 24);
+        let screen = driver.screen();
+
+        let mut mm_colors = std::collections::HashMap::new();
+        let mut default_count = 0usize;
+        let mut total_count = 0usize;
+        for (row_i, line) in screen.lines().enumerate() {
+            let cols: Vec<usize> = line
+                .chars()
+                .enumerate()
+                .filter(|(_, c)| ('\u{2800}'..='\u{28FF}').contains(c))
+                .map(|(i, _)| i)
+                .collect();
+            for col in cols {
+                if let Some(style) = driver.style_at(col as u16, row_i as u16) {
+                    total_count += 1;
+                    let key = format!("{:?}", style.fg);
+                    if key == "Rgb(171, 178, 191)" {
+                        default_count += 1;
+                    }
+                    *mm_colors.entry(key).or_insert(0usize) += 1;
+                }
+            }
+        }
+        eprintln!(
+            "DIAG990sparse: distinct fg colors within the minimap strip = {}, \
+             default-colored cells = {default_count}/{total_count}",
+            mm_colors.len()
+        );
+        for (c, n) in &mm_colors {
+            eprintln!("DIAG990sparse: minimap color {c}: {n} cells");
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn diag_990_gaps() {
+        for n in [4usize, 8, 20, 400] {
+            let mut app = TuiShellApp::new(None);
+            app.engine.settings.autohide_panels = false;
+            app.engine.app_shell.hide_sidebar();
+            app.engine.session.explorer_visible = false;
+            let text: String = (0..n).map(|i| format!("line {i}\n")).collect();
+            app.engine.buffer_mut().insert(0, &text);
+
+            let mut driver = driver_with_shell(app, config(), 100, 24);
+            driver.press_named(quadraui::NamedKey::Escape);
+            let screen = driver.screen();
+
+            let painted_rows: Vec<usize> = (0..24usize)
+                .filter(|&row| braille_col(&screen, row).is_some())
+                .collect();
+            eprintln!("DIAG990gaps[n={n}]: painted_rows = {painted_rows:?}");
+            eprintln!("DIAG990gaps[n={n}]: screen:\n{screen}");
+        }
+    }
+
+    fn diag_990_indent_run(extra_long_line: bool) {
+        let mut app = TuiShellApp::new(None);
+        app.engine.settings.autohide_panels = false;
+        app.engine.app_shell.hide_sidebar();
+        app.engine.session.explorer_visible = false;
+        // Pad each of the three indent levels out to its own 4-line group
+        // (lines_per_row) so each lands on its own minimap ROW instead of
+        // sharing one row's 4 packed dot-subrows with the other two --
+        // much easier to read the "first set-dot column" back per row.
+        let mut text = String::from("x\n\n\n\n    x\n\n\n\n        x\n\n\n\n");
+        if extra_long_line {
+            text.push_str(&"y".repeat(300));
+            text.push('\n');
+        }
+        app.engine.buffer_mut().insert(0, &text);
+
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        driver.press_named(quadraui::NamedKey::Escape);
+        let screen = driver.screen();
+        eprintln!("DIAG990indent[long={extra_long_line}]: screen:\n{screen}");
+        for row in 2..6usize {
+            let Some(line) = screen.lines().nth(row) else {
+                continue;
+            };
+            let first_set: Option<usize> = line
+                .chars()
+                .enumerate()
+                .find(|(_, c)| ('\u{2801}'..='\u{28FF}').contains(c))
+                .map(|(i, _)| i);
+            eprintln!(
+                "DIAG990indent[long={extra_long_line}]: row {row} first set-dot column: {first_set:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn diag_990_indent() {
+        diag_990_indent_run(false);
+        diag_990_indent_run(true);
+    }
 }
