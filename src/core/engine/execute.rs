@@ -1721,11 +1721,7 @@ impl Engine {
                 if self.dirty() {
                     let buf_id = self.active_buffer_id();
                     let current_win = self.active_window_id();
-                    let other_views = self
-                        .windows
-                        .values()
-                        .any(|w| w.buffer_id == buf_id && w.id != current_win);
-                    if !other_views {
+                    if !self.buffer_has_other_views(buf_id, current_win) {
                         self.message = "No write since last change (add ! to override)".to_string();
                         return EngineAction::Error;
                     }

@@ -301,6 +301,39 @@ fn test_q_blocks_when_single_buffer_dirty() {
     assert!(engine.message.contains("No write since last change"));
 }
 
+// #1038: `:q`'s "another window still shows this buffer" check moved into
+// the shared `Engine::buffer_has_other_views` helper (also now used by
+// `handle_tab_bar_click`'s `CloseTab` arm). This pins `:q`'s own behavior
+// unchanged by that extraction: a dirty buffer with a second view open
+// must still close quietly rather than blocking with "No write since last
+// change".
+#[test]
+fn test_q_does_not_block_when_dirty_buffer_has_another_view() {
+    let mut engine = Engine::new();
+    engine.open_editor_group(SplitDirection::Vertical);
+    engine.buffer_mut().insert(0, "dirty");
+    engine.set_dirty(true);
+
+    let groups_before = engine.editor_groups.len();
+    let action = type_command_action(&mut engine, "q");
+    assert_eq!(
+        action,
+        EngineAction::None,
+        "another view of the buffer survives, so `:q` must not block with \
+         \"No write since last change\""
+    );
+    assert!(
+        !engine.message.contains("No write since last change"),
+        "unexpected block message: {}",
+        engine.message
+    );
+    assert_eq!(
+        engine.editor_groups.len(),
+        groups_before - 1,
+        "the closed group should be gone"
+    );
+}
+
 #[test]
 fn test_q_bang_closes_dirty_tab_when_multiple() {
     let mut engine = Engine::new();
@@ -30473,6 +30506,58 @@ fn test_tab_bar_handle_click_close_dirty_tab_returns_true() {
     assert!(needs_confirm); // Should request confirmation
                             // Tab should NOT be closed yet
     assert_eq!(engine.active_group().tabs.len(), 2);
+}
+
+// #1038: closing one of several views of a dirty buffer must not prompt —
+// only closing the *last* view should. `Engine::dirty()` is buffer-level and
+// has no idea how many windows display that buffer, so the tab-bar close
+// path used to prompt on every close, however many views remained. The `:q`
+// path already got this right (see `execute.rs`'s "quit" handler); this test
+// covers the tab-bar path sharing the same `buffer_has_other_views` check.
+#[test]
+fn test_tab_bar_handle_click_close_dirty_tab_with_other_view_does_not_confirm() {
+    let mut engine = Engine::new();
+    // Split into a second editor group showing the *same* buffer.
+    engine.open_editor_group(SplitDirection::Vertical);
+    let group_a = engine.prev_active_group.unwrap();
+    let group_b = engine.active_group;
+    assert_ne!(group_a, group_b);
+
+    // Dirty the shared buffer.
+    engine.buffer_mut().insert(0, "dirty");
+    engine
+        .buffer_manager
+        .get_mut(engine.active_buffer_id())
+        .unwrap()
+        .dirty = true;
+
+    // Closing group B's tab must NOT prompt — group A still shows the buffer.
+    let needs_confirm = engine.handle_tab_bar_click(group_b, TabBarClickTarget::CloseTab(0));
+    assert!(!needs_confirm, "another view remains — must not prompt");
+    assert!(
+        !engine.editor_groups.contains_key(&group_b),
+        "the closed group should be gone"
+    );
+    assert!(
+        engine.editor_groups.contains_key(&group_a),
+        "the other view's group must survive"
+    );
+    // The buffer is still open (and still dirty) in the surviving group.
+    assert!(engine
+        .buffer_manager
+        .get(engine.active_buffer_id())
+        .is_some());
+    assert!(engine.dirty());
+
+    // Negative case: closing the *last* remaining view of the still-dirty
+    // buffer must still prompt. Without the other-views check this would
+    // also pass trivially — the check has to actually gate on something.
+    engine.active_group = group_a;
+    let needs_confirm = engine.handle_tab_bar_click(group_a, TabBarClickTarget::CloseTab(0));
+    assert!(
+        needs_confirm,
+        "last view of a dirty buffer must still prompt"
+    );
 }
 
 // --- Explorer reveal on tab switch (#232) ---

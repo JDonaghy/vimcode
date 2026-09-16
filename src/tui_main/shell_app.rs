@@ -7603,6 +7603,132 @@ mod tests {
         }
     }
 
+    /// #1038: closing one of *several* views of a dirty buffer must not
+    /// prompt to save/discard — only closing the **last** view should.
+    /// `Engine::dirty()` is buffer-level and has no idea how many windows
+    /// display that buffer, so the tab-bar close path used to prompt on
+    /// every close, however many views remained (the `:q` path already got
+    /// this right; see `execute.rs`'s "quit" handler and the new shared
+    /// `Engine::buffer_has_other_views` helper both now call).
+    ///
+    /// End to end through the real `driver_with_shell` pipeline: a genuine
+    /// mouse click on the painted × closes one group's tab, and the
+    /// assertion reads the **painted screen** (`CLAUDE.md` rule 1) — not
+    /// `engine.dialog.is_some()` — for both the positive case (no dialog,
+    /// one view survives) and the negative case in the same fixture
+    /// (closing the last remaining view still prompts).
+    ///
+    /// Fixture shape borrowed from
+    /// `render_content_paints_group_divider_via_shell_app` below: a short
+    /// scratch buffer split into two editor groups via `open_editor_group`,
+    /// which points the new group's window at the *same* buffer id — the
+    /// same "two views, one buffer" shape #1038 reports.
+    ///
+    /// `hide_single_tab` is pinned off: after the first close only one
+    /// group remains, and if a developer's ambient `~/.config/vimcode`
+    /// settings had that flag on, `is_tab_bar_hidden` would suppress the
+    /// second click's tab bar entirely (see `app_with_sidebar_open`'s doc
+    /// comment on `Engine::new` reading real on-disk settings).
+    ///
+    /// RED-verified: with the `buffer_has_other_views` guard removed from
+    /// `handle_tab_bar_click`'s `CloseTab` arm (i.e. prompting on
+    /// `self.dirty()` alone, the pre-#1038 behaviour), this test fails at
+    /// the first `screen_contains("Unsaved Changes")` assertion — the
+    /// dialog paints after closing the *first* of two views. Restored
+    /// before committing.
+    #[test]
+    fn tab_bar_close_dirty_tab_with_other_view_does_not_confirm_via_shell_app() {
+        let mut app = TuiShellApp::new(None);
+        app.engine.settings.hide_single_tab = false;
+        app.engine.buffer_mut().insert(0, "short\n");
+        app.engine.open_editor_group(SplitDirection::Vertical);
+        let buf_id = app.engine.active_buffer_id();
+        app.engine.buffer_manager.get_mut(buf_id).unwrap().dirty = true;
+
+        let mut driver = driver_with_shell(app, config(), 80, 24);
+
+        // Precondition: two groups, both showing the dirty shared buffer,
+        // no dialog yet.
+        let tab_bar_id = quadraui::WidgetId::new(crate::render::EDITOR_TAB_BAR_WIDGET_ID);
+        let starts_before = driver
+            .screen()
+            .lines()
+            .next()
+            .unwrap()
+            .match_indices("[No Name]")
+            .count();
+        assert_eq!(
+            starts_before,
+            2,
+            "precondition: two editor groups must both show the shared \
+             buffer; screen:\n{}",
+            driver.screen()
+        );
+        assert!(
+            !driver.screen_contains("Unsaved Changes"),
+            "precondition: no confirm dialog before any close"
+        );
+
+        // Close one group's only tab through a real click on its painted ×.
+        // With two groups sharing the "tabs:group" widget id, this resolves
+        // to whichever group's bar painted last this frame — it doesn't
+        // matter which, since both show the identical dirty buffer.
+        let (cx, cy) = driver
+            .tab_close_center(&tab_bar_id, 0)
+            .expect("a group's tab bar must have painted tab 0's close button");
+        driver.click(cx, cy);
+
+        assert!(
+            !driver.screen_contains("Unsaved Changes"),
+            "closing one of two views of a dirty buffer must not prompt \
+             (#1038) — the other view can still save it; screen:\n{}",
+            driver.screen()
+        );
+        let starts_after_first = driver
+            .screen()
+            .lines()
+            .next()
+            .unwrap()
+            .match_indices("[No Name]")
+            .count();
+        assert_eq!(
+            starts_after_first,
+            1,
+            "the closed group is gone but the other view of the buffer \
+             must survive; screen:\n{}",
+            driver.screen()
+        );
+
+        // Negative case, same fixture: only one view is left now, so
+        // closing it must still prompt — otherwise deleting the
+        // other-views check entirely would also pass this test.
+        let (cx2, cy2) = driver
+            .tab_close_center(&tab_bar_id, 0)
+            .expect("the surviving group's tab bar must still paint a close button");
+        driver.click(cx2, cy2);
+
+        assert!(
+            driver.screen_contains("Unsaved Changes"),
+            "closing the LAST view of a still-dirty buffer must still \
+             prompt (#1038 negative case); screen:\n{}",
+            driver.screen()
+        );
+        let starts_after_second = driver
+            .screen()
+            .lines()
+            .next()
+            .unwrap()
+            .match_indices("[No Name]")
+            .count();
+        assert_eq!(
+            starts_after_second,
+            1,
+            "the tab must not actually be closed yet — the confirm dialog \
+             intercepts it; screen:\n{}",
+            driver.screen()
+        );
+    }
+
     /// #609: `render_content` must also paint the *group-level* divider
     /// line between split editor groups — `render_group_dividers`, ported
     /// from `draw_frame`'s raw-`Buffer`-read loop to

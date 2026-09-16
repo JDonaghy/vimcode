@@ -1945,8 +1945,15 @@ impl Engine {
                     g.active_tab = idx;
                 }
                 self.line_annotations.clear();
+                // Only prompt when this is the *last* window showing the
+                // buffer — another view can still save it, so silently
+                // closing this one loses nothing (#1038).
                 if self.dirty() {
-                    return true; // Caller should show confirmation
+                    let buf_id = self.active_buffer_id();
+                    let current_win = self.active_window_id();
+                    if !self.buffer_has_other_views(buf_id, current_win) {
+                        return true; // Caller should show confirmation
+                    }
                 }
                 self.close_tab();
             }
