@@ -15611,235 +15611,471 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    fn diag_990_run(n_lines: usize) {
-        let dir = std::env::temp_dir().join(format!(
-            "vimcode_diag_990_{}_{:?}_{n_lines}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let file = dir.join("diag990.rs");
-        let mut text = String::new();
-        // A more realistic shape than "every single line has a keyword and
-        // a string": most real source lines are blank, closing braces, or
-        // plain statements with no distinct scope colour at all. If
-        // candidate #2 (sampling drops highlights on unsampled lines) is
-        // the dominant effect, a file this size (heavy downsampling) should
-        // show it much more starkly than the maximally-dense fixture did.
-        for i in 0..(n_lines / 5) {
-            text.push_str(&format!("fn function_{i}(x: i32) -> i32 {{\n"));
-            text.push_str("    let mut acc = x;\n");
-            text.push_str("    acc += 1;\n");
-            text.push_str("}\n");
-            text.push('\n');
-        }
-        std::fs::write(&file, &text).unwrap();
+    // ── #990: v0.11.0 TUI minimap rendering bug suite ───────────────────
+    //
+    // Three separately-gated painted-output scenarios, one per reported
+    // symptom. All three drive the real `TuiShellApp` through
+    // `driver_with_shell` and assert on *painted cells* (glyph runs and
+    // `style_at` foreground colours) — never on `Minimap`/`syntax_spans`
+    // state being populated, which is exactly the shape CLAUDE.md's rule 1
+    // warns passes against the bug (`syntax_spans` is non-empty today for
+    // all three, and the strip still paints wrong).
+    //
+    // Deliverables 1 and 2 are quadraui rasteriser defects (quadraui#992,
+    // quadraui#993) and per the Platform-Neutrality Rule get **no**
+    // vimcode-side workaround — these tests are the detector on our side of
+    // the pinned `rev`, so that bumping the pin flips them to "fix landed,
+    // delete the entry" instead of silently regressing unnoticed.
+    // Deliverable 3's cause was diagnosed here (see its own doc) and is
+    // vimcode-side.
 
-        let mut app = TuiShellApp::new(None);
-        app.engine.settings.autohide_panels = false;
-        app.engine.app_shell.hide_sidebar();
-        app.engine.session.explorer_visible = false;
-        app.engine
-            .open_file_with_mode(&file, crate::core::engine::OpenMode::Permanent)
-            .unwrap();
+    /// Every screen row on which the minimap strip painted *anything at
+    /// all* — including the all-blank braille cell `\u{2800}`, which is
+    /// still a cell the rasteriser touched (a row it never touched holds
+    /// plain spaces). That distinction is the whole point for deliverable
+    /// 1: the gaps bug leaves rows *untouched* between touched ones.
+    fn minimap_painted_rows(screen: &str) -> Vec<usize> {
+        (0..screen.lines().count())
+            .filter(|&row| braille_col(screen, row).is_some())
+            .collect()
+    }
 
-        let win_id = app.engine.active_window_id();
-        let buf_id = app.engine.windows.get(&win_id).unwrap().buffer_id;
-        let n_highlights = app
-            .engine
-            .buffer_manager
-            .get(buf_id)
-            .unwrap()
-            .highlights
-            .len();
-        eprintln!("DIAG990[{n_lines}]: n_highlights = {n_highlights}");
+    /// `(first_cell, last_cell, n_cells_with_a_set_dot, strip_width)` for
+    /// the braille run on `row`, or `None` if that row paints no *set* dot.
+    ///
+    /// `strip_width` counts every braille cell on the row (blank ones
+    /// included), i.e. the full width of the minimap strip — so a caller
+    /// can ask "did this line's mark occupy the whole strip?" without
+    /// hardcoding a column or a width.
+    fn minimap_dot_run(screen: &str, row: usize) -> Option<(usize, usize, usize, usize)> {
+        let line = screen.lines().nth(row)?;
+        let cells: Vec<(usize, char)> = line
+            .chars()
+            .enumerate()
+            .filter(|(_, c)| ('\u{2800}'..='\u{28FF}').contains(c))
+            .collect();
+        let strip_width = cells.len();
+        let set: Vec<usize> = cells
+            .iter()
+            .filter(|(_, c)| *c != '\u{2800}')
+            .map(|(i, _)| *i)
+            .collect();
+        Some((*set.first()?, *set.last()?, set.len(), strip_width))
+    }
 
-        let driver = driver_with_shell(app, config(), 100, 24);
+    /// Distinct foreground colours painted on minimap cells that actually
+    /// carry a set dot, keyed by their `Debug` form (theme-independent —
+    /// the assertions below only ever count distinct keys, never name a
+    /// specific RGB triple).
+    fn minimap_dot_fg_colors<A: quadraui::AppLogic>(
+        driver: &quadraui::tui::testing::TuiDriver<A>,
+    ) -> std::collections::HashMap<String, usize> {
         let screen = driver.screen();
-
-        // Isolate just the minimap strip's own columns (the trailing run of
-        // braille glyphs on a row that paints them) and look at fg colour
-        // only there — the whole-screen scan mixes in sidebar/editor colour
-        // and would tell us nothing about the minimap specifically.
-        let mut mm_colors = std::collections::HashMap::new();
-        let mut default_count = 0usize;
-        let mut total_count = 0usize;
-        for (row_i, line) in screen.lines().enumerate() {
+        let mut colors = std::collections::HashMap::new();
+        for (row, line) in screen.lines().enumerate() {
             let cols: Vec<usize> = line
                 .chars()
                 .enumerate()
-                .filter(|(_, c)| ('\u{2800}'..='\u{28FF}').contains(c))
+                .filter(|(_, c)| ('\u{2801}'..='\u{28FF}').contains(c))
                 .map(|(i, _)| i)
                 .collect();
             for col in cols {
-                if let Some(style) = driver.style_at(col as u16, row_i as u16) {
-                    total_count += 1;
-                    let key = format!("{:?}", style.fg);
-                    if key == "Rgb(171, 178, 191)" {
-                        default_count += 1;
-                    }
-                    *mm_colors.entry(key).or_insert(0usize) += 1;
+                if let Some(style) = driver.style_at(col as u16, row as u16) {
+                    *colors.entry(format!("{:?}", style.fg)).or_insert(0usize) += 1;
                 }
             }
         }
-        eprintln!(
-            "DIAG990[{n_lines}]: distinct fg colors within the minimap strip = {}, \
-             default-colored cells = {default_count}/{total_count}",
-            mm_colors.len()
-        );
-        for (c, n) in &mm_colors {
-            eprintln!("DIAG990[{n_lines}]: minimap color {c}: {n} cells");
-        }
-
-        let _ = std::fs::remove_dir_all(&dir);
+        colors
     }
 
-    #[test]
-    fn diag_990_minimap_colour() {
-        diag_990_run(200);
-        diag_990_run(5000);
-        diag_990_run(50000);
-    }
-
-    /// Even sparser than `diag_990_run`: only every 50th "line group" has
-    /// any tokens at all (the rest are truly blank), just under the
-    /// `syntax_max_lines` cap so parsing still runs.
-    #[test]
-    fn diag_990_sparse() {
-        let dir = std::env::temp_dir().join(format!(
-            "vimcode_diag_990_sparse_{}_{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let file = dir.join("diag990sparse.rs");
-        let mut text = String::new();
-        for i in 0..19000usize {
-            if i % 50 == 0 {
-                text.push_str(&format!("fn function_{i}() {{\n"));
-            } else {
-                text.push('\n');
-            }
-        }
-        std::fs::write(&file, &text).unwrap();
-
-        let mut app = TuiShellApp::new(None);
+    /// A `TuiShellApp` with the ambient panel state pinned so the minimap
+    /// strip's geometry is the same on every machine — same reasoning as
+    /// [`app_with_split_shaped_buffer`]'s own doc comment.
+    fn app_for_minimap_test() -> TuiShellApp {
+        let mut app = TuiShellApp::new_for_test();
         app.engine.settings.autohide_panels = false;
+        app.engine.settings.minimap = true;
         app.engine.app_shell.hide_sidebar();
         app.engine.session.explorer_visible = false;
-        app.engine
-            .open_file_with_mode(&file, crate::core::engine::OpenMode::Permanent)
-            .unwrap();
+        app
+    }
 
-        let win_id = app.engine.active_window_id();
-        let buf_id = app.engine.windows.get(&win_id).unwrap().buffer_id;
-        let n_highlights = app
-            .engine
-            .buffer_manager
-            .get(buf_id)
-            .unwrap()
-            .highlights
-            .len();
-        eprintln!("DIAG990sparse: n_highlights = {n_highlights}");
-
-        let driver = driver_with_shell(app, config(), 100, 24);
+    /// Paint a buffer of `n_lines` plain lines and report which screen rows
+    /// the minimap strip touched.
+    fn minimap_rows_for_line_count(n_lines: usize) -> (Vec<usize>, String) {
+        let mut app = app_for_minimap_test();
+        let text: String = (0..n_lines).map(|i| format!("line {i}\n")).collect();
+        app.engine.buffer_mut().insert(0, &text);
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        // One benign dispatch so `TuiShellApp::handle`'s end-of-dispatch
+        // sidebar/title-bar syncs land before the frame under assertion —
+        // `driver_with_shell`'s very first paint runs before any `handle()`
+        // call (see `app_with_split_shaped_buffer`'s doc).
+        driver.press_named(quadraui::NamedKey::Escape);
         let screen = driver.screen();
+        (minimap_painted_rows(&screen), screen)
+    }
 
-        let mut mm_colors = std::collections::HashMap::new();
-        let mut default_count = 0usize;
-        let mut total_count = 0usize;
-        for (row_i, line) in screen.lines().enumerate() {
-            let cols: Vec<usize> = line
-                .chars()
-                .enumerate()
-                .filter(|(_, c)| ('\u{2800}'..='\u{28FF}').contains(c))
-                .map(|(i, _)| i)
-                .collect();
-            for col in cols {
-                if let Some(style) = driver.style_at(col as u16, row_i as u16) {
-                    total_count += 1;
-                    let key = format!("{:?}", style.fg);
-                    if key == "Rgb(171, 178, 191)" {
-                        default_count += 1;
-                    }
-                    *mm_colors.entry(key).or_insert(0usize) += 1;
-                }
-            }
-        }
-        eprintln!(
-            "DIAG990sparse: distinct fg colors within the minimap strip = {}, \
-             default-colored cells = {default_count}/{total_count}",
-            mm_colors.len()
+    /// The gap property itself, as a reusable assertion: between the first
+    /// and last row the minimap touched there must be no *untouched* row.
+    fn assert_minimap_rows_contiguous(n_lines: usize) {
+        let (rows, screen) = minimap_rows_for_line_count(n_lines);
+        assert!(
+            rows.len() >= 2,
+            "precondition: a {n_lines}-line buffer must paint a minimap \
+             strip spanning at least two rows, or this assertion is \
+             vacuous; rows={rows:?}; screen:\n{screen}"
         );
-        for (c, n) in &mm_colors {
-            eprintln!("DIAG990sparse: minimap color {c}: {n} cells");
-        }
-
-        let _ = std::fs::remove_dir_all(&dir);
+        let gaps: Vec<(usize, usize)> = rows
+            .windows(2)
+            .filter(|w| w[1] != w[0] + 1)
+            .map(|w| (w[0], w[1]))
+            .collect();
+        assert!(
+            gaps.is_empty(),
+            "the minimap must paint contiguous cell rows for a \
+             {n_lines}-line file — found unpainted row(s) between painted \
+             ones at {gaps:?} (painted rows: {rows:?}); screen:\n{screen}"
+        );
     }
 
+    /// #990 deliverable 1 (upstream: **quadraui#992**) — a short file must
+    /// not paint a minimap full of holes.
+    ///
+    /// # Mechanism
+    ///
+    /// `MinimapSizing::Fill` stretches the row pitch up to `MAX_ROW_PITCH`
+    /// (8 cells on the TUI) while quadraui's `draw_minimap` paints exactly
+    /// **one** cell row per visible line — so the shorter the file, the
+    /// bigger the pitch and the more untouched rows are left between
+    /// painted ones. Measured here at 100x24 against unfixed `develop`:
+    ///
+    /// | file lines | rows the strip touched |
+    /// |---|---|
+    /// | 400 | `[2,3,4,…,21]` — contiguous |
+    /// | 20  | `[2,5,9,12,15,19]` — 2-row holes |
+    /// | 8   | `[2,9,15]` — 6-row holes |
+    ///
+    /// That is why file length is a **parameter** here rather than one
+    /// fixture: "worse the shorter the file" is the reported behaviour, and
+    /// the 400-line case passes today, so a single long-file test would
+    /// have been green against the bug. The 400-line assertion is
+    /// deliberately left **ungated** — it is both a regression guard and
+    /// the proof that [`assert_minimap_rows_contiguous`] is satisfiable at
+    /// all, so the gated failure below is about file length and not about a
+    /// broken probe.
+    ///
+    /// Per the Platform-Neutrality Rule the fix belongs in quadraui's
+    /// rasteriser (paint every row in a line's pitch band, not just the
+    /// first); nothing in `src/tui_main/` is allowed to paper over it.
+    ///
+    /// **RED against unfixed `develop`:** confirmed by running this
+    /// scenario with its `KNOWN_BUGS` entry removed — the 20-line
+    /// assertion fails with `found unpainted row(s) between painted ones at
+    /// [(2, 5), (5, 9), (9, 12), (12, 15), (15, 19)] (painted rows: [2, 5,
+    /// 9, 12, 15, 19])`. The 8-line assertion was then confirmed to fail
+    /// *independently* (with the 20-line one commented out, so it could not
+    /// be hidden by short-circuiting): `found unpainted row(s) … at [(2,
+    /// 9), (9, 15)] (painted rows: [2, 9, 15])`.
     #[test]
-    fn diag_990_gaps() {
-        for n in [4usize, 8, 20, 400] {
-            let mut app = TuiShellApp::new(None);
-            app.engine.settings.autohide_panels = false;
-            app.engine.app_shell.hide_sidebar();
-            app.engine.session.explorer_visible = false;
-            let text: String = (0..n).map(|i| format!("line {i}\n")).collect();
-            app.engine.buffer_mut().insert(0, &text);
+    fn minimap_paints_contiguous_rows_for_short_files() {
+        // Ungated: long files are contiguous today.
+        assert_minimap_rows_contiguous(400);
 
-            let mut driver = driver_with_shell(app, config(), 100, 24);
-            driver.press_named(quadraui::NamedKey::Escape);
-            let screen = driver.screen();
-
-            let painted_rows: Vec<usize> = (0..24usize)
-                .filter(|&row| braille_col(&screen, row).is_some())
-                .collect();
-            eprintln!("DIAG990gaps[n={n}]: painted_rows = {painted_rows:?}");
-            eprintln!("DIAG990gaps[n={n}]: screen:\n{screen}");
-        }
+        crate::harness::known_bug_gate(
+            "minimap_paints_contiguous_rows_for_short_files::tui",
+            || {
+                assert_minimap_rows_contiguous(20);
+                assert_minimap_rows_contiguous(8);
+            },
+        );
     }
 
-    fn diag_990_indent_run(extra_long_line: bool) {
-        let mut app = TuiShellApp::new(None);
-        app.engine.settings.autohide_panels = false;
-        app.engine.app_shell.hide_sidebar();
-        app.engine.session.explorer_visible = false;
-        // Pad each of the three indent levels out to its own 4-line group
-        // (lines_per_row) so each lands on its own minimap ROW instead of
-        // sharing one row's 4 packed dot-subrows with the other two --
-        // much easier to read the "first set-dot column" back per row.
+    /// The three-indent-level fixture for deliverable 2, optionally with a
+    /// long line appended.
+    ///
+    /// Each indent level is padded out to its own `MINIMAP_LINES_PER_ROW`
+    /// (4) group so it lands on its own minimap row instead of being packed
+    /// into a shared row with the other two — that keeps "which column did
+    /// *this* indent level's mark start at" readable straight off the
+    /// painted frame.
+    fn minimap_indent_runs(with_long_line: bool) -> (Vec<(usize, usize, usize, usize)>, String) {
+        let mut app = app_for_minimap_test();
         let mut text = String::from("x\n\n\n\n    x\n\n\n\n        x\n\n\n\n");
-        if extra_long_line {
+        if with_long_line {
             text.push_str(&"y".repeat(300));
             text.push('\n');
         }
         app.engine.buffer_mut().insert(0, &text);
-
         let mut driver = driver_with_shell(app, config(), 100, 24);
         driver.press_named(quadraui::NamedKey::Escape);
         let screen = driver.screen();
-        eprintln!("DIAG990indent[long={extra_long_line}]: screen:\n{screen}");
-        for row in 2..6usize {
-            let Some(line) = screen.lines().nth(row) else {
-                continue;
-            };
-            let first_set: Option<usize> = line
-                .chars()
-                .enumerate()
-                .find(|(_, c)| ('\u{2801}'..='\u{28FF}').contains(c))
-                .map(|(i, _)| i);
-            eprintln!(
-                "DIAG990indent[long={extra_long_line}]: row {row} first set-dot column: {first_set:?}"
-            );
-        }
+        let runs: Vec<(usize, usize, usize, usize)> = (0..screen.lines().count())
+            .filter_map(|row| minimap_dot_run(&screen, row))
+            .collect();
+        (runs, screen)
     }
 
+    /// #990 deliverable 2 (upstream: **quadraui#993**) — the minimap's
+    /// horizontal marks must bear some resemblance to the file's own
+    /// indentation.
+    ///
+    /// # Mechanism, measured off the painted frame
+    ///
+    /// Each line is normalised by **its own** `chars.len()` rather than by
+    /// a scale shared across the file, so *every* line is stretched to fill
+    /// the whole strip. Against unfixed `develop`, the fixture
+    /// `"x"` / `"    x"` / `"        x"` paints (100x24, 12-cell strip):
+    ///
+    /// | line | painted run |
+    /// |---|---|
+    /// | `x` (1 char) | all **12** cells — `⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉` |
+    /// | `    x` (5 chars) | last 3 cells (char 5 of 5 → 80–100% of width) |
+    /// | `        x` (9 chars) | last 2 cells (char 9 of 9 → ~89–100%) |
+    /// | 300×`y` | all **12** cells — identical to the 1-char line |
+    ///
+    /// # Why this test does not assert what the issue first proposed
+    ///
+    /// The issue nominated "adding a long line must not move where the
+    /// short lines' dots land" as *the* discriminating assertion. Measured,
+    /// it does not discriminate: under per-line normalisation every line is
+    /// independent, so adding the long line moves nothing — the assertion
+    /// is **trivially true against the bug**. It is still asserted below
+    /// (it is a genuine post-fix property worth pinning), but it is
+    /// deliberately not load-bearing.
+    ///
+    /// What actually discriminates is the *extent* of each mark, which is
+    /// the direct observable consequence of self-normalisation: a 1-char
+    /// line and a 300-char line in the same file paint **identical**
+    /// full-width runs today. Two assertions capture that, and both fail
+    /// against unfixed `develop`.
+    ///
+    /// The monotonic-column assertion the issue also asked for is kept, but
+    /// as a *non-decreasing* one (deeper indentation never starts left of
+    /// shallower, and the deepest starts strictly right of the shallowest)
+    /// rather than strictly-increasing-per-level: a correct rasteriser with
+    /// a shared scale may legitimately land two indent levels in the same
+    /// terminal cell, and pinning strict inequality would turn this test
+    /// into a false alarm the day the real fix lands.
+    ///
+    /// Per the Platform-Neutrality Rule the fix is quadraui's; no
+    /// vimcode-side re-normalisation is permitted here.
+    ///
+    /// **RED against unfixed `develop`:** confirmed by running this
+    /// scenario with its `KNOWN_BUGS` entry removed — assertion (b) fails
+    /// (`a 1-character line must not paint a mark spanning the entire
+    /// 12-cell minimap strip`). Assertion (c) was then confirmed to fail
+    /// *independently* (with (b) disabled, so it could not be hidden by
+    /// short-circuiting): `the short line's minimap mark must be narrower
+    /// than the long line's — got 12 vs 12 cells`. Assertions (a) and (d)
+    /// pass today, as this test's doc explains — they are post-fix
+    /// properties, not the discriminators.
     #[test]
-    fn diag_990_indent() {
-        diag_990_indent_run(false);
-        diag_990_indent_run(true);
+    fn minimap_indent_marks_track_the_files_own_indentation() {
+        let (runs, screen) = minimap_indent_runs(false);
+        assert!(
+            runs.len() >= 3,
+            "precondition: the three indent levels must each paint their \
+             own minimap row; runs={runs:?}; screen:\n{screen}"
+        );
+        let (long_runs, long_screen) = minimap_indent_runs(true);
+        assert!(
+            long_runs.len() >= 4,
+            "precondition: the appended long line must paint a fourth \
+             minimap row; runs={long_runs:?}; screen:\n{long_screen}"
+        );
+
+        crate::harness::known_bug_gate(
+            "minimap_indent_marks_track_the_files_own_indentation::tui",
+            || {
+                let [(first0, _, count0, strip_width), (first1, ..), (first2, ..)] = runs[..3]
+                else {
+                    unreachable!("length checked above")
+                };
+
+                // (a) Indentation ordering: deeper never starts left of
+                // shallower, and the deepest starts strictly right of the
+                // shallowest.
+                assert!(
+                    first0 <= first1 && first1 <= first2 && first0 < first2,
+                    "the three indent levels (0, 4, 8 spaces) must paint their \
+                 marks at non-decreasing columns with the deepest strictly \
+                 right of the shallowest; got first-dot columns \
+                 {first0}, {first1}, {first2}; screen:\n{screen}"
+                );
+
+                // (b) Extent, self-normalisation's direct symptom: one
+                // character cannot reasonably be the whole file's width.
+                assert!(
+                    count0 < strip_width,
+                    "a 1-character line must not paint a mark spanning the \
+                 entire {strip_width}-cell minimap strip — that is the \
+                 painted signature of per-line normalisation \
+                 (quadraui#993); screen:\n{screen}"
+                );
+
+                // (c) The discriminating comparison: in one file, a 1-char line
+                // and a 300-char line must not occupy the same width.
+                let (_, _, short_count, _) = long_runs[0];
+                let (_, _, long_count, _) = long_runs[3];
+                assert!(
+                    short_count < long_count,
+                    "in a file containing both a 1-character line and a \
+                 300-character line, the short line's minimap mark must be \
+                 narrower than the long line's — got {short_count} vs \
+                 {long_count} cells; screen:\n{long_screen}"
+                );
+
+                // (d) The issue's original proposal, kept as a post-fix
+                // property (see this test's doc for why it is not
+                // load-bearing): appending a long line must not shift where the
+                // short lines' marks start.
+                let before: Vec<usize> = runs[..3].iter().map(|r| r.0).collect();
+                let after: Vec<usize> = long_runs[..3].iter().map(|r| r.0).collect();
+                assert_eq!(
+                    before, after,
+                    "appending a long line must not move where the three short \
+                 lines' marks start; screen:\n{long_screen}"
+                );
+            },
+        );
+    }
+
+    /// Open `n_lines` of `let value_N = 1;`, each indented by `indent`
+    /// spaces, in a real `.rs` buffer so tree-sitter actually highlights
+    /// it, and return the painted minimap's distinct dot colours alongside
+    /// the highlight count the engine produced.
+    fn minimap_colors_for_indent(
+        indent: usize,
+    ) -> (std::collections::HashMap<String, usize>, usize, String) {
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_test_990_minimap_colour_{}_{:?}_{indent}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("colour990.rs");
+        let pad = " ".repeat(indent);
+        let text: String = (0..100)
+            .map(|i| format!("{pad}let value_{i} = 1;\n"))
+            .collect();
+        std::fs::write(&file, &text).unwrap();
+
+        // `syntax_max_lines` lives in a process-global atomic that another
+        // test in this binary can have moved; pin it so "were there any
+        // highlights at all" is deterministic here.
+        crate::core::buffer_manager::set_syntax_max_lines(20_000);
+
+        let mut app = app_for_minimap_test();
+        app.engine
+            .open_file_with_mode(&file, crate::core::engine::OpenMode::Permanent)
+            .unwrap();
+        let win_id = app.engine.active_window_id();
+        let buf_id = app.engine.windows.get(&win_id).unwrap().buffer_id;
+        let n_highlights = app
+            .engine
+            .buffer_manager
+            .get(buf_id)
+            .unwrap()
+            .highlights
+            .len();
+
+        let driver = driver_with_shell(app, config(), 100, 24);
+        let colors = minimap_dot_fg_colors(&driver);
+        let screen = driver.screen();
+        let _ = std::fs::remove_dir_all(&dir);
+        (colors, n_highlights, screen)
+    }
+
+    /// #990 deliverable 3 — the minimap paints **no** colour for indented
+    /// code. Diagnosed here; the cause is **vimcode's**, not quadraui's.
+    ///
+    /// # Diagnosis
+    ///
+    /// The issue listed four candidates. Measured against unfixed
+    /// `develop`, with a 100-line `.rs` buffer whose every line is
+    /// `let value_N = 1;` indented by a varying number of spaces:
+    ///
+    /// | indent | tree-sitter highlights | distinct painted dot colours |
+    /// |---|---|---|
+    /// | 0  | 400 | 5 |
+    /// | 8  | 400 | 3 |
+    /// | 20 | 400 | 2 |
+    /// | 40 | 400 | **1** (the fallback only) |
+    /// | 80 | 400 | **1** (the fallback only) |
+    ///
+    /// * Candidate 1 (*`buffer_state.highlights` is empty under the TUI*)
+    ///   is **disproven** — 400 highlights in every row of that table, and
+    ///   the colour count still collapses to 1. The test below asserts the
+    ///   highlight count is non-zero explicitly and ungated, so this stays
+    ///   disproven rather than re-guessed.
+    /// * Candidate 2 (*sampling drops spans*) is real but secondary — it
+    ///   makes colour *sparse* on long files (measured: ~68% fallback cells
+    ///   on a deliberately sparse 19 000-line fixture), never absent.
+    /// * Candidate 4 (*grid granularity mismatch*) matches the measured
+    ///   cutoff exactly, and is **vimcode-side**:
+    ///   `render::build_minimap_data` hands `quadraui::aggregate_spans` a
+    ///   `MinimapGrid` with a hardcoded `cols: MINIMAP_SPAN_COLS` (200) and
+    ///   `cols_per_cell: 2` — a 200-cell colour grid covering character
+    ///   columns 0..400 — while the TUI strip the rasteriser paints is only
+    ///   ~12 cells wide. Only grid cells 0..~12 are ever consulted, i.e.
+    ///   character columns 0..~24. Every span on a line indented past that
+    ///   lands in a grid cell nothing reads, which is precisely the
+    ///   observed monotonic collapse and its cutoff between indent 20 and
+    ///   indent 40. Real source is nested, so in practice nearly every
+    ///   token is past the cutoff — hence "no colouring".
+    ///
+    /// The fix therefore belongs in vimcode (derive the grid's `cols` /
+    /// `cols_per_cell` from the strip's actual painted width instead of a
+    /// fixed 200), and is **not** attempted here: this issue is test-only,
+    /// and the entangled quadraui#993 defect above means the dots and the
+    /// colours are on two different horizontal scales until that lands too.
+    /// Filed separately as a vimcode issue.
+    ///
+    /// **RED against unfixed `develop`:** confirmed by running this
+    /// scenario with its `KNOWN_BUGS` entry removed — the gated assertion
+    /// fails with `the minimap must paint more than one distinct
+    /// foreground colour … got 1`.
+    #[test]
+    fn minimap_paints_syntax_colour_for_indented_code() {
+        // Ungated, and the reason this test can't be green for the wrong
+        // reason: un-indented code *is* coloured today, so the probe works
+        // and the gated failure below is about indentation alone.
+        let (flat_colors, flat_highlights, flat_screen) = minimap_colors_for_indent(0);
+        assert!(
+            flat_highlights > 0,
+            "precondition: tree-sitter must produce highlights for this \
+             fixture, or the colour assertions are vacuous"
+        );
+        assert!(
+            flat_colors.len() > 1,
+            "precondition/regression guard: un-indented highlighted code \
+             must paint more than one distinct minimap colour; got \
+             {flat_colors:?}; screen:\n{flat_screen}"
+        );
+
+        let (colors, highlights, screen) = minimap_colors_for_indent(40);
+        // Ungated: candidate 1 stays disproven — the highlights are there.
+        assert!(
+            highlights > 0,
+            "precondition: indenting the fixture must not stop tree-sitter \
+             highlighting it (candidate 1 of this issue's diagnosis); got \
+             {highlights} highlights"
+        );
+
+        crate::harness::known_bug_gate(
+            "minimap_paints_syntax_colour_for_indented_code::tui",
+            || {
+                assert!(
+                    colors.len() > 1,
+                    "the minimap must paint more than one distinct foreground \
+                 colour for syntax-highlighted code, even when that code is \
+                 indented ({highlights} highlights exist for this buffer) — \
+                 got {}: {colors:?}; screen:\n{screen}",
+                    colors.len()
+                );
+            },
+        );
     }
 }
