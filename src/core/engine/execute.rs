@@ -3356,11 +3356,10 @@ impl Engine {
                 }
             }
         }
-        if flags.contains('c') {
-            // #801 acceptance: never *silently* discard the confirm flag.
-            self.message = "E-vimcode: the :s 'c' (confirm) flag is not implemented".to_string();
-            return EngineAction::Error;
-        }
+        // #1031 (#801 Phase 2): the confirm loop is entered further down,
+        // once the pattern/replacement/range are all resolved — see
+        // `confirm && !report_only` below.
+        let confirm = flags.contains('c');
         let global = flags.contains('g');
         let report_only = flags.contains('n');
         let quiet = flags.contains('e');
@@ -3431,6 +3430,54 @@ impl Engine {
         }
         first_line = first_line.min(n_lines.saturating_sub(1));
         last_line = last_line.min(n_lines.saturating_sub(1));
+
+        // --- `:s///c` confirm loop (#1031, #801 Phase 2) ---
+        //
+        // `n` ("report only, don't substitute") wins over `c` if both are
+        // given — there is nothing to confirm if nothing is ever applied —
+        // so that combination falls through to the ordinary scan below
+        // exactly like a plain `:s///n` would.
+        if confirm && !report_only {
+            let candidates = collect_confirm_candidates(
+                body,
+                &line_starts,
+                first_line,
+                last_line,
+                &compiled,
+                global,
+                &repl,
+            );
+            if candidates.is_empty() {
+                if !quiet {
+                    self.message = format!("E486: Pattern not found: {pattern}");
+                    return EngineAction::Error;
+                }
+                self.message.clear();
+                if let Some(next) = chained {
+                    let next = next.trim().to_string();
+                    if !next.is_empty() {
+                        return self.execute_command(&next);
+                    }
+                }
+                return EngineAction::None;
+            }
+            self.confirm_sub = Some(ConfirmSubState {
+                body: body.to_string(),
+                trailing: trailing.to_string(),
+                matches: candidates,
+                idx: 0,
+                copied: 0,
+                out: String::new(),
+                n_subs: 0,
+                done_lines: Vec::new(),
+                last_end_in_out: None,
+                last_was_multiline: false,
+                first_change_cursor: None,
+                cur,
+                chained,
+            });
+            return self.begin_confirm_sub_prompt();
+        }
 
         // --- single left-to-right pass over the buffer text ---
         let mut out = String::new();
@@ -3643,6 +3690,231 @@ impl Engine {
     pub(crate) fn splice_buffer_text(&mut self, new_text: &str) {
         let cursor_before = *self.cursor();
         self.splice_buffer_text_at(new_text, cursor_before);
+    }
+
+    // --- `:s///c` confirm loop (#1031, #801 Phase 2) ---
+    //
+    // `run_substitute` precomputes every candidate match up front (see
+    // `collect_confirm_candidates`) using the *original*, unmodified buffer
+    // text — the same one-pass scan the non-confirm path already used,
+    // just not applied yet. The interactive loop below only ever decides,
+    // per candidate in order, whether to fold its rendered replacement into
+    // an `out` string being built incrementally; the real buffer is left
+    // untouched (`self.confirm_sub` holds all of this state) until the loop
+    // ends, at which point one `splice_buffer_text_at` applies the result —
+    // exactly mirroring what a single non-interactive `:s///g` would have
+    // spliced, just gated per-match by the user's answer. This keeps
+    // candidate positions stable across answers (no later match ever shifts
+    // because an earlier one was replaced), which is safe because, like the
+    // non-confirm path, no candidate's rendered text is re-scanned for
+    // further matches.
+    //
+    // Verified against a real `nvim --headless --listen` session (v0.12.5,
+    // driven interactively over its msgpack `--remote-send`, not the
+    // non-interactive `-es` batch mode, which short-circuits `:s///c`
+    // entirely): the pending match's *start* (not its line's first
+    // non-blank) is where the cursor sits while a prompt is up; quitting
+    // (`q`/`<Esc>`) or `l` ("last") freezes the cursor there and prints no
+    // report line even if earlier answers replaced something; only running
+    // off the end of the candidate list (individually or via `a`) both
+    // reports and re-lands the cursor the same place the non-confirm path
+    // would (last substitution's line, first non-blank unless the last
+    // substitution was multiline).
+
+    /// Show the prompt for the confirm loop's current candidate, or finish
+    /// the loop (as a "ran off the end" completion) if there isn't one.
+    fn begin_confirm_sub_prompt(&mut self) -> EngineAction {
+        let Some(state) = self.confirm_sub.as_ref() else {
+            return EngineAction::None;
+        };
+        let Some(m) = state.matches.get(state.idx) else {
+            return self.finish_confirm_sub(true, true);
+        };
+        let line = m.sline;
+        let col = m.scol;
+        let rendered = m.rendered.clone();
+        self.view_mut().cursor.line = line;
+        self.view_mut().cursor.col = col;
+        self.clamp_cursor_col();
+        self.message = format!(
+            "replace with {rendered}? (y)es/(n)o/(a)ll/(q)uit/(l)ast/scroll up(^E)/down(^Y)"
+        );
+        EngineAction::None
+    }
+
+    /// Route one keystroke to the confirm loop. Called from `handle_key`
+    /// while `self.confirm_sub.is_some()`, ahead of all other dispatch.
+    pub(crate) fn handle_confirm_sub_key(
+        &mut self,
+        key_name: &str,
+        unicode: Option<char>,
+        ctrl: bool,
+    ) -> EngineAction {
+        if ctrl && (unicode == Some('e') || key_name == "e") {
+            self.scroll_viewport_with_cursor(1, 1);
+            return EngineAction::None;
+        }
+        if ctrl && (unicode == Some('y') || key_name == "y") {
+            self.scroll_viewport_with_cursor(-1, 1);
+            return EngineAction::None;
+        }
+        if key_name == "Escape" {
+            return self.finish_confirm_sub(false, false);
+        }
+        match unicode {
+            Some('y') => {
+                self.confirm_sub_apply_current();
+                self.confirm_sub_advance()
+            }
+            Some('n') => self.confirm_sub_advance(),
+            Some('a') => {
+                loop {
+                    self.confirm_sub_apply_current();
+                    let Some(state) = self.confirm_sub.as_mut() else {
+                        return EngineAction::None;
+                    };
+                    state.idx += 1;
+                    if state.idx >= state.matches.len() {
+                        break;
+                    }
+                }
+                self.finish_confirm_sub(true, true)
+            }
+            // "Last" -- verified against real Neovim: unlike `q`/`<Esc>`,
+            // `l` *does* re-land the cursor the same way a natural
+            // completion would (first non-blank of the line the applied
+            // replacement landed on), it just prints no report line.
+            Some('l') => {
+                self.confirm_sub_apply_current();
+                self.finish_confirm_sub(true, false)
+            }
+            Some('q') => self.finish_confirm_sub(false, false),
+            // Any other key is simply ignored -- verified against real
+            // Neovim: the prompt stays up for the same candidate (mode
+            // stays 'r', cursor doesn't move), it is not treated as `n`.
+            _ => EngineAction::None,
+        }
+    }
+
+    /// Fold the current candidate's rendered replacement into the
+    /// in-progress `out` string, mirroring exactly what the non-confirm
+    /// scan does per match (`run_substitute`'s own comment on the
+    /// equivalent code explains the bookkeeping).
+    fn confirm_sub_apply_current(&mut self) {
+        let Some(state) = self.confirm_sub.as_mut() else {
+            return;
+        };
+        let Some(m) = state.matches.get(state.idx).cloned() else {
+            return;
+        };
+        state.out.push_str(&state.body[state.copied..m.mstart]);
+        state.out.push_str(&m.rendered);
+        state.copied = m.mend;
+        state.n_subs += 1;
+        if state.first_change_cursor.is_none() {
+            state.first_change_cursor = Some(Cursor {
+                line: m.sline,
+                col: m.scol,
+            });
+        }
+        state.last_end_in_out = Some(state.out.len());
+        state.last_was_multiline = m.eline > m.sline;
+        // Mirrors the non-confirm scan: a multiline match's start line is
+        // deliberately *not* added to `done_lines` there either (it shrinks
+        // `last_line` instead) -- kept identical here for the same report
+        // count.
+        if m.eline == m.sline && state.done_lines.last() != Some(&m.sline) {
+            state.done_lines.push(m.sline);
+        }
+    }
+
+    /// Move to the next candidate (without deciding anything about it),
+    /// showing its prompt, or finish the loop if that was the last one.
+    fn confirm_sub_advance(&mut self) -> EngineAction {
+        let Some(state) = self.confirm_sub.as_mut() else {
+            return EngineAction::None;
+        };
+        state.idx += 1;
+        if state.idx >= state.matches.len() {
+            self.finish_confirm_sub(true, true)
+        } else {
+            self.begin_confirm_sub_prompt()
+        }
+    }
+
+    /// End the confirm loop: splice whatever got decided into the real
+    /// buffer, then handle the cursor and message independently —
+    /// verified against real Neovim (see this section's own doc above),
+    /// the two don't always travel together:
+    ///
+    /// * `reposition` — land the cursor the same way the non-confirm path
+    ///   would (last substitution's line, first non-blank unless
+    ///   multiline). True for a natural "ran off the end" completion
+    ///   (individually or via `a`) *and* for `l`. False only for `q`/
+    ///   `<Esc>`, which instead freeze the cursor exactly where the last
+    ///   prompt already left it (the pending, undecided candidate).
+    /// * `report` — print "N substitutions on M lines". True only for the
+    ///   natural completion; `l`, `q` and `<Esc>` all stay silent even if
+    ///   an earlier answer replaced something.
+    fn finish_confirm_sub(&mut self, reposition: bool, report: bool) -> EngineAction {
+        let Some(state) = self.confirm_sub.take() else {
+            return EngineAction::None;
+        };
+        let mut out = state.out;
+        out.push_str(&state.body[state.copied..]);
+
+        if state.n_subs > 0 {
+            let new_full = format!("{out}{}", state.trailing);
+            let first_change_cursor = state.first_change_cursor.unwrap_or(Cursor {
+                line: state.cur,
+                col: 0,
+            });
+            self.splice_buffer_text_at(&new_full, first_change_cursor);
+        }
+
+        if reposition && state.n_subs > 0 {
+            let target_line = state
+                .last_end_in_out
+                .map(|b| out[..b].matches('\n').count())
+                .unwrap_or(state.cur);
+            let target_col = if state.last_was_multiline {
+                state.last_end_in_out.map(|b| {
+                    let line_start = out[..b].rfind('\n').map(|i| i + 1).unwrap_or(0);
+                    out[line_start..b].chars().count()
+                })
+            } else {
+                None
+            };
+            let max_line = self.buffer().len_lines().saturating_sub(1);
+            let target_line = target_line.min(max_line);
+            self.view_mut().cursor.line = target_line;
+            self.view_mut().cursor.col =
+                target_col.unwrap_or_else(|| self.first_non_blank_col(target_line));
+            self.clamp_cursor_col();
+        }
+        // Quitting (`q`/`<Esc>`) leaves the cursor exactly where the last
+        // prompt left it (the pending candidate) -- `reposition` is false
+        // in that case, so the block above is simply skipped.
+
+        if report && state.n_subs > 0 {
+            self.message = format!(
+                "{} substitution{} on {} line{}",
+                state.n_subs,
+                if state.n_subs == 1 { "" } else { "s" },
+                state.done_lines.len(),
+                if state.done_lines.len() == 1 { "" } else { "s" }
+            );
+        } else {
+            self.message.clear();
+        }
+
+        if let Some(next) = state.chained {
+            let next = next.trim().to_string();
+            if !next.is_empty() {
+                return self.execute_command(&next);
+            }
+        }
+        EngineAction::None
     }
 
     // --- Search ---
@@ -4620,6 +4892,179 @@ impl Engine {
         self.view_mut().cursor.col = self.first_non_blank_col(line);
         self.clamp_cursor_col();
     }
+}
+
+/// One candidate match `:s///c` offers to confirm — everything about it is
+/// derived from the *original*, unmodified buffer text once, up front (see
+/// `collect_confirm_candidates`), so answering earlier candidates never
+/// shifts a later one's position.
+#[derive(Clone)]
+pub(crate) struct ConfirmSubMatch {
+    /// Byte offset of the match's start in the frozen `body` (honours
+    /// `\zs`/`\ze` like the non-confirm scan does).
+    mstart: usize,
+    /// Byte offset just past the match's end in the frozen `body`.
+    mend: usize,
+    /// 0-indexed line the match starts on.
+    sline: usize,
+    /// 0-indexed line the match ends on (`> sline` for a match that
+    /// swallowed a line break, e.g. `:%s/\n//`).
+    eline: usize,
+    /// 0-indexed char column of `mstart` within `sline` — where the cursor
+    /// sits while this candidate's prompt is up (verified against real
+    /// Neovim: the match's start, not the line's first non-blank).
+    scol: usize,
+    /// This candidate's replacement text, already expanded against its own
+    /// captures (`\1`, `\U`, `&`, …).
+    rendered: String,
+}
+
+/// State for an in-progress `:s///c` confirm loop — lives in
+/// `Engine::confirm_sub` between keystrokes; see that field's doc and the
+/// "confirm loop" section of `impl Engine` in this file for how it's driven.
+pub(crate) struct ConfirmSubState {
+    /// The buffer's text at the moment `:s///c` was invoked, sans a
+    /// trailing `\n` (see `trailing`) — frozen for the whole loop; matches'
+    /// offsets are only ever valid against this copy, not the live buffer.
+    body: String,
+    /// `"\n"` if `body` ends the buffer's actual trailing newline, else `""`.
+    trailing: String,
+    /// Every match `:s///c` will offer to confirm, in order, precomputed
+    /// against `body`.
+    matches: Vec<ConfirmSubMatch>,
+    /// Index into `matches` of the candidate currently being prompted for.
+    idx: usize,
+    /// Byte offset into `body` up to which `out` already accounts for
+    /// (either copied verbatim or replaced) — mirrors the non-confirm
+    /// scan's `copied`.
+    copied: usize,
+    /// The substitution result being built incrementally as candidates are
+    /// decided — mirrors the non-confirm scan's `out`.
+    out: String,
+    /// Count of candidates actually replaced (`y`/`a`/`l`) — *not* the
+    /// number of candidates offered; a `n`-answered candidate must not
+    /// count toward the post-loop report (#1031 deliverable 2).
+    n_subs: usize,
+    /// Distinct 0-indexed lines an actual replacement landed on, in the
+    /// order they were applied — feeds "N substitutions on M lines".
+    /// Mirrors the non-confirm scan's own `done_lines` quirk: a multiline
+    /// match's start line is never pushed here (see `confirm_sub_apply_current`).
+    done_lines: Vec<usize>,
+    /// Byte offset into `out` just past the most recently applied
+    /// replacement — used to compute the final cursor line/col exactly like
+    /// the non-confirm path's `last_end_in_out`.
+    last_end_in_out: Option<usize>,
+    /// Whether the most recently applied replacement swallowed a line
+    /// break, same meaning as the non-confirm path's `last_was_multiline`.
+    last_was_multiline: bool,
+    /// Cursor `u` should restore to — the position of the *first* applied
+    /// replacement (#886's rule), or `None` if nothing has been applied yet.
+    first_change_cursor: Option<Cursor>,
+    /// The cursor's line when `:s///c` was invoked — the fallback used if
+    /// nothing ever gets applied (mirrors the non-confirm path's `cur`).
+    cur: usize,
+    /// A `|`-chained follow-up ex command (`:s/a/x/|s/b/y/c`), run once the
+    /// loop ends, same as the non-confirm path.
+    chained: Option<String>,
+}
+
+/// Scan `body` for every match `:s///c` should offer to confirm, applying
+/// the exact same global/same-line-dedup/multiline/empty-match-at-eol rules
+/// the non-confirm scan in `run_substitute` uses to decide which matches
+/// are candidates at all — the two scans *must* agree, since `:s///gc` and
+/// `:s///g` differ only in whether each candidate is applied unconditionally
+/// or interactively. Unlike that scan, this one never mutates an `out`
+/// string; it only records each candidate's span, line/col and rendered
+/// replacement text so the confirm loop (`Engine::confirm_sub_apply_current`
+/// et al.) can decide, one keystroke at a time, which candidates actually
+/// get folded into the result.
+#[allow(clippy::too_many_arguments)]
+fn collect_confirm_candidates(
+    body: &str,
+    line_starts: &[usize],
+    first_line: usize,
+    last_line: usize,
+    compiled: &vim_regex::Compiled,
+    global: bool,
+    repl: &str,
+) -> Vec<ConfirmSubMatch> {
+    let line_of = |b: usize| match line_starts.binary_search(&b) {
+        Ok(i) => i,
+        Err(i) => i - 1,
+    };
+    let mut matches = Vec::new();
+    let mut at = line_starts[first_line];
+    let mut done_lines: Vec<usize> = Vec::new();
+    let mut last_line = last_line;
+    while at <= body.len() {
+        let Some(caps) = compiled.captures_at(body, at) else {
+            break;
+        };
+        let whole = caps.get(0).expect("group 0 always matches");
+        let (mstart, mend) = compiled.span(&caps);
+        let sline = line_of(mstart);
+        if sline > last_line {
+            break;
+        }
+        let skip_to_next_line = |at: &mut usize| -> bool {
+            match line_starts.get(sline + 1) {
+                Some(&next) => {
+                    *at = next;
+                    true
+                }
+                None => false,
+            }
+        };
+        if !global && done_lines.last() == Some(&sline) {
+            if skip_to_next_line(&mut at) {
+                continue;
+            }
+            break;
+        }
+        let at_eol = mend == body.len() || body.as_bytes()[mend] == b'\n';
+        if mstart == mend && at_eol && done_lines.last() == Some(&sline) {
+            if skip_to_next_line(&mut at) {
+                continue;
+            }
+            break;
+        }
+
+        let rendered = expand_replacement(repl, &caps, &compiled.group_map, &body[mstart..mend]);
+        let eline = line_of(mend);
+        if eline > sline {
+            last_line = last_line.saturating_sub(eline - sline);
+        } else if done_lines.last() != Some(&sline) {
+            done_lines.push(sline);
+        }
+        let line_start = line_starts[sline];
+        let scol = body[line_start..mstart].chars().count();
+        matches.push(ConfirmSubMatch {
+            mstart,
+            mend,
+            sline,
+            eline,
+            scol,
+            rendered,
+        });
+
+        at = if whole.end() > whole.start() {
+            whole.end().max(mend)
+        } else {
+            let from = whole.end().max(mend);
+            match body[from..].chars().next() {
+                Some(c) => from + c.len_utf8(),
+                None => from + 1,
+            }
+        };
+        if !global && eline == sline {
+            if let Some(&next) = line_starts.get(eline + 1) {
+                at = at.max(next);
+            } else {
+                break;
+            }
+        }
+    }
+    matches
 }
 
 /// One whitespace run `:retab` rewrote on a line, in char offsets — used to

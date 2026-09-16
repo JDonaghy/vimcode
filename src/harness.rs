@@ -1239,22 +1239,6 @@ pub(crate) fn assert_text_metrics_backend_applies_metrics<B: TextMetricsBackend>
 /// measurements and for the (stronger) property those scenarios assert
 /// now that they are ungated.
 pub(crate) const KNOWN_BUGS: &[&str] = &[
-    // #986: v0.11.0 bug report -- `:s///c` (confirm-prompt) is #801 Phase 2,
-    // which was never built: `execute.rs`'s `flags.contains('c')` check
-    // always errors loudly ("E-vimcode: ... not implemented") instead of
-    // entering a confirm loop, so neither scenario below can pass yet on
-    // either backend. Shared (not `::gtk`/`::tui`-suffixed) because the
-    // root cause -- the flag isn't implemented at all -- is identical on
-    // both; each label backs a macro-generated `#[test]` on *each* backend
-    // (see `issue_986_confirm_prompt_never_built`'s own doc), so fixing
-    // only one backend still leaves the other backend's use of this same
-    // label failing as an unlisted regression until both are done. A third
-    // scenario this issue wanted (is the pending match visually
-    // highlighted, not just the prompt text) was attempted and deliberately
-    // dropped, not gated -- see that module's own doc for why a pixel/style
-    // probe for it produced a false pass unrelated to this feature.
-    "confirm_prompt_text_is_painted", // #986 — fix: #1031
-    "confirm_report_line_excludes_skipped_matches", // #986 — fix: #1031
     // #990: v0.11.0 bug report -- three separate TUI minimap rendering
     // defects, each with its own painted-output scenario in
     // `src/tui_main/shell_app.rs`. TUI-only labels: all three are measured
@@ -2657,9 +2641,11 @@ mod issue_987_group_scrollbar_inert_and_click_resizes {
 // (#801 Phase 2 never built) ────────────────────────────────────────────
 //
 // #801 deliberately never built the `:s///c` confirm loop: `execute.rs`'s
-// `flags.contains('c')` check always errors loudly ("E-vimcode: the :s 'c'
-// (confirm) flag is not implemented") instead of entering it -- see that
-// check's own comment. `tests/nvim_conformance.rs`'s new `"sub:c ..."` cases
+// `flags.contains('c')` check always errored loudly ("E-vimcode: the :s 'c'
+// (confirm) flag is not implemented") instead of entering it. #1031 (#801
+// Phase 2) replaced that error branch with a real confirm loop --
+// `Engine::confirm_sub` / `handle_confirm_sub_key` in `execute.rs`.
+// `tests/nvim_conformance.rs`'s `"sub:c ..."` cases
 // cover the buffer/cursor half of the contract (oracle-compared against a
 // real `nvim --headless`), but that harness only ever compares buffer text
 // + cursor position -- it cannot tell "the engine silently didn't implement
@@ -2681,10 +2667,13 @@ mod issue_987_group_scrollbar_inert_and_click_resizes {
 // *actual* replacements, excluding matches answered 'n'? See
 // `confirm_report_line_excludes_skipped_matches` below.
 //
-// No implementation lands with this issue -- every scenario here is
-// `known_bug_gate`-wrapped and listed in `KNOWN_BUGS` above, so the suite
-// stays green until a future issue builds the real confirm loop (at which
-// point the gate forces that issue to delete these entries).
+// #986 itself shipped no implementation -- every scenario here was
+// `known_bug_gate`-wrapped and listed in `KNOWN_BUGS`, so the suite stayed
+// green while `execute.rs` still errored loudly. #1031 (#801 Phase 2) is
+// the fix: `run_substitute` now enters a real confirm loop (`Engine::
+// confirm_sub` + `handle_confirm_sub_key` in `execute.rs`) and both entries
+// are gone from `KNOWN_BUGS` -- `known_bug_gate` would fail the build on a
+// listed-but-passing scenario otherwise.
 #[cfg(test)]
 mod issue_986_confirm_prompt_never_built {
     use super::*;

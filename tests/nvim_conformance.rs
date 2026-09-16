@@ -3227,6 +3227,47 @@ const CASES_EX: &[Case] = &[
         1,
         ":s/\\v(\\w+) (\\w+)/\\2 \\1/<CR>",
     ),
+    // #1031 (#801 Phase 2): `:s///c` confirm loop. Verified against a real
+    // interactive `nvim --headless --listen` + `--remote-send` session
+    // (v0.12.5) -- the non-interactive `-es` batch mode this suite's other
+    // cases don't need silently short-circuits `:s///c` (the confirm prompt
+    // never engages), so these were hand-checked outside `cargo test`
+    // before being added here.
+    c(
+        "sub:c y n y y",
+        &["a", "a", "a", "a"],
+        1,
+        1,
+        ":%s/a/x/gc<CR>ynyy",
+    ),
+    c(
+        "sub:c decline all",
+        &["a", "a", "a", "a"],
+        1,
+        1,
+        ":%s/a/x/gc<CR>nnnn",
+    ),
+    c(
+        "sub:c quit early",
+        &["a", "a", "a", "a"],
+        1,
+        1,
+        ":%s/a/x/gc<CR>y<Esc>",
+    ),
+    c(
+        "sub:c 'a' fills remaining",
+        &["a", "a", "a", "a"],
+        1,
+        1,
+        ":%s/a/x/gc<CR>na",
+    ),
+    c(
+        "sub:c 'l' replaces then quits",
+        &["a", "a", "a", "a"],
+        1,
+        1,
+        ":%s/a/x/gc<CR>yl",
+    ),
     c("g:d", &["a", "b", "a", "c"], 1, 1, ":g/a/d<CR>"),
     c("g:s", &["a x", "b x", "a x"], 1, 1, ":g/a/s/x/y/<CR>"),
     c("g:!", &["a", "b", "a", "c"], 1, 1, ":g!/a/d<CR>"),
@@ -5807,27 +5848,15 @@ const KNOWN_DEVIATIONS: &[&str] = &[
     // through `nvim_input` instead of `feedkeys`, so there is no synthetic
     // `<Esc>` and the case simply passes.
     //
-    // ── #986: v0.11.0 bug suite -- `:s///c` confirm-prompt spec (#801
-    // Phase 2 never built). `execute.rs`'s `flags.contains('c')` check
-    // always errors loudly instead of entering a confirm loop, so the
-    // keystrokes meant for the confirm prompt (y/n/a/q/l/<Esc>) fall
-    // through to ordinary Normal-mode command dispatch on the vimcode side
-    // instead -- see each case's own doc, in `CASES_EX`, for what that
-    // dispatch actually does today (never a crash, always a mismatch).
-    // "sub:c plain :s unaffected by confirm gate (regression guard)" is
-    // deliberately NOT listed here -- it already passes and must stay
-    // that way.
-    "sub:c y accepts each prompted match (g)",
-    "sub:c n skips each prompted match (g)",
-    "sub:c a accepts this and all remaining (g)",
-    "sub:c q quits after partial replace (g)",
-    "sub:c l replaces then quits (g)",
-    "sub:c Esc quits after partial replace (g)",
-    "sub:c q quits before any replace, cursor at match (g)",
-    "sub:c Esc quits before any replace, cursor at match (g)",
-    "sub:c y accepts first match per line (no g)",
-    "sub:c n then y across lines (no g)",
-    "sub:c skip counted correctly across buffer (g)",
+    // ── RESOLVED (#1031, #801 Phase 2): "sub:c ..." ──
+    //
+    // #986's v0.11.0 bug suite listed 11 confirm-prompt cases here because
+    // `execute.rs`'s `flags.contains('c')` check always errored loudly
+    // instead of entering a confirm loop, so the keystrokes meant for the
+    // prompt (y/n/a/q/l/<Esc>) fell through to ordinary Normal-mode command
+    // dispatch on the vimcode side. #1031 built the real confirm loop
+    // (`Engine::confirm_sub`, `execute.rs`) and all 11 now pass, alongside
+    // the 5 new cases #1031 itself added right after them in `CASES_EX`.
 ];
 
 // ---------------------------------------------------------------------------
