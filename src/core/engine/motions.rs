@@ -573,7 +573,8 @@ impl Engine {
         }
         let line_text: String = self.buffer().content.line(line).chars().collect();
         let chars: Vec<char> = line_text.trim_end_matches('\n').chars().collect();
-        let (start, len, new_text) = addsub_in_line(&chars, col, delta, NrFormats::default(), sel)?;
+        let nf = NrFormats::from_list(&self.settings.nrformats);
+        let (start, len, new_text) = addsub_in_line(&chars, col, delta, nf, sel)?;
 
         let line_start = self.buffer().line_to_char(line);
         self.delete_with_undo(line_start + start, line_start + start + len);
@@ -6682,8 +6683,10 @@ fn bigword_class(c: char) -> u8 {
 // plus a separate sign flag**, so that is what this models.
 // ---------------------------------------------------------------------------
 
-/// Vim's 'nrformats'.  VimCode has no setting for it yet and pins Neovim's
-/// default (`bin,hex` — note Vim's own default additionally includes `octal`).
+/// Vim's 'nrformats'. `Default` matches `Settings::default().nrformats`
+/// (`bin,hex` — note Vim's own default additionally includes `octal`); the
+/// live value is built from `Settings::nrformats` via [`NrFormats::from_list`]
+/// (#1001).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) struct NrFormats {
     pub bin: bool,
@@ -6700,6 +6703,30 @@ impl Default for NrFormats {
             hex: true,
             alpha: false,
         }
+    }
+}
+
+impl NrFormats {
+    /// Parse `Settings::nrformats`' `"bin"`/`"octal"`/`"hex"`/`"alpha"`
+    /// keywords (`:h 'nrformats'`) into flags. Unknown keywords are ignored,
+    /// matching real Vim's tolerance of unrecognized comma-separated values.
+    pub(crate) fn from_list(list: &[String]) -> Self {
+        let mut nf = Self {
+            bin: false,
+            oct: false,
+            hex: false,
+            alpha: false,
+        };
+        for item in list {
+            match item.as_str() {
+                "bin" => nf.bin = true,
+                "octal" => nf.oct = true,
+                "hex" => nf.hex = true,
+                "alpha" => nf.alpha = true,
+                _ => {}
+            }
+        }
+        nf
     }
 }
 
@@ -6903,6 +6930,28 @@ pub(crate) fn addsub_in_line(
     let firstdigit = at(chars, col);
     if !firstdigit.is_ascii_digit() && !(nf.alpha && firstdigit.is_ascii_alphabetic()) {
         return None;
+    }
+
+    if firstdigit.is_ascii_alphabetic() {
+        // `:h nrformats`, "alpha": a single ASCII letter is its own
+        // self-contained "number" — it increments/decrements within its own
+        // case's a-z/A-Z range and *clamps* rather than wraps at either end
+        // (`z<C-a>` stays `z`, `a<C-x>` stays `a`), unlike every other format
+        // here, which wraps modulo its width. It has no sign and no padding:
+        // a literal `-` right before it is never consumed as part of it —
+        // `-a<C-a>` leaves the `-` untouched and gives `-b`, not `-` + `0`
+        // (which would give `-a` unchanged) — so this returns before the
+        // sign-consuming step below, which applies only to the
+        // decimal/hex/bin formats.
+        let base = if firstdigit.is_ascii_uppercase() {
+            b'A'
+        } else {
+            b'a'
+        } as i64;
+        let pos = firstdigit as i64 - base;
+        let new_pos = (pos + delta).clamp(0, 25);
+        let new_ch = (base + new_pos) as u8 as char;
+        return Some((col, 1, new_ch.to_string()));
     }
 
     if !visual && col > 0 && at(chars, col - 1) == '-' {

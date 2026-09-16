@@ -28663,6 +28663,147 @@ fn test_nvim_ctrl_x_past_zero() {
     nvim_case("n=0\n", 0, 0, "<C-x>", "n=-1\n", 0, 3);
 }
 
+// -- #1001: 'smarttab' --
+
+#[test]
+fn test_smarttab_on_tab_at_front_uses_shiftwidth() {
+    // Default (smarttab on, matching Neovim): with ts=8/sw=4, <Tab> in front
+    // of the line (nothing but blanks before the cursor) advances by
+    // 'shiftwidth', not 'tabstop' — verified against real nvim (4 spaces).
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "x\n");
+    assert!(engine.settings.smarttab);
+    engine.settings.tabstop = 8;
+    engine.settings.shift_width = 4;
+    engine.settings.expand_tab = true;
+    engine.feed_keys("i<Tab><Esc>");
+    assert_eq!(engine.buffer().to_string(), "    x\n");
+}
+
+#[test]
+fn test_smarttab_off_tab_at_front_uses_tabstop() {
+    // 'smarttab' off: <Tab> always advances by 'tabstop', even in front of
+    // the line — a literal tabstop-worth of spaces, not the shiftwidth
+    // rounding above. Verified against real nvim (8 spaces).
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "x\n");
+    engine.settings.smarttab = false;
+    engine.settings.tabstop = 8;
+    engine.settings.shift_width = 4;
+    engine.settings.expand_tab = true;
+    engine.feed_keys("i<Tab><Esc>");
+    assert_eq!(engine.buffer().to_string(), "        x\n");
+}
+
+#[test]
+fn test_smarttab_on_backspace_over_indent_removes_shiftwidth() {
+    // Default (smarttab on): <BS> within leading indentation removes a
+    // whole 'shiftwidth' worth of blanks (rounded to the previous stop), not
+    // one space at a time. Verified against real nvim.
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "    a\n");
+    assert!(engine.settings.smarttab);
+    engine.settings.expand_tab = true;
+    engine.settings.shift_width = 8; // wider than the 4-space indent present
+    engine.view_mut().cursor.col = 4;
+    engine.feed_keys("i<BS><Esc>");
+    assert_eq!(engine.buffer().to_string(), "a\n");
+}
+
+#[test]
+fn test_smarttab_off_backspace_over_indent_removes_one_char() {
+    // 'smarttab' off: <BS> over leading whitespace deletes a single
+    // character, same as anywhere else in the line. Verified against real
+    // nvim.
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "    a\n");
+    engine.settings.smarttab = false;
+    engine.settings.expand_tab = true;
+    engine.settings.shift_width = 8;
+    engine.view_mut().cursor.col = 4;
+    engine.feed_keys("i<BS><Esc>");
+    assert_eq!(engine.buffer().to_string(), "   a\n");
+}
+
+// -- #1001: 'nrformats' --
+
+#[test]
+fn test_nrformats_default_does_not_recognize_octal() {
+    // Default 'nrformats' (bin,hex, matching Neovim) does not include
+    // octal: a leading-zero run is decimal, so 007 <C-a> gives 008, not the
+    // octal-arithmetic 010. Verified against real nvim (pins today's
+    // behavior as correct — regression guard for acceptance criterion 4).
+    nvim_case("007\n", 0, 0, "<C-a>", "008\n", 0, 2);
+}
+
+#[test]
+fn test_nrformats_octal_increments_as_octal() {
+    // 'nrformats' with "octal" added: 007 <C-a> treats 007 as octal 7, which
+    // is 010 in octal. Verified against real nvim.
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "007\n");
+    engine.settings.nrformats = vec!["bin".to_string(), "octal".to_string(), "hex".to_string()];
+    engine.feed_keys("<C-a>");
+    assert_eq!(engine.buffer().to_string(), "010\n");
+}
+
+#[test]
+fn test_nrformats_alpha_increments_letter() {
+    // 'nrformats' with "alpha": <C-a> on a bare ASCII letter increments it
+    // within the alphabet. Verified against real nvim (g -> h).
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "g\n");
+    engine.settings.nrformats = vec!["alpha".to_string()];
+    engine.feed_keys("<C-a>");
+    assert_eq!(engine.buffer().to_string(), "h\n");
+}
+
+#[test]
+fn test_nrformats_alpha_clamps_at_alphabet_boundary() {
+    // Unlike every other 'nrformats' kind (which wraps modulo its width),
+    // alpha clamps at 'z'/'Z' rather than wrapping to 'a'/'A'. Verified
+    // against real nvim (z stays z).
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "z\n");
+    engine.settings.nrformats = vec!["alpha".to_string()];
+    engine.feed_keys("<C-a>");
+    assert_eq!(engine.buffer().to_string(), "z\n");
+}
+
+#[test]
+fn test_nrformats_without_alpha_ignores_bare_letters() {
+    // Without "alpha" in 'nrformats' (the default), <C-a> on a line with no
+    // digits at or after the cursor does nothing.
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "g\n");
+    engine.feed_keys("<C-a>");
+    assert_eq!(engine.buffer().to_string(), "g\n");
+}
+
+#[test]
+fn test_nrformats_visual_ctrl_a_honors_octal() {
+    // Visual-mode <C-a> (`visual_addsub`) must route through the same
+    // 'nrformats' option as Normal-mode <C-a> — not a hardcoded default.
+    // Verified against real nvim (V<C-a> on 007 with octal enabled -> 010).
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "007\n");
+    engine.settings.nrformats = vec!["bin".to_string(), "octal".to_string(), "hex".to_string()];
+    engine.feed_keys("V<C-a>");
+    assert_eq!(engine.buffer().to_string(), "010\n");
+}
+
+#[test]
+fn test_nrformats_g_ctrl_a_honors_alpha() {
+    // g<C-a> (progressive Visual-mode increment) must also honor
+    // 'nrformats'. Verified against real nvim: VGg<C-a> over "a\na\na\n"
+    // with nrformats=alpha gives b/c/d (each line's amount grows by 1).
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "a\na\na\n");
+    engine.settings.nrformats = vec!["alpha".to_string()];
+    engine.feed_keys("VGg<C-a>");
+    assert_eq!(engine.buffer().to_string(), "b\nc\nd\n");
+}
+
 // -- Search history --
 
 #[test]

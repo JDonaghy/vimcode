@@ -1055,8 +1055,12 @@ impl Engine {
             let cur = self.char_idx_to_cursor(idx);
             let text = if expand {
                 let line_start = self.buffer().line_to_char(cur.line);
-                let front_of_line = (0..cur.col)
-                    .all(|i| matches!(self.buffer().content.char(line_start + i), ' ' | '\t'));
+                // `:h smarttab` (#1001): only used to pick 'shiftwidth' vs
+                // 'tabstop' when 'smarttab' is on — see the single-cursor
+                // `Tab` handler in `keys.rs` for the full rule.
+                let front_of_line = self.settings.smarttab
+                    && (0..cur.col)
+                        .all(|i| matches!(self.buffer().content.char(line_start + i), ' ' | '\t'));
                 let stop = if front_of_line {
                     self.effective_shift_width().max(1)
                 } else {
