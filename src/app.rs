@@ -4690,6 +4690,95 @@ impl App {
                     }
                 }
 
+                // ── V scrollbar hit-test (before divider) — #1026/#987 ────────
+                // Mirrors the H-scrollbar rung immediately above:
+                //   - on the thumb → start a DragTarget::ScrollbarY drag.
+                //   - on the empty track → page-jump toward the click.
+                // Either way, consume the click *before* the divider hit-test
+                // below gets a look. Without this rung, `handle_mouse_click_msg`
+                // had no vertical-scrollbar hit-test at all, so a click on a
+                // window's own scrollbar column (the last `cell_width` before
+                // its edge, painted since quadraui#968) fell straight through
+                // to `route_divider_grab` — inert on any window, and silently
+                // resizing the split for any window whose scrollbar-adjacent
+                // side happened to sit inside the divider's own grab margin.
+                //
+                // Window rects come from `self.painted_editor_bounds()` (the
+                // same cached, already-painted `content_bounds`/`tab_bar_h`
+                // the divider rung below reads via `painted_divider_geometry`)
+                // rather than `compute_editor_window_rects`'s `width`/`height`
+                // recompute: that helper always assumes the editor area starts
+                // at `x = 0`, which only holds with the activity bar/sidebar at
+                // zero width. With either painted, its real left edge is
+                // `AppShellLayout::main_content_bounds.x`, so a rect rebuilt
+                // from `(0, 0, width, height)` lands columns off from what was
+                // actually drawn — verified while building this rung: TUI's
+                // own conformance fixture (activity bar always reserves a
+                // real column, no sidebar needed to see it) reproduced exactly
+                // that drift.
+                if let Some((content_bounds, tab_bar_h)) = self.painted_editor_bounds() {
+                    let lh = self.cached_line_height;
+                    let cw = self.cached_char_width;
+                    let engine = self.engine.borrow();
+                    let (rects, _dividers) =
+                        engine.calculate_group_window_rects(content_bounds, tab_bar_h);
+                    if let Some((win_id, scroll_top)) =
+                        v_scrollbar_hit_test(&engine, x, y, &rects, cw, lh)
+                    {
+                        let win_rect = rects.iter().find(|(id, _)| *id == win_id).map(|(_, r)| *r);
+                        let geom = win_rect
+                            .and_then(|rect| v_scrollbar_geometry(&engine, win_id, &rect, cw, lh));
+                        drop(engine);
+                        if let Some((
+                            _track_x,
+                            track_y,
+                            _track_w,
+                            track_h,
+                            thumb_y,
+                            thumb_h,
+                            scroll_range,
+                            _,
+                        )) = geom
+                        {
+                            let max_scroll = scroll_range.round() as usize;
+                            let page_rows = (track_h / lh.max(1.0)).floor() as usize;
+                            if y < thumb_y {
+                                let mut engine = self.engine.borrow_mut();
+                                let new_top = scroll_top.saturating_sub(page_rows);
+                                engine.set_scroll_top_for_window(win_id, new_top);
+                                engine.sync_scroll_binds();
+                                self.draw_needed.set(true);
+                                return;
+                            } else if y >= thumb_y + thumb_h {
+                                let mut engine = self.engine.borrow_mut();
+                                let new_top = (scroll_top + page_rows).min(max_scroll);
+                                engine.set_scroll_top_for_window(win_id, new_top);
+                                engine.sync_scroll_binds();
+                                self.draw_needed.set(true);
+                                return;
+                            }
+                            let grab_offset = (y - thumb_y) as f32;
+                            let drag_rc = self.backend.borrow().drag_state_handle();
+                            drag_rc
+                                .borrow_mut()
+                                .begin(quadraui::DragTarget::ScrollbarY {
+                                    widget: quadraui::WidgetId::new(format!(
+                                        "editor:v_sb:{}",
+                                        win_id.0
+                                    )),
+                                    track_start: track_y as f32,
+                                    track_length: track_h as f32,
+                                    thumb_length: thumb_h as f32,
+                                    max_scroll,
+                                    grab_offset,
+                                    inverted: false,
+                                });
+                            self.draw_needed.set(true);
+                            return;
+                        }
+                    }
+                }
+
                 // ── Divider hit-test (#753 shared rung) ───────────────────────
                 // Editor-group boundaries then `:split`/`:vsplit` boundaries
                 // (#582), sequenced by `render::route_divider_grab`. GTK's only
@@ -6828,9 +6917,25 @@ impl App {
                     if let Some(edge) =
                         ctx.window_edge(position.x, position.y, backend.line_height())
                     {
-                        backend.begin_window_resize(edge);
-                        self.draw_needed.set(true);
-                        return quadraui::Reaction::Redraw;
+                        // #1026/#987 review: `begin_window_resize`'s own doc
+                        // contract is explicit — it returns `false` "when the
+                        // backend owns no window (TUI...)" and callers
+                        // "should treat `false` as a no-op, not an error".
+                        // This call site used to discard that return value
+                        // and swallow the click unconditionally, so on TUI
+                        // (`ctx.window_edge`'s margin math is generic
+                        // geometry, not GTK-gated — it fires for any backend
+                        // near the outer window bounds) a click on a
+                        // window's own rightmost column — exactly where a
+                        // vertical scrollbar column sits when that window is
+                        // flush with the screen's own right edge — never
+                        // reached `handle_mouse_click_msg` at all. Only
+                        // consume the event when the backend actually armed
+                        // a resize.
+                        if backend.begin_window_resize(edge) {
+                            self.draw_needed.set(true);
+                            return quadraui::Reaction::Redraw;
+                        }
                     }
                 }
             }
