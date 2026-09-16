@@ -2431,6 +2431,28 @@ impl ShellApp for TuiShellApp {
             // click opened an unrelated dropdown and left the menu bar
             // open".
             //
+            // **Review (fix iteration 1): position alone is not enough.**
+            // Once the menu bar is visible, row 0 (`title_bar_bounds`) *is*
+            // the menu bar, and its first item, "File", paints at exactly
+            // the same columns (`[ab.x, ab.x + ab.width)`) this check tests
+            // — the hamburger's old corner and "File"'s label fully
+            // overlap. A purely positional, stateless check (the original
+            // shape of this fix) can't tell "the one stale muscle-memory
+            // click the reveal just left behind" apart from "a deliberate
+            // click on `File`, five minutes later" — it fired for *every*
+            // left-click landing there for as long as the menu bar stayed
+            // open, permanently breaking mouse access to `File`. Gated
+            // here, additionally, on `Engine::hamburger_stale_click_guard`
+            // — a one-shot flag armed only by the hamburger's own reveal
+            // (`on_shell_event`'s `PanelChanged` arm) and consumed by the
+            // very next `MouseDown` to reach this dispatch, hit or miss.
+            // That bounds the corner-check to the single click immediately
+            // following a reveal — the click this issue is actually about
+            // — instead of every click for the rest of the menu bar's
+            // lifetime; a later, deliberate click on `File` finds the guard
+            // already consumed and falls through to the `MenuSystem`
+            // intercept below like any other menu click.
+            //
             // Recognised structurally, not by remembering the stale
             // coordinate: a `MouseDown` inside `title_bar_bounds` (the row
             // the reveal itself carved out) whose column still falls
@@ -2451,23 +2473,31 @@ impl ShellApp for TuiShellApp {
             // wrongly believing it's already open.
             if self.engine.menu_bar_visible {
                 if let UiEvent::MouseDown {
-                    button: quadraui::MouseButton::Left,
-                    position,
-                    ..
+                    button, position, ..
                 } = &event
                 {
-                    let viewport = backend.viewport();
-                    let area = quadraui::Rect::new(0.0, 0.0, viewport.width, viewport.height);
-                    let layout = ctx.shell().layout(area, backend.line_height());
-                    let ab = layout.activity_bar_bounds;
-                    let in_hamburger_corner = ctx.in_title_bar(position.x, position.y)
-                        && position.x >= ab.x
-                        && position.x < ab.x + ab.width;
-                    if in_hamburger_corner {
-                        self.engine.menu_bar_visible = false;
-                        ctx.shell_mut().hide_sidebar();
-                        ctx.shell_mut().set_title_bar_visible(false);
-                        break 'dispatch Reaction::Redraw;
+                    // One-shot consume: this is the only place the guard is
+                    // ever cleared once armed (besides a fresh reveal
+                    // re-arming it), so every `MouseDown` reaching this
+                    // dispatch while the menu bar is visible spends it,
+                    // whether or not it turns out to be the stale corner —
+                    // see the doc comment above and
+                    // `Engine::hamburger_stale_click_guard`'s own doc.
+                    let guard_armed = std::mem::take(&mut self.engine.hamburger_stale_click_guard);
+                    if guard_armed && *button == quadraui::MouseButton::Left {
+                        let viewport = backend.viewport();
+                        let area = quadraui::Rect::new(0.0, 0.0, viewport.width, viewport.height);
+                        let layout = ctx.shell().layout(area, backend.line_height());
+                        let ab = layout.activity_bar_bounds;
+                        let in_hamburger_corner = ctx.in_title_bar(position.x, position.y)
+                            && position.x >= ab.x
+                            && position.x < ab.x + ab.width;
+                        if in_hamburger_corner {
+                            self.engine.menu_bar_visible = false;
+                            ctx.shell_mut().hide_sidebar();
+                            ctx.shell_mut().set_title_bar_visible(false);
+                            break 'dispatch Reaction::Redraw;
+                        }
                     }
                 }
             }
@@ -2899,7 +2929,23 @@ impl ShellApp for TuiShellApp {
         match event {
             quadraui::AppShellEvent::PanelChanged { panel_id } => {
                 if panel_id.as_str() == HAMBURGER_PANEL_ID {
+                    // #1029 (review, fix iteration 1): arm the stale-corner
+                    // one-shot guard only on a genuine reveal (the
+                    // `false -> true` transition), not on every echo
+                    // `ShellAdapter` re-fires through this same arm after
+                    // each `handle()`/`tick()` poll (`take_requested_panel`'s
+                    // doc above) — those see `menu_bar_visible` already
+                    // `true` and must NOT keep re-arming the guard, or it
+                    // would stay armed indefinitely and reproduce the exact
+                    // "fires for as long as the menu bar stays visible" bug
+                    // the guard exists to bound. See
+                    // `Engine::hamburger_stale_click_guard`'s own doc for
+                    // the full guard lifecycle.
+                    let just_revealed = !self.engine.menu_bar_visible;
                     self.engine.menu_bar_visible = true;
+                    if just_revealed {
+                        self.engine.hamburger_stale_click_guard = true;
+                    }
                     // #1029 (defect 2 of #988): deliberately does NOT mirror
                     // this onto the shadow `engine.app_shell` the way the
                     // real-panel branch below does for its own click —
@@ -5506,6 +5552,174 @@ mod tests {
             "a click on the Search icon after the stale hamburger click \
              above must still open the Search panel; screen:\n{}",
             driver.screen()
+        );
+    }
+
+    /// #1029 review (non-blocking concern): pins the behaviour of
+    /// [`TuiShellApp::reclaim_hamburger_sidebar_reservation`] when a real
+    /// sidebar panel (Explorer here, via [`app_with_sidebar_open`]) is
+    /// already open before the hamburger is clicked. That method's own doc
+    /// comment explains it only reclaims the sidebar region when the shadow
+    /// `engine.app_shell` says `sidebar_visible() == false` — the "nothing
+    /// real was ever shown" case, where leaving the reservation in place
+    /// would leak the shadow's *default* active panel (Explorer, which is
+    /// active but not visible until a real click or fixture opens it) into
+    /// a region the user never opened. When a real panel is already open,
+    /// `sidebar_visible()` is `true`, the reclaim is skipped, and the
+    /// previously-open panel's content keeps painting alongside the
+    /// now-visible menu bar — the same way opening a menu bar in a real
+    /// editor doesn't hide whatever sidebar panel was already open. This is
+    /// intended, not a residual content leak: the shadow's content is
+    /// *real* here (the user asked for it, via `show_panel`), unlike the
+    /// phantom-default-Explorer case the reclaim exists to correct.
+    #[test]
+    fn hamburger_click_with_real_sidebar_panel_open_keeps_its_content_painted() {
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_test_1029_hamburger_sidebar_open_{:?}",
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker_file = dir.join("zqxw1029.txt");
+        std::fs::write(&marker_file, "marker").unwrap();
+
+        let mut app = app_with_sidebar_open();
+        app.engine.cwd = dir.clone();
+        app.engine.explorer_reveal_path(&marker_file);
+        assert!(
+            app.engine.app_shell.sidebar_visible(),
+            "precondition: Explorer must be open before the hamburger is \
+             ever clicked"
+        );
+
+        let mut driver = driver_with_shell(app, TuiShellApp::shell_config(false), 80, 24);
+        driver.dispatch(quadraui::UiEvent::WindowFocused(true));
+        driver.render();
+        assert!(
+            driver.screen_contains("zqxw1029.txt"),
+            "precondition: Explorer's marker file must paint before the \
+             hamburger is clicked; screen:\n{}",
+            driver.screen()
+        );
+
+        let hamburger = crate::icons::HAMBURGER.s();
+        let (hx, hy) = driver
+            .find(hamburger)
+            .expect("hamburger icon must paint on the activity bar");
+        driver.click(hx, hy);
+        driver.dispatch(quadraui::UiEvent::WindowFocused(true));
+        driver.render();
+        let screen = driver.screen();
+        assert!(
+            screen.contains("File"),
+            "hamburger click must reveal the menu row even with a real \
+             sidebar panel already open; screen:\n{screen}"
+        );
+        assert!(
+            screen.contains("zqxw1029.txt"),
+            "Explorer's content must stay painted alongside the revealed \
+             menu bar — `reclaim_hamburger_sidebar_reservation` must not \
+             blank out a real, user-opened panel's content; screen:\n{screen}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1029 review (blocking finding, fix iteration 1): the original
+    /// stale-corner-click fix was purely positional and stateless, so it
+    /// swallowed *every* left-click landing on `File`'s columns for as long
+    /// as the menu bar stayed open — not just the one stale click a reveal
+    /// leaves behind. This pins the fix: `Engine::hamburger_stale_click_guard`
+    /// bounds the corner interception to a single one-shot click immediately
+    /// after a reveal, consumed by the very next `MouseDown` regardless of
+    /// where it lands. Reveal, spend that one-shot click on a genuine,
+    /// unrelated menu click (`Edit`, which does not fall in the hamburger's
+    /// corner columns), then confirm mouse access to `File` still works
+    /// afterwards — the exact capability the review said was permanently
+    /// broken.
+    ///
+    /// **RED against the pre-review (iteration 0) shape of this fix:**
+    /// confirmed by reverting the one-shot guard (making the corner-check
+    /// unconditional on `menu_bar_visible` alone, as it originally was) and
+    /// re-running — the final `New Tab` assertion fails: the click on
+    /// `File` lands in the same `[ab.x, ab.x + ab.width)` column range as
+    /// the hamburger's corner and is swallowed as a "close the menu"
+    /// action instead of opening the `File` dropdown.
+    #[test]
+    fn hamburger_corner_guard_does_not_permanently_block_file_menu_clicks() {
+        let mut driver = driver_with_shell(
+            TuiShellApp::new(None),
+            TuiShellApp::shell_config(false),
+            80,
+            24,
+        );
+        driver.set_double_click_folding(false);
+        driver.dispatch(quadraui::UiEvent::WindowFocused(true));
+        driver.render();
+
+        // ── Click 1: reveal (arms the one-shot guard) ───────────────────
+        let hamburger = crate::icons::HAMBURGER.s();
+        let (hx, hy) = driver
+            .find(hamburger)
+            .expect("hamburger icon must paint on the activity bar");
+        driver.click(hx, hy);
+        driver.dispatch(quadraui::UiEvent::WindowFocused(true));
+        driver.render();
+        assert!(
+            driver.screen_contains("File"),
+            "hamburger click must reveal the menu row; screen:\n{}",
+            driver.screen()
+        );
+
+        // ── Click 2: spend the one-shot guard on a genuine, unrelated
+        // menu click ─────────────────────────────────────────────────────
+        // `Edit` sits well to the right of the hamburger's corner columns
+        // (`[ab.x, ab.x + ab.width)`), so this click both consumes the
+        // guard *and* must behave exactly like any ordinary menu click —
+        // opening `Edit`'s dropdown, not closing the menu bar.
+        let (ex, ey) = driver
+            .find("Edit")
+            .expect("Edit menu label must paint once the menu bar is open");
+        driver.click(ex, ey);
+        driver.dispatch(quadraui::UiEvent::WindowFocused(true));
+        driver.render();
+        assert!(
+            driver.screen_contains("Undo"),
+            "clicking Edit must open its dropdown, spending the one-shot \
+             guard on an unrelated click; screen:\n{}",
+            driver.screen()
+        );
+
+        // Close the Edit dropdown without touching `menu_bar_visible` —
+        // Escape only closes the open dropdown here (mirrors
+        // `menu_intercept_routes_via_is_open_when_bar_hidden_with_dropdown_
+        // open_via_shell_app`'s use of the same key for the same reason).
+        driver.press_named(quadraui::NamedKey::Escape);
+        let screen = driver.screen();
+        assert!(
+            screen.contains("File") && !screen.contains("Undo"),
+            "Escape should close the Edit dropdown while leaving the menu \
+             bar itself open; screen:\n{screen}"
+        );
+
+        // ── Click 3: File, now that the guard is already spent ──────────
+        // With the one-shot guard consumed by click 2, this click must
+        // reach the `MenuSystem` intercept like any other menu click — not
+        // be swallowed as a phantom "close the menu" action just because
+        // it lands in the same columns the hamburger's corner used to
+        // occupy.
+        let (fx, fy) = driver
+            .find("File")
+            .expect("File menu label must still paint");
+        driver.click(fx, fy);
+        driver.dispatch(quadraui::UiEvent::WindowFocused(true));
+        driver.render();
+        let screen = driver.screen();
+        assert!(
+            screen.contains("File") && screen.contains("New Tab"),
+            "a later, deliberate click on File must open its dropdown — \
+             mouse access to File must not stay permanently broken just \
+             because the menu bar is open; screen:\n{screen}"
         );
     }
 
