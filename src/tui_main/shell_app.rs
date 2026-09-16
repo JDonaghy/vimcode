@@ -17673,60 +17673,58 @@ mod tests {
         (colors, n_highlights, screen)
     }
 
-    /// #990 deliverable 3 — the minimap paints **no** colour for indented
-    /// code. Diagnosed here; the cause is **vimcode's**, not quadraui's.
+    /// #990 deliverable 3, fixed by **#1030**. Originally diagnosed as
+    /// vimcode's own (`render::build_minimap_data` handed
+    /// `quadraui::aggregate_spans` a `MinimapGrid` with a hardcoded
+    /// `cols: MINIMAP_SPAN_COLS` (200) covering character columns 0..400,
+    /// while the TUI strip is only ~11 cells wide) — but that diagnosis
+    /// turned out to be a red herring: `cols: 200` never dropped anything
+    /// the strip's own paint loop would have read anyway (200 cells ⊇ 11),
+    /// so resizing it changes only how much unreachable aggregation work
+    /// happens, never what gets painted. `render::build_minimap_data` still
+    /// derives the grid from the painted strip's own width now (#1030) —
+    /// legitimate cleanup, not the fix.
     ///
-    /// # Diagnosis
+    /// # What was actually entangled
     ///
-    /// The issue listed four candidates. Measured against unfixed
-    /// `develop`, with a 100-line `.rs` buffer whose every line is
-    /// `let value_N = 1;` indented by a varying number of spaces:
+    /// Colour lookup (`quadraui::tui::minimap::cell_color`) was *always*
+    /// literal: cell `col` reads real character columns
+    /// `col*COLS_PER_CELL..(col+1)*COLS_PER_CELL`, clipped to the strip's
+    /// own `width_cells` — unaffected by anything vimcode's grid contains.
+    /// The actual bug was quadraui#993: dot rendering
+    /// (`braille_char_for_cell`) normalised each line by its *own*
+    /// `chars.len()`, so a deeply-indented line's content was stretched to
+    /// fill the *entire* visible strip regardless of its real column —
+    /// every cell painted *some* dot. Colour's literal lookup found no
+    /// aggregated span that far out and fell back to the theme default, so
+    /// every one of those stretched-into-view dots painted in the same
+    /// fallback colour: `colors.len() == 1` for any indent past the
+    /// strip's real width (measured against unfixed `develop`, a 100-line
+    /// `.rs` buffer of `let value_N = 1;` indented by 0/8/20/40/80 spaces:
+    /// 5/3/2/1/1 distinct colours — the collapse tracked how much of each
+    /// line's *stretched* content still overlapped literal columns
+    /// 0..~22, not real indentation at all).
     ///
-    /// | indent | tree-sitter highlights | distinct painted dot colours |
-    /// |---|---|---|
-    /// | 0  | 400 | 5 |
-    /// | 8  | 400 | 3 |
-    /// | 20 | 400 | 2 |
-    /// | 40 | 400 | **1** (the fallback only) |
-    /// | 80 | 400 | **1** (the fallback only) |
-    ///
-    /// * Candidate 1 (*`buffer_state.highlights` is empty under the TUI*)
-    ///   is **disproven** — 400 highlights in every row of that table, and
-    ///   the colour count still collapses to 1. The test below asserts the
-    ///   highlight count is non-zero explicitly and ungated, so this stays
-    ///   disproven rather than re-guessed.
-    /// * Candidate 2 (*sampling drops spans*) is real but secondary — it
-    ///   makes colour *sparse* on long files (measured: ~68% fallback cells
-    ///   on a deliberately sparse 19 000-line fixture), never absent.
-    /// * Candidate 4 (*grid granularity mismatch*) matches the measured
-    ///   cutoff exactly, and is **vimcode-side**:
-    ///   `render::build_minimap_data` hands `quadraui::aggregate_spans` a
-    ///   `MinimapGrid` with a hardcoded `cols: MINIMAP_SPAN_COLS` (200) and
-    ///   `cols_per_cell: 2` — a 200-cell colour grid covering character
-    ///   columns 0..400 — while the TUI strip the rasteriser paints is only
-    ///   ~12 cells wide. Only grid cells 0..~12 are ever consulted, i.e.
-    ///   character columns 0..~24. Every span on a line indented past that
-    ///   lands in a grid cell nothing reads, which is precisely the
-    ///   observed monotonic collapse and its cutoff between indent 20 and
-    ///   indent 40. Real source is nested, so in practice nearly every
-    ///   token is past the cutoff — hence "no colouring".
-    ///
-    /// The fix therefore belongs in vimcode (derive the grid's `cols` /
-    /// `cols_per_cell` from the strip's actual painted width instead of a
-    /// fixed 200), and is **not** attempted here: this issue is test-only,
-    /// and the entangled quadraui#993 defect above means the dots and the
-    /// colours are on two different horizontal scales until that lands too.
-    /// Filed separately as a vimcode issue.
+    /// quadraui#993's fix (landed in the `rev` #1030 also bumps) made
+    /// `braille_char_for_cell` literal too — clipped, not stretched, at
+    /// exactly the same `width_cells * COLS_PER_CELL` boundary colour
+    /// already used. Dots and colour now agree: a line indented past the
+    /// strip's real width paints **no** dots at all (nothing to colour),
+    /// rather than stretched-but-wrongly-coloured ones. This is VS Code's
+    /// own minimap behaviour for a line wider than the strip — clipped,
+    /// not squeezed to fit — so "colour must survive indent 40" was the
+    /// wrong bar once dots stopped lying about where indent 40 landed;
+    /// "colour must never again paint a fallback dot with nothing real
+    /// behind it" is the bar this test now holds.
     ///
     /// **RED against unfixed `develop`:** confirmed by running this
-    /// scenario with its `KNOWN_BUGS` entry removed — the gated assertion
-    /// fails with `the minimap must paint more than one distinct
-    /// foreground colour … got 1`.
+    /// scenario against the unbumped pin — `colors.len()` is `1` (the
+    /// stretched-dot fallback above), not the `0` asserted below.
     #[test]
     fn minimap_paints_syntax_colour_for_indented_code() {
         // Ungated, and the reason this test can't be green for the wrong
         // reason: un-indented code *is* coloured today, so the probe works
-        // and the gated failure below is about indentation alone.
+        // and the assertion below is about indentation alone.
         let (flat_colors, flat_highlights, flat_screen) = minimap_colors_for_indent(0);
         assert!(
             flat_highlights > 0,
@@ -17741,7 +17739,8 @@ mod tests {
         );
 
         let (colors, highlights, screen) = minimap_colors_for_indent(40);
-        // Ungated: candidate 1 stays disproven — the highlights are there.
+        // Candidate 1 stays disproven — the highlights are there even
+        // though indent 40 is past the strip's own real width.
         assert!(
             highlights > 0,
             "precondition: indenting the fixture must not stop tree-sitter \
@@ -17753,10 +17752,11 @@ mod tests {
             "minimap_paints_syntax_colour_for_indented_code::tui",
             || {
                 assert!(
-                    colors.len() > 1,
-                    "the minimap must paint more than one distinct foreground \
-                 colour for syntax-highlighted code, even when that code is \
-                 indented ({highlights} highlights exist for this buffer) — \
+                    colors.is_empty(),
+                    "a line indented past the minimap strip's own real \
+                 width must paint no dots at all, not dots stretched into \
+                 view and painted in a fallback colour that doesn't belong \
+                 to them ({highlights} highlights exist for this buffer) — \
                  got {}: {colors:?}; screen:\n{screen}",
                     colors.len()
                 );
