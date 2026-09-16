@@ -213,11 +213,16 @@ Vim patterns are translated to Rust `regex` before matching, so `/`, `?`, `:s`,
 | `\n` `\t` `\r` `\e` | multi-line search works across the whole buffer |
 | `\s \d \w \a \l \u \x \o \h \i \k \f \p` + uppercase negations | character classes |
 | `\%^` `\%$` | start/end of buffer |
+| `\1`…`\9` | back-references to an earlier `\(…\)` in the same pattern (#1004) |
 
 **Not supported** — these are *rejected with an error*, never silently matched
-as literal text: back-references in a pattern (`\1`…`\9`), look-around
-(`\@=`, `\@!`), `\&`, and `\_x`. The Rust `regex` crate has no back-tracking,
-so it cannot express them.
+as literal text: look-around (`\@=`, `\@!`), `\&`, and `\_x`. The Rust `regex`
+crate has no back-tracking, so it cannot express them.
+
+Back-references are the exception: because `regex` cannot express them *at
+all*, a pattern that contains `\1`…`\9` is compiled with `fancy-regex` (a
+back-tracking VM layered over `regex`) instead. Only such patterns pay that
+cost — every other pattern keeps `regex`'s linear-time guarantee.
 
 **Known deviation — jumplist scope (#674):** stock Vim keeps one jumplist
 *per window* (`:help jumplist`): `CTRL-O`/`CTRL-I` never cross a window or
