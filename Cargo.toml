@@ -216,6 +216,13 @@ gio = { version = "0.22", optional = true }
 ratatui = "0.30"
 ignore = "0.4"
 regex = "1"
+# `regex` is deliberately backtracking-free (linear-time guarantee) and so
+# cannot express `\1`..`\9` backreferences at all — not a missing feature,
+# a permanent design constraint of the crate. `fancy-regex` layers a
+# backtracking VM on top of it; vim_regex.rs uses it only for the patterns
+# that actually contain a backreference (#1004). Already resolved
+# transitively via `termwiz`, so this adds no new dependency to the tree.
+fancy-regex = "0.11"
 lsp-types = "0.97"
 copypasta-ext = "0.4"
 mlua = { version = "0.9", features = ["lua54", "vendored"] }

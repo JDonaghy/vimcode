@@ -4065,6 +4065,7 @@ version = "0.11.0"
 dependencies = [
  "cc",
  "copypasta-ext",
+ "fancy-regex",
  "gio",
  "gtk4",
  "ignore",
