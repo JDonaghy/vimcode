@@ -1824,6 +1824,88 @@ impl TuiShellApp {
             ..layout.clone()
         }
     }
+
+    /// #1029: spend [`Engine::hamburger_stale_click_guard`] for `event` on
+    /// the [`ShellApp::handle`] path, and report whether `event` is the one
+    /// `MouseDown` that guard covers.
+    ///
+    /// Called from the very top of `handle`, before its `'dispatch` block,
+    /// so no early exit inside that block can skip it (review, fix
+    /// iteration 2 — the spend used to live inside the corner-check arm,
+    /// which several earlier arms `break` past).
+    ///
+    /// Returning `true` means "this is the single click immediately
+    /// following a hamburger reveal" — the corner check then decides,
+    /// positionally, whether it landed on the row the reveal shifted the
+    /// hamburger off. `true` is only ever returned for a
+    /// [`UiEvent::MouseDown`], so the corner check can destructure it
+    /// without re-filtering.
+    ///
+    /// The `false`-returning arms split three ways:
+    ///
+    /// - **guard not armed** — nothing to spend, nothing to correct;
+    /// - **pointer/window plumbing** (`MouseMoved`, `MouseUp`,
+    ///   `MouseEntered`/`MouseLeft`, `WindowResized`, `WindowFocused`,
+    ///   `DpiChanged`, `WindowStateChanged`) — *leaves the guard armed*.
+    ///   None of these is "the user moved on": `MouseUp` in particular is
+    ///   the release half of the reveal's *own* click and arrives before
+    ///   the stale click ever could, so spending the guard on it would
+    ///   disable the fix outright. A pointer drifting a cell or a terminal
+    ///   resize is not an interaction either.
+    /// - **everything else** (a keystroke, an accelerator, a scroll, a
+    ///   double-click, a paste, a drop, and any variant quadraui adds
+    ///   later) — *spends* the guard without correcting anything. The
+    ///   user did something other than the stale muscle-memory click, so
+    ///   the window has closed. Defaulting new variants to "spend" is the
+    ///   safe direction: the worst case is that one stale click stops
+    ///   being corrected (a missed fix), where the opposite default risks
+    ///   a live guard swallowing a deliberate `File` click (a regression).
+    fn consume_hamburger_stale_click_guard(&mut self, event: &UiEvent) -> bool {
+        if !self.engine.hamburger_stale_click_guard {
+            return false;
+        }
+        match event {
+            UiEvent::MouseDown { .. } => {
+                self.engine.hamburger_stale_click_guard = false;
+                true
+            }
+            UiEvent::MouseUp { .. }
+            | UiEvent::MouseMoved { .. }
+            | UiEvent::MouseEntered { .. }
+            | UiEvent::MouseLeft { .. }
+            | UiEvent::WindowResized { .. }
+            | UiEvent::WindowFocused(_)
+            | UiEvent::DpiChanged(_)
+            | UiEvent::WindowStateChanged { .. } => false,
+            _ => {
+                self.engine.hamburger_stale_click_guard = false;
+                false
+            }
+        }
+    }
+
+    /// #1029: spend [`Engine::hamburger_stale_click_guard`] on the
+    /// *shell-consumed* path — the half [`Self::handle`] can never see.
+    ///
+    /// `ShellAdapter::handle` hit-tests the activity bar itself; when a
+    /// click lands on a real panel icon (Explorer, Search, Git, an
+    /// extension panel) or the sidebar divider, it reports the semantic
+    /// [`quadraui::AppShellEvent`] through `on_shell_event_ctx` and
+    /// **returns without falling through to `Self::handle`** (see
+    /// [`Self::on_shell_event`]'s doc). Those clicks are exactly as much
+    /// "the user moved on" as a keystroke is, so the guard has to die here
+    /// too — the review's blocking scenario was reveal → click Search →
+    /// click `File`, where the middle click never reached `handle` and the
+    /// still-armed guard then swallowed the `File` click.
+    ///
+    /// Not called for the hamburger's own `PanelChanged` (that arm *arms*
+    /// the guard), nor for the `suppress_shell_panel_echo` echoes
+    /// `take_requested_panel` provokes — those are the app reconciling the
+    /// runner against the shadow, not user input, and one of them fires
+    /// immediately after every hamburger reveal.
+    fn disarm_hamburger_stale_click_guard(&mut self) {
+        self.engine.hamburger_stale_click_guard = false;
+    }
 }
 
 impl ShellApp for TuiShellApp {
@@ -2356,6 +2438,19 @@ impl ShellApp for TuiShellApp {
         backend: &mut dyn quadraui::Backend,
         ctx: &ShellContext<'_>,
     ) -> Reaction {
+        // ── #1029 (review, fix iteration 2): spend the one-shot
+        // stale-hamburger-corner guard here, at the very top ─────────────
+        // Deliberately *before* the labelled block below, not inside it:
+        // `'dispatch` has a dozen early exits (panel accelerators, dialogs,
+        // the `MenuSystem` intercept, …) and any one of them taken before
+        // the corner check would leave the guard armed for an arbitrarily
+        // later click — the exact "not truly one-shot" defect the review
+        // blocked on. Evaluating it up here makes "the guard covers
+        // *exactly* the next `MouseDown` to reach `Self::handle`" true by
+        // construction, independent of which arm the event ends up in.
+        // See [`Self::consume_hamburger_stale_click_guard`].
+        let stale_hamburger_corner_click = self.consume_hamburger_stale_click_guard(&event);
+
         // The dispatch below has several early exits; a labelled block (not
         // bare `return`s) is what keeps the title-bar sync that follows
         // reachable on *every* one of them, including any arm added later.
@@ -2444,14 +2539,36 @@ impl ShellApp for TuiShellApp {
             // open, permanently breaking mouse access to `File`. Gated
             // here, additionally, on `Engine::hamburger_stale_click_guard`
             // — a one-shot flag armed only by the hamburger's own reveal
-            // (`on_shell_event`'s `PanelChanged` arm) and consumed by the
-            // very next `MouseDown` to reach this dispatch, hit or miss.
-            // That bounds the corner-check to the single click immediately
-            // following a reveal — the click this issue is actually about
-            // — instead of every click for the rest of the menu bar's
-            // lifetime; a later, deliberate click on `File` finds the guard
-            // already consumed and falls through to the `MenuSystem`
-            // intercept below like any other menu click.
+            // (`on_shell_event`'s `PanelChanged` arm) and spent by the very
+            // next user interaction on *any* path, hit or miss. That bounds
+            // the corner-check to the single click immediately following a
+            // reveal — the click this issue is actually about — instead of
+            // every click for the rest of the menu bar's lifetime; a later,
+            // deliberate click on `File` finds the guard already spent and
+            // falls through to the `MenuSystem` intercept below like any
+            // other menu click.
+            //
+            // **Review (fix iteration 2): "the very next click" has to mean
+            // every path, not just this one.** The guard's spend used to
+            // live inside this block, so only a `MouseDown` that actually
+            // *reached* this dispatch could clear it. Two ordinary
+            // interactions bypass it entirely: a click on a real
+            // activity-bar panel icon (Search/Explorer/Git/an extension
+            // panel) is consumed upstream by `ShellAdapter`'s own hit-test
+            // and reported as `AppShellEvent::PanelChanged`, which
+            // `ShellAdapter::handle` returns from without ever falling
+            // through to `Self::handle` (see `Self::on_shell_event`'s doc);
+            // and a keystroke that hits one of `'dispatch`'s earlier early
+            // exits never got here either. Either one left the guard armed
+            // indefinitely, so a genuine `File` click arriving *afterwards*
+            // was still misread as the stale corner — the same regression
+            // iteration 1 blocked on, reached by a different route. The
+            // spend now happens in exactly two places, both outside this
+            // block: [`Self::consume_hamburger_stale_click_guard`] at the
+            // top of `handle` (every event on the `Self::handle` path) and
+            // [`Self::disarm_hamburger_stale_click_guard`] in
+            // `Self::on_shell_event` (every event on the shell-consumed
+            // path). This block only *reads* the decision they made.
             //
             // Recognised structurally, not by remembering the stale
             // coordinate: a `MouseDown` inside `title_bar_bounds` (the row
@@ -2471,33 +2588,36 @@ impl ShellApp for TuiShellApp {
             // — now back at its un-shifted row-0 position — resolves as a
             // fresh reveal rather than `AppShell::handle_activity_click`
             // wrongly believing it's already open.
-            if self.engine.menu_bar_visible {
-                if let UiEvent::MouseDown {
-                    button, position, ..
-                } = &event
-                {
-                    // One-shot consume: this is the only place the guard is
-                    // ever cleared once armed (besides a fresh reveal
-                    // re-arming it), so every `MouseDown` reaching this
-                    // dispatch while the menu bar is visible spends it,
-                    // whether or not it turns out to be the stale corner —
-                    // see the doc comment above and
-                    // `Engine::hamburger_stale_click_guard`'s own doc.
-                    let guard_armed = std::mem::take(&mut self.engine.hamburger_stale_click_guard);
-                    if guard_armed && *button == quadraui::MouseButton::Left {
-                        let viewport = backend.viewport();
-                        let area = quadraui::Rect::new(0.0, 0.0, viewport.width, viewport.height);
-                        let layout = ctx.shell().layout(area, backend.line_height());
-                        let ab = layout.activity_bar_bounds;
-                        let in_hamburger_corner = ctx.in_title_bar(position.x, position.y)
-                            && position.x >= ab.x
-                            && position.x < ab.x + ab.width;
-                        if in_hamburger_corner {
-                            self.engine.menu_bar_visible = false;
-                            ctx.shell_mut().hide_sidebar();
-                            ctx.shell_mut().set_title_bar_visible(false);
-                            break 'dispatch Reaction::Redraw;
-                        }
+            if stale_hamburger_corner_click && self.engine.menu_bar_visible {
+                // `stale_hamburger_corner_click` is only ever `true` for a
+                // `MouseDown` (see the helper), so this pattern always
+                // matches — it is how the position is read, not a second
+                // filter. Deliberately **button-agnostic** (review, fix
+                // iteration 2): gating on `Left` alone meant a non-`Left`
+                // press spent the one-shot guard "without correcting
+                // anything", and the alternative — letting a right-click
+                // leave the guard armed — is worse, since the *next* left
+                // click could then be a deliberate `File` click and would
+                // be swallowed. Any press landing on the hamburger's stale
+                // corner within the one-shot window is treated as the
+                // stale click; a press of any button there has no other
+                // meaning (a right-click on the `File` label does not open
+                // a context menu — it would fall into the `MenuSystem`
+                // intercept and open `File`'s dropdown, which is exactly
+                // the #988 symptom).
+                if let UiEvent::MouseDown { position, .. } = &event {
+                    let viewport = backend.viewport();
+                    let area = quadraui::Rect::new(0.0, 0.0, viewport.width, viewport.height);
+                    let layout = ctx.shell().layout(area, backend.line_height());
+                    let ab = layout.activity_bar_bounds;
+                    let in_hamburger_corner = ctx.in_title_bar(position.x, position.y)
+                        && position.x >= ab.x
+                        && position.x < ab.x + ab.width;
+                    if in_hamburger_corner {
+                        self.engine.menu_bar_visible = false;
+                        ctx.shell_mut().hide_sidebar();
+                        ctx.shell_mut().set_title_bar_visible(false);
+                        break 'dispatch Reaction::Redraw;
                     }
                 }
             }
@@ -2996,6 +3116,13 @@ impl ShellApp for TuiShellApp {
                     if std::mem::take(&mut self.suppress_shell_panel_echo) {
                         return;
                     }
+                    // #1029 (review, fix iteration 2): a genuine extension-panel
+                    // icon click — `ShellAdapter` consumed the `MouseDown`, so
+                    // `Self::handle` never sees it and can't spend the
+                    // stale-corner guard. Spend it here. (Below the echo check
+                    // on purpose: a suppressed echo is our own reconciliation,
+                    // not user input.)
+                    self.disarm_hamburger_stale_click_guard();
                     self.activate_ext_panel(&name);
                     return;
                 }
@@ -3003,8 +3130,20 @@ impl ShellApp for TuiShellApp {
                     // Echo of our own `take_requested_panel` reconciliation
                     // (see that method): the engine already holds this
                     // state — don't re-run the click path and steal focus.
+                    // Deliberately *before* the guard spend just below: a
+                    // hamburger reveal provokes exactly one of these echoes
+                    // on the very next poll (see the hamburger arm above),
+                    // and spending the guard on it would kill the #1029 fix
+                    // before the stale click could ever arrive.
                     return;
                 }
+                // #1029 (review, fix iteration 2): the review's blocking
+                // scenario — reveal, then click Search/Explorer/Git, then
+                // click `File`. This middle click is consumed upstream by
+                // `ShellAdapter` and never reaches `Self::handle`, so
+                // without this the guard stayed armed and the later `File`
+                // click was misread as the stale hamburger corner.
+                self.disarm_hamburger_stale_click_guard();
                 // ── #634 smoke retry: a real activity-bar click ─────────
                 // `ShellAdapter` consumed the `MouseDown` and only reports
                 // this semantic event, so the legacy `mouse::handle_mouse`
@@ -3048,6 +3187,10 @@ impl ShellApp for TuiShellApp {
                 // the same three fields in its own hide branch. Leaving them
                 // set would make `take_requested_panel` keep steering the
                 // runner back onto a panel whose sidebar the user just closed.
+                // #1029 (review, fix iteration 2): another shell-consumed
+                // user click that never reaches `Self::handle` — spend the
+                // stale-corner guard.
+                self.disarm_hamburger_stale_click_guard();
                 self.sidebar.ext_panel_name = None;
                 self.engine.ext_panel_has_focus = false;
                 self.engine.ext_panel_active = None;
@@ -3061,6 +3204,7 @@ impl ShellApp for TuiShellApp {
             // visibility sync + `take_requested_panel` then carry the
             // result back to the runner's `AppShell`.
             quadraui::AppShellEvent::BottomItemClicked { id } if id.as_str() == PANEL_SETTINGS => {
+                self.disarm_hamburger_stale_click_guard();
                 self.sidebar.ext_panel_name = None;
                 self.engine.ext_panel_has_focus = false;
                 self.engine.ext_panel_active = None;
@@ -3075,9 +3219,20 @@ impl ShellApp for TuiShellApp {
             // follow or the next `handle()` would immediately push the stale
             // value back and undo the drag.
             quadraui::AppShellEvent::SidebarResized { new_width } => {
+                self.disarm_hamburger_stale_click_guard();
                 self.sidebar_width = new_width.round().max(0.0) as u16;
             }
-            _ => {}
+            // #1029 (review, fix iteration 2): every remaining
+            // `AppShellEvent` variant (`BottomPanelResized`,
+            // `BottomPanelHidden`, a non-Settings `BottomItemClicked`) is
+            // likewise a shell-consumed *user interaction* —
+            // `ShellAdapter::handle` only ever notifies these in response
+            // to real input, and never notifies `Consumed`/`Ignored` at
+            // all (`Ignored` is precisely what falls through to
+            // `Self::handle` instead). So spend the guard here too, and
+            // let any variant quadraui adds later default to the safe
+            // direction.
+            _ => self.disarm_hamburger_stale_click_guard(),
         }
     }
 
@@ -3133,6 +3288,10 @@ impl ShellApp for TuiShellApp {
                 .map(quadraui::WidgetId::as_str)
                 == Some(HAMBURGER_PANEL_ID)
         {
+            // #1029 (review, fix iteration 2): the menu bar is closing, so
+            // there is no stale corner left to reclaim — spend the guard
+            // rather than carry it across into the next reveal.
+            self.disarm_hamburger_stale_click_guard();
             self.engine.menu_bar_visible = false;
             ctx.shell_mut().set_title_bar_visible(false);
             return;
@@ -5720,6 +5879,153 @@ mod tests {
             "a later, deliberate click on File must open its dropdown — \
              mouse access to File must not stay permanently broken just \
              because the menu bar is open; screen:\n{screen}"
+        );
+    }
+
+    /// #1029 review (blocking finding, fix iteration 2): the one-shot
+    /// stale-corner guard used to be spent only by a `MouseDown` that
+    /// actually reached `TuiShellApp::handle`. A click on a **real
+    /// activity-bar panel icon** never does — `ShellAdapter::handle`
+    /// hit-tests the activity bar itself, reports
+    /// `AppShellEvent::PanelChanged`, and returns without falling through
+    /// (see `TuiShellApp::on_shell_event`'s doc). So the wholly ordinary
+    /// sequence *reveal → switch panels → click `File`* left the guard
+    /// armed across the middle click, and the `File` click — which paints
+    /// at exactly the hamburger's old corner columns — was swallowed as a
+    /// phantom "close the menu" action.
+    ///
+    /// The sibling test above spends the guard on `Edit`, a menu-*bar*
+    /// label, which is one of the click types that always *did* reach
+    /// `handle`; this one drives the path that did not.
+    ///
+    /// **Verified RED against the iteration-1 fix:** removing the
+    /// `disarm_hamburger_stale_click_guard()` call from
+    /// `on_shell_event`'s real-panel arm and re-running fails the final
+    /// `New Tab` assertion — the `File` click hides the menu bar instead
+    /// of opening the dropdown.
+    #[test]
+    fn hamburger_corner_guard_is_spent_by_a_real_activity_bar_panel_click() {
+        let mut driver = driver_with_shell(
+            TuiShellApp::new(None),
+            TuiShellApp::shell_config(false),
+            80,
+            24,
+        );
+        driver.set_double_click_folding(false);
+        driver.dispatch(quadraui::UiEvent::WindowFocused(true));
+        driver.render();
+
+        // ── Click 1: reveal (arms the one-shot guard) ───────────────────
+        let hamburger = crate::icons::HAMBURGER.s();
+        let (hx, hy) = driver
+            .find(hamburger)
+            .expect("hamburger icon must paint on the activity bar");
+        driver.click(hx, hy);
+        driver.dispatch(quadraui::UiEvent::WindowFocused(true));
+        driver.render();
+        assert!(
+            driver.screen_contains("File"),
+            "hamburger click must reveal the menu row; screen:\n{}",
+            driver.screen()
+        );
+
+        // ── Click 2: a real activity-bar panel icon ─────────────────────
+        // Consumed entirely by `ShellAdapter`'s own hit-test — it never
+        // reaches `TuiShellApp::handle`, which is the whole point.
+        let search = crate::icons::SEARCH.s();
+        let (sx, sy) = driver.find(search).unwrap_or_else(|| {
+            panic!(
+                "search icon must paint on the activity bar with the menu \
+                 bar open; screen:\n{}",
+                driver.screen()
+            )
+        });
+        driver.click(sx, sy);
+        driver.dispatch(quadraui::UiEvent::WindowFocused(true));
+        driver.render();
+        assert!(
+            driver.screen_contains("Replace…"),
+            "sanity: the Search icon click must actually open the Search \
+             panel, or it isn't the shell-consumed click this test needs; \
+             screen:\n{}",
+            driver.screen()
+        );
+        assert!(
+            driver.screen_contains("File"),
+            "switching panels must leave the revealed menu bar alone; \
+             screen:\n{}",
+            driver.screen()
+        );
+
+        // ── Click 3: File, with the guard long since spent ──────────────
+        let (fx, fy) = driver
+            .find("File")
+            .expect("File menu label must still paint");
+        driver.click(fx, fy);
+        driver.dispatch(quadraui::UiEvent::WindowFocused(true));
+        driver.render();
+        let screen = driver.screen();
+        assert!(
+            screen.contains("File") && screen.contains("New Tab"),
+            "after using an ordinary activity-bar panel, a deliberate click \
+             on File must open its dropdown — the stale-hamburger-corner \
+             guard must not have survived the intervening panel click; \
+             screen:\n{screen}"
+        );
+    }
+
+    /// #1029 review (blocking finding, fix iteration 2), keyboard half:
+    /// the guard's spend now lives at the very top of
+    /// [`TuiShellApp::handle`], above the `'dispatch` block, so a
+    /// keystroke that takes one of that block's earlier early exits still
+    /// spends it. Before that move the spend sat inside the corner-check
+    /// arm, which several arms `break` past — so *reveal → type → click
+    /// `File`* was the same latent regression as the panel-click path.
+    ///
+    /// **Verified RED against the iteration-1 fix:** moving the spend back
+    /// inside the corner-check arm (so only a `MouseDown` reaching it
+    /// clears the guard) fails the final `New Tab` assertion.
+    #[test]
+    fn hamburger_corner_guard_is_spent_by_an_intervening_keystroke() {
+        let mut driver = driver_with_shell(
+            TuiShellApp::new(None),
+            TuiShellApp::shell_config(false),
+            80,
+            24,
+        );
+        driver.set_double_click_folding(false);
+        driver.dispatch(quadraui::UiEvent::WindowFocused(true));
+        driver.render();
+
+        let hamburger = crate::icons::HAMBURGER.s();
+        let (hx, hy) = driver
+            .find(hamburger)
+            .expect("hamburger icon must paint on the activity bar");
+        driver.click(hx, hy);
+        driver.dispatch(quadraui::UiEvent::WindowFocused(true));
+        driver.render();
+        assert!(
+            driver.screen_contains("File"),
+            "hamburger click must reveal the menu row; screen:\n{}",
+            driver.screen()
+        );
+
+        // A plain keystroke: the user moved on, so the stale muscle-memory
+        // click can never arrive any more.
+        driver.press_named(quadraui::NamedKey::Escape);
+        driver.render();
+
+        let (fx, fy) = driver
+            .find("File")
+            .expect("File menu label must still paint after a keystroke");
+        driver.click(fx, fy);
+        driver.dispatch(quadraui::UiEvent::WindowFocused(true));
+        driver.render();
+        let screen = driver.screen();
+        assert!(
+            screen.contains("File") && screen.contains("New Tab"),
+            "after an intervening keystroke, a deliberate click on File \
+             must open its dropdown; screen:\n{screen}"
         );
     }
 

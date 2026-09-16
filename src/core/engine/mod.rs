@@ -3042,10 +3042,33 @@ pub struct Engine {
     /// the `PanelChanged` echoes `ShellAdapter` re-fires after every
     /// `handle()`/`tick()` poll — see `on_shell_event`'s hamburger arm,
     /// which only arms this on the transition, so an echo of an
-    /// already-true flag is a no-op here too). Consumed (set back to
-    /// `false`) by the very next `MouseDown` that reaches
-    /// `TuiShellApp::handle`, whether or not it lands on the stale
-    /// corner.
+    /// already-true flag is a no-op here too).
+    ///
+    /// **Spent (set back to `false`) by the very next user interaction,
+    /// on every path** — not just by events that happen to reach
+    /// `TuiShellApp::handle` (review, #1029 iteration 2). Two spenders,
+    /// one per path:
+    ///
+    /// - `TuiShellApp::consume_hamburger_stale_click_guard`, called at
+    ///   the top of `handle` before its `'dispatch` block, for every
+    ///   event that reaches the app directly: a `MouseDown` (the one the
+    ///   corner check is for), a keystroke, a scroll, a paste …
+    ///   Pointer/window plumbing — `MouseUp` (the release half of the
+    ///   reveal's own click!), `MouseMoved`, focus/resize/DPI — is
+    ///   deliberately excluded, since none of it is the user moving on.
+    /// - `TuiShellApp::disarm_hamburger_stale_click_guard`, called from
+    ///   `on_shell_event`, for every click `ShellAdapter` hit-tests and
+    ///   consumes *upstream* of `handle` — a real activity-bar panel icon
+    ///   (Explorer/Search/Git/an extension panel), the Settings cog, a
+    ///   divider drag. Those never reach `handle` at all, so without this
+    ///   half the guard survived them and then mis-fired on the next
+    ///   genuine `File` click.
+    ///
+    /// The one exception is the `suppress_shell_panel_echo` reconciliation
+    /// echo `take_requested_panel` provokes right after every hamburger
+    /// reveal: it is the app steering the runner back onto the shadow's
+    /// panel, not user input, and spending the guard on it would disable
+    /// this fix entirely.
     ///
     /// Purely positional matching (the click lands where the activity
     /// bar used to be, before the reveal shifted it down a row) can't
@@ -3056,7 +3079,12 @@ pub struct Engine {
     /// on the `File` label for as long as the menu bar stays visible").
     /// Bounding the corner-check to the single click immediately
     /// following a reveal fixes the one stale click without permanently
-    /// stealing mouse access to `File`.
+    /// stealing mouse access to `File` — but only if "immediately
+    /// following" is literally true, which is why the spend has to cover
+    /// the shell-consumed path too (review, #1029 iteration 2: "it's
+    /// consumed by the next `MouseDown` that happens not to be a
+    /// recognized activity-bar panel click, which can be arbitrarily
+    /// later").
     pub hamburger_stale_click_guard: bool,
     /// Cached global (bottom-of-screen) status bar rect from the last paint
     /// (#752) — the exact twin of [`Self::menu_bar_rect`] one band lower, and
