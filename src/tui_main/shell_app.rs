@@ -16628,4 +16628,185 @@ mod tests {
             },
         );
     }
+
+    /// #1008 review: `page_up` (`<C-b>`)'s clamped-scroll cursor landing
+    /// position changed from a fixed offset off the *old* topline to the
+    /// **bottom of the new window** (minus `'scrolloff'`) — see `page_up`
+    /// in `src/core/engine/motions.rs`. That is genuine user-visible
+    /// behaviour, and the review that requested this fix pointed out the
+    /// only coverage added for it (`tests/new_vim_features.rs`,
+    /// `tests/nvim_conformance.rs`) was engine-level: nothing drove it
+    /// through a real render pipeline. This is that black-box regression,
+    /// per `CLAUDE.md`'s "Testing (CRITICAL)" rule 1 (assert on rendered
+    /// output, not internal state).
+    ///
+    /// Two pre-existing pitfalls had to be cleared before `<C-b>` could
+    /// even reach `page_up()` through the real driver, neither of them
+    /// specific to this fix:
+    ///
+    /// 1. `settings.panel_keys.toggle_sidebar` defaults to the literal
+    ///    string `"<C-b>"` (`core/settings.rs`'s `pk_toggle_sidebar`), and
+    ///    `setup()` registers it as a `quadraui::AcceleratorScope::Global`
+    ///    accelerator (`render::register_panel_accelerators`) — global, so
+    ///    it wins over the editor's own `<C-b>` *unconditionally*, the same
+    ///    way a VS-Code-style "toggle sidebar" shortcut is meant to.
+    ///    Confirmed empirically: with the default binding left in place,
+    ///    every `<C-b>` this test sent toggled the Explorer sidebar instead
+    ///    of paging, regardless of which panel had focus. Clearing the
+    ///    binding to `""` — `register_panel_accelerators`'s documented
+    ///    "unbound" spelling — is the same opt-out a real vim-motion user
+    ///    would make, and is what lets this test's `<C-b>` reach
+    ///    `Engine::handle_key` -> `page_up()` at all. It has to happen
+    ///    *after* the `tick()` call below, not before — see that call's own
+    ///    comment for why setting it any earlier gets silently overwritten.
+    /// 2. Even unbound, the sidebar can still end up visible and focused by
+    ///    the time `app` is wrapped (`Engine::new_for_test()` plus
+    ///    `TuiShellApp::setup()`/`tick()` can reveal it), which would
+    ///    swallow keys meant for the editor. A real mouse click into the
+    ///    editor pane — the same action `mouse.rs`'s "clicking the editor
+    ///    clears every sidebar's focus" arm exists for — is used below as
+    ///    a click-to-focus guardrail regardless of whatever the sidebar
+    ///    ended up doing.
+    ///
+    /// The click also serves as the `:<N><CR>` jump's starting point: it
+    /// lands the cursor wherever it clicks, which the jump immediately
+    /// overrides, so it doesn't need to preserve any particular cursor
+    /// position — only to move focus.
+    ///
+    /// The jump moves the cursor 5 lines past the bottom of the first
+    /// window; `ensure_cursor_visible` bottom-aligns it, landing the new
+    /// topline 5 rows below the first window regardless of `height` — which
+    /// in turn guarantees a single `<C-b>` cannot scroll a full page and
+    /// must clamp at the top of the buffer for any plausible terminal
+    /// height (the arithmetic only requires `height >= 7`).
+    ///
+    /// **RED against the pre-#1008 formula:** that formula placed the
+    /// cursor at `scrolloff + 1` lines below the *previous* topline
+    /// (topline 6 here, 1-indexed) — i.e. line 6 — regardless of `height`.
+    /// The assertion below requires the painted status bar to read
+    /// `"Ln <height>, Col 1"` instead, which only the new "bottom of the
+    /// new window" formula produces.
+    #[test]
+    fn ctrl_b_clamped_scroll_lands_cursor_on_new_window_bottom_via_shell_app() {
+        fn visible_l_markers(screen: &str) -> Vec<usize> {
+            screen
+                .lines()
+                .flat_map(|line| line.split_whitespace())
+                .filter_map(|tok| tok.strip_prefix('L').and_then(|n| n.parse::<usize>().ok()))
+                .collect()
+        }
+
+        let mut app = TuiShellApp::new_for_test();
+        app.engine
+            .buffer_mut()
+            .insert(0, &(1..=300).map(|n| format!("L{n}\n")).collect::<String>());
+
+        let mut backend = backend_at(100.0, 40.0);
+        app.setup(&mut backend);
+        // `tick()`'s `poll_idle()` -> `check_settings_reload()` reloads
+        // `Engine::settings` wholesale from this *machine's real*
+        // `~/.config/vimcode/settings.json` the first time it runs —
+        // `Engine::new_for_test()` seeds `settings_mtime: None`, and
+        // `check_settings_reload` treats "no recorded mtime" as "reload
+        // unconditionally" (`core/engine/mod.rs`). So the override below
+        // has to happen *after* this call, not before, or this real disk
+        // file stomps it back to its own value the instant `tick()` runs.
+        app.tick(&mut backend);
+        // `settings.panel_keys.toggle_sidebar` defaults to the literal
+        // string `"<C-b>"` (`core/settings.rs`'s `pk_toggle_sidebar`), and
+        // the `setup()` call `driver_with_shell` makes below registers it
+        // as a `quadraui::AcceleratorScope::Global` accelerator
+        // (`render::register_panel_accelerators`) — global, so it wins
+        // over the editor's own Ctrl+B *unconditionally*, exactly as the
+        // `<C-b>`-toggles-sidebar default is meant to for a VS-Code-style
+        // user. Confirmed empirically: with the default binding in place,
+        // every `<C-b>` this test sent toggled the Explorer sidebar
+        // instead of paging. A test of the vim motion has to opt out of
+        // that default the same way a vim-motion user would: an empty
+        // binding is `register_panel_accelerators`'s documented "unbound"
+        // spelling, so the `<C-b>` sent below reaches `Engine::handle_key`
+        // -> `page_up()` instead of being claimed as a sidebar toggle
+        // before the editor ever sees it.
+        app.engine.settings.panel_keys.toggle_sidebar = String::new();
+
+        let height = app.engine.viewport_lines();
+        assert!(
+            height >= 7,
+            "this fixture's arithmetic needs a real editor viewport of at \
+             least 7 rows to guarantee the <C-b> below clamps; got {height}"
+        );
+
+        let mut driver = driver_with_shell(app, config(), 100, 40);
+
+        // Click-to-focus guardrail (see doc comment above): whatever the
+        // sidebar ended up doing, a real click into the editor's "L1" line
+        // is what a user would do to make sure their next keystroke reaches
+        // the buffer, not a leftover-focused panel.
+        let (cx, cy) = driver
+            .find("L1")
+            .expect("the buffer's first line must paint before the click");
+        driver.click(cx, cy);
+
+        // Jump 5 lines past the bottom of the first window. `ensure_cursor_
+        // visible` bottom-aligns a downward jump, so the new topline
+        // (1-indexed) becomes `target - height + 1 == 6`, independent of
+        // `height`.
+        let target = height + 5;
+        driver.press_named(quadraui::NamedKey::Escape);
+        driver.type_char(':');
+        for ch in target.to_string().chars() {
+            driver.type_char(ch);
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
+
+        let after_jump = visible_l_markers(&driver.screen());
+        assert_eq!(
+            after_jump.iter().min().copied(),
+            Some(6),
+            "setup sanity: :{target}<CR> should bottom-align the window 5 \
+             rows below the first page; screen:\n{}",
+            driver.screen()
+        );
+
+        // A single <C-b> from topline 6 cannot scroll a full page (the
+        // near-full-page step outruns the 5 lines of headroom above the
+        // buffer's start), so it clamps at line 1 — exactly the "cursor to
+        // fixed old-topline offset" vs. "cursor to new window bottom" fork
+        // #1008 fixed.
+        driver.ctrl_char('b');
+
+        let after_scroll = visible_l_markers(&driver.screen());
+        assert_eq!(
+            after_scroll.iter().min().copied(),
+            Some(1),
+            "clamped <C-b> must scroll back to the very top of the buffer; \
+             screen:\n{}",
+            driver.screen()
+        );
+        assert_eq!(
+            after_scroll.iter().max().copied(),
+            Some(height),
+            "clamped <C-b> must show a full window from the top; screen:\n{}",
+            driver.screen()
+        );
+
+        // The status bar's "Ln N, Col N" (`render.rs`'s `build_status_line`,
+        // already used the same way by other tests in this file, e.g.
+        // `.find("Ln 1, Col 1")`) is the painted proof of *where the cursor
+        // is*, not just which lines the window shows — the two window-bound
+        // assertions above would also pass if the cursor were clamped
+        // in-window but landed anywhere else on it. The pre-#1008 formula
+        // would have shown "Ln 6, Col 1" here (`scrolloff + 1` past the old
+        // topline, both 0); the fix requires "Ln {height}, Col 1" (the new
+        // window's last line).
+        let expected_status = format!("Ln {height}, Col 1");
+        assert!(
+            driver.screen_contains(&expected_status),
+            "clamped <C-b> must land the cursor on the new window's last \
+             line ({expected_status}), not a fixed offset from the old \
+             topline (the pre-#1008 formula landed on \"Ln 6, Col 1\" here); \
+             screen:\n{}",
+            driver.screen()
+        );
+    }
 }
