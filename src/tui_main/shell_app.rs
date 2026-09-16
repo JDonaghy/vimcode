@@ -11790,6 +11790,125 @@ mod tests {
         }
     }
 
+    // ── #992: file-type icon coverage (.cs via the expanded extension
+    // table) ─────────────────────────────────────────────────────────────
+
+    /// A `.cs` tab paints the C# badge, and that badge is absent — replaced
+    /// by the generic badge — for an unrecognised extension. The two-case
+    /// comparison is what actually proves "non-generic": a single-render
+    /// assertion that *some* nerd glyph painted would also have passed
+    /// against the #992 bug report, where `.json` painted a badge while
+    /// `.cs` silently fell through to `FILE_GENERIC` because no extension-
+    /// table arm existed for it — checking only the `.cs` row in isolation
+    /// can't distinguish "got its own badge" from "got the generic one".
+    ///
+    /// # Why this fails against unfixed `develop`
+    ///
+    /// Before #992 added a `"cs"` arm to `icons::file_icon`, `.cs` fell
+    /// through the same `_ => FILE_GENERIC.s()` catch-all as the
+    /// unrecognised-extension control case, so `cs_row` and `generic_row`
+    /// would both paint `FILE_GENERIC` and never `FILE_CSHARP` — the first
+    /// assertion below fails.
+    #[test]
+    fn tab_bar_paints_a_distinct_icon_for_cs_files_via_shell_app() {
+        let prev_nf = crate::icons::nerd_fonts_enabled();
+        let row_for = |file_name: &str| {
+            let dir = std::env::temp_dir().join(format!(
+                "vimcode_test_992_tab_{}_{:?}",
+                file_name.replace('.', "_"),
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join(file_name);
+            std::fs::write(&path, "// marker\n").unwrap();
+
+            let mut app = TuiShellApp::new(None);
+            app.engine.settings.use_nerd_fonts = true;
+            crate::icons::set_nerd_fonts(true);
+            app.engine
+                .open_file_with_mode(&path, crate::core::engine::OpenMode::Permanent)
+                .unwrap();
+
+            let driver = driver_with_shell(app, config(), 100, 24);
+            let row = driver
+                .screen()
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .to_string();
+            let _ = std::fs::remove_dir_all(&dir);
+            row
+        };
+
+        let cs_row = row_for("widget992.cs");
+        let generic_row = row_for("widget992.zqxwunknown");
+        crate::icons::set_nerd_fonts(prev_nf);
+
+        assert!(
+            cs_row.contains(crate::icons::FILE_CSHARP.nerd),
+            "a .cs tab must paint the C# badge; row:\n{cs_row}"
+        );
+        assert!(
+            !generic_row.contains(crate::icons::FILE_CSHARP.nerd),
+            "an unrecognised extension must not paint the C# badge; row:\n{generic_row}"
+        );
+        assert!(
+            generic_row.contains(crate::icons::FILE_GENERIC.nerd),
+            "an unrecognised extension must still paint the generic badge \
+             (proving the difference above is real, not just 'nothing \
+             painted'); row:\n{generic_row}"
+        );
+    }
+
+    /// The explorer-tree counterpart to the tab-bar test above: a `.cs`
+    /// file's row paints the C# badge, and a sibling file with an
+    /// unrecognised extension paints the generic badge instead — see that
+    /// test's doc comment for why the two-case comparison is what actually
+    /// demonstrates "non-generic".
+    ///
+    /// # Why this fails against unfixed `develop`
+    ///
+    /// Same root cause as the tab-bar test: pre-#992, `build_explorer_tree_
+    /// rows` resolved `.cs` through the same extension table with no `"cs"`
+    /// arm, so its row painted `FILE_GENERIC` — identical to
+    /// `widget992.zqxwunknown`'s row — and the first assertion fails.
+    #[test]
+    fn explorer_tree_paints_a_distinct_icon_for_cs_files_via_shell_app() {
+        let prev_nf = crate::icons::nerd_fonts_enabled();
+        crate::icons::set_nerd_fonts(true);
+
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_test_992_explorer_{:?}",
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cs_file = dir.join("cs992.cs");
+        let generic_file = dir.join("zz992.zqx");
+        std::fs::write(&cs_file, "// marker\n").unwrap();
+        std::fs::write(&generic_file, "marker\n").unwrap();
+
+        let mut app = TuiShellApp::new(None);
+        app.engine.cwd = dir.clone();
+        app.engine.explorer_reveal_path(&cs_file);
+
+        let driver = driver_with_shell(app, config(), 80, 24);
+        let screen = driver.screen();
+        crate::icons::set_nerd_fonts(prev_nf);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(
+            screen.contains("cs992.cs") && screen.contains("zz992.zqx"),
+            "both the .cs file and its unrecognised-extension sibling must \
+             be painted in the explorer tree; screen:\n{screen}"
+        );
+        assert!(
+            screen.contains(crate::icons::FILE_CSHARP.nerd),
+            "the cs992.cs file's row must paint the C# badge; screen:\n{screen}"
+        );
+    }
+
     // ── Minimap (#35) ───────────────────────────────────────────────────
 
     /// Buffer with a lopsided indentation shape, long enough that the
