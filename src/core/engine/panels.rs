@@ -97,6 +97,70 @@ impl Engine {
         );
     }
 
+    /// `:CheckNerdFonts` (issue #999) — paint a sample row of a few
+    /// file-type glyphs next to their ASCII fallbacks and let the user say
+    /// which one actually rendered.
+    ///
+    /// There is no reliable way to detect terminal glyph support from
+    /// inside the terminal (a CSI-6n cursor-advance probe measures width
+    /// handling, not whether a real glyph painted — a tofu box still
+    /// advances the cursor the same as a glyph would). So instead of
+    /// guessing, this asks the one oracle that actually knows: the user,
+    /// once, with both variants on screen at the same time. The answer is
+    /// persisted as an explicit `use_nerd_fonts` override (`Some(_)`),
+    /// which always wins over the backend-derived default and survives
+    /// restarts — see [`crate::core::settings::Settings::use_nerd_fonts`].
+    ///
+    /// Reads `Icon::nerd`/`Icon::fallback` directly rather than going
+    /// through `Icon::s()` so both variants show regardless of the
+    /// thread-local `use_nerd_fonts` flag currently in effect.
+    pub fn show_check_nerd_fonts_dialog(&mut self) {
+        let sample = [
+            crate::icons::FILE_RUST,
+            crate::icons::FILE_PYTHON,
+            crate::icons::FILE_JS,
+            crate::icons::FILE_JSON,
+        ];
+        let nerd_row: String = sample
+            .iter()
+            .map(|i| i.nerd)
+            .collect::<Vec<_>>()
+            .join("   ");
+        let fallback_row: String = sample
+            .iter()
+            .map(|i| i.fallback)
+            .collect::<Vec<_>>()
+            .join("   ");
+        self.show_dialog(
+            "check_nerd_fonts",
+            "Check Nerd Fonts",
+            vec![
+                "Do the top row's icons look like distinct file-type glyphs".to_string(),
+                "(not boxes, question marks, or blank cells)?".to_string(),
+                String::new(),
+                format!("Nerd Font:  {nerd_row}"),
+                format!("Fallback:   {fallback_row}"),
+            ],
+            vec![
+                DialogButton {
+                    label: "Nerd Font row looks right".into(),
+                    hotkey: 'n',
+                    action: "enable".into(),
+                },
+                DialogButton {
+                    label: "Fallback row looks right".into(),
+                    hotkey: 'f',
+                    action: "disable".into(),
+                },
+                DialogButton {
+                    label: "Cancel".into(),
+                    hotkey: '\0',
+                    action: "cancel".into(),
+                },
+            ],
+        );
+    }
+
     /// Convenience: show an error dialog with a single OK button.
     #[allow(dead_code)]
     pub fn show_error_dialog(&mut self, title: &str, message: &str) {
@@ -494,6 +558,23 @@ impl Engine {
             },
             "file_changed" => {
                 self.handle_file_watcher_action(action);
+                EngineAction::None
+            }
+            "check_nerd_fonts" => {
+                if let Some(enabled) = match action {
+                    "enable" => Some(true),
+                    "disable" => Some(false),
+                    _ => None, // cancel — leave the setting untouched
+                } {
+                    self.settings.use_nerd_fonts = Some(enabled);
+                    crate::icons::set_nerd_fonts(enabled);
+                    let state = if enabled { "enabled" } else { "disabled" };
+                    self.message = if let Err(e) = self.settings.save() {
+                        format!("Nerd Fonts {state} but failed to save: {e}")
+                    } else {
+                        format!("Nerd Fonts {state} and saved to settings.")
+                    };
+                }
                 EngineAction::None
             }
             _ => EngineAction::None,

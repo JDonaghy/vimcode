@@ -194,7 +194,7 @@ mod mac_driver_tests {
         // both tests below fail on that gap and assert nothing about the
         // minimap, so it is scoped out on purpose; the gap itself needs a
         // quadraui issue (see this PR's notes), never a fix in `src/macos/`.
-        engine.settings.use_nerd_fonts = false;
+        engine.settings.use_nerd_fonts = Some(false);
         engine
     }
 
@@ -438,7 +438,7 @@ mod mac_driver_tests {
     /// buffer that test doesn't need here.
     fn plain_engine() -> Engine {
         let mut engine = Engine::new_for_test();
-        engine.settings.use_nerd_fonts = false;
+        engine.settings.use_nerd_fonts = Some(false);
         engine
     }
 
@@ -637,7 +637,7 @@ mod mac_driver_tests {
     fn engine_with_nerd_fonts_on() -> Engine {
         let mut engine = Engine::new_for_test();
         engine.buffer_mut().insert(0, "fn main() {}\n");
-        engine.settings.use_nerd_fonts = true;
+        engine.settings.use_nerd_fonts = Some(true);
         engine
     }
 

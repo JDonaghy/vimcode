@@ -959,12 +959,18 @@ impl TuiShellApp {
             .borrow_mut()
             .set_backend_info(1.0, msv_metrics);
 
-        let nerd_font_missing =
-            engine.settings.use_nerd_fonts && !icons::detect_nerd_font_windows();
-        if nerd_font_missing {
-            engine.settings.use_nerd_fonts = false;
-        }
-        icons::set_nerd_fonts(engine.settings.use_nerd_fonts);
+        // #999: there is no reliable way to detect terminal glyph support
+        // from inside the terminal (a CSI-6n width probe measures advance,
+        // not whether a real glyph painted — see the issue), so this no
+        // longer probes or silently overrides the user's setting. When
+        // `use_nerd_fonts` has never been explicitly set *and* the
+        // backend-derived default resolves to fallback icons, nudge the
+        // user toward `:CheckNerdFonts` once at startup instead — asking
+        // the one oracle that can actually see the difference, rather than
+        // guessing on their behalf.
+        let nerd_fonts_undiscovered =
+            engine.settings.use_nerd_fonts.is_none() && !engine.settings.use_nerd_fonts();
+        icons::set_nerd_fonts(engine.settings.use_nerd_fonts());
         if restore_session {
             engine.startup(file_path.as_deref());
         } else {
@@ -972,10 +978,10 @@ impl TuiShellApp {
         }
         setup_tui_clipboard(&mut engine);
 
-        let pending_startup_msg = if nerd_font_missing {
+        let pending_startup_msg = if nerd_fonts_undiscovered {
             Some(
-                "No Nerd Font detected — using fallback icons. Install a Nerd Font and run \
-                 :set nerdfonts to enable."
+                "Using ASCII fallback icons. If your terminal has a Nerd Font, run \
+                 :CheckNerdFonts to check and enable them."
                     .to_string(),
             )
         } else {
@@ -4532,7 +4538,7 @@ mod tests {
     /// of this fixture.
     fn app_with_ext_panel() -> TuiShellApp {
         let mut app = TuiShellApp::new(None);
-        app.engine.settings.use_nerd_fonts = false;
+        app.engine.settings.use_nerd_fonts = Some(false);
         crate::icons::set_nerd_fonts(false);
         app.engine.ext_panels.clear();
         app.engine.ext_panels.insert(
@@ -6925,7 +6931,7 @@ mod tests {
     #[test]
     fn tui_ext_panel_double_click_on_a_section_header_does_not_toggle_it() {
         let mut app = TuiShellApp::new_for_test();
-        app.engine.settings.use_nerd_fonts = false;
+        app.engine.settings.use_nerd_fonts = Some(false);
         crate::icons::set_nerd_fonts(false);
         app.engine.ext_panels.clear();
         app.engine.ext_panels.insert(
@@ -8503,7 +8509,7 @@ mod tests {
     /// Mirrors `gtk/testing.rs`'s `engine_with_every_editor_rung`.
     fn app_with_every_editor_rung() -> TuiShellApp {
         let mut app = TuiShellApp::new(None);
-        app.engine.settings.use_nerd_fonts = false;
+        app.engine.settings.use_nerd_fonts = Some(false);
         app.engine.settings.breadcrumbs = true;
         app.engine.settings.minimap = true;
         let cwd = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -8690,7 +8696,7 @@ mod tests {
     /// Mirrors `gtk/testing.rs`'s `engine_with_every_bottom_rung`.
     fn app_with_every_bottom_rung() -> TuiShellApp {
         let mut app = TuiShellApp::new(None);
-        app.engine.settings.use_nerd_fonts = false;
+        app.engine.settings.use_nerd_fonts = Some(false);
         // `separated_status_line` is `Some` only for
         // `window_status_line && !status_line_above_terminal && panel open`.
         app.engine.settings.window_status_line = true;
@@ -11639,7 +11645,7 @@ mod tests {
         std::fs::write(&beta, "fn other() {}\n").unwrap();
 
         let mut app = TuiShellApp::new(None);
-        app.engine.settings.use_nerd_fonts = on;
+        app.engine.settings.use_nerd_fonts = Some(on);
         crate::icons::set_nerd_fonts(on);
         app.engine
             .open_file_with_mode(&alpha, crate::core::engine::OpenMode::Permanent)
@@ -13228,7 +13234,7 @@ mod tests {
     /// presence on the painted grid with.
     fn app_with_editor_hover_link() -> TuiShellApp {
         let mut app = TuiShellApp::new(None);
-        app.engine.settings.use_nerd_fonts = false;
+        app.engine.settings.use_nerd_fonts = Some(false);
         crate::icons::set_nerd_fonts(false);
         app.engine.session.explorer_visible = false;
         app.engine.buffer_mut().insert(0, "fn main() {}\n");
@@ -13353,7 +13359,7 @@ mod tests {
     #[test]
     fn driver_editor_hover_renders_code_and_bare_url_link_via_quadraui_markdown() {
         let mut app = TuiShellApp::new(None);
-        app.engine.settings.use_nerd_fonts = false;
+        app.engine.settings.use_nerd_fonts = Some(false);
         crate::icons::set_nerd_fonts(false);
         app.engine.session.explorer_visible = false;
         app.engine.buffer_mut().insert(0, "fn main() {}\n");

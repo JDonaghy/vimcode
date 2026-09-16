@@ -1770,7 +1770,7 @@ mod tests {
         // the harness paints its first frame.
         let render_with_nerd_fonts = |on: bool| {
             let mut engine = engine_with_two_rust_tabs();
-            engine.settings.use_nerd_fonts = on;
+            engine.settings.use_nerd_fonts = Some(on);
             crate::icons::set_nerd_fonts(on);
             let mut h = harness(engine, 1400, 900);
             tab_zero_left_half(&mut h)
@@ -1834,7 +1834,7 @@ mod tests {
         // After `Engine::new` (which applies the developer's own settings),
         // before the harness paints — see `tab_paints_its_language_icon…`.
         let mut engine = engine_with_three_named_tabs();
-        engine.settings.use_nerd_fonts = true;
+        engine.settings.use_nerd_fonts = Some(true);
         crate::icons::set_nerd_fonts(true);
         let mut h = harness(engine, 1400, 900);
 
@@ -2592,7 +2592,7 @@ mod tests {
 
         fn activity_bar_strip(with_ext: bool) -> Vec<(u8, u8, u8)> {
             let mut engine = Engine::new();
-            engine.settings.use_nerd_fonts = false;
+            engine.settings.use_nerd_fonts = Some(false);
             engine.ext_panels.clear();
             if with_ext {
                 engine.ext_panels.insert(
@@ -2692,7 +2692,7 @@ mod tests {
             let _paint = crate::test_paint::PaintGuard::acquire();
             let _cwd = crate::test_cwd::CwdReadGuard::acquire();
             let mut engine = Engine::new();
-            engine.settings.use_nerd_fonts = true;
+            engine.settings.use_nerd_fonts = Some(true);
             let engine = Rc::new(RefCell::new(engine));
             let app = App::new_headless(Rc::clone(&engine));
             let mut config = crate::gtk::build_shell_config(&app);
@@ -3036,7 +3036,7 @@ mod sidebar_panel_clicks {
     /// a Nerd Font installed.
     fn panel_harness(panel: &str) -> Harness<impl AppLogic> {
         let mut engine = Engine::new();
-        engine.settings.use_nerd_fonts = false;
+        engine.settings.use_nerd_fonts = Some(false);
         engine.app_shell.show_panel(&quadraui::WidgetId::new(panel));
         harness(engine, 1400, 900)
     }
@@ -3222,7 +3222,7 @@ mod sidebar_panel_clicks {
     #[test]
     fn bottom_panel_tab_strip_click_switches_the_painted_panel() {
         let mut engine = Engine::new();
-        engine.settings.use_nerd_fonts = false;
+        engine.settings.use_nerd_fonts = Some(false);
         engine.terminal_new_tab(80, 10);
         engine
             .dap_output_lines
@@ -3288,7 +3288,7 @@ mod sidebar_panel_clicks {
     #[test]
     fn terminal_ctrl_f_opens_the_painted_find_bar() {
         let mut engine = Engine::new_for_test();
-        engine.settings.use_nerd_fonts = false;
+        engine.settings.use_nerd_fonts = Some(false);
         // `terminal_new_tab` opens the panel and focuses it.
         engine.terminal_new_tab(80, 10);
 
@@ -3334,7 +3334,7 @@ mod sidebar_panel_clicks {
     fn focused_terminal_swallows_editor_keys_on_gtk() {
         let build = |focused: bool| {
             let mut engine = Engine::new_for_test();
-            engine.settings.use_nerd_fonts = false;
+            engine.settings.use_nerd_fonts = Some(false);
             engine.buffer_mut().insert(0, "ZQXWTERMGTK758\n");
             engine.terminal_new_tab(80, 6);
             engine.terminal_has_focus = focused;
@@ -3549,7 +3549,7 @@ mod sidebar_panel_clicks {
     #[test]
     fn switching_to_a_plugin_panel_clears_stale_marketplace_focus() {
         let mut engine = Engine::new();
-        engine.settings.use_nerd_fonts = false;
+        engine.settings.use_nerd_fonts = Some(false);
         engine.ext_panels.clear();
         engine.ext_panels.insert(
             "git-insights".to_string(),
@@ -3622,7 +3622,7 @@ mod sidebar_panel_clicks {
     #[test]
     fn an_editor_drag_crossing_the_sidebar_is_not_stolen_by_a_panel() {
         let mut engine = Engine::new();
-        engine.settings.use_nerd_fonts = false;
+        engine.settings.use_nerd_fonts = Some(false);
         engine.buffer_mut().insert(
             0,
             "alpha beta gamma
@@ -3658,7 +3658,7 @@ second line here
     #[test]
     fn an_editor_text_drag_paints_a_selection_through_the_shared_drag_router() {
         let mut engine = Engine::new();
-        engine.settings.use_nerd_fonts = false;
+        engine.settings.use_nerd_fonts = Some(false);
         let mut text = String::new();
         for _ in 0..60 {
             text.push_str("alpha beta gamma delta epsilon\n");
@@ -3735,7 +3735,7 @@ second line here
     #[test]
     fn a_sidebar_drag_keeps_its_grab_once_it_crosses_into_the_editor() {
         let mut engine = Engine::new();
-        engine.settings.use_nerd_fonts = false;
+        engine.settings.use_nerd_fonts = Some(false);
         engine.buffer_mut().insert(
             0,
             "alpha beta gamma
@@ -7463,7 +7463,7 @@ mod overlay_band_z_order {
     #[test]
     fn frame_sequence_matches_across_backends_via_gtk_driver() {
         let mut engine = Engine::new();
-        engine.settings.use_nerd_fonts = false;
+        engine.settings.use_nerd_fonts = Some(false);
         engine.buffer_mut().insert(0, "fn main() {}\n");
         // Explicit, not ambient (#762): a global status bar exists only when
         // per-window status lines are off, and the default is on.
@@ -7593,7 +7593,7 @@ mod chrome_band_order {
     #[test]
     fn chrome_band_composes_in_canonical_order_via_gtk_driver() {
         let mut engine = Engine::new();
-        engine.settings.use_nerd_fonts = false;
+        engine.settings.use_nerd_fonts = Some(false);
         // Explicit, not ambient: a global status bar exists only when
         // per-window status lines are off, and the default is on.
         engine.settings.window_status_line = false;
@@ -7646,7 +7646,7 @@ mod chrome_band_order {
     #[test]
     fn chrome_band_drops_the_wildmenu_rung_when_no_completion_is_up_via_gtk_driver() {
         let mut engine = Engine::new();
-        engine.settings.use_nerd_fonts = false;
+        engine.settings.use_nerd_fonts = Some(false);
         engine.settings.window_status_line = false;
         engine.app_shell.show_panel(&quadraui::WidgetId::new(
             crate::core::engine::sidebar::PANEL_SETTINGS,
@@ -7673,7 +7673,7 @@ mod chrome_band_order {
     #[test]
     fn chrome_band_drops_the_status_bar_rung_with_per_window_status_lines_via_gtk_driver() {
         let mut engine = Engine::new();
-        engine.settings.use_nerd_fonts = false;
+        engine.settings.use_nerd_fonts = Some(false);
         engine.settings.window_status_line = true;
         engine.app_shell.show_panel(&quadraui::WidgetId::new(
             crate::core::engine::sidebar::PANEL_SETTINGS,
@@ -7724,7 +7724,7 @@ mod editor_band_order {
     /// this from a seven-rung assertion into a five-rung one.
     fn engine_with_every_editor_rung() -> Engine {
         let mut engine = Engine::new_for_test();
-        engine.settings.use_nerd_fonts = false;
+        engine.settings.use_nerd_fonts = Some(false);
         engine.settings.breadcrumbs = true;
         engine.settings.minimap = true;
         let cwd = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -7919,7 +7919,7 @@ mod editor_band_order {
     #[test]
     fn unsplit_editor_composes_no_group_divider_rung_via_gtk_driver() {
         let mut engine = Engine::new_for_test();
-        engine.settings.use_nerd_fonts = false;
+        engine.settings.use_nerd_fonts = Some(false);
         engine.buffer_mut().insert(0, "fn main() {}\n");
 
         let h = harness(engine, 1400, 900);
@@ -7966,7 +7966,7 @@ mod bottom_band_order {
     /// `app_with_every_bottom_rung`.
     fn engine_with_every_bottom_rung() -> Engine {
         let mut engine = Engine::new_for_test();
-        engine.settings.use_nerd_fonts = false;
+        engine.settings.use_nerd_fonts = Some(false);
         // `separated_status_line` is `Some` only for
         // `window_status_line && !status_line_above_terminal && panel open`.
         engine.settings.window_status_line = true;
@@ -10407,7 +10407,7 @@ mod conformance_proof_slice {
     /// less thing to double-check when a scenario body moves between them.
     fn plain_engine() -> Engine {
         let mut engine = Engine::new_for_test();
-        engine.settings.use_nerd_fonts = false;
+        engine.settings.use_nerd_fonts = Some(false);
         engine
     }
 
@@ -10546,7 +10546,7 @@ mod hit_band_sweep_971 {
     /// tests' `screen_has` checks look for.
     fn plain_engine() -> Engine {
         let mut engine = Engine::new_for_test();
-        engine.settings.use_nerd_fonts = false;
+        engine.settings.use_nerd_fonts = Some(false);
         engine
     }
 
@@ -10793,7 +10793,7 @@ mod issue_991_merge_conflicts {
     /// from the text labels these assertions look for.
     fn plain_engine() -> Engine {
         let mut engine = Engine::new_for_test();
-        engine.settings.use_nerd_fonts = false;
+        engine.settings.use_nerd_fonts = Some(false);
         engine
             .app_shell
             .show_panel(&quadraui::WidgetId::new(PANEL_GIT));
