@@ -7006,17 +7006,29 @@ fn test_fold_close_detects_range() {
     assert!(end >= 3, "end should include indented body");
 }
 
+/// Press `zf3j` — create+close a manual fold spanning the cursor line plus
+/// the next 3 (lines 0-3 from `make_indented_engine`'s header). Vim's
+/// default `'foldmethod'` is `"manual"`, so (#1006) `zc`/`za`/`zR` etc. no
+/// longer invent a fold from indentation the way this suite's fixtures used
+/// to rely on — every test below defines one explicitly first, the way a
+/// real manual-fold session would.
+fn press_zf3j(engine: &mut Engine) {
+    press_char(engine, 'z');
+    press_char(engine, 'f');
+    press_char(engine, '3');
+    press_char(engine, 'j');
+}
+
 #[test]
 fn test_fold_close_and_open() {
     let mut engine = make_indented_engine();
     engine.view_mut().cursor.line = 0;
 
-    // zc — close fold
-    press_char(&mut engine, 'z');
-    press_char(&mut engine, 'c');
+    // zf3j — create+close fold
+    press_zf3j(&mut engine);
     assert!(
         engine.view().fold_at(0).is_some(),
-        "fold should exist after zc"
+        "fold should exist after zf3j"
     );
 
     // zo — open fold
@@ -7032,6 +7044,14 @@ fn test_fold_close_and_open() {
 fn test_fold_toggle_za() {
     let mut engine = make_indented_engine();
     engine.view_mut().cursor.line = 0;
+
+    // Define the fold, then leave it open, so za's own toggle is what's
+    // under test (not fold creation, which 'foldmethod'="manual" reserves
+    // for zf — #1006).
+    press_zf3j(&mut engine);
+    press_char(&mut engine, 'z');
+    press_char(&mut engine, 'o');
+    assert!(engine.view().fold_at(0).is_none(), "reopened before za");
 
     // First za closes the fold
     press_char(&mut engine, 'z');
@@ -7049,8 +7069,7 @@ fn test_fold_open_all_zr() {
     let mut engine = make_indented_engine();
     engine.view_mut().cursor.line = 0;
 
-    press_char(&mut engine, 'z');
-    press_char(&mut engine, 'c');
+    press_zf3j(&mut engine);
     assert!(!engine.view().folds.is_empty(), "should have a fold");
 
     press_char(&mut engine, 'z');
@@ -7064,8 +7083,7 @@ fn test_fold_navigation_skips_hidden_lines() {
     engine.view_mut().cursor.line = 0;
 
     // Close the fold (lines 1-3 become hidden)
-    press_char(&mut engine, 'z');
-    press_char(&mut engine, 'c');
+    press_zf3j(&mut engine);
 
     // j from line 0 should skip to line 4 (first visible line after fold)
     press_char(&mut engine, 'j');
@@ -7087,23 +7105,110 @@ fn test_fold_navigation_skips_hidden_lines() {
 #[test]
 fn test_fold_cursor_clamp_on_close() {
     let mut engine = make_indented_engine();
-    // Put cursor inside what will become the fold body
-    engine.view_mut().cursor.line = 2;
-
-    // Close fold from line 0 — but cursor is on line 2, which is inside.
-    // The fold command detects range from cursor (line 2) not header.
-    // So we place cursor at 0 and close, then move cursor inside and close again.
-
-    // Close from line 0
     engine.view_mut().cursor.line = 0;
+
+    // Define the fold, then reopen it — still defined (#1006) — so a
+    // second zc from inside the body finds it via `enclosing_fold_def`
+    // rather than from the header line.
+    press_zf3j(&mut engine);
+    press_char(&mut engine, 'z');
+    press_char(&mut engine, 'o');
+
+    // Put cursor inside what will become the fold body, then reclose.
+    engine.view_mut().cursor.line = 2;
     press_char(&mut engine, 'z');
     press_char(&mut engine, 'c');
 
-    // Cursor should still be on line 0 (the fold header)
+    // Cursor should be pulled up to line 0 (the fold header), not left
+    // hidden inside the now-closed fold.
     assert_eq!(
         engine.view().cursor.line,
         0,
         "cursor should stay at fold header after zc"
+    );
+}
+
+// ── #1006: fold round-trip + nested-fold regressions ───────────────────────
+//
+// Found while adding oracle-backed fold cases to `tests/nvim_conformance.rs`
+// (#1006). Each fails against unfixed `develop`.
+
+#[test]
+fn test_fold_zfj_zo_zc_roundtrip_on_flat_text() {
+    // Before #1006, `zo` deleted the fold's definition outright, so a `zc`
+    // on text with no indent structure (nothing for `detect_fold_range` to
+    // rediscover) could never reclose it.
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "one\ntwo\nthree\nfour\n");
+    engine.view_mut().cursor.line = 0;
+    engine.feed_keys("zfj");
+    assert!(engine.view().fold_at(0).is_some(), "zfj should close");
+    engine.feed_keys("zo");
+    assert!(engine.view().fold_at(0).is_none(), "zo should open");
+    engine.feed_keys("zc");
+    assert!(
+        engine.view().fold_at(0).is_some(),
+        "zc should reclose the same manual fold (#1006)"
+    );
+    let fold = engine.view().fold_at(0).unwrap();
+    assert_eq!(fold.end, 1, "reclosed fold should span the original range");
+}
+
+#[test]
+fn test_fold_zo_on_outer_leaves_inner_fold_closed() {
+    // Opening an outer fold must not silently drop a nested inner fold's
+    // own closed state. Verified against `nvim --headless`: `foldclosed()`
+    // on the inner range still reports it after `zo` on the outer header.
+    let mut engine = make_indented_engine();
+    engine.view_mut().cursor.line = 1; // "    let x = 1;"
+    engine.feed_keys("zfj"); // inner fold: lines 1-2
+    engine.view_mut().cursor.line = 0;
+    engine.feed_keys("zf3j"); // outer fold: lines 0-3 (nests the inner one)
+    assert!(engine.view().fold_at(0).is_some(), "outer should be closed");
+
+    engine.feed_keys("zo"); // open just the outer fold
+    assert!(
+        engine.view().fold_at(0).is_none(),
+        "outer should now be open"
+    );
+    assert!(
+        engine.view().is_line_hidden(2),
+        "inner fold body should still be hidden"
+    );
+    assert!(
+        engine.view().fold_at(1).is_some(),
+        "inner fold should still show as closed"
+    );
+}
+
+#[test]
+fn test_next_visible_line_skips_outermost_nested_closed_fold() {
+    // `next_visible_line` (feeds `<C-d>`/`<C-e>`/scroll-top snapping) used
+    // to jump past whichever closed fold it found *first* in `folds` —
+    // which, once a fold no longer discards a contained one on close
+    // (#1006), can be the narrower nested fold, landing back inside the
+    // still-closed outer one instead of past it.
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "0\n1\n2\n3\n4\n5\n");
+    engine.view_mut().close_fold(2, 3); // inner
+    engine.view_mut().close_fold(0, 4); // outer, nests the inner one
+    assert_eq!(
+        engine.view().next_visible_line(0, 1, 5),
+        5,
+        "should skip the whole nested closed region, not just the inner fold"
+    );
+}
+
+#[test]
+fn test_prev_visible_line_skips_outermost_nested_closed_fold() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "0\n1\n2\n3\n4\n5\n");
+    engine.view_mut().close_fold(2, 3);
+    engine.view_mut().close_fold(0, 4);
+    assert_eq!(
+        engine.view().prev_visible_line(5, 1),
+        0,
+        "should skip back to the outer header, not the inner fold's start"
     );
 }
 

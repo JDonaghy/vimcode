@@ -2704,24 +2704,14 @@ impl Engine {
                     }
                 }
                 Some('z') => {
-                    // ]z: move to end of current open fold
+                    // ]z: move to end of current open fold. Uses the
+                    // *defined* fold hierarchy (open or closed), not just
+                    // `folds` (closed only, #1006) — otherwise this never
+                    // finds the open fold it's specifically documented to
+                    // move within (`:h ]z`, verified against `nvim
+                    // --headless`).
                     let line = self.view().cursor.line;
-                    let folds = &self.view().folds;
-                    let mut best = None;
-                    for fold in folds {
-                        if fold.start <= line && fold.end >= line {
-                            match best {
-                                None => best = Some(fold.end),
-                                Some(prev) => {
-                                    // pick the innermost (smallest end)
-                                    if fold.end < prev {
-                                        best = Some(fold.end);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    if let Some(end) = best {
+                    if let Some(end) = self.view().enclosing_fold_def(line).map(|f| f.end) {
                         self.view_mut().cursor.line = end;
                         self.view_mut().cursor.col = 0;
                         self.clamp_cursor_col();
@@ -2797,23 +2787,11 @@ impl Engine {
                     }
                 }
                 Some('z') => {
-                    // [z: move to start of current open fold
+                    // [z: move to start of current open fold — see the `]z`
+                    // comment above for why this uses `enclosing_fold_def`
+                    // rather than `folds` (#1006).
                     let line = self.view().cursor.line;
-                    let folds = &self.view().folds;
-                    let mut best = None;
-                    for fold in folds {
-                        if fold.start <= line && fold.end >= line {
-                            match best {
-                                None => best = Some(fold.start),
-                                Some(prev) => {
-                                    if fold.start > prev {
-                                        best = Some(fold.start);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    if let Some(start) = best {
+                    if let Some(start) = self.view().enclosing_fold_def(line).map(|f| f.start) {
                         self.view_mut().cursor.line = start;
                         self.view_mut().cursor.col = 0;
                         self.clamp_cursor_col();
@@ -3475,6 +3453,27 @@ impl Engine {
     ) -> EngineAction {
         // Handle 'Z' sentinel for zf{motion} — fold creation operator.
         if operator == 'Z' {
+            // zf{a/i}{object} (e.g. `zfap`) — same `i`/`a` text-object
+            // grammar as any other operator (#1006). This branch always
+            // returns before reaching the shared `pending_text_object`
+            // dispatch further down in this function, so both halves of
+            // that grammar (setting it, then consuming it on the next key)
+            // have to be handled right here rather than relying on falling
+            // through — a version that only set `pending_text_object` and
+            // relied on the shared block silently never fired it, because
+            // the very next keypress re-enters this function with
+            // `operator == 'Z'` and hits this `if` again first.
+            if let Some(modifier) = self.pending_text_object.take() {
+                if let Some(obj_type) = unicode {
+                    self.apply_fold_text_object(modifier, obj_type);
+                }
+                return EngineAction::None;
+            }
+            if unicode == Some('i') || unicode == Some('a') {
+                self.pending_text_object = unicode;
+                self.pending_operator = Some('Z');
+                return EngineAction::None;
+            }
             let cursor_line = self.view().cursor.line;
             let total = self.buffer().len_lines();
             let target = match unicode {
@@ -3795,7 +3794,10 @@ impl Engine {
             // Fall through to common motion match block below
         }
 
-        // Check if we're waiting for a text object type (after 'i' or 'a')
+        // Check if we're waiting for a text object type (after 'i' or 'a').
+        // `operator == 'Z'` never reaches here — see the comment where that
+        // branch handles its own `pending_text_object` at the top of this
+        // function.
         if let Some(modifier) = self.pending_text_object.take() {
             if let Some(obj_type) = unicode {
                 self.apply_operator_text_object(operator, modifier, obj_type, changed);
@@ -4698,6 +4700,20 @@ impl Engine {
         if start_line > end_line {
             return;
         }
+        // A linewise command that touches any part of a closed fold applies
+        // to the fold's entire range (`:h fold-behavior`) — verified
+        // against `nvim --headless`: `dd`/`yy` on a closed fold's header
+        // remove/yank every line inside it, not just the header (#1006).
+        let start_line = self
+            .view()
+            .enclosing_closed_fold(start_line)
+            .map(|f| f.start)
+            .unwrap_or(start_line);
+        let end_line = self
+            .view()
+            .enclosing_closed_fold(end_line)
+            .map(|f| f.end)
+            .unwrap_or(end_line);
         // Force charwise mode: convert line range to char range and redirect
         if self.force_motion_mode == Some('v') {
             self.force_motion_mode = None;
