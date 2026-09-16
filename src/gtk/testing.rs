@@ -6930,6 +6930,135 @@ mod minimap {
              pane's text width); before={before:?}, after={after:?}"
         );
     }
+
+    /// #1030 review round 2 — deliverable 3 requires checking GTK does not
+    /// regress from `build_minimap_data`'s `visible_span_cols` formula
+    /// (`src/render.rs`) and stating what was measured. This pins that
+    /// measurement against real painted GTK pixels instead of leaving it as
+    /// an unverified comment.
+    ///
+    /// # Why this cannot be RED against either formula this issue produced
+    ///
+    /// GTK's own rasteriser (`quadraui::gtk::minimap::draw_minimap` ->
+    /// `paint_row_blocks`) paints one 1px-wide block per non-blank
+    /// character column at exactly `strip.x + col`, and `draw_minimap`
+    /// clips all painting to the strip rect (`cr.clip()`) — so a strip only
+    /// ever shows columns `0..strip.width` on screen, no matter how many
+    /// columns the *aggregated colour grid* covers. Both the first
+    /// reviewed formula (`rect.width * MINIMAP_COLS_PER_CELL` raw columns,
+    /// with no floor) and the fixed one (the same, floored at
+    /// `quadraui::primitives::minimap::COLUMN_CAPACITY`) always resolve to
+    /// at least `rect.width` raw columns for any positive `rect.width`
+    /// (`2 * w >= w`), so the aggregated grid has *always* covered every
+    /// column GTK can actually paint — there is no strip width at which
+    /// GTK's rendered pixels can differ between the two formulas. This test
+    /// cannot be red against either and is not trying to be; it exists so
+    /// "no GTK regression" is a measured fact rather than a comment's
+    /// claim, and so a future change that actually does shrink the grid
+    /// below GTK's real requirement gets caught here.
+    ///
+    /// # What it measures
+    ///
+    /// Opens a real, tree-sitter-highlighted `.rs` buffer and samples
+    /// pixels inside the painted minimap strip, counting distinct
+    /// non-background colours — the GTK analogue of the TUI test's
+    /// `colors.len()` probe (`minimap_paints_syntax_colour_for_indented_code`
+    /// in `src/tui_main/shell_app.rs`). At a 1400px-wide pane the strip
+    /// resolves to exactly `MINIMAP_TARGET_COLS` (120px, == GTK's
+    /// `COLUMN_CAPACITY`), so an indent of 20 columns lands well inside the
+    /// range every formula this issue considered ever covered.
+    fn minimap_gtk_distinct_colors_for_indent(indent: usize) -> usize {
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_test_1030_gtk_minimap_colour_{}_{:?}_{indent}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("colour1030.rs");
+        let pad = " ".repeat(indent);
+        let text: String = (0..60)
+            .map(|i| format!("{pad}let value_{i} = 1;\n"))
+            .collect();
+        std::fs::write(&file, &text).unwrap();
+
+        // `syntax_max_lines` lives in a process-global atomic another test
+        // in this binary can have moved; pin it so "were there any
+        // highlights at all" is deterministic here (mirrors the TUI
+        // fixture's own reasoning).
+        crate::core::buffer_manager::set_syntax_max_lines(20_000);
+
+        let mut engine = Engine::new();
+        engine
+            .open_file_with_mode(&file, crate::core::engine::OpenMode::Permanent)
+            .unwrap();
+        let win_id = engine.active_window_id();
+        let buf_id = engine.windows.get(&win_id).unwrap().buffer_id;
+        let n_highlights = engine.buffer_manager.get(buf_id).unwrap().highlights.len();
+        assert!(
+            n_highlights > 0,
+            "precondition: tree-sitter must produce highlights for this \
+             fixture, or the colour assertions below are vacuous"
+        );
+
+        let mut h = harness(engine, 1400, 900);
+        h.window_center(win_id)
+            .expect("editor pane must paint with the minimap on");
+
+        let theme = crate::render::Theme::from_name(&h.engine.borrow().settings.colorscheme);
+        let bg = (theme.background.r, theme.background.g, theme.background.b);
+
+        let strip = {
+            let layout = h.screen_layout.borrow();
+            layout
+                .as_ref()
+                .unwrap()
+                .minimap
+                .iter()
+                .find(|m| m.window_id == win_id)
+                .expect("the layout must carry a minimap for the pane")
+                .rect
+        };
+
+        let x0 = strip.x.round() as i32;
+        let x1 = (strip.x + strip.width).round() as i32;
+        let y0 = strip.y.round() as i32;
+        let y1 = (strip.y + strip.height).round() as i32;
+        let mut seen = std::collections::HashSet::new();
+        for y in (y0..y1).step_by(2) {
+            for x in x0..x1 {
+                let c = h.driver.pixel(x, y);
+                if c != bg {
+                    seen.insert(c);
+                }
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        seen.len()
+    }
+
+    #[test]
+    fn minimap_paints_distinct_syntax_colors_at_indentation_via_gtk_driver() {
+        let flat = minimap_gtk_distinct_colors_for_indent(0);
+        assert!(
+            flat > 1,
+            "precondition/regression guard: un-indented highlighted code \
+             must paint more than one distinct colour in the GTK minimap \
+             strip; got {flat}"
+        );
+
+        let indented = minimap_gtk_distinct_colors_for_indent(20);
+        assert!(
+            indented > 1,
+            "#1030 GTK measurement: code indented by 20 columns (well \
+             inside every column budget this issue's formulas ever \
+             produced) must still paint more than one distinct colour in \
+             the GTK minimap strip — got {indented}. If this ever fails, \
+             `build_minimap_data`'s `visible_span_cols` floor \
+             (`src/render.rs`) has regressed below what GTK's rasteriser \
+             actually needs."
+        );
+    }
 }
 
 /// Black-box coverage for the VimCode app icon painted left of the `File`
