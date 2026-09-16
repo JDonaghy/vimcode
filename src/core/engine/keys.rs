@@ -1174,6 +1174,25 @@ impl Engine {
                 self.insert_repeat_count = self.take_count();
                 self.start_undo_group();
                 self.insert_text_buffer.clear();
+                // Unlike `a`/`A`/`I` (which all recompute the target column
+                // from the line's content), plain single-cursor `i` inserts
+                // at whatever column the cursor already holds. Real Vim's
+                // main loop revalidates the cursor against the Normal-mode
+                // end-of-line column before dispatching every command;
+                // vimcode has no equivalent per-keystroke revalidation, so
+                // if the cursor is ever sitting one column past the last
+                // char while still nominally in Normal mode, `i` would
+                // insert there instead of at the last valid column -- which
+                // then lets `<C-w>` delete one word too many (confirmed
+                // against Neovim, #1003 "dot:i<C-w> ."). Gated on
+                // `extra_cursors.is_empty()`: vimcode's VSCode-style
+                // multi-cursor mode has no Vim oracle and deliberately
+                // allows a cursor to sit at end-of-line (see
+                // `test_multi_cursor_tab_advances_to_each_cursors_own_next_tabstop`),
+                // so this clamp must not touch that path.
+                if self.view().extra_cursors.is_empty() {
+                    self.clamp_cursor_col();
+                }
                 self.set_mode(Mode::Insert);
             }
             Some('a') => {
@@ -3602,6 +3621,21 @@ impl Engine {
             if is_doubled {
                 let count = self.take_count();
                 let line = self.view().cursor.line;
+                // `{count}>>`/`{count}<<`'s count works like a downward
+                // linewise motion of `count - 1` lines from the cursor: it
+                // clamps at the buffer's end the same way `j` does when
+                // there's still *some* room to move (confirmed against
+                // Neovim: `5>>` on a 2-line buffer shifts both lines, not an
+                // error, "misc:5>>") -- but it aborts the whole command,
+                // shifting nothing, when the cursor is already sitting on
+                // the very last line and asks for more than one line,
+                // because then that motion can't move at all (confirmed
+                // against Neovim: `2>>` on a one-line buffer, or on the last
+                // line of any buffer, shifts nothing; #1003 "dot:>> 2.").
+                let last_line = self.buffer().len_lines().saturating_sub(1);
+                if count > 1 && line >= last_line {
+                    return EngineAction::None;
+                }
                 if operator == '>' {
                     self.indent_lines(line, count, changed, true);
                 } else {

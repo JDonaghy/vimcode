@@ -10014,6 +10014,111 @@ fn test_indent_dot_repeat() {
     );
 }
 
+// ─── #1003: `{count}>>`/`{count}<<`'s count behaves like a downward linewise
+// motion of `count - 1` lines: it clamps at the buffer's end when the cursor
+// can still move down *at all* (matching `j`), but aborts the whole command
+// -- shifting nothing -- when the cursor is already on the last line and
+// asks for more than one line, because then that motion can't move at all.
+// Both directions confirmed against Neovim. ─────────────────────────────────
+
+#[test]
+fn test_shift_right_count_exceeding_lines_on_last_line_aborts() {
+    // `2>>` on a one-line buffer: the cursor's only line IS the last line,
+    // so the implied one-line downward motion can't happen -- the whole
+    // command fails, nothing shifts, cursor stays put. Before this fix
+    // vimcode clamped the count down to the single available line and
+    // indented it anyway.
+    let mut e = engine_with_text("a\n");
+    let cursor_before = e.view().cursor;
+    press_char(&mut e, '2');
+    press_char(&mut e, '>');
+    press_char(&mut e, '>');
+    assert_eq!(
+        e.buffer().to_string(),
+        "a\n",
+        "2>> on a 1-line buffer must abort -- the buffer must stay byte-identical"
+    );
+    assert_eq!(
+        e.view().cursor,
+        cursor_before,
+        "an aborted >> must not move the cursor"
+    );
+}
+
+#[test]
+fn test_shift_right_count_exceeding_lines_on_last_line_of_multiline_buffer_aborts() {
+    // Same abort, but the "last line" is the second of a 2-line buffer, with
+    // the cursor moved onto it first: `2>>` from there must also abort even
+    // though the buffer as a whole has more than one line.
+    let mut e = engine_with_text("a\nb\n");
+    press_char(&mut e, 'j'); // move onto the last line
+    let cursor_before = e.view().cursor;
+    press_char(&mut e, '2');
+    press_char(&mut e, '>');
+    press_char(&mut e, '>');
+    assert_eq!(
+        e.buffer().to_string(),
+        "a\nb\n",
+        "2>> from the last line must abort -- nothing shifts"
+    );
+    assert_eq!(e.view().cursor, cursor_before);
+}
+
+#[test]
+fn test_shift_right_count_exceeding_lines_from_non_last_line_clamps() {
+    // Contrast case, confirmed against Neovim ("misc:5>>"): when the cursor
+    // is NOT already on the last line, a count that overshoots the buffer's
+    // end does not abort -- it clamps and shifts every line through the end,
+    // the same way a `5j` from line 1 of a 2-line buffer just lands on line
+    // 2 instead of failing. `5>>` from the first line of a 2-line buffer
+    // shifts both lines.
+    let mut e = engine_with_text("a\nb\n");
+    press_char(&mut e, '5');
+    press_char(&mut e, '>');
+    press_char(&mut e, '>');
+    assert_eq!(
+        e.buffer().to_string(),
+        "    a\n    b\n",
+        "5>> from a non-last line should clamp and shift through the buffer's end"
+    );
+}
+
+#[test]
+fn test_shift_left_count_exceeding_lines_on_last_line_aborts() {
+    // The abort applies symmetrically to `<<` (dedent), not just `>>`.
+    let mut e = engine_with_text("    a\n");
+    let cursor_before = e.view().cursor;
+    press_char(&mut e, '2');
+    press_char(&mut e, '<');
+    press_char(&mut e, '<');
+    assert_eq!(
+        e.buffer().to_string(),
+        "    a\n",
+        "2<< on a 1-line buffer must abort -- the buffer must stay byte-identical"
+    );
+    assert_eq!(e.view().cursor, cursor_before);
+}
+
+#[test]
+fn test_shift_right_count_within_lines_still_works() {
+    // The abort must not regress a count that's actually satisfiable: `1>>`
+    // and a bare `>>` on a 1-line buffer both still indent normally.
+    let mut e = engine_with_text("a\n");
+    press_char(&mut e, '1');
+    press_char(&mut e, '>');
+    press_char(&mut e, '>');
+    assert_eq!(e.buffer().to_string(), "    a\n", "1>> should indent");
+
+    let mut e2 = engine_with_text("a\n");
+    press_char(&mut e2, '>');
+    press_char(&mut e2, '>');
+    assert_eq!(
+        e2.buffer().to_string(),
+        "    a\n",
+        "a bare >> (implicit count 1) should indent"
+    );
+}
+
 #[test]
 fn test_visual_indent() {
     let mut engine = Engine::new();
@@ -15736,9 +15841,15 @@ fn test_multi_cursor_tab_records_one_insert_fragment_not_one_per_cursor() {
 
     // Replay it where a real user would notice: insert-mode <C-a> re-inserts
     // `last_inserted_text` verbatim (same buffer the "." register and
-    // count-prefixed inserts replay).
-    engine.view_mut().cursor = Cursor { line: 2, col: 1 };
-    engine.handle_key("i", Some('i'), false);
+    // count-prefixed inserts replay). Uses `A` (not a raw past-eol cursor +
+    // `i`) to reach "end of line, about to insert" -- #1003 made plain `i`
+    // clamp a single-cursor Normal-mode column that's already past the last
+    // char, so a manually-placed col 1 on the 1-char "Z" would now land
+    // before 'Z' instead of after it; `A` reaches the same end-of-line
+    // insert point the way real Vim does, regardless of the cursor's prior
+    // column.
+    engine.view_mut().cursor = Cursor { line: 2, col: 0 };
+    engine.handle_key("A", Some('A'), false);
     engine.handle_key("a", Some('a'), true);
     engine.handle_key("Escape", None, false);
 
@@ -27790,6 +27901,29 @@ fn test_nvim_insert_ctrl_w_at_line_start() {
     engine.update_syntax();
     engine.feed_keys("i<C-w><Esc>");
     assert_eq!(engine.buffer().to_string(), "hello\n");
+}
+
+#[test]
+fn test_nvim_insert_i_clamps_past_eol_cursor_before_ctrl_w() {
+    // #1003 ("dot:i<C-w> ."): the cursor can end up sitting one column past
+    // the last character while nominally still in Normal mode (only
+    // reachable via direct placement -- e.g. this test's raw `cursor.col`
+    // write below, matching how the nvim-conformance harness positions the
+    // cursor with `nvim_win_set_cursor`-equivalent semantics before the
+    // first keystroke). Pressing `i` there must still insert *before* the
+    // last valid column, not at the invalid past-eol one. Before this fix,
+    // vimcode's `i` handler used the raw (unclamped) column as-is, so
+    // `<C-w>` deleted the whole trailing word ("cd") instead of just its
+    // last fragment ("c") -- confirmed against Neovim, which deletes only
+    // "c" and leaves "d" behind.
+    let mut e = engine_with_text("ab cd\n");
+    e.view_mut().cursor.col = 5; // one past 'd' -- invalid for Normal mode
+    e.feed_keys("i<C-w>X<Esc>");
+    assert_eq!(
+        e.buffer().to_string(),
+        "ab Xd\n",
+        "<C-w> after a clamped `i` should delete just \"c\", leaving \"d\" after the insert"
+    );
 }
 
 // ── Phase 4 Batch 12: Search, scroll, increment, replace ────────────────
