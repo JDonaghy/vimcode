@@ -15747,6 +15747,58 @@ mod tests {
         );
     }
 
+    /// #1004: `/\(foo\)\1` back-references the text captured by an earlier
+    /// `\(…\)` group *in the same search pattern* — Vim lands the cursor on
+    /// "foofoo", not on the lone "foo" that only satisfies the `\(foo\)`
+    /// half. Drives the real event pipeline (`/`, the pattern, Enter) rather
+    /// than calling `Engine::execute`/`search_fwd` directly, and reads the
+    /// painted screen: the command line renders `engine.message` verbatim
+    /// (established by `render_content_paints_command_line_via_shell_app`
+    /// above), so `"match 1 of 1"` appearing there proves the search-count
+    /// indicator agrees the pattern matched — and following up with `x`
+    /// proves *where*: deleting under the cursor removes the leading `f` of
+    /// the second "foo", painting "foo oofoo bar". A cursor left on the
+    /// first "foo" (the old rejected-pattern behavior, or a fallback to
+    /// literal matching) would instead delete from column 0 and paint
+    /// "oo foofoo bar".
+    ///
+    /// **Verified RED against unfixed `develop`:** back-references were
+    /// rejected as untranslatable, so the search failed outright — the
+    /// command line painted a "Pattern not found" / rejection message
+    /// instead of "match 1 of 1", and `x` had no match to land on.
+    #[test]
+    fn search_pattern_backreference_lands_on_the_repeated_text_via_shell_app() {
+        let mut app = TuiShellApp::new_for_test();
+        app.engine.buffer_mut().insert(0, "foo foofoo bar");
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        driver.press_named(quadraui::NamedKey::Escape);
+        driver.render();
+
+        driver.type_char('/');
+        for c in "\\(foo\\)\\1".chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
+        driver.render();
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("match 1 of 1"),
+            "the backref pattern has exactly one match (\"foofoo\"), so the \
+             search-count indicator must say so; screen:\n{screen}"
+        );
+
+        driver.type_char('x');
+        driver.render();
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("foo oofoo bar"),
+            "the cursor must land on the second \"foo\" (start of the \
+             \"foofoo\" match), so x deletes its leading 'f'; screen:\n{screen}"
+        );
+    }
+
     /// The editor context menu's "Go to Definition" row advertises a key
     /// that actually invokes the language server. Since #889 gave `gd` back
     /// to Vim's local-declaration motion, that key is the tag jump

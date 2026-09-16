@@ -1021,7 +1021,7 @@ mod tests {
     }
 
     #[test]
-    fn backref_to_zero_fails_rather_than_panics() {
+    fn backref_to_zero_translates_to_a_literal_digit() {
         // `\0` is not a valid pattern-atom backreference in Vim (only `:s`
         // replacement text gives `\0` that meaning) — it must not panic.
         // Falls back to the existing "unrecognised escape → literal char" rule.
