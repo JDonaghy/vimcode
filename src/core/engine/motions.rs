@@ -3578,16 +3578,17 @@ impl Engine {
 
     /// `<C-b>`: scroll a full page backward, keeping a 2-line overlap with
     /// the previous page. Mirrors `<C-f>`, with two differences confirmed
-    /// against real interactive Neovim (#805; see
-    /// `scripts/nvim_headless_vs_interactive_repro.sh` — the headless
-    /// oracle `tests/nvim_conformance.rs` uses disagrees with real Neovim
-    /// on both):
+    /// against real interactive Neovim (#805, #1008; see
+    /// `scripts/nvim_headless_vs_interactive_repro.sh` and #1008's
+    /// attached-UI RPC oracle in `tests/nvim_conformance.rs`):
     ///  - already at the top of the buffer is a true no-op (no cursor
     ///    move at all), not just a clamped scroll;
-    ///  - the cursor lands on `scrolloff + 1` lines below the *previous*
-    ///    topline — not at the bottom of the new page — which only
-    ///    coincides with "bottom of the new page" when the scroll isn't
-    ///    clamped by the start of the buffer.
+    ///  - the cursor lands on the **last line of the new window**
+    ///    (`w_botline - 1`, minus `scrolloff`), not a fixed offset from
+    ///    the previous topline. The two forms agree whenever a whole page
+    ///    is actually scrolled, and only diverge when the scroll is
+    ///    clamped by the start of the buffer — see the in-body comment
+    ///    below for the measured numbers.
     pub(crate) fn page_up(&mut self) {
         let old_top = self.view().scroll_top;
         if old_top == 0 {

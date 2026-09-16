@@ -4445,8 +4445,8 @@ const CASES_SCROLL: &[Case] = &[
     // second `<C-b>` cannot scroll a whole page (it clamps at the top of the
     // buffer), which is exactly where "cursor to the last line of the new
     // window" stops agreeing with "cursor to a fixed offset from the old
-    // window" — see `page_up` in `src/core/engine/motions.rs`. The three
-    // two below pin the clamped form; the unclamped one is `scroll:C-b`
+    // window" — see `page_up` in `src/core/engine/motions.rs`. The two
+    // below pin the clamped form; the unclamped one is `scroll:C-b`
     // above, which passed before and still does.
     c("scroll:2<C-b>", LONG, 60, 1, "2<C-b>"),
     c("scroll:3<C-b> clamped at top", LONG, 60, 1, "3<C-b>"),
