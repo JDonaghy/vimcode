@@ -5725,6 +5725,265 @@ mod tests {
         );
     }
 
+    /// #1001: with `'smarttab'` on (Neovim's default, which vimcode's
+    /// existing #804 Tab/BS behavior already matched before this option
+    /// existed), `<Tab>` in front of a line (nothing but blanks before the
+    /// cursor) advances by `'shiftwidth'`, not `'tabstop'`. With
+    /// `'smarttab'` off, it always uses `'tabstop'`, even in front of the
+    /// line. The engine-side tests in `engine::tests`
+    /// (`test_smarttab_on_tab_at_front_uses_shiftwidth` /
+    /// `test_smarttab_off_tab_at_front_uses_tabstop`) drive a raw `Engine`
+    /// and poke `engine.settings.smarttab` directly, asserting on
+    /// `engine.buffer()` — none of them render a frame or exercise the
+    /// `:set`/`SETTING_DEFS` wiring added in `settings.rs` (the `"sta"`
+    /// abbreviation, the `SettingDef` entry), the same gap
+    /// `joinspaces_setting_makes_j_insert_two_spaces_after_period_via_shell_app`
+    /// was added to close for `'joinspaces'` (#1000). This types `:set
+    /// nosmarttab` through the driver's real command line, drives `<Tab>`,
+    /// and asserts the *rendered* column the fixture line moves to via
+    /// `find_bounds` — never a hardcoded coordinate, never the buffer
+    /// string, per CLAUDE.md's #587/#592 rule.
+    ///
+    /// **Verified RED against unfixed `develop`:** temporarily dropping the
+    /// `self.settings.smarttab &&` guard from the `front_of_line`
+    /// computation in `keys.rs` (restoring the old unconditional #804 rule)
+    /// made the "off" half of this test fail — `<Tab>` still advanced by
+    /// `'shiftwidth'` (4) after `:set nosmarttab`, so `off_col - margin`
+    /// was `4.0`, not the expected `8.0` — before restoring the guard.
+    #[test]
+    fn smarttab_setting_changes_tab_indent_width_via_shell_app() {
+        let mut app = TuiShellApp::new_for_test();
+        assert!(
+            app.engine.settings.smarttab,
+            "precondition: smarttab defaults on"
+        );
+        app.engine.settings.tabstop = 8;
+        app.engine.settings.shift_width = 4;
+        app.engine.settings.expand_tab = true;
+        app.engine.buffer_mut().insert(0, "ZQXW1001T_MARK\n");
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        driver.press_named(quadraui::NamedKey::Escape);
+        driver.render();
+
+        let margin = driver
+            .find_bounds("ZQXW1001T_MARK")
+            .expect("the fixture line should be painted before <Tab>")
+            .x;
+
+        driver.type_char('i');
+        driver.press_named(quadraui::NamedKey::Tab);
+        driver.press_named(quadraui::NamedKey::Escape);
+        driver.render();
+
+        let on_col = driver
+            .find_bounds("ZQXW1001T_MARK")
+            .expect("the marker should still be painted after <Tab>")
+            .x;
+        assert_eq!(
+            on_col - margin,
+            4.0,
+            "smarttab on (the default) must indent <Tab> at the front of \
+             the line by 'shiftwidth' (4), not 'tabstop' (8); marker moved \
+             from column {margin} to {on_col}; screen:\n{}",
+            driver.screen()
+        );
+
+        // Undo the Tab, then flip 'smarttab' off through the real command
+        // line and repeat.
+        driver.type_char('u');
+        driver.render();
+        driver.type_char('0');
+        driver.render();
+
+        for c in ":set nosmarttab".chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
+        driver.render();
+
+        driver.type_char('i');
+        driver.press_named(quadraui::NamedKey::Tab);
+        driver.press_named(quadraui::NamedKey::Escape);
+        driver.render();
+
+        let off_col = driver
+            .find_bounds("ZQXW1001T_MARK")
+            .expect("the marker should still be painted after the second <Tab>")
+            .x;
+        assert_eq!(
+            off_col - margin,
+            8.0,
+            "with 'smarttab' off, <Tab> at the front of the line must \
+             indent by 'tabstop' (8), not 'shiftwidth' (4); marker moved \
+             from column {margin} to {off_col}; screen:\n{}",
+            driver.screen()
+        );
+    }
+
+    /// #1001: with `'smarttab'` on (the default), `<BS>` over leading
+    /// whitespace removes a whole `'shiftwidth'` worth of blanks (rounded
+    /// to the previous stop) instead of one character at a time. With
+    /// `'smarttab'` off, `<BS>` always removes exactly one character, same
+    /// as anywhere else in the line. Mirrors
+    /// `smarttab_setting_changes_tab_indent_width_via_shell_app` above but
+    /// for the `<BS>` half of `:h 'smarttab'`, and the engine-side
+    /// `test_smarttab_on_backspace_over_indent_removes_shiftwidth` /
+    /// `test_smarttab_off_backspace_over_indent_removes_one_char` pair —
+    /// this drives the real `:set` command line and asserts the *rendered*
+    /// column via `find_bounds`, closing the same driver-tier gap.
+    ///
+    /// **Verified RED against unfixed `develop`:** temporarily dropping the
+    /// `self.settings.smarttab &&` guard from the `leading_blanks`
+    /// computation in `keys.rs` made the "off" half of this test fail —
+    /// `<BS>` still removed the full 4-space indent (rounding to
+    /// `'shiftwidth'`) after `:set nosmarttab`, instead of just one
+    /// character, so `margin - off_col` was `4.0`, not the expected `1.0` —
+    /// before restoring the guard.
+    #[test]
+    fn smarttab_setting_changes_backspace_indent_width_via_shell_app() {
+        let mut app = TuiShellApp::new_for_test();
+        assert!(
+            app.engine.settings.smarttab,
+            "precondition: smarttab defaults on"
+        );
+        app.engine.settings.expand_tab = true;
+        app.engine.settings.shift_width = 8; // wider than the 4-space indent below
+        app.engine.buffer_mut().insert(0, "    ZQXW1001B_MARK\n");
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        driver.press_named(quadraui::NamedKey::Escape);
+        driver.render();
+
+        let margin = driver
+            .find_bounds("ZQXW1001B_MARK")
+            .expect("the fixture line should be painted before <BS>")
+            .x;
+
+        driver.type_char('^'); // to the first non-blank, i.e. right after the indent
+        driver.type_char('i');
+        driver.press_named(quadraui::NamedKey::Backspace);
+        driver.press_named(quadraui::NamedKey::Escape);
+        driver.render();
+
+        let on_col = driver
+            .find_bounds("ZQXW1001B_MARK")
+            .expect("the marker should still be painted after <BS>")
+            .x;
+        assert_eq!(
+            margin - on_col,
+            4.0,
+            "smarttab on (the default) must delete the whole 4-space indent \
+             (rounded to 'shiftwidth' 8) on a single <BS>; marker moved from \
+             column {margin} to {on_col}; screen:\n{}",
+            driver.screen()
+        );
+
+        // Undo the BS, then flip 'smarttab' off through the real command
+        // line and repeat.
+        driver.type_char('u');
+        driver.render();
+
+        for c in ":set nosmarttab".chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
+        driver.render();
+
+        driver.type_char('^');
+        driver.type_char('i');
+        driver.press_named(quadraui::NamedKey::Backspace);
+        driver.press_named(quadraui::NamedKey::Escape);
+        driver.render();
+
+        let off_col = driver
+            .find_bounds("ZQXW1001B_MARK")
+            .expect("the marker should still be painted after the second <BS>")
+            .x;
+        assert_eq!(
+            margin - off_col,
+            1.0,
+            "with 'smarttab' off, <BS> over leading whitespace must delete \
+             exactly one character; marker moved from column {margin} to \
+             {off_col}; screen:\n{}",
+            driver.screen()
+        );
+    }
+
+    /// #1001: `'nrformats'` controls which numeral formats `<C-a>`/`<C-x>`
+    /// recognize besides plain decimal. Default (`bin,hex`, matching
+    /// Neovim) does not include `octal`, so a leading-zero run like `007`
+    /// is read as decimal (`<C-a>` gives `008`); adding `octal` makes the
+    /// same `007` read as octal 7 (`<C-a>` gives `010`). The engine-side
+    /// `test_nrformats_default_does_not_recognize_octal` /
+    /// `test_nrformats_octal_increments_as_octal` pair pokes
+    /// `engine.settings.nrformats` directly and asserts on
+    /// `engine.buffer()` — this types `:set nrformats=bin,octal,hex`
+    /// through the driver's real command line (exercising the `"nf"`
+    /// abbreviation and the list-valued parser added in `settings.rs`) and
+    /// asserts on the *rendered* screen, closing the same driver-tier gap
+    /// as the two tests above.
+    ///
+    /// **Verified RED against unfixed `develop`:** temporarily reverting
+    /// the `addsub_on_line` call site in `motions.rs` to its pre-#1001
+    /// hardcoded `NrFormats::default()` (ignoring `self.settings.nrformats`
+    /// entirely) made the "octal" half of this test fail — `<C-a>` on `007`
+    /// still painted `ZQXWNRFMT_008` after `:set nrformats=bin,octal,hex`,
+    /// never `ZQXWNRFMT_010` — before restoring the fix.
+    #[test]
+    fn nrformats_setting_makes_ctrl_a_treat_leading_zeros_as_octal_via_shell_app() {
+        let mut app = TuiShellApp::new_for_test();
+        assert_eq!(
+            app.engine.settings.nrformats,
+            vec!["bin".to_string(), "hex".to_string()],
+            "precondition: nrformats defaults to bin,hex (no octal)"
+        );
+        app.engine.buffer_mut().insert(0, "ZQXWNRFMT_007\n");
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        driver.press_named(quadraui::NamedKey::Escape);
+        driver.render();
+
+        driver.type_char('0');
+        driver.ctrl_char('a');
+        driver.render();
+
+        let off_screen = driver.screen();
+        assert!(
+            off_screen.contains("ZQXWNRFMT_008"),
+            "default nrformats (no octal) must treat 007 as decimal, so \
+             <C-a> must give 008; screen:\n{off_screen}"
+        );
+        assert!(
+            !off_screen.contains("ZQXWNRFMT_010"),
+            "default nrformats must not treat 007 as octal; screen:\n{off_screen}"
+        );
+
+        // Undo the increment, then add 'octal' to 'nrformats' through the
+        // real command line and repeat.
+        driver.type_char('u');
+        driver.render();
+
+        for c in ":set nrformats=bin,octal,hex".chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
+        driver.render();
+
+        driver.type_char('0');
+        driver.ctrl_char('a');
+        driver.render();
+
+        let on_screen = driver.screen();
+        assert!(
+            on_screen.contains("ZQXWNRFMT_010"),
+            "with 'octal' added to nrformats, <C-a> on 007 must treat it as \
+             octal 7 and give 010; screen:\n{on_screen}"
+        );
+        assert!(
+            !on_screen.contains("ZQXWNRFMT_008"),
+            "with 'octal' in nrformats, 007 must not be read as decimal; \
+             screen:\n{on_screen}"
+        );
+    }
+
     /// #882: `2cc` changes exactly the two lines the count names, not just
     /// the first one. Verified against `nvim --headless -u NONE` (0.12.5) as
     /// the `tests/nvim_conformance.rs` oracle case "op:2cc".
