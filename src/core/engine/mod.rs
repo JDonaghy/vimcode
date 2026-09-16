@@ -2781,7 +2781,10 @@ pub struct Engine {
     /// Flat selection index across all SC sections (staged/unstaged/worktrees).
     pub sc_selected: usize,
     /// Which sections are expanded: [staged, unstaged, worktrees, log].
-    pub sc_sections_expanded: [bool; 4],
+    /// Expand/collapse state per SC section, indexed by the
+    /// `SC_SECTION_*` constants (0=merge, 1=staged, 2=changes,
+    /// 3=worktrees, 4=log — #991 inserted MERGE CHANGES at the front).
+    pub sc_sections_expanded: [bool; SC_SECTION_COUNT],
     /// Whether the Source Control panel currently has keyboard focus.
     pub sc_has_focus: bool,
     /// quadraui SidebarSystem — owns SC sidebar (4 sections: Staged Changes,
@@ -3109,6 +3112,11 @@ pub struct Engine {
     pub debug_button_pressed: Option<usize>,
     /// True while a DAP debug session is active.
     pub dap_session_active: bool,
+
+    // --- ACP (Agent Client Protocol) state (#951, ACP-0 — transport only, no UI) ---
+    /// The live ACP agent subprocess + session, if one has been started.
+    /// `None` until a later slice starts one; `poll_acp` is a no-op then.
+    pub acp_client: Option<crate::core::acp::AcpClient>,
 
     // --- DAP (Debug Adapter Protocol) state ---
     /// Multi-adapter DAP coordinator. None until first debug session is started.
@@ -3919,10 +3927,14 @@ impl Engine {
             sc_file_statuses: Vec::new(),
             sc_worktrees: Vec::new(),
             sc_selected: 0,
-            sc_sections_expanded: [true, true, true, true],
+            sc_sections_expanded: [true; SC_SECTION_COUNT],
             sc_has_focus: false,
             sc_sidebar_system: {
+                // Order matters — it is the painted order, and the
+                // `SC_SECTION_*` constants index it. MERGE CHANGES sits
+                // above STAGED CHANGES, matching VS Code (#991).
                 let mut s = quadraui::SidebarSystem::new(vec![
+                    quadraui::SidebarSectionDef::new("merge", "MERGE CHANGES"),
                     quadraui::SidebarSectionDef::new("staged", "STAGED CHANGES"),
                     quadraui::SidebarSectionDef::new("changes", "CHANGES"),
                     quadraui::SidebarSectionDef::new("worktrees", "WORKTREES"),
@@ -4052,6 +4064,7 @@ impl Engine {
             debug_button_hovered: None,
             debug_button_pressed: None,
             dap_session_active: false,
+            acp_client: None,
             dap_manager: None,
             dap_stopped_thread: None,
             dap_breakpoints: HashMap::new(),
@@ -4414,6 +4427,7 @@ impl Engine {
         redraw |= self.flush_cursor_move_hook();
         self.lsp_flush_changes();
         redraw |= self.poll_lsp();
+        redraw |= self.poll_acp();
         if self.poll_project_search() {
             self.search_switch_to_results();
             redraw = true;
@@ -5114,6 +5128,7 @@ pub(crate) fn diff_state_from_hunks(
 }
 
 mod accessors;
+mod acp_ops;
 mod buffers;
 mod dap_ops;
 pub use dap_ops::DEBUG_BUTTON_IDS;
@@ -5134,6 +5149,10 @@ pub mod sidebar;
 mod source_control;
 pub use source_control::ScKeyResult;
 pub use source_control::SC_BUTTON_IDS;
+pub use source_control::{
+    SC_SECTION_CHANGES, SC_SECTION_COUNT, SC_SECTION_LOG, SC_SECTION_MERGE, SC_SECTION_STAGED,
+    SC_SECTION_WORKTREES,
+};
 mod spell_ops;
 mod terminal_ops;
 mod visual;

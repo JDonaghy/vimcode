@@ -233,7 +233,13 @@ impl Engine {
         let repo_root = git::find_repo_root(&self.cwd);
         if let Some(ref root) = repo_root {
             for fs in &self.sc_file_statuses {
-                let kind = fs.unstaged.or(fs.staged);
+                // #991: a conflicted path carries neither side, so without
+                // the `unmerged` arm it got no explorer badge at all.
+                let kind = fs
+                    .unmerged
+                    .map(|_| git::StatusKind::Unmerged)
+                    .or(fs.unstaged)
+                    .or(fs.staged);
                 if let Some(k) = kind {
                     let abs = root.join(&fs.path);
                     let canon = abs.canonicalize().unwrap_or(abs);
@@ -550,12 +556,15 @@ impl Engine {
 
     /// If `line` falls inside a fold body, snap to the fold header (start).
     pub(crate) fn snap_scroll_top(folds: &[FoldRegion], line: usize) -> usize {
-        for f in folds {
-            if line > f.start && line <= f.end {
-                return f.start;
-            }
-        }
-        line
+        // Nested closed folds can both contain `line` (#1006) — snap to the
+        // outermost (smallest `start`), the one actually visible at the top
+        // of the viewport, not just whichever entry comes first.
+        folds
+            .iter()
+            .filter(|f| line > f.start && line <= f.end)
+            .map(|f| f.start)
+            .min()
+            .unwrap_or(line)
     }
 
     /// Set scroll_left for a specific window without changing the active window.

@@ -81,6 +81,19 @@ impl Engine {
             return EngineAction::ToggleTerminalMaximize;
         }
 
+        // Handle :CheckNerdFonts (issue #999) — TUI-discoverability command:
+        // paint a sample row of nerd-font glyphs next to their ASCII
+        // fallbacks and let the user say which one actually rendered,
+        // persisting the answer as an explicit `use_nerd_fonts` override.
+        // Platform-neutral: the dialog it opens is the same generic
+        // `Engine::dialog` system every other confirm dialog uses (both
+        // backends already render/key-handle it), so there is nothing
+        // backend-specific to add here or on either backend's side.
+        if cmd == "CheckNerdFonts" {
+            self.show_check_nerd_fonts_dialog();
+            return EngineAction::None;
+        }
+
         // Handle workspace / folder commands (both user-typed names and menu action strings)
         if cmd == "OpenFolder" || cmd == "open_folder_dialog" {
             return EngineAction::OpenFolderDialog;
@@ -2536,7 +2549,7 @@ impl Engine {
             }
             let line_text: String = self.buffer().content.line(line_idx).chars().collect();
             let line_text = line_text.trim_end_matches('\n');
-            let matches = compiled.regex.is_match(line_text);
+            let matches = compiled.is_match(line_text);
             if matches != invert {
                 matching.push(line_idx);
             }
@@ -2678,7 +2691,7 @@ impl Engine {
         // the pattern doesn't match sorts as the empty key.
         let key_of = |line: &str| -> String {
             match &compiled {
-                Some(compiled) => match compiled.regex.captures(line) {
+                Some(compiled) => match compiled.captures(line) {
                     Some(caps) => {
                         let (s, e) = compiled.span(&caps);
                         if use_match {
@@ -3433,7 +3446,7 @@ impl Engine {
         let mut first_change_pos: Option<usize> = None;
 
         while at <= body.len() {
-            let Some(caps) = compiled.regex.captures_at(body, at) else {
+            let Some(caps) = compiled.captures_at(body, at) else {
                 break;
             };
             let whole = caps.get(0).expect("group 0 always matches");
@@ -3660,10 +3673,7 @@ impl Engine {
     /// (`[1/1]` in the search-count indicator). `captures_iter` has exactly
     /// that semantics, including the advance-one-char rule for empty matches.
     pub(crate) fn collect_match_spans(re: &vim_regex::Compiled, text: &str) -> Vec<(usize, usize)> {
-        re.regex
-            .captures_iter(text)
-            .map(|caps| re.span(&caps))
-            .collect()
+        re.match_spans(text)
     }
 
     pub fn run_search(&mut self) {
@@ -4823,7 +4833,7 @@ enum CaseMode {
 /// differs when `\zs` / `\ze` injected a capture group ahead of it.
 pub(crate) fn expand_replacement<'a>(
     repl: &str,
-    caps: &regex::Captures<'a>,
+    caps: &vim_regex::Captures<'a>,
     group_map: &[usize],
     whole: &'a str,
 ) -> String {

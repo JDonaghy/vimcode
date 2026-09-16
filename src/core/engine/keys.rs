@@ -1174,6 +1174,25 @@ impl Engine {
                 self.insert_repeat_count = self.take_count();
                 self.start_undo_group();
                 self.insert_text_buffer.clear();
+                // Unlike `a`/`A`/`I` (which all recompute the target column
+                // from the line's content), plain single-cursor `i` inserts
+                // at whatever column the cursor already holds. Real Vim's
+                // main loop revalidates the cursor against the Normal-mode
+                // end-of-line column before dispatching every command;
+                // vimcode has no equivalent per-keystroke revalidation, so
+                // if the cursor is ever sitting one column past the last
+                // char while still nominally in Normal mode, `i` would
+                // insert there instead of at the last valid column -- which
+                // then lets `<C-w>` delete one word too many (confirmed
+                // against Neovim, #1003 "dot:i<C-w> ."). Gated on
+                // `extra_cursors.is_empty()`: vimcode's VSCode-style
+                // multi-cursor mode has no Vim oracle and deliberately
+                // allows a cursor to sit at end-of-line (see
+                // `test_multi_cursor_tab_advances_to_each_cursors_own_next_tabstop`),
+                // so this clamp must not touch that path.
+                if self.view().extra_cursors.is_empty() {
+                    self.clamp_cursor_col();
+                }
                 self.set_mode(Mode::Insert);
             }
             Some('a') => {
@@ -1375,8 +1394,10 @@ impl Engine {
                     let char_idx = self.buffer().line_to_char(line) + col;
                     // Calculate how many chars we can actually delete
                     let line_end = self.buffer().line_to_char(line) + content_len;
-                    let available = line_end - char_idx;
-                    let to_delete = count.min(available);
+                    // Counted in cursor cells, not raw codepoints (#1005):
+                    // `x` on a combining-mark cluster deletes the whole
+                    // cluster as one cell, matching `nvim`.
+                    let to_delete = self.cluster_chars_len(char_idx, count, line_end);
 
                     if to_delete > 0 && char_idx < self.buffer().len_chars() {
                         // Save deleted chars to register (characterwise)
@@ -2683,24 +2704,14 @@ impl Engine {
                     }
                 }
                 Some('z') => {
-                    // ]z: move to end of current open fold
+                    // ]z: move to end of current open fold. Uses the
+                    // *defined* fold hierarchy (open or closed), not just
+                    // `folds` (closed only, #1006) — otherwise this never
+                    // finds the open fold it's specifically documented to
+                    // move within (`:h ]z`, verified against `nvim
+                    // --headless`).
                     let line = self.view().cursor.line;
-                    let folds = &self.view().folds;
-                    let mut best = None;
-                    for fold in folds {
-                        if fold.start <= line && fold.end >= line {
-                            match best {
-                                None => best = Some(fold.end),
-                                Some(prev) => {
-                                    // pick the innermost (smallest end)
-                                    if fold.end < prev {
-                                        best = Some(fold.end);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    if let Some(end) = best {
+                    if let Some(end) = self.view().enclosing_fold_def(line).map(|f| f.end) {
                         self.view_mut().cursor.line = end;
                         self.view_mut().cursor.col = 0;
                         self.clamp_cursor_col();
@@ -2776,23 +2787,11 @@ impl Engine {
                     }
                 }
                 Some('z') => {
-                    // [z: move to start of current open fold
+                    // [z: move to start of current open fold — see the `]z`
+                    // comment above for why this uses `enclosing_fold_def`
+                    // rather than `folds` (#1006).
                     let line = self.view().cursor.line;
-                    let folds = &self.view().folds;
-                    let mut best = None;
-                    for fold in folds {
-                        if fold.start <= line && fold.end >= line {
-                            match best {
-                                None => best = Some(fold.start),
-                                Some(prev) => {
-                                    if fold.start > prev {
-                                        best = Some(fold.start);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    if let Some(start) = best {
+                    if let Some(start) = self.view().enclosing_fold_def(line).map(|f| f.start) {
                         self.view_mut().cursor.line = start;
                         self.view_mut().cursor.col = 0;
                         self.clamp_cursor_col();
@@ -3454,6 +3453,27 @@ impl Engine {
     ) -> EngineAction {
         // Handle 'Z' sentinel for zf{motion} — fold creation operator.
         if operator == 'Z' {
+            // zf{a/i}{object} (e.g. `zfap`) — same `i`/`a` text-object
+            // grammar as any other operator (#1006). This branch always
+            // returns before reaching the shared `pending_text_object`
+            // dispatch further down in this function, so both halves of
+            // that grammar (setting it, then consuming it on the next key)
+            // have to be handled right here rather than relying on falling
+            // through — a version that only set `pending_text_object` and
+            // relied on the shared block silently never fired it, because
+            // the very next keypress re-enters this function with
+            // `operator == 'Z'` and hits this `if` again first.
+            if let Some(modifier) = self.pending_text_object.take() {
+                if let Some(obj_type) = unicode {
+                    self.apply_fold_text_object(modifier, obj_type);
+                }
+                return EngineAction::None;
+            }
+            if unicode == Some('i') || unicode == Some('a') {
+                self.pending_text_object = unicode;
+                self.pending_operator = Some('Z');
+                return EngineAction::None;
+            }
             let cursor_line = self.view().cursor.line;
             let total = self.buffer().len_lines();
             let target = match unicode {
@@ -3602,6 +3622,21 @@ impl Engine {
             if is_doubled {
                 let count = self.take_count();
                 let line = self.view().cursor.line;
+                // `{count}>>`/`{count}<<`'s count works like a downward
+                // linewise motion of `count - 1` lines from the cursor: it
+                // clamps at the buffer's end the same way `j` does when
+                // there's still *some* room to move (confirmed against
+                // Neovim: `5>>` on a 2-line buffer shifts both lines, not an
+                // error, "misc:5>>") -- but it aborts the whole command,
+                // shifting nothing, when the cursor is already sitting on
+                // the very last line and asks for more than one line,
+                // because then that motion can't move at all (confirmed
+                // against Neovim: `2>>` on a one-line buffer, or on the last
+                // line of any buffer, shifts nothing; #1003 "dot:>> 2.").
+                let last_line = self.buffer().len_lines().saturating_sub(1);
+                if count > 1 && line >= last_line {
+                    return EngineAction::None;
+                }
                 if operator == '>' {
                     self.indent_lines(line, count, changed, true);
                 } else {
@@ -3759,7 +3794,10 @@ impl Engine {
             // Fall through to common motion match block below
         }
 
-        // Check if we're waiting for a text object type (after 'i' or 'a')
+        // Check if we're waiting for a text object type (after 'i' or 'a').
+        // `operator == 'Z'` never reaches here — see the comment where that
+        // branch handles its own `pending_text_object` at the top of this
+        // function.
         if let Some(modifier) = self.pending_text_object.take() {
             if let Some(obj_type) = unicode {
                 self.apply_operator_text_object(operator, modifier, obj_type, changed);
@@ -4662,6 +4700,20 @@ impl Engine {
         if start_line > end_line {
             return;
         }
+        // A linewise command that touches any part of a closed fold applies
+        // to the fold's entire range (`:h fold-behavior`) — verified
+        // against `nvim --headless`: `dd`/`yy` on a closed fold's header
+        // remove/yank every line inside it, not just the header (#1006).
+        let start_line = self
+            .view()
+            .enclosing_closed_fold(start_line)
+            .map(|f| f.start)
+            .unwrap_or(start_line);
+        let end_line = self
+            .view()
+            .enclosing_closed_fold(end_line)
+            .map(|f| f.end)
+            .unwrap_or(end_line);
         // Force charwise mode: convert line range to char range and redirect
         if self.force_motion_mode == Some('v') {
             self.force_motion_mode = None;
@@ -6574,12 +6626,15 @@ impl Engine {
                     let line_start = self.buffer().line_to_char(line);
                     let leading_blanks = col > 0
                         && self.settings.expand_tab
+                        && self.settings.smarttab
                         && (0..col).all(|i| self.buffer().content.char(line_start + i) == ' ');
                     if leading_blanks {
-                        // `:h smarttab`: backspacing within leading indentation
-                        // removes a whole 'shiftwidth' worth of blanks
-                        // (rounded to the previous stop), not one space at a
-                        // time (#804).
+                        // `:h smarttab`: with 'smarttab' on (checked above),
+                        // backspacing within leading indentation removes a
+                        // whole 'shiftwidth' worth of blanks (rounded to the
+                        // previous stop), not one space at a time (#804).
+                        // Off, a plain one-character BackSpace applies here
+                        // too, via the `col > 0` branch below (#1001).
                         let sw = self.effective_shift_width().max(1);
                         let new_col = ((col - 1) / sw) * sw;
                         self.delete_with_undo(line_start + new_col, char_idx);
@@ -6720,15 +6775,17 @@ impl Engine {
                     let col = self.view().cursor.col;
                     let char_idx = self.buffer().line_to_char(line) + col;
                     if self.settings.expand_tab {
-                        // `:h smarttab`: in front of a line (nothing but
-                        // blanks before the cursor) Tab advances using
-                        // 'shiftwidth'; everywhere else it uses 'tabstop' —
-                        // in both cases advancing to the *next* stop, not
-                        // inserting a fixed count of spaces (#804).
+                        // `:h smarttab`: with 'smarttab' on, in front of a
+                        // line (nothing but blanks before the cursor) Tab
+                        // advances using 'shiftwidth'; everywhere else — and
+                        // always, with 'smarttab' off (#1001) — it uses
+                        // 'tabstop'. In both cases it advances to the *next*
+                        // stop, not a fixed count of spaces (#804).
                         let line_start = self.buffer().line_to_char(line);
-                        let front_of_line = (0..col).all(|i| {
-                            matches!(self.buffer().content.char(line_start + i), ' ' | '\t')
-                        });
+                        let front_of_line = self.settings.smarttab
+                            && (0..col).all(|i| {
+                                matches!(self.buffer().content.char(line_start + i), ' ' | '\t')
+                            });
                         let stop = if front_of_line {
                             self.effective_shift_width().max(1)
                         } else {
@@ -8920,6 +8977,8 @@ impl Engine {
             "scs",
             "startofline",
             "sol",
+            "joinspaces",
+            "js",
             "cursorline",
             "cul",
             "autoread",

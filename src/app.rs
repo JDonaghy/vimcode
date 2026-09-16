@@ -1076,7 +1076,11 @@ impl App {
 
         let mut engine = {
             let mut e = Engine::new();
-            icons::set_nerd_fonts(e.settings.use_nerd_fonts);
+            // #999: record this as a GUI backend *before* resolving
+            // `use_nerd_fonts()` — GUI bundles the icon font, so an unset
+            // setting inherits `true` regardless of OS.
+            icons::set_gui_backend(true);
+            icons::set_nerd_fonts(e.settings.use_nerd_fonts());
             e.startup(file_path.as_deref());
             e
         };
@@ -1192,7 +1196,11 @@ impl App {
 
         let mut engine = {
             let mut e = Engine::new();
-            crate::icons::set_nerd_fonts(e.settings.use_nerd_fonts);
+            // #999: same GUI-backend-then-resolve ordering as `App::new`
+            // above — every non-GTK GUI backend this constructor serves
+            // (macOS, Win-GUI) bundles the icon font too.
+            crate::icons::set_gui_backend(true);
+            crate::icons::set_nerd_fonts(e.settings.use_nerd_fonts());
             e.startup(file_path.as_deref());
             e
         };
@@ -1539,9 +1547,14 @@ impl App {
         engine: Rc<RefCell<Engine>>,
         backend: Rc<RefCell<Box<dyn TextMetricsBackend>>>,
     ) -> Self {
+        // #999: this constructor is the shared headless `App` test seam for
+        // every GUI backend (GTK, and the macOS driver-tier test per this
+        // fn's own doc), so it's a GUI backend for `use_nerd_fonts()`
+        // resolution purposes the same as `App::new`/`App::new_portable`.
+        crate::icons::set_gui_backend(true);
         let (use_nerd_fonts, last_colorscheme) = {
             let e = engine.borrow();
-            (e.settings.use_nerd_fonts, e.settings.colorscheme.clone())
+            (e.settings.use_nerd_fonts(), e.settings.colorscheme.clone())
         };
         // Path-qualified rather than via the `use` at the top of this file —
         // that import is `gui`-gated and this constructor is not (#896).
@@ -3130,6 +3143,23 @@ impl App {
                         .map(|l| l.content_bounds)
                         .unwrap_or(slab_rect);
                     engine.sc_sidebar_body_rect.set(body_rect);
+                    // #971: without this, `sc_sidebar_system.handle_cached`
+                    // returns `Ignored` unconditionally and every
+                    // content-row press (header collapse, row select) is a
+                    // silent no-op — see `render::gui_sidebar_system_metrics`'s
+                    // own doc for the full story. Reads `backend.line_height()`
+                    // directly — not the `lh` parameter above, whose
+                    // `self.cached_line_height.max(backend.line_height())`
+                    // derivation (`render_content`'s own top) can lag behind
+                    // what `backend` reports by the time `render()` a few
+                    // lines down actually reads it — so the metrics
+                    // `handle_cached` hit-tests against can never disagree
+                    // with what this exact `render()` call paints.
+                    let sc_lh = backend.line_height();
+                    engine
+                        .sc_sidebar_system
+                        .borrow_mut()
+                        .set_backend_info(sc_lh, render::gui_sidebar_system_metrics(sc_lh));
                     render::populate_sc_sidebar_system(engine, theme);
                     engine.sc_sidebar_system.borrow().render(backend, body_rect);
 
@@ -3175,6 +3205,7 @@ impl App {
                 }
             }
             PANEL_EXTENSIONS => {
+                Self::refresh_ext_sidebar_metrics(backend, engine);
                 render::populate_ext_sidebar_system(engine);
                 engine.ext_sidebar_body_rect.set(q_sb);
                 engine.ext_sidebar_system.borrow().render(backend, q_sb);
@@ -3188,6 +3219,7 @@ impl App {
             }
             id if id.starts_with("ext:") => {
                 // Extension panel — render via ext_sidebar_system.
+                Self::refresh_ext_sidebar_metrics(backend, engine);
                 render::populate_ext_sidebar_system(engine);
                 engine.ext_sidebar_body_rect.set(q_sb);
                 engine.ext_sidebar_system.borrow().render(backend, q_sb);
@@ -3221,6 +3253,30 @@ impl App {
         // `panel_hover_popup_rect` pinned at its last painted
         // value and `handle_mouse_press` went on arbitrating
         // clicks against a popup that was no longer on screen.
+    }
+
+    /// Re-derive `ext_sidebar_system`'s backend metrics from what `backend`
+    /// is about to paint with (#971).
+    ///
+    /// Without this, `ext_sidebar_system.handle_cached` returns `Ignored`
+    /// unconditionally and every content-row press on the plugin ext panel
+    /// (header collapse, row select) is a silent no-op — see
+    /// `render::gui_sidebar_system_metrics`'s own doc for the full story.
+    /// Reads `backend.line_height()` directly rather than accepting a
+    /// cached `lh` parameter — see the `PANEL_GIT` arm's identical comment
+    /// in [`Self::paint_sidebar_panel_rung`] on why: a cached value can lag
+    /// behind what `backend` reports by the time `render()` actually reads
+    /// it, so the metrics `handle_cached` hit-tests against could disagree
+    /// with what this exact `render()` call paints. Shared by the
+    /// `PANEL_EXTENSIONS` arm and the `id if id.starts_with("ext:")` arm
+    /// above, which were previously two verbatim copies of this same
+    /// four-line snippet.
+    fn refresh_ext_sidebar_metrics(backend: &mut dyn quadraui::Backend, engine: &Engine) {
+        let ext_lh = backend.line_height();
+        engine
+            .ext_sidebar_system
+            .borrow_mut()
+            .set_backend_info(ext_lh, render::gui_sidebar_system_metrics(ext_lh));
     }
 
     /// Compose the editor-anchored popups: completion menu, LSP hover, editor

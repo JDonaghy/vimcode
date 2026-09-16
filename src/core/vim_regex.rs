@@ -66,6 +66,10 @@ pub struct Translation {
     /// (index 0 unused). Only differs from identity when `\zs` / `\ze` injected
     /// a group ahead of a user group.
     pub group_map: Vec<usize>,
+    /// `true` if the pattern contains a `\1`..`\9` backreference, which
+    /// `regex`'s linear-time automaton cannot execute — such a pattern must
+    /// be compiled with `fancy_regex` instead (#1004).
+    pub has_backref: bool,
 }
 
 impl Translation {
@@ -176,7 +180,18 @@ struct Translator<'a> {
     last_sub: &'a str,
     /// True right after `\(`, `\|`, or at pattern start — where `^` is an anchor.
     at_start: bool,
+    /// `true` once a `\1`..`\9` backreference atom has been emitted.
+    has_backref: bool,
 }
+
+/// Placeholder marker for a not-yet-resolved backreference: NUL followed by
+/// the referenced Vim group's ASCII digit. `\zs`/`\ze` insert `(`/`)` into
+/// `out` *after* the whole pattern has been scanned, which can renumber
+/// groups that opened after the injection point — so a backreference can't
+/// be resolved to its final Rust group number until that renumbering is
+/// done. NUL never otherwise appears in translated output (no atom emits
+/// it), so it is safe to use as a private marker byte here.
+const BACKREF_MARK: char = '\u{0}';
 
 impl<'a> Translator<'a> {
     fn peek(&self) -> Option<char> {
@@ -435,10 +450,13 @@ impl<'a> Translator<'a> {
                     'r' => self.out.push_str("\\r"),
                     'e' => self.out.push_str("\\x1b"),
                     '1'..='9' => {
-                        return Err(format!(
-                            "E-vimcode: back-reference \\{n} in a pattern is not supported by \
-                             this regex engine"
-                        ))
+                        // The final Rust group number isn't known until the
+                        // whole pattern has been scanned (`\zs`/`\ze` can
+                        // still renumber groups that open later) — emit a
+                        // placeholder and resolve it in `translate()`.
+                        self.has_backref = true;
+                        self.out.push(BACKREF_MARK);
+                        self.out.push(n);
                     }
                     '&' => {
                         return Err(
@@ -549,6 +567,7 @@ pub fn translate(pattern: &str, magic: Magic, last_sub: &str) -> Result<Translat
         case_override: None,
         last_sub,
         at_start: true,
+        has_backref: false,
     };
     t.run()?;
 
@@ -558,6 +577,7 @@ pub fn translate(pattern: &str, magic: Magic, last_sub: &str) -> Result<Translat
         zs,
         ze,
         case_override,
+        has_backref,
         ..
     } = t;
 
@@ -582,12 +602,103 @@ pub fn translate(pattern: &str, magic: Magic, last_sub: &str) -> Result<Translat
             .collect();
     }
 
+    if has_backref {
+        out = resolve_backref_marks(&out, &group_map);
+    }
+
     Ok(Translation {
         regex: out,
         case_override,
         span_group,
         group_map,
+        has_backref,
     })
+}
+
+/// Replace each deferred `BACKREF_MARK<digit>` placeholder with the Rust
+/// backreference syntax `\N`, where `N` is the Vim group's final Rust group
+/// number — resolved only now that `\zs`/`\ze` renumbering (if any) is known.
+///
+/// A digit outside `group_map`'s range (referencing a group the pattern
+/// never defines) is passed through unmapped; `fancy_regex::Regex::new`
+/// rejects that as `Err(InvalidBackref)` rather than panicking, which is the
+/// desired "fail, don't crash" behaviour for `\0` and undefined groups
+/// (#1004).
+fn resolve_backref_marks(src: &str, group_map: &[usize]) -> String {
+    let mut out = String::with_capacity(src.len());
+    let mut chars = src.chars();
+    while let Some(c) = chars.next() {
+        if c == BACKREF_MARK {
+            let Some(d) = chars.next() else {
+                break;
+            };
+            let vim_n = d.to_digit(10).expect("marker always followed by a digit") as usize;
+            let rust_n = group_map.get(vim_n).copied().unwrap_or(vim_n);
+            out.push('\\');
+            out.push_str(&rust_n.to_string());
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// A single match, uniform across [`CompiledRegex::Fast`]'s `regex::Match`
+/// and [`CompiledRegex::Backref`]'s `fancy_regex::Match` — same shape, two
+/// crates.
+#[derive(Clone, Copy)]
+pub struct CapMatch<'t> {
+    start: usize,
+    end: usize,
+    text: &'t str,
+}
+
+impl<'t> CapMatch<'t> {
+    pub fn start(&self) -> usize {
+        self.start
+    }
+    pub fn end(&self) -> usize {
+        self.end
+    }
+    pub fn as_str(&self) -> &'t str {
+        self.text
+    }
+}
+
+/// One match's capture groups, uniform across the fast/backref engines.
+pub enum Captures<'t> {
+    Fast(regex::Captures<'t>),
+    Backref(fancy_regex::Captures<'t>),
+}
+
+impl<'t> Captures<'t> {
+    pub fn get(&self, i: usize) -> Option<CapMatch<'t>> {
+        match self {
+            Captures::Fast(c) => c.get(i).map(|m| CapMatch {
+                start: m.start(),
+                end: m.end(),
+                text: m.as_str(),
+            }),
+            Captures::Backref(c) => c.get(i).map(|m| CapMatch {
+                start: m.start(),
+                end: m.end(),
+                text: m.as_str(),
+            }),
+        }
+    }
+}
+
+/// The compiled regex backing a [`Compiled`] pattern.
+///
+/// `regex`'s automaton is provably linear-time, which is a permanent design
+/// constraint that rules out backreferences entirely — not a missing
+/// feature to work around. `fancy_regex` layers a backtracking VM on top of
+/// `regex` and is used *only* when the pattern actually contains `\1`..`\9`,
+/// so the common (and hot) case keeps `regex`'s speed and guarantees (#1004).
+#[derive(Debug)]
+pub enum CompiledRegex {
+    Fast(regex::Regex),
+    Backref(fancy_regex::Regex),
 }
 
 /// Translate and compile in one step, applying `'ignorecase'` / `'smartcase'`.
@@ -598,20 +709,67 @@ pub fn translate(pattern: &str, magic: Magic, last_sub: &str) -> Result<Translat
 /// * a `\c` / `\C` in the pattern overrides both.
 #[derive(Debug)]
 pub struct Compiled {
-    pub regex: regex::Regex,
+    pub regex: CompiledRegex,
     pub span_group: Option<usize>,
     pub group_map: Vec<usize>,
 }
 
 impl Compiled {
     /// Byte span the match *reports*, honouring `\zs` / `\ze`.
-    pub fn span(&self, caps: &regex::Captures) -> (usize, usize) {
+    pub fn span(&self, caps: &Captures) -> (usize, usize) {
         match self.span_group.and_then(|g| caps.get(g)) {
             Some(m) => (m.start(), m.end()),
             None => {
                 let m = caps.get(0).expect("group 0 always matches");
                 (m.start(), m.end())
             }
+        }
+    }
+
+    pub fn is_match(&self, text: &str) -> bool {
+        match &self.regex {
+            CompiledRegex::Fast(re) => re.is_match(text),
+            // A catastrophic-backtrack pattern hits fancy_regex's backtrack
+            // limit and returns `Err`; treat that as "no match" rather than
+            // propagating a panic (#1004).
+            CompiledRegex::Backref(re) => re.is_match(text).unwrap_or(false),
+        }
+    }
+
+    pub fn captures<'t>(&self, text: &'t str) -> Option<Captures<'t>> {
+        match &self.regex {
+            CompiledRegex::Fast(re) => re.captures(text).map(Captures::Fast),
+            CompiledRegex::Backref(re) => re.captures(text).ok().flatten().map(Captures::Backref),
+        }
+    }
+
+    /// Captures for the first match starting at-or-after byte offset `at`.
+    pub fn captures_at<'t>(&self, text: &'t str, at: usize) -> Option<Captures<'t>> {
+        match &self.regex {
+            CompiledRegex::Fast(re) => re.captures_at(text, at).map(Captures::Fast),
+            CompiledRegex::Backref(re) => re
+                .captures_from_pos(text, at)
+                .ok()
+                .flatten()
+                .map(Captures::Backref),
+        }
+    }
+
+    /// Every non-overlapping match's *reported* span (honouring `\zs`/`\ze`).
+    ///
+    /// Vim enumerates matches **non-overlapping**: `searchit()` restarts its
+    /// scan at `endpos.col`, so `/o\+` over `fooo` is one match, not three.
+    pub fn match_spans(&self, text: &str) -> Vec<(usize, usize)> {
+        match &self.regex {
+            CompiledRegex::Fast(re) => re
+                .captures_iter(text)
+                .map(|caps| self.span(&Captures::Fast(caps)))
+                .collect(),
+            CompiledRegex::Backref(re) => re
+                .captures_iter(text)
+                .filter_map(|c| c.ok())
+                .map(|caps| self.span(&Captures::Backref(caps)))
+                .collect(),
         }
     }
 }
@@ -633,14 +791,22 @@ pub fn compile(
         None => ignorecase && !(smartcase && smartcase_applies && pat_has_uppercase(pattern)),
     };
     let src = format!("(?m{}){}", if case_insensitive { "i" } else { "" }, t.regex);
-    match regex::Regex::new(&src) {
-        Ok(regex) => Ok(Compiled {
-            regex,
-            span_group: t.span_group,
-            group_map: t.group_map,
-        }),
-        Err(e) => Err(format!("E383: Invalid pattern: {pattern} ({e})")),
-    }
+    let regex = if t.has_backref {
+        match fancy_regex::Regex::new(&src) {
+            Ok(re) => CompiledRegex::Backref(re),
+            Err(e) => return Err(format!("E383: Invalid pattern: {pattern} ({e})")),
+        }
+    } else {
+        match regex::Regex::new(&src) {
+            Ok(re) => CompiledRegex::Fast(re),
+            Err(e) => return Err(format!("E383: Invalid pattern: {pattern} ({e})")),
+        }
+    };
+    Ok(Compiled {
+        regex,
+        span_group: t.span_group,
+        group_map: t.group_map,
+    })
 }
 
 #[cfg(test)]
@@ -802,9 +968,73 @@ mod tests {
     }
 
     #[test]
-    fn backrefs_in_pattern_are_rejected_not_silently_literal() {
-        let err = translate("\\(foo\\)\\1", Magic::Magic, "").unwrap_err();
-        assert!(err.contains("back-reference"), "{err}");
+    fn backrefs_translate_to_rust_backref_syntax() {
+        let t = translate("\\(foo\\)\\1", Magic::Magic, "").unwrap();
+        assert_eq!(t.regex, "(foo)\\1");
+        assert!(t.has_backref);
+    }
+
+    #[test]
+    fn backref_renumbers_with_zs_injected_group() {
+        // `\zs` injects a group ahead of the user's `\(b\)`, shifting its
+        // Rust group number from 1 to 2 — the backreference must follow.
+        // (No `\ze`, so the injected group's close defaults to the pattern's
+        // end and wraps the backref too — that's correct: the reported span
+        // starts at `\zs` and runs to the natural end of the match.)
+        let t = translate("\\zs\\(b\\)\\1", Magic::Magic, "").unwrap();
+        assert_eq!(t.regex, "((b)\\2)");
+        assert_eq!(t.group_map, vec![0, 2]);
+    }
+
+    #[test]
+    fn backref_matches_repeated_text() {
+        // The #1004 oracle case: `/\(foo\)\1` must match "foofoo" — not stop
+        // at the first "foo", and not treat `\1` as a literal "1".
+        let c = compile("\\(foo\\)\\1", false, false, true, "").unwrap();
+        let text = "foo foofoo";
+        let caps = c.captures(text).expect("matches foofoo");
+        let (s, e) = c.span(&caps);
+        assert_eq!(&text[s..e], "foofoo");
+        assert_eq!(s, 4);
+    }
+
+    #[test]
+    fn backref_does_not_match_mismatched_repeat() {
+        let c = compile("\\(foo\\)\\1", false, false, true, "").unwrap();
+        assert!(!c.is_match("foobar"));
+    }
+
+    #[test]
+    fn nested_group_backref() {
+        // `\2` refers to the inner `\(b\)`; requires "ab" immediately
+        // followed by another "b".
+        let c = compile("\\(a\\(b\\)\\)\\2", false, false, true, "").unwrap();
+        assert!(c.is_match("abb"));
+        assert!(!c.is_match("aba"));
+    }
+
+    #[test]
+    fn backref_used_twice() {
+        let c = compile("\\(a\\)\\1\\1", false, false, true, "").unwrap();
+        assert!(c.is_match("aaa"));
+        assert!(!c.is_match("aab"));
+    }
+
+    #[test]
+    fn backref_to_zero_translates_to_a_literal_digit() {
+        // `\0` is not a valid pattern-atom backreference in Vim (only `:s`
+        // replacement text gives `\0` that meaning) — it must not panic.
+        // Falls back to the existing "unrecognised escape → literal char" rule.
+        let t = translate("\\(a\\)\\0", Magic::Magic, "").unwrap();
+        assert_eq!(t.regex, "(a)0");
+        assert!(!t.has_backref);
+    }
+
+    #[test]
+    fn backref_to_undefined_group_fails_rather_than_panics() {
+        // Only one group is defined; `\2` has nothing to refer to.
+        let err = compile("\\(a\\)\\2", false, false, true, "").unwrap_err();
+        assert!(err.contains("Invalid pattern"), "{err}");
     }
 
     #[test]
@@ -831,13 +1061,13 @@ mod tests {
     fn compile_applies_smartcase_only_when_it_applies() {
         // ignorecase + smartcase, lowercase pattern → insensitive
         let c = compile("foo", true, true, true, "").unwrap();
-        assert!(c.regex.is_match("FOO"));
+        assert!(c.is_match("FOO"));
         // uppercase in pattern → sensitive
         let c = compile("Foo", true, true, true, "").unwrap();
-        assert!(!c.regex.is_match("FOO"));
+        assert!(!c.is_match("FOO"));
         // `*` sets smartcase_applies = false → stays insensitive
         let c = compile("Foo", true, true, false, "").unwrap();
-        assert!(c.regex.is_match("FOO"));
+        assert!(c.is_match("FOO"));
     }
 
     #[test]
@@ -849,6 +1079,6 @@ mod tests {
     #[test]
     fn multiline_flag_is_on_so_anchors_are_per_line() {
         let c = compile("^b", false, false, true, "").unwrap();
-        assert!(c.regex.is_match("a\nb"));
+        assert!(c.is_match("a\nb"));
     }
 }

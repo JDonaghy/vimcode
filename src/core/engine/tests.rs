@@ -1184,6 +1184,106 @@ fn test_word_end() {
     assert_eq!(engine.view().cursor.col, 10);
 }
 
+// #1005: `w`/`e`/`b`/`ge` must stop at a transition between the generic
+// ASCII/Latin/Cyrillic "word" class and "wide" (CJK/Hiragana/Katakana/Hangul)
+// word characters, even when nothing separates them — verified against
+// `nvim`: `w` on `foo日本語bar` stops between `foo` and `日本語`. Before this
+// fix, `is_word_char` (Rust's `is_alphanumeric`) treated both as the same
+// class, so `w` skipped straight over the whole line as one word.
+#[test]
+fn test_word_forward_stops_at_cjk_boundary() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "foo日本語bar");
+
+    press_char(&mut engine, 'w');
+    assert_eq!(
+        engine.view().cursor.col,
+        3,
+        "w should stop at the start of the CJK run, not skip past it"
+    );
+
+    press_char(&mut engine, 'w');
+    assert_eq!(
+        engine.view().cursor.col,
+        6,
+        "w should stop at the start of `bar`, leaving the CJK run behind"
+    );
+}
+
+/// Companion case: Cyrillic embedded in an ASCII run is *not* wide, so it
+/// must NOT break the word the way CJK does — `w` skips straight over it,
+/// matching `nvim` on `helloжworld next`.
+#[test]
+fn test_word_forward_does_not_split_on_cyrillic() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "helloжworld next");
+
+    press_char(&mut engine, 'w');
+    assert_eq!(
+        engine.view().cursor.col,
+        12,
+        "Cyrillic is a narrow word char like Latin, so `helloжworld` is one word"
+    );
+}
+
+#[test]
+fn test_word_backward_stops_at_cjk_boundary() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "foo日本語bar");
+    press_char(&mut engine, '$');
+
+    press_char(&mut engine, 'b');
+    assert_eq!(
+        engine.view().cursor.col,
+        6,
+        "b should land at `bar`'s start"
+    );
+
+    press_char(&mut engine, 'b');
+    assert_eq!(
+        engine.view().cursor.col,
+        3,
+        "b should land at the CJK run start"
+    );
+
+    press_char(&mut engine, 'b');
+    assert_eq!(
+        engine.view().cursor.col,
+        0,
+        "b should land at `foo`'s start"
+    );
+}
+
+#[test]
+fn test_word_end_stops_at_cjk_boundary() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "foo日本語bar");
+
+    press_char(&mut engine, 'e');
+    assert_eq!(
+        engine.view().cursor.col,
+        2,
+        "e should stop at the last char of `foo`, not run into the CJK"
+    );
+}
+
+#[test]
+fn test_diw_on_cjk_run_leaves_ascii_neighbors() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "foo日本語bar");
+    engine.view_mut().cursor.col = 3; // on 日
+
+    press_char(&mut engine, 'd');
+    press_char(&mut engine, 'i');
+    press_char(&mut engine, 'w');
+
+    assert_eq!(
+        engine.buffer().to_string(),
+        "foobar",
+        "diw on the CJK run must not delete into the adjoining ASCII words"
+    );
+}
+
 #[test]
 fn test_paragraph_forward_basic() {
     let mut engine = Engine::new();
@@ -6906,17 +7006,29 @@ fn test_fold_close_detects_range() {
     assert!(end >= 3, "end should include indented body");
 }
 
+/// Press `zf3j` — create+close a manual fold spanning the cursor line plus
+/// the next 3 (lines 0-3 from `make_indented_engine`'s header). Vim's
+/// default `'foldmethod'` is `"manual"`, so (#1006) `zc`/`za`/`zR` etc. no
+/// longer invent a fold from indentation the way this suite's fixtures used
+/// to rely on — every test below defines one explicitly first, the way a
+/// real manual-fold session would.
+fn press_zf3j(engine: &mut Engine) {
+    press_char(engine, 'z');
+    press_char(engine, 'f');
+    press_char(engine, '3');
+    press_char(engine, 'j');
+}
+
 #[test]
 fn test_fold_close_and_open() {
     let mut engine = make_indented_engine();
     engine.view_mut().cursor.line = 0;
 
-    // zc — close fold
-    press_char(&mut engine, 'z');
-    press_char(&mut engine, 'c');
+    // zf3j — create+close fold
+    press_zf3j(&mut engine);
     assert!(
         engine.view().fold_at(0).is_some(),
-        "fold should exist after zc"
+        "fold should exist after zf3j"
     );
 
     // zo — open fold
@@ -6932,6 +7044,14 @@ fn test_fold_close_and_open() {
 fn test_fold_toggle_za() {
     let mut engine = make_indented_engine();
     engine.view_mut().cursor.line = 0;
+
+    // Define the fold, then leave it open, so za's own toggle is what's
+    // under test (not fold creation, which 'foldmethod'="manual" reserves
+    // for zf — #1006).
+    press_zf3j(&mut engine);
+    press_char(&mut engine, 'z');
+    press_char(&mut engine, 'o');
+    assert!(engine.view().fold_at(0).is_none(), "reopened before za");
 
     // First za closes the fold
     press_char(&mut engine, 'z');
@@ -6949,8 +7069,7 @@ fn test_fold_open_all_zr() {
     let mut engine = make_indented_engine();
     engine.view_mut().cursor.line = 0;
 
-    press_char(&mut engine, 'z');
-    press_char(&mut engine, 'c');
+    press_zf3j(&mut engine);
     assert!(!engine.view().folds.is_empty(), "should have a fold");
 
     press_char(&mut engine, 'z');
@@ -6964,8 +7083,7 @@ fn test_fold_navigation_skips_hidden_lines() {
     engine.view_mut().cursor.line = 0;
 
     // Close the fold (lines 1-3 become hidden)
-    press_char(&mut engine, 'z');
-    press_char(&mut engine, 'c');
+    press_zf3j(&mut engine);
 
     // j from line 0 should skip to line 4 (first visible line after fold)
     press_char(&mut engine, 'j');
@@ -6987,23 +7105,110 @@ fn test_fold_navigation_skips_hidden_lines() {
 #[test]
 fn test_fold_cursor_clamp_on_close() {
     let mut engine = make_indented_engine();
-    // Put cursor inside what will become the fold body
-    engine.view_mut().cursor.line = 2;
-
-    // Close fold from line 0 — but cursor is on line 2, which is inside.
-    // The fold command detects range from cursor (line 2) not header.
-    // So we place cursor at 0 and close, then move cursor inside and close again.
-
-    // Close from line 0
     engine.view_mut().cursor.line = 0;
+
+    // Define the fold, then reopen it — still defined (#1006) — so a
+    // second zc from inside the body finds it via `enclosing_fold_def`
+    // rather than from the header line.
+    press_zf3j(&mut engine);
+    press_char(&mut engine, 'z');
+    press_char(&mut engine, 'o');
+
+    // Put cursor inside what will become the fold body, then reclose.
+    engine.view_mut().cursor.line = 2;
     press_char(&mut engine, 'z');
     press_char(&mut engine, 'c');
 
-    // Cursor should still be on line 0 (the fold header)
+    // Cursor should be pulled up to line 0 (the fold header), not left
+    // hidden inside the now-closed fold.
     assert_eq!(
         engine.view().cursor.line,
         0,
         "cursor should stay at fold header after zc"
+    );
+}
+
+// ── #1006: fold round-trip + nested-fold regressions ───────────────────────
+//
+// Found while adding oracle-backed fold cases to `tests/nvim_conformance.rs`
+// (#1006). Each fails against unfixed `develop`.
+
+#[test]
+fn test_fold_zfj_zo_zc_roundtrip_on_flat_text() {
+    // Before #1006, `zo` deleted the fold's definition outright, so a `zc`
+    // on text with no indent structure (nothing for `detect_fold_range` to
+    // rediscover) could never reclose it.
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "one\ntwo\nthree\nfour\n");
+    engine.view_mut().cursor.line = 0;
+    engine.feed_keys("zfj");
+    assert!(engine.view().fold_at(0).is_some(), "zfj should close");
+    engine.feed_keys("zo");
+    assert!(engine.view().fold_at(0).is_none(), "zo should open");
+    engine.feed_keys("zc");
+    assert!(
+        engine.view().fold_at(0).is_some(),
+        "zc should reclose the same manual fold (#1006)"
+    );
+    let fold = engine.view().fold_at(0).unwrap();
+    assert_eq!(fold.end, 1, "reclosed fold should span the original range");
+}
+
+#[test]
+fn test_fold_zo_on_outer_leaves_inner_fold_closed() {
+    // Opening an outer fold must not silently drop a nested inner fold's
+    // own closed state. Verified against `nvim --headless`: `foldclosed()`
+    // on the inner range still reports it after `zo` on the outer header.
+    let mut engine = make_indented_engine();
+    engine.view_mut().cursor.line = 1; // "    let x = 1;"
+    engine.feed_keys("zfj"); // inner fold: lines 1-2
+    engine.view_mut().cursor.line = 0;
+    engine.feed_keys("zf3j"); // outer fold: lines 0-3 (nests the inner one)
+    assert!(engine.view().fold_at(0).is_some(), "outer should be closed");
+
+    engine.feed_keys("zo"); // open just the outer fold
+    assert!(
+        engine.view().fold_at(0).is_none(),
+        "outer should now be open"
+    );
+    assert!(
+        engine.view().is_line_hidden(2),
+        "inner fold body should still be hidden"
+    );
+    assert!(
+        engine.view().fold_at(1).is_some(),
+        "inner fold should still show as closed"
+    );
+}
+
+#[test]
+fn test_next_visible_line_skips_outermost_nested_closed_fold() {
+    // `next_visible_line` (feeds `<C-d>`/`<C-e>`/scroll-top snapping) used
+    // to jump past whichever closed fold it found *first* in `folds` —
+    // which, once a fold no longer discards a contained one on close
+    // (#1006), can be the narrower nested fold, landing back inside the
+    // still-closed outer one instead of past it.
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "0\n1\n2\n3\n4\n5\n");
+    engine.view_mut().close_fold(2, 3); // inner
+    engine.view_mut().close_fold(0, 4); // outer, nests the inner one
+    assert_eq!(
+        engine.view().next_visible_line(0, 1, 5),
+        5,
+        "should skip the whole nested closed region, not just the inner fold"
+    );
+}
+
+#[test]
+fn test_prev_visible_line_skips_outermost_nested_closed_fold() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "0\n1\n2\n3\n4\n5\n");
+    engine.view_mut().close_fold(2, 3);
+    engine.view_mut().close_fold(0, 4);
+    assert_eq!(
+        engine.view().prev_visible_line(5, 1),
+        0,
+        "should skip back to the outer header, not the inner fold's start"
     );
 }
 
@@ -9329,6 +9534,171 @@ fn test_join_lines_current_ends_with_space_cursor_on_next_char() {
     nvim_case("a \nb\n", 0, 0, "J", "a b\n", 0, 2);
 }
 
+// ── #1000: 'joinspaces' — J inserts two spaces after '.', '!', '?' ──────
+//
+// All values below (except the two marked otherwise) were verified against
+// real `nvim --headless` (0.12.5), e.g.:
+//   nvim --headless -u NONE -i NONE --cmd "set noswapfile" \
+//     -c "lua vim.o.joinspaces=true" -c "edit in.txt" -c "normal! J" \
+//     -c "lua print(vim.api.nvim_win_get_cursor(0)[2])" -c "write! out.txt" -c qa!
+//
+// | input           | joinspaces | keys | buffer              | cursor col |
+// |-----------------|-----------|------|----------------------|-----------|
+// | "one.\nworld\n" | off       | J    | "one. world\n"       | 4         |
+// | "one!\nworld\n" | off       | J    | "one! world\n"       | 4         |
+// | "one?\nworld\n" | off       | J    | "one? world\n"       | 4         |
+// | "one\nworld\n"  | off       | J    | "one world\n"        | 3         |
+// | "one.\nworld\n" | off       | gJ   | "one.world\n"        | 4         |
+// | "one.\nworld\n" | on        | J    | "one.  world\n"      | 4         |
+// | "one!\nworld\n" | on        | J    | "one!  world\n"      | 4         |
+// | "one?\nworld\n" | on        | J    | "one?  world\n"      | 4         |
+// | "one\nworld\n"  | on        | J    | "one world\n"        | 3         |
+// | "one.\nworld\n" | on        | gJ   | "one.world\n"        | 4         |
+// | "one.\ntwo!\nthree?\n" | on | 3J  | "one.  two!  three?\n" | 10      |
+// | "foo.\n)\n"     | on        | J    | "foo.)\n"            | 4         |
+//
+// "foo. \nbar\n" (current line already ends with a trailing space) is
+// *not* in the table above: real nvim pads that from one space to two
+// ("foo.  bar\n") when 'joinspaces' is on, but issue #1000 explicitly
+// preserves vimcode's pre-existing "already-trailing-whitespace ⇒ never pad
+// further" rule regardless of 'joinspaces' (see acceptance criterion 3), so
+// vimcode intentionally keeps a single space here — a documented, narrow
+// deviation from real Vim, not a bug in this change.
+
+#[test]
+fn test_joinspaces_off_period_single_space() {
+    let mut e = Engine::new();
+    assert!(!e.settings.joinspaces, "joinspaces defaults to off");
+    nvim_case("one.\nworld\n", 0, 0, "J", "one. world\n", 0, 4);
+}
+
+#[test]
+fn test_joinspaces_off_exclaim_single_space() {
+    nvim_case("one!\nworld\n", 0, 0, "J", "one! world\n", 0, 4);
+}
+
+#[test]
+fn test_joinspaces_off_question_single_space() {
+    nvim_case("one?\nworld\n", 0, 0, "J", "one? world\n", 0, 4);
+}
+
+#[test]
+fn test_joinspaces_off_ordinary_word_single_space() {
+    nvim_case("one\nworld\n", 0, 0, "J", "one world\n", 0, 3);
+}
+
+#[test]
+fn test_joinspaces_off_gj_never_inserts_space() {
+    nvim_case("one.\nworld\n", 0, 0, "gJ", "one.world\n", 0, 4);
+}
+
+#[test]
+fn test_joinspaces_on_period_two_spaces() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "one.\nworld\n");
+    engine.settings.joinspaces = true;
+    engine.feed_keys("J");
+    assert_eq!(engine.buffer().to_string(), "one.  world\n");
+    assert_eq!(engine.view().cursor.line, 0);
+    assert_eq!(engine.view().cursor.col, 4);
+}
+
+#[test]
+fn test_joinspaces_on_exclaim_two_spaces() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "one!\nworld\n");
+    engine.settings.joinspaces = true;
+    engine.feed_keys("J");
+    assert_eq!(engine.buffer().to_string(), "one!  world\n");
+    assert_eq!(engine.view().cursor.col, 4);
+}
+
+#[test]
+fn test_joinspaces_on_question_two_spaces() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "one?\nworld\n");
+    engine.settings.joinspaces = true;
+    engine.feed_keys("J");
+    assert_eq!(engine.buffer().to_string(), "one?  world\n");
+    assert_eq!(engine.view().cursor.col, 4);
+}
+
+#[test]
+fn test_joinspaces_on_ordinary_word_still_single_space() {
+    // 'joinspaces' only affects '.', '!' and '?' — an ordinary word gets
+    // just one space, same as with the option off.
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "one\nworld\n");
+    engine.settings.joinspaces = true;
+    engine.feed_keys("J");
+    assert_eq!(engine.buffer().to_string(), "one world\n");
+    assert_eq!(engine.view().cursor.col, 3);
+}
+
+#[test]
+fn test_joinspaces_on_gj_never_inserts_space() {
+    // gJ never inserts a space, regardless of 'joinspaces'.
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "one.\nworld\n");
+    engine.settings.joinspaces = true;
+    engine.feed_keys("gJ");
+    assert_eq!(engine.buffer().to_string(), "one.world\n");
+    assert_eq!(engine.view().cursor.col, 4);
+}
+
+#[test]
+fn test_joinspaces_on_count_join_pads_every_sentence_end() {
+    // 3J joins 3 lines (2 join points); each join point that ends in
+    // sentence punctuation gets its own two spaces.
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "one.\ntwo!\nthree?\n");
+    engine.settings.joinspaces = true;
+    engine.feed_keys("3J");
+    assert_eq!(engine.buffer().to_string(), "one.  two!  three?\n");
+    assert_eq!(engine.view().cursor.col, 10);
+}
+
+#[test]
+fn test_joinspaces_on_next_line_paren_still_no_space() {
+    // Precedence: a next line starting with ')' still gets no space at
+    // all, even when 'joinspaces' is on and the current line ends in '.'.
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "foo.\n)\n");
+    engine.settings.joinspaces = true;
+    engine.feed_keys("J");
+    assert_eq!(engine.buffer().to_string(), "foo.)\n");
+    assert_eq!(engine.view().cursor.col, 4);
+}
+
+#[test]
+fn test_joinspaces_on_current_trailing_space_not_padded_further() {
+    // Precedence: a current line that already ends in whitespace is never
+    // padded further, regardless of 'joinspaces' — vimcode's pre-existing
+    // rule (see module comment above for why this is a deliberate, narrow
+    // deviation from real Vim's own 'joinspaces' behavior in this case).
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "foo. \nbar\n");
+    engine.settings.joinspaces = true;
+    engine.feed_keys("J");
+    assert_eq!(engine.buffer().to_string(), "foo. bar\n");
+    assert_eq!(engine.view().cursor.col, 5);
+}
+
+#[test]
+fn test_set_joinspaces_via_colon_set() {
+    let mut engine = Engine::new();
+    assert!(!engine.settings.joinspaces);
+    engine.execute_command("set joinspaces");
+    assert!(engine.settings.joinspaces);
+    engine.execute_command("set nojoinspaces");
+    assert!(!engine.settings.joinspaces);
+    engine.execute_command("set js");
+    assert!(engine.settings.joinspaces);
+    // `:set js!` toggles (vimcode's `:set inv joinspaces` equivalent).
+    engine.execute_command("set js!");
+    assert!(!engine.settings.joinspaces);
+}
+
 // =======================================================================
 // Tests: Search word under cursor (* / #)
 // =======================================================================
@@ -9846,6 +10216,111 @@ fn test_indent_dot_repeat() {
     assert!(
         text.starts_with("        "),
         "dot repeat of >> should double-indent"
+    );
+}
+
+// ─── #1003: `{count}>>`/`{count}<<`'s count behaves like a downward linewise
+// motion of `count - 1` lines: it clamps at the buffer's end when the cursor
+// can still move down *at all* (matching `j`), but aborts the whole command
+// -- shifting nothing -- when the cursor is already on the last line and
+// asks for more than one line, because then that motion can't move at all.
+// Both directions confirmed against Neovim. ─────────────────────────────────
+
+#[test]
+fn test_shift_right_count_exceeding_lines_on_last_line_aborts() {
+    // `2>>` on a one-line buffer: the cursor's only line IS the last line,
+    // so the implied one-line downward motion can't happen -- the whole
+    // command fails, nothing shifts, cursor stays put. Before this fix
+    // vimcode clamped the count down to the single available line and
+    // indented it anyway.
+    let mut e = engine_with_text("a\n");
+    let cursor_before = e.view().cursor;
+    press_char(&mut e, '2');
+    press_char(&mut e, '>');
+    press_char(&mut e, '>');
+    assert_eq!(
+        e.buffer().to_string(),
+        "a\n",
+        "2>> on a 1-line buffer must abort -- the buffer must stay byte-identical"
+    );
+    assert_eq!(
+        e.view().cursor,
+        cursor_before,
+        "an aborted >> must not move the cursor"
+    );
+}
+
+#[test]
+fn test_shift_right_count_exceeding_lines_on_last_line_of_multiline_buffer_aborts() {
+    // Same abort, but the "last line" is the second of a 2-line buffer, with
+    // the cursor moved onto it first: `2>>` from there must also abort even
+    // though the buffer as a whole has more than one line.
+    let mut e = engine_with_text("a\nb\n");
+    press_char(&mut e, 'j'); // move onto the last line
+    let cursor_before = e.view().cursor;
+    press_char(&mut e, '2');
+    press_char(&mut e, '>');
+    press_char(&mut e, '>');
+    assert_eq!(
+        e.buffer().to_string(),
+        "a\nb\n",
+        "2>> from the last line must abort -- nothing shifts"
+    );
+    assert_eq!(e.view().cursor, cursor_before);
+}
+
+#[test]
+fn test_shift_right_count_exceeding_lines_from_non_last_line_clamps() {
+    // Contrast case, confirmed against Neovim ("misc:5>>"): when the cursor
+    // is NOT already on the last line, a count that overshoots the buffer's
+    // end does not abort -- it clamps and shifts every line through the end,
+    // the same way a `5j` from line 1 of a 2-line buffer just lands on line
+    // 2 instead of failing. `5>>` from the first line of a 2-line buffer
+    // shifts both lines.
+    let mut e = engine_with_text("a\nb\n");
+    press_char(&mut e, '5');
+    press_char(&mut e, '>');
+    press_char(&mut e, '>');
+    assert_eq!(
+        e.buffer().to_string(),
+        "    a\n    b\n",
+        "5>> from a non-last line should clamp and shift through the buffer's end"
+    );
+}
+
+#[test]
+fn test_shift_left_count_exceeding_lines_on_last_line_aborts() {
+    // The abort applies symmetrically to `<<` (dedent), not just `>>`.
+    let mut e = engine_with_text("    a\n");
+    let cursor_before = e.view().cursor;
+    press_char(&mut e, '2');
+    press_char(&mut e, '<');
+    press_char(&mut e, '<');
+    assert_eq!(
+        e.buffer().to_string(),
+        "    a\n",
+        "2<< on a 1-line buffer must abort -- the buffer must stay byte-identical"
+    );
+    assert_eq!(e.view().cursor, cursor_before);
+}
+
+#[test]
+fn test_shift_right_count_within_lines_still_works() {
+    // The abort must not regress a count that's actually satisfiable: `1>>`
+    // and a bare `>>` on a 1-line buffer both still indent normally.
+    let mut e = engine_with_text("a\n");
+    press_char(&mut e, '1');
+    press_char(&mut e, '>');
+    press_char(&mut e, '>');
+    assert_eq!(e.buffer().to_string(), "    a\n", "1>> should indent");
+
+    let mut e2 = engine_with_text("a\n");
+    press_char(&mut e2, '>');
+    press_char(&mut e2, '>');
+    assert_eq!(
+        e2.buffer().to_string(),
+        "    a\n",
+        "a bare >> (implicit count 1) should indent"
     );
 }
 
@@ -14967,14 +15442,16 @@ fn make_sc_engine_with_files() -> Engine {
             path: "a.rs".to_string(),
             staged: Some(git::StatusKind::Modified),
             unstaged: None,
+            unmerged: None,
         },
         git::FileStatus {
             path: "b.rs".to_string(),
             staged: None,
             unstaged: Some(git::StatusKind::Modified),
+            unmerged: None,
         },
     ];
-    engine.sc_sections_expanded = [true, true, false, true];
+    engine.sc_sections_expanded = [true, true, true, false, true];
     engine
 }
 
@@ -15075,11 +15552,14 @@ fn test_sc_nav_clamps_at_top() {
 #[test]
 fn test_sc_tab_toggles_section() {
     let mut engine = make_sc_engine_with_files();
-    assert!(engine.sc_sections_expanded[0]);
+    // flat 0 is the first *visible* section header. With no conflicts the
+    // Merge Changes section is hidden (#991), so that is STAGED CHANGES.
+    let sec = source_control::SC_SECTION_STAGED;
+    assert!(engine.sc_sections_expanded[sec]);
     engine.handle_sc_key("Tab", false, None);
-    assert!(!engine.sc_sections_expanded[0]);
+    assert!(!engine.sc_sections_expanded[sec]);
     engine.handle_sc_key("Tab", false, None);
-    assert!(engine.sc_sections_expanded[0]);
+    assert!(engine.sc_sections_expanded[sec]);
 }
 
 #[test]
@@ -15385,9 +15865,10 @@ fn test_sc_visual_row_to_flat_tui_empty_staged() {
         path: "b.rs".to_string(),
         staged: None,
         unstaged: Some(git::StatusKind::Modified),
+        unmerged: None,
     }];
-    engine.sc_sections_expanded = [true, true, false, false]; // staged expanded but empty; log collapsed
-                                                              // Row 3: STAGED header (flat 0)
+    engine.sc_sections_expanded = [true, true, true, false, false]; // staged expanded but empty; log collapsed
+                                                                    // Row 3: STAGED header (flat 0)
     assert_eq!(engine.sc_visual_row_to_flat(3, true), Some((0, true)));
     // Row 4: "(no changes)" hint — None
     assert_eq!(engine.sc_visual_row_to_flat(4, true), None);
@@ -15565,9 +16046,15 @@ fn test_multi_cursor_tab_records_one_insert_fragment_not_one_per_cursor() {
 
     // Replay it where a real user would notice: insert-mode <C-a> re-inserts
     // `last_inserted_text` verbatim (same buffer the "." register and
-    // count-prefixed inserts replay).
-    engine.view_mut().cursor = Cursor { line: 2, col: 1 };
-    engine.handle_key("i", Some('i'), false);
+    // count-prefixed inserts replay). Uses `A` (not a raw past-eol cursor +
+    // `i`) to reach "end of line, about to insert" -- #1003 made plain `i`
+    // clamp a single-cursor Normal-mode column that's already past the last
+    // char, so a manually-placed col 1 on the 1-char "Z" would now land
+    // before 'Z' instead of after it; `A` reaches the same end-of-line
+    // insert point the way real Vim does, regardless of the cursor's prior
+    // column.
+    engine.view_mut().cursor = Cursor { line: 2, col: 0 };
+    engine.handle_key("A", Some('A'), false);
     engine.handle_key("a", Some('a'), true);
     engine.handle_key("Escape", None, false);
 
@@ -16996,8 +17483,9 @@ fn test_sc_hover_file_generates_markdown() {
         path: "src/main.rs".to_string(),
         staged: None,
         unstaged: Some(crate::core::git::StatusKind::Modified),
+        unmerged: None,
     }];
-    e.sc_sections_expanded = [true, true, false, false];
+    e.sc_sections_expanded = [true, true, true, false, false];
     // flat index: 0=staged header, 1=unstaged header, 2=file item
     let md = e.sc_hover_markdown(2);
     assert!(md.is_some());
@@ -17014,7 +17502,7 @@ fn test_sc_hover_file_generates_markdown() {
 fn test_sc_hover_section_header_returns_none_for_non_branch() {
     let mut e = engine_with_text("hello\n");
     e.sc_file_statuses = vec![];
-    e.sc_sections_expanded = [true, true, false, false];
+    e.sc_sections_expanded = [true, true, true, false, false];
     // flat index 0 = Staged Changes header (section 0 → branch info)
     // flat index 1 = Unstaged Changes header (section 1 → None)
     let md = e.sc_hover_markdown(1);
@@ -17029,7 +17517,7 @@ fn test_sc_hover_log_entry_generates_markdown() {
         hash: "abc1234".to_string(),
         message: "feat: add hover popups".to_string(),
     }];
-    e.sc_sections_expanded = [true, true, false, true];
+    e.sc_sections_expanded = [true, true, true, false, true];
     // flat indices: 0=staged hdr, 1=unstaged hdr, 2=log hdr, 3=log item
     let md = e.sc_hover_markdown(3);
     assert!(md.is_some());
@@ -17043,13 +17531,15 @@ fn test_sc_hover_log_entry_generates_markdown() {
 // ─── SC SidebarSystem (#321) ────────────────────────────────────────────
 
 #[test]
-fn test_sc_sidebar_system_initialized_with_4_sections() {
+fn test_sc_sidebar_system_initialized_with_5_sections() {
     let engine = Engine::new();
     let sidebar = engine.sc_sidebar_system.borrow();
-    assert!(sidebar.is_section_visible(0));
-    assert!(sidebar.is_section_visible(1));
-    assert!(sidebar.is_section_visible(2));
-    assert!(sidebar.is_section_visible(3));
+    for section in 0..source_control::SC_SECTION_COUNT {
+        assert!(
+            sidebar.is_section_visible(section),
+            "section {section} should exist"
+        );
+    }
 }
 
 #[test]
@@ -17704,11 +18194,13 @@ fn test_explorer_indicators_git_status() {
             path: "src/main.rs".to_string(),
             staged: None,
             unstaged: Some(git::StatusKind::Modified),
+            unmerged: None,
         },
         git::FileStatus {
             path: "new_file.txt".to_string(),
             staged: None,
             unstaged: Some(git::StatusKind::Untracked),
+            unmerged: None,
         },
     ];
     let (git_st, _) = e.explorer_indicators();
@@ -19087,6 +19579,102 @@ fn test_confirm_delete_folder() {
     assert!(e.message.contains("Deleted folder"));
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ─── `:CheckNerdFonts` dialog tests (#999) ───────────────────────────────────
+//
+// `crate::icons::{nerd_fonts_enabled, set_nerd_fonts}` is thread-local
+// (#618), so any test that mutates it saves and restores the ambient value
+// to avoid leaking into whatever other test Rust's runner schedules next on
+// the same worker thread — same discipline the shell_app.rs/gtk testing.rs
+// nerd-font tests already follow.
+
+#[test]
+fn test_check_nerd_fonts_shows_dialog_with_both_variants_side_by_side() {
+    let mut e = Engine::new();
+    e.execute_command("CheckNerdFonts");
+
+    assert!(e.dialog.is_some());
+    let dlg = e.dialog.as_ref().unwrap();
+    assert_eq!(dlg.tag, "check_nerd_fonts");
+    // Rendered content, not a flag: the dialog body must contain the actual
+    // nerd glyph AND its ASCII fallback for a sampled file type, side by
+    // side, so the user has something concrete to compare.
+    assert!(
+        dlg.body
+            .iter()
+            .any(|l| l.contains(crate::icons::FILE_RUST.nerd)),
+        "dialog body must show the Nerd Font glyph row: {:?}",
+        dlg.body
+    );
+    assert!(
+        dlg.body
+            .iter()
+            .any(|l| l.contains(crate::icons::FILE_RUST.fallback)),
+        "dialog body must show the ASCII fallback row: {:?}",
+        dlg.body
+    );
+    assert_eq!(dlg.buttons.len(), 3);
+    assert_eq!(dlg.buttons[0].action, "enable");
+    assert_eq!(dlg.buttons[1].action, "disable");
+    assert_eq!(dlg.buttons[2].action, "cancel");
+}
+
+#[test]
+fn test_check_nerd_fonts_enable_persists_explicit_override() {
+    let prev_nf = crate::icons::nerd_fonts_enabled();
+
+    let mut e = Engine::new();
+    e.settings.use_nerd_fonts = None;
+    e.execute_command("CheckNerdFonts");
+    assert!(e.dialog.is_some());
+
+    // Press 'n' — "Nerd Font row looks right" hotkey.
+    e.handle_key("", Some('n'), false);
+    assert!(e.dialog.is_none());
+    assert_eq!(
+        e.settings.use_nerd_fonts,
+        Some(true),
+        "must persist an explicit Some(_), not just flip the live flag"
+    );
+    assert!(crate::icons::nerd_fonts_enabled());
+    assert!(e.message.contains("enabled"));
+
+    crate::icons::set_nerd_fonts(prev_nf);
+}
+
+#[test]
+fn test_check_nerd_fonts_disable_persists_explicit_override() {
+    let prev_nf = crate::icons::nerd_fonts_enabled();
+
+    let mut e = Engine::new();
+    e.settings.use_nerd_fonts = None;
+    e.execute_command("CheckNerdFonts");
+    assert!(e.dialog.is_some());
+
+    // Press 'f' — "Fallback row looks right" hotkey.
+    e.handle_key("", Some('f'), false);
+    assert!(e.dialog.is_none());
+    assert_eq!(e.settings.use_nerd_fonts, Some(false));
+    assert!(!crate::icons::nerd_fonts_enabled());
+    assert!(e.message.contains("disabled"));
+
+    crate::icons::set_nerd_fonts(prev_nf);
+}
+
+#[test]
+fn test_check_nerd_fonts_cancel_leaves_setting_unset() {
+    let mut e = Engine::new();
+    e.settings.use_nerd_fonts = None;
+    e.execute_command("CheckNerdFonts");
+    assert!(e.dialog.is_some());
+
+    e.handle_key("Escape", None, false);
+    assert!(e.dialog.is_none());
+    assert!(
+        e.settings.use_nerd_fonts.is_none(),
+        "cancel must not persist any override"
+    );
 }
 
 #[test]
@@ -27520,6 +28108,29 @@ fn test_nvim_insert_ctrl_w_at_line_start() {
     assert_eq!(engine.buffer().to_string(), "hello\n");
 }
 
+#[test]
+fn test_nvim_insert_i_clamps_past_eol_cursor_before_ctrl_w() {
+    // #1003 ("dot:i<C-w> ."): the cursor can end up sitting one column past
+    // the last character while nominally still in Normal mode (only
+    // reachable via direct placement -- e.g. this test's raw `cursor.col`
+    // write below, matching how the nvim-conformance harness positions the
+    // cursor with `nvim_win_set_cursor`-equivalent semantics before the
+    // first keystroke). Pressing `i` there must still insert *before* the
+    // last valid column, not at the invalid past-eol one. Before this fix,
+    // vimcode's `i` handler used the raw (unclamped) column as-is, so
+    // `<C-w>` deleted the whole trailing word ("cd") instead of just its
+    // last fragment ("c") -- confirmed against Neovim, which deletes only
+    // "c" and leaves "d" behind.
+    let mut e = engine_with_text("ab cd\n");
+    e.view_mut().cursor.col = 5; // one past 'd' -- invalid for Normal mode
+    e.feed_keys("i<C-w>X<Esc>");
+    assert_eq!(
+        e.buffer().to_string(),
+        "ab Xd\n",
+        "<C-w> after a clamped `i` should delete just \"c\", leaving \"d\" after the insert"
+    );
+}
+
 // ── Phase 4 Batch 12: Search, scroll, increment, replace ────────────────
 // Mined from test_search.vim, test_scroll.vim, test_increment.vim, test_normal.vim
 
@@ -28389,6 +29000,147 @@ fn test_nvim_ctrl_x_on_hex_decrement() {
 fn test_nvim_ctrl_x_past_zero() {
     // Ctrl-X on 0 becomes -1
     nvim_case("n=0\n", 0, 0, "<C-x>", "n=-1\n", 0, 3);
+}
+
+// -- #1001: 'smarttab' --
+
+#[test]
+fn test_smarttab_on_tab_at_front_uses_shiftwidth() {
+    // Default (smarttab on, matching Neovim): with ts=8/sw=4, <Tab> in front
+    // of the line (nothing but blanks before the cursor) advances by
+    // 'shiftwidth', not 'tabstop' — verified against real nvim (4 spaces).
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "x\n");
+    assert!(engine.settings.smarttab);
+    engine.settings.tabstop = 8;
+    engine.settings.shift_width = 4;
+    engine.settings.expand_tab = true;
+    engine.feed_keys("i<Tab><Esc>");
+    assert_eq!(engine.buffer().to_string(), "    x\n");
+}
+
+#[test]
+fn test_smarttab_off_tab_at_front_uses_tabstop() {
+    // 'smarttab' off: <Tab> always advances by 'tabstop', even in front of
+    // the line — a literal tabstop-worth of spaces, not the shiftwidth
+    // rounding above. Verified against real nvim (8 spaces).
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "x\n");
+    engine.settings.smarttab = false;
+    engine.settings.tabstop = 8;
+    engine.settings.shift_width = 4;
+    engine.settings.expand_tab = true;
+    engine.feed_keys("i<Tab><Esc>");
+    assert_eq!(engine.buffer().to_string(), "        x\n");
+}
+
+#[test]
+fn test_smarttab_on_backspace_over_indent_removes_shiftwidth() {
+    // Default (smarttab on): <BS> within leading indentation removes a
+    // whole 'shiftwidth' worth of blanks (rounded to the previous stop), not
+    // one space at a time. Verified against real nvim.
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "    a\n");
+    assert!(engine.settings.smarttab);
+    engine.settings.expand_tab = true;
+    engine.settings.shift_width = 8; // wider than the 4-space indent present
+    engine.view_mut().cursor.col = 4;
+    engine.feed_keys("i<BS><Esc>");
+    assert_eq!(engine.buffer().to_string(), "a\n");
+}
+
+#[test]
+fn test_smarttab_off_backspace_over_indent_removes_one_char() {
+    // 'smarttab' off: <BS> over leading whitespace deletes a single
+    // character, same as anywhere else in the line. Verified against real
+    // nvim.
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "    a\n");
+    engine.settings.smarttab = false;
+    engine.settings.expand_tab = true;
+    engine.settings.shift_width = 8;
+    engine.view_mut().cursor.col = 4;
+    engine.feed_keys("i<BS><Esc>");
+    assert_eq!(engine.buffer().to_string(), "   a\n");
+}
+
+// -- #1001: 'nrformats' --
+
+#[test]
+fn test_nrformats_default_does_not_recognize_octal() {
+    // Default 'nrformats' (bin,hex, matching Neovim) does not include
+    // octal: a leading-zero run is decimal, so 007 <C-a> gives 008, not the
+    // octal-arithmetic 010. Verified against real nvim (pins today's
+    // behavior as correct — regression guard for acceptance criterion 4).
+    nvim_case("007\n", 0, 0, "<C-a>", "008\n", 0, 2);
+}
+
+#[test]
+fn test_nrformats_octal_increments_as_octal() {
+    // 'nrformats' with "octal" added: 007 <C-a> treats 007 as octal 7, which
+    // is 010 in octal. Verified against real nvim.
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "007\n");
+    engine.settings.nrformats = vec!["bin".to_string(), "octal".to_string(), "hex".to_string()];
+    engine.feed_keys("<C-a>");
+    assert_eq!(engine.buffer().to_string(), "010\n");
+}
+
+#[test]
+fn test_nrformats_alpha_increments_letter() {
+    // 'nrformats' with "alpha": <C-a> on a bare ASCII letter increments it
+    // within the alphabet. Verified against real nvim (g -> h).
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "g\n");
+    engine.settings.nrformats = vec!["alpha".to_string()];
+    engine.feed_keys("<C-a>");
+    assert_eq!(engine.buffer().to_string(), "h\n");
+}
+
+#[test]
+fn test_nrformats_alpha_clamps_at_alphabet_boundary() {
+    // Unlike every other 'nrformats' kind (which wraps modulo its width),
+    // alpha clamps at 'z'/'Z' rather than wrapping to 'a'/'A'. Verified
+    // against real nvim (z stays z).
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "z\n");
+    engine.settings.nrformats = vec!["alpha".to_string()];
+    engine.feed_keys("<C-a>");
+    assert_eq!(engine.buffer().to_string(), "z\n");
+}
+
+#[test]
+fn test_nrformats_without_alpha_ignores_bare_letters() {
+    // Without "alpha" in 'nrformats' (the default), <C-a> on a line with no
+    // digits at or after the cursor does nothing.
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "g\n");
+    engine.feed_keys("<C-a>");
+    assert_eq!(engine.buffer().to_string(), "g\n");
+}
+
+#[test]
+fn test_nrformats_visual_ctrl_a_honors_octal() {
+    // Visual-mode <C-a> (`visual_addsub`) must route through the same
+    // 'nrformats' option as Normal-mode <C-a> — not a hardcoded default.
+    // Verified against real nvim (V<C-a> on 007 with octal enabled -> 010).
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "007\n");
+    engine.settings.nrformats = vec!["bin".to_string(), "octal".to_string(), "hex".to_string()];
+    engine.feed_keys("V<C-a>");
+    assert_eq!(engine.buffer().to_string(), "010\n");
+}
+
+#[test]
+fn test_nrformats_g_ctrl_a_honors_alpha() {
+    // g<C-a> (progressive Visual-mode increment) must also honor
+    // 'nrformats'. Verified against real nvim: VGg<C-a> over "a\na\na\n"
+    // with nrformats=alpha gives b/c/d (each line's amount grows by 1).
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "a\na\na\n");
+    engine.settings.nrformats = vec!["alpha".to_string()];
+    engine.feed_keys("VGg<C-a>");
+    assert_eq!(engine.buffer().to_string(), "b\nc\nd\n");
 }
 
 // -- Search history --
@@ -30556,5 +31308,76 @@ fn test_gp_charwise_multiline_cursor_lands_after_pasted_text() {
         engine.view().cursor.col,
         0,
         "FAIL: gp must not leave the cursor resting on the line's trailing newline"
+    );
+}
+// #1005: `x`/`rX` must treat a base character plus its trailing zero-width
+// "composing" characters (combining marks, and the vowel/final jamo half of
+// a decomposed Hangul syllable) as ONE cursor cell — verified against
+// `nvim`: `x` on `e` + U+0301 (COMBINING ACUTE ACCENT) deletes both
+// codepoints, and `rX` on the same replaces both with a single `X`, not one
+// `X` per codepoint.
+#[test]
+fn test_x_deletes_whole_combining_mark_cluster() {
+    let mut engine = Engine::new();
+    // "e" + U+0301 (COMBINING ACUTE ACCENT) + " world"
+    engine.buffer_mut().insert(0, "e\u{0301} world");
+
+    press_char(&mut engine, 'x');
+
+    assert_eq!(
+        engine.buffer().to_string(),
+        " world",
+        "x must delete the base char AND its combining mark as one cell"
+    );
+    assert_eq!(engine.view().cursor.col, 0);
+}
+
+#[test]
+fn test_rx_replaces_whole_combining_mark_cluster_with_one_char() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "e\u{0301} world");
+
+    press_char(&mut engine, 'r');
+    press_char(&mut engine, 'X');
+
+    assert_eq!(
+        engine.buffer().to_string(),
+        "X world",
+        "rX must replace the whole cluster with a single X, not one X per codepoint"
+    );
+    assert_eq!(engine.view().cursor.col, 0);
+}
+
+/// Companion case: a decomposed Hangul syllable (leading consonant +
+/// vowel jamo, U+1100 U+1161) behaves the same way — the vowel jamo is
+/// zero-width so it combines with the leading consonant into one cell, even
+/// though neither codepoint is a Unicode combining mark.
+#[test]
+fn test_x_deletes_whole_hangul_jamo_cluster() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "\u{1100}\u{1161} next");
+
+    press_char(&mut engine, 'x');
+
+    assert_eq!(
+        engine.buffer().to_string(),
+        " next",
+        "x must delete both jamo codepoints as one cell"
+    );
+}
+
+#[test]
+fn test_x_count_counts_cells_not_codepoints() {
+    let mut engine = Engine::new();
+    // Two combining-mark clusters followed by plain ascii: "e´" "e´" "z"
+    engine.buffer_mut().insert(0, "e\u{0301}e\u{0301}z");
+
+    press_char(&mut engine, '2');
+    press_char(&mut engine, 'x');
+
+    assert_eq!(
+        engine.buffer().to_string(),
+        "z",
+        "2x must delete 2 cells (4 codepoints), not 2 codepoints"
     );
 }

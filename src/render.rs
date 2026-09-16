@@ -513,33 +513,35 @@ pub fn build_tab_bar_icons(tabs: &[TabInfo]) -> Vec<Option<quadraui::TabIcon>> {
     tabs.iter()
         .map(|t| {
             // `TabInfo::name` carries a deliberate trailing space (see its
-            // doc); the extension has to be read from the trimmed name.
-            let ext = tab_name_extension(&t.name);
+            // doc); the filename lookup has to read the trimmed name so a
+            // filename-badged file (`Dockerfile`, `.gitignore`, #992) can
+            // still match exactly, not just its (often absent) extension.
+            let name = tab_name_filename(&t.name);
             Some(quadraui::TabIcon {
-                glyph: icons::file_icon(&ext).to_string(),
-                color: tab_icon_color(&ext),
+                glyph: icons::file_icon_for_name(name).to_string(),
+                color: tab_icon_color(name),
             })
         })
         .collect()
 }
 
-/// Extract the lowercase file extension from a [`TabInfo::name`] label.
-/// Scratch/special buffers (`"[Keymaps]"`, `"[No Name]"`) yield `""`, which
-/// [`icons::file_icon`] maps to the generic file glyph — matching VS Code,
-/// which badges untitled editors with a plain file icon rather than nothing.
-fn tab_name_extension(name: &str) -> String {
-    std::path::Path::new(name.trim())
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("")
-        .to_lowercase()
+/// Extract the trimmed base filename from a [`TabInfo::name`] label, for
+/// [`icons::file_icon_for_name`]/[`icons::file_icon_color_for_name`].
+/// Scratch/special buffers (`"[Keymaps]"`, `"[No Name]"`) pass through
+/// unmatched by the filename table and fall back to the (empty) extension
+/// lookup, which [`icons::file_icon`] maps to the generic file glyph —
+/// matching VS Code, which badges untitled editors with a plain file icon
+/// rather than nothing.
+fn tab_name_filename(name: &str) -> &str {
+    name.trim()
 }
 
 /// The language identity colour for a tab icon. Thin adapter over
-/// [`icons::file_icon_color`] so no rendering call site names an RGB literal
-/// (see that function's design note for why this is not a `Theme` token).
-fn tab_icon_color(ext: &str) -> Color {
-    let (r, g, b) = icons::file_icon_color(ext);
+/// [`icons::file_icon_color_for_name`] so no rendering call site names an
+/// RGB literal (see [`icons::file_icon_color`]'s design note for why this is
+/// not a `Theme` token).
+fn tab_icon_color(name: &str) -> Color {
+    let (r, g, b) = icons::file_icon_color_for_name(name);
     Color::from_rgb(r, g, b)
 }
 
@@ -911,7 +913,7 @@ pub fn breadcrumb_draw_targets(
 /// #540 ShellApp migration, silently freezing the GTK backend's nerd-fonts
 /// flag at its default (`false`) forever.
 pub fn sync_nerd_fonts(b: &mut dyn quadraui::Backend, engine: &Engine) {
-    b.set_nerd_fonts(engine.settings.use_nerd_fonts);
+    b.set_nerd_fonts(engine.settings.use_nerd_fonts());
 }
 
 /// The family name the bundled Nerd Font icon subset (`ICON_FONT_BYTES`)
@@ -8583,7 +8585,7 @@ pub struct DebugSidebarItem {
 #[derive(Debug, Clone)]
 pub struct ScFileItem {
     pub path: String,
-    /// Single-char status label: A / M / D / R / ?
+    /// Single-char status label: A / M / D / R / C / ? / ! (conflict)
     pub status_char: char,
     pub is_staged: bool,
 }
@@ -8615,6 +8617,10 @@ pub struct SourceControlData {
     pub ahead: u32,
     /// Number of commits behind the upstream.
     pub behind: u32,
+    /// Unmerged (conflicted) files — the "Merge Changes" section (#991).
+    /// Empty in a conflict-free tree, which is what keeps that section
+    /// from being always-on.
+    pub merge: Vec<ScFileItem>,
     /// Staged files (index changes).
     pub staged: Vec<ScFileItem>,
     /// Unstaged / untracked files (working-tree changes).
@@ -8623,8 +8629,9 @@ pub struct SourceControlData {
     pub worktrees: Vec<ScWorktreeItem>,
     /// Recent git log entries.
     pub log: Vec<ScLogItem>,
-    /// Which sections are expanded: [staged, unstaged, worktrees, log].
-    pub sections_expanded: [bool; 4],
+    /// Which sections are expanded, indexed by the `SC_SECTION_*`
+    /// constants: [merge, staged, unstaged, worktrees, log].
+    pub sections_expanded: [bool; crate::core::engine::SC_SECTION_COUNT],
     /// Flat selection index.
     pub selected: usize,
     /// Whether the panel currently has keyboard focus.
@@ -8834,15 +8841,26 @@ fn panel_hover_anchor_y(
     // each. Staged + Unstaged always show; Worktrees only when there's more
     // than one; Log always shows — mirrors the SC sidebar's own section
     // list.
+    use crate::core::engine::{
+        SC_SECTION_CHANGES, SC_SECTION_LOG, SC_SECTION_MERGE, SC_SECTION_STAGED,
+        SC_SECTION_WORKTREES,
+    };
     let show_worktrees = sc.worktrees.len() > 1;
-    let mut sections: Vec<(usize, bool)> = vec![
-        (sc.staged.len(), sc.sections_expanded[0]),
-        (sc.unstaged.len(), sc.sections_expanded[1]),
-    ];
-    if show_worktrees {
-        sections.push((sc.worktrees.len(), sc.sections_expanded[2]));
+    let mut sections: Vec<(usize, bool)> = Vec::new();
+    // #991: Merge Changes sits above Staged and is present only when the
+    // tree has conflicts — mirrors `Engine::sc_visible_sections`.
+    if !sc.merge.is_empty() {
+        sections.push((sc.merge.len(), sc.sections_expanded[SC_SECTION_MERGE]));
     }
-    sections.push((sc.log.len(), sc.sections_expanded[3]));
+    sections.push((sc.staged.len(), sc.sections_expanded[SC_SECTION_STAGED]));
+    sections.push((sc.unstaged.len(), sc.sections_expanded[SC_SECTION_CHANGES]));
+    if show_worktrees {
+        sections.push((
+            sc.worktrees.len(),
+            sc.sections_expanded[SC_SECTION_WORKTREES],
+        ));
+    }
+    sections.push((sc.log.len(), sc.sections_expanded[SC_SECTION_LOG]));
 
     let mut y_off = section_top;
     let mut fi = 0usize;
@@ -10298,13 +10316,39 @@ pub struct ScreenLayout {
 /// `MINIMAP_MIN_TEXT_COLS`).
 pub const MINIMAP_WIDTH_FRACTION: f64 = 0.15;
 
-/// Target minimap width, in the caller's own native unit (px for GTK,
-/// columns for TUI) — VS Code's `minimap.maxColumn` default (#728), shared
-/// by both backends' `MinimapSizing` below since VS Code renders its
-/// minimap at one pixel per assumed source column, so at 120px this is
-/// "precisely 1px per column", and TUI's column-native units make the same
-/// constant trivially the column count directly.
+/// Target minimap width for **GTK**, in raw pixels — VS Code's
+/// `minimap.maxColumn` default (#728): VS Code renders its minimap at one
+/// pixel per assumed source column, so at 120px this is "precisely 1px per
+/// column".
+///
+/// #989: despite the name, this is GTK-only — it used to be reused for TUI's
+/// `TUI_MINIMAP_SIZING` too on the theory that "columns for TUI" made the
+/// same number trivially portable, but 120 *terminal columns* is wider than
+/// almost any real terminal, so in `resolve_width` the fraction term always
+/// won and the TUI strip scaled with the pane instead of holding steady. See
+/// [`MINIMAP_TARGET_COLS_TUI`] for TUI's own, deliberately much smaller,
+/// value.
 const MINIMAP_TARGET_COLS: f64 = 120.0;
+
+/// Target minimap width for TUI, in cell columns — **not** `MINIMAP_TARGET_COLS`
+/// (#989). `MINIMAP_TARGET_COLS` (120) is meaningful only in GTK's pixel unit:
+/// at 120*px* it is VS Code's "precisely 1px per column" parity, but the same
+/// number read as 120 *columns* is wider than almost any real terminal, so in
+/// `resolve_width`'s `target_cols.min(pane_width_cols * fraction)` the
+/// `fraction` term always won instead — the strip scaled with the pane on
+/// every ordinary terminal width, the exact bug #989 reports. This is the
+/// same pixels-vs-columns unit split `gtk_minimap_sizing`'s doc comment
+/// covers, just seen from the TUI side: reusing the pixel-flavoured constant
+/// here is the defect, not a redundancy to "simplify" back.
+///
+/// Chosen so `target_cols.min(pane_width_cols * MINIMAP_WIDTH_FRACTION)`
+/// resolves to this fixed value — not the fraction — across ordinary
+/// terminal widths (80..200 cols): at the narrow end (80 cols),
+/// `80 * 0.15 = 12`, so any target at or below 12 makes the target win from
+/// 80 cols up. Below 80 cols the fraction (and eventually `MINIMAP_MIN_COLS`)
+/// still take over, so the strip keeps narrowing smoothly on panes that
+/// genuinely can't afford it.
+const MINIMAP_TARGET_COLS_TUI: f64 = 12.0;
 
 /// Floor on the reserved width for TUI, in cell columns directly — see
 /// `gtk_minimap_sizing`'s doc comment for why GTK needs its own, separate
@@ -10336,7 +10380,7 @@ const MINIMAP_MIN_TEXT_COLS: f64 = 30.0;
 /// shaped after [`TUI_PICKER_SIZING`]/[`gtk_picker_sizing`] above — the same
 /// established pattern for a genuine per-backend sizing difference.
 pub const TUI_MINIMAP_SIZING: quadraui::MinimapSizing = quadraui::MinimapSizing::VsCodeParity {
-    target_cols: MINIMAP_TARGET_COLS as f32,
+    target_cols: MINIMAP_TARGET_COLS_TUI as f32,
     fraction: MINIMAP_WIDTH_FRACTION as f32,
     min: MINIMAP_MIN_COLS as f32,
     max: MINIMAP_MAX_COLS as f32,
@@ -13904,6 +13948,19 @@ fn build_source_control_data(engine: &Engine) -> Option<SourceControlData> {
         .clone()
         .unwrap_or_else(|| "HEAD".to_string());
 
+    // #991: conflicted files carry neither side, so they land here and
+    // nowhere else.
+    let merge: Vec<ScFileItem> = engine
+        .sc_file_statuses
+        .iter()
+        .filter(|f| f.is_unmerged())
+        .map(|f| ScFileItem {
+            path: f.path.clone(),
+            status_char: crate::core::git::StatusKind::Unmerged.label(),
+            is_staged: false,
+        })
+        .collect();
+
     let staged: Vec<ScFileItem> = engine
         .sc_file_statuses
         .iter()
@@ -13952,6 +14009,7 @@ fn build_source_control_data(engine: &Engine) -> Option<SourceControlData> {
         branch,
         ahead: engine.sc_ahead,
         behind: engine.sc_behind,
+        merge,
         staged,
         unstaged,
         worktrees,
@@ -14409,10 +14467,63 @@ pub fn populate_ext_sidebar_system(engine: &Engine) {
     engine.populate_ext_sidebar_system();
 }
 
+/// `MsvLayoutMetrics` for a pixel-unit GUI backend's `SidebarSystem`
+/// instances (Source Control, plugin ext panels).
+///
+/// #971: `SidebarSystem::handle_cached` returns `SidebarEvent::Ignored`
+/// unconditionally until `set_backend_info` has been called at least once,
+/// and nothing on GTK/macOS ever called it — TUI's own one-time
+/// `set_backend_info(1.0, ..)` at startup (`tui_main/shell_app.rs`'s
+/// `App::from_engine`) is the *only* call site in the whole crate before
+/// this one. So every content-row press on the Source Control and plugin
+/// ext panels (header collapse, row select/activate) silently did nothing
+/// on both GUI backends — it just looked like the feature had never been
+/// wired up rather than "the same bug on every backend", because the one
+/// existing GTK test for this panel (`sidebar_panel_clicks::
+/// git_panel_click_activates_the_commit_box_but_not_the_header`) only
+/// exercises the header/commit-input bands, which return early in
+/// `route_sc_sidebar_click` before ever reaching `handle_cached`. #971's
+/// own sweep tests are what surfaced it: `src/macos/mod.rs`'s
+/// `sc_panel_header_click_hit_band_matches_the_painted_row` /
+/// `ext_panel_header_click_hit_band_matches_the_painted_row` sanity-check
+/// that one header click actually toggles the section *before* trusting
+/// the sweep's own cross-sample comparison — a sweep whose probe silently
+/// does nothing passes just as cleanly as one that works, since every
+/// sample would agree with the (unchanged) baseline either way.
+///
+/// Called fresh every frame from each GTK/macOS `paint_sidebar_panel_rung`
+/// call site, not once at startup like TUI's fixed metrics — a pixel
+/// backend's `line_height` can change (zoom, font settings) where TUI's
+/// cell grid cannot, the same #540/#967 drift class every other
+/// pixel-backend hit-test in this file re-applies its metrics against
+/// rather than trusting a stale snapshot.
+pub fn gui_sidebar_system_metrics(line_height: f32) -> quadraui::MsvLayoutMetrics {
+    quadraui::MsvLayoutMetrics {
+        // Matches `SidebarSystem::compute_tree_layout`'s own row-height
+        // formula (`(lh * 1.4).round()`) — headers paint at the same
+        // height as a content row, and the two must agree since
+        // `compute_layout`'s header band and `compute_tree_layout`'s row
+        // pitch are what stack to build the panel's total content height,
+        // both starting from the same `rect`.
+        header_size: (line_height * 1.4).round(),
+        divider_size: 0.0,
+        // Matches the picker's own GTK/macOS scrollbar gutter width
+        // (`gtk_picker_rows`'s `scrollbar_w`).
+        scrollbar_size: 6.0,
+        // Sub-pixel layout — quadraui's own doc on this field: "GTK leaves
+        // it 0.0" (`MsvLayoutMetrics::cell_quantum`).
+        cell_quantum: 0.0,
+    }
+}
+
 /// Populate the `SidebarSystem` on `engine.sc_sidebar_system` with current
-/// row data for all 4 SC sections. Call once per frame before
+/// row data for all 5 SC sections. Call once per frame before
 /// `sidebar_system.render()` or `.handle_cached()`.
 pub fn populate_sc_sidebar_system(engine: &Engine, theme: &Theme) {
+    use crate::core::engine::{
+        SC_SECTION_CHANGES, SC_SECTION_LOG, SC_SECTION_MERGE, SC_SECTION_STAGED,
+        SC_SECTION_WORKTREES,
+    };
     use quadraui::{Decoration, StyledSpan, StyledText, TreeRow};
 
     let add_fg = theme.git_added;
@@ -14420,24 +14531,27 @@ pub fn populate_sc_sidebar_system(engine: &Engine, theme: &Theme) {
     let mod_fg = theme.git_modified;
     let dim_fg = theme.status_inactive_fg;
 
-    let staged: Vec<_> = engine
-        .sc_file_statuses
-        .iter()
-        .filter(|f| f.staged.is_some())
-        .collect();
-    let unstaged: Vec<_> = engine
-        .sc_file_statuses
-        .iter()
-        .filter(|f| f.unstaged.is_some())
-        .collect();
+    let merge = engine.sc_section_files(SC_SECTION_MERGE);
+    let staged = engine.sc_section_files(SC_SECTION_STAGED);
+    let unstaged = engine.sc_section_files(SC_SECTION_CHANGES);
     let show_worktrees = engine.sc_worktrees.len() > 1;
+    // #991: the Merge Changes section is only shown when the tree actually
+    // has a conflict, so a clean repo still paints exactly two file
+    // sections (the "not always-on" half of this issue).
+    let show_merge = !merge.is_empty();
 
-    let file_row = |i: usize, f: &crate::core::git::FileStatus, is_staged: bool| {
-        let kind = if is_staged { f.staged } else { f.unstaged };
+    let file_row = |i: usize, f: &crate::core::git::FileStatus, section: usize| {
+        let kind = match section {
+            // Conflict rows carry the '!' marker, VS Code's conflict char.
+            SC_SECTION_MERGE => Some(crate::core::git::StatusKind::Unmerged),
+            SC_SECTION_STAGED => f.staged,
+            _ => f.unstaged,
+        };
         let ch = kind.map(|k| k.label()).unwrap_or('?');
         let color = match ch {
             'A' => add_fg,
             'D' => del_fg,
+            '!' => del_fg,
             _ => mod_fg,
         };
         TreeRow {
@@ -14457,16 +14571,22 @@ pub fn populate_sc_sidebar_system(engine: &Engine, theme: &Theme) {
         }
     };
 
+    let merge_rows: Vec<TreeRow> = merge
+        .iter()
+        .enumerate()
+        .map(|(i, f)| file_row(i, f, SC_SECTION_MERGE))
+        .collect();
+
     let staged_rows: Vec<TreeRow> = staged
         .iter()
         .enumerate()
-        .map(|(i, f)| file_row(i, f, true))
+        .map(|(i, f)| file_row(i, f, SC_SECTION_STAGED))
         .collect();
 
     let unstaged_rows: Vec<TreeRow> = unstaged
         .iter()
         .enumerate()
-        .map(|(i, f)| file_row(i, f, false))
+        .map(|(i, f)| file_row(i, f, SC_SECTION_CHANGES))
         .collect();
 
     let worktree_rows: Vec<TreeRow> = engine
@@ -14515,7 +14635,9 @@ pub fn populate_sc_sidebar_system(engine: &Engine, theme: &Theme) {
     let mut sidebar = engine.sc_sidebar_system.borrow_mut();
     sidebar.set_has_focus(engine.sc_has_focus);
     if engine.sc_has_focus && sidebar.active_section().is_none() {
-        sidebar.set_active_section(Some(0));
+        // Never land on the (possibly hidden) Merge Changes section by
+        // default — its actions resolve conflicts (#991).
+        sidebar.set_active_section(Some(SC_SECTION_STAGED));
     }
 
     let badge = |n: usize| {
@@ -14525,16 +14647,19 @@ pub fn populate_sc_sidebar_system(engine: &Engine, theme: &Theme) {
             None
         }
     };
-    sidebar.set_section_badge(0, badge(staged.len()));
-    sidebar.set_section_badge(1, badge(unstaged.len()));
-    sidebar.set_section_badge(2, badge(engine.sc_worktrees.len()));
-    sidebar.set_section_badge(3, badge(engine.sc_log.len()));
-    sidebar.set_section_visible(2, show_worktrees);
+    sidebar.set_section_badge(SC_SECTION_MERGE, badge(merge.len()));
+    sidebar.set_section_badge(SC_SECTION_STAGED, badge(staged.len()));
+    sidebar.set_section_badge(SC_SECTION_CHANGES, badge(unstaged.len()));
+    sidebar.set_section_badge(SC_SECTION_WORKTREES, badge(engine.sc_worktrees.len()));
+    sidebar.set_section_badge(SC_SECTION_LOG, badge(engine.sc_log.len()));
+    sidebar.set_section_visible(SC_SECTION_MERGE, show_merge);
+    sidebar.set_section_visible(SC_SECTION_WORKTREES, show_worktrees);
 
-    sidebar.set_rows(0, staged_rows);
-    sidebar.set_rows(1, unstaged_rows);
-    sidebar.set_rows(2, worktree_rows);
-    sidebar.set_rows(3, log_rows);
+    sidebar.set_rows(SC_SECTION_MERGE, merge_rows);
+    sidebar.set_rows(SC_SECTION_STAGED, staged_rows);
+    sidebar.set_rows(SC_SECTION_CHANGES, unstaged_rows);
+    sidebar.set_rows(SC_SECTION_WORKTREES, worktree_rows);
+    sidebar.set_rows(SC_SECTION_LOG, log_rows);
 }
 
 /// Populate the Search panel's `SidebarSystem` with current form + tree
@@ -14817,8 +14942,11 @@ fn build_explorer_tree_rows(
                 icons::FOLDER.fallback.to_string(),
             ))
         } else {
-            let ext = row.path.extension().and_then(|e| e.to_str()).unwrap_or("");
-            let glyph = icons::file_icon(ext).to_string();
+            // #992: filename-matched first (`Dockerfile`, `.gitignore`, ...
+            // -- `Path::extension()` is `None` for both a no-dot filename
+            // and a leading-dot dotfile, so an extension-only lookup can
+            // never badge either), falling back to the extension table.
+            let glyph = icons::file_icon_for_name(&row.name).to_string();
             Some(QIcon::new(glyph, ".".to_string()))
         };
 
@@ -21622,11 +21750,12 @@ mod tests {
             branch: "main".into(),
             ahead: 0,
             behind: 0,
+            merge: vec![],
             staged: vec![],
             unstaged: vec![],
             worktrees: vec![],
             log: vec![],
-            sections_expanded: [true; 4],
+            sections_expanded: [true; crate::core::engine::SC_SECTION_COUNT],
             selected: 0,
             has_focus: false,
             commit_message: String::new(),
@@ -23644,25 +23773,55 @@ mod tests {
         );
     }
 
-    /// #722 acceptance: the reserved width is a proportion of the *pane's*
-    /// width, so widening the pane must widen the strip too — unlike the
-    /// old fixed `MINIMAP_COLS` constant, which stayed put as the window
-    /// grew. `char_width == 1.0` (TUI-shaped) keeps `resolve_width`'s
-    /// column-normalisation a no-op, so both widths land `want = width *
-    /// MINIMAP_WIDTH_FRACTION` strictly inside `[MINIMAP_MIN_COLS,
-    /// MINIMAP_MAX_COLS]` (9 and 18, against a 6..30 band) and the clamp
-    /// can't be masking the scaling either assertion exercises.
+    /// #722 acceptance (narrowed by #989): below the point where
+    /// `MINIMAP_TARGET_COLS_TUI` becomes affordable, the reserved width is
+    /// still a proportion of the *pane's* width, so widening a genuinely
+    /// narrow pane must still widen the strip. `char_width == 1.0`
+    /// (TUI-shaped) keeps `resolve_width`'s column-normalisation a no-op, so
+    /// both widths land `want = width * MINIMAP_WIDTH_FRACTION` strictly
+    /// inside `[MINIMAP_MIN_COLS, MINIMAP_MAX_COLS]` (6 and 10.5, against a
+    /// 6..30 band) and below `MINIMAP_TARGET_COLS_TUI` (12) — both widths
+    /// stay in the pre-#989 proportional regime, unlike an *ordinary*
+    /// terminal width (see `minimap_reserved_width_holds_steady_across_ordinary_pane_widths`
+    /// below for the #989 fix itself, where the strip stops scaling).
     #[test]
-    fn minimap_reserved_width_scales_with_pane_width() {
+    fn minimap_reserved_width_scales_with_a_narrow_pane_width() {
         let e = minimap_engine();
-        let narrow = minimap_reserved_width(&e, 60.0, 1.0, TUI_MINIMAP_SIZING);
-        let wide = minimap_reserved_width(&e, 120.0, 1.0, TUI_MINIMAP_SIZING);
-        assert_eq!(narrow, 60.0 * MINIMAP_WIDTH_FRACTION);
-        assert_eq!(wide, 120.0 * MINIMAP_WIDTH_FRACTION);
+        let narrow = minimap_reserved_width(&e, 40.0, 1.0, TUI_MINIMAP_SIZING);
+        let wide = minimap_reserved_width(&e, 70.0, 1.0, TUI_MINIMAP_SIZING);
+        assert_eq!(narrow, 40.0 * MINIMAP_WIDTH_FRACTION);
+        assert_eq!(wide, 70.0 * MINIMAP_WIDTH_FRACTION);
         assert!(
             wide > narrow * 1.5,
-            "doubling the pane width must substantially widen the strip: \
-             narrow(60)={narrow}, wide(120)={wide}"
+            "widening a pane still too narrow to afford the fixed target must \
+             substantially widen the strip: \
+             narrow(40)={narrow}, wide(70)={wide}"
+        );
+    }
+
+    /// #989 fix: on ordinary terminal widths (80..200 cols) the TUI minimap
+    /// must hold steady at `MINIMAP_TARGET_COLS_TUI`, not scale with the
+    /// pane. RED against the pre-#989 shape (`TUI_MINIMAP_SIZING` reusing
+    /// the pixel-flavoured `MINIMAP_TARGET_COLS` = 120, which can never bind
+    /// in columns): at those same three widths this would have returned
+    /// `15`, `22.5` and `30` (the `fraction`-driven, then max-clamped,
+    /// values) respectively — three different widths instead of one.
+    #[test]
+    fn minimap_reserved_width_holds_steady_across_ordinary_pane_widths() {
+        let e = minimap_engine();
+        let at_100 = minimap_reserved_width(&e, 100.0, 1.0, TUI_MINIMAP_SIZING);
+        let at_150 = minimap_reserved_width(&e, 150.0, 1.0, TUI_MINIMAP_SIZING);
+        let at_200 = minimap_reserved_width(&e, 200.0, 1.0, TUI_MINIMAP_SIZING);
+        assert_eq!(
+            (at_100, at_150, at_200),
+            (
+                MINIMAP_TARGET_COLS_TUI,
+                MINIMAP_TARGET_COLS_TUI,
+                MINIMAP_TARGET_COLS_TUI
+            ),
+            "the TUI minimap must hold a fixed width across ordinary \
+             terminal widths, not scale with the pane: \
+             100={at_100}, 150={at_150}, 200={at_200}"
         );
     }
 

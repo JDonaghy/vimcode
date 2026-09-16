@@ -1,6 +1,6 @@
 [package]
 name = "vimcode"
-version = "0.11.0"
+version = "0.12.0"
 edition = "2021"
 description = "Vim-like code editor with GTK4 and tree-sitter"
 license = "MIT"
@@ -216,6 +216,13 @@ gio = { version = "0.22", optional = true }
 ratatui = "0.30"
 ignore = "0.4"
 regex = "1"
+# `regex` is deliberately backtracking-free (linear-time guarantee) and so
+# cannot express `\1`..`\9` backreferences at all — not a missing feature,
+# a permanent design constraint of the crate. `fancy-regex` layers a
+# backtracking VM on top of it; vim_regex.rs uses it only for the patterns
+# that actually contain a backreference (#1004). Already resolved
+# transitively via `termwiz`, so this adds no new dependency to the tree.
+fancy-regex = "0.11"
 lsp-types = "0.97"
 copypasta-ext = "0.4"
 mlua = { version = "0.9", features = ["lua54", "vendored"] }
@@ -228,6 +235,18 @@ notify = { version = "7", default-features = false, features = ["macos_kqueue"] 
 
 [dev-dependencies]
 insta = "1.39"
+# #1008: msgpack values for the `tests/nvim_conformance.rs` oracle, which
+# drives `nvim --embed` over msgpack-RPC with a UI attached (`nvim_ui_attach`)
+# instead of the old `nvim --headless -l script.lua`. Deliberately a
+# **dev**-dependency: nothing vimcode ships touches msgpack.
+#
+# `rmpv` (values + reader/writer), not `nvim-rs` (the transport #27 names):
+# nvim-rs is an async client that would drag `tokio` into the test graph for a
+# suite whose every call is a blocking request/response over one pipe. The
+# ~100-line `NvimRpc` in that file speaks the same three-frame msgpack-RPC
+# protocol synchronously; #27's fuzzing loop can build on it or swap in
+# nvim-rs then without touching anything else.
+rmpv = "1.3"
 
 [build-dependencies]
 cc = "1.0"

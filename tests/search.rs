@@ -351,15 +351,57 @@ fn test_star_sets_a_whole_word_pattern_reusable_by_sub() {
 fn test_invalid_pattern_is_rejected_not_matched_literally() {
     // #801 acceptance: a pattern the engine cannot translate must produce an
     // error, never a silent fall-back to literal matching.
-    let mut e = engine_with("a\\(foo\\)\\1 b\n");
-    search_fwd(&mut e, "\\(foo\\)\\1");
+    //
+    // #1004 moved back-references out of the untranslatable set (they now
+    // compile via `fancy_regex` — see the two tests below), so this uses
+    // look-around, which stays genuinely unsupported. The buffer contains the
+    // pattern verbatim, so a literal fall-back *would* find a match here.
+    let mut e = engine_with("a foo\\@= b\n");
+    search_fwd(&mut e, "foo\\@=");
     assert!(
-        e.message.contains("back-reference"),
+        e.message.contains("look-around"),
         "expected a rejection message, got {:?}",
         e.message
     );
     // The cursor did not move to a bogus "literal" match.
     assert_cursor(&e, 0, 0);
+}
+
+#[test]
+fn test_search_pattern_backreference_matches_repeated_text() {
+    // #1004: `\1` inside a *pattern* back-references the text `\(foo\)`
+    // captured earlier in that same pattern, so `/\(foo\)\1` must land on
+    // "foofoo" — not on the lone "foo" at col 0, and not on a literal "1".
+    let mut e = engine_with("foo foofoo bar\n");
+    search_fwd(&mut e, "\\(foo\\)\\1");
+    assert_cursor(&e, 0, 4);
+    // The search-count indicator counts matches through the same compiled
+    // pattern: "foofoo" is the only one, so the lone "foo" at col 0 is not
+    // being counted as a match of `\(foo\)\1`.
+    assert_eq!(e.message, "match 1 of 1");
+}
+
+#[test]
+fn test_search_pattern_backreference_reports_not_found_when_unrepeated() {
+    // The same pattern must *fail* when the capture is not immediately
+    // repeated — i.e. `\1` is executed, not dropped on the floor.
+    let mut e = engine_with("foo bar foo\n");
+    search_fwd(&mut e, "\\(foo\\)\\1");
+    assert!(
+        e.message.contains("Pattern not found"),
+        "expected not-found, got {:?}",
+        e.message
+    );
+    assert_cursor(&e, 0, 0);
+}
+
+#[test]
+fn test_substitute_with_pattern_backreference() {
+    // `:s` shares the same compiled pattern path, so `\1` must work there too
+    // — and the replacement's own `\1` still refers to group 1's text.
+    let mut e = engine_with("xx aa yy\n");
+    exec(&mut e, "s/\\(a\\)\\1/[\\1]/");
+    assert_eq!(buf(&e).trim_end(), "xx [a] yy");
 }
 
 #[test]

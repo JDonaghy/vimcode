@@ -1,6 +1,48 @@
 # VimCode Project State
 
-**Last updated:** September 14, 2026 (#522 — Track A foundation: generic external-tool JSON seam, `src/core/tool_client.rs`, no coordinator vocabulary in core). Prior revisions: September 14 (#970 — confirmed the two "failing GTK click-geometry tests" are the already-known/already-documented Darwin font-rasteriser divergence from #926/#933, not a new bug; no code change), September 14 (#950 review fix round — driver-tier pixel test added for the SEARCH_COD→SEARCH glyph change, self-contradictory pure-refactor claim corrected), September 14 (#950 — ShellApp convergence decomposition + cheap wins), September 14 (#949 review fix round — driver-tier test added, macOS/Win-GUI claim corrected), September 14 (#949 — GTK-only settings-reload watcher deleted), September 11 (macOS native-menu audit — #901/#902 filed, milestone #7 reopened), September 10 (#862 — `src/app.rs` no longer needs the `gui` feature to compile), September 5 (#827 correction pass), September 4 (#801), September 3 (platform-neutrality chain drained). Milestone #7 is **2 open** (#901, #902 — 2026-09-11 macOS native-menu audit). **#47 is reopened, in milestone #5** — its blocker (quadraui#699/#704) closed 2026-09-03, and #811 already ported the TUI side onto the new API. See `GOALS.md` for the full correction history.
+**Last updated:** September 14, 2026 (#951 — ACP-0: `src/core/acp.rs`, NDJSON JSON-RPC transport + session lifecycle, foundation of the ACP track, epic #531). Prior revisions: September 14 (#522 — Track A foundation: generic external-tool JSON seam, `src/core/tool_client.rs`, no coordinator vocabulary in core), September 14 (#970 — confirmed the two "failing GTK click-geometry tests" are the already-known/already-documented Darwin font-rasteriser divergence from #926/#933, not a new bug; no code change), September 14 (#950 review fix round — driver-tier pixel test added for the SEARCH_COD→SEARCH glyph change, self-contradictory pure-refactor claim corrected), September 14 (#950 — ShellApp convergence decomposition + cheap wins), September 14 (#949 review fix round — driver-tier test added, macOS/Win-GUI claim corrected), September 14 (#949 — GTK-only settings-reload watcher deleted), September 11 (macOS native-menu audit — #901/#902 filed, milestone #7 reopened), September 10 (#862 — `src/app.rs` no longer needs the `gui` feature to compile), September 5 (#827 correction pass), September 4 (#801), September 3 (platform-neutrality chain drained). Milestone #7 is **2 open** (#901, #902 — 2026-09-11 macOS native-menu audit). **#47 is reopened, in milestone #5** — its blocker (quadraui#699/#704) closed 2026-09-03, and #811 already ported the TUI side onto the new API. See `GOALS.md` for the full correction history.
+
+## #951 — ACP-0: `src/core/acp.rs`, NDJSON JSON-RPC transport + session lifecycle (foundation)
+
+Root of the ACP track (epic #531 — see the issue's "standing commitments" for the whole
+track). This slice ships the transport and client<->agent session lifecycle only — **no UI**;
+later slices build the AI panel state machine and rendering on top of `AcpEvent` and
+`Engine::poll_acp`.
+
+**Not `lsp.rs` reuse** — two specifics don't carry over: ACP is NDJSON (one JSON message per
+line on stdio, no `Content-Length` framing), and agent->client requests (`fs/read_text_file`,
+`session/request_permission`, etc.) are dispatched by method name and **parked** via
+`AcpEvent::ClientRequest` rather than blanket-answered with `result: null` the way `lsp.rs`'s
+reader thread does today. A parked request is answered later, out of band, with
+`AcpClient::respond_to_client_request`, whose reply is written through the same
+`Arc<Mutex<Box<dyn Write + Send>>>` stdin the reader thread holds — load-bearing here (unlike
+`dap.rs`, whose non-shared `BufWriter` stdin is exactly why the DAP client can't answer
+adapter requests; this module does not repeat that).
+
+**Engine integration is one field, one function, one call site** per the issue's scope:
+`Engine::acp_client: Option<AcpClient>`, `Engine::poll_acp()` (`src/core/engine/acp_ops.rs`),
+called from `poll_idle`. Today `poll_acp` only meaningfully handles `AgentExited` (clears the
+client, reuses the existing generic `self.message` status-line field the same way
+`LspEvent::ServerExited` does — no new backend-specific surface); the other event variants are
+forwarded to `redraw` for later slices to consume.
+
+**Fixture:** `tests/fixtures/fake_acp_agent.sh` — a deterministic NDJSON echo agent in plain
+`/bin/sh` (no jq/python/node, so it runs in CI, which has neither Node nor a real agent
+login). It drives `initialize` -> `session/new` -> `session/prompt` ->
+`stopReason: end_turn`, and mid-turn issues a scripted `fs/read_text_file` client request that
+**blocks** until the test answers it out of band via `respond_to_client_request` — proving the
+reply actually reaches the agent through the shared stdin, not just that client-side
+bookkeeping looks right. Every later ACP slice can depend on this fixture instead of a real
+adapter.
+
+**Tests:** `src/core/acp.rs` (11 tests: pure `classify_line`/`encode_ndjson_line` unit tests,
+plus `#[cfg(unix)]` integration tests against the fixture covering the full lifecycle, agent
+death mid-session -> `AgentExited` with no panic/orphan process, and malformed-line/stderr
+noise not desyncing the reader) and `src/core/engine/acp_ops.rs` (2 tests: no-op with no
+client, and `AgentExited` draining into `self.message` + clearing `acp_client`). This PR is
+internal-only — no UI, no new user-visible behavior (`poll_acp`'s only observable effect,
+`self.message` on an agent exit, requires a live ACP agent that nothing yet starts) — so no
+GTK/TUI driver test accompanies it per CLAUDE.md's exemption for internal-only changes.
 
 ## #522 — Track A foundation: generic external-tool JSON seam (`tool_client.rs`), no coord in core
 

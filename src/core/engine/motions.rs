@@ -15,7 +15,12 @@ impl Engine {
 
         let first = self.buffer().content.char(pos);
         if is_word_char(first) {
-            while pos < total_chars && is_word_char(self.buffer().content.char(pos)) {
+            let wide = is_wide_word_char(first);
+            while pos < total_chars {
+                let ch = self.buffer().content.char(pos);
+                if !is_word_char(ch) || is_wide_word_char(ch) != wide {
+                    break;
+                }
                 pos += 1;
             }
         } else if !first.is_whitespace() {
@@ -111,7 +116,12 @@ impl Engine {
             // Landed exactly on a blank line, which Vim counts as its own
             // word — nothing more to extend backward into.
         } else if is_word_char(ch) {
-            while pos > 0 && is_word_char(self.buffer().content.char(pos - 1)) {
+            let wide = is_wide_word_char(ch);
+            while pos > 0 {
+                let prev = self.buffer().content.char(pos - 1);
+                if !is_word_char(prev) || is_wide_word_char(prev) != wide {
+                    break;
+                }
                 pos -= 1;
             }
         } else {
@@ -145,7 +155,9 @@ impl Engine {
         // Check if we're already at the end of a word
         let at_word_end = if pos + 1 < total_chars {
             let next_char = self.buffer().content.char(pos + 1);
-            (is_word_char(current_char) && !is_word_char(next_char))
+            (is_word_char(current_char)
+                && (!is_word_char(next_char)
+                    || is_wide_word_char(next_char) != is_wide_word_char(current_char)))
                 || (!is_word_char(current_char)
                     && !current_char.is_whitespace()
                     && (is_word_char(next_char) || next_char.is_whitespace()))
@@ -172,7 +184,12 @@ impl Engine {
 
         let ch = self.buffer().content.char(pos);
         if is_word_char(ch) {
-            while pos + 1 < total_chars && is_word_char(self.buffer().content.char(pos + 1)) {
+            let wide = is_wide_word_char(ch);
+            while pos + 1 < total_chars {
+                let next = self.buffer().content.char(pos + 1);
+                if !is_word_char(next) || is_wide_word_char(next) != wide {
+                    break;
+                }
                 pos += 1;
             }
         } else if !ch.is_whitespace() {
@@ -206,7 +223,12 @@ impl Engine {
         // If on whitespace, just move back one to begin searching.
         if !ch.is_whitespace() {
             if is_word_char(ch) {
-                while pos > 0 && is_word_char(self.buffer().content.char(pos - 1)) {
+                let wide = is_wide_word_char(ch);
+                while pos > 0 {
+                    let prev = self.buffer().content.char(pos - 1);
+                    if !is_word_char(prev) || is_wide_word_char(prev) != wide {
+                        break;
+                    }
                     pos -= 1;
                 }
             } else {
@@ -573,7 +595,8 @@ impl Engine {
         }
         let line_text: String = self.buffer().content.line(line).chars().collect();
         let chars: Vec<char> = line_text.trim_end_matches('\n').chars().collect();
-        let (start, len, new_text) = addsub_in_line(&chars, col, delta, NrFormats::default(), sel)?;
+        let nf = NrFormats::from_list(&self.settings.nrformats);
+        let (start, len, new_text) = addsub_in_line(&chars, col, delta, nf, sel)?;
 
         let line_start = self.buffer().line_to_char(line);
         self.delete_with_undo(line_start + start, line_start + start + len);
@@ -3192,6 +3215,21 @@ impl Engine {
             return;
         }
         let end_line = (start_line + count).min(num_lines);
+        // Fold-aware (#1006): extend to cover the full range of any closed
+        // fold either boundary touches — `dd` on a closed fold's header
+        // removes every line inside it, not just the header
+        // (`:h fold-behavior`, verified against `nvim --headless`).
+        let start_line = self
+            .view()
+            .enclosing_closed_fold(start_line)
+            .map(|f| f.start)
+            .unwrap_or(start_line);
+        let end_line = self
+            .view()
+            .enclosing_closed_fold(end_line.saturating_sub(1).max(start_line))
+            .map(|f| f.end + 1)
+            .unwrap_or(end_line)
+            .min(num_lines);
         let actual_count = end_line - start_line;
 
         if actual_count == 0 {
@@ -3540,16 +3578,17 @@ impl Engine {
 
     /// `<C-b>`: scroll a full page backward, keeping a 2-line overlap with
     /// the previous page. Mirrors `<C-f>`, with two differences confirmed
-    /// against real interactive Neovim (#805; see
-    /// `scripts/nvim_headless_vs_interactive_repro.sh` — the headless
-    /// oracle `tests/nvim_conformance.rs` uses disagrees with real Neovim
-    /// on both):
+    /// against real interactive Neovim (#805, #1008; see
+    /// `scripts/nvim_headless_vs_interactive_repro.sh` and #1008's
+    /// attached-UI RPC oracle in `tests/nvim_conformance.rs`):
     ///  - already at the top of the buffer is a true no-op (no cursor
     ///    move at all), not just a clamped scroll;
-    ///  - the cursor lands on `scrolloff + 1` lines below the *previous*
-    ///    topline — not at the bottom of the new page — which only
-    ///    coincides with "bottom of the new page" when the scroll isn't
-    ///    clamped by the start of the buffer.
+    ///  - the cursor lands on the **last line of the new window**
+    ///    (`w_botline - 1`, minus `scrolloff`), not a fixed offset from
+    ///    the previous topline. The two forms agree whenever a whole page
+    ///    is actually scrolled, and only diverge when the scroll is
+    ///    clamped by the start of the buffer — see the in-body comment
+    ///    below for the measured numbers.
     pub(crate) fn page_up(&mut self) {
         let old_top = self.view().scroll_top;
         if old_top == 0 {
@@ -3561,8 +3600,27 @@ impl Engine {
         let step = viewport.saturating_sub(overlap);
         let new_top = self.view().prev_visible_line(old_top, step);
         self.view_mut().scroll_top = new_top;
+        // Vim lands `<C-b>` on the **last line of the new window**
+        // (`onepage()` sets `w_cursor.lnum = w_botline - 1`), not a fixed
+        // offset from where the window used to be. The two are the same
+        // number whenever a whole page was actually scrolled — which is why
+        // the old `old_top + 1` form was right for every single `<C-b>` — and
+        // they part company the moment the scroll is clamped at the top of
+        // the buffer, because then the window moved less than a page but the
+        // cursor still belongs at its bottom edge.
+        //
+        // Measured against both a headless and a real interactive Neovim
+        // (`scripts/nvim_headless_vs_interactive_repro.sh`), 60-line buffer,
+        // 22-row window, cursor on line 60: `2<C-b>` ends on line 22. The old
+        // form answered 20. This was `tests/nvim_conformance.rs`'s last
+        // `HARNESS_LIMITED` entry, excused for three issues as a broken-oracle
+        // artifact; #1008's attached-UI oracle showed the oracle had been
+        // right all along (see that file's `HARNESS_LIMITED` doc comment).
+        let bottom = self
+            .view()
+            .next_visible_line(new_top, viewport.saturating_sub(1), max_line);
         let scrolloff = self.settings.scrolloff;
-        let target = (old_top + scrolloff + 1).min(max_line);
+        let target = bottom.saturating_sub(scrolloff).max(new_top).min(max_line);
         self.land_vertical_scroll_cursor(target);
     }
 
@@ -3952,6 +4010,124 @@ impl Engine {
         }
     }
 
+    // ── 'foldmethod' "indent" ───────────────────────────────────────────────
+    //
+    // The block below implements Vim's real indent-fold algorithm
+    // (`:h fold-indent`), which is deliberately a *different, more faithful*
+    // computation than `detect_fold_range` above: `detect_fold_range` treats
+    // the less-indented line immediately before a block as that block's
+    // header (the right heuristic for "fold what's under the cursor" — used
+    // by the VSCode-style progressive fold and as the historical z-command
+    // fallback), but that's not what Vim's indent method does. Vim assigns
+    // each line its OWN level (`indent / shiftwidth`) independent of its
+    // neighbors, so an unindented `fn foo() {` is level 0 and — unlike
+    // `detect_fold_range`'s header — is never itself inside a fold. A
+    // level-N fold is a maximal run of >= 2 consecutive lines all at level
+    // >= N (a single elevated line does not become its own fold). Verified
+    // line-for-line against `nvim --headless -u NONE` with
+    // `foldmethod=indent` on a two-level nested fixture (#1006).
+
+    /// A line's indent-fold level: `indent / shiftwidth`, rounded down.
+    fn indent_fold_level(&self, line_idx: usize) -> usize {
+        let shift_width = (self.settings.shift_width as usize).max(1);
+        self.line_indent(line_idx) / shift_width
+    }
+
+    /// Compute the full nested indent-fold hierarchy: every foldable
+    /// region, with its 1-based nesting depth (1 = outermost). See the
+    /// module comment above for why this doesn't reuse `detect_fold_range`.
+    pub(crate) fn compute_indent_folds(&self) -> Vec<(usize, usize, usize)> {
+        let total = self.buffer().len_lines();
+        let levels: Vec<usize> = (0..total).map(|i| self.indent_fold_level(i)).collect();
+        let mut out = Vec::new();
+        Self::collect_level_folds(&levels, 0, total, 1, &mut out);
+        out
+    }
+
+    /// Recursive helper for `compute_indent_folds`: within `[from, to)`,
+    /// find every maximal run of >= 2 consecutive lines at `level` or
+    /// deeper, record it, then recurse one level deeper over that same
+    /// sub-range to find the folds nested inside it.
+    fn collect_level_folds(
+        levels: &[usize],
+        from: usize,
+        to: usize,
+        level: usize,
+        out: &mut Vec<(usize, usize, usize)>,
+    ) {
+        let mut i = from;
+        while i < to {
+            if levels[i] >= level {
+                let start = i;
+                let mut end = i;
+                while end + 1 < to && levels[end + 1] >= level {
+                    end += 1;
+                }
+                if end > start {
+                    out.push((start, end, level));
+                    Self::collect_level_folds(levels, start, end + 1, level + 1, out);
+                }
+                i = end + 1;
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    /// The innermost indent-computed fold containing `line`, if any.
+    fn indent_fold_containing(&self, line: usize) -> Option<(usize, usize)> {
+        self.compute_indent_folds()
+            .into_iter()
+            .filter(|(start, end, _)| *start <= line && line <= *end)
+            .min_by_key(|(start, end, _)| end - start)
+            .map(|(start, end, _)| (start, end))
+    }
+
+    /// The nearest indent-fold header strictly after `line`, skipping
+    /// headers already hidden inside another closed fold.
+    fn indent_fold_after(&self, line: usize) -> Option<usize> {
+        self.compute_indent_folds()
+            .into_iter()
+            .map(|(start, _, _)| start)
+            .filter(|&start| start > line && !self.view().is_line_hidden(start))
+            .min()
+    }
+
+    /// The *end* of the nearest indent fold strictly before `line` — `zk`
+    /// moves to the end of the previous fold, not its start (`:h zk`;
+    /// verified against `nvim --headless`, #1006), unlike `zj`'s `:h zj`
+    /// "start of the next fold". Skips folds already hidden inside another
+    /// closed fold.
+    fn indent_fold_end_before(&self, line: usize) -> Option<usize> {
+        self.compute_indent_folds()
+            .into_iter()
+            .filter(|(start, end, _)| *end < line && !self.view().is_line_hidden(*start))
+            .map(|(_, end, _)| end)
+            .max()
+    }
+
+    /// Apply `'foldlevel'` under `'foldmethod'` `"indent"`: compute the
+    /// nested indent-fold hierarchy and close every fold nested deeper than
+    /// `level`, processing deepest-first. Deepest-first matters when both a
+    /// fold and its child need closing (`level` 0 with 2+ nesting levels):
+    /// closing the child first and the parent second lets `close_fold`'s
+    /// "drop folds fully contained in the new one" rule fold the child's
+    /// closed entry into the parent's, leaving one clean closed range
+    /// instead of two overlapping ones. Folds at or above `level` are still
+    /// recorded via `define_fold` (not closed) so a later `zo`/`zc` on them
+    /// works from a real definition.
+    pub fn apply_foldlevel(&mut self, level: usize) {
+        let mut ranges = self.compute_indent_folds();
+        ranges.sort_by_key(|(_, _, level)| std::cmp::Reverse(*level));
+        for (start, end, fold_level) in ranges {
+            if fold_level > level {
+                self.view_mut().close_fold(start, end);
+            } else {
+                self.view_mut().define_fold(start, end);
+            }
+        }
+    }
+
     /// Toggle the fold at `line_idx` regardless of cursor position.
     /// Used by click handlers when the user clicks the fold indicator.
     pub fn toggle_fold_at_line(&mut self, line_idx: usize) {
@@ -3974,16 +4150,43 @@ impl Engine {
         }
     }
 
+    /// Close a fold, then (matching Vim) pull the cursor up to the header if
+    /// it just got hidden.
+    fn close_fold_and_clamp(&mut self, start: usize, end: usize) {
+        self.view_mut().close_fold(start, end);
+        if self.view().is_line_hidden(self.view().cursor.line) {
+            self.view_mut().cursor.line = start;
+            self.clamp_cursor_col();
+        }
+    }
+
+    /// zc — close the fold enclosing the cursor.
+    ///
+    /// Prefers an already-*defined* fold (`fold_defs`, however it was
+    /// created and whether currently open or closed) so a manual `zf` fold
+    /// round-trips through `zo`/`zc` back to the same region (#1006) rather
+    /// than trying to rediscover it. With `'foldmethod'` `"indent"` and
+    /// nothing defined yet at the cursor, falls back to the real indent-fold
+    /// computation (`compute_indent_folds`) — Vim computes that method's
+    /// hierarchy automatically, without a `zf`. In `"manual"` mode with
+    /// nothing defined, matches Vim: nothing happens (`E490`), verified
+    /// against `nvim --headless` (#1006) — vimcode used to invent a fold
+    /// from indentation here even in the default manual method, which real
+    /// Vim never does.
     pub(crate) fn cmd_fold_close(&mut self) {
         let line = self.view().cursor.line;
-        if let Some((start, end)) = self.detect_fold_range(line) {
-            self.view_mut().close_fold(start, end);
-            // If cursor ended up inside the fold, move it to the header.
-            if self.view().is_line_hidden(self.view().cursor.line) {
-                self.view_mut().cursor.line = start;
-                self.clamp_cursor_col();
+        if let Some(range) = self.view().enclosing_fold_def(line) {
+            let (start, end) = (range.start, range.end);
+            self.close_fold_and_clamp(start, end);
+            return;
+        }
+        if self.settings.foldmethod == "indent" {
+            if let Some((start, end)) = self.indent_fold_containing(line) {
+                self.close_fold_and_clamp(start, end);
+                return;
             }
         }
+        self.message = "E490: No fold found".to_string();
     }
 
     /// Find the enclosing foldable block for `line` by walking upward to find
@@ -4074,27 +4277,48 @@ impl Engine {
         self.view_mut().open_fold(line);
     }
 
-    /// zM — close all folds in the buffer using indent-based detection.
+    /// zM — close every fold in the buffer.
+    ///
+    /// With `'foldmethod'` `"indent"` this first computes the whole
+    /// indent-fold hierarchy (Vim derives that method's folds automatically,
+    /// there's no `zf` step) and closes it down to `'foldlevel'` 0 — i.e.
+    /// closes everything (`apply_foldlevel(0)`). Otherwise (`"manual"`) it
+    /// only closes folds that already exist via `zf`; matching Vim, `zM`
+    /// never invents a manual fold (#1006, verified against `nvim
+    /// --headless`).
     pub(crate) fn cmd_fold_close_all(&mut self) {
-        let total = self.buffer().len_lines();
-        let mut i = 0;
-        while i < total {
-            if let Some((start, end)) = self.detect_fold_range(i) {
+        if self.settings.foldmethod == "indent" {
+            self.apply_foldlevel(0);
+        } else {
+            let mut defs: Vec<(usize, usize)> = self
+                .view()
+                .fold_defs
+                .iter()
+                .map(|f| (f.start, f.end))
+                .collect();
+            // Innermost (narrowest) first, so `close_fold`'s "drop folds
+            // fully contained in the new one" rule folds a closed child into
+            // its closed parent instead of leaving two overlapping entries.
+            defs.sort_by_key(|(start, end)| end - start);
+            for (start, end) in defs {
                 self.view_mut().close_fold(start, end);
-                i = end + 1;
-            } else {
-                i += 1;
             }
         }
         // Clamp cursor if it ended up hidden.
         let cursor_line = self.view().cursor.line;
         if self.view().is_line_hidden(cursor_line) {
-            // Move cursor to the nearest fold header above.
-            for f in self.view().folds.iter().rev() {
-                if f.start <= cursor_line && cursor_line <= f.end {
-                    self.view_mut().cursor.line = f.start;
-                    break;
-                }
+            // Move cursor to the outermost enclosing fold's header — nested
+            // closed folds can both contain `cursor_line` (#1006), and only
+            // the outermost header is actually visible.
+            if let Some(start) = self
+                .view()
+                .folds
+                .iter()
+                .filter(|f| f.start <= cursor_line && cursor_line <= f.end)
+                .map(|f| f.start)
+                .min()
+            {
+                self.view_mut().cursor.line = start;
             }
             self.clamp_cursor_col();
         }
@@ -4155,6 +4379,33 @@ impl Engine {
         self.message = format!("{lines} lines folded");
     }
 
+    /// zf{a/i}{object} (e.g. `zfap`, `zfi{`) — fold the line range of a text
+    /// object, the same grammar `d`/`c`/`y` use (#1006). Reuses
+    /// `find_text_object_range` rather than duplicating its per-object
+    /// logic; converts the returned char range to a line range the way
+    /// `cmd_fold_create`'s other callers already work in.
+    pub(crate) fn apply_fold_text_object(&mut self, modifier: char, obj_type: char) {
+        let cursor = self.view().cursor;
+        let cursor_pos = self.buffer().line_to_char(cursor.line) + cursor.col;
+        let count = self.take_count().max(1);
+        let Some((start_pos, end_pos)) =
+            self.find_text_object_range(modifier, obj_type, cursor_pos, count)
+        else {
+            return;
+        };
+        if start_pos >= end_pos {
+            return;
+        }
+        let start_line = self.buffer().content.char_to_line(start_pos);
+        // `end_pos` is exclusive (points just past the object), so resolve
+        // the line of the last character actually *in* the object.
+        let end_line = self
+            .buffer()
+            .content
+            .char_to_line((end_pos - 1).max(start_pos));
+        self.cmd_fold_create(start_line, end_line);
+    }
+
     /// zv — open enough folds to make cursor line visible.
     pub(crate) fn cmd_fold_open_cursor_visible(&mut self) {
         loop {
@@ -4179,28 +4430,25 @@ impl Engine {
         self.cmd_fold_close_all();
     }
 
-    /// zj — move to the start of the next fold.
+    /// zj — move to the start of the next fold (open or closed — any
+    /// defined fold, not just closed ones, matches Vim). With
+    /// `'foldmethod'` `"indent"`, also considers folds not yet materialized
+    /// in `fold_defs` (Vim computes that method's hierarchy on demand, not
+    /// just from prior `zf`/`zc`/`zM` calls).
     pub(crate) fn cmd_fold_move_next(&mut self) {
         let cursor_line = self.view().cursor.line;
-        let total = self.buffer().len_lines();
-        // First check existing closed folds.
         let next_fold = self
             .view()
-            .folds
+            .fold_defs
             .iter()
-            .find(|f| f.start > cursor_line)
-            .map(|f| f.start);
-        // Also scan for potential fold starts (lines with children indented deeper).
-        let mut next_detectable = None;
-        for i in (cursor_line + 1)..total {
-            if self.view().is_line_hidden(i) {
-                continue;
-            }
-            if self.detect_fold_range(i).is_some() {
-                next_detectable = Some(i);
-                break;
-            }
-        }
+            .filter(|f| f.start > cursor_line)
+            .map(|f| f.start)
+            .min();
+        let next_detectable = if self.settings.foldmethod == "indent" {
+            self.indent_fold_after(cursor_line)
+        } else {
+            None
+        };
         let target = match (next_fold, next_detectable) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (Some(a), None) => Some(a),
@@ -4213,28 +4461,23 @@ impl Engine {
         }
     }
 
-    /// zk — move to the end of the previous fold.
+    /// zk — move to the *end* of the previous fold (`:h zk`; not its start —
+    /// that asymmetry with `zj` is real Vim behavior, verified against
+    /// `nvim --headless`, #1006).
     pub(crate) fn cmd_fold_move_prev(&mut self) {
         let cursor_line = self.view().cursor.line;
-        // Check existing closed folds.
         let prev_fold = self
             .view()
-            .folds
+            .fold_defs
             .iter()
-            .rev()
-            .find(|f| f.start < cursor_line)
-            .map(|f| f.start);
-        // Also scan for potential fold starts.
-        let mut prev_detectable = None;
-        for i in (0..cursor_line).rev() {
-            if self.view().is_line_hidden(i) {
-                continue;
-            }
-            if self.detect_fold_range(i).is_some() {
-                prev_detectable = Some(i);
-                break;
-            }
-        }
+            .filter(|f| f.end < cursor_line)
+            .map(|f| f.end)
+            .max();
+        let prev_detectable = if self.settings.foldmethod == "indent" {
+            self.indent_fold_end_before(cursor_line)
+        } else {
+            None
+        };
         let target = match (prev_fold, prev_detectable) {
             (Some(a), Some(b)) => Some(a.max(b)),
             (Some(a), None) => Some(a),
@@ -4781,6 +5024,58 @@ impl Engine {
         self.message = "1 line yanked".to_string();
     }
 
+    /// Advance `idx` past one "cursor cell" — a base character plus any
+    /// immediately-following zero-display-width characters (Vim's
+    /// "composing" characters: combining marks, and some Hangul jamo — a
+    /// leading consonant is full-width, but the vowel/final jamo that
+    /// combines with it is zero-width) — capped at `limit` (exclusive).
+    /// Shared by [`Engine::cluster_chars_len`] and [`Engine::cluster_count`]
+    /// so the two can't drift on what counts as one cell. (#1005)
+    ///
+    /// Reuses `quadraui::text_util::char_cell_width` (unconditionally
+    /// compiled, no feature gate) rather than re-deriving zero-width
+    /// classification locally — see the Platform-Neutrality Rule in
+    /// CLAUDE.md.
+    fn advance_one_cell(&self, mut idx: usize, limit: usize) -> usize {
+        idx += 1;
+        while idx < limit
+            && quadraui::text_util::char_cell_width(self.buffer().content.char(idx)) == 0
+        {
+            idx += 1;
+        }
+        idx
+    }
+
+    /// Length in chars of `count` "cursor cells" starting at `start`, capped
+    /// at `limit` (exclusive). `x`/`X`/`r` count *cells*, not raw
+    /// codepoints — `:h utf-8-char`, verified against `nvim`: `rX` on
+    /// `e` + U+0301 (combining acute) replaces both codepoints with a single
+    /// `X`, and `x` deletes both as one unit. (#1005)
+    pub(crate) fn cluster_chars_len(&self, start: usize, count: usize, limit: usize) -> usize {
+        let mut idx = start;
+        let mut n = 0;
+        while n < count && idx < limit {
+            idx = self.advance_one_cell(idx, limit);
+            n += 1;
+        }
+        idx - start
+    }
+
+    /// How many whole cursor cells (see [`Engine::cluster_chars_len`]) fit
+    /// between `start` and `limit` — used to fail `Nr{c}`/`Nx` the same way
+    /// Vim does when fewer than `N` cells remain on the line, rather than
+    /// only checking raw codepoint count (which would let a count that
+    /// spans a combining-mark cluster silently succeed short).
+    pub(crate) fn cluster_count(&self, start: usize, limit: usize) -> usize {
+        let mut idx = start;
+        let mut n = 0;
+        while idx < limit {
+            idx = self.advance_one_cell(idx, limit);
+            n += 1;
+        }
+        n
+    }
+
     /// Replace count characters with the replacement character
     pub(crate) fn replace_chars(&mut self, replacement: char, count: usize, changed: &mut bool) {
         let line = self.view().cursor.line;
@@ -4800,11 +5095,12 @@ impl Engine {
         };
 
         // `:h r` — the count must fit on the line, otherwise `r` fails
-        // entirely (`5rx` on `abc` changes nothing).
-        if count > available {
+        // entirely (`5rx` on `abc` changes nothing). Counted in cursor
+        // cells, not raw codepoints (#1005) — see `cluster_count`.
+        if count > self.cluster_count(char_idx, char_idx + available) {
             return;
         }
-        let to_replace = count.min(available);
+        let to_replace = self.cluster_chars_len(char_idx, count, char_idx + available);
 
         if replacement == '\n' {
             // `Nr<CR>` replaces the N characters with a SINGLE line break and
@@ -4836,15 +5132,19 @@ impl Engine {
         }
 
         if to_replace > 0 && char_idx < self.buffer().len_chars() {
-            // Build the replacement string
-            let replacement_str: String = std::iter::repeat_n(replacement, to_replace).collect();
+            // Build the replacement string — one replacement char per
+            // replaced *cell* (`count`), not per deleted codepoint
+            // (`to_replace`): a single combining-mark cluster spans several
+            // codepoints but is exactly one cell, so `rX` on it must produce
+            // one `X`, not one per codepoint (#1005).
+            let replacement_str: String = std::iter::repeat_n(replacement, count).collect();
 
             // Delete the old characters and insert the new ones
             self.delete_with_undo(char_idx, char_idx + to_replace);
             self.insert_with_undo(char_idx, &replacement_str);
 
             // Cursor on last replaced char (Neovim behavior)
-            self.view_mut().cursor.col = col + to_replace - 1;
+            self.view_mut().cursor.col = col + count - 1;
             self.clamp_cursor_col();
             *changed = true;
         }
@@ -4855,6 +5155,19 @@ impl Engine {
         let start_line = self.view().cursor.line;
         let total_lines = self.buffer().len_lines();
         let end_line = (start_line + count).min(total_lines);
+        // Fold-aware (#1006): see `delete_lines`'s identical fix — `yy` on a
+        // closed fold's header yanks every line inside it.
+        let start_line = self
+            .view()
+            .enclosing_closed_fold(start_line)
+            .map(|f| f.start)
+            .unwrap_or(start_line);
+        let end_line = self
+            .view()
+            .enclosing_closed_fold(end_line.saturating_sub(1).max(start_line))
+            .map(|f| f.end + 1)
+            .unwrap_or(end_line)
+            .min(total_lines);
         let actual_count = end_line - start_line;
 
         if actual_count == 0 {
@@ -5820,9 +6133,24 @@ impl Engine {
             // Insert a space unless the next non-ws char is ')' or next line was empty/only ws.
             // Also don't add space if the current line already ends with whitespace.
             let should_add_space = !matches!(next_non_ws, None | Some(')') | Some(']') | Some('}'));
-            let ends_with_ws = newline_pos > cur_line_start
-                && self.buffer().content.char(newline_pos - 1).is_whitespace();
+            let last_char = if newline_pos > cur_line_start {
+                Some(self.buffer().content.char(newline_pos - 1))
+            } else {
+                None
+            };
+            let ends_with_ws = last_char.is_some_and(|c| c.is_whitespace());
             let insert_space = should_add_space && !ends_with_ws;
+            // Vim's 'joinspaces': when on, joining onto a line whose last
+            // non-blank char is '.', '!' or '?' inserts two spaces instead
+            // of one (`:h 'joinspaces'`). `ends_with_ws` being false here
+            // guarantees `last_char` (when `insert_space` is true) really is
+            // that last non-blank char, not trailing whitespace before it.
+            let sentence_end = matches!(last_char, Some('.') | Some('!') | Some('?'));
+            let space_str = if insert_space && self.settings.joinspaces && sentence_end {
+                "  "
+            } else {
+                " "
+            };
 
             // A join needs the absorbed line's marks to gain a *column*
             // offset (not just shift down a line, which is all the generic
@@ -5833,10 +6161,10 @@ impl Engine {
             self.suppress_mark_line_adjust = true;
             self.delete_with_undo(newline_pos, del_end);
             if insert_space {
-                self.insert_with_undo(newline_pos, " ");
+                self.insert_with_undo(newline_pos, space_str);
             }
             self.suppress_mark_line_adjust = false;
-            let ins_len = if insert_space { 1 } else { 0 };
+            let ins_len = if insert_space { space_str.len() } else { 0 };
             self.restore_marks_from_offsets(
                 local_marks,
                 global_marks,
@@ -5877,7 +6205,12 @@ impl Engine {
         // real interactive Neovim's `zz`, which was landing one line lower
         // than vimcode did (see scripts/nvim_headless_vs_interactive_repro.sh).
         let half = self.viewport_lines().saturating_sub(1) / 2;
-        let new_top = cursor_line.saturating_sub(half);
+        // Fold-aware (#1006): step back `half` *visible* rows, not buffer
+        // lines — plain subtraction can land `scroll_top` inside a closed
+        // fold's hidden body, and undercounts how far up the buffer a
+        // closed fold above the cursor actually reaches (a fold spanning
+        // many buffer lines is still only one screen row).
+        let new_top = self.view().prev_visible_line(cursor_line, half);
         self.view_mut().scroll_top = new_top;
     }
 
@@ -5933,6 +6266,25 @@ impl Engine {
             tab_id: self.active_tab().id,
             window_id: self.active_window_id(),
         }
+    }
+
+    /// Test-support accessor (#985): a public snapshot of the jump list —
+    /// `(file, line, col)` per entry, 0-indexed like the rest of the engine's
+    /// cursor API. `JumpEntry`/`jump_list` are `pub(crate)`, so an external
+    /// integration test (`tests/nvim_conformance.rs`) has no other way to
+    /// compare vimcode's jumplist contents against Neovim's `getjumplist()`
+    /// oracle. Read-only; no behaviour change.
+    pub fn jump_list_snapshot(&self) -> Vec<(Option<std::path::PathBuf>, usize, usize)> {
+        self.jump_list
+            .iter()
+            .map(|e| (e.file.clone(), e.line, e.col))
+            .collect()
+    }
+
+    /// Test-support accessor (#985): the jump list's current position —
+    /// see [`Engine::jump_list_snapshot`].
+    pub fn jump_list_position(&self) -> usize {
+        self.jump_list_pos
     }
 
     /// Push the current cursor position onto the jump list, and set it as
@@ -6437,26 +6789,39 @@ impl Engine {
     /// `H`'s target: the `count`'th line from the top of the window, kept at
     /// least 'scrolloff' lines below the top edge (#805). Shared with `dH` so
     /// the operator form honours its count too (#807).
+    /// `H`'s target: the `count`'th line from the top of the window.
+    ///
+    /// Fold-aware (#1006): a closed fold occupies exactly one screen row
+    /// regardless of how many buffer lines it spans, so "the window's last
+    /// row" is a *buffer* line only `next_visible_line` can find — plain
+    /// `scroll_top + viewport_lines - 1` arithmetic under-counts by however
+    /// many lines are folded away, landing `H`/`L`/`zt`+`L`/`zz`+`H` short
+    /// of where Neovim actually puts them (verified against `nvim
+    /// --headless`).
     pub(crate) fn screen_top_target(&self, count: usize) -> usize {
         let scroll_top = self.view().scroll_top;
         let viewport = self.view().viewport_lines.max(1);
         let max_line = self.buffer().len_lines().saturating_sub(1);
         let offset = count.saturating_sub(1).max(self.settings.scrolloff);
-        (scroll_top + offset)
-            .min(scroll_top + viewport.saturating_sub(1))
+        let rows = offset.min(viewport.saturating_sub(1));
+        self.view()
+            .next_visible_line(scroll_top, rows, max_line)
             .min(max_line)
     }
 
     /// `L`'s target: the `count`'th line from the bottom of the window — the
-    /// mirror of [`Engine::screen_top_target`].
+    /// mirror of [`Engine::screen_top_target`], and fold-aware for the same
+    /// reason (see its doc).
     pub(crate) fn screen_bottom_target(&self, count: usize) -> usize {
         let scroll_top = self.view().scroll_top;
         let viewport = self.view().viewport_lines.max(1);
         let max_line = self.buffer().len_lines().saturating_sub(1);
-        let window_bottom = scroll_top + viewport - 1;
+        let window_bottom =
+            self.view()
+                .next_visible_line(scroll_top, viewport.saturating_sub(1), max_line);
         let offset = count.saturating_sub(1).max(self.settings.scrolloff);
-        window_bottom
-            .saturating_sub(offset)
+        self.view()
+            .prev_visible_line(window_bottom, offset)
             .max(scroll_top)
             .min(max_line)
     }
@@ -6615,12 +6980,35 @@ pub(crate) const CLASS_NL: u8 = 0;
 pub(crate) const CLASS_BLANK: u8 = 1;
 const CLASS_WORD: u8 = 2;
 const CLASS_PUNCT: u8 = 3;
+const CLASS_WIDE: u8 = 4;
+
+/// True for "wide" (double display-cell) word characters — CJK ideographs,
+/// Hiragana, Katakana, Hangul syllables and similar East-Asian-Wide
+/// alphanumerics.
+///
+/// `is_word_char` alone (Rust's `is_alphanumeric`) does not distinguish
+/// these from ASCII/Latin/Cyrillic letters, but Vim does: verified against
+/// `nvim`, `w` on `foo日本語bar` stops between `foo` and `日本語` even though
+/// nothing separates them, while `w` on `helloжworld` (Cyrillic embedded in
+/// ASCII, both narrow) does not stop there at all — the whole thing is one
+/// word. `w`/`e`/`b`/`ge` and the `iw`/`aw` text objects treat a transition
+/// between narrow-word and wide-word as a boundary the same way they treat a
+/// word/punctuation transition. (#1005)
+///
+/// Reuses `quadraui::text_util::is_wide_char` (unconditionally compiled, no
+/// feature gate) rather than re-deriving East Asian Width locally — see the
+/// Platform-Neutrality Rule in CLAUDE.md.
+pub(crate) fn is_wide_word_char(c: char) -> bool {
+    is_word_char(c) && quadraui::text_util::is_wide_char(c)
+}
 
 fn char_class(c: char) -> u8 {
     if c == '\n' {
         CLASS_NL
     } else if c.is_whitespace() {
         CLASS_BLANK
+    } else if is_wide_word_char(c) {
+        CLASS_WIDE
     } else if is_word_char(c) {
         CLASS_WORD
     } else {
@@ -6630,7 +7018,7 @@ fn char_class(c: char) -> u8 {
 
 fn bigword_class(c: char) -> u8 {
     match char_class(c) {
-        CLASS_PUNCT => CLASS_WORD,
+        CLASS_PUNCT | CLASS_WIDE => CLASS_WORD,
         other => other,
     }
 }
@@ -6648,8 +7036,10 @@ fn bigword_class(c: char) -> u8 {
 // plus a separate sign flag**, so that is what this models.
 // ---------------------------------------------------------------------------
 
-/// Vim's 'nrformats'.  VimCode has no setting for it yet and pins Neovim's
-/// default (`bin,hex` — note Vim's own default additionally includes `octal`).
+/// Vim's 'nrformats'. `Default` matches `Settings::default().nrformats`
+/// (`bin,hex` — note Vim's own default additionally includes `octal`); the
+/// live value is built from `Settings::nrformats` via [`NrFormats::from_list`]
+/// (#1001).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) struct NrFormats {
     pub bin: bool,
@@ -6666,6 +7056,30 @@ impl Default for NrFormats {
             hex: true,
             alpha: false,
         }
+    }
+}
+
+impl NrFormats {
+    /// Parse `Settings::nrformats`' `"bin"`/`"octal"`/`"hex"`/`"alpha"`
+    /// keywords (`:h 'nrformats'`) into flags. Unknown keywords are ignored,
+    /// matching real Vim's tolerance of unrecognized comma-separated values.
+    pub(crate) fn from_list(list: &[String]) -> Self {
+        let mut nf = Self {
+            bin: false,
+            oct: false,
+            hex: false,
+            alpha: false,
+        };
+        for item in list {
+            match item.as_str() {
+                "bin" => nf.bin = true,
+                "octal" => nf.oct = true,
+                "hex" => nf.hex = true,
+                "alpha" => nf.alpha = true,
+                _ => {}
+            }
+        }
+        nf
     }
 }
 
@@ -6869,6 +7283,28 @@ pub(crate) fn addsub_in_line(
     let firstdigit = at(chars, col);
     if !firstdigit.is_ascii_digit() && !(nf.alpha && firstdigit.is_ascii_alphabetic()) {
         return None;
+    }
+
+    if firstdigit.is_ascii_alphabetic() {
+        // `:h nrformats`, "alpha": a single ASCII letter is its own
+        // self-contained "number" — it increments/decrements within its own
+        // case's a-z/A-Z range and *clamps* rather than wraps at either end
+        // (`z<C-a>` stays `z`, `a<C-x>` stays `a`), unlike every other format
+        // here, which wraps modulo its width. It has no sign and no padding:
+        // a literal `-` right before it is never consumed as part of it —
+        // `-a<C-a>` leaves the `-` untouched and gives `-b`, not `-` + `0`
+        // (which would give `-a` unchanged) — so this returns before the
+        // sign-consuming step below, which applies only to the
+        // decimal/hex/bin formats.
+        let base = if firstdigit.is_ascii_uppercase() {
+            b'A'
+        } else {
+            b'a'
+        } as i64;
+        let pos = firstdigit as i64 - base;
+        let new_pos = (pos + delta).clamp(0, 25);
+        let new_ch = (base + new_pos) as u8 as char;
+        return Some((col, 1, new_ch.to_string()));
     }
 
     if !visual && col > 0 && at(chars, col - 1) == '-' {

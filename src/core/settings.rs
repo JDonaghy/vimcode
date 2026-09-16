@@ -272,6 +272,51 @@ pub struct Settings {
     #[serde(default)]
     pub startofline: bool,
 
+    /// When true, `J` (join) inserts two spaces instead of one after a line
+    /// ending in `.`, `!` or `?`. Corresponds to Vim's `'joinspaces'` /
+    /// `'js'`. Default **false**, matching Neovim (real Vim defaults this
+    /// **on** — see `:h 'joinspaces'`). `gJ` is unaffected regardless of this
+    /// setting: it never inserts a space.
+    #[serde(default)]
+    pub joinspaces: bool,
+
+    /// When true, `<Tab>` at or before the first non-blank column of a line
+    /// advances by `'shiftwidth'` (rounded to its next stop) instead of
+    /// `'tabstop'`, and `<BS>` over leading whitespace deletes a whole
+    /// `'shiftwidth'` worth of blanks instead of one character. Corresponds
+    /// to Vim's `'smarttab'` / `'sta'`. Default **true**, matching Neovim
+    /// (real Vim defaults this **off** — see `:h 'smarttab'`); vimcode's
+    /// existing hardcoded Insert-mode Tab/BS behavior already matched
+    /// Neovim's default before this option existed, so flipping the default
+    /// would silently change behavior for every user who never touches this
+    /// setting.
+    #[serde(default = "default_smarttab")]
+    pub smarttab: bool,
+
+    /// Which numeral formats `<C-a>`/`<C-x>` (and Visual-mode `g<C-a>`)
+    /// recognize besides plain decimal: any of `"bin"`, `"octal"`, `"hex"`,
+    /// `"alpha"`. Corresponds to Vim's `'nrformats'` / `'nf'`. Default
+    /// `["bin", "hex"]`, matching Neovim (real Vim's default additionally
+    /// includes `"octal"` — see `:h 'nrformats'`).
+    #[serde(default = "default_nrformats")]
+    pub nrformats: Vec<String>,
+
+    /// How folds are found: `"manual"` (only `zf`-created folds — nothing is
+    /// closeable until the user explicitly folds a range) or `"indent"`
+    /// (folds are derived from indentation and recomputed on demand).
+    /// Corresponds to Vim's `'foldmethod'` / `'fdm'`. Default `"manual"`,
+    /// matching Vim (`:h 'foldmethod'`) — a fresh buffer has no folds at all
+    /// until one is created.
+    #[serde(default = "default_foldmethod")]
+    pub foldmethod: String,
+
+    /// When `'foldmethod'` is `"indent"`, folds nested deeper than this level
+    /// start closed; folds at or above it start open. Corresponds to Vim's
+    /// `'foldlevel'` / `'fdl'`. Default `0`, matching Vim: every indent fold
+    /// starts closed until raised (`:h 'foldlevel'`).
+    #[serde(default)]
+    pub foldlevel: usize,
+
     /// Highlight the line the cursor is on (default true).
     #[serde(default = "default_cursorline")]
     pub cursorline: bool,
@@ -407,9 +452,32 @@ pub struct Settings {
     pub hover_delay: u32,
 
     /// Use Nerd Font icons in the UI (activity bar, file explorer, panels).
-    /// Disable if your terminal/font lacks Nerd Font glyphs to get ASCII fallbacks.
-    #[serde(default = "default_use_nerd_fonts")]
-    pub use_nerd_fonts: bool,
+    ///
+    /// Backend-derived (issue #999): `None` means "inherit from the running
+    /// backend" and is resolved live by the [`Settings::use_nerd_fonts`]
+    /// accessor method — GTK and macOS bundle Symbols Nerd Font 3.5.1 and
+    /// install/register it at startup
+    /// (`app_support::install_bundled_icon_font`,
+    /// `render::register_nerd_font_fallback`), so the glyphs are guaranteed
+    /// available regardless of what the user has installed, on every OS —
+    /// those two backends therefore inherit `true` unconditionally. Win-GUI
+    /// shares the same bundled font in principle but has two open,
+    /// unverified bugs (vimcode#178, vimcode#161) suggesting its font
+    /// resolution path may not actually work yet, and there is no Windows
+    /// host in this project's fleet to check — so it keeps the conservative
+    /// guess until those are confirmed fixed. The TUI renders through the
+    /// user's terminal emulator, which uses its own configured font; there
+    /// is no reliable way to detect that font's glyph coverage from inside
+    /// the terminal (a CSI-6n width probe measures advance, not whether a
+    /// real glyph painted — see the issue), so the TUI also keeps the
+    /// previous conservative `target_os`-based guess and offers
+    /// `:CheckNerdFonts` for the user to check by eye instead. `Some(_)` is
+    /// an explicit user override that always wins, including across a
+    /// later backend change, and persists across restarts. Never read this
+    /// field directly; call the accessor method
+    /// (`self.settings.use_nerd_fonts()`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub use_nerd_fonts: Option<bool>,
 
     /// What Ctrl+F does: "find" opens the find/replace overlay, "page_down"
     /// is traditional Vim Ctrl+F page-down behavior.
@@ -474,13 +542,50 @@ fn default_hover_delay() -> u32 {
     300
 }
 
-fn default_use_nerd_fonts() -> bool {
-    // On Windows, terminal fonts (Consolas, Cascadia Mono) don't include Nerd
-    // Font glyphs by default. Use ASCII fallback icons instead.  Users who
-    // install a Nerd Font can enable via `:set nerdfonts`.  On Linux/macOS,
-    // the GTK backend bundles a Nerd Font subset and TUI terminals commonly
-    // have Nerd Font support.
-    !cfg!(target_os = "windows")
+/// Backend-derived default for `use_nerd_fonts` — see the field doc on
+/// [`Settings::use_nerd_fonts`].
+///
+/// `gui` is `crate::icons::is_gui_backend()`, set once at startup by every
+/// GUI entry point (`App::new`, `App::new_portable`,
+/// `App::new_headless_with_backend`) right where they already call
+/// `icons::set_nerd_fonts(...)`; it defaults to `false` (the conservative,
+/// TUI assumption) so a caller that forgets to opt in gets today's
+/// behavior rather than a false "glyphs available".
+///
+/// GUI is uniform across GTK/macOS/Win-GUI *except* on Windows itself:
+/// `App`'s `impl quadraui::ShellApp` is the one shared implementation all
+/// three GUI backends run (`src/app.rs`), so there is no per-backend hook
+/// to special-case just Win-GUI without adding per-backend code — this
+/// `cfg!(target_os = "windows")` check lives here in core, mirroring the
+/// TUI branch below, rather than in `src/gtk/`/`src/tui_main/`, so it does
+/// not run afoul of this repo's Platform-Neutrality Rule. The reason it
+/// exists at all: vimcode#178 (diff toolbar arrows render as `?`) and
+/// vimcode#161 (tree-sized icon font) are open evidence that Win-GUI's
+/// DirectWrite fallback path may not fully resolve the bundled font yet,
+/// and there is no Windows host anywhere in this project's fleet to verify
+/// it either way. Per the issue: "if Win-GUI genuinely can't resolve it
+/// yet, leave it off and say so" — so Win-GUI keeps the pre-#999
+/// conservative guess until #178/#161 confirm the font path actually
+/// works, while GTK/macOS (verified to bundle and resolve the font) get
+/// the new `true` default on every OS they run on.
+fn default_use_nerd_fonts(gui: bool) -> bool {
+    if gui && cfg!(target_os = "windows") {
+        // Win-GUI: see the doc comment above — #178/#161 are open,
+        // unverified evidence that the bundled font may not resolve here,
+        // so don't claim it's available until they're confirmed fixed.
+        false
+    } else if gui {
+        // GTK/macOS bundle the font (`app_support::ICON_FONT_BYTES`) and
+        // install/register it at startup — always available.
+        true
+    } else {
+        // TUI: on Windows, terminal fonts (Consolas, Cascadia Mono) don't
+        // include Nerd Font glyphs by default. Use ASCII fallback icons
+        // instead. Users who install a Nerd Font can enable via
+        // `:set nerdfonts` or `:CheckNerdFonts`. On Linux/macOS, TUI
+        // terminals commonly have Nerd Font support.
+        !cfg!(target_os = "windows")
+    }
 }
 
 fn default_swap_file() -> bool {
@@ -565,6 +670,18 @@ fn default_leader() -> char {
 
 fn default_extension_registries() -> Vec<String> {
     vec![crate::core::registry::DEFAULT_REGISTRY_URL.to_string()]
+}
+
+fn default_smarttab() -> bool {
+    true
+}
+
+fn default_nrformats() -> Vec<String> {
+    vec!["bin".to_string(), "hex".to_string()]
+}
+
+fn default_foldmethod() -> String {
+    "manual".to_string()
 }
 
 fn default_colorscheme() -> String {
@@ -956,6 +1073,11 @@ impl Default for Settings {
             smartcase: false,
             scrolloff: 0,
             startofline: false,
+            joinspaces: false,
+            smarttab: default_smarttab(),
+            nrformats: default_nrformats(),
+            foldmethod: default_foldmethod(),
+            foldlevel: 0,
             cursorline: default_cursorline(),
             window_status_line: default_window_status_line(),
             status_line_above_terminal: default_status_line_above_terminal(),
@@ -984,8 +1106,8 @@ impl Default for Settings {
             match_brackets: default_match_brackets(),
             auto_pairs: None, // mode-derived — see Settings::auto_pairs()
             hover_delay: default_hover_delay(),
-            use_nerd_fonts: default_use_nerd_fonts(),
-            ctrl_f_action: None, // mode-derived — see Settings::ctrl_f_action()
+            use_nerd_fonts: None, // backend-derived — see Settings::use_nerd_fonts()
+            ctrl_f_action: None,  // mode-derived — see Settings::ctrl_f_action()
             syntax_max_lines: default_syntax_max_lines(),
         }
     }
@@ -1026,6 +1148,21 @@ impl Settings {
     pub fn auto_pairs(&self) -> bool {
         self.auto_pairs
             .unwrap_or_else(|| default_auto_pairs(self.editor_mode))
+    }
+
+    /// Resolve the effective `use_nerd_fonts`: an explicit override if set,
+    /// otherwise the backend-derived default (issue #999) — see the field
+    /// doc on [`Settings::use_nerd_fonts`]. Unlike `ctrl_f_action`/
+    /// `auto_pairs`, which are derived from `self.editor_mode` (a stored,
+    /// user-configurable field), the dimension here — GUI vs TUI — isn't a
+    /// `Settings` field at all: it's a fact about which binary is running,
+    /// recorded via `crate::icons::set_gui_backend`/`is_gui_backend` the
+    /// same way `icons::set_nerd_fonts` already threads the resolved
+    /// glyph-vs-fallback flag through this module (see that thread-local's
+    /// doc for why thread-local, not process-global).
+    pub fn use_nerd_fonts(&self) -> bool {
+        self.use_nerd_fonts
+            .unwrap_or_else(|| default_use_nerd_fonts(crate::icons::is_gui_backend()))
     }
 
     /// Load settings from ~/.config/vimcode/settings.json
@@ -1232,7 +1369,7 @@ impl Settings {
         } else {
             "nosmartcase"
         };
-        let nf = if self.use_nerd_fonts {
+        let nf = if self.use_nerd_fonts() {
             "nerdfonts"
         } else {
             "nonerdfonts"
@@ -1303,6 +1440,8 @@ impl Settings {
             "ignorecase" | "ic" => self.ignorecase = enable,
             "smartcase" | "scs" => self.smartcase = enable,
             "startofline" | "sol" => self.startofline = enable,
+            "joinspaces" | "js" => self.joinspaces = enable,
+            "smarttab" | "sta" => self.smarttab = enable,
             "cursorline" | "cul" => self.cursorline = enable,
             "windowstatusline" | "wsl" => self.window_status_line = enable,
             "statuslineaboveterminal" | "slat" => self.status_line_above_terminal = enable,
@@ -1321,8 +1460,12 @@ impl Settings {
             "minimap" => self.minimap = enable,
             "matchbrackets" => self.match_brackets = enable,
             "autopairs" => self.auto_pairs = Some(enable),
-            "nerdfonts" | "nf" => {
-                self.use_nerd_fonts = enable;
+            // `"nf"` is Vim's real abbreviation for `'nrformats'` (a
+            // value-option, handled in `set_value_option` below) — nerdfonts
+            // (a vimcode-only setting with no real-Vim counterpart) keeps
+            // only its full name here to avoid claiming that abbreviation.
+            "nerdfonts" => {
+                self.use_nerd_fonts = Some(enable);
                 crate::icons::set_nerd_fonts(enable);
             }
             _ => {
@@ -1388,6 +1531,13 @@ impl Settings {
             }
             "extension_registries" => {
                 self.extension_registries = value
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+            }
+            "nrformats" | "nf" => {
+                self.nrformats = value
                     .split(',')
                     .map(|s| s.trim().to_string())
                     .filter(|s| !s.is_empty())
@@ -1520,6 +1670,17 @@ impl Settings {
             } else {
                 "nostartofline".to_string()
             }),
+            "joinspaces" | "js" => Ok(if self.joinspaces {
+                "joinspaces".to_string()
+            } else {
+                "nojoinspaces".to_string()
+            }),
+            "smarttab" | "sta" => Ok(if self.smarttab {
+                "smarttab".to_string()
+            } else {
+                "nosmarttab".to_string()
+            }),
+            "nrformats" | "nf" => Ok(format!("nrformats={}", self.nrformats.join(","))),
             "cursorline" | "cul" => Ok(if self.cursorline {
                 "cursorline".to_string()
             } else {
@@ -1608,7 +1769,7 @@ impl Settings {
                 self.extension_registries.join(",")
             )),
             "hover_delay" | "hd" => Ok(format!("hover_delay={}", self.hover_delay)),
-            "nerdfonts" | "nf" => Ok(if self.use_nerd_fonts {
+            "nerdfonts" => Ok(if self.use_nerd_fonts() {
                 "nerdfonts".to_string()
             } else {
                 "nonerdfonts".to_string()
@@ -1711,6 +1872,9 @@ impl Settings {
             "spelllang" => self.spelllang.clone(),
             "scrolloff" => self.scrolloff.to_string(),
             "startofline" | "sol" => self.startofline.to_string(),
+            "joinspaces" | "js" => self.joinspaces.to_string(),
+            "smarttab" | "sta" => self.smarttab.to_string(),
+            "nrformats" | "nf" => self.nrformats.join(","),
             "colorcolumn" => self.colorcolumn.clone(),
             "textwidth" => self.textwidth.to_string(),
             "hlsearch" => self.hlsearch.to_string(),
@@ -1753,7 +1917,7 @@ impl Settings {
             "match_brackets" | "matchbrackets" => self.match_brackets.to_string(),
             "auto_pairs" | "autopairs" => self.auto_pairs().to_string(),
             "hover_delay" => self.hover_delay.to_string(),
-            "use_nerd_fonts" | "nerdfonts" | "nf" => self.use_nerd_fonts.to_string(),
+            "use_nerd_fonts" | "nerdfonts" => self.use_nerd_fonts().to_string(),
             "ctrl_f_action" => self.ctrl_f_action(),
             "extension_registries" => self.extension_registries.join(", "),
             "syntax_max_lines" | "syntaxmaxlines" => self.syntax_max_lines.to_string(),
@@ -1812,6 +1976,15 @@ impl Settings {
                     .map_err(|_| format!("Invalid scrolloff: {value}"))?;
             }
             "startofline" | "sol" => self.startofline = value == "true",
+            "joinspaces" | "js" => self.joinspaces = value == "true",
+            "smarttab" | "sta" => self.smarttab = value == "true",
+            "nrformats" | "nf" => {
+                self.nrformats = value
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+            }
             "colorcolumn" => self.colorcolumn = value.to_string(),
             "textwidth" => {
                 self.textwidth = value
@@ -1881,9 +2054,9 @@ impl Settings {
                     .parse()
                     .map_err(|_| format!("Invalid hover_delay: {value}"))?;
             }
-            "use_nerd_fonts" | "nerdfonts" | "nf" => {
-                self.use_nerd_fonts = value == "true";
-                crate::icons::set_nerd_fonts(self.use_nerd_fonts);
+            "use_nerd_fonts" | "nerdfonts" => {
+                self.use_nerd_fonts = Some(value == "true");
+                crate::icons::set_nerd_fonts(self.use_nerd_fonts());
             }
             "ctrl_f_action" => match value {
                 "find" | "page_down" => self.ctrl_f_action = Some(value.to_string()),
@@ -2122,6 +2295,27 @@ pub static SETTING_DEFS: &[SettingDef] = &[
         description: "Land on the first non-blank column after G, gg, H, M, L, <C-d>, <C-u>, <C-b>, <C-f> (Vim's default; Neovim's is off)",
         category: "Editor",
         setting_type: SettingType::Bool,
+    },
+    SettingDef {
+        key: "joinspaces",
+        label: "Join Spaces",
+        description: "Insert two spaces instead of one when J joins a line ending in '.', '!' or '?' (Vim's default; Neovim's is off)",
+        category: "Editor",
+        setting_type: SettingType::Bool,
+    },
+    SettingDef {
+        key: "smarttab",
+        label: "Smart Tab",
+        description: "Tab/Backspace at the start of a line use 'shift_width' instead of 'tabstop' (Vim's default is off; Neovim's is on)",
+        category: "Editor",
+        setting_type: SettingType::Bool,
+    },
+    SettingDef {
+        key: "nrformats",
+        label: "Number Formats",
+        description: "Extra numeral formats <C-a>/<C-x> recognize besides decimal: bin, octal, hex, alpha (comma-separated; Neovim's default is \"bin,hex\")",
+        category: "Editor",
+        setting_type: SettingType::StringVal,
     },
     SettingDef {
         key: "colorcolumn",
@@ -2719,6 +2913,42 @@ mod tests {
     }
 
     #[test]
+    fn test_set_smarttab() {
+        let mut s = Settings::default();
+        assert!(s.smarttab);
+        s.parse_set_option("nosmarttab").unwrap();
+        assert!(!s.smarttab);
+        s.parse_set_option("sta").unwrap();
+        assert!(s.smarttab);
+    }
+
+    #[test]
+    fn test_set_nrformats_default_and_nf_alias() {
+        let mut s = Settings::default();
+        assert_eq!(s.nrformats, vec!["bin".to_string(), "hex".to_string()]);
+        let msg = s.parse_set_option("nf=bin,octal,hex").unwrap();
+        assert_eq!(msg, "nf=bin,octal,hex");
+        assert_eq!(
+            s.nrformats,
+            vec!["bin".to_string(), "octal".to_string(), "hex".to_string()]
+        );
+        let query = s.parse_set_option("nrformats?").unwrap();
+        assert_eq!(query, "nrformats=bin,octal,hex");
+    }
+
+    #[test]
+    fn test_nf_abbreviation_is_nrformats_not_nerdfonts() {
+        // `"nf"` is Vim's real 'nrformats' abbreviation. vimcode's own
+        // nerdfonts setting predates this option and had claimed "nf" for
+        // itself; that alias was dropped in favor of the real-Vim meaning —
+        // `:set nf=...` must go to `nrformats`, not toggle `nerdfonts`.
+        let mut s = Settings::default();
+        s.parse_set_option("nf=alpha").unwrap();
+        assert_eq!(s.nrformats, vec!["alpha".to_string()]);
+        assert!(s.use_nerd_fonts()); // untouched
+    }
+
+    #[test]
     fn test_set_unknown_option_is_error() {
         let mut s = Settings::default();
         assert!(s.parse_set_option("unknownoption").is_err());
@@ -3146,12 +3376,17 @@ mod tests {
             !json.contains("\"accept\""),
             "unset completion_keys.accept must be omitted from serialized settings"
         );
+        assert!(
+            !json.contains("\"use_nerd_fonts\""),
+            "unset use_nerd_fonts must be omitted from serialized settings"
+        );
 
         // Round-trip: deserializing that JSON must still resolve unset.
         let s2: Settings = serde_json::from_str(&json).unwrap();
         assert!(s2.ctrl_f_action.is_none());
         assert!(s2.auto_pairs.is_none());
         assert!(s2.completion_keys.accept.is_none());
+        assert!(s2.use_nerd_fonts.is_none());
     }
 
     #[test]
@@ -3160,12 +3395,74 @@ mod tests {
         s.ctrl_f_action = Some("find".to_string());
         s.auto_pairs = Some(true);
         s.completion_keys.accept = Some("<C-y>".to_string());
+        s.use_nerd_fonts = Some(false);
 
         let json = serde_json::to_string(&s).unwrap();
         let s2: Settings = serde_json::from_str(&json).unwrap();
         assert_eq!(s2.ctrl_f_action, Some("find".to_string()));
         assert_eq!(s2.auto_pairs, Some(true));
         assert_eq!(s2.completion_keys.accept, Some("<C-y>".to_string()));
+        assert_eq!(s2.use_nerd_fonts, Some(false));
+    }
+
+    // ── Backend-derived contested default: `use_nerd_fonts` (#999) ──────────
+    // Unlike the mode-derived trio above, this one derives from which
+    // *backend* is running (GUI vs TUI) rather than `editor_mode` — see the
+    // field doc on `Settings::use_nerd_fonts`. `crate::icons::
+    // is_gui_backend`/`set_gui_backend` is thread-local (it sits next to
+    // `nerd_fonts_enabled`/`set_nerd_fonts`, for the same #618 reason), so
+    // each test here saves and restores the ambient value to avoid leaking
+    // into whatever other test Rust's runner schedules next on the same
+    // worker thread.
+
+    #[test]
+    fn use_nerd_fonts_unset_is_true_on_gui_backend() {
+        let prev = crate::icons::is_gui_backend();
+        crate::icons::set_gui_backend(true);
+        let s = Settings::default();
+        assert!(s.use_nerd_fonts.is_none(), "must start unset");
+        assert!(
+            s.use_nerd_fonts(),
+            "GUI bundles the icon font, so an unset setting must resolve true on every OS"
+        );
+        crate::icons::set_gui_backend(prev);
+    }
+
+    #[test]
+    fn use_nerd_fonts_unset_is_conservative_guess_on_tui_backend() {
+        let prev = crate::icons::is_gui_backend();
+        crate::icons::set_gui_backend(false);
+        let s = Settings::default();
+        assert!(s.use_nerd_fonts.is_none(), "must start unset");
+        assert_eq!(
+            s.use_nerd_fonts(),
+            !cfg!(target_os = "windows"),
+            "TUI keeps the previous target_os-based guess"
+        );
+        crate::icons::set_gui_backend(prev);
+    }
+
+    #[test]
+    fn use_nerd_fonts_explicit_override_survives_backend_change() {
+        let prev = crate::icons::is_gui_backend();
+
+        let mut s = Settings::default();
+        s.use_nerd_fonts = Some(false);
+        crate::icons::set_gui_backend(true);
+        assert!(
+            !s.use_nerd_fonts(),
+            "explicit false must win even on a GUI backend that would default true"
+        );
+
+        let mut s2 = Settings::default();
+        s2.use_nerd_fonts = Some(true);
+        crate::icons::set_gui_backend(false);
+        assert!(
+            s2.use_nerd_fonts(),
+            "explicit true must win even on a TUI backend that might default false"
+        );
+
+        crate::icons::set_gui_backend(prev);
     }
 
     /// #902: `menu_style` defaults to `Inherit`, matching VS Code's

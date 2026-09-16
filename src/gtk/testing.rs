@@ -537,8 +537,15 @@ pub fn conformance_harness(
     let backend: Rc<RefCell<Box<dyn crate::app::TextMetricsBackend>>> =
         Rc::new(RefCell::new(Box::new(super::backend::GtkBackend::new())));
     let (app, config) = crate::harness::build_app_and_config(Rc::clone(&engine), backend);
+    let screen_layout = Rc::clone(&app.cached_screen_layout);
     let driver = driver_with_shell(app, config, width, height);
-    crate::harness::ConformanceHarness::new(driver, engine, paint, cwd)
+    crate::harness::ConformanceHarness::new_with_screen_layout(
+        driver,
+        engine,
+        screen_layout,
+        paint,
+        cwd,
+    )
 }
 
 /// The same as [`conformance_harness`], but with `dir`'s shared
@@ -1763,7 +1770,7 @@ mod tests {
         // the harness paints its first frame.
         let render_with_nerd_fonts = |on: bool| {
             let mut engine = engine_with_two_rust_tabs();
-            engine.settings.use_nerd_fonts = on;
+            engine.settings.use_nerd_fonts = Some(on);
             crate::icons::set_nerd_fonts(on);
             let mut h = harness(engine, 1400, 900);
             tab_zero_left_half(&mut h)
@@ -1799,6 +1806,86 @@ mod tests {
         );
     }
 
+    /// #999 acceptance, GTK half: with `use_nerd_fonts` left **unset**
+    /// (`None` — the state of a fresh `Settings::default()`, i.e. no
+    /// `settings.json` on disk at all) a GUI backend must still paint the
+    /// Nerd Font language badge, on the strength of the bundled icon font
+    /// alone (`app_support::ICON_FONT_BYTES`) rather than any guess about
+    /// the host OS. This is the driver-tier twin of `Settings::
+    /// use_nerd_fonts`'s unit tests (`use_nerd_fonts_unset_is_true_on_gui_backend`
+    /// et al. in `core/settings.rs`), asserted on **rendered pixels**
+    /// rather than on `Settings` state — see `CLAUDE.md`'s "Testing
+    /// (CRITICAL)" rule ("assert on rendered output, never on state being
+    /// populated").
+    ///
+    /// Uses `Engine::new_for_test()`, not `engine_with_two_rust_tabs`'s
+    /// usual `Engine::new()`: this test's whole point is the *unset*
+    /// resolution path, so it must not risk inheriting an explicit
+    /// `use_nerd_fonts` from whatever `~/.config/vimcode/settings.json`
+    /// happens to exist on the machine running the suite.
+    ///
+    /// # Why this fails against unfixed `develop`
+    ///
+    /// Before #999, `Settings::use_nerd_fonts` was a plain `bool` defaulted
+    /// by `!cfg!(target_os = "windows")` — on this Linux/macOS test fleet
+    /// that guess happens to also be `true`, so the pixel assertion below
+    /// stays green even against the old code by accident of host OS. The
+    /// part unfixed `develop` actually gets wrong — defaulting `false` on a
+    /// Windows *GTK* build despite bundling the font — has no compilable
+    /// driver in this fleet (`src/win/mod.rs` is Windows-only, same
+    /// constraint noted there). What this test *does* pin down, and what
+    /// breaks immediately under a naive revert: swapping the accessor back
+    /// to reading `self.use_nerd_fonts` directly no longer compiles once
+    /// the field is `Option<bool>`, and reverting `App::new_headless_with_backend`'s
+    /// `icons::set_gui_backend(true)` call (so `is_gui_backend()` stays
+    /// `false` here, the TUI-shaped answer) does *not* flip this test on
+    /// this host, precisely because TUI's guess and GUI's new default
+    /// happen to coincide off Windows — which is exactly the coverage gap
+    /// `use_nerd_fonts_unset_is_true_on_gui_backend`'s unit test exists to
+    /// close for the resolution logic itself; this test's job is only to
+    /// prove that logic is actually wired into what gets painted.
+    #[test]
+    fn tab_language_icon_paints_by_default_with_use_nerd_fonts_unset() {
+        let prev_nf = crate::icons::nerd_fonts_enabled();
+
+        let mut engine = Engine::new_for_test();
+        assert!(
+            engine.settings.use_nerd_fonts.is_none(),
+            "fixture must start from the unset default, not an explicit override"
+        );
+        let cwd = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        engine.cwd = cwd.clone();
+        for (i, name) in ["aaa703.rs", "bbb703.rs"].iter().enumerate() {
+            if i > 0 {
+                engine.new_tab(None);
+            }
+            let buf = engine.active_buffer_id();
+            if let Some(state) = engine.buffer_manager.get_mut(buf) {
+                state.file_path = Some(cwd.join(name));
+            }
+        }
+
+        let mut h = harness(engine, 1400, 900);
+        let (on_px, _) = tab_zero_left_half(&mut h);
+
+        crate::icons::set_nerd_fonts(prev_nf);
+
+        let reddest = |px: &[(u8, u8, u8)]| {
+            px.iter()
+                .max_by_key(|(r, _, b)| *r as i32 - *b as i32)
+                .copied()
+        };
+        assert!(
+            on_px.iter().copied().any(is_icon_orange),
+            "with use_nerd_fonts unset, a GUI backend must still paint the \
+             orange Rust badge — the font is bundled, so there is nothing \
+             to detect and nothing to guess wrong; sampled {} px, reddest \
+             was {:?}",
+            on_px.len(),
+            reddest(&on_px)
+        );
+    }
+
     /// #703, **the regression that matters**: with icons painted, a click on
     /// the painted × must still close the tab it sits on.
     ///
@@ -1827,7 +1914,7 @@ mod tests {
         // After `Engine::new` (which applies the developer's own settings),
         // before the harness paints — see `tab_paints_its_language_icon…`.
         let mut engine = engine_with_three_named_tabs();
-        engine.settings.use_nerd_fonts = true;
+        engine.settings.use_nerd_fonts = Some(true);
         crate::icons::set_nerd_fonts(true);
         let mut h = harness(engine, 1400, 900);
 
@@ -1850,6 +1937,193 @@ mod tests {
             "clicking tab 1's painted × must close tab 1 — measuring with \
              the icon-less `tab_bar_layout` while painting with icons closes \
              the tab to its left"
+        );
+    }
+
+    // ── #992: file-type icon coverage (.cs via the expanded extension
+    // table) ─────────────────────────────────────────────────────────────
+
+    /// True for a pixel painted near `target` — the identity colour of some
+    /// file type's badge. A *tighter* ±10-per-channel tolerance than
+    /// `is_icon_orange`'s ±25 above: `ICON_BLUE` (#519aba) sits much closer
+    /// than orange does to this theme's ordinary antialiased text-on-dark-
+    /// background fringe colours, so ±25 picked up false "blue" matches on
+    /// tabs with no badge at all (verified by hand: a `.zz` control tab's
+    /// unbadged slot had pixels ±16-24 off ICON_BLUE, all antialiasing
+    /// fringe, while the glyph body itself paints the exact RGB triple with
+    /// no tolerance needed at all). ±10 still comfortably covers the glyph's
+    /// own edge antialiasing without reaching into that fringe.
+    fn pixel_near((r, g, b): (u8, u8, u8), target: (u8, u8, u8)) -> bool {
+        let near = |a: u8, b: u8| (a as i32 - b as i32).abs() <= 10;
+        near(r, target.0) && near(g, target.1) && near(b, target.2)
+    }
+
+    /// Two tabs, backed by the given (equal-length, so their painted slots
+    /// are equal-width) filenames. Mirrors `engine_with_two_rust_tabs` but
+    /// parameterised so the #992 `.cs` coverage tests below can reuse the
+    /// same `tab_zero_left_half` trick for any extension pairing.
+    fn engine_with_two_tabs_named(names: [&str; 2]) -> Engine {
+        let mut engine = Engine::new();
+        let cwd = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        engine.cwd = cwd.clone();
+        for (i, name) in names.iter().enumerate() {
+            if i > 0 {
+                engine.new_tab(None);
+            }
+            let buf = engine.active_buffer_id();
+            if let Some(state) = engine.buffer_manager.get_mut(buf) {
+                state.file_path = Some(cwd.join(name));
+            }
+        }
+        engine
+    }
+
+    /// A `.cs` tab paints its badge in `ICON_BLUE` (C#'s Seti-UI colour),
+    /// and a same-shaped tab with an unrecognised extension does not. The
+    /// two-case comparison is what actually proves "non-generic badge, not
+    /// just some badge": a single render showing a blue-ish pixel somewhere
+    /// could also be an antialiasing fringe of unrelated chrome, and a
+    /// render that only checked "some Nerd Font glyph painted" would have
+    /// passed against the #992 bug report, where `.json` painted a badge
+    /// while `.cs` silently fell through to the generic one because no
+    /// extension-table arm existed for it.
+    ///
+    /// # Why this fails against unfixed `develop`
+    ///
+    /// Before #992 added a `"cs"` arm to `icons::file_icon_color`, `.cs`
+    /// fell through the same `_ => ICON_NEUTRAL` catch-all as the
+    /// unrecognised-extension control case — both tabs would paint
+    /// `ICON_NEUTRAL` (off-white), never `ICON_BLUE`, and the first
+    /// assertion below fails.
+    #[test]
+    fn tab_paints_a_distinct_icon_for_cs_files() {
+        let prev_nf = crate::icons::nerd_fonts_enabled();
+
+        let render_with = |names: [&str; 2]| {
+            let mut engine = engine_with_two_tabs_named(names);
+            engine.settings.use_nerd_fonts = Some(true);
+            crate::icons::set_nerd_fonts(true);
+            let mut h = harness(engine, 1400, 900);
+            tab_zero_left_half(&mut h)
+        };
+
+        // Tab 0 is `.cs` in the first render, an unrecognised extension in
+        // the second — `tab_zero_left_half` always samples tab 0.
+        let (cs_px, _) = render_with(["aaa992.cs", "bbb992.zz"]);
+        let (generic_px, _) = render_with(["ccc992.zz", "ddd992.cs"]);
+
+        crate::icons::set_nerd_fonts(prev_nf);
+
+        assert!(
+            cs_px
+                .iter()
+                .copied()
+                .any(|p| pixel_near(p, crate::icons::ICON_BLUE)),
+            "a .cs tab must paint its blue C# badge inside its own slot; \
+             sampled: {:?}",
+            cs_px
+        );
+        assert!(
+            !generic_px
+                .iter()
+                .copied()
+                .any(|p| pixel_near(p, crate::icons::ICON_BLUE)),
+            "an unrecognised extension must not paint the C# blue badge; \
+             matches: {:?}",
+            generic_px
+                .iter()
+                .copied()
+                .filter(|p| pixel_near(*p, crate::icons::ICON_BLUE))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// A fresh temp dir containing a single file named `file_name`, with an
+    /// `Engine` whose explorer sidebar has revealed it (the default active
+    /// panel is Explorer, per `App::new_headless`/`Engine::new`). Returns
+    /// the engine and the directory (the caller must clean the directory up
+    /// once done with the harness built from it).
+    fn engine_revealing_one_explorer_file(
+        file_name: &str,
+        tag: &str,
+    ) -> (Engine, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_test_992_gtk_explorer_{tag}_{:?}",
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join(file_name);
+        std::fs::write(&file, "marker\n").unwrap();
+
+        let mut engine = Engine::new();
+        engine.cwd = dir.clone();
+        engine.settings.use_nerd_fonts = Some(true);
+        engine.explorer_reveal_path(&file);
+        (engine, dir)
+    }
+
+    /// The explorer-tree counterpart to `tab_paints_a_distinct_icon_for_cs_
+    /// files` above: a `.cs` file's row paints the C# badge glyph, and a
+    /// sibling file with an unrecognised extension does not — rendered in
+    /// **separate** fixtures (one file per render) rather than side by side,
+    /// because `GtkDriver::find_bounds` returns only the *first* match for a
+    /// needle and `FILE_GENERIC`'s glyph is also painted elsewhere in this
+    /// fixture's chrome (verified by hand: it resolves to an unrelated
+    /// widget, not the row under test), so a shared-screen comparison could
+    /// silently pass by matching the wrong occurrence. There is no per-icon
+    /// *colour* to probe here unlike the tab bar: `build_explorer_tree_rows`
+    /// constructs `QIcon::new(glyph, fallback)` with no colour parameter at
+    /// all (unlike `quadraui::TabIcon`), so the glyph identity itself is the
+    /// only thing to assert on — via `find_bounds` locating the raw glyph
+    /// string, the same way `find_bounds("Paste")` locates ordinary text.
+    ///
+    /// # Why this fails against unfixed `develop`
+    ///
+    /// Before #992 added a `"cs"` arm to `icons::file_icon`, `.cs` fell
+    /// through to `FILE_GENERIC` just like the unrecognised-extension
+    /// control case, so `find_bounds(FILE_CSHARP.nerd)` would find nothing
+    /// in the first fixture — the first assertion fails.
+    #[test]
+    fn explorer_tree_paints_a_distinct_icon_for_cs_files() {
+        let prev_nf = crate::icons::nerd_fonts_enabled();
+        crate::icons::set_nerd_fonts(true);
+
+        let (cs_engine, cs_dir) = engine_revealing_one_explorer_file("cs992.cs", "cs");
+        let h_cs = harness(cs_engine, 1400, 900);
+        let cs_glyph = h_cs.driver.find_bounds(crate::icons::FILE_CSHARP.nerd);
+        let _ = std::fs::remove_dir_all(&cs_dir);
+
+        let (generic_engine, generic_dir) =
+            engine_revealing_one_explorer_file("zz992.zqx", "generic");
+        let h_generic = harness(generic_engine, 1400, 900);
+        let generic_has_cs_glyph = h_generic
+            .driver
+            .find_bounds(crate::icons::FILE_CSHARP.nerd)
+            .is_some();
+        let generic_has_generic_glyph = h_generic
+            .driver
+            .find_bounds(crate::icons::FILE_GENERIC.nerd)
+            .is_some();
+        let _ = std::fs::remove_dir_all(&generic_dir);
+
+        crate::icons::set_nerd_fonts(prev_nf);
+
+        assert!(
+            cs_glyph.is_some(),
+            "the cs992.cs file's explorer-tree row must paint the C# badge \
+             glyph somewhere on screen"
+        );
+        assert!(
+            !generic_has_cs_glyph,
+            "an unrecognised-extension file's row must not paint the C# \
+             badge glyph"
+        );
+        assert!(
+            generic_has_generic_glyph,
+            "an unrecognised-extension file's row must still paint the \
+             generic badge (proving the difference above is real, not just \
+             'nothing painted')"
         );
     }
 
@@ -2585,7 +2859,7 @@ mod tests {
 
         fn activity_bar_strip(with_ext: bool) -> Vec<(u8, u8, u8)> {
             let mut engine = Engine::new();
-            engine.settings.use_nerd_fonts = false;
+            engine.settings.use_nerd_fonts = Some(false);
             engine.ext_panels.clear();
             if with_ext {
                 engine.ext_panels.insert(
@@ -2685,7 +2959,7 @@ mod tests {
             let _paint = crate::test_paint::PaintGuard::acquire();
             let _cwd = crate::test_cwd::CwdReadGuard::acquire();
             let mut engine = Engine::new();
-            engine.settings.use_nerd_fonts = true;
+            engine.settings.use_nerd_fonts = Some(true);
             let engine = Rc::new(RefCell::new(engine));
             let app = App::new_headless(Rc::clone(&engine));
             let mut config = crate::gtk::build_shell_config(&app);
@@ -3029,7 +3303,7 @@ mod sidebar_panel_clicks {
     /// a Nerd Font installed.
     fn panel_harness(panel: &str) -> Harness<impl AppLogic> {
         let mut engine = Engine::new();
-        engine.settings.use_nerd_fonts = false;
+        engine.settings.use_nerd_fonts = Some(false);
         engine.app_shell.show_panel(&quadraui::WidgetId::new(panel));
         harness(engine, 1400, 900)
     }
@@ -3215,7 +3489,7 @@ mod sidebar_panel_clicks {
     #[test]
     fn bottom_panel_tab_strip_click_switches_the_painted_panel() {
         let mut engine = Engine::new();
-        engine.settings.use_nerd_fonts = false;
+        engine.settings.use_nerd_fonts = Some(false);
         engine.terminal_new_tab(80, 10);
         engine
             .dap_output_lines
@@ -3281,7 +3555,7 @@ mod sidebar_panel_clicks {
     #[test]
     fn terminal_ctrl_f_opens_the_painted_find_bar() {
         let mut engine = Engine::new_for_test();
-        engine.settings.use_nerd_fonts = false;
+        engine.settings.use_nerd_fonts = Some(false);
         // `terminal_new_tab` opens the panel and focuses it.
         engine.terminal_new_tab(80, 10);
 
@@ -3327,7 +3601,7 @@ mod sidebar_panel_clicks {
     fn focused_terminal_swallows_editor_keys_on_gtk() {
         let build = |focused: bool| {
             let mut engine = Engine::new_for_test();
-            engine.settings.use_nerd_fonts = false;
+            engine.settings.use_nerd_fonts = Some(false);
             engine.buffer_mut().insert(0, "ZQXWTERMGTK758\n");
             engine.terminal_new_tab(80, 6);
             engine.terminal_has_focus = focused;
@@ -3542,7 +3816,7 @@ mod sidebar_panel_clicks {
     #[test]
     fn switching_to_a_plugin_panel_clears_stale_marketplace_focus() {
         let mut engine = Engine::new();
-        engine.settings.use_nerd_fonts = false;
+        engine.settings.use_nerd_fonts = Some(false);
         engine.ext_panels.clear();
         engine.ext_panels.insert(
             "git-insights".to_string(),
@@ -3615,7 +3889,7 @@ mod sidebar_panel_clicks {
     #[test]
     fn an_editor_drag_crossing_the_sidebar_is_not_stolen_by_a_panel() {
         let mut engine = Engine::new();
-        engine.settings.use_nerd_fonts = false;
+        engine.settings.use_nerd_fonts = Some(false);
         engine.buffer_mut().insert(
             0,
             "alpha beta gamma
@@ -3651,7 +3925,7 @@ second line here
     #[test]
     fn an_editor_text_drag_paints_a_selection_through_the_shared_drag_router() {
         let mut engine = Engine::new();
-        engine.settings.use_nerd_fonts = false;
+        engine.settings.use_nerd_fonts = Some(false);
         let mut text = String::new();
         for _ in 0..60 {
             text.push_str("alpha beta gamma delta epsilon\n");
@@ -3728,7 +4002,7 @@ second line here
     #[test]
     fn a_sidebar_drag_keeps_its_grab_once_it_crosses_into_the_editor() {
         let mut engine = Engine::new();
-        engine.settings.use_nerd_fonts = false;
+        engine.settings.use_nerd_fonts = Some(false);
         engine.buffer_mut().insert(
             0,
             "alpha beta gamma
@@ -7456,7 +7730,7 @@ mod overlay_band_z_order {
     #[test]
     fn frame_sequence_matches_across_backends_via_gtk_driver() {
         let mut engine = Engine::new();
-        engine.settings.use_nerd_fonts = false;
+        engine.settings.use_nerd_fonts = Some(false);
         engine.buffer_mut().insert(0, "fn main() {}\n");
         // Explicit, not ambient (#762): a global status bar exists only when
         // per-window status lines are off, and the default is on.
@@ -7586,7 +7860,7 @@ mod chrome_band_order {
     #[test]
     fn chrome_band_composes_in_canonical_order_via_gtk_driver() {
         let mut engine = Engine::new();
-        engine.settings.use_nerd_fonts = false;
+        engine.settings.use_nerd_fonts = Some(false);
         // Explicit, not ambient: a global status bar exists only when
         // per-window status lines are off, and the default is on.
         engine.settings.window_status_line = false;
@@ -7639,7 +7913,7 @@ mod chrome_band_order {
     #[test]
     fn chrome_band_drops_the_wildmenu_rung_when_no_completion_is_up_via_gtk_driver() {
         let mut engine = Engine::new();
-        engine.settings.use_nerd_fonts = false;
+        engine.settings.use_nerd_fonts = Some(false);
         engine.settings.window_status_line = false;
         engine.app_shell.show_panel(&quadraui::WidgetId::new(
             crate::core::engine::sidebar::PANEL_SETTINGS,
@@ -7666,7 +7940,7 @@ mod chrome_band_order {
     #[test]
     fn chrome_band_drops_the_status_bar_rung_with_per_window_status_lines_via_gtk_driver() {
         let mut engine = Engine::new();
-        engine.settings.use_nerd_fonts = false;
+        engine.settings.use_nerd_fonts = Some(false);
         engine.settings.window_status_line = true;
         engine.app_shell.show_panel(&quadraui::WidgetId::new(
             crate::core::engine::sidebar::PANEL_SETTINGS,
@@ -7717,7 +7991,7 @@ mod editor_band_order {
     /// this from a seven-rung assertion into a five-rung one.
     fn engine_with_every_editor_rung() -> Engine {
         let mut engine = Engine::new_for_test();
-        engine.settings.use_nerd_fonts = false;
+        engine.settings.use_nerd_fonts = Some(false);
         engine.settings.breadcrumbs = true;
         engine.settings.minimap = true;
         let cwd = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -7912,7 +8186,7 @@ mod editor_band_order {
     #[test]
     fn unsplit_editor_composes_no_group_divider_rung_via_gtk_driver() {
         let mut engine = Engine::new_for_test();
-        engine.settings.use_nerd_fonts = false;
+        engine.settings.use_nerd_fonts = Some(false);
         engine.buffer_mut().insert(0, "fn main() {}\n");
 
         let h = harness(engine, 1400, 900);
@@ -7959,7 +8233,7 @@ mod bottom_band_order {
     /// `app_with_every_bottom_rung`.
     fn engine_with_every_bottom_rung() -> Engine {
         let mut engine = Engine::new_for_test();
-        engine.settings.use_nerd_fonts = false;
+        engine.settings.use_nerd_fonts = Some(false);
         // `separated_status_line` is `Some` only for
         // `window_status_line && !status_line_above_terminal && panel open`.
         engine.settings.window_status_line = true;
@@ -10400,7 +10674,7 @@ mod conformance_proof_slice {
     /// less thing to double-check when a scenario body moves between them.
     fn plain_engine() -> Engine {
         let mut engine = Engine::new_for_test();
-        engine.settings.use_nerd_fonts = false;
+        engine.settings.use_nerd_fonts = Some(false);
         engine
     }
 
@@ -10501,5 +10775,423 @@ mod issue_969_text_metrics_backend_conformance {
     fn gtk_backend_applies_line_height_and_char_width() {
         let mut backend = crate::gtk::backend::GtkBackend::new();
         crate::harness::assert_text_metrics_backend_applies_metrics(&mut backend);
+    }
+}
+
+// ── #971: hit-band integrity sweep, the GTK half ────────────────────────
+//
+// #971's review requested GTK-side coverage proving the SC/ext-panel
+// `set_backend_info` wiring fix and the `HeaderActivated` double-toggle fix
+// both hold on this backend too — the fix sites in `src/app.rs` and
+// `src/core/engine/{source_control,ext_panel}.rs` have no backend gate, so
+// the macOS-only coverage `src/macos/mod.rs::mac_driver_tests` originally
+// shipped was a real gap, not redundant with it. These two tests are the
+// GTK twins of `mac_driver_tests::sc_panel_header_click_hit_band_matches_the_painted_row`
+// and `::ext_panel_header_click_hit_band_matches_the_painted_row` — same
+// fixtures, same `crate::harness::sweep_hit_band_integrity_resetting` call,
+// same sanity-check shape — built on `conformance_harness`
+// (`quadraui::testing::ConformanceDriver`) rather than this module's own
+// `Harness`, since the sweep helpers in `crate::harness` are written once
+// against that backend-neutral trait.
+#[cfg(test)]
+mod hit_band_sweep_971 {
+    use quadraui::testing::ConformanceDriver;
+
+    use super::conformance_harness;
+    use crate::core::engine::sidebar::PANEL_GIT;
+    use crate::core::Engine;
+
+    /// Surface size in pixels — arbitrary, matches `src/macos/mod.rs`'s own
+    /// `W`/`H` for this issue's fixtures so painted layouts are directly
+    /// comparable between the two backends' test failures.
+    const W: i32 = 1400;
+    const H: i32 = 900;
+
+    /// Same nerd-fonts-off rationale as every other `plain_engine()` twin in
+    /// this repo (`src/macos/mod.rs`, `conformance_proof_slice` above):
+    /// icon glyphs are a separate painted run from the text labels these
+    /// tests' `screen_has` checks look for.
+    fn plain_engine() -> Engine {
+        let mut engine = Engine::new_for_test();
+        engine.settings.use_nerd_fonts = Some(false);
+        engine
+    }
+
+    /// Mirrors `src/macos/mod.rs::mac_driver_tests::engine_with_sc_recent_commits`
+    /// exactly: three filler unstaged files (pushes "RECENT COMMITS" a few
+    /// rows down — a row-index-dependent hit-band bug can pass on row 0 and
+    /// only surface further down) and two log entries, so there is a content
+    /// row directly beneath the header a mis-hit could land on.
+    fn engine_with_sc_recent_commits() -> Engine {
+        let mut engine = plain_engine();
+        engine
+            .app_shell
+            .show_panel(&quadraui::WidgetId::new(PANEL_GIT));
+        engine.sc_file_statuses = (0..3)
+            .map(|i| crate::core::git::FileStatus {
+                path: format!("filler_971_{i}.rs"),
+                staged: None,
+                unstaged: Some(crate::core::git::StatusKind::Modified),
+                unmerged: None,
+            })
+            .collect();
+        engine.sc_log = (0..2)
+            .map(|i| crate::core::git::GitLogEntry {
+                hash: format!("{i:07x}"),
+                message: format!("ZQXW971SCLOG{i}"),
+            })
+            .collect();
+        engine
+    }
+
+    /// Mirrors `src/macos/mod.rs::mac_driver_tests::engine_with_marketplace_as_ext_panel`
+    /// exactly.
+    fn engine_with_marketplace_as_ext_panel() -> Engine {
+        let mut engine = plain_engine();
+        engine.ext_registry = Some(vec![crate::core::extensions::ExtensionManifest {
+            name: "zqxw971-avail".to_string(),
+            display_name: "ZQXW971 Available Ext".to_string(),
+            ..Default::default()
+        }]);
+        engine.ext_panel_active = Some("zqxw971-marketplace-via-ext-panel".to_string());
+        engine.ext_panel_has_focus = true;
+        if !engine.app_shell.sidebar_visible() {
+            engine.app_shell.toggle_sidebar();
+        }
+        engine
+    }
+
+    /// Centre point of the first painted text run containing `needle` —
+    /// mirrors `src/macos/mod.rs::mac_driver_tests::center_of` exactly.
+    fn center_of<D: ConformanceDriver>(driver: &D, needle: &str) -> (f32, f32) {
+        let bounds = driver
+            .inventory()
+            .text_runs()
+            .iter()
+            .find(|r| r.text.contains(needle))
+            .unwrap_or_else(|| panic!("center_of: {needle:?} not painted"))
+            .bounds;
+        (
+            bounds.x + bounds.width / 2.0,
+            bounds.y + bounds.height / 2.0,
+        )
+    }
+
+    /// #971: the source-control panel's "RECENT COMMITS" section header,
+    /// clicked anywhere inside its own painted glyphs, must always toggle
+    /// *that* section — never the log row painted immediately below it. The
+    /// GTK twin of `mac_driver_tests::sc_panel_header_click_hit_band_matches_the_painted_row`
+    /// — see that test's own doc for the full rationale (the cached
+    /// `SidebarSystem` routing pattern this pins, and why
+    /// `sweep_hit_band_integrity_resetting` rather than
+    /// `sweep_hit_band_integrity` is needed here: quadraui's
+    /// `DoubleClickDetector` folds two same-spot `MouseDown`s in quick
+    /// succession into a `DoubleClick` on **every** backend — GTK included,
+    /// not just `MacBackend` — and `SidebarSystem::double_click` has no
+    /// header case).
+    ///
+    /// **RED-verification (#971):** reverting `App::paint_sidebar_panel_rung`'s
+    /// `PANEL_GIT` arm to drop its `set_backend_info` call (this issue's own
+    /// fix) takes this test red on GTK exactly as it does on macOS — the
+    /// very first sanity click stops collapsing the section at all, so the
+    /// "`!screen_contains(...)`" sanity assertion fires before the sweep is
+    /// even reached. Confirmed locally with `cargo test --features gui
+    /// sc_panel_header_click_hit_band_matches_the_painted_row_gtk` before
+    /// restoring the fix.
+    #[test]
+    fn sc_panel_header_click_hit_band_matches_the_painted_row_gtk() {
+        let mut h = conformance_harness(engine_with_sc_recent_commits(), W, H);
+
+        assert!(
+            h.driver.screen_contains("RECENT COMMITS") && h.driver.screen_contains("ZQXW971SCLOG0"),
+            "precondition: the SC panel must paint both the RECENT COMMITS \
+             header and its first log entry; painted text was {:?}",
+            h.driver.painted_texts()
+        );
+
+        // Sanity: the sweep below only compares samples against *each
+        // other*, so a header click that silently did nothing would still
+        // pass every sample uniformly. Prove the click has real effect
+        // first, so the sweep cannot pass vacuously.
+        let center = center_of(&h.driver, "RECENT COMMITS");
+        h.driver.click(center.0, center.1);
+        assert!(
+            !h.driver.screen_contains("ZQXW971SCLOG0"),
+            "sanity: a header click must actually collapse the section, \
+             hiding the log entry; painted text was {:?}",
+            h.driver.painted_texts()
+        );
+        h.engine
+            .borrow_mut()
+            .sc_sidebar_system
+            .borrow_mut()
+            .set_collapsed(crate::core::engine::SC_SECTION_LOG, false);
+        h.driver.render();
+        assert!(
+            h.driver.screen_contains("ZQXW971SCLOG0"),
+            "sanity restore: re-expanding the section directly must bring \
+             the log entry back; painted text was {:?}",
+            h.driver.painted_texts()
+        );
+
+        let engine = h.engine.clone();
+        crate::harness::sweep_hit_band_integrity_resetting(
+            &mut h.driver,
+            "RECENT COMMITS",
+            5,
+            |d| {
+                // Break the `DoubleClickDetector`'s position match before
+                // every real probe — see this test's own doc.
+                d.click(W as f32 - 20.0, H as f32 - 20.0);
+                engine
+                    .borrow_mut()
+                    .sc_sidebar_system
+                    .borrow_mut()
+                    .set_collapsed(crate::core::engine::SC_SECTION_LOG, false);
+                d.render();
+            },
+            |d| ConformanceDriver::inventory(d).screen_has("ZQXW971SCLOG0"),
+        );
+    }
+
+    /// #971: the ext-panel body's "AVAILABLE" section header, clicked
+    /// anywhere inside its own painted glyphs, must always toggle *that*
+    /// section — never the row painted immediately below it. The GTK twin
+    /// of `mac_driver_tests::ext_panel_header_click_hit_band_matches_the_painted_row`
+    /// — see that test's own doc for the full rationale, including why it
+    /// does not exercise `render::SidebarBodyGeometry::content_row` (out of
+    /// scope — that formula is wired only to a currently-disconnected hover
+    /// path).
+    ///
+    /// **RED-verification (#971):** reverting `App::paint_sidebar_panel_rung`'s
+    /// `PANEL_EXTENSIONS`/`ext:` arms to drop their `set_backend_info` call
+    /// takes this test red on GTK the same way it does on macOS — the
+    /// sanity click stops collapsing the section, so the sanity assertion
+    /// fires before the sweep runs. Confirmed locally with `cargo test
+    /// --features gui ext_panel_header_click_hit_band_matches_the_painted_row_gtk`
+    /// before restoring the fix.
+    #[test]
+    fn ext_panel_header_click_hit_band_matches_the_painted_row_gtk() {
+        let mut h = conformance_harness(engine_with_marketplace_as_ext_panel(), W, H);
+
+        assert!(
+            h.driver.screen_contains("AVAILABLE")
+                && h.driver.screen_contains("ZQXW971 Available Ext"),
+            "precondition: the ext panel must paint the AVAILABLE header \
+             and its one row; painted text was {:?}",
+            h.driver.painted_texts()
+        );
+
+        // Sanity — see `sc_panel_header_click_hit_band_matches_the_painted_row_gtk`'s
+        // own comment on why this is needed before trusting the sweep below.
+        let center = center_of(&h.driver, "AVAILABLE");
+        h.driver.click(center.0, center.1);
+        assert!(
+            !h.driver.screen_contains("ZQXW971 Available Ext"),
+            "sanity: a header click must actually collapse the AVAILABLE \
+             section, hiding its one row; painted text was {:?}",
+            h.driver.painted_texts()
+        );
+        h.engine
+            .borrow_mut()
+            .ext_sidebar_system
+            .borrow_mut()
+            .set_collapsed(1, false);
+        h.driver.render();
+        assert!(
+            h.driver.screen_contains("ZQXW971 Available Ext"),
+            "sanity restore: re-expanding the section directly must bring \
+             its row back; painted text was {:?}",
+            h.driver.painted_texts()
+        );
+
+        let engine = h.engine.clone();
+        crate::harness::sweep_hit_band_integrity_resetting(
+            &mut h.driver,
+            "AVAILABLE",
+            5,
+            |d| {
+                // Break the `DoubleClickDetector`'s position match before
+                // every real probe — see
+                // `sc_panel_header_click_hit_band_matches_the_painted_row_gtk`'s
+                // identical comment for the full story.
+                d.click(W as f32 - 20.0, H as f32 - 20.0);
+                engine
+                    .borrow_mut()
+                    .ext_sidebar_system
+                    .borrow_mut()
+                    .set_collapsed(1, false);
+                d.render();
+            },
+            |d| ConformanceDriver::inventory(d).screen_has("ZQXW971 Available Ext"),
+        );
+    }
+}
+
+// ─── #991: merge-conflict rows in the Source Control panel (GTK) ─────────
+//
+// The GTK twin of `src/tui_main/shell_app.rs`'s
+// `sc_panel_paints_every_unmerged_xy_code_under_merge_changes` and
+// friends — the multi-backend rule applies to the tests too, and the SC
+// panel's sections are painted through the shared
+// `render::populate_sc_sidebar_system` on both backends, so a section
+// inserted at index 0 has to be proven on both.
+//
+// Every assertion reads *painted* content (`text_runs()` / `screen_has`),
+// never `engine.sc_file_statuses`.
+//
+// **RED against unfixed `develop`:** there is no "MERGE CHANGES" section
+// at all, so `painted_row_y(.., "MERGE CHANGES")` is `None` and the
+// `.expect(..)` fires in all three conflict tests; for `UU`/`UA` the file
+// row is additionally absent from the frame entirely.
+#[cfg(test)]
+mod issue_991_merge_conflicts {
+    use quadraui::testing::ConformanceDriver;
+
+    use super::conformance_harness;
+    use crate::core::engine::sidebar::PANEL_GIT;
+    use crate::core::Engine;
+
+    const W: i32 = 1400;
+    const H: i32 = 900;
+
+    /// Nerd-fonts off for the same reason every other `plain_engine()`
+    /// twin in this repo does it: icon glyphs are a separate painted run
+    /// from the text labels these assertions look for.
+    fn plain_engine() -> Engine {
+        let mut engine = Engine::new_for_test();
+        engine.settings.use_nerd_fonts = Some(false);
+        engine
+            .app_shell
+            .show_panel(&quadraui::WidgetId::new(PANEL_GIT));
+        engine
+    }
+
+    /// An engine whose SC statuses come from a literal `git status
+    /// --porcelain` block, parsed by the **real** parser — lets one test
+    /// drive all seven unmerged `XY` codes without seven real conflicts.
+    fn engine_with_porcelain(porcelain: &str) -> Engine {
+        let mut engine = plain_engine();
+        engine.sc_file_statuses = crate::core::git::parse_status_porcelain(porcelain);
+        engine
+    }
+
+    /// Top y of the first painted text run containing `needle`, or `None`
+    /// when nothing painted it.
+    fn painted_row_y<D: ConformanceDriver>(driver: &D, needle: &str) -> Option<f32> {
+        driver
+            .inventory()
+            .text_runs()
+            .iter()
+            .find(|r| r.text.contains(needle))
+            .map(|r| r.bounds.y)
+    }
+
+    /// #991, the whole table from the issue: one case per unmerged `XY`
+    /// code. `UU`/`UA` used to vanish from the panel entirely; the other
+    /// five used to be painted as ordinary staged/unstaged changes.
+    /// Section membership is asserted geometrically from the painted row's
+    /// own y against the two painted section headers.
+    #[test]
+    fn sc_panel_paints_every_unmerged_xy_code_under_merge_changes_gtk() {
+        for (code, path) in [
+            ("UU", "zqxw991uu.txt"),
+            ("UA", "zqxw991ua.txt"),
+            ("AU", "zqxw991au.txt"),
+            ("DU", "zqxw991du.txt"),
+            ("UD", "zqxw991ud.txt"),
+            ("AA", "zqxw991aa.txt"),
+            ("DD", "zqxw991dd.txt"),
+        ] {
+            let h = conformance_harness(engine_with_porcelain(&format!("{code} {path}\n")), W, H);
+            let painted = h.driver.painted_texts();
+
+            let merge = painted_row_y(&h.driver, "MERGE CHANGES").unwrap_or_else(|| {
+                panic!(
+                    "{code}: the SC panel must paint a MERGE CHANGES section for \
+                     a conflicted file; painted: {painted:?}"
+                )
+            });
+            let staged = painted_row_y(&h.driver, "STAGED CHANGES").unwrap_or_else(|| {
+                panic!("{code}: STAGED CHANGES header missing; painted: {painted:?}")
+            });
+            let row = painted_row_y(&h.driver, path).unwrap_or_else(|| {
+                panic!("{code}: the conflicted file row was never painted; painted: {painted:?}")
+            });
+
+            assert!(
+                merge < row && row < staged,
+                "{code}: the conflicted row must paint *inside* MERGE CHANGES \
+                 (header y={merge}, STAGED CHANGES y={staged}), but painted at \
+                 y={row}; painted: {painted:?}"
+            );
+            // VS Code's conflict marker, from `StatusKind::Unmerged::label()`.
+            assert!(
+                h.driver
+                    .inventory()
+                    .text_runs()
+                    .iter()
+                    .any(|r| r.text.trim() == "!" && (r.bounds.y - row).abs() < 1.0),
+                "{code}: the conflicted row must carry the '!' conflict marker \
+                 on its own line; painted: {painted:?}"
+            );
+        }
+    }
+
+    /// #991 regression case: a non-conflicted tree must still render
+    /// exactly the two file sections it always did — Merge Changes is not
+    /// always-on.
+    #[test]
+    fn sc_panel_without_conflicts_paints_no_merge_changes_section_gtk() {
+        let h = conformance_harness(
+            engine_with_porcelain("M  zqxw991stg.txt\n M zqxw991drt.txt\n"),
+            W,
+            H,
+        );
+        let painted = h.driver.painted_texts();
+        assert!(
+            !h.driver.screen_contains("MERGE CHANGES"),
+            "a conflict-free tree must not paint a MERGE CHANGES section; \
+             painted: {painted:?}"
+        );
+        assert!(
+            h.driver.screen_contains("STAGED CHANGES")
+                && h.driver.screen_contains("zqxw991stg.txt"),
+            "the ordinary staged row must still paint; painted: {painted:?}"
+        );
+        assert!(
+            h.driver.screen_contains("zqxw991drt.txt"),
+            "the ordinary unstaged row must still paint; painted: {painted:?}"
+        );
+    }
+
+    /// #991 end-to-end on GTK: a **real** `git merge` conflict read back
+    /// through `Engine::sc_refresh` → `git status --porcelain` → the
+    /// painted panel.
+    #[test]
+    fn sc_panel_paints_a_real_merge_conflict_under_merge_changes_gtk() {
+        let dir = crate::harness::make_conflicted_repo("gtk991");
+        let mut engine = plain_engine();
+        engine.cwd = dir.clone();
+        engine.sc_refresh();
+
+        let h = conformance_harness(engine, W, H);
+        let painted = h.driver.painted_texts();
+
+        let merge = painted_row_y(&h.driver, "MERGE CHANGES").unwrap_or_else(|| {
+            panic!("a real merge conflict must paint MERGE CHANGES; painted: {painted:?}")
+        });
+        let staged = painted_row_y(&h.driver, "STAGED CHANGES")
+            .unwrap_or_else(|| panic!("STAGED CHANGES header missing; painted: {painted:?}"));
+        let row =
+            painted_row_y(&h.driver, crate::harness::CONFLICT_FIXTURE_FILE).unwrap_or_else(|| {
+                panic!("the conflicted row was never painted; painted: {painted:?}")
+            });
+        assert!(
+            merge < row && row < staged,
+            "the conflicted row must paint inside MERGE CHANGES; painted: {painted:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -194,7 +194,7 @@ mod mac_driver_tests {
         // both tests below fail on that gap and assert nothing about the
         // minimap, so it is scoped out on purpose; the gap itself needs a
         // quadraui issue (see this PR's notes), never a fix in `src/macos/`.
-        engine.settings.use_nerd_fonts = false;
+        engine.settings.use_nerd_fonts = Some(false);
         engine
     }
 
@@ -219,6 +219,32 @@ mod mac_driver_tests {
         // `driver_with_shell` paints the first frame inside `new` — which is
         // precisely where #896 aborted.
         (guards, driver_with_shell(app, config, W, H))
+    }
+
+    /// Like [`driver`], but also hands back the `Rc<RefCell<Engine>>` —
+    /// needed by a sweep whose `setup` closure mutates the engine directly
+    /// *between* samples (#971's picker sweep re-opens the popup before
+    /// every sample; see `crate::harness::sweep_hit_band_integrity_resetting`'s
+    /// own doc for why a plain click-then-click-to-restore pattern can't be
+    /// reused there).
+    fn driver_with_engine(
+        engine: Engine,
+    ) -> (
+        (crate::test_paint::PaintGuard, crate::test_cwd::CwdReadGuard),
+        Rc<RefCell<Engine>>,
+        quadraui::macos::testing::MacDriver<impl quadraui::AppLogic>,
+    ) {
+        let guards = (
+            crate::test_paint::PaintGuard::acquire(),
+            crate::test_cwd::CwdReadGuard::acquire(),
+        );
+        let engine = Rc::new(RefCell::new(engine));
+        let backend: Rc<RefCell<Box<dyn TextMetricsBackend>>> =
+            Rc::new(RefCell::new(Box::new(MacBackend::new())));
+        let app = App::new_headless_with_backend(Rc::clone(&engine), backend);
+        let config = app.shell_config();
+        let driver = driver_with_shell(app, config, W, H);
+        (guards, engine, driver)
     }
 
     // ── #928 proof slice: `crate::harness::ConformanceHarness` on `MacDriver` ──
@@ -412,7 +438,7 @@ mod mac_driver_tests {
     /// buffer that test doesn't need here.
     fn plain_engine() -> Engine {
         let mut engine = Engine::new_for_test();
-        engine.settings.use_nerd_fonts = false;
+        engine.settings.use_nerd_fonts = Some(false);
         engine
     }
 
@@ -611,7 +637,7 @@ mod mac_driver_tests {
     fn engine_with_nerd_fonts_on() -> Engine {
         let mut engine = Engine::new_for_test();
         engine.buffer_mut().insert(0, "fn main() {}\n");
-        engine.settings.use_nerd_fonts = true;
+        engine.settings.use_nerd_fonts = Some(true);
         engine
     }
 
@@ -882,5 +908,475 @@ mod mac_driver_tests {
     fn mac_backend_applies_line_height_and_char_width() {
         let mut backend = MacBackend::new();
         crate::harness::assert_text_metrics_backend_applies_metrics(&mut backend);
+    }
+
+    // ── #971: hit-band integrity, the remaining surfaces ────────────────
+    //
+    // #967/#968 wired `crate::harness::sweep_hit_band_integrity` to one
+    // surface (the explorer tree, just above). This issue points it at
+    // the source-control panel, the tab bar, the plugin ext-panel body,
+    // and the unified picker — one fixture + one selector per surface, per
+    // CLAUDE.md's "add tests incrementally" rule.
+
+    /// A git-panel engine with three filler unstaged files (pushes
+    /// "RECENT COMMITS" a few rows down the panel — mirrors #967's own
+    /// `filler_dirs`: a row-index-dependent hit-band bug can pass on row 0
+    /// and only surface further down) and two log entries, so there is a
+    /// content row directly beneath the header a mis-hit could land on.
+    fn engine_with_sc_recent_commits() -> Engine {
+        let mut engine = plain_engine();
+        engine.app_shell.show_panel(&quadraui::WidgetId::new(
+            crate::core::engine::sidebar::PANEL_GIT,
+        ));
+        engine.sc_file_statuses = (0..3)
+            .map(|i| crate::core::git::FileStatus {
+                path: format!("filler_971_{i}.rs"),
+                staged: None,
+                unstaged: Some(crate::core::git::StatusKind::Modified),
+                unmerged: None,
+            })
+            .collect();
+        engine.sc_log = (0..2)
+            .map(|i| crate::core::git::GitLogEntry {
+                hash: format!("{i:07x}"),
+                message: format!("ZQXW971SCLOG{i}"),
+            })
+            .collect();
+        engine
+    }
+
+    /// #971: the source-control panel's "RECENT COMMITS" section header,
+    /// clicked anywhere inside its own painted glyphs, must always toggle
+    /// *that* section — never the log row painted immediately below it.
+    ///
+    /// The SC panel routes every press through the *cached* `SidebarSystem`
+    /// layout (`Engine::handle_sc_sidebar_ui_event` ->
+    /// `sc_sidebar_system.handle_cached`) — the "good" pattern #971 calls
+    /// out, with no per-frame row arithmetic re-derived from a raw `y`.
+    ///
+    /// Uses `crate::harness::sweep_hit_band_integrity_resetting`, not
+    /// `sweep_hit_band_integrity`: quadraui's `SidebarSystem` treats two
+    /// `MouseDown`s at the same point in quick succession as a
+    /// `DoubleClick` (the same real-world double-click detection a live
+    /// GUI does), and `SidebarSystem::double_click` has no header case
+    /// (`_ => SidebarEvent::Ignored`) — so a headless driver's
+    /// back-to-back click-then-click-to-restore on a header (no real-world
+    /// delay between them, unlike a real user) gets coalesced into a
+    /// double-click that silently does nothing, rather than toggling back
+    /// the way it does for #967's tree row. `setup` instead re-expands the
+    /// section directly (`set_collapsed(SC_SECTION_LOG, false)`) before every
+    /// sample — no second click involved at all.
+    ///
+    /// Fingerprint: is the first log entry's distinctive message still
+    /// painted? A correct hit collapses the log section, hiding the log rows; a
+    /// mis-hit lands on the log row itself (`SidebarEvent::RowSelected`),
+    /// which changes nothing painted, disagreeing with the header-hit
+    /// baseline.
+    #[test]
+    fn sc_panel_header_click_hit_band_matches_the_painted_row() {
+        use quadraui::testing::ConformanceDriver;
+
+        let (_guards, engine, mut driver) = driver_with_engine(engine_with_sc_recent_commits());
+
+        assert!(
+            driver.screen_contains("RECENT COMMITS") && driver.screen_contains("ZQXW971SCLOG0"),
+            "precondition: the SC panel must paint both the RECENT COMMITS \
+             header and its first log entry; painted text was {:?}",
+            driver.painted_texts()
+        );
+
+        // Sanity: the sweep below only compares samples against *each
+        // other*, so a header click that silently did nothing would still
+        // pass every sample uniformly. Prove the click has real effect
+        // first, so the sweep cannot pass vacuously.
+        let center = center_of(&driver, "RECENT COMMITS");
+        driver.click(center.0, center.1);
+        assert!(
+            !driver.screen_contains("ZQXW971SCLOG0"),
+            "sanity: a header click must actually collapse the section, \
+             hiding the log entry; painted text was {:?}",
+            driver.painted_texts()
+        );
+        engine
+            .borrow_mut()
+            .sc_sidebar_system
+            .borrow_mut()
+            .set_collapsed(crate::core::engine::SC_SECTION_LOG, false);
+        driver.render();
+        assert!(
+            driver.screen_contains("ZQXW971SCLOG0"),
+            "sanity restore: re-expanding the section directly must bring \
+             the log entry back; painted text was {:?}",
+            driver.painted_texts()
+        );
+
+        crate::harness::sweep_hit_band_integrity_resetting(
+            &mut driver,
+            "RECENT COMMITS",
+            5,
+            |d| {
+                // Consecutive samples click within ~3.8px of each other —
+                // inside `MacBackend`'s own 4px/400ms `DoubleClickDetector`
+                // radius (real double-click detection, the same a live
+                // click would trigger), so back-to-back probe clicks would
+                // otherwise fold into a `DoubleClick`, which
+                // `SidebarSystem::double_click` doesn't handle for headers
+                // (this test's own doc). A throwaway click far outside the
+                // panel breaks the position match before every real probe.
+                d.click(W as f32 - 20.0, H as f32 - 20.0);
+                engine
+                    .borrow_mut()
+                    .sc_sidebar_system
+                    .borrow_mut()
+                    .set_collapsed(crate::core::engine::SC_SECTION_LOG, false);
+                d.render();
+            },
+            |d| ConformanceDriver::inventory(d).screen_has("ZQXW971SCLOG0"),
+        );
+    }
+
+    /// Centre point of the first painted text run containing `needle` — the
+    /// same lookup `crate::harness::sweep_hit_band_integrity` does
+    /// internally, exposed here for the sanity clicks each #971 test does
+    /// *before* handing off to the sweep.
+    fn center_of<D: quadraui::testing::ConformanceDriver>(driver: &D, needle: &str) -> (f32, f32) {
+        let bounds = driver
+            .inventory()
+            .text_runs()
+            .iter()
+            .find(|r| r.text.contains(needle))
+            .unwrap_or_else(|| panic!("center_of: {needle:?} not painted"))
+            .bounds;
+        (
+            bounds.x + bounds.width / 2.0,
+            bounds.y + bounds.height / 2.0,
+        )
+    }
+
+    /// A scratch directory for the tab-bar / picker sweeps below, mirroring
+    /// [`scratch_explorer_dir`]'s own naming/cleanup shape.
+    fn scratch_dir_971(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_test_971_macos_{tag}_{:?}",
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Two tabs in a single group, both backed by real files with distinct
+    /// bodies so which tab is *active* is readable from painted editor
+    /// content, not tab-bar chrome. `b` is opened last (and so starts
+    /// active).
+    ///
+    /// Deliberately just two tabs, no filler: `AppShell`'s sidebar is
+    /// visible by default and paints at `x: 48..374`, squarely under
+    /// where an *earlier* tab (`a`, at `x` ~145..297) would land at this
+    /// window width — `App::try_route_sidebar_mouse_event` arbitrates the
+    /// sidebar ahead of the tab bar, so a click on `a` never reaches
+    /// `click::pixel_to_click_target` at all. Padding tabs past the
+    /// sidebar to reach `a` was tried and reverted (#971 PR notes): a
+    /// filler wide enough to clear `x=374` throws off `TabBarPixelHits`'
+    /// slot indices enough that a "click on `a`" lands on the filler
+    /// instead, and hiding the sidebar needs the real
+    /// `EngineAction::ToggleSidebar` -> `App::sync_sidebar_from_engine`
+    /// round trip a driver-level click takes, not a fixture-time `Engine`
+    /// mutation (`engine.app_shell` is a snapshot `App::shell_config`
+    /// reads once at construction, not the runner's own live copy).
+    /// `b`'s own row (`x` ~344..496, centre ~421) already clears the
+    /// sidebar as the *last* tab in a two-tab bar, which is what this
+    /// test's own sweep exploits instead: [`tab_bar_click_hit_band_matches_the_painted_tab`]'s
+    /// own doc has the fingerprint this shape enables.
+    fn engine_with_two_tabs(dir: &std::path::Path) -> Engine {
+        let file_a = dir.join("zqxw971_tab_a.txt");
+        let file_b = dir.join("zqxw971_tab_b.txt");
+        std::fs::write(&file_a, "ZQXW971TABBODYA\n").unwrap();
+        std::fs::write(&file_b, "ZQXW971TABBODYB\n").unwrap();
+        let mut engine = plain_engine();
+        engine.cwd = dir.to_path_buf();
+        engine.new_tab(Some(&file_a));
+        engine.new_tab(Some(&file_b));
+        engine
+    }
+
+    /// #971: `b`'s own painted label, clicked anywhere inside its glyph
+    /// band, must always resolve to `b` — never `a`, its left neighbour.
+    /// #515's right-edge mis-hit ("clicking near a tab's right edge lands
+    /// on the next tab") is exactly the defect class this sweep's
+    /// top/middle/bottom probes exist to catch (see
+    /// `crate::harness::sweep_hit_band_integrity`'s own doc) — `b` is the
+    /// *second* of two tabs, so a rightward mis-hit has nowhere further
+    /// to land and a leftward one lands squarely on `a`.
+    ///
+    /// `b` starts active (opened last), so a click anywhere correctly
+    /// inside its own band is a no-op — same reasoning
+    /// `sweep_hit_band_integrity`'s own doc gives for why a non-restoring
+    /// click is fine here: the fingerprint reads "which tab is active
+    /// now", a pure function of the click's actual target, not of
+    /// history. A correct hit leaves `b` active (`ZQXW971TABBODYB` stays
+    /// painted); a mis-hit onto `a` flips the editor to `a`'s body
+    /// instead, disagreeing with the top-of-row baseline.
+    ///
+    /// The sanity check below can only probe the *positive* baseline (a
+    /// hit inside `b`'s own band keeps `b` active) rather than proving a
+    /// hit can also switch tabs at all — `a`'s own row is the one behind
+    /// the sidebar (see [`engine_with_two_tabs`]'s doc), so this test
+    /// cannot drive a real activating click the way
+    /// `sc_panel_header_click_hit_band_matches_the_painted_row`'s sanity
+    /// check does. Forcing `active_tab` to `a` directly and re-rendering
+    /// instead proves the *fingerprint* itself can read both states —
+    /// ruling out a fingerprint that is vacuously always-true, the one
+    /// failure mode a same-tab-only click could not otherwise catch.
+    #[test]
+    fn tab_bar_click_hit_band_matches_the_painted_tab() {
+        use quadraui::testing::ConformanceDriver;
+
+        let dir = scratch_dir_971("tabbar");
+        let (_guards, engine, mut driver) = driver_with_engine(engine_with_two_tabs(&dir));
+
+        assert!(
+            driver.screen_contains("zqxw971_tab_b.txt")
+                && driver.screen_contains("ZQXW971TABBODYB"),
+            "precondition: tab b must have painted its label and be the \
+             active tab showing its body; painted text was {:?}",
+            driver.painted_texts()
+        );
+
+        // Sanity: the fingerprint below (`screen_has("ZQXW971TABBODYB")`)
+        // must actually be capable of reading `false` — otherwise the
+        // sweep would pass even if every click were a no-op. Force `a`
+        // active directly (no click involved) and confirm the painted
+        // body follows. Indices are relative to the *end* of the tab
+        // list (`b` is last, `a` second-to-last) rather than hardcoded —
+        // `Engine::new_for_test`'s own initial "[No Name]" tab (never
+        // closed by this fixture) sits at index 0, ahead of both.
+        let (a_idx, b_idx) = {
+            let e = engine.borrow();
+            let n = e.editor_groups[&e.active_group].tabs.len();
+            (n - 2, n - 1)
+        };
+        {
+            let mut e = engine.borrow_mut();
+            let group = e.active_group;
+            e.editor_groups.get_mut(&group).unwrap().active_tab = a_idx;
+        }
+        driver.render();
+        assert!(
+            !driver.screen_contains("ZQXW971TABBODYB") && driver.screen_contains("ZQXW971TABBODYA"),
+            "sanity: the fingerprint must read false once `a` (not `b`) is \
+             active, or the sweep below could pass vacuously; painted \
+             text was {:?}",
+            driver.painted_texts()
+        );
+        {
+            let mut e = engine.borrow_mut();
+            let group = e.active_group;
+            e.editor_groups.get_mut(&group).unwrap().active_tab = b_idx;
+        }
+        driver.render();
+        assert!(
+            driver.screen_contains("ZQXW971TABBODYB"),
+            "sanity restore: b must be active again; painted text was {:?}",
+            driver.painted_texts()
+        );
+
+        crate::harness::sweep_hit_band_integrity(&mut driver, "zqxw971_tab_b.txt", 5, |d| {
+            ConformanceDriver::inventory(d).screen_has("ZQXW971TABBODYB")
+        });
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A plugin ext-panel engine: `ext_panel_active` is set directly
+    /// (bypassing `AppShell` registration, which real ext panels also
+    /// bypass — see `render::apply_activity_panel_switch`'s own doc) and
+    /// the sidebar shown via the raw `AppShell::toggle_sidebar`, not
+    /// `Engine::toggle_sidebar` — the latter persists to the developer's
+    /// real session file, the exact reason `crate::gtk::testing::
+    /// sidebar_panel_clicks::panel_harness` avoids it too.
+    ///
+    /// One "available" (not-installed) extension in `ext_registry` gives
+    /// the "AVAILABLE" section content, while "INSTALLED" stays empty —
+    /// pushing the target header down a row, the same filler technique
+    /// [`engine_with_sc_recent_commits`] uses.
+    fn engine_with_marketplace_as_ext_panel() -> Engine {
+        let mut engine = plain_engine();
+        engine.ext_registry = Some(vec![crate::core::extensions::ExtensionManifest {
+            name: "zqxw971-avail".to_string(),
+            display_name: "ZQXW971 Available Ext".to_string(),
+            ..Default::default()
+        }]);
+        engine.ext_panel_active = Some("zqxw971-marketplace-via-ext-panel".to_string());
+        engine.ext_panel_has_focus = true;
+        if !engine.app_shell.sidebar_visible() {
+            engine.app_shell.toggle_sidebar();
+        }
+        engine
+    }
+
+    /// #971: the ext-panel body's "AVAILABLE" section header, clicked
+    /// anywhere inside its own painted glyphs, must always toggle *that*
+    /// section — never the row painted immediately below it.
+    ///
+    /// This exercises `Engine::handle_ext_sidebar_ui_event` ->
+    /// `ext_sidebar_system.handle_cached`, the same cached-`SidebarSystem`
+    /// pattern the SC panel test above pins. It does **not** exercise
+    /// `render::SidebarBodyGeometry::content_row` — #971's own
+    /// "highest-suspicion" independent row formula — because that formula
+    /// is wired *only* to `render::route_sidebar_hover`'s `ExtPanel` arm
+    /// (a `MouseMoved`-only path, never a click), and the hover it drives
+    /// only ever produces a *delayed* (350ms dwell) popup gated on a
+    /// second, currently-disconnected registry
+    /// (`Engine::resolve_panel_hover_item_id` reads `ext_panels`/
+    /// `ext_panel_items`, populated only for a plugin with a live
+    /// registration — unrelated to what `ext_sidebar_system` actually
+    /// paints here). Neither half produces an immediately-painted signal a
+    /// headless driver can read without first fixing that unrelated
+    /// mismatch, which is out of this issue's scope. See this issue's PR
+    /// notes for the follow-up this gap needs.
+    ///
+    /// Uses `sweep_hit_band_integrity_resetting`, not
+    /// `sweep_hit_band_integrity` — see
+    /// `sc_panel_header_click_hit_band_matches_the_painted_row`'s own
+    /// comment on the double-click coalescing this sidesteps. "AVAILABLE"
+    /// is section 1 (`ext_sidebar_system`'s own `SidebarSectionDef` order:
+    /// `["installed", "available"]`, `Engine::new`).
+    ///
+    /// Fingerprint: is the one available extension's distinctive display
+    /// name still painted? A correct hit collapses the "available"
+    /// section, hiding its one row; a mis-hit lands on the row itself
+    /// (`SidebarEvent::RowSelected`), which changes nothing painted,
+    /// disagreeing with the header-hit baseline.
+    #[test]
+    fn ext_panel_header_click_hit_band_matches_the_painted_row() {
+        use quadraui::testing::ConformanceDriver;
+
+        let (_guards, engine, mut driver) =
+            driver_with_engine(engine_with_marketplace_as_ext_panel());
+
+        assert!(
+            driver.screen_contains("AVAILABLE") && driver.screen_contains("ZQXW971 Available Ext"),
+            "precondition: the ext panel must paint the AVAILABLE header \
+             and its one row; painted text was {:?}",
+            driver.painted_texts()
+        );
+
+        // Sanity — see `sc_panel_header_click_hit_band_matches_the_painted_row`'s
+        // own comment on why this is needed before trusting the sweep below.
+        let center = center_of(&driver, "AVAILABLE");
+        driver.click(center.0, center.1);
+        assert!(
+            !driver.screen_contains("ZQXW971 Available Ext"),
+            "sanity: a header click must actually collapse the AVAILABLE \
+             section, hiding its one row; painted text was {:?}",
+            driver.painted_texts()
+        );
+        engine
+            .borrow_mut()
+            .ext_sidebar_system
+            .borrow_mut()
+            .set_collapsed(1, false);
+        driver.render();
+        assert!(
+            driver.screen_contains("ZQXW971 Available Ext"),
+            "sanity restore: re-expanding the section directly must bring \
+             its row back; painted text was {:?}",
+            driver.painted_texts()
+        );
+
+        crate::harness::sweep_hit_band_integrity_resetting(
+            &mut driver,
+            "AVAILABLE",
+            5,
+            |d| {
+                // Break `MacBackend`'s `DoubleClickDetector` position match
+                // before every real probe — see
+                // `sc_panel_header_click_hit_band_matches_the_painted_row`'s
+                // identical comment for the full story.
+                d.click(W as f32 - 20.0, H as f32 - 20.0);
+                engine
+                    .borrow_mut()
+                    .ext_sidebar_system
+                    .borrow_mut()
+                    .set_collapsed(1, false);
+                d.render();
+            },
+            |d| ConformanceDriver::inventory(d).screen_has("ZQXW971 Available Ext"),
+        );
+    }
+
+    /// #971: a unified-picker (fuzzy file finder) result row, clicked
+    /// anywhere inside its own painted glyphs, must always select *that*
+    /// row — never its neighbour.
+    ///
+    /// Uses `crate::harness::sweep_hit_band_integrity_resetting`, not
+    /// `sweep_hit_band_integrity`: `render::apply_picker_row_click` closes
+    /// the popup outright the moment a click lands on an *already*-selected
+    /// row (see that function's own #971 doc comment), so a plain
+    /// click-then-click-to-restore would dismiss the picker after sample
+    /// 0's restore click. `setup` instead re-opens the picker fresh (file
+    /// `a` selected, its preview loaded) before every sample.
+    ///
+    /// Fingerprint: is file `b`'s distinctive body painted in the preview
+    /// pane? A correct hit on `b`'s row is not yet selected (the picker
+    /// always re-opens onto `a`), so it only selects `b` and loads its
+    /// preview — never confirms. A neighbour mis-hit (back onto `a`, still
+    /// selected) is a no-op, leaving `a`'s preview on screen instead.
+    #[test]
+    fn picker_row_click_hit_band_matches_the_painted_row() {
+        use crate::core::engine::PickerSource;
+        use quadraui::testing::ConformanceDriver;
+
+        let dir = scratch_dir_971("picker");
+        std::fs::write(dir.join("zqxw971_picka.txt"), "ZQXW971PICKABODY\n").unwrap();
+        std::fs::write(dir.join("zqxw971_pickb.txt"), "ZQXW971PICKBBODY\n").unwrap();
+
+        let mut engine = plain_engine();
+        engine.cwd = dir.clone();
+        engine.open_picker(PickerSource::Files);
+        let (_guards, engine, mut driver) = driver_with_engine(engine);
+
+        assert!(
+            driver.screen_contains("zqxw971_picka.txt")
+                && driver.screen_contains("zqxw971_pickb.txt"),
+            "precondition: the picker must paint both files; painted text \
+             was {:?}",
+            driver.painted_texts()
+        );
+        assert!(
+            driver.screen_contains("ZQXW971PICKABODY"),
+            "precondition: the default selection (file a, alphabetically \
+             first) must preview file a's body; painted text was {:?}",
+            driver.painted_texts()
+        );
+
+        // Sanity — see `sc_panel_header_click_hit_band_matches_the_painted_row`'s
+        // own comment on why this is needed before trusting the sweep
+        // below: `sweep_hit_band_integrity_resetting` only compares samples
+        // against each other, so a row click that silently did nothing
+        // would still pass every sample uniformly.
+        let center_b = center_of(&driver, "zqxw971_pickb.txt");
+        driver.click(center_b.0, center_b.1);
+        assert!(
+            driver.screen_contains("ZQXW971PICKBBODY"),
+            "sanity: a click on file b's own row must select it and load \
+             its preview; painted text was {:?}",
+            driver.painted_texts()
+        );
+
+        crate::harness::sweep_hit_band_integrity_resetting(
+            &mut driver,
+            "zqxw971_pickb.txt",
+            5,
+            |d| {
+                engine.borrow_mut().close_picker();
+                engine.borrow_mut().open_picker(PickerSource::Files);
+                d.render();
+            },
+            |d| ConformanceDriver::inventory(d).screen_has("ZQXW971PICKBBODY"),
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
