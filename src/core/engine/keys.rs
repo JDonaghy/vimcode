@@ -8920,6 +8920,8 @@ impl Engine {
             "scs",
             "startofline",
             "sol",
+            "joinspaces",
+            "js",
             "cursorline",
             "cul",
             "autoread",

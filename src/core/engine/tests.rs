@@ -9329,6 +9329,171 @@ fn test_join_lines_current_ends_with_space_cursor_on_next_char() {
     nvim_case("a \nb\n", 0, 0, "J", "a b\n", 0, 2);
 }
 
+// ── #1000: 'joinspaces' — J inserts two spaces after '.', '!', '?' ──────
+//
+// All values below (except the two marked otherwise) were verified against
+// real `nvim --headless` (0.12.5), e.g.:
+//   nvim --headless -u NONE -i NONE --cmd "set noswapfile" \
+//     -c "lua vim.o.joinspaces=true" -c "edit in.txt" -c "normal! J" \
+//     -c "lua print(vim.api.nvim_win_get_cursor(0)[2])" -c "write! out.txt" -c qa!
+//
+// | input           | joinspaces | keys | buffer              | cursor col |
+// |-----------------|-----------|------|----------------------|-----------|
+// | "one.\nworld\n" | off       | J    | "one. world\n"       | 4         |
+// | "one!\nworld\n" | off       | J    | "one! world\n"       | 4         |
+// | "one?\nworld\n" | off       | J    | "one? world\n"       | 4         |
+// | "one\nworld\n"  | off       | J    | "one world\n"        | 3         |
+// | "one.\nworld\n" | off       | gJ   | "one.world\n"        | 4         |
+// | "one.\nworld\n" | on        | J    | "one.  world\n"      | 4         |
+// | "one!\nworld\n" | on        | J    | "one!  world\n"      | 4         |
+// | "one?\nworld\n" | on        | J    | "one?  world\n"      | 4         |
+// | "one\nworld\n"  | on        | J    | "one world\n"        | 3         |
+// | "one.\nworld\n" | on        | gJ   | "one.world\n"        | 4         |
+// | "one.\ntwo!\nthree?\n" | on | 3J  | "one.  two!  three?\n" | 10      |
+// | "foo.\n)\n"     | on        | J    | "foo.)\n"            | 4         |
+//
+// "foo. \nbar\n" (current line already ends with a trailing space) is
+// *not* in the table above: real nvim pads that from one space to two
+// ("foo.  bar\n") when 'joinspaces' is on, but issue #1000 explicitly
+// preserves vimcode's pre-existing "already-trailing-whitespace ⇒ never pad
+// further" rule regardless of 'joinspaces' (see acceptance criterion 3), so
+// vimcode intentionally keeps a single space here — a documented, narrow
+// deviation from real Vim, not a bug in this change.
+
+#[test]
+fn test_joinspaces_off_period_single_space() {
+    let mut e = Engine::new();
+    assert!(!e.settings.joinspaces, "joinspaces defaults to off");
+    nvim_case("one.\nworld\n", 0, 0, "J", "one. world\n", 0, 4);
+}
+
+#[test]
+fn test_joinspaces_off_exclaim_single_space() {
+    nvim_case("one!\nworld\n", 0, 0, "J", "one! world\n", 0, 4);
+}
+
+#[test]
+fn test_joinspaces_off_question_single_space() {
+    nvim_case("one?\nworld\n", 0, 0, "J", "one? world\n", 0, 4);
+}
+
+#[test]
+fn test_joinspaces_off_ordinary_word_single_space() {
+    nvim_case("one\nworld\n", 0, 0, "J", "one world\n", 0, 3);
+}
+
+#[test]
+fn test_joinspaces_off_gj_never_inserts_space() {
+    nvim_case("one.\nworld\n", 0, 0, "gJ", "one.world\n", 0, 4);
+}
+
+#[test]
+fn test_joinspaces_on_period_two_spaces() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "one.\nworld\n");
+    engine.settings.joinspaces = true;
+    engine.feed_keys("J");
+    assert_eq!(engine.buffer().to_string(), "one.  world\n");
+    assert_eq!(engine.view().cursor.line, 0);
+    assert_eq!(engine.view().cursor.col, 4);
+}
+
+#[test]
+fn test_joinspaces_on_exclaim_two_spaces() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "one!\nworld\n");
+    engine.settings.joinspaces = true;
+    engine.feed_keys("J");
+    assert_eq!(engine.buffer().to_string(), "one!  world\n");
+    assert_eq!(engine.view().cursor.col, 4);
+}
+
+#[test]
+fn test_joinspaces_on_question_two_spaces() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "one?\nworld\n");
+    engine.settings.joinspaces = true;
+    engine.feed_keys("J");
+    assert_eq!(engine.buffer().to_string(), "one?  world\n");
+    assert_eq!(engine.view().cursor.col, 4);
+}
+
+#[test]
+fn test_joinspaces_on_ordinary_word_still_single_space() {
+    // 'joinspaces' only affects '.', '!' and '?' — an ordinary word gets
+    // just one space, same as with the option off.
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "one\nworld\n");
+    engine.settings.joinspaces = true;
+    engine.feed_keys("J");
+    assert_eq!(engine.buffer().to_string(), "one world\n");
+    assert_eq!(engine.view().cursor.col, 3);
+}
+
+#[test]
+fn test_joinspaces_on_gj_never_inserts_space() {
+    // gJ never inserts a space, regardless of 'joinspaces'.
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "one.\nworld\n");
+    engine.settings.joinspaces = true;
+    engine.feed_keys("gJ");
+    assert_eq!(engine.buffer().to_string(), "one.world\n");
+    assert_eq!(engine.view().cursor.col, 4);
+}
+
+#[test]
+fn test_joinspaces_on_count_join_pads_every_sentence_end() {
+    // 3J joins 3 lines (2 join points); each join point that ends in
+    // sentence punctuation gets its own two spaces.
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "one.\ntwo!\nthree?\n");
+    engine.settings.joinspaces = true;
+    engine.feed_keys("3J");
+    assert_eq!(engine.buffer().to_string(), "one.  two!  three?\n");
+    assert_eq!(engine.view().cursor.col, 10);
+}
+
+#[test]
+fn test_joinspaces_on_next_line_paren_still_no_space() {
+    // Precedence: a next line starting with ')' still gets no space at
+    // all, even when 'joinspaces' is on and the current line ends in '.'.
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "foo.\n)\n");
+    engine.settings.joinspaces = true;
+    engine.feed_keys("J");
+    assert_eq!(engine.buffer().to_string(), "foo.)\n");
+    assert_eq!(engine.view().cursor.col, 4);
+}
+
+#[test]
+fn test_joinspaces_on_current_trailing_space_not_padded_further() {
+    // Precedence: a current line that already ends in whitespace is never
+    // padded further, regardless of 'joinspaces' — vimcode's pre-existing
+    // rule (see module comment above for why this is a deliberate, narrow
+    // deviation from real Vim's own 'joinspaces' behavior in this case).
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "foo. \nbar\n");
+    engine.settings.joinspaces = true;
+    engine.feed_keys("J");
+    assert_eq!(engine.buffer().to_string(), "foo. bar\n");
+    assert_eq!(engine.view().cursor.col, 5);
+}
+
+#[test]
+fn test_set_joinspaces_via_colon_set() {
+    let mut engine = Engine::new();
+    assert!(!engine.settings.joinspaces);
+    engine.execute_command("set joinspaces");
+    assert!(engine.settings.joinspaces);
+    engine.execute_command("set nojoinspaces");
+    assert!(!engine.settings.joinspaces);
+    engine.execute_command("set js");
+    assert!(engine.settings.joinspaces);
+    // `:set js!` toggles (vimcode's `:set inv joinspaces` equivalent).
+    engine.execute_command("set js!");
+    assert!(!engine.settings.joinspaces);
+}
+
 // =======================================================================
 // Tests: Search word under cursor (* / #)
 // =======================================================================
