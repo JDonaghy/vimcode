@@ -191,6 +191,25 @@ impl Engine {
             .any(|id| self.buffer_manager.get(id).is_some_and(|s| s.dirty))
     }
 
+    /// True if some window other than `except_win` still displays `buf_id`.
+    ///
+    /// A dirty buffer can be abandoned in one window/tab as long as another
+    /// window still shows it — the buffer itself isn't going anywhere, so
+    /// there's nothing to lose (`:h E37`). Only when `except_win` is the
+    /// *last* window showing `buf_id` is closing it a real "discard my only
+    /// copy" decision that deserves a confirmation prompt.
+    ///
+    /// This predicate used to be duplicated: the `:q` path
+    /// (`execute.rs`) got it right, but the tab-bar close path
+    /// (`handle_tab_bar_click`'s `CloseTab` arm) never applied it and
+    /// prompted on every view of a dirty buffer, not just the last one
+    /// (#1038). Both call sites now share this one function.
+    pub fn buffer_has_other_views(&self, buf_id: BufferId, except_win: WindowId) -> bool {
+        self.windows
+            .values()
+            .any(|w| w.buffer_id == buf_id && w.id != except_win)
+    }
+
     /// Compute explorer tree indicators: git status + deduplicated diagnostic counts.
     /// Returns (git_statuses, diag_counts) where:
     /// - git_statuses: canonical path → git status char (M, A, D, R, ?)
