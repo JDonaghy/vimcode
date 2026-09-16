@@ -1130,15 +1130,6 @@ pub(crate) const KNOWN_BUGS: &[&str] = &[
     // plumbing that panel id actually routes through today (see this
     // scenario's own fixture doc for why). GTK-only, same reason as above.
     "ext_panel_row_click_selects_the_clicked_row_not_the_row_below::gtk", // #983 — fix: #1028
-    // #984: v0.11.0 bug report -- the file explorer's expand/collapse
-    // chevron needs a double click, while its row's text label needs one.
-    // The root cause is a missing `TreeControllerEvent::RowToggleExpand`
-    // match arm in `Engine::dispatch_explorer_tree_event` (shared core
-    // code, not backend-specific) -- see
-    // `explorer_chevron_click_toggles_dir_with_same_arity_as_label_click`'s
-    // own doc. Reproduces on both backends, unlike #983's GTK-only gap.
-    "explorer_chevron_click_toggles_dir_with_same_arity_as_label_click::gtk", // #984 — fix: #1027
-    "explorer_chevron_click_toggles_dir_with_same_arity_as_label_click::tui", // #984 — fix: #1027
     // #986: v0.11.0 bug report -- `:s///c` (confirm-prompt) is #801 Phase 2,
     // which was never built: `execute.rs`'s `flags.contains('c')` check
     // always errors loudly ("E-vimcode: ... not implemented") instead of
@@ -2073,10 +2064,21 @@ mod issue_984_explorer_chevron_needs_a_double_click {
     use super::*;
 
     /// An explorer rooted at a scratch dir with one collapsed directory,
-    /// `kkxxqq_dir984`, holding one child, `child984_marker` -- the root
+    /// `kkxxqq_dir984`, holding one child, `child984mk` -- the root
     /// itself is expanded (so `kkxxqq_dir984`'s own row paints) but
     /// `kkxxqq_dir984` is deliberately left out of `explorer_expanded`, so
     /// it starts collapsed, matching this scenario's own precondition.
+    ///
+    /// `child984mk` is short on purpose, like `CONFLICT_FIXTURE_FILE` above
+    /// -- at this fixture's own depth-2 nesting (root -> `kkxxqq_dir984` ->
+    /// this file), the shared `App::shell_config()` conformance harness's
+    /// (unwidened, quadraui-default) sidebar leaves only ~12 columns for a
+    /// TUI row label, and a name past that column budget paints truncated
+    /// (e.g. the `_marker` suffix this fixture used to carry never actually
+    /// reached the screen on TUI, independent of and unrelated to #984's own
+    /// chevron bug). `screen_has` needs the *whole* name painted, so this
+    /// fixture stays inside that budget rather than one `assert!` silently
+    /// depending on a name that happens to fit today.
     ///
     /// `tag` must be distinct per caller (each backend's `#[test]` below
     /// calls this once) -- combined with the calling thread's id, same
@@ -2089,7 +2091,7 @@ mod issue_984_explorer_chevron_needs_a_double_click {
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("kkxxqq_dir984")).unwrap();
-        std::fs::write(dir.join("kkxxqq_dir984").join("child984_marker"), b"").unwrap();
+        std::fs::write(dir.join("kkxxqq_dir984").join("child984mk"), b"").unwrap();
 
         let mut engine = crate::core::Engine::new_for_test();
         engine.settings.use_nerd_fonts = Some(false);
@@ -2121,7 +2123,7 @@ mod issue_984_explorer_chevron_needs_a_double_click {
     // issue_984_explorer_chevron_needs_a_double_click` fails both tests on
     // the first assertion inside
     // `explorer_chevron_click_toggles_dir_with_same_arity_as_label_click`
-    // -- "child984_marker" is still not painted after one chevron click,
+    // -- "child984mk" is still not painted after one chevron click,
     // on both backends. Restored (entries back in place) and confirmed
     // green again -- see this issue's PR notes for the captured failure.
     #[cfg(feature = "gui")]
@@ -2139,7 +2141,7 @@ mod issue_984_explorer_chevron_needs_a_double_click {
                 crate::harness::explorer_chevron_click_toggles_dir_with_same_arity_as_label_click(
                     driver,
                     "kkxxqq_dir984",
-                    "child984_marker",
+                    "child984mk",
                 );
             },
         );
@@ -2159,7 +2161,7 @@ mod issue_984_explorer_chevron_needs_a_double_click {
                 crate::harness::explorer_chevron_click_toggles_dir_with_same_arity_as_label_click(
                     driver,
                     "kkxxqq_dir984",
-                    "child984_marker",
+                    "child984mk",
                 );
             },
         );
@@ -2187,7 +2189,7 @@ mod issue_984_explorer_chevron_needs_a_double_click {
                 "precondition: the collapsed directory must be painted"
             );
             crate::harness::sweep_hit_band_integrity(driver, "kkxxqq_dir984", 5, |d| {
-                d.screen_has("child984_marker")
+                d.screen_has("child984mk")
             });
         },
     }
