@@ -405,14 +405,74 @@ fn test_substitute_with_pattern_backreference() {
 }
 
 #[test]
-fn test_substitute_confirm_flag_is_rejected_not_silently_dropped() {
+fn test_substitute_confirm_flag_prompts_before_touching_the_buffer() {
+    // #1031 (#801 Phase 2): the `c` flag used to be rejected outright
+    // ("not implemented"). It now opens a confirm prompt — and, critically,
+    // nothing is substituted behind the user's back before they answer.
     let mut e = engine_with("a a\n");
     exec(&mut e, "%s/a/b/gc");
     assert!(
-        e.message.contains("confirm"),
-        "expected the c flag to be rejected, got {:?}",
+        e.message
+            .contains("replace with b? (y)es/(n)o/(a)ll/(q)uit/(l)ast"),
+        "expected the :s_c prompt, got {:?}",
         e.message
     );
-    // Nothing was substituted behind the user's back.
     assert_eq!(buf(&e).trim_end(), "a a");
+    // The prompt parks the cursor on the pending match, not the line's
+    // first non-blank.
+    assert_cursor(&e, 0, 0);
+}
+
+#[test]
+fn test_substitute_confirm_y_and_n_replace_only_the_confirmed_matches() {
+    let mut e = engine_with("a a a\n");
+    exec(&mut e, "%s/a/b/gc");
+    // y on the first match — applied, but only once the loop finishes.
+    press(&mut e, 'y');
+    // n skips the second, y takes the third.
+    press(&mut e, 'n');
+    press(&mut e, 'y');
+    assert_eq!(buf(&e).trim_end(), "b a b");
+    // Prompt is gone and a report replaced it.
+    assert!(
+        !e.message.contains("replace with"),
+        "prompt should be dismissed, got {:?}",
+        e.message
+    );
+}
+
+#[test]
+fn test_substitute_confirm_a_replaces_the_rest_and_q_stops() {
+    // `a` answers "all remaining".
+    let mut e = engine_with("a a a\n");
+    exec(&mut e, "%s/a/b/gc");
+    press(&mut e, 'n');
+    press(&mut e, 'a');
+    assert_eq!(buf(&e).trim_end(), "a b b");
+
+    // `q` quits, keeping only what was already confirmed.
+    let mut e = engine_with("a a a\n");
+    exec(&mut e, "%s/a/b/gc");
+    press(&mut e, 'y');
+    press(&mut e, 'q');
+    assert_eq!(buf(&e).trim_end(), "b a a");
+}
+
+#[test]
+fn test_substitute_confirm_prompt_swallows_normal_mode_keys() {
+    // While the prompt is up, an unrelated key must not fall through to
+    // Normal mode and edit the buffer — it re-prompts the same candidate.
+    let mut e = engine_with("a a\n");
+    exec(&mut e, "%s/a/b/gc");
+    press(&mut e, 'x');
+    assert_eq!(buf(&e).trim_end(), "a a");
+    assert!(
+        e.message.contains("replace with b?"),
+        "expected the prompt to persist, got {:?}",
+        e.message
+    );
+    // The loop is still live: y still answers the first match.
+    press(&mut e, 'y');
+    press(&mut e, 'y');
+    assert_eq!(buf(&e).trim_end(), "b b");
 }

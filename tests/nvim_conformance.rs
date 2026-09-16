@@ -3229,10 +3229,10 @@ const CASES_EX: &[Case] = &[
     ),
     // #1031 (#801 Phase 2): `:s///c` confirm loop. Verified against a real
     // interactive `nvim --headless --listen` + `--remote-send` session
-    // (v0.12.5) -- the non-interactive `-es` batch mode this suite's other
-    // cases don't need silently short-circuits `:s///c` (the confirm prompt
-    // never engages), so these were hand-checked outside `cargo test`
-    // before being added here.
+    // (v0.12.5). The non-interactive `-es` batch mode the suite's other cases
+    // use silently short-circuits `:s///c` (the confirm prompt never
+    // engages), so these were hand-checked outside `cargo test` before being
+    // added here.
     c(
         "sub:c y n y y",
         &["a", "a", "a", "a"],
