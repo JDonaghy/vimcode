@@ -1124,12 +1124,12 @@ pub(crate) const KNOWN_BUGS: &[&str] = &[
     // by construction (TUI's row pitch always equals its glyph height, so it
     // has no such gap to fall into) -- see
     // `row_click_hits_its_own_row_not_the_row_below`'s own doc.
-    "settings_row_click_selects_the_clicked_row_not_the_row_below::gtk", // #983
+    "settings_row_click_selects_the_clicked_row_not_the_row_below::gtk", // #983 — fix: #1028
     // #983: the same shared-cause report against the "git insights" plugin
     // panel, reproduced here via the ext-panel/marketplace `SidebarSystem`
     // plumbing that panel id actually routes through today (see this
     // scenario's own fixture doc for why). GTK-only, same reason as above.
-    "ext_panel_row_click_selects_the_clicked_row_not_the_row_below::gtk", // #983
+    "ext_panel_row_click_selects_the_clicked_row_not_the_row_below::gtk", // #983 — fix: #1028
     // #984: v0.11.0 bug report -- the file explorer's expand/collapse
     // chevron needs a double click, while its row's text label needs one.
     // The root cause is a missing `TreeControllerEvent::RowToggleExpand`
@@ -1137,8 +1137,8 @@ pub(crate) const KNOWN_BUGS: &[&str] = &[
     // code, not backend-specific) -- see
     // `explorer_chevron_click_toggles_dir_with_same_arity_as_label_click`'s
     // own doc. Reproduces on both backends, unlike #983's GTK-only gap.
-    "explorer_chevron_click_toggles_dir_with_same_arity_as_label_click::gtk", // #984
-    "explorer_chevron_click_toggles_dir_with_same_arity_as_label_click::tui", // #984
+    "explorer_chevron_click_toggles_dir_with_same_arity_as_label_click::gtk", // #984 — fix: #1027
+    "explorer_chevron_click_toggles_dir_with_same_arity_as_label_click::tui", // #984 — fix: #1027
     // #987: v0.11.0 bug report -- a group's own vertical scrollbar is inert
     // (no `EditorHit::VScrollbar` hit-test exists anywhere in
     // `src/app.rs`'s shared mouse dispatch, on either backend), and when
@@ -1149,8 +1149,8 @@ pub(crate) const KNOWN_BUGS: &[&str] = &[
     // shared `crate::app::App` dispatch code as GTK, not the separately
     // hand-written production TUI stack -- see
     // `drag_group_scrollbar_column`'s own doc.
-    "left_group_scrollbar_drag_scrolls_without_resizing::gtk", // #987
-    "left_group_scrollbar_drag_scrolls_without_resizing::tui", // #987
+    "left_group_scrollbar_drag_scrolls_without_resizing::gtk", // #987 — fix: #1026
+    "left_group_scrollbar_drag_scrolls_without_resizing::tui", // #987 — fix: #1026
     // #987 deliverable 3: the same inertness generalizes to *any* group,
     // not just one beside a divider -- the right group's scrollbar (no
     // divider on its own right edge in a two-group layout) is inert too,
@@ -1158,8 +1158,8 @@ pub(crate) const KNOWN_BUGS: &[&str] = &[
     // `right_group_scrollbar_drag_scrolls_without_resizing`'s own doc for
     // the RED-verification distinguishing this from the left-group case
     // above (only one assertion fails here, not both).
-    "right_group_scrollbar_drag_scrolls_without_resizing::gtk", // #987
-    "right_group_scrollbar_drag_scrolls_without_resizing::tui", // #987
+    "right_group_scrollbar_drag_scrolls_without_resizing::gtk", // #987 — fix: #1026
+    "right_group_scrollbar_drag_scrolls_without_resizing::tui", // #987 — fix: #1026
     // #986: v0.11.0 bug report -- `:s///c` (confirm-prompt) is #801 Phase 2,
     // which was never built: `execute.rs`'s `flags.contains('c')` check
     // always errors loudly ("E-vimcode: ... not implemented") instead of
@@ -1174,8 +1174,8 @@ pub(crate) const KNOWN_BUGS: &[&str] = &[
     // highlighted, not just the prompt text) was attempted and deliberately
     // dropped, not gated -- see that module's own doc for why a pixel/style
     // probe for it produced a false pass unrelated to this feature.
-    "confirm_prompt_text_is_painted",               // #986
-    "confirm_report_line_excludes_skipped_matches", // #986
+    "confirm_prompt_text_is_painted", // #986 — fix: #1031
+    "confirm_report_line_excludes_skipped_matches", // #986 — fix: #1031
     // #988: v0.11.0 bug report -- the TUI hamburger (menu) button won't
     // re-hide the menu bar once revealed. An earlier version of this entry's
     // comment claimed (based on a since-invalidated test) that "the toggle
@@ -1221,7 +1221,7 @@ pub(crate) const KNOWN_BUGS: &[&str] = &[
     // click reaches its target). See
     // `hamburger_stale_click_position_after_reveal_misses_the_shifted_button`'s
     // own doc in `src/tui_main/shell_app.rs`.
-    "hamburger_second_click_at_stale_position_does_not_hide_menu_bar::tui", // #988
+    "hamburger_second_click_at_stale_position_does_not_hide_menu_bar::tui", // #988 — fix: #1029
     // Defect 2 -- deeper, and present even once defect 1 above is
     // accounted for: `on_shell_event`'s `PanelChanged { hamburger }` arm
     // never touches the shadow `engine.app_shell`, so
@@ -1235,7 +1235,7 @@ pub(crate) const KNOWN_BUGS: &[&str] = &[
     // `hamburger_relocated_click_after_reveal_still_fails_to_hide_menu_bar`'s
     // own doc in `src/tui_main/shell_app.rs` for the full mechanism this
     // entry pins.
-    "hamburger_second_click_at_correct_position_does_not_hide_menu_bar::tui", // #988
+    "hamburger_second_click_at_correct_position_does_not_hide_menu_bar::tui", // #988 — fix: #1029
     // #990: v0.11.0 bug report -- three separate TUI minimap rendering
     // defects, each with its own painted-output scenario in
     // `src/tui_main/shell_app.rs`. TUI-only labels: all three are measured
@@ -1253,7 +1253,7 @@ pub(crate) const KNOWN_BUGS: &[&str] = &[
     // `rev` flips the scenario to "fix landed, delete the entry" rather
     // than the fix (or a regression of it) passing unnoticed on our side of
     // the pin. See `minimap_paints_contiguous_rows_for_short_files`.
-    "minimap_paints_contiguous_rows_for_short_files::tui", // #990, quadraui#992
+    "minimap_paints_contiguous_rows_for_short_files::tui", // #990, quadraui#992 — fix: #1030
     // Defect 2 -- indentation bears little resemblance to the file's,
     // upstream **quadraui#993**: each line is normalised by its own
     // `chars.len()` instead of a scale shared across the file, so every
@@ -1264,7 +1264,7 @@ pub(crate) const KNOWN_BUGS: &[&str] = &[
     // bug and does not discriminate; the scenario's extent assertions are
     // what actually fail. See
     // `minimap_indent_marks_track_the_files_own_indentation`.
-    "minimap_indent_marks_track_the_files_own_indentation::tui", // #990, quadraui#993
+    "minimap_indent_marks_track_the_files_own_indentation::tui", // #990, quadraui#993 — fix: #1030
     // Defect 3 -- no colouring. Diagnosed as **vimcode's own**, not
     // quadraui's (the issue's candidate 4): `render::build_minimap_data`
     // builds its `MinimapGrid` with a hardcoded `cols: MINIMAP_SPAN_COLS`
@@ -1276,10 +1276,11 @@ pub(crate) const KNOWN_BUGS: &[&str] = &[
     // indent 0, 3 at 8, 2 at 20, 1 (fallback only) at 40 and 80. The
     // issue's candidate 1 ("highlights are empty under the TUI") is
     // disproven and asserted against, ungated, in the scenario itself.
-    // Test-only here by this issue's own scope; the fix is filed separately
-    // against vimcode. See
+    // Test-only here by this issue's own scope. The fix is #1030 (filed
+    // 2026-09-16 -- at the time this comment was first written it claimed a
+    // separate vimcode fix issue existed, and none did). See
     // `minimap_paints_syntax_colour_for_indented_code`.
-    "minimap_paints_syntax_colour_for_indented_code::tui", // #990
+    "minimap_paints_syntax_colour_for_indented_code::tui", // #990 — fix: #1030
 ];
 
 /// A saved `std::panic::set_hook`/`take_hook` closure — named so
