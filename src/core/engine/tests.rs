@@ -19100,6 +19100,102 @@ fn test_confirm_delete_folder() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+// ─── `:CheckNerdFonts` dialog tests (#999) ───────────────────────────────────
+//
+// `crate::icons::{nerd_fonts_enabled, set_nerd_fonts}` is thread-local
+// (#618), so any test that mutates it saves and restores the ambient value
+// to avoid leaking into whatever other test Rust's runner schedules next on
+// the same worker thread — same discipline the shell_app.rs/gtk testing.rs
+// nerd-font tests already follow.
+
+#[test]
+fn test_check_nerd_fonts_shows_dialog_with_both_variants_side_by_side() {
+    let mut e = Engine::new();
+    e.execute_command("CheckNerdFonts");
+
+    assert!(e.dialog.is_some());
+    let dlg = e.dialog.as_ref().unwrap();
+    assert_eq!(dlg.tag, "check_nerd_fonts");
+    // Rendered content, not a flag: the dialog body must contain the actual
+    // nerd glyph AND its ASCII fallback for a sampled file type, side by
+    // side, so the user has something concrete to compare.
+    assert!(
+        dlg.body
+            .iter()
+            .any(|l| l.contains(crate::icons::FILE_RUST.nerd)),
+        "dialog body must show the Nerd Font glyph row: {:?}",
+        dlg.body
+    );
+    assert!(
+        dlg.body
+            .iter()
+            .any(|l| l.contains(crate::icons::FILE_RUST.fallback)),
+        "dialog body must show the ASCII fallback row: {:?}",
+        dlg.body
+    );
+    assert_eq!(dlg.buttons.len(), 3);
+    assert_eq!(dlg.buttons[0].action, "enable");
+    assert_eq!(dlg.buttons[1].action, "disable");
+    assert_eq!(dlg.buttons[2].action, "cancel");
+}
+
+#[test]
+fn test_check_nerd_fonts_enable_persists_explicit_override() {
+    let prev_nf = crate::icons::nerd_fonts_enabled();
+
+    let mut e = Engine::new();
+    e.settings.use_nerd_fonts = None;
+    e.execute_command("CheckNerdFonts");
+    assert!(e.dialog.is_some());
+
+    // Press 'n' — "Nerd Font row looks right" hotkey.
+    e.handle_key("", Some('n'), false);
+    assert!(e.dialog.is_none());
+    assert_eq!(
+        e.settings.use_nerd_fonts,
+        Some(true),
+        "must persist an explicit Some(_), not just flip the live flag"
+    );
+    assert!(crate::icons::nerd_fonts_enabled());
+    assert!(e.message.contains("enabled"));
+
+    crate::icons::set_nerd_fonts(prev_nf);
+}
+
+#[test]
+fn test_check_nerd_fonts_disable_persists_explicit_override() {
+    let prev_nf = crate::icons::nerd_fonts_enabled();
+
+    let mut e = Engine::new();
+    e.settings.use_nerd_fonts = None;
+    e.execute_command("CheckNerdFonts");
+    assert!(e.dialog.is_some());
+
+    // Press 'f' — "Fallback row looks right" hotkey.
+    e.handle_key("", Some('f'), false);
+    assert!(e.dialog.is_none());
+    assert_eq!(e.settings.use_nerd_fonts, Some(false));
+    assert!(!crate::icons::nerd_fonts_enabled());
+    assert!(e.message.contains("disabled"));
+
+    crate::icons::set_nerd_fonts(prev_nf);
+}
+
+#[test]
+fn test_check_nerd_fonts_cancel_leaves_setting_unset() {
+    let mut e = Engine::new();
+    e.settings.use_nerd_fonts = None;
+    e.execute_command("CheckNerdFonts");
+    assert!(e.dialog.is_some());
+
+    e.handle_key("Escape", None, false);
+    assert!(e.dialog.is_none());
+    assert!(
+        e.settings.use_nerd_fonts.is_none(),
+        "cancel must not persist any override"
+    );
+}
+
 #[test]
 fn test_move_file_dialog_shows_with_input() {
     let dir = std::env::temp_dir().join("vimcode_test_move_dialog");

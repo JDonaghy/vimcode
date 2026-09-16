@@ -189,7 +189,7 @@ mod win_driver_tests {
 
     fn plain_engine() -> Engine {
         let mut engine = Engine::new_for_test();
-        engine.settings.use_nerd_fonts = false;
+        engine.settings.use_nerd_fonts = Some(false);
         engine
     }
 

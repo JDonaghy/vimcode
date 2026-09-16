@@ -1173,7 +1173,7 @@ macro_rules! backend_conformance {
 fn gtk_or_tui_probe_harness(
 ) -> ConformanceHarness<quadraui::tui::testing::TuiDriver<impl quadraui::AppLogic>> {
     let mut engine = crate::core::Engine::new_for_test();
-    engine.settings.use_nerd_fonts = false;
+    engine.settings.use_nerd_fonts = Some(false);
     crate::tui_main::testing::conformance_harness(engine, 80, 24)
 }
 
@@ -1203,7 +1203,7 @@ mod tests {
         std::fs::create_dir_all(dir.join("src").join("core")).unwrap();
 
         let mut engine = crate::core::Engine::new_for_test();
-        engine.settings.use_nerd_fonts = false;
+        engine.settings.use_nerd_fonts = Some(false);
         engine.cwd = dir.clone();
         engine.explorer_expanded.insert(dir.clone());
         engine.explorer_expanded.insert(dir.join("src"));
@@ -1461,7 +1461,7 @@ mod issue_983_row_click_selects_the_row_below {
     /// own "does the child label vanish" technique, just pointed lower.
     fn engine_settings_scrolled_to_lsp() -> Engine {
         let mut engine = Engine::new_for_test();
-        engine.settings.use_nerd_fonts = false;
+        engine.settings.use_nerd_fonts = Some(false);
         engine
             .app_shell
             .show_panel(&quadraui::WidgetId::new(PANEL_SETTINGS));
@@ -1491,7 +1491,7 @@ mod issue_983_row_click_selects_the_row_below {
     /// panel would use for its own rows once that other gap is closed.
     fn engine_git_insights_scrolled_to_available() -> Engine {
         let mut engine = Engine::new_for_test();
-        engine.settings.use_nerd_fonts = false;
+        engine.settings.use_nerd_fonts = Some(false);
         let mut manifests: Vec<ExtensionManifest> = (0..20)
             .map(|i| ExtensionManifest {
                 name: format!("zqxw983installed{i}"),
@@ -1741,7 +1741,7 @@ mod issue_984_explorer_chevron_needs_a_double_click {
         std::fs::write(dir.join("kkxxqq_dir984").join("child984_marker"), b"").unwrap();
 
         let mut engine = crate::core::Engine::new_for_test();
-        engine.settings.use_nerd_fonts = false;
+        engine.settings.use_nerd_fonts = Some(false);
         engine.cwd = dir.clone();
         engine.explorer_expanded.insert(dir.clone());
         engine.explorer_rebuild_rows();

@@ -26,6 +26,7 @@ use std::cell::Cell;
 
 thread_local! {
     static USE_NERD_FONTS: Cell<bool> = const { Cell::new(true) };
+    static IS_GUI_BACKEND: Cell<bool> = const { Cell::new(false) };
 }
 
 /// Enable or disable Nerd Font glyphs on the current thread. When disabled,
@@ -36,6 +37,31 @@ pub fn set_nerd_fonts(val: bool) {
 
 pub fn nerd_fonts_enabled() -> bool {
     USE_NERD_FONTS.with(|f| f.get())
+}
+
+/// Record whether the current thread belongs to a GUI backend (GTK, macOS,
+/// Win-GUI) as opposed to the TUI. Read by
+/// [`crate::core::settings::Settings::use_nerd_fonts`] to resolve its
+/// backend-derived default (issue #999) — GUI bundles the icon font and
+/// always has it available; TUI cannot detect its terminal's glyph coverage
+/// and keeps the conservative `target_os` guess.
+///
+/// Every GUI entry point (`App::new`, `App::new_portable`,
+/// `App::new_headless_with_backend`) calls `set_gui_backend(true)` once at
+/// startup, in the same place it already calls `set_nerd_fonts(...)`. TUI
+/// entry points leave this at its default, `false`.
+///
+/// Thread-local for the same reason `USE_NERD_FONTS` is (see the module
+/// doc's "#618" section): rendering never crosses threads in this
+/// codebase, so a test that flips this can only affect other tests
+/// scheduled on that same worker thread, never tests running concurrently
+/// on other threads in the shared `cargo test` process.
+pub fn set_gui_backend(val: bool) {
+    IS_GUI_BACKEND.with(|f| f.set(val));
+}
+
+pub fn is_gui_backend() -> bool {
+    IS_GUI_BACKEND.with(|f| f.get())
 }
 
 /// A UI icon with a Nerd Font glyph and a standard-Unicode fallback.
