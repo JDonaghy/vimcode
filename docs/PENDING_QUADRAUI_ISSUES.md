@@ -285,3 +285,83 @@ behaviour verified in that test, or waive the deliverable — and per
 rather than closing #1030 as if the criterion had been met. A worker session
 cannot make that call or edit the issue (`git`-only, no `gh`), which is why
 it is recorded here.
+
+---
+
+## `TuiBackend` lets a `None` cursor_position clobber a `Some` within one frame (blocks vimcode#1039)
+
+**Title:** `TuiBackend::last_cursor_position` is overwritten unconditionally
+by every `Backend::draw_editor` call, so an inactive window's `None` can
+clobber the active window's `Some` painted earlier in the same frame
+
+**Body:**
+
+vimcode#1039 reported that with two tab groups (a split) open, entering
+insert mode in the **left** group painted no visible caret — the caret is a
+`Bar`/`Underline` shape, which is not painted into the cell buffer like
+`Block`; it is placed once per frame via `ratatui::Frame::set_cursor_position`.
+
+Investigating (this issue's fix) found the clobber is one layer deeper than
+the issue's own hypothesis. vimcode already gates `RenderedWindow.cursor` to
+`Some` only for the active window (`render::build_rendered_window`'s
+existing `is_active` check), so `quadraui::tui::draw_editor`
+(`quadraui/src/tui/editor.rs:460`, pinned rev `8abca3a`) never actually
+reports a `Bar`/`Underline` `cursor_position` for an inactive window today —
+inactive windows call `draw_editor` with a cursor-less editor and get
+`cursor_position: None` back correctly.
+
+The clobber instead happens in `quadraui::tui::TuiBackend`
+(`quadraui/src/tui/backend.rs:2534`, pinned rev `8abca3a`):
+
+```rust
+// backend.rs:2534, inside the fn that turns an EditorPaintResult into a
+// Backend::draw_editor return value:
+self.last_cursor_position = tui_result.cursor_position;
+```
+
+This assignment is **unconditional** — every `draw_editor` call overwrites
+`last_cursor_position`, including calls for inactive windows that report
+`None`. `last_cursor_position` is later drained once per frame via
+`TuiBackend::take_last_cursor_position` (`backend.rs:649`) and applied to
+the real `Frame::set_cursor_position` (`quadraui/src/tui/run.rs:427-428`).
+So whichever window's `draw_editor` call happens to run **last** in a given
+frame decides the whole frame's caret — regardless of which window is
+actually active/focused. vimcode's `render_all_windows` painted windows in
+a fixed layout order (left, then right), so a left-active split had its
+correct `Some` position from the left window's `draw_editor` call
+overwritten by `None` from the right window's later, cursor-less call —
+exactly the "left group breaks, right/single group works" symptom the issue
+reported.
+
+**vimcode-side workaround already shipped** (this issue, `750d5e7`):
+`render_all_windows` (`src/tui_main/render_impl.rs`) now partitions
+`windows` by `is_active` and paints the active window **last**, so its
+`Some` position is always the one still standing when `take_last_cursor_
+position` drains at end of frame. This is a reorder against data
+(`RenderedWindow.is_active`) vimcode already had — no new per-backend
+state — but it is a workaround coupled to `TuiBackend`'s specific
+last-write-wins behaviour: `render_all_windows` is currently the only TUI
+call site of `draw_editor` and exactly one window is ever `is_active`
+(`render.rs:13159`), so it holds today, but it would silently stop
+mattering (harmlessly) or silently regress (if quadraui's cache semantics
+change the other direction) with no compile-time signal, if quadraui's
+internals change — e.g. parallelized per-window painting, or multiple
+non-window `draw_editor` callers appearing.
+
+**Ask:** make `TuiBackend`'s cache never let a `None` `cursor_position`
+clobber a `Some` already recorded earlier in the same frame — e.g. only
+overwrite `last_cursor_position` when the new value is `Some`, or reset to
+`None` explicitly at frame-start (`backend.rs:1245` already does a
+frame-start reset — the question is `2534`'s per-call overwrite happening
+unconditionally *within* a frame after that reset) rather than on every
+individual `draw_editor` call regardless of its own result. Once that
+lands, vimcode's `render_all_windows` partition-and-reorder becomes
+redundant scaffolding (order no longer matters) and can be deleted, or kept
+harmlessly — either is fine, but should be a deliberate follow-up on the
+vimcode side once this fix ships, not silently forgotten.
+
+**Blocks:** `JDonaghy/vimcode#1039` — the vimcode-side reorder in
+`750d5e7` is a correct workaround for the caret's visible symptom today,
+but the underlying bug is upstream. Leave #1039 open behind this one per
+`GOALS.md`'s milestone-discipline rule; do not treat the reorder as the
+permanent fix.
