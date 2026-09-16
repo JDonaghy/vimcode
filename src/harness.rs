@@ -1160,6 +1160,32 @@ pub(crate) const KNOWN_BUGS: &[&str] = &[
     // above (only one assertion fails here, not both).
     "right_group_scrollbar_drag_scrolls_without_resizing::gtk", // #987
     "right_group_scrollbar_drag_scrolls_without_resizing::tui", // #987
+    // #988: v0.11.0 bug report -- the TUI hamburger (menu) button won't
+    // re-hide the menu bar once revealed. Confirmed by driving the harness
+    // (not the issue's own "likely shape" guess, which named the wrong
+    // arm -- see below): the toggle *mechanism* has no defect at all --
+    // `hamburger_click_toggles_menu_bar_open_then_closed_then_open_again`
+    // (`src/tui_main/shell_app.rs`, ungated) drives three clicks, each
+    // correctly re-located from the just-painted frame, and the menu row
+    // cycles open/closed/open exactly as a toggle should. The real,
+    // reproducible defect is a hit-target-moved-out-from-under-the-click
+    // bug: revealing the menu shifts the hamburger down one screen row, and
+    // a second click at the *same physical position* the first click used
+    // (what a user's muscle memory would reach for) lands in the
+    // now-relocated title-bar band instead and is silently swallowed --
+    // reproducing the exact reported symptom. TUI-only by construction --
+    // GTK has no hamburger button at all (`render::build_activity_bar`'s
+    // `include_hamburger` is `false` for GTK, which uses a native menu bar
+    // widget instead). Not `mouse.rs`'s hand-rolled `ActivityBarTarget::
+    // MenuToggle` arm (the issue's own "likely shape" guess) -- that arm is
+    // unreachable for a hamburger mouse click in production, since the
+    // hamburger is a registered `AppShell` `PanelDefinition` and
+    // `ShellAdapter::handle` consumes the click into a semantic
+    // `AppShellEvent` before `mouse::handle_mouse` ever runs. See
+    // `hamburger_stale_click_position_after_reveal_misses_the_shifted_button`'s
+    // own doc in `src/tui_main/shell_app.rs` for the full mechanism this
+    // entry pins.
+    "hamburger_second_click_at_stale_position_does_not_hide_menu_bar::tui", // #988
 ];
 
 /// A saved `std::panic::set_hook`/`take_hook` closure — named so
