@@ -16028,6 +16028,30 @@ pub fn populate_settings_form_controller(engine: &Engine) {
 /// expands/collapses on a single click, and a value row selects on a single
 /// click but only *activates* (opens the inline editor / cycles an enum) on a
 /// double click.
+///
+/// # Row geometry is not offset from the paint (#983 → #1028)
+///
+/// #983 reported (v0.11.0) that a click low in a settings row selected the
+/// row *below* it, and blamed the `handle_cached` path below — the
+/// `backend: None` branch of `quadraui::FormController::click_inner`, which
+/// re-derives its row layout from `lh` alone instead of asking the backend.
+/// #1028 measured it on a real GTK frame rather than inferring it from
+/// glyph bounds, and there is no offset to fix: the `▼ LSP` category row's
+/// background is *painted* over `y ∈ [389, 421)` and this function resolves
+/// clicks to it over exactly `y ∈ [389, 421)`. Both paths agree because the
+/// row pitch is the same pure function of `lh` on both sides —
+/// `FormController`'s cached `row_height(lh)` and `GtkBackend::form_layout`'s
+/// `layout_metrics::form_row_height(lh)` are both `(lh * 1.4).round()`; the
+/// cached path only approximates the *horizontal* text measure, which row
+/// resolution does not use. The ext-panel/`SidebarSystem` rows behave the
+/// same way (`[741, 773)` painted, `[741, 773)` hit).
+///
+/// What #983's reporter actually clicked was the next row's own top padding
+/// — a row's band is ~32px tall around a ~23px glyph, so each row owns a
+/// ~4.5px strip of background above and below its label. Do **not** add a
+/// vimcode-side offset here to "fix" that; it would break the agreement
+/// above. `harness::row_click_in_its_painted_band_hits_its_own_row` locks
+/// the two bands together, on both panels and on both sides of the glyph.
 pub fn handle_settings_form_ui_event(
     engine: &mut Engine,
     event: &quadraui::UiEvent,

@@ -616,50 +616,132 @@ pub fn sweep_hit_band_integrity_resetting<D: ConformanceDriver + DriverInput>(
     }
 }
 
-/// #983: a click anywhere inside `needle`'s own **painted row band** —
-/// not just its text glyph, but the full vertical slot the panel
-/// allocates it before the next painted row (`next_row_needle`) begins —
-/// must act on `needle`'s own row, never silently act on the row painted
-/// immediately below it.
+/// Which side of a row's own text glyph a probe point sits on, within
+/// that row's **painted background band**.
 ///
-/// This is a different bug shape than [`sweep_hit_band_integrity`]'s
-/// #967 family: that helper samples strictly within a run's own painted
-/// glyph bounds, which is exactly the zone this issue's bug does *not*
-/// live in. #983's report (v0.11.0: "settings / git insights row click
-/// selects the row below") traces to a GTK-only gap between a row's own
-/// text-glyph height and the panel's real row pitch — e.g. the Settings
-/// panel measured 23px-tall label glyphs spaced 32px apart, and
-/// `render::handle_settings_form_ui_event`'s `handle_cached` path (the
-/// `backend: None` branch of `quadraui::FormController::click_inner`)
-/// resolves a click anywhere in that ~9px gap to the *next* field — a
-/// point still visually inside the clicked row's own 32px band, by any
-/// reasonable reading of "this row's own area" (there is no drawn
-/// boundary at the glyph's own bottom edge for a user to see). The same
-/// shape reproduces on the plugin/marketplace ext-panel's `SidebarSystem`
-/// rows (the "git insights" report) with an even larger ~15-18px gap.
-/// Both are a **constant** per-row offset, not a #967-style
-/// accumulating one — measured identical (~4.5px into a 32px settings
-/// row, both near row 3 and row 48) regardless of row index; see this
-/// function's callers for the measurements.
+/// Every panel in this repo paints a row taller than the text glyph it
+/// centres inside it (GTK: a 32px band around a 23px label), so each row
+/// owns a strip of background *above* its glyph and another *below* it.
+/// Fixing one edge and not the other only moves a hit-band bug, so #1028
+/// probes both — see
+/// [`row_click_in_its_painted_band_hits_its_own_row`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RowBandEdge {
+    /// The topmost pixel of the band, above the row's own text glyph.
+    AboveGlyph,
+    /// The bottommost pixel of the band, below the row's own text glyph.
+    BelowGlyph,
+}
+
+/// Measure one painted row's background band by walking a single column
+/// of **real painted pixels** outward from `seed_y` while the colour is
+/// unchanged, returning the half-open band `[top, bottom)`.
 ///
-/// TUI cannot reproduce this bug *by construction*, not merely "doesn't
-/// happen to today": its row pitch is a fixed 1 cell, always exactly
-/// equal to its own glyph height (`TextMetricsBackend` is a genuine
-/// no-op there — see `src/tui_main/mod.rs`'s own doc), so there is no
-/// sub-row gap for a click to land in. The sanity assert below makes
-/// that structural claim self-checking rather than assumed: it fails
-/// loudly (not silently no-ops) if this is ever pointed at a backend
-/// whose glyph height already equals its row pitch, rather than
-/// reporting a false "pass" that proves nothing.
+/// This exists because `FrameInventory::text_runs()` only exposes *glyph*
+/// bounds, and a row's glyph is strictly smaller than the band the panel
+/// paints for it — so glyph bounds cannot answer "which row does this
+/// point belong to". #983's original reproduction derived its probe point
+/// from glyph bounds alone and, as a direct result, aimed *past* the
+/// clicked row's band and into the next row's own band (see
+/// [`row_click_in_its_painted_band_hits_its_own_row`]'s doc for the
+/// measurements). Reading the band off the pixels the frame actually
+/// painted is the only way to state "inside this row" without asserting a
+/// hardcoded coordinate — `CLAUDE.md`'s Testing rule 1.
+///
+/// `pixel(y)` must sample a column that is background at `seed_y` — i.e.
+/// clear of the row's own glyph, its chevron and any scrollbar gutter.
+/// Panics if the band cannot be resolved (the whole `0..limit` column is
+/// one colour), rather than silently returning a band that proves nothing.
+///
+/// The row being measured must also be painted in a colour its immediate
+/// neighbours do *not* share — a section header (`theme.header_bg`) or the
+/// focused row (`theme.selected_bg`) — or the walk runs straight through
+/// the boundary into the next identically-filled row. Callers get that
+/// checked for them: `row_click_in_its_painted_band_hits_its_own_row`
+/// asserts the returned band actually contains the needle's own glyph, so
+/// a band measured off the wrong row fails loudly there instead of
+/// silently probing a neighbour's padding.
+pub fn painted_row_band(
+    mut pixel: impl FnMut(i32) -> (u8, u8, u8),
+    seed_y: i32,
+    limit: i32,
+) -> (f32, f32) {
+    let seed = pixel(seed_y);
+    let mut top = seed_y;
+    while top > 0 && pixel(top - 1) == seed {
+        top -= 1;
+    }
+    let mut bottom = seed_y;
+    while bottom + 1 < limit && pixel(bottom + 1) == seed {
+        bottom += 1;
+    }
+    assert!(
+        top > 0 && bottom + 1 < limit,
+        "painted_row_band: the probe column is a single flat colour {seed:?} from \
+         y={top} to y={bottom} — it never crossed this row's own background band \
+         edge, so it is sampling a column with no per-row fill (wrong x?) and any \
+         band derived from it would prove nothing"
+    );
+    (top as f32, (bottom + 1) as f32)
+}
+
+/// #983 / #1028: a click anywhere inside `needle`'s own **painted
+/// background band** — the full vertical slot the panel fills for that
+/// row, on either side of its text glyph — must act on `needle`'s own
+/// row, never on the row painted above or below it.
+///
+/// `band` is `needle`'s painted band as measured by
+/// [`painted_row_band`] from the pixels of the current frame; `edge`
+/// picks which extreme of it to probe. Both edges are exercised by
+/// #1028's callers: fixing only the bottom edge would just move the bug
+/// to the top one.
+///
+/// # What #983 actually turned out to be (measured, #1028)
+///
+/// The v0.11.0 report ("settings / git insights row click selects the
+/// row below") was originally reproduced here by probing
+/// `next_row_needle`'s **glyph** top minus half a pixel, on the theory
+/// that a GTK-only gap between a row's text-glyph height and the panel's
+/// row pitch let a click inside a row's own band resolve to the next
+/// row. Measuring the frame instead of the glyphs shows that is not what
+/// is happening. On a 1400x900 GTK frame, driving the two reported
+/// panels through their real click paths:
+///
+/// | panel | row | painted band (bg pixels) | hit band (click sweep) |
+/// |---|---|---|---|
+/// | Settings (`FormController`) | `▼ LSP` header | `[389, 421)` | `[389, 421)` |
+/// | Ext panel (`SidebarSystem`) | `AVAILABLE` header | `[741, 773)` | `[741, 773)` |
+///
+/// The hit band matches the painted band **to the pixel** on both
+/// panels, and both bands are painted in a *visibly different* colour
+/// from their neighbours (`theme.header_bg` vs `theme.tab_bar_bg` —
+/// `51,51,76` vs `38,38,51` on the default theme), so the boundary is
+/// drawn, not invisible. The original probe point was not inside the
+/// clicked row's band at all: it sat 4px (settings) / 7.5px (ext panel)
+/// *below* the next row's band top edge, inside that next row's own
+/// painted background. So neither vimcode's
+/// `render::handle_settings_form_ui_event` nor quadraui's
+/// `FormController::click_inner` / `SidebarSystem` row resolution has a
+/// geometry bug to fix — no quadraui issue was filed, because there is
+/// no upstream gap to file.
+///
+/// What this helper guards now is the property the report *meant*: the
+/// row a click lands on is the row whose painted band contains the
+/// point, everywhere in that band including the padding strips above and
+/// below the glyph — which is a strictly stronger claim than the single
+/// glyph-derived point the original probed, and the claim a paint/hit
+/// drift (#967's family) would actually break.
 ///
 /// `effect_after_click` reads back, from **painted** output only (never
-/// engine state — CLAUDE.md's "assert on rendered output" rule, #587/
-/// #592), whether the click acted on `needle`'s own row: `true` only
-/// when the correct-row outcome is observed.
-pub fn row_click_hits_its_own_row_not_the_row_below<D: ConformanceDriver + DriverInput>(
+/// engine state — `CLAUDE.md`'s "assert on rendered output" rule,
+/// #587/#592), whether the click acted on `needle`'s own row: `true`
+/// only when the correct-row outcome is observed.
+pub fn row_click_in_its_painted_band_hits_its_own_row<D: ConformanceDriver + DriverInput>(
     driver: &mut D,
     needle: &str,
     next_row_needle: &str,
+    band: (f32, f32),
+    edge: RowBandEdge,
     mut effect_after_click: impl FnMut(&mut D) -> bool,
 ) {
     let locate = |d: &mut D, text: &str| -> quadraui::Rect {
@@ -668,7 +750,7 @@ pub fn row_click_hits_its_own_row_not_the_row_below<D: ConformanceDriver + Drive
             .iter()
             .find(|r| r.text.contains(text))
             .unwrap_or_else(|| {
-                panic!("row_click_hits_its_own_row_not_the_row_below: {text:?} not painted")
+                panic!("row_click_in_its_painted_band_hits_its_own_row: {text:?} not painted")
             })
             .bounds
     };
@@ -683,32 +765,65 @@ pub fn row_click_hits_its_own_row_not_the_row_below<D: ConformanceDriver + Drive
         bounds.y
     );
 
-    let x = bounds.x + bounds.width / 2.0;
-    // Just inside `needle`'s own row slot, immediately above where the
-    // next row's own label begins — self-measured from two real painted
-    // positions, never a literal coordinate.
-    let y = next_bounds.y - 0.5;
+    let (top, bottom) = band;
+    let glyph_bottom = bounds.y + bounds.height;
     assert!(
-        y > bounds.y + bounds.height,
-        "sanity: the probe point (y={y:.1}) must fall below {needle:?}'s own \
-         text glyph (bottom={:.1}) — otherwise this only re-tests the glyph's \
-         own centre, which every pre-existing click test in this panel \
-         already covers, not the gap between a row's glyph and the next \
-         row's own label this issue is about. A backend whose row pitch \
-         already equals its glyph height (TUI, by construction) has no such \
-         gap and will fail here — that is the point, not a bug in the probe: \
-         this scenario should not be registered for that backend.",
-        bounds.y + bounds.height,
+        top <= bounds.y && bottom >= glyph_bottom,
+        "sanity: the measured band [{top}, {bottom}) must contain {needle:?}'s own \
+         glyph ([{}, {}]) — otherwise `painted_row_band` was seeded off the wrong \
+         row and this probe would test some other row's padding",
+        bounds.y,
+        glyph_bottom,
     );
+    assert!(
+        bottom <= next_bounds.y,
+        "sanity: {needle:?}'s band must end (y={bottom}) at or above \
+         {next_row_needle:?}'s own glyph top (y={}) — they would otherwise \
+         overlap, and no probe point could be attributed to one row",
+        next_bounds.y,
+    );
+
+    let x = bounds.x + bounds.width / 2.0;
+    // Self-measured from the frame's own pixels, never a literal
+    // coordinate: the extreme pixel of the row's own painted band, on the
+    // requested side of its glyph.
+    let y = match edge {
+        RowBandEdge::AboveGlyph => top + 0.5,
+        RowBandEdge::BelowGlyph => bottom - 0.5,
+    };
+    match edge {
+        RowBandEdge::AboveGlyph => assert!(
+            y < bounds.y,
+            "sanity: the probe point (y={y:.1}) must fall above {needle:?}'s own \
+             text glyph (top={:.1}) — otherwise this only re-tests the glyph's own \
+             centre, which every pre-existing click test in this panel already \
+             covers, not the row's padding strip this issue is about. A backend \
+             whose row pitch already equals its glyph height (TUI, by \
+             construction) has no such strip and will fail here — that is the \
+             point, not a bug in the probe: this scenario should not be \
+             registered for that backend.",
+            bounds.y,
+        ),
+        RowBandEdge::BelowGlyph => assert!(
+            y > glyph_bottom,
+            "sanity: the probe point (y={y:.1}) must fall below {needle:?}'s own \
+             text glyph (bottom={glyph_bottom:.1}) — see the `AboveGlyph` arm's \
+             message for why this is a structural claim, not a tuning knob."
+        ),
+    }
 
     driver.click(x, y);
 
     assert!(
         effect_after_click(driver),
-        "a click inside {needle:?}'s own painted row band (x={x:.1}, y={y:.1}) \
-         — below its text glyph, but still above where {next_row_needle:?} \
-         begins painting — must act on {needle:?}'s own row, not the row \
-         painted below it (#983)"
+        "a click inside {needle:?}'s own painted background band (x={x:.1}, \
+         y={y:.1}, band [{top}, {bottom})) — {} its text glyph, and strictly \
+         above where {next_row_needle:?} begins painting — must act on \
+         {needle:?}'s own row, not the row painted next to it (#983/#1028)",
+        match edge {
+            RowBandEdge::AboveGlyph => "above",
+            RowBandEdge::BelowGlyph => "below",
+        },
     );
 }
 
@@ -1112,24 +1227,18 @@ pub(crate) fn assert_text_metrics_backend_applies_metrics<B: TextMetricsBackend>
 ///
 /// Empty as of #982 (that issue shipped the mechanism and a self-test of
 /// both gate directions, below, not any of the six real bug scenarios).
-/// #983 is the first of those chained follow-ups to land a real entry —
-/// two, one per backend-scoped scenario it adds (settings panel, ext-panel/
-/// "git insights"). The remaining v0.11.0 bugs are separate issues chained
-/// `--after` this one, each adding its own label here alongside its
-/// scenario.
+/// The remaining v0.11.0 bugs are separate issues chained `--after` that
+/// one, each adding its own label here alongside its scenario.
+///
+/// #983 briefly held two entries (settings panel, ext-panel/"git
+/// insights") and #1028 removed both: measuring the frame rather than the
+/// glyph bounds showed the reported hit-band gap does not exist — the
+/// painted row band and the click hit band match to the pixel on both
+/// panels. See
+/// [`row_click_in_its_painted_band_hits_its_own_row`]'s doc for the
+/// measurements and for the (stronger) property those scenarios assert
+/// now that they are ungated.
 pub(crate) const KNOWN_BUGS: &[&str] = &[
-    // #983: v0.11.0 bug report -- a click inside a settings-panel row's own
-    // painted band, below its text glyph but still above the next row's own
-    // label, resolves to the row below instead of the row clicked. GTK-only
-    // by construction (TUI's row pitch always equals its glyph height, so it
-    // has no such gap to fall into) -- see
-    // `row_click_hits_its_own_row_not_the_row_below`'s own doc.
-    "settings_row_click_selects_the_clicked_row_not_the_row_below::gtk", // #983 — fix: #1028
-    // #983: the same shared-cause report against the "git insights" plugin
-    // panel, reproduced here via the ext-panel/marketplace `SidebarSystem`
-    // plumbing that panel id actually routes through today (see this
-    // scenario's own fixture doc for why). GTK-only, same reason as above.
-    "ext_panel_row_click_selects_the_clicked_row_not_the_row_below::gtk", // #983 — fix: #1028
     // #986: v0.11.0 bug report -- `:s///c` (confirm-prompt) is #801 Phase 2,
     // which was never built: `execute.rs`'s `flags.contains('c')` check
     // always errors loudly ("E-vimcode: ... not implemented") instead of
@@ -1770,21 +1879,38 @@ mod tests {
     }
 }
 
-// ── #983: settings / git-insights row click selects the row below ──────
+// ── #983 / #1028: settings / git-insights row click vs. the painted row ──
 //
-// v0.11.0 bug suite. Both panels share the same root cause (see
-// `row_click_hits_its_own_row_not_the_row_below`'s own doc): a GTK-only
-// gap between a row's painted text-glyph height and the panel's real row
-// pitch, constant per row (not growing like #967), that resolves a click
-// in that gap to the row below. Reported and confirmed here on both the
-// Settings panel (`FormController`) and the ext-panel/marketplace
-// `SidebarSystem` that "git insights" (a plugin panel) routes through —
-// see the second fixture's own doc for why that's the closest in-repo
-// reproduction of the plugin panel specifically. TUI is excluded from
-// both `backend_conformance!` registrations below, not silently skipped:
-// its row pitch always equals its glyph height by construction (fixed
-// `TextMetricsBackend` no-op, `src/tui_main/mod.rs`), so there is no gap
-// for this bug to live in.
+// v0.11.0 bug suite. #983 reported that a click in a row's padding — below
+// its text glyph but above the next row's label — acted on the row below,
+// on the Settings panel (`FormController`) and on the ext-panel/marketplace
+// `SidebarSystem` that "git insights" (a plugin panel) routes through.
+//
+// #1028 went to fix it and found there is nothing to fix: measured against
+// the real frame rather than against `text_runs()` glyph bounds, each row's
+// *painted background band* and its *click hit band* are identical to the
+// pixel on both panels (Settings `▼ LSP`: painted [389, 421), hit
+// [389, 421); ext panel `AVAILABLE`: painted [741, 773), hit [741, 773)) —
+// and both bands are filled in a visibly different colour from their
+// neighbours, so the boundary is drawn, not invisible. The original probe
+// point (`next_row_glyph.y - 0.5`) was not inside the clicked row's band at
+// all; it sat 4px / 7.5px *below* the next row's band top edge, inside that
+// next row's own painted background. Neither vimcode's
+// `render::handle_settings_form_ui_event` nor quadraui's
+// `FormController::click_inner` / `SidebarSystem` row resolution is at
+// fault, so no quadraui issue was filed. See
+// `row_click_in_its_painted_band_hits_its_own_row`'s own doc for the full
+// table and method.
+//
+// The scenarios below therefore assert the property the report *meant*,
+// ungated: a click anywhere in a row's painted band — the padding strip
+// above its glyph *and* the one below it, deliberately both, so fixing one
+// edge can never quietly move a bug to the other — acts on that row. TUI is
+// excluded, not silently skipped: its row pitch always equals its glyph
+// height by construction (fixed `TextMetricsBackend` no-op,
+// `src/tui_main/mod.rs`), so it has no padding strip to probe and the
+// helper's own sanity assert fails loudly there rather than reporting a
+// false pass.
 #[cfg(test)]
 mod issue_983_row_click_selects_the_row_below {
     use super::*;
@@ -1860,82 +1986,160 @@ mod issue_983_row_click_selects_the_row_below {
         engine
     }
 
-    // ── Deliverable 1: click well below row 0, assert the painted
-    // selection landed on the clicked row, not the row below ──────────
+    // ── Deliverable 1: click the padding strip on *both* sides of a row's
+    // own text glyph, well below row 0, and assert the painted outcome
+    // landed on the clicked row ────────────────────────────────────────
+    //
+    // Hand-written rather than `backend_conformance!`-registered for two
+    // reasons. (a) They are GTK-only by construction — see this module's
+    // top doc — so the macro's per-backend expansion buys nothing. (b) The
+    // probe point is derived from the frame's own *pixels*
+    // (`GtkDriver::pixel`, via `harness::painted_row_band`), and `pixel` is
+    // an inherent `GtkDriver` method, not part of the backend-neutral
+    // `ConformanceDriver` trait the macro's `|driver|` body is generic
+    // over. The pre-existing `ext_panel_row_sweep_hit_band_integrity_gtk`
+    // below is hand-written for its own (different) reason already.
+    //
+    // RED-verification (#1028): these are not green by accident — two
+    // perturbations were run and confirmed red before being reverted.
+    //
+    // 1. Widen the returned band by a single pixel past the measured
+    //    boundary (`(b.0, b.1 + 1.0)` in `probe_band`) and both
+    //    `BelowGlyph` tests fail on the *final* assertion — settings at
+    //    "y=421.5, band [389, 422)", ext panel at "y=773.5, band
+    //    [741, 774)" — because that one extra pixel is already the first
+    //    row of the *next* row's fill, and the click lands there. That
+    //    one-pixel sensitivity is the whole content of these tests: they
+    //    pin paint and hit to the same boundary, which is exactly what a
+    //    #967-family drift would break.
+    // 2. Seed `probe_band` off a *neighbouring* row ("Enable LSP" instead
+    //    of "▼ LSP"; "Zqxw983Avail" instead of "AVAILABLE") and all four
+    //    fail on the band-containment sanity assert ("the measured band
+    //    [421, 461) must contain \"▼ LSP\"'s own glyph ([393.5, 416.5])"),
+    //    so a mis-seeded band can never masquerade as a passing probe.
 
-    // RED-verification (#983): with the KNOWN_BUGS entry below removed,
-    // `cargo test --features gui --lib
-    // issue_983_row_click_selects_the_row_below::settings_row_click_selects_the_clicked_row_not_the_row_below::gtk`
-    // fails on the final assertion inside
-    // `row_click_hits_its_own_row_not_the_row_below` — "Enable LSP"/"Format
-    // on Save" are still painted after the click, proving it landed on
-    // LSP's own first setting row instead of the LSP category header.
-    // Restored (KNOWN_BUGS entry back in place) and confirmed green again.
-    crate::backend_conformance! {
-        label: settings_row_click_selects_the_clicked_row_not_the_row_below,
-        backends: [gtk],
-        engine: engine_settings_scrolled_to_lsp(),
-        size: (1400, 900),
-        body: |driver| {
-            crate::harness::known_bug_gate(
-                "settings_row_click_selects_the_clicked_row_not_the_row_below::gtk",
-                || {
-                    assert!(
-                        driver.screen_has("Enable LSP") && driver.screen_has("Format on Save"),
-                        "precondition: scrolling to the LSP category must paint both \
-                         of its settings; painted: {:?}",
-                        driver.inventory().text_runs()
-                    );
-                    crate::harness::row_click_hits_its_own_row_not_the_row_below(
-                        driver,
-                        "▼ LSP",
-                        "Enable LSP",
-                        |d| !(d.screen_has("Enable LSP") || d.screen_has("Format on Save")),
-                    );
-                },
-            );
-        },
+    /// `needle`'s painted background band, measured off the pixels of the
+    /// frame currently on screen.
+    ///
+    /// The probe column sits just past the right edge of `needle`'s own
+    /// glyph — inside the panel, clear of the glyph itself, its chevron and
+    /// the scrollbar gutter — so the colour it reads is the row's own
+    /// background fill. Never a hardcoded coordinate: both the column and
+    /// the seed row come from `needle`'s real painted bounds.
+    #[cfg(feature = "gui")]
+    fn probe_band<A: quadraui::AppLogic>(
+        driver: &mut quadraui::gtk::testing::GtkDriver<A>,
+        needle: &str,
+        viewport_h: i32,
+    ) -> (f32, f32) {
+        let glyph = driver
+            .find_bounds(needle)
+            .unwrap_or_else(|| panic!("probe_band: {needle:?} not painted"));
+        let probe_x = (glyph.x + glyph.width + 8.0) as i32;
+        let seed_y = (glyph.y + glyph.height / 2.0) as i32;
+        crate::harness::painted_row_band(|y| driver.pixel(probe_x, y), seed_y, viewport_h)
     }
 
-    // RED-verification (#983): same procedure as above, against
-    // `ext_panel_row_click_selects_the_clicked_row_not_the_row_below::gtk`
-    // — with its KNOWN_BUGS entry removed, the final assertion fails
-    // because "Zqxw983Avail" is still painted after the click (the
-    // AVAILABLE header failed to collapse; the click landed on the
-    // available row itself, one row below the header). Restored and
-    // confirmed green again.
-    crate::backend_conformance! {
-        label: ext_panel_row_click_selects_the_clicked_row_not_the_row_below,
-        backends: [gtk],
-        engine: engine_git_insights_scrolled_to_available(),
-        size: (1400, 900),
-        body: |driver| {
-            crate::harness::known_bug_gate(
-                "ext_panel_row_click_selects_the_clicked_row_not_the_row_below::gtk",
-                || {
-                    assert!(
-                        driver.screen_has("AVAILABLE") && driver.screen_has("Zqxw983Avail"),
-                        "precondition: the ext panel must paint the pushed-down \
-                         AVAILABLE header and its one row; painted: {:?}",
-                        driver.inventory().text_runs()
-                    );
-                    crate::harness::row_click_hits_its_own_row_not_the_row_below(
-                        driver,
-                        "AVAILABLE",
-                        "Zqxw983Avail",
-                        |d| !d.screen_has("Zqxw983Avail"),
-                    );
-                },
-            );
-        },
+    #[cfg(feature = "gui")]
+    #[test]
+    fn settings_row_click_below_its_glyph_hits_its_own_row_gtk() {
+        let mut h =
+            crate::gtk::testing::conformance_harness(engine_settings_scrolled_to_lsp(), 1400, 900);
+        assert!(
+            h.driver.screen_has("Enable LSP") && h.driver.screen_has("Format on Save"),
+            "precondition: scrolling to the LSP category must paint both of its \
+             settings; painted: {:?}",
+            h.driver.inventory().text_runs()
+        );
+        let band = probe_band(&mut h.driver, "▼ LSP", 900);
+        crate::harness::row_click_in_its_painted_band_hits_its_own_row(
+            &mut h.driver,
+            "▼ LSP",
+            "Enable LSP",
+            band,
+            crate::harness::RowBandEdge::BelowGlyph,
+            |d| !(d.screen_has("Enable LSP") || d.screen_has("Format on Save")),
+        );
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn settings_row_click_above_its_glyph_hits_its_own_row_gtk() {
+        let mut h =
+            crate::gtk::testing::conformance_harness(engine_settings_scrolled_to_lsp(), 1400, 900);
+        assert!(
+            h.driver.screen_has("Enable LSP") && h.driver.screen_has("Format on Save"),
+            "precondition: scrolling to the LSP category must paint both of its \
+             settings; painted: {:?}",
+            h.driver.inventory().text_runs()
+        );
+        let band = probe_band(&mut h.driver, "▼ LSP", 900);
+        crate::harness::row_click_in_its_painted_band_hits_its_own_row(
+            &mut h.driver,
+            "▼ LSP",
+            "Enable LSP",
+            band,
+            crate::harness::RowBandEdge::AboveGlyph,
+            |d| !(d.screen_has("Enable LSP") || d.screen_has("Format on Save")),
+        );
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn ext_panel_row_click_below_its_glyph_hits_its_own_row_gtk() {
+        let mut h = crate::gtk::testing::conformance_harness(
+            engine_git_insights_scrolled_to_available(),
+            1400,
+            900,
+        );
+        assert!(
+            h.driver.screen_has("AVAILABLE") && h.driver.screen_has("Zqxw983Avail"),
+            "precondition: the ext panel must paint the pushed-down AVAILABLE \
+             header and its one row; painted: {:?}",
+            h.driver.inventory().text_runs()
+        );
+        let band = probe_band(&mut h.driver, "AVAILABLE", 900);
+        crate::harness::row_click_in_its_painted_band_hits_its_own_row(
+            &mut h.driver,
+            "AVAILABLE",
+            "Zqxw983Avail",
+            band,
+            crate::harness::RowBandEdge::BelowGlyph,
+            |d| !d.screen_has("Zqxw983Avail"),
+        );
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn ext_panel_row_click_above_its_glyph_hits_its_own_row_gtk() {
+        let mut h = crate::gtk::testing::conformance_harness(
+            engine_git_insights_scrolled_to_available(),
+            1400,
+            900,
+        );
+        assert!(
+            h.driver.screen_has("AVAILABLE") && h.driver.screen_has("Zqxw983Avail"),
+            "precondition: the ext panel must paint the pushed-down AVAILABLE \
+             header and its one row; painted: {:?}",
+            h.driver.inventory().text_runs()
+        );
+        let band = probe_band(&mut h.driver, "AVAILABLE", 900);
+        crate::harness::row_click_in_its_painted_band_hits_its_own_row(
+            &mut h.driver,
+            "AVAILABLE",
+            "Zqxw983Avail",
+            band,
+            crate::harness::RowBandEdge::AboveGlyph,
+            |d| !d.screen_has("Zqxw983Avail"),
+        );
     }
 
     // ── Deliverable 2: sweep_hit_band_integrity over a settings row and
     // an ext-panel row — the "similar bugs" generalization. These sample
     // strictly inside the needle's own painted glyph bounds (per that
-    // helper's own contract), which is the #967-shaped zone #983's own
-    // bug does *not* live in (it lives in the gap *below* the glyph — see
-    // `row_click_hits_its_own_row_not_the_row_below`'s doc) — so both are
+    // helper's own contract), i.e. the interior of the band Deliverable 1
+    // above probes the *edges* of (see
+    // `row_click_in_its_painted_band_hits_its_own_row`'s doc) — so both are
     // expected to pass today, on every backend, with no KNOWN_BUGS entry.
     // What they protect against is a *different*, #967-style regression
     // creeping into either row-pitch formula later, and they cost nothing
