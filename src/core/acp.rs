@@ -781,9 +781,10 @@ mod tests {
     }
 
     /// Poll until at least one event has arrived or the deadline passes.
-    /// The fake agent replies synchronously off a blocking `read`, so this
-    /// only needs to ride out normal process/pipe scheduling latency, not
-    /// anything actually slow.
+    /// The fake agent replies synchronously off a blocking `read`, so the
+    /// only thing being ridden out here is process/pipe scheduling latency —
+    /// but see [`TEST_DEADLINE`] for why "scheduling latency" is not
+    /// automatically small.
     #[cfg(unix)]
     fn poll_until(client: &mut AcpClient, deadline: std::time::Duration) -> Vec<AcpEvent> {
         let start = std::time::Instant::now();
@@ -809,9 +810,10 @@ mod tests {
     /// "the first poll returns Initialized, the second returns AgentExited"
     /// therefore passes or fails at random — it was the flake seen at #984's
     /// test stage. Nothing about the client's contract promises a one-event-
-    /// per-poll cadence, so the fix belongs here rather than in a wider
-    /// deadline: the property under test is that both events *arrive*, in
-    /// order, not how they are batched.
+    /// per-poll cadence, and no deadline can repair that — a drain that
+    /// already returned both events leaves the *next* one empty however long
+    /// you wait. Accumulating is the fix; the property under test is that
+    /// both events *arrive*, in order, not how they are batched.
     #[cfg(unix)]
     fn poll_collecting_until(
         client: &mut AcpClient,
@@ -829,8 +831,22 @@ mod tests {
         }
     }
 
+    /// How long a fixture-backed test waits for an event before giving up.
+    ///
+    /// Deliberately generous rather than "roughly how long the fixture takes
+    /// on an idle box". Every wait loop in this module exits the instant its
+    /// condition holds, so the bound is only ever reached on the *failing*
+    /// path — which means a larger value costs a passing run exactly nothing
+    /// and only buys headroom on a loaded one. That headroom is the point:
+    /// a full `cargo test` drives the GTK harness, ~2.7k lib tests and the
+    /// nvim conformance oracles concurrently, and a `sh` fork+exec plus a
+    /// pipe round-trip can be descheduled for orders of magnitude longer
+    /// there than the couple of milliseconds it costs standalone. The two
+    /// death-path tests (here and in `engine::acp_ops`) were the ones that
+    /// went red at #984's test stage, so they are the ones that must not be
+    /// sitting near their bound.
     #[cfg(unix)]
-    const TEST_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+    const TEST_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
 
     #[cfg(unix)]
     #[test]
@@ -934,7 +950,7 @@ mod tests {
         // First event: Initialized (the fixture replies before dying).
         assert!(
             matches!(events.first(), Some(AcpEvent::Initialized { .. })),
-            "expected Initialized first, got {events:?}"
+            "expected Initialized first within {TEST_DEADLINE:?}, got {events:?}"
         );
 
         // Then: the process death must surface as AgentExited, not a hang
@@ -946,14 +962,22 @@ mod tests {
             Some(AcpEvent::AgentExited {
                 was_initialized, ..
             }) => assert!(*was_initialized),
-            _ => panic!("expected an AgentExited event, got {events:?}"),
+            _ => panic!("expected an AgentExited event within {TEST_DEADLINE:?}, got {events:?}"),
         }
 
-        // No orphan process left behind.
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        // No orphan process left behind. `AgentExited` is only emitted once
+        // the agent's stdout hits EOF, which the kernel does not deliver
+        // until the process is gone, so this is close to a formality — but
+        // `try_wait` can still report `None` for the sliver between the
+        // child calling `exit` and becoming reapable. Poll for it instead of
+        // sleeping a fixed 100ms and hoping that sliver fitted inside.
+        let start = std::time::Instant::now();
+        while !client.has_exited() && start.elapsed() < TEST_DEADLINE {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
         assert!(
             client.has_exited(),
-            "agent process should have exited on its own"
+            "agent process should have exited on its own within {TEST_DEADLINE:?}"
         );
     }
 

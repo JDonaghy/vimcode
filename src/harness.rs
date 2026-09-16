@@ -1160,6 +1160,126 @@ pub(crate) const KNOWN_BUGS: &[&str] = &[
     // above (only one assertion fails here, not both).
     "right_group_scrollbar_drag_scrolls_without_resizing::gtk", // #987
     "right_group_scrollbar_drag_scrolls_without_resizing::tui", // #987
+    // #986: v0.11.0 bug report -- `:s///c` (confirm-prompt) is #801 Phase 2,
+    // which was never built: `execute.rs`'s `flags.contains('c')` check
+    // always errors loudly ("E-vimcode: ... not implemented") instead of
+    // entering a confirm loop, so neither scenario below can pass yet on
+    // either backend. Shared (not `::gtk`/`::tui`-suffixed) because the
+    // root cause -- the flag isn't implemented at all -- is identical on
+    // both; each label backs a macro-generated `#[test]` on *each* backend
+    // (see `issue_986_confirm_prompt_never_built`'s own doc), so fixing
+    // only one backend still leaves the other backend's use of this same
+    // label failing as an unlisted regression until both are done. A third
+    // scenario this issue wanted (is the pending match visually
+    // highlighted, not just the prompt text) was attempted and deliberately
+    // dropped, not gated -- see that module's own doc for why a pixel/style
+    // probe for it produced a false pass unrelated to this feature.
+    "confirm_prompt_text_is_painted",               // #986
+    "confirm_report_line_excludes_skipped_matches", // #986
+    // #988: v0.11.0 bug report -- the TUI hamburger (menu) button won't
+    // re-hide the menu bar once revealed. An earlier version of this entry's
+    // comment claimed (based on a since-invalidated test) that "the toggle
+    // *mechanism* has no defect at all" and only a hit-target-moved-
+    // out-from-under-the-click bug was real. That claim was wrong (review,
+    // fix iteration 1): the "mechanism works" test was silently exercising
+    // a `UiEvent::DoubleClick` fold artifact instead of two genuine clicks
+    // (`quadraui::tui::testing::TuiDriver`'s `DoubleClickDetector` folds two
+    // `click()` calls with no simulated time between them, and the
+    // hamburger's one-row shift was well inside the fold's distance
+    // window), which happened to route through the legacy, already-correct
+    // `mouse::handle_mouse` path (`mouse.rs:1830`) instead of the real
+    // `ShellAdapter`/`on_shell_event` semantic-click path a real,
+    // time-separated second click takes. With double-click folding
+    // disabled, TWO independent, complementary defects reproduce, each with
+    // its own entry below. TUI-only by construction -- GTK has no hamburger
+    // button at all (`render::build_activity_bar`'s `include_hamburger` is
+    // `false` for GTK, which uses a native menu bar widget instead). Not
+    // `mouse.rs`'s hand-rolled `ActivityBarTarget::MenuToggle` arm (the
+    // issue's own "likely shape" guess) -- that arm is unreachable for a
+    // genuine single-click on the hamburger in production, since the
+    // hamburger is a registered `AppShell` `PanelDefinition` and
+    // `ShellAdapter::handle` consumes a plain `MouseDown` into a semantic
+    // `AppShellEvent` before `mouse::handle_mouse` ever runs (it's only
+    // reachable via the `DoubleClick` fold above).
+    //
+    // Defect 1 -- hit-target-moved-out-from-under-the-click: revealing the
+    // menu shifts the hamburger down one screen row, so a second click at
+    // the *same physical position* the first click used (what a user's
+    // muscle memory would reach for) no longer lands on the hamburger.
+    // What it lands on instead, confirmed empirically at 80x24 with the
+    // double-click fold disabled (review, fix iteration 2): the hamburger
+    // paints at cell (1.5, 0.5) while hidden and moves to (1.5, 1.5) once
+    // the reveal reserves row 0 -- and row 0 is now the menu bar itself,
+    // whose first item `File` occupies exactly those columns. So the stale
+    // click is NOT silently swallowed by the title-bar band (as an earlier
+    // version of this comment claimed, a claim that only ever held for the
+    // folded `DoubleClick` the test used to accidentally send): it OPENS
+    // THE `File` DROPDOWN. The menu row stays visible *and* an unwanted
+    // `menu-system-dropdown` overlay now covers the activity bar and
+    // swallows the next click too -- so the fix must restore all three
+    // properties the gated body asserts (menu hidden, no dropdown, next
+    // click reaches its target). See
+    // `hamburger_stale_click_position_after_reveal_misses_the_shifted_button`'s
+    // own doc in `src/tui_main/shell_app.rs`.
+    "hamburger_second_click_at_stale_position_does_not_hide_menu_bar::tui", // #988
+    // Defect 2 -- deeper, and present even once defect 1 above is
+    // accounted for: `on_shell_event`'s `PanelChanged { hamburger }` arm
+    // never touches the shadow `engine.app_shell`, so
+    // `engine.app_shell.sidebar_visible()` stays `false` for the hamburger
+    // forever. `TuiShellApp::handle`'s own runner/shadow sidebar-visibility
+    // sync reads that on every intervening dispatch and force-hides the
+    // *runner*'s `AppShell` sidebar in response, so
+    // `AppShell::handle_activity_click`'s "already active + visible -> hide"
+    // branch is never reached for the hamburger at all -- every click,
+    // correctly located or not, resolves as a fresh reveal. See
+    // `hamburger_relocated_click_after_reveal_still_fails_to_hide_menu_bar`'s
+    // own doc in `src/tui_main/shell_app.rs` for the full mechanism this
+    // entry pins.
+    "hamburger_second_click_at_correct_position_does_not_hide_menu_bar::tui", // #988
+    // #990: v0.11.0 bug report -- three separate TUI minimap rendering
+    // defects, each with its own painted-output scenario in
+    // `src/tui_main/shell_app.rs`. TUI-only labels: all three are measured
+    // off the braille strip the TUI rasteriser paints, which has no GTK
+    // analogue to probe the same way.
+    //
+    // Defect 1 -- large gaps for a short file, upstream **quadraui#992**:
+    // `MinimapSizing::Fill` stretches the row pitch up to `MAX_ROW_PITCH`
+    // (8 cells on TUI) while `draw_minimap` paints exactly one cell row per
+    // visible line, so the shorter the file the more untouched rows are
+    // left between painted ones (measured at 100x24: a 400-line file paints
+    // rows 2..=21 contiguously, a 20-line file paints only
+    // [2,5,9,12,15,19]). Per the Platform-Neutrality Rule the fix is
+    // quadraui's rasteriser -- this entry exists so bumping the pinned
+    // `rev` flips the scenario to "fix landed, delete the entry" rather
+    // than the fix (or a regression of it) passing unnoticed on our side of
+    // the pin. See `minimap_paints_contiguous_rows_for_short_files`.
+    "minimap_paints_contiguous_rows_for_short_files::tui", // #990, quadraui#992
+    // Defect 2 -- indentation bears little resemblance to the file's,
+    // upstream **quadraui#993**: each line is normalised by its own
+    // `chars.len()` instead of a scale shared across the file, so every
+    // line is stretched to fill the whole strip -- a 1-character line and a
+    // 300-character line in the same file paint identical full-width runs.
+    // Note the issue's originally-proposed assertion ("adding a long line
+    // must not move the short lines' dots") is trivially TRUE against this
+    // bug and does not discriminate; the scenario's extent assertions are
+    // what actually fail. See
+    // `minimap_indent_marks_track_the_files_own_indentation`.
+    "minimap_indent_marks_track_the_files_own_indentation::tui", // #990, quadraui#993
+    // Defect 3 -- no colouring. Diagnosed as **vimcode's own**, not
+    // quadraui's (the issue's candidate 4): `render::build_minimap_data`
+    // builds its `MinimapGrid` with a hardcoded `cols: MINIMAP_SPAN_COLS`
+    // (200) / `cols_per_cell: 2`, a colour grid covering character columns
+    // 0..400, while the painted TUI strip is ~12 cells wide -- so only
+    // character columns 0..~24 are ever consulted and any token indented
+    // past that falls back to the default colour. Measured collapse with
+    // 400 highlights present throughout: 5 distinct painted colours at
+    // indent 0, 3 at 8, 2 at 20, 1 (fallback only) at 40 and 80. The
+    // issue's candidate 1 ("highlights are empty under the TUI") is
+    // disproven and asserted against, ungated, in the scenario itself.
+    // Test-only here by this issue's own scope; the fix is filed separately
+    // against vimcode. See
+    // `minimap_paints_syntax_colour_for_indented_code`.
+    "minimap_paints_syntax_colour_for_indented_code::tui", // #990
 ];
 
 /// A saved `std::panic::set_hook`/`take_hook` closure — named so
@@ -2405,4 +2525,216 @@ mod issue_987_group_scrollbar_inert_and_click_resizes {
              split (#987 negative-space case)"
         );
     }
+}
+
+// ── #986: v0.11.0 bug suite -- oracle-backed `:s///c` confirm-prompt spec
+// (#801 Phase 2 never built) ────────────────────────────────────────────
+//
+// #801 deliberately never built the `:s///c` confirm loop: `execute.rs`'s
+// `flags.contains('c')` check always errors loudly ("E-vimcode: the :s 'c'
+// (confirm) flag is not implemented") instead of entering it -- see that
+// check's own comment. `tests/nvim_conformance.rs`'s new `"sub:c ..."` cases
+// cover the buffer/cursor half of the contract (oracle-compared against a
+// real `nvim --headless`), but that harness only ever compares buffer text
+// + cursor position -- it cannot tell "the engine silently didn't implement
+// this" from "the prompt never painted", and per CLAUDE.md rule 1 (assert on
+// rendered output, never on state alone -- the #587/#592 failure mode) a
+// state-only assertion here would be worthless anyway, since there is no
+// confirm *state* to assert on yet. The gap that genuinely needs a
+// driver/paint-tier check instead lives here: is the confirm prompt
+// actually *painted* on the command line (not just held in some field)?
+// See `confirm_prompt_text_is_painted` below. (A second rendering gap --
+// is the pending match itself visually highlighted, not just the prompt
+// text -- was attempted and deliberately left uncovered; see this module's
+// own doc further down for why, mirroring this issue's honest treatment of
+// `^E`/`^Y`.)
+//
+// Plus one non-rendering gap that's still easiest to prove with a live
+// driver rather than by hand-deriving the 'report' option's interaction
+// with skipped matches: does the post-substitute report line count only
+// *actual* replacements, excluding matches answered 'n'? See
+// `confirm_report_line_excludes_skipped_matches` below.
+//
+// No implementation lands with this issue -- every scenario here is
+// `known_bug_gate`-wrapped and listed in `KNOWN_BUGS` above, so the suite
+// stays green until a future issue builds the real confirm loop (at which
+// point the gate forces that issue to delete these entries).
+#[cfg(test)]
+mod issue_986_confirm_prompt_never_built {
+    use super::*;
+
+    /// The exact prompt Neovim v0.12.5 paints for `:%s/zqxw986abc/zqxw986def/gc`
+    /// -- captured verbatim from a real `nvim --headless` run (this issue's
+    /// own "do not invent the UI contract -- derive it from Neovim"
+    /// instruction), via `nvim_buf_set_lines`/`nvim_feedkeys` driving a real
+    /// `:%s` and reading nvim's own stdout. Longer and more spelled-out than
+    /// `:help :s_c`'s classic-Vim `(y/n/a/q/l/^E/^Y)?` shorthand -- this is
+    /// Neovim's own wording, not a harness artifact: reproduced identically
+    /// across a dozen separate probes (varying the fixture, the replacement
+    /// text, and the answer sequence), none of them a window/scroll-relative
+    /// read -- not the #805 headless-oracle-artifact class of case.
+    ///
+    /// Full captured confirm contract (see this issue's PR description for
+    /// the complete table): `y` replaces-and-continues, `n` skips-and-
+    /// continues, `a` replaces this-and-all-remaining, `q`/`<Esc>` quit
+    /// without replacing the pending match, `l` replaces-the-pending-match-
+    /// then-quits ("last"). `^E`/`^Y` (scroll the window while the prompt is
+    /// up) do not hang a headless oracle -- confirmed by feeding them
+    /// directly -- but produce no buffer/cursor difference for
+    /// `tests/nvim_conformance.rs`'s comparison to observe (scroll position
+    /// isn't part of what that harness compares), so they are the two rows
+    /// left uncovered, honestly, per this issue's own allowance.
+    const NVIM_CONFIRM_PROMPT: &str =
+        "replace with zqxw986def? (y)es/(n)o/(a)ll/(q)uit/(l)ast/scroll up(^E)/down(^Y)";
+
+    /// Three matches across three lines, all sharing one grep-safe,
+    /// screen-collision-safe token (`zqxw986abc`, mirroring #983's
+    /// `zqxw983...` convention) so `screen_has`/`find_bounds` below can
+    /// never accidentally match unrelated painted chrome.
+    fn engine_with_multi_match_buffer() -> Engine {
+        let mut engine = Engine::new_for_test();
+        engine.settings.use_nerd_fonts = false;
+        engine
+            .buffer_mut()
+            .insert(0, "zqxw986abc zqxw986abc\nzqxw986abc\nxyz zqxw986abc\n");
+        engine
+    }
+
+    /// Four matches, one per line -- the fixture the report-line scenario
+    /// below needs: answering `n` to exactly one of the four must make the
+    /// post-substitute report read "3 substitutions on 3 lines", not "4".
+    fn engine_with_four_single_match_lines() -> Engine {
+        let mut engine = Engine::new_for_test();
+        engine.settings.use_nerd_fonts = false;
+        engine
+            .buffer_mut()
+            .insert(0, "zqxw986abc\nzqxw986abc\nzqxw986abc\nzqxw986abc\n");
+        engine
+    }
+
+    // ── Deliverable 2, item 1: the prompt itself is painted (both backends,
+    // via the shared macro -- `ConformanceDriver::screen_has` is portable) ──
+    //
+    // RED-verification: with the `confirm_prompt_text_is_painted` entry
+    // removed from `KNOWN_BUGS`, both
+    // `issue_986_confirm_prompt_never_built::confirm_prompt_text_is_painted::gtk`
+    // (`cargo test --features gui --lib`) and its `::tui` twin
+    // (`cargo test --no-default-features --lib`) fail on the final
+    // assertion: today `:%s/zqxw986abc/zqxw986def/gc<CR>` hits the
+    // `flags.contains('c')` early return and paints the "E-vimcode: ... not
+    // implemented" message instead, so `screen_has(NVIM_CONFIRM_PROMPT)` is
+    // false on both. Restored (entry back in place) and confirmed green
+    // again on both.
+    crate::backend_conformance! {
+        label: confirm_prompt_text_is_painted,
+        backends: [gtk, tui],
+        engine: engine_with_multi_match_buffer(),
+        size: (1400, 900),
+        body: |driver| {
+            crate::harness::known_bug_gate("confirm_prompt_text_is_painted", || {
+                assert!(
+                    driver.screen_has("zqxw986abc"),
+                    "precondition: the fixture buffer must paint"
+                );
+                driver.type_char(':');
+                driver.type_text("%s/zqxw986abc/zqxw986def/gc");
+                driver.press_named(quadraui::NamedKey::Enter);
+                assert!(
+                    driver.screen_has(NVIM_CONFIRM_PROMPT),
+                    "the real ':s///c' confirm prompt (captured verbatim from \
+                     Neovim) must be painted on the command line after \
+                     ':%s/zqxw986abc/zqxw986def/gc<CR>'; painted: {:?}",
+                    driver.inventory().text_runs()
+                );
+            });
+        },
+    }
+
+    // ── Deliverable "report line" item: skipped ('n') matches must not
+    // count toward the post-substitute "N substitutions on M lines" report
+    // (both backends, shared macro) ──────────────────────────────────────
+    //
+    // RED-verification: same procedure as above, against
+    // `confirm_report_line_excludes_skipped_matches::gtk`/`::tui` -- with
+    // its `KNOWN_BUGS` entry removed, both fail on the final assertion (no
+    // confirm loop exists yet, so nothing ever paints a report line at
+    // all, let alone the correctly-counted one). Restored and confirmed
+    // green again on both.
+    crate::backend_conformance! {
+        label: confirm_report_line_excludes_skipped_matches,
+        backends: [gtk, tui],
+        engine: engine_with_four_single_match_lines(),
+        size: (1400, 900),
+        body: |driver| {
+            crate::harness::known_bug_gate(
+                "confirm_report_line_excludes_skipped_matches",
+                || {
+                    assert!(
+                        driver.screen_has("zqxw986abc"),
+                        "precondition: the fixture buffer must paint"
+                    );
+                    driver.type_char(':');
+                    driver.type_text("%s/zqxw986abc/zqxw986def/gc");
+                    driver.press_named(quadraui::NamedKey::Enter);
+                    // y, n, y, y -- one of the four matches skipped.
+                    driver.type_char('y');
+                    driver.type_char('n');
+                    driver.type_char('y');
+                    driver.type_char('y');
+                    assert!(
+                        driver.screen_has("3 substitutions on 3 lines"),
+                        "answering y/n/y/y (one skip) must report exactly 3 \
+                         substitutions on 3 lines -- the skipped match must not \
+                         count -- captured verbatim from Neovim; painted: {:?}",
+                        driver.inventory().text_runs()
+                    );
+                },
+            );
+        },
+    }
+
+    // ── Deliverable 2, item 2: the pending match is visually highlighted --
+    // an honest gap, NOT covered by an automated test (see below) ────────
+    //
+    // This issue's own instruction (#252/CLAUDE.md rule 1: assert on
+    // rendered output, never on state alone) calls for pinning that the
+    // pending match is visually distinguished, not just that a plain
+    // prompt string appears. Two attempts were made and both had to be
+    // discarded as unusable, not merely inconvenient:
+    //
+    //   1. Same cell's `style_at`/`pixel`, sampled before vs. after the
+    //      confirm prompt opens: measured a real but entirely unrelated
+    //      global repaint between the harness's first frame and the first
+    //      frame after any ex-command round-trips through the engine (an
+    //      unrelated corner of the screen shifted color identically, with
+    //      zero relation to `:s` or `c`), so the assertion passed today,
+    //      for the wrong reason, against unfixed `develop` -- exactly the
+    //      false positive CLAUDE.md's "state that the new test was
+    //      observed RED against unfixed develop" rule exists to catch.
+    //   2. Two different matches' cells sampled from the *same* frame
+    //      (the pending match vs. one not yet reached), meant to sidestep
+    //      attempt 1's confound: still measurably different colors at a
+    //      1400x900 driver size with **zero keys pressed at all** (a pure
+    //      construction-time baseline), so whatever painted the
+    //      difference predates any interaction with this feature too.
+    //      Shrinking the driver to a realistic 120x30 made the fixture
+    //      buffer stop painting altogether (the default sidebar/explorer
+    //      `Engine::new_for_test()` starts with consumes the whole width
+    //      at that size), so there was no size at which this approach
+    //      produced a signal traceable to the confirm prompt specifically.
+    //
+    // Building a confound-free per-cell probe would mean first learning
+    // exactly how a real confirm-loop implementation paints the highlight
+    // (cursor-line color? a dedicated match style? something else?) --
+    // knowledge that does not exist yet, since no implementation exists
+    // (this issue is test-only, no implementation lands here). Rather than
+    // ship a test that either passes for the wrong reason or asserts a
+    // guessed rendering mechanism this issue was explicitly told not to
+    // invent ("do not invent the UI contract"), this half of deliverable 2
+    // is left as a stated, honest gap -- the same treatment this issue
+    // gives `^E`/`^Y` below. [`confirm_prompt_text_is_painted`] above still
+    // satisfies the deliverable's core, confound-free half: the prompt
+    // *text* itself is asserted as painted output, not engine state. A
+    // future confirm-loop implementation issue should add the highlight
+    // assertion once its actual rendering mechanism is known.
 }
