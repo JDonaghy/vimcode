@@ -291,8 +291,13 @@ impl render::EngineActionHost for GtkEngineActionHost<'_> {
     }
     /// Matches the former inline `EngineAction::QuitWithError` arm in
     /// `dispatch_engine_action` exactly — no `save_session_state` (unlike
-    /// `quit` above), mirroring `tui_main::handle_action`'s asymmetric
-    /// treatment of the same variant.
+    /// `quit` above). This asymmetry is GTK-specific, not something
+    /// `tui_main::handle_action` itself does: TUI's `Quit`/`SaveQuit` and
+    /// `QuitWithError` arms both call `save_session` (`tui_main/mod.rs`),
+    /// i.e. TUI treats the two variants *symmetrically*. The divergence is
+    /// cross-backend (GTK skips the save on `QuitWithError`, TUI doesn't),
+    /// preserved here exactly as it behaved pre-#1063 rather than changed
+    /// as a side effect of this convergence.
     fn quit_with_error(&mut self, engine: &mut Engine) -> ! {
         engine.cleanup_all_swaps();
         engine.lsp_shutdown();

@@ -12263,3 +12263,115 @@ mod issue_991_merge_conflicts {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+/// #1063 review fix: the converged menu-action `EngineAction` applier
+/// (`App::handle_menu_action` -> `App::dispatch_engine_action` ->
+/// `render::apply_engine_action` -> `GtkEngineActionHost`, `app.rs`) shipped
+/// with zero black-box coverage on GTK -- `harness.rs`'s own
+/// `issue_1063_menu_action_engine_action_applier` module registers `tui`
+/// and `tui_prod` scenarios only; its own doc explains why (the Alt+T/Enter
+/// dispatch it uses is `TuiDriver`-specific, not part of the shared
+/// `ConformanceDriver` bound), which doesn't excuse the GTK side of the
+/// actual converged code from having none. This module is the missing GTK
+/// arm, reached the way a user would: a real click on the "Terminal"
+/// menu-bar header, then a real click on "New Terminal" inside the dropdown
+/// it opens -- through `menu_system.handle()`, the same shared dispatch
+/// `handle_dispatch`'s "Menu system intercept" block (`app.rs`) routes both
+/// mouse and key events through, exactly like the
+/// `menu_quit_with_unsaved_changes_opens_confirm_dialog` test above (File >
+/// Quit) uses for a different menu.
+///
+/// `EngineAction::OpenTerminal` (the "terminal" menu id, `MENU_STRUCTURE`)
+/// is one of the five variants GTK's pre-#1063 `handle_menu_action` used to
+/// restate by hand behind a bare `_ => {}` -- exactly the rung this issue
+/// converged onto the shared `render::apply_engine_action` -- so a
+/// regression here (a double-borrow panic from `GtkEngineActionHost`
+/// reaching for a second, independent `self.app.engine.borrow_mut()`, or
+/// the macro-only `is_macro` suppression leaking into this non-macro menu
+/// path) would show up as this test failing or panicking.
+///
+/// **RED-verified:** with `GtkEngineActionHost::open_terminal`'s body
+/// replaced by a no-op (`self.app.draw_needed.set(true);` only), the
+/// "before"/"after" painted-text-count assertion below fails (`after`
+/// stays at 1, not 2). Restored before committing.
+#[cfg(test)]
+mod issue_1063_menu_action_engine_action_applier_gtk {
+    use super::*;
+
+    /// Exact-match count of the literal `"Terminal"` painted text, rather
+    /// than `screen_contains("Terminal")`: the menu bar's own top-level
+    /// "Terminal" header (`MENU_STRUCTURE`) is *always* painted once GTK's
+    /// menu bar is up (`menu_bar_visible` is forced true on GTK -- see
+    /// `command_center_stays_live_when_menu_bar_is_hidden`'s doc comment
+    /// above), so a substring/`screen_contains` check would pass even if
+    /// clicking "New Terminal" did nothing at all. Opening a terminal pane
+    /// adds a *second* "Terminal" -- the bottom-panel tab bar's own label
+    /// (`render::build_bottom_panel_tab_bar`) -- so the count going 1 -> 2
+    /// is the proof. This mirrors the row-skip trick
+    /// `harness.rs::menu_terminal_activation_opens_terminal_pane` (the
+    /// `tui`/`tui_prod` sibling of this test) uses against the TUI
+    /// character grid, adapted for GTK's flat painted-text list -- this
+    /// harness module's own doc notes GTK has no character grid to skip a
+    /// row of.
+    fn terminal_label_count(h: &Harness<impl AppLogic>) -> usize {
+        h.driver
+            .painted_texts()
+            .into_iter()
+            .filter(|t| *t == "Terminal")
+            .count()
+    }
+
+    #[test]
+    fn menu_terminal_new_terminal_opens_a_terminal_pane_on_gtk() {
+        let mut engine = Engine::new_for_test();
+        engine.settings.use_nerd_fonts = Some(false);
+        let mut h = harness(engine, 1400, 900);
+        h.driver.render();
+
+        assert_eq!(
+            terminal_label_count(&h),
+            1,
+            "precondition: only the menu bar's own \"Terminal\" header \
+             should be painted before any terminal pane opens; painted: \
+             {:?}",
+            h.driver.painted_texts()
+        );
+
+        let header = h
+            .driver
+            .find_bounds("Terminal")
+            .expect("the Terminal menu-bar header must paint");
+        h.driver.click(
+            header.x + header.width / 2.0,
+            header.y + header.height / 2.0,
+        );
+        h.driver.render();
+
+        let new_terminal = h.driver.find_bounds("New Terminal").expect(
+            "clicking the Terminal menu-bar header must open its dropdown, \
+             showing \"New Terminal\"",
+        );
+        h.driver.click(
+            new_terminal.x + new_terminal.width / 2.0,
+            new_terminal.y + new_terminal.height / 2.0,
+        );
+        h.driver.render();
+
+        assert_eq!(
+            terminal_label_count(&h),
+            2,
+            "Terminal \u{25b8} New Terminal must open a terminal pane, \
+             through the converged render::apply_engine_action -> \
+             GtkEngineActionHost::open_terminal path (#1063) -- adding the \
+             bottom-panel tab bar's own \"Terminal\" label alongside the \
+             menu bar's; painted: {:?}",
+            h.driver.painted_texts()
+        );
+        assert!(
+            h.engine.borrow().terminal_has_focus,
+            "opening a terminal via the menu must focus it, exactly as \
+             GtkEngineActionHost::open_terminal (App::new_terminal_tab's \
+             replacement) does"
+        );
+    }
+}
