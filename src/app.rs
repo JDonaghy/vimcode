@@ -2464,6 +2464,44 @@ impl App {
         }
     }
 
+    /// Reconcile the runner's own `AppShell` (`ctx.shell()`/`ctx.shell_mut()`)
+    /// with `engine.app_shell`'s (the "shadow" copy's) current sidebar
+    /// visibility, pushing `show_panel`/`hide_sidebar` through `ctx` if the
+    /// two have drifted.
+    ///
+    /// #1057: extracted out of [`Self::run_post_key_epilogue`] (its
+    /// original, and until now only, caller — see that method's own doc for
+    /// *why* the two copies need reconciling at all) so
+    /// [`Self::on_shell_event_ctx`] can call it too. That second call site
+    /// exists because of a gap this issue's fix exposed: `AppShell` never
+    /// runs its own toggle for a *bottom* item (`BottomItemClicked`) — it
+    /// only ever reports the click, both directions — so
+    /// `on_shell_event`'s `BottomItemClicked` arm is 100% responsible for
+    /// deciding the new visibility, entirely inside `engine.app_shell`. Left
+    /// unsynced, the runner's own `AppShell` (which is what actually
+    /// determines whether `render_content`'s sidebar column exists in the
+    /// composited frame — `engine.app_shell` only decides *which panel's
+    /// content* to paint inside it) never learns the sidebar closed: a
+    /// second Settings click flipped `engine.app_shell.sidebar_visible()` to
+    /// `false` correctly, but the runner kept laying out and painting the
+    /// sidebar as if nothing had changed. Verified directly: before this
+    /// method gained its `on_shell_event_ctx` call site, `bottom_item_
+    /// second_click_collapses_sidebar`'s `gtk`/`tui` arms in `src/harness.rs`
+    /// went red at the second-click assertion — the engine-side state
+    /// (`sidebar_visible()`) was already correct, only the paint wasn't.
+    fn sync_runner_sidebar_visibility(&self, ctx: &quadraui::ShellContext<'_>) {
+        let shadow_visible = self.engine.borrow().app_shell.sidebar_visible();
+        if ctx.shell().sidebar_visible() != shadow_visible {
+            if shadow_visible {
+                if let Some(id) = self.engine.borrow().app_shell.active_panel_id().cloned() {
+                    ctx.shell_mut().show_panel(&id);
+                }
+            } else {
+                ctx.shell_mut().hide_sidebar();
+            }
+        }
+    }
+
     /// GTK's half of the shared after-every-editor-keypress epilogue.
     /// [`render::post_key_epilogue`] applies everything `Engine` owns; this
     /// applies the residues that need GTK: macro playback (whose
@@ -2523,16 +2561,7 @@ impl App {
         // inside `render::post_key_epilogue`, which has no field of its own
         // to report through — so this just reconciles the two copies
         // unconditionally, the same way TUI's `on_shell_event` tail does.
-        let shadow_visible = self.engine.borrow().app_shell.sidebar_visible();
-        if ctx.shell().sidebar_visible() != shadow_visible {
-            if shadow_visible {
-                if let Some(id) = self.engine.borrow().app_shell.active_panel_id().cloned() {
-                    ctx.shell_mut().show_panel(&id);
-                }
-            } else {
-                ctx.shell_mut().hide_sidebar();
-            }
-        }
+        self.sync_runner_sidebar_visibility(ctx);
 
         // If a yank just happened, arm a 200 ms deadline; `tick_dispatch`
         // polls it and clears the highlight once it elapses (#813 — ported
@@ -8292,17 +8321,65 @@ impl quadraui::ShellApp for App {
                     .set_sidebar_width(*new_width);
             }
             AppShellEvent::BottomItemClicked { id } => {
-                // The runner treats bottom activity-bar items as action buttons
-                // (not sidebar panels), so it does not change its own sidebar
-                // visibility.  For vimcode, bottom items like "bottom:settings"
-                // represent sidebar panels stored in the engine's AppShell.
-                // Sync the active panel so render_content() draws the correct
-                // content the next time the sidebar is visible.
-                self.engine.borrow_mut().app_shell.show_panel(id);
-                self.draw_needed.set(true);
+                // The runner treats bottom activity-bar items as action
+                // buttons (not sidebar panels), so it never toggles or
+                // hides on its own — it only ever reports the click
+                // (TUI's `on_shell_event`, same arm, carries the matching
+                // comment). #1057: this used to unconditionally
+                // `show_panel`, so a second click on an already-open
+                // bottom item (e.g. "bottom:settings") re-showed it
+                // instead of collapsing the sidebar like VS Code does for
+                // an active-tab click — while TUI, one click handler
+                // over, already ran the toggle. Route through
+                // `switch_panel`, the same shared
+                // `render::apply_activity_panel_switch` call site
+                // `PanelChanged`'s ext-panel arm above already uses, so
+                // both backends make the identical toggle decision from
+                // one place instead of drifting again.
+                self.switch_panel(id.as_str().to_string());
             }
             _ => {}
         }
+    }
+
+    /// #1057: the ctx-aware override TUI's `TuiShellApp` already had (its
+    /// own title-bar sync, quadraui#617) — `App` only implemented the
+    /// deprecated ctx-less [`Self::on_shell_event`] until now, so nothing
+    /// here could ever push a shell-state change back into the runner's own
+    /// `AppShell` on the same frame an event fires.
+    ///
+    /// That gap stayed invisible as long as every `AppShellEvent` arm's
+    /// runner-visible outcome was something the runner had *already*
+    /// decided before calling in — `PanelChanged`/`SidebarHidden` for a top
+    /// panel: the runner's own `AppShell` toggles itself first (that's
+    /// *why* it reports one or the other), and `on_shell_event` just
+    /// mirrors that decision into `engine.app_shell`, the shadow copy.
+    /// `BottomItemClicked` breaks that assumption: the runner never toggles
+    /// a *bottom* item itself (see that arm's own doc, above — it only
+    /// ever reports the click), so the toggle-to-hide decision is 100% made
+    /// inside `on_shell_event`, entirely within `engine.app_shell`, with no
+    /// way to tell the runner. Without this override, `engine.app_shell.
+    /// sidebar_visible()` correctly flips to `false` on a second Settings
+    /// click, but the runner's own `AppShell` — which is what actually
+    /// determines whether `render_content`'s sidebar column exists in the
+    /// composited frame, not `engine.app_shell` — never learns, and keeps
+    /// painting the sidebar as if nothing changed. Push the shadow's new
+    /// state through the same [`Self::sync_runner_sidebar_visibility`] the
+    /// key-dispatch epilogue already uses for the same reason (#762).
+    ///
+    /// Verified directly: before this override existed,
+    /// `bottom_item_second_click_collapses_sidebar`'s `gtk`/`tui` arms in
+    /// `src/harness.rs` went red at the second-click assertion — the
+    /// engine-side state was already correct (`sidebar_visible() == false`),
+    /// only the paint wasn't following it.
+    fn on_shell_event_ctx(
+        &mut self,
+        event: &quadraui::AppShellEvent,
+        ctx: &quadraui::ShellContext<'_>,
+    ) {
+        #[allow(deprecated)]
+        self.on_shell_event(event);
+        self.sync_runner_sidebar_visibility(ctx);
     }
 }
 

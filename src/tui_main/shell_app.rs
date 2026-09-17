@@ -3221,20 +3221,24 @@ impl ShellApp for TuiShellApp {
                 self.engine.ext_panel_active = None;
                 self.engine.collapse_sidebar();
             }
-            // ── #634 smoke retry: the Settings cog is registered as a
-            // *bottom item* (`shell_config`), and `AppShell` doesn't run
-            // its panel toggle for those — it only reports the click. Run
-            // the legacy toggle on the shadow (same call `mouse.rs`'s
-            // `ActivityBarTarget::Settings` arm made); the end-of-`handle`
-            // visibility sync + `take_requested_panel` then carry the
-            // result back to the runner's `AppShell`.
-            quadraui::AppShellEvent::BottomItemClicked { id } if id.as_str() == PANEL_SETTINGS => {
+            // ── #634 smoke retry, generalised by #1057: bottom items
+            // (`shell_config`'s "bottom:*" ids, currently just Settings)
+            // are registered as *bottom items*, and `AppShell` doesn't run
+            // its panel toggle for those — it only reports the click, for
+            // every click, not just the second one. #1057 found GTK's own
+            // `BottomItemClicked` arm skipping the toggle entirely
+            // (always `show_panel`, never hide) while this arm ran it —
+            // the two backends disagreed on whether a second click on the
+            // active bottom item collapses the sidebar. VS Code collapses
+            // it, so that's the converged behaviour; run it through
+            // `render::apply_activity_panel_switch`, the same shared call
+            // `activate_ext_panel` and GTK's `switch_panel` already use,
+            // rather than hand-rolling the toggle again here.
+            quadraui::AppShellEvent::BottomItemClicked { id } => {
                 self.disarm_hamburger_stale_click_guard();
-                self.sidebar.ext_panel_name = None;
-                self.engine.ext_panel_has_focus = false;
-                self.engine.ext_panel_active = None;
-                self.engine.toggle_sidebar_panel(PANEL_SETTINGS);
-                if self.engine.app_shell.sidebar_visible() {
+                let switched = render::apply_activity_panel_switch(&mut self.engine, id.as_str());
+                self.sidebar.ext_panel_name = switched.ext_panel;
+                if switched.sidebar_visible {
                     self.sidebar.has_focus = true;
                 }
             }

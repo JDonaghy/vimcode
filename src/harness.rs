@@ -3085,3 +3085,138 @@ mod issue_1053_dead_activity_bar_block {
         );
     }
 }
+
+/// #1057 (GOALS.md's 2026-09-16 audit, #1044, wave 1 item 5): a bottom
+/// activity-bar item (`shell_config`'s only one today, "bottom:settings")
+/// drifted between backends on a second click of the item it had *already*
+/// opened. `TuiShellApp::on_shell_event`'s `BottomItemClicked` arm ran
+/// `Engine::toggle_sidebar_panel`, collapsing the sidebar on a second click
+/// -- `App::on_shell_event`'s own arm just called
+/// `app_shell.show_panel(id)` unconditionally, so a second Settings click
+/// there re-showed the panel it was already showing instead of collapsing
+/// it.
+///
+/// Checked against VS Code before picking a side, per the issue's own
+/// instruction not to default to "toggle" without checking: VS Code does
+/// collapse the Panel when its already-active tab is clicked again -- there
+/// is no VS Code bottom item that stays permanently open once toggled on.
+/// So TUI's existing behaviour was the one to keep, and GTK's was the
+/// drift.
+///
+/// Converged both backends onto `render::apply_activity_panel_switch`, the
+/// same shared toggle-decision function `App::switch_panel` and
+/// `TuiShellApp::activate_ext_panel` already called for the ext-panel case
+/// -- see `src/app.rs`'s `BottomItemClicked` arm (now `self.switch_panel
+/// (id.as_str().to_string())`) and `src/tui_main/shell_app.rs`'s, same arm
+/// (now `render::apply_activity_panel_switch(&mut self.engine, ...)`), for
+/// the actual fix. Neither backend hand-rolls the toggle decision anymore.
+///
+/// Registered on `gtk`, `tui` *and* `tui_prod`: the fix touches
+/// `src/app.rs` (shared by both the `gtk` arm, through `run_with_shell`,
+/// and the `tui` arm, which wraps the same `App`) and
+/// `src/tui_main/shell_app.rs` (`tui_prod` only) -- this is the scenario
+/// that proves the two independent call sites actually converged on the
+/// same decision, per the issue's "Proving it actually converged" section,
+/// rather than each merely doing *something* plausible in isolation.
+///
+/// Verified RED against unfixed `develop`: reverting `src/app.rs`'s
+/// `BottomItemClicked` arm to its pre-#1057 body (`self.engine.borrow_mut()
+/// .app_shell.show_panel(id); self.draw_needed.set(true);`) turns the `gtk`
+/// and `tui` arms red -- the second click leaves "SETTINGS" painted instead
+/// of collapsing the sidebar -- while `tui_prod` stays green, since TUI's
+/// own arm was never broken. Restored after confirming red.
+#[cfg(test)]
+mod issue_1057_bottom_item_click_toggles_sidebar {
+    use super::*;
+
+    /// Nerd Fonts off so `crate::icons::SETTINGS.s()` resolves to the
+    /// stable ASCII fallback `"*"` on every backend/thread, rather than a
+    /// glyph whose resolution could vary with the ambient nerd-fonts
+    /// default (`Settings::use_nerd_fonts`'s per-backend/per-OS guess) --
+    /// same rationale as `issue_1053_dead_activity_bar_block`'s own
+    /// `engine_fixture`.
+    fn engine_fixture() -> crate::core::Engine {
+        let mut engine = crate::core::Engine::new_for_test();
+        engine.settings.use_nerd_fonts = Some(false);
+        engine
+    }
+
+    // Click-to-show, then click-again-to-hide, on all three arms -- the
+    // issue's "Driver test on both backends covering click-to-show and
+    // click-again" deliverable, plus the `tui_prod` convergence proof.
+    //
+    // Marker is "Appearance" (the Settings form's first group header, from
+    // the shared `render::populate_settings_form_controller` +
+    // `FormController` -- identical on every backend), not the literal
+    // "SETTINGS" caption: that caption is painted by
+    // `tui_main::panels::render_settings_panel`'s own
+    // `draw_settings_chrome(.., " SETTINGS", ..)` call, which is genuine
+    // *TUI-only* chrome -- `App::render_content`'s `PANEL_SETTINGS` arm
+    // (`src/app.rs`) renders the shared `FormController` directly, with no
+    // such caption. That's a real, separate divergence (a candidate for its
+    // own future convergence item), not something this issue's fix touches
+    // -- so this test doesn't lean on it.
+    crate::backend_conformance! {
+        label: bottom_item_second_click_collapses_sidebar,
+        backends: [gtk, tui, tui_prod],
+        engine: engine_fixture(),
+        size: (800, 480),
+        body: |driver| {
+            // Every click below is a genuine, independent, fully-released
+            // press -- `drag_text(icon, icon)` (down -> move -> up, all at
+            // the same point) rather than the bare `click_text`/`click`
+            // (down only, no release). A bottom item is not a
+            // `SidebarHidden`-reporting top panel (`AppShell` never runs
+            // its own toggle for one -- see the arms this scenario
+            // exercises, in `src/app.rs` and `src/tui_main/shell_app.rs`),
+            // so nothing here depends on that difference *semantically* --
+            // but a second bare `mouse_down` at the same point with no
+            // intervening `mouse_up` left the simulated button latched
+            // "still pressed" and the second click was silently swallowed
+            // before ever reaching `on_shell_event` (observed directly:
+            // `TuiDriver`'s own translate/dispatch layer, independent of
+            // this issue's fix). `drag_text` releases between presses, so
+            // each of the two clicks below is a real, independent one, the
+            // same as a user's two separate mouse clicks would be.
+            //
+            // Also disables double-click folding: two of these close
+            // together in simulated time would otherwise fold into a
+            // `DoubleClick`, which bypasses `ShellAdapter`'s semantic
+            // dispatch (and so this arm) entirely (see
+            // `driver_click_on_every_activity_bar_icon_opens_its_panel_via_
+            // shell_app`'s own doc for the same rationale).
+            driver.set_double_click_folding(false);
+
+            // `driver.screen()` is not used in diagnostics here: its return
+            // type diverges per backend (`GtkDriver::screen` -> `Vec<u8>`,
+            // `TuiDriver::screen` -> `String`), so a shared
+            // `backend_conformance!` body can only rely on
+            // `ConformanceDriver::screen_has`, which is uniformly `bool`
+            // everywhere.
+            assert!(
+                !driver.screen_has("Appearance"),
+                "precondition: the sidebar starts closed (session.explorer_\
+                 visible defaults to false), so the Settings panel's form \
+                 must not be painted yet"
+            );
+
+            driver.drag_text(crate::icons::SETTINGS.s(), crate::icons::SETTINGS.s());
+            assert!(
+                driver.screen_has("Appearance"),
+                "clicking the Settings bottom item once must open its \
+                 panel, on every backend"
+            );
+
+            driver.drag_text(crate::icons::SETTINGS.s(), crate::icons::SETTINGS.s());
+            assert!(
+                !driver.screen_has("Appearance"),
+                "#1057: clicking the Settings bottom item again, while its \
+                 own panel is already open, must collapse the sidebar -- VS \
+                 Code collapses an active bottom-panel tab on a second \
+                 click (checked before defaulting to this), and this is the \
+                 behaviour TUI already had; GTK used to unconditionally \
+                 re-show the panel instead of collapsing it"
+            );
+        },
+    }
+}
