@@ -2347,7 +2347,7 @@ impl ShellApp for TuiShellApp {
                             &render::TUI_TAB_SWITCHER_SIZING,
                         ) {
                             let list =
-                                render::tab_switcher_to_quadraui_list_view(ts, geo.max_visible);
+                                render::tab_switcher_to_quadraui_list_view(ts, geo.visible_rows);
                             backend.draw_list(geo.bounds, &list);
                             *self.tab_switcher_popup_rect.borrow_mut() = Some(geo.bounds);
                             composed.push(render::FrameOp::TabSwitcher);
@@ -15445,6 +15445,141 @@ mod tests {
             "an outside click must propagate to the editor underneath and \
              move the cursor off line 1; screen:\n{screen}"
         );
+    }
+
+    // ── #1056: `FrameOp::TabSwitcher` row-count cap ───────────────────────
+    //
+    // `render.rs`'s `FrameOp::TabSwitcher` arm used to feed
+    // `TabSwitcherGeometry::max_visible` (the uncapped height budget) into
+    // `tab_switcher_to_quadraui_list_view` here, instead of `visible_rows`
+    // (the height-capped row count) GTK's twin arm feeds — flagged as an
+    // unresolved divergence in that doc comment. This is the "more tabs
+    // than fit" reproduction the follow-up asked for.
+
+    /// `count` file tabs, zero-padded (`tab00.txt`..) so no name is a
+    /// substring of another (`tab1` would otherwise match inside `tab10`).
+    /// Opened in order via `new_tab`, which touches the MRU on every call,
+    /// so the resulting MRU order is deterministic: newest first.
+    fn app_with_many_file_tabs_and_switcher_open(count: usize) -> TuiShellApp {
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_test_1056_tab_switcher_{:?}",
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let files: Vec<_> = (0..count)
+            .map(|i| dir.join(format!("tab{i:02}.txt")))
+            .collect();
+        for (i, path) in files.iter().enumerate() {
+            std::fs::write(path, format!("line {i}\n")).unwrap();
+        }
+
+        let mut app = TuiShellApp::new(None);
+        app.engine.settings.autohide_panels = false;
+        app.engine.app_shell.hide_sidebar();
+        app.engine.session.explorer_visible = false;
+        app.engine
+            .open_file_with_mode(&files[0], crate::core::engine::OpenMode::Permanent)
+            .unwrap();
+        for path in &files[1..] {
+            app.engine.new_tab(Some(path));
+        }
+        app.engine.open_tab_switcher();
+        assert!(
+            app.engine.tab_switcher_open,
+            "fixture must actually open the tab switcher"
+        );
+        app
+    }
+
+    /// #1056 reproduction: 12 tabs open in a 12-row terminal.
+    /// `TUI_TAB_SWITCHER_SIZING` caps the visible window at
+    /// `12 - 4 (reserve) = 8` rows, so the popup must paint exactly the 8
+    /// most-recently-used tabs and hide the 4 oldest, on both backends
+    /// (the GTK twin is `tab_switcher_caps_visible_rows_when_more_tabs_than_fit`
+    /// in `src/gtk/testing.rs`).
+    ///
+    /// Per the issue's "reproduce it first" ask: the swap this fixes
+    /// (`max_visible` vs `visible_rows` fed into
+    /// `tab_switcher_to_quadraui_list_view`) turned out **not** to move the
+    /// painted row count — see the updated `FrameOp::TabSwitcher` doc
+    /// comment in `render.rs` for why (the popup's own painted bounds,
+    /// which both backends already size from `visible_rows`, is what
+    /// `ListView::layout` clips rows to; and `tab_switcher_selected` is
+    /// always `< len`, so the `scroll_offset` branch this parameter feeds
+    /// never fires regardless of which field is passed here). Reverting
+    /// the `shell_app.rs` fix and rerunning this test does **not** turn it
+    /// red. It is still added per the issue's explicit ask, as a standing
+    /// regression guard on the cap itself and on the two backends staying
+    /// in sync.
+    #[test]
+    fn driver_tab_switcher_caps_visible_rows_when_more_tabs_than_fit() {
+        let cols: u16 = 100;
+        let rows: u16 = 12;
+        let total_tabs = 12;
+        let driver = driver_with_shell(
+            app_with_many_file_tabs_and_switcher_open(total_tabs),
+            config(),
+            cols,
+            rows,
+        );
+
+        let geo = render::TabSwitcherGeometry::compute(
+            quadraui::Rect::new(0.0, 0.0, cols as f32, rows as f32),
+            total_tabs,
+            &render::TUI_TAB_SWITCHER_SIZING,
+        )
+        .expect("12 items must yield a popup");
+        let expected = geo.visible_rows;
+        assert!(
+            expected < total_tabs,
+            "test setup must actually put more tabs than fit the popup \
+             (computed cap={expected}, tabs={total_tabs})"
+        );
+
+        // Scope the assertion to the popup's own painted rect, not the
+        // whole screen: the tab bar at the top of the frame also paints a
+        // (width-truncated) strip of open-tab names, which would otherwise
+        // make the "scrolled off" half of this assertion pass for the
+        // wrong reason.
+        let screen = driver.screen();
+        let lines: Vec<&str> = screen.lines().collect();
+        let (px, py, pw, ph) = (
+            geo.bounds.x as usize,
+            geo.bounds.y as usize,
+            geo.bounds.width as usize,
+            geo.bounds.height as usize,
+        );
+        let mut popup_text = String::new();
+        for line in lines.iter().skip(py).take(ph) {
+            let chars: Vec<char> = line.chars().collect();
+            let end = (px + pw).min(chars.len());
+            if px < end {
+                popup_text.push_str(&chars[px..end].iter().collect::<String>());
+                popup_text.push('\n');
+            }
+        }
+
+        // MRU order is newest-first (tab11 opened last => index 0), so the
+        // visible window is the `expected` most-recently-opened tabs.
+        for i in (total_tabs - expected..total_tabs).rev() {
+            let name = format!("tab{i:02}.txt");
+            assert!(
+                popup_text.contains(&name),
+                "{name} is one of the {expected} most-recently-used tabs \
+                 and must still be visible inside the popup; popup:\n\
+                 {popup_text}\nfull screen:\n{screen}"
+            );
+        }
+        for i in 0..(total_tabs - expected) {
+            let name = format!("tab{i:02}.txt");
+            assert!(
+                !popup_text.contains(&name),
+                "{name} is older than the {expected}-row cap and must have \
+                 scrolled off the popup; popup:\n{popup_text}\nfull \
+                 screen:\n{screen}"
+            );
+        }
     }
 
     // ── #734 slice 1: the shared modal keyboard rung ─────────────────────

@@ -5016,6 +5016,149 @@ mod chrome_surfaces {
         );
     }
 
+    // ── #1056: `FrameOp::TabSwitcher` row-count cap ───────────────────────
+    //
+    // GTK's `FrameOp::TabSwitcher` arm already fed
+    // `TabSwitcherGeometry::visible_rows` into
+    // `tab_switcher_to_quadraui_list_view`; TUI's twin arm fed
+    // `max_visible` (the uncapped height budget) instead — fixed alongside
+    // this test. See the `FrameOp::TabSwitcher` doc comment in `render.rs`.
+    // This is the GTK half of the "more tabs than fit" reproduction the
+    // follow-up asked for (TUI half:
+    // `driver_tab_switcher_caps_visible_rows_when_more_tabs_than_fit` in
+    // `src/tui_main/shell_app.rs`).
+
+    /// `count` file tabs under a short `/tmp` path (not `std::env::temp_dir()`,
+    /// whose macOS `/var/folders/.../T/` prefix is long enough that the
+    /// switcher's per-row detail column — the tab's full path, right-aligned
+    /// — reserves so much width that the item's own filename span never
+    /// paints at all, per `quadraui::gtk::list`'s `text_right_limit` guard).
+    /// Zero-padded names (`tab00.txt`..) so no name is a substring of
+    /// another. Opened in order via `new_tab`, which touches the MRU on
+    /// every call, so the resulting MRU order is deterministic: newest
+    /// first.
+    fn engine_with_many_file_tabs(count: usize) -> (Engine, Vec<std::path::PathBuf>) {
+        let dir = std::path::PathBuf::from(format!(
+            "/tmp/vc1056_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let files: Vec<_> = (0..count)
+            .map(|i| dir.join(format!("tab{i:02}.txt")))
+            .collect();
+        for (i, path) in files.iter().enumerate() {
+            std::fs::write(path, format!("line {i}\n")).unwrap();
+        }
+
+        let mut engine = Engine::new();
+        engine
+            .open_file_with_mode(&files[0], crate::core::engine::OpenMode::Permanent)
+            .unwrap();
+        for path in &files[1..] {
+            engine.new_tab(Some(path));
+        }
+        (engine, files)
+    }
+
+    /// #1056 reproduction, GTK half: 12 tabs open in a viewport short
+    /// enough that `gtk_tab_switcher_sizing`'s height budget caps the
+    /// popup below 12 rows, so it must paint only the most-recently-used
+    /// tabs that fit and hide the rest — not the full 12-entry MRU list.
+    ///
+    /// Asserted on each tab's full path (e.g. `/tmp/vc1056_.../tab07.txt`)
+    /// rather than the bare filename: the bare filename also appears in the
+    /// tab bar's own strip of open tabs (unrelated chrome, painted before
+    /// the popup), which would make a bare-filename search pass or fail for
+    /// the wrong reason. The full path is unique to the switcher's
+    /// right-aligned detail column — the breadcrumb bar nearby paints each
+    /// path *segment* as a separate run (`"tmp"`, `"vc1056_…"`, …), never
+    /// the joined string with slashes.
+    ///
+    /// The exact number of rows GTK paints can run one higher than
+    /// `TabSwitcherGeometry::visible_rows` predicts — `quadraui`'s shared
+    /// `ListView::layout` deliberately lets a partial trailing row peek
+    /// through when there is any leftover sub-row pixel space, which a
+    /// whole-cell TUI grid can never have. The `<= 1` tolerance below
+    /// accounts for exactly that, and only that.
+    ///
+    /// Per the issue's "reproduce it first" ask: investigating the swap
+    /// this fixes (TUI fed `max_visible`; GTK already fed `visible_rows`)
+    /// turned up that it never actually changed the painted row count on
+    /// either backend — see the updated `FrameOp::TabSwitcher` doc comment
+    /// in `render.rs` for the invariant that makes it inert
+    /// (`tab_switcher_selected` is always `< len`, and the row count
+    /// itself comes from the popup's own painted bounds, not from this
+    /// parameter). This test is a standing regression guard on the cap
+    /// itself and on the two backends agreeing on it, not a red/green proof
+    /// of that specific swap — reverting the `shell_app.rs` fix and
+    /// rerunning it does not turn it red.
+    #[test]
+    fn tab_switcher_caps_visible_rows_when_more_tabs_than_fit() {
+        let total_tabs = 12;
+        let (mut engine, files) = engine_with_many_file_tabs(total_tabs);
+        engine.open_tab_switcher();
+        assert!(
+            engine.tab_switcher_open,
+            "fixture must actually open the tab switcher"
+        );
+
+        // A short window: wide enough (1400px) that width never becomes the
+        // binding constraint on the popup or its detail column, short
+        // enough (220px) that the height budget caps well below
+        // `total_tabs` rows regardless of the exact font metrics this
+        // machine measures.
+        let h = harness(engine, 1400, 220);
+
+        let paths: Vec<String> = files.iter().map(|p| p.display().to_string()).collect();
+        let visible: Vec<bool> = paths.iter().map(|p| h.driver.screen_contains(p)).collect();
+        let visible_count = visible.iter().filter(|v| **v).count();
+        assert!(
+            visible_count < total_tabs,
+            "test setup must actually put more tabs than fit the popup \
+             (all {total_tabs} paths painted — the popup isn't capping at \
+             all, or the harness viewport is too tall for this fixture)"
+        );
+
+        let lh = h
+            .painted_line_height
+            .get()
+            .expect("a painted frame must record its line height (#555)") as f32;
+        let expected = crate::render::TabSwitcherGeometry::compute(
+            quadraui::Rect::new(0.0, 0.0, 1400.0, 220.0),
+            total_tabs,
+            &crate::render::gtk_tab_switcher_sizing(lh),
+        )
+        .expect("12 items must yield a popup")
+        .visible_rows;
+        assert!(
+            visible_count.abs_diff(expected) <= 1,
+            "painted row count ({visible_count}) should match the geometry's \
+             intended cap ({expected}), give or take the one-row tolerance \
+             for `ListView::layout`'s partial trailing row"
+        );
+
+        // MRU order is newest-first (tab11 opened last => index 0), so the
+        // visible window must be a contiguous run of the most-recently-used
+        // tabs — the newest `visible_count` present, the rest absent.
+        for i in (total_tabs - visible_count..total_tabs).rev() {
+            assert!(
+                visible[i],
+                "tab{i:02}.txt is one of the {visible_count} \
+                 most-recently-used tabs and must still paint its full path \
+                 inside the popup"
+            );
+        }
+        for i in 0..(total_tabs - visible_count) {
+            assert!(
+                !visible[i],
+                "tab{i:02}.txt is older than the {visible_count}-row cap \
+                 and must not paint at all (scrolled off)"
+            );
+        }
+    }
+
     // ── #733 slice 1: the shared modal-overlay mouse rung ────────────────
     //
     // `handle_mouse_click_msg`'s top rung is now
