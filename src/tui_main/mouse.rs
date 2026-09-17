@@ -1,5 +1,6 @@
 use super::*;
 
+use crate::click;
 use crate::core::engine::TabBarClickTarget;
 
 /// Compute the `grab_offset` to seed [`quadraui::DragTarget::ScrollbarY`]
@@ -2254,29 +2255,29 @@ pub(super) fn handle_mouse(
                         crate::render::resolve_tab_bar_click(&gtb.hit_regions, local_col)
                     });
                 if let Some(target) = hit_target {
-                    match target {
-                        TabBarClickTarget::Tab(_) => {
-                            let needs_confirm = engine.handle_tab_bar_click(group_id, target);
-                            if needs_confirm {
-                                engine.show_close_tab_confirm();
-                            }
-                            tab_drag.arm(col as f64, row as f64);
-                        }
-                        TabBarClickTarget::CloseTab(_) => {
-                            let needs_confirm = engine.handle_tab_bar_click(group_id, target);
-                            if needs_confirm {
-                                engine.show_close_tab_confirm();
-                            }
-                        }
-                        TabBarClickTarget::ActionMenu => {
-                            engine.active_group = group_id;
+                    // #1059: routed through the same `click::dispatch_tab_bar_target`
+                    // GTK calls (#814) instead of a hand-rolled arm-by-arm copy —
+                    // the shape #752 already flagged as how this file's *other*
+                    // copy (below) silently dropped `lsp_ensure_active_buffer()`.
+                    let is_tab = matches!(target, TabBarClickTarget::Tab(_));
+                    match click::dispatch_tab_bar_target(engine, group_id, Some(target)) {
+                        render::ClickTarget::ActionMenuButton(group_id) => {
                             // #434: pass tab-row height (1.0 row in TUI) so the
                             // engine drives Below placement; replaces the prior
                             // `row + 1` hack.
                             engine.open_editor_action_menu(group_id, col, row, 1.0);
                         }
+                        render::ClickTarget::CloseTab(group_id, idx) => {
+                            let needs_confirm = engine
+                                .handle_tab_bar_click(group_id, TabBarClickTarget::CloseTab(idx));
+                            if needs_confirm {
+                                engine.show_close_tab_confirm();
+                            }
+                        }
                         _ => {
-                            engine.handle_tab_bar_click(group_id, target);
+                            if is_tab {
+                                tab_drag.arm(col as f64, row as f64);
+                            }
                         }
                     }
                     return sidebar_width;
@@ -2347,24 +2348,31 @@ pub(super) fn handle_mouse(
                 // this arm now measures `local_col` against (#735's audit note on
                 // `ScreenLayout::tab_bar_hit_regions` called this arm out as its
                 // last remaining reader).
-                match render::resolve_tab_bar_click(&gtb.hit_regions, local_col) {
-                    Some(TabBarClickTarget::ActionMenu) => {
+                //
+                // #1059: dispatch itself now goes through the shared
+                // `click::dispatch_tab_bar_target` (GTK's rung since #814)
+                // instead of the hand-rolled copy #752's comment above already
+                // called out as the *last* one — this was it.
+                let target = render::resolve_tab_bar_click(&gtb.hit_regions, local_col);
+                let is_tab = matches!(target, Some(TabBarClickTarget::Tab(_)));
+                match click::dispatch_tab_bar_target(engine, group_id, target) {
+                    render::ClickTarget::ActionMenuButton(group_id) => {
                         // Needs screen coordinates, so the engine's own arm is a
                         // deliberate no-op (see `handle_tab_bar_click`). #434:
                         // pass the tab-row height (1.0 row in TUI) so the engine
                         // drives `Below` placement.
-                        engine.active_group = group_id;
                         engine.open_editor_action_menu(group_id, col, row, 1.0);
                     }
-                    Some(target) => {
-                        let is_tab = matches!(target, TabBarClickTarget::Tab(_));
-                        if engine.handle_tab_bar_click(group_id, target) {
+                    render::ClickTarget::CloseTab(group_id, idx) => {
+                        if engine.handle_tab_bar_click(group_id, TabBarClickTarget::CloseTab(idx)) {
                             engine.show_close_tab_confirm();
-                        } else if is_tab {
+                        }
+                    }
+                    _ => {
+                        if is_tab {
                             tab_drag.arm(col as f64, row as f64);
                         }
                     }
-                    None => {}
                 }
                 return sidebar_width;
             }
