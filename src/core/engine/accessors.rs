@@ -231,7 +231,7 @@ impl Engine {
 
     /// Compute explorer tree indicators: git status + deduplicated diagnostic counts.
     /// Returns (git_statuses, diag_counts) where:
-    /// - git_statuses: canonical path → git status char (M, A, D, R, ?)
+    /// - git_statuses: canonical path → git status char (M, A, D, R, U)
     /// - diag_counts: canonical path → (error_lines, warning_lines) deduplicated by line number
     ///
     /// Result is cached in `explorer_indicators_cache`; call
@@ -328,14 +328,19 @@ impl Engine {
 
         // Propagate git statuses up to parent directories so that a folder
         // shows modified/added color when any descendant file has that status.
-        // Priority: M > D > R > A > ?
+        // Priority: M > D > R > A > U
+        //
+        // #1051: this reads `StatusKind::label()`'s own output (populated
+        // into `git_statuses` above), so it must track that mapping — 'U'
+        // is the display label for `StatusKind::Untracked`, not git's `?`
+        // porcelain notation.
         fn git_priority(c: char) -> u8 {
             match c {
                 'M' => 5,
                 'D' => 4,
                 'R' => 3,
                 'A' => 2,
-                '?' => 1,
+                'U' => 1,
                 _ => 0,
             }
         }
