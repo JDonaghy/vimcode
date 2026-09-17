@@ -894,7 +894,8 @@ fn map_gtk_key_with_unicode(gdk_name: &str) -> (&str, Option<char>) {
         "Right" => ("Right", None),
         "Home" => ("Home", None),
         "End" => ("End", None),
-        "Tab" | "ISO_Left_Tab" => ("Tab", None),
+        "Tab" => ("Tab", None),
+        "ISO_Left_Tab" => ("BackTab", None),
         "Page_Up" => ("Page_Up", None),
         "Page_Down" => ("Page_Down", None),
         "question" => ("?", Some('?')),
@@ -7084,6 +7085,25 @@ impl App {
                         //    has an `NamedKey::Insert => Some(("Insert", ..))`
                         //    arm so both backends get the same, still-working
                         //    `"Insert"` spelling.
+                        //
+                        // `key_name` doesn't reach engine consumers raw: it
+                        // passes through a second, GTK-local decode layer —
+                        // `map_gtk_key_name` / `map_gtk_key_with_unicode`
+                        // below in this file — before `handle_key_press`
+                        // dispatches it. Both tables already had an
+                        // `"ISO_Left_Tab"` arm from before this PR, but it
+                        // was dead code on the GTK path (GTK never produced
+                        // that spelling as `key_name` pre-#1060). Making
+                        // `"ISO_Left_Tab"` live here is what surfaced their
+                        // disagreement: `map_gtk_key_name` round-trips it to
+                        // `"BackTab"` correctly, but `map_gtk_key_with_unicode`
+                        // used to collapse both `"Tab"` and `"ISO_Left_Tab"`
+                        // to plain `"Tab"`, silently turning Shift+Tab into
+                        // Tab for the one route that consumes its output
+                        // (`FocusKeyRoute::SourceControl`'s `sc_mapped`).
+                        // Fixed alongside this comment so `map_gtk_key_with_unicode`
+                        // now matches `map_gtk_key_name`'s `"ISO_Left_Tab" =>
+                        // "BackTab"` round-trip.
                         let n = render::engine_key_from_ui(&key, modifiers, true)
                             .map(|(name, _, _)| name)
                             .unwrap_or_default();
