@@ -3421,6 +3421,127 @@ mod issue_1062_shell_event_shadow_sync {
     }
 }
 
+/// #1063 (GOALS.md's 2026-09-16 audit, #1044, wave 2 item 11): GTK's
+/// `App::handle_menu_action` used to restate a *subset* of its own
+/// general-purpose `EngineAction` applier (`App::dispatch_engine_action`) by
+/// hand -- five variants named explicitly behind a bare `_ => {}` catch-all
+/// -- instead of calling it; TUI's menu arm already called its own
+/// general-purpose applier (`dispatch_post_key_action`), but that was a
+/// *different* function from GTK's, so the two could still drift
+/// independently. Both now call one shared function,
+/// `render::apply_engine_action`, via a `render::EngineActionHost` per
+/// backend (`GtkEngineActionHost` in `app.rs`, `TuiEngineActionHost` in
+/// `tui_main/shell_app.rs`) -- see that function's rung header comment in
+/// `render.rs` for the full "why".
+///
+/// This is a structural-convergence scenario, not a bug reproduction -- the
+/// closest sibling in this wave is #1062's shadow-sync rung, whose own doc
+/// makes the same call. Every menu item reachable in `MENU_STRUCTURE` today
+/// that could reach GTK's old catch-all already had an explicit arm there
+/// (`Quit`/`SaveQuit`/`QuitWithUnsaved`/`ToggleSidebar`/`OpenTerminal`) --
+/// the catch-all was a latent trap for a *future* menu item, not a live
+/// #984-shaped bug, so this is not expected to go red against pre-#1063
+/// `develop`. What it proves, registered on `tui` **and** `tui_prod`
+/// (see the next doc comment for why there's no `gtk` arm here), is that
+/// both still open a terminal pane via Terminal &#9656; New Terminal
+/// *after* being collapsed onto the one shared applier -- per #1063's own
+/// "Proving it actually converged" section, `tui_prod` is the only arm
+/// that could have caught `TuiShellApp`'s own `dispatch_post_key_action`
+/// drifting from the shared function during the convergence, since it is
+/// the only arm that drives the shipped `TuiShellApp` rather than the
+/// shared `App`; `tui` (wrapping `App`, the same shell `gtk` wraps) is
+/// what could have caught `GtkEngineActionHost` itself double-borrowing
+/// `Engine` or otherwise regressing GTK's menu path (see that struct's own
+/// doc, `app.rs`, for the double-borrow hazard this scenario's mere
+/// passing rules out).
+///
+/// TUI-only (`tui` + `tui_prod`, no `gtk` arm): reveals the menu bar via
+/// Alt+T, the same #318 shim `alt_letter_reveals_menu_bar_via_shell_app`
+/// (`tui_main/shell_app.rs`) exercises, then activates "New Terminal" with
+/// Enter -- a raw modifier-carrying `UiEvent::KeyPressed`, which is
+/// `TuiDriver`'s own inherent `dispatch`/`press_named`, not part of the
+/// cross-backend `ConformanceDriver` bound (`type_char`/`type_text`/
+/// `press_named`/`screen_has`/`inventory` only -- see this module's own
+/// "Which trait bound a scenario needs" doc), so this can't be a `gtk` arm
+/// of [`backend_conformance!`] without a click-based redesign; the shared
+/// generic parameter (`T: quadraui::AppLogic`) still lets the same body run
+/// against both TUI shells, which is what this issue's convergence proof
+/// needs.
+fn menu_terminal_activation_opens_terminal_pane<T: quadraui::AppLogic>(
+    driver: &mut quadraui::tui::testing::TuiDriver<T>,
+) {
+    // 't' is `MENU_STRUCTURE`'s alt-letter for the "Terminal" menu
+    // (`render.rs`: `("Terminal", 't', &[...])`) -- Alt+T reveals + opens
+    // its dropdown in one dispatch.
+    driver.dispatch(quadraui::UiEvent::KeyPressed {
+        key: quadraui::Key::Char('t'),
+        modifiers: quadraui::Modifiers {
+            alt: true,
+            ..quadraui::Modifiers::default()
+        },
+        repeat: false,
+    });
+    assert!(
+        driver.screen().contains("New Terminal"),
+        "Alt+T should reveal the menu bar and open the Terminal dropdown; \
+         screen:\n{}",
+        driver.screen()
+    );
+
+    // Enter activates the first (already-selected) item, "New Terminal"
+    // (action id "terminal" -> `EngineAction::OpenTerminal`).
+    // `MenuSystem::handle` closes the dropdown itself before returning
+    // `Activated`, so nothing from the dropdown box can paint on the rows
+    // checked below.
+    driver.press_named(quadraui::NamedKey::Enter);
+
+    // The bottom-panel tab bar's "Terminal" label (`render::
+    // build_bottom_panel_tab_bar`) is the deterministic proof a terminal
+    // pane actually opened. Skip row 0: the menu bar's own "Terminal"
+    // top-level label lives there too (and stays painted regardless of
+    // whether the terminal opened), so a whole-screen search would pass
+    // even against a no-op.
+    let screen = driver.screen();
+    assert!(
+        screen.lines().skip(1).any(|l| l.contains("Terminal")),
+        "Terminal \u{25b8} New Terminal must open a terminal pane \
+         (bottom-panel tab bar showing \"Terminal\" outside the menu-bar \
+         row), via the shared render::apply_engine_action (#1063); \
+         screen:\n{screen}"
+    );
+}
+
+#[cfg(test)]
+mod issue_1063_menu_action_engine_action_applier {
+    use super::*;
+
+    fn engine_fixture() -> crate::core::Engine {
+        let mut engine = crate::core::Engine::new_for_test();
+        engine.settings.use_nerd_fonts = Some(false);
+        engine
+    }
+
+    // #1043's own `tui`/`tui_prod` pair shape (see e.g.
+    // `explorer_chevron_click_toggles_dir_with_same_arity_as_label_click_tui`/
+    // `_tui_prod`, above): `tui` is the control (`App`, the shell `gtk` also
+    // wraps -- `GtkEngineActionHost`'s code runs here even though this
+    // arm never touches real GTK), `tui_prod` is the shipped `TuiShellApp`.
+    // Structural-convergence proof, not a bug reproduction -- see this
+    // module's own doc above for why it's not expected to go red against
+    // pre-#1063 `develop`.
+    #[test]
+    fn menu_terminal_activation_opens_terminal_pane_tui() {
+        let mut h = crate::tui_main::testing::conformance_harness(engine_fixture(), 80, 24);
+        menu_terminal_activation_opens_terminal_pane(&mut h.driver);
+    }
+
+    #[test]
+    fn menu_terminal_activation_opens_terminal_pane_tui_prod() {
+        let mut h = crate::tui_main::testing::conformance_harness_prod(engine_fixture(), 80, 24);
+        menu_terminal_activation_opens_terminal_pane(&mut h.driver);
+    }
+}
+
 /// #1059 (GOALS.md's 2026-09-16 audit, #1044, wave 2 item 7): `tui_main::mouse`
 /// hand-rolled the tab-bar-row dispatch match **twice** (once for a split
 /// group's tab bar, once for a single group's) instead of calling the shared

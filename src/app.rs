@@ -92,7 +92,7 @@ use crate::icons;
 use crate::render;
 
 use core::engine::EngineAction;
-use core::{Engine, OpenMode, WindowRect};
+use core::{Engine, WindowRect};
 use render::Theme;
 
 use copypasta_ext::ClipboardProviderExt;
@@ -158,6 +158,145 @@ struct GtkShellShadowHost;
 impl render::ShellShadowSyncHost for GtkShellShadowHost {
     fn panel_absent_from_shadow(&self, _panel_id: &quadraui::WidgetId) -> bool {
         false
+    }
+}
+
+/// [`render::EngineActionHost`] impl for GTK (#1063) — see the rung's header
+/// comment in `render.rs`. Unlike [`GtkAccelHost`] above, these hooks run
+/// with full `&mut App` in hand (`App::dispatch_engine_action`, the sole
+/// caller, has no engine borrow outstanding when it builds this), so there's
+/// no need to defer to `tick()` via `DeferredQueue` — except most method
+/// bodies below read/mutate the `engine: &mut Engine` parameter
+/// `apply_engine_action` hands them directly, rather than going through
+/// `self.engine.borrow()/borrow_mut()` the way the pre-#1063 `App` methods
+/// they replace did. That's not stylistic: `apply_engine_action`'s own
+/// `engine` parameter is already a live `RefMut` borrow of that same
+/// `Rc<RefCell<Engine>>` — reaching for a second, independent
+/// `self.app.engine.borrow_mut()` from in here would double-borrow the same
+/// `RefCell` and panic at runtime. `open_terminal`/`open_workspace_dialog`
+/// below used to be `App::new_terminal_tab`/`App::open_workspace_dialog`
+/// verbatim, until this rewrite left both with no other caller (menu, key
+/// and macro dispatch all go through here now) and #1063 deleted them
+/// rather than ship dead code.
+struct GtkEngineActionHost<'a> {
+    app: &'a mut App,
+}
+
+impl GtkEngineActionHost<'_> {
+    /// Shared by [`Self::quit`] and [`Self::quit_with_unsaved`]'s
+    /// no-unsaved-changes branch — inlines `App::save_session_and_exit`
+    /// against the already-borrowed `engine` instead of calling it (see this
+    /// struct's own doc for why).
+    fn save_session_and_exit(app: &App, engine: &mut Engine) {
+        engine.session.window.width = app
+            .window
+            .as_ref()
+            .map(|w| w.win_default_width())
+            .unwrap_or(800);
+        engine.session.window.height = app
+            .window
+            .as_ref()
+            .map(|w| w.win_default_height())
+            .unwrap_or(600);
+        engine.save_session_state();
+        engine.cleanup_all_swaps();
+        engine.lsp_shutdown();
+        app.exit_requested.set(true);
+    }
+}
+
+impl render::EngineActionHost for GtkEngineActionHost<'_> {
+    /// Was `App::new_terminal_tab`; see this struct's own doc.
+    fn open_terminal(&mut self, engine: &mut Engine) {
+        let cols = self.app.terminal_cols();
+        let rows = engine.session.terminal_panel_rows;
+        engine.terminal_new_tab(cols, rows);
+        self.app.draw_needed.set(true);
+    }
+    /// Inlines `App::toggle_terminal_maximize`.
+    fn toggle_terminal_maximize(&mut self, engine: &mut Engine) {
+        let ctx = crate::core::engine::UiEventContext {
+            terminal_cols: self.app.terminal_cols(),
+            terminal_max_rows: self.app.terminal_target_maximize_rows(),
+        };
+        engine.handle_ui_event(
+            crate::core::engine::UiEvent::Accelerator(
+                crate::core::engine::AcceleratorId::new("terminal.toggle_maximize"),
+                quadraui::Modifiers::default(),
+            ),
+            ctx,
+        );
+        self.app.draw_needed.set(true);
+    }
+    /// Inlines `App::run_command_in_terminal`.
+    fn run_in_terminal(&mut self, engine: &mut Engine, cmd: String) {
+        let cols = self.app.terminal_cols();
+        let rows = engine.session.terminal_panel_rows;
+        engine.terminal_run_command(&cmd, cols, rows);
+        self.app.draw_needed.set(true);
+    }
+    /// Inlines `App::open_folder_dialog`.
+    fn open_folder_dialog(&mut self, engine: &mut Engine) {
+        let controller = quadraui::FolderPickerController::new(
+            engine.cwd.clone(),
+            vec![".vimcode-workspace".to_string()],
+            engine.settings.show_hidden_files,
+        );
+        *self.app.folder_picker.borrow_mut() = Some(controller);
+        self.app.draw_needed.set(true);
+    }
+    /// Was `App::open_workspace_dialog` (see this struct's own doc), inlining
+    /// the `refresh_file_tree` / `refresh_explorer` / `reveal_path_in_explorer`
+    /// chain it called — `queue_explorer_draw` (that chain's last step) is a
+    /// documented no-op under the `ShellApp` runner, so dropping it changes
+    /// nothing.
+    fn open_workspace_dialog(&mut self, engine: &mut Engine) {
+        engine.explorer_rebuild_rows();
+        if let Some(path) = engine.file_path().cloned() {
+            engine.explorer_reveal_path(&path);
+        }
+        self.app.draw_needed.set(true);
+    }
+    /// Inlines `App::save_workspace_as_dialog` — touches no engine state, so
+    /// this one calls straight through.
+    fn save_workspace_as_dialog(&mut self, _engine: &mut Engine) {
+        self.app.save_workspace_as_dialog();
+    }
+    /// Inlines `App::open_recent_dialog`.
+    fn open_recent_dialog(&mut self, engine: &mut Engine) {
+        if engine.session.recent_workspaces.is_empty() {
+            engine.message = "No recent workspaces".to_string();
+        } else {
+            engine.open_picker(crate::core::engine::PickerSource::RecentWorkspaces);
+        }
+        self.app.draw_needed.set(true);
+    }
+    /// Inlines `App::sync_sidebar_from_engine` — a redraw trigger only under
+    /// the `ShellApp` runner (see that method's own doc comment).
+    fn sidebar_toggled(&mut self, _engine: &mut Engine) {
+        self.app.draw_needed.set(true);
+    }
+    /// Inlines `App::show_quit_confirm`.
+    fn quit_with_unsaved(&mut self, engine: &mut Engine) {
+        if !engine.has_any_unsaved() {
+            Self::save_session_and_exit(self.app, engine);
+            return;
+        }
+        engine.show_quit_confirm();
+        self.app.draw_needed.set(true);
+    }
+    /// Inlines `App::quit_confirmed` (itself just `save_session_and_exit`).
+    fn quit(&mut self, engine: &mut Engine) {
+        Self::save_session_and_exit(self.app, engine);
+    }
+    /// Matches the former inline `EngineAction::QuitWithError` arm in
+    /// `dispatch_engine_action` exactly — no `save_session_state` (unlike
+    /// `quit` above), mirroring `tui_main::handle_action`'s asymmetric
+    /// treatment of the same variant.
+    fn quit_with_error(&mut self, engine: &mut Engine) -> ! {
+        engine.cleanup_all_swaps();
+        engine.lsp_shutdown();
+        std::process::exit(1);
     }
 }
 
@@ -2027,78 +2166,35 @@ impl App {
         self.exit_requested.set(true);
     }
 
-    /// Dispatch an `EngineAction` produced by `handle_key` or macro playback.
+    /// Dispatch an `EngineAction` produced by `handle_key`, macro playback,
+    /// or a fired menu item (`handle_menu_action`, below).
     ///
     /// `is_macro`: when true, `OpenTerminal` toggles instead of creating a new
-    /// tab, and dialog-open actions are suppressed (macros can't drive dialogs).
+    /// tab, and dialog-open actions are suppressed (macros can't drive
+    /// dialogs) — handled here, before ever reaching `apply_engine_action`,
+    /// since neither is something a shared applier should know about (a
+    /// menu click is never `is_macro`, so this whole branch is dead for that
+    /// caller). Every other variant — the exhaustive general-purpose case —
+    /// is `render::apply_engine_action` (#1063), the same function
+    /// `tui_main::dispatch_post_key_action` now calls too; see that
+    /// function's rung header comment in `render.rs`.
     fn dispatch_engine_action(&mut self, action: EngineAction, is_macro: bool) {
-        match action {
-            EngineAction::Quit | EngineAction::SaveQuit => {
-                self.save_session_and_exit();
-            }
-            EngineAction::OpenFile(path) => {
-                let mut engine = self.engine.borrow_mut();
-                if let Err(e) = engine.open_file_with_mode(&path, OpenMode::Permanent) {
-                    engine.message = e;
-                }
-            }
-            EngineAction::OpenTerminal => {
-                if is_macro {
+        if is_macro {
+            match &action {
+                EngineAction::OpenTerminal => {
                     self.toggle_terminal();
-                } else {
-                    self.new_terminal_tab();
+                    return;
                 }
+                EngineAction::OpenFolderDialog
+                | EngineAction::OpenWorkspaceDialog
+                | EngineAction::SaveWorkspaceAsDialog
+                | EngineAction::OpenRecentDialog => return,
+                _ => {}
             }
-            EngineAction::ToggleTerminalMaximize => {
-                self.toggle_terminal_maximize();
-            }
-            EngineAction::RunInTerminal(cmd) => {
-                self.run_command_in_terminal(cmd);
-            }
-            EngineAction::OpenFolderDialog => {
-                if !is_macro {
-                    self.open_folder_dialog();
-                }
-            }
-            EngineAction::OpenWorkspaceDialog => {
-                if !is_macro {
-                    self.open_workspace_dialog();
-                }
-            }
-            EngineAction::SaveWorkspaceAsDialog => {
-                if !is_macro {
-                    self.save_workspace_as_dialog();
-                }
-            }
-            EngineAction::OpenRecentDialog => {
-                if !is_macro {
-                    self.open_recent_dialog();
-                }
-            }
-            EngineAction::QuitWithUnsaved => {
-                self.show_quit_confirm();
-            }
-            EngineAction::ToggleSidebar => {
-                // Engine handles this internally; sync local cache.
-                self.sync_sidebar_from_engine();
-            }
-            EngineAction::QuitWithError => {
-                let mut engine = self.engine.borrow_mut();
-                engine.cleanup_all_swaps();
-                engine.lsp_shutdown();
-                drop(engine);
-                // `:cquit` needs a nonzero exit code to signal failure to
-                // whatever invoked it (scripting/CI use), which
-                // `quadraui::Reaction::Exit` cannot carry — mirrors
-                // `tui_main::handle_action`'s direct `process::exit(1)`
-                // rather than going through `exit_requested` (#813).
-                std::process::exit(1);
-            }
-            EngineAction::OpenUrl(url) => {
-                open_url(&url);
-            }
-            EngineAction::None | EngineAction::Error => {}
         }
+        let engine_rc = self.engine.clone();
+        let mut host = GtkEngineActionHost { app: self };
+        render::apply_engine_action(action, &mut engine_rc.borrow_mut(), &mut host);
     }
 
     /// Return focus to the main editor drawing area when a sidebar loses
@@ -5589,14 +5685,6 @@ impl App {
         self.draw_needed.set(true);
     }
 
-    /// Open a new terminal tab.
-    fn new_terminal_tab(&mut self) {
-        let cols = self.terminal_cols();
-        let rows = self.engine.borrow().session.terminal_panel_rows;
-        self.engine.borrow_mut().terminal_new_tab(cols, rows);
-        self.draw_needed.set(true);
-    }
-
     /// Run `cmd` in a visible terminal pane (used for extension installs).
     fn run_command_in_terminal(&mut self, cmd: String) {
         let cols = self.terminal_cols();
@@ -5646,23 +5734,19 @@ impl App {
                     self.save_session_and_exit();
                 }
             }
+            // #1063: used to restate a subset of `dispatch_engine_action`'s
+            // match by hand (four variants named explicitly behind a bare
+            // `_ => {}`) instead of calling it — exactly the shape that hid
+            // #984 for months, since a menu item wired to a fifth variant
+            // nobody had added an arm for would silently no-op instead of
+            // failing to compile. `dispatch_engine_action(_, false)` is
+            // exhaustive (via `render::apply_engine_action`, #1063) and a
+            // menu activation is never a macro, so this is the same
+            // behavior for every variant this catch-all used to name, plus
+            // real handling — not a silent no-op — for every one it didn't.
             _ => {
                 let engine_action = self.engine.borrow_mut().dispatch_menu_action(&action);
-                match engine_action {
-                    EngineAction::Quit | EngineAction::SaveQuit => {
-                        self.quit_confirmed();
-                    }
-                    EngineAction::QuitWithUnsaved => {
-                        self.show_quit_confirm();
-                    }
-                    EngineAction::ToggleSidebar => {
-                        self.sync_sidebar_from_engine();
-                    }
-                    EngineAction::OpenTerminal => {
-                        self.new_terminal_tab();
-                    }
-                    _ => {}
-                }
+                self.dispatch_engine_action(engine_action, false);
             }
         }
         self.sync_menu_overlay();
@@ -6584,14 +6668,6 @@ impl App {
                 *self.folder_picker.borrow_mut() = None;
             }
         }
-        self.draw_needed.set(true);
-    }
-
-    /// Finish an "Open Workspace" action started in the engine.
-    fn open_workspace_dialog(&mut self) {
-        // open_workspace_from_file() already ran in the engine;
-        // just refresh the file tree.
-        self.refresh_file_tree();
         self.draw_needed.set(true);
     }
 

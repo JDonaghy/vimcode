@@ -4621,6 +4621,131 @@ pub fn dispatch_panel_accelerator(
     Some(action)
 }
 
+// ─── Menu-action `EngineAction` applier rung (#1063) ────────────────────────
+//
+// `Engine::dispatch_menu_action` (`core/engine/vscode.rs`) turns a fired
+// `quadraui::MenuEvent::Activated` id into an `EngineAction` the caller still
+// has to apply. Most variants are pure bookkeeping the engine already
+// finished (`None`/`Error`, and every menu item whose own `execute_command`
+// arm does its work and returns `None` — `sidebar`'s toggle, for instance,
+// happens inside the engine itself). The dozen or so that remain name an
+// effect `Engine` cannot finish alone: opening a terminal needs the live
+// pane's column/row count, a dialog needs to write into backend-local dialog
+// state, quitting needs the backend's own shutdown sequence.
+//
+// Before this rung, GTK's `App::handle_menu_action` restated a *subset* of
+// this match by hand — five variants named explicitly behind a bare `_ =>
+// {}` catch-all — instead of reusing `App::dispatch_engine_action`, its own
+// already-exhaustive general-purpose applier (used by the keyboard/macro
+// paths). That catch-all is exactly the shape that hid #984 for months: a
+// future menu item wired to a variant nobody had added an arm for would
+// silently no-op instead of failing to compile. TUI's menu arm
+// (`tui_main/shell_app.rs`) already routed through its own general-purpose
+// applier (`dispatch_post_key_action`) — exhaustive, but a *different*
+// function from GTK's, so the two could still drift independently even
+// though neither, on its own, had a reachability gap today.
+//
+// [`apply_engine_action`] is the one function both now call: an exhaustive
+// match (no `_ =>` arm — a new `EngineAction` variant fails to compile here
+// until every caller decides what it means), with a `host: &mut impl
+// EngineActionHost` seam for the effects each backend must supply itself —
+// follows [`dispatch_panel_accelerator`]'s shape above, not a new one.
+pub trait EngineActionHost {
+    /// Open a new terminal tab (needs the live pane's column/row count).
+    fn open_terminal(&mut self, engine: &mut Engine);
+    /// Toggle terminal-panel maximize (needs the live viewport's row count).
+    fn toggle_terminal_maximize(&mut self, engine: &mut Engine);
+    /// Run `cmd` in a new terminal tab (extension-install flow).
+    fn run_in_terminal(&mut self, engine: &mut Engine, cmd: String);
+    /// Show the "Open Folder" dialog/picker.
+    fn open_folder_dialog(&mut self, engine: &mut Engine);
+    /// Finish an "Open Workspace" action already run inside the engine.
+    fn open_workspace_dialog(&mut self, engine: &mut Engine);
+    /// Show the "Save Workspace As" dialog.
+    fn save_workspace_as_dialog(&mut self, engine: &mut Engine);
+    /// Show the "Open Recent" workspace picker.
+    fn open_recent_dialog(&mut self, engine: &mut Engine);
+    /// Re-sync/redraw after the engine toggled sidebar visibility internally.
+    fn sidebar_toggled(&mut self, engine: &mut Engine);
+    /// Show the "unsaved changes" quit-confirmation UI.
+    fn quit_with_unsaved(&mut self, engine: &mut Engine);
+    /// Save session state and request a clean shutdown.
+    fn quit(&mut self, engine: &mut Engine);
+    /// Save session state and exit the process with a non-zero code
+    /// (`:cquit`). Never returns.
+    fn quit_with_error(&mut self, engine: &mut Engine) -> !;
+}
+
+/// Apply the [`crate::core::engine::EngineAction`] produced by
+/// `Engine::dispatch_menu_action` (a fired `MenuEvent::Activated`). Returns
+/// `true` when the action means the caller should exit — `Quit`/`SaveQuit`;
+/// `QuitWithError` never returns at all.
+///
+/// `OpenFile`/`OpenUrl`/`None`/`Error` need no backend help — `Engine`
+/// already did (or need do) everything for those — so they're handled
+/// inline rather than through `host`.
+pub fn apply_engine_action(
+    action: crate::core::engine::EngineAction,
+    engine: &mut Engine,
+    host: &mut impl EngineActionHost,
+) -> bool {
+    use crate::core::engine::EngineAction;
+    match action {
+        EngineAction::None | EngineAction::Error => false,
+        EngineAction::Quit | EngineAction::SaveQuit => {
+            host.quit(engine);
+            true
+        }
+        EngineAction::QuitWithError => host.quit_with_error(engine),
+        EngineAction::QuitWithUnsaved => {
+            host.quit_with_unsaved(engine);
+            false
+        }
+        EngineAction::OpenFile(path) => {
+            if let Err(e) = engine.open_file_with_mode(&path, crate::core::OpenMode::Permanent) {
+                engine.message = e;
+            }
+            false
+        }
+        EngineAction::OpenTerminal => {
+            host.open_terminal(engine);
+            false
+        }
+        EngineAction::ToggleTerminalMaximize => {
+            host.toggle_terminal_maximize(engine);
+            false
+        }
+        EngineAction::RunInTerminal(cmd) => {
+            host.run_in_terminal(engine, cmd);
+            false
+        }
+        EngineAction::OpenFolderDialog => {
+            host.open_folder_dialog(engine);
+            false
+        }
+        EngineAction::OpenWorkspaceDialog => {
+            host.open_workspace_dialog(engine);
+            false
+        }
+        EngineAction::SaveWorkspaceAsDialog => {
+            host.save_workspace_as_dialog(engine);
+            false
+        }
+        EngineAction::OpenRecentDialog => {
+            host.open_recent_dialog(engine);
+            false
+        }
+        EngineAction::ToggleSidebar => {
+            host.sidebar_toggled(engine);
+            false
+        }
+        EngineAction::OpenUrl(url) => {
+            crate::core::engine::open_url_in_browser(&url);
+            false
+        }
+    }
+}
+
 // ─── Shell-event shadow-sync rung (#1062) ────────────────────────────────────
 //
 // `AppShellEvent::PanelChanged`/`SidebarHidden`/`SidebarResized` all report a
