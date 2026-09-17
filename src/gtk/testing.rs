@@ -7207,6 +7207,182 @@ mod minimap {
         seen.len()
     }
 
+    /// #1052 — GTK minimap syntax colour stopped partway down a long file
+    /// (a *vertical* falloff by buffer line, distinct from #990/#1030's
+    /// *horizontal* falloff by indentation column).
+    ///
+    /// # Reproduction and root cause (deliverables 1-3)
+    ///
+    /// Reproduces on unfixed `develop`: a 1200-line, densely-highlighted
+    /// `.rs` fixture painted into a 1400x900 GTK harness produced a strip
+    /// whose per-decile (10%-of-height band) distinct non-background colour
+    /// count was `[10, 7, 9, 6, 1, 1, 1, 1, 1, 2]` — real syntax colour
+    /// variety for the top ~40% of the strip, then flat/monochrome for the
+    /// rest. `buffer_state.highlights` was *not* the cause: it covered the
+    /// buffer almost exactly to its final byte (measured
+    /// `max_highlight_end_byte=19248` against `buffer_len_bytes=19250`,
+    /// `highlights.len()=3400`), ruling out the "parsed window" theory the
+    /// issue raised — this is a minimap bug, not a syntax-parse bug, and
+    /// vertical, not #1030/#990's horizontal one.
+    ///
+    /// The actual cause: `build_minimap_data`'s `target_lines` (the number
+    /// of buffer lines it samples) was computed as `display_rows *
+    /// MINIMAP_LINES_PER_ROW` where `display_rows = rect.height /
+    /// line_height` — correct for TUI, whose minimap row genuinely costs
+    /// one editor `line_height` (cell-native, `line_height == 1.0`), but
+    /// wrong for GTK: GTK's rasteriser (`quadraui::gtk::minimap`) paints
+    /// each sampled line at a **fixed** `ROW_PITCH_PX` (2px) pitch,
+    /// completely decoupled from the editor's own font-derived
+    /// `line_height` (~18-22px measured here). GTK could therefore paint
+    /// roughly `line_height / ROW_PITCH_PX` (~10x, measured: strip height
+    /// 756.5px / 2px = 378 possible rows vs. the 136 lines the old formula
+    /// actually sampled) more rows than it was ever given, and its own
+    /// rasteriser paints sampled rows top-aligned rather than stretched to
+    /// fill the strip (`Minimap::layout_with_sizing`'s `FixedPitch` arm) —
+    /// so once the too-few samples ran out, the rest of the strip simply
+    /// stayed unpainted.
+    ///
+    /// The fix (`src/render.rs`, `build_minimap_data`) takes the max of
+    /// both backends' real row requirements, mirroring the `visible_span_cols`
+    /// column-axis fix immediately below it in the same function (#1030):
+    /// GTK's `rect.height / ROW_PITCH_PX` alongside the existing
+    /// `display_rows * MINIMAP_LINES_PER_ROW`. Re-measured with the fix:
+    /// `[8, 9, 8, 8, 9, 6, 9, 6, 9, 8]` — flat colour diversity across the
+    /// whole strip, no falloff.
+    ///
+    /// # TUI (deliverable 5)
+    ///
+    /// TUI does **not** need the same fix: its minimap row genuinely is
+    /// cell-native (one packed braille row per `MINIMAP_LINES_PER_ROW`
+    /// buffer lines, no separate fixed pixel pitch), so `display_rows *
+    /// MINIMAP_LINES_PER_ROW` was already exactly TUI's own row capacity —
+    /// there is nothing for TUI's `rect.height / ROW_PITCH_PX` candidate to
+    /// correct (see the fix's own doc comment for why that candidate can
+    /// never dominate on TUI's side). This falloff is GTK-specific, so
+    /// unlike #1030/#990 this label correctly stays `::gtk`-suffixed.
+    ///
+    /// # What this test asserts
+    ///
+    /// RED-verified: reverting the `gtk_row_capacity` term in
+    /// `build_minimap_data` (i.e. back to unfixed `develop`) leaves the
+    /// bottom 10% of the strip with zero saturated (chroma >= 10) pixels —
+    /// just the flat, near-grey background/overlay tint — failing the
+    /// assertion below. Sampling near the *bottom* of a long file's strip
+    /// (not just the top, unlike the precondition guard in
+    /// `minimap_paints_distinct_syntax_colors_at_indentation_via_gtk_driver`)
+    /// is exactly the "vertical counterpart" deliverable 4 asks for.
+    #[test]
+    fn minimap_paints_syntax_colour_near_the_bottom_of_a_long_file_via_gtk_driver() {
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_test_1052_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("long_file_1052.rs");
+        // ~1200 lines of varied, densely-highlightable Rust (docs, structs,
+        // impls, fields) — not one repeated line shape — standing in for
+        // the issue's `parser.h`.
+        let mut text = String::new();
+        for i in 0..100 {
+            text.push_str(&format!(
+                "/// Doc comment for Thing{i}.\n\
+                 pub struct Thing{i} {{\n\
+                 \x20   pub field_{i}: u32,\n\
+                 \x20   other: bool,\n\
+                 }}\n\
+                 \n\
+                 impl Thing{i} {{\n\
+                 \x20   pub fn new(x: u32) -> Self {{\n\
+                 \x20       Self {{ field_{i}: x, other: false }}\n\
+                 \x20   }}\n\
+                 }}\n\
+                 \n"
+            ));
+        }
+        std::fs::write(&file, &text).unwrap();
+
+        crate::core::buffer_manager::set_syntax_max_lines(20_000);
+
+        let mut engine = Engine::new();
+        engine
+            .open_file_with_mode(&file, crate::core::engine::OpenMode::Permanent)
+            .unwrap();
+        let win_id = engine.active_window_id();
+        let buf_id = engine.windows.get(&win_id).unwrap().buffer_id;
+        let n_highlights = engine.buffer_manager.get(buf_id).unwrap().highlights.len();
+        assert!(
+            n_highlights > 0,
+            "precondition: tree-sitter must produce highlights for this \
+             fixture, or the colour assertions below are vacuous"
+        );
+
+        let mut h = harness(engine, 1400, 900);
+        h.window_center(win_id)
+            .expect("editor pane must paint with the minimap on");
+
+        let strip = {
+            let layout = h.screen_layout.borrow();
+            layout
+                .as_ref()
+                .unwrap()
+                .minimap
+                .iter()
+                .find(|m| m.window_id == win_id)
+                .expect("the layout must carry a minimap for the pane")
+                .rect
+        };
+
+        let x0 = strip.x.round() as i32;
+        let x1 = (strip.x + strip.width).round() as i32;
+        let y0 = strip.y.round() as i32;
+        let y1 = (strip.y + strip.height).round() as i32;
+        let total_h = (y1 - y0).max(1);
+        // The bottom decile: the last 10% of the strip's height. Chosen
+        // over a hardcoded pixel offset per CLAUDE.md ("locate targets,
+        // never hardcode coordinates") — it's derived from the strip's own
+        // painted rect, whatever height that resolves to on this run.
+        let band = ((total_h as f64 * 0.10).round() as i32).max(1);
+        let bottom_y0 = (y1 - band).max(y0);
+
+        // A flat/unpainted region (background fill, or the translucent
+        // viewport-highlight tint blended into it) is near-neutral grey —
+        // low spread between its highest and lowest channel. Real syntax
+        // colours (keywords, types, string/comment hues) are saturated by
+        // comparison. Filtering on chroma rather than an exact background
+        // tuple match is robust to the minimap's fill not being
+        // byte-identical to `render::Theme.background` (quadraui's
+        // GTK rasteriser measured at (23,24,28) against this fixture's
+        // (26,26,26) theme value — a translucent overlay, not the base
+        // fill, most likely) and to antialiasing at strip edges.
+        let chroma = |c: (u8, u8, u8)| c.0.max(c.1).max(c.2) - c.0.min(c.1).min(c.2);
+        let mut bottom_colors = std::collections::HashSet::new();
+        for y in bottom_y0..y1 {
+            for x in x0..x1 {
+                let c = h.driver.pixel(x, y);
+                if chroma(c) >= 10 {
+                    bottom_colors.insert(c);
+                }
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(
+            !bottom_colors.is_empty(),
+            "#1052: a long, densely-highlighted file must still paint at \
+             least one saturated syntax colour (chroma >= 10) in the \
+             bottom 10% of the GTK minimap strip (y in {bottom_y0}..{y1} \
+             of strip y-range {y0}..{y1}) — got none (just the flat, \
+             near-grey background/overlay tint). If this fails, \
+             `build_minimap_data`'s `target_lines` (`src/render.rs`) has \
+             regressed back to sampling fewer buffer lines than GTK's fixed \
+             `ROW_PITCH_PX` row pitch can actually paint in this strip \
+             height, so the bottom of any sufficiently long file's minimap \
+             goes unpainted again."
+        );
+    }
+
     #[test]
     fn minimap_paints_distinct_syntax_colors_at_indentation_via_gtk_driver() {
         // Indents 0 and 20 are deliverable 3's no-regression measurement;
