@@ -11642,6 +11642,80 @@ mod engine_key_from_ui_gtk_tests {
              the first PageDown produced"
         );
     }
+
+    /// #1060 review: plain BackTab (Shift+Tab, no ctrl) against the Source
+    /// Control sidebar — the GTK mirror of TUI's `back_tab_cycles_the_sc_
+    /// sidebar_section_backward_via_shell_app`. `FocusKeyRoute::SourceControl`
+    /// is the one route whose `key_name` travels through `map_gtk_key_with_
+    /// unicode` (not `map_gtk_key_name`), and that function's `"Tab" |
+    /// "ISO_Left_Tab" => ("Tab", None)` arm used to silently collapse the
+    /// shared decoder's `"ISO_Left_Tab"` spelling (which `NamedKey::BackTab`
+    /// now produces, since this PR routed it through `engine_key_from_ui`)
+    /// right back down to plain `"Tab"` before `sc_sidebar_navigate` ever
+    /// saw it — so Shift+Tab silently cycled the active section *forward*
+    /// instead of backward, a regression this PR introduced and this test
+    /// closes.
+    ///
+    /// **Verified RED against unfixed `develop`:** with `map_gtk_key_with_
+    /// unicode`'s `"ISO_Left_Tab"` arm restored to fold into `("Tab", None)`
+    /// instead of `("BackTab", None)`, the final `assert!` below fails —
+    /// BackTab shows `"▶ CHANGES"` (cycled forward again) instead of cycling
+    /// back to `"▶ STAGED CHANGES"`.
+    #[test]
+    fn back_tab_cycles_the_sc_sidebar_section_backward_on_gtk() {
+        use crate::core::git::{FileStatus, StatusKind};
+
+        let mut engine = Engine::new_for_test();
+        engine.settings.use_nerd_fonts = Some(false);
+        engine.app_shell.show_panel(&quadraui::WidgetId::new(
+            crate::core::engine::sidebar::PANEL_GIT,
+        ));
+        engine.sc_has_focus = true;
+        // One file in each of the two always-shown sections (Staged,
+        // Changes) so both headers paint, mirroring the TUI test's fixture.
+        engine.sc_file_statuses = vec![
+            FileStatus {
+                path: "zqxwbts.rs".to_string(),
+                staged: Some(StatusKind::Modified),
+                ..Default::default()
+            },
+            FileStatus {
+                path: "zqxwbtc.rs".to_string(),
+                unstaged: Some(StatusKind::Modified),
+                ..Default::default()
+            },
+        ];
+
+        let mut h = harness(engine, 1400, 900);
+        h.driver.render();
+        assert!(
+            h.driver.screen_contains("▶ STAGED CHANGES"),
+            "precondition: Staged must be the initially active section; \
+             painted: {:?}",
+            h.driver.painted_texts()
+        );
+
+        press(&mut h, Key::Named(NamedKey::Tab), Modifiers::default());
+        h.driver.render();
+        assert!(
+            h.driver.screen_contains("▶ CHANGES") && !h.driver.screen_contains("▶ STAGED CHANGES"),
+            "Tab must cycle the SC sidebar's active section forward, from \
+             Staged to Changes; painted: {:?}",
+            h.driver.painted_texts()
+        );
+
+        press(&mut h, Key::Named(NamedKey::BackTab), Modifiers::default());
+        h.driver.render();
+        assert!(
+            h.driver.screen_contains("▶ STAGED CHANGES"),
+            "plain BackTab (Shift+Tab, no ctrl) decoded via the shared \
+             `engine_key_from_ui` (\"ISO_Left_Tab\") must cycle the active \
+             section back to Staged through `map_gtk_key_with_unicode`'s \
+             SourceControl route — before this fix it silently collapsed \
+             back to \"Tab\" and cycled forward again instead; painted: {:?}",
+            h.driver.painted_texts()
+        );
+    }
 }
 
 // ── #928 proof slice: `crate::harness::ConformanceHarness` on `GtkDriver` ──
