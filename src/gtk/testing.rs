@@ -3803,6 +3803,187 @@ mod sidebar_panel_clicks {
         );
     }
 
+    /// #1058: opening a terminal split (clicking the toolbar's split button)
+    /// must size the two new PTY panes off the *real* live panel pixel
+    /// width, not the fixed `terminal_cols() == 80` fallback — a window
+    /// whose panel is nowhere near 80 columns wide must not get a split
+    /// pinned at 80 columns regardless.
+    ///
+    /// Drives it through the real production click path:
+    /// `resolve_terminal_toolbar_click` -> `TerminalToolbarAction::
+    /// ToggleSplit` -> `execute_terminal_toolbar_action`, fed the
+    /// `ctx.terminal_cols` `App::handle_mouse_click_msg` builds — the call
+    /// site this issue fixes (`self.terminal_panel_cols(width)`, using the
+    /// click's own live `width` rather than the old `self.terminal_cols()`).
+    ///
+    /// Compares the *same* scenario at two driver widths rather than
+    /// asserting one exact predicted column count: `App::cached_char_width`
+    /// (what the fixed conversion divides by) is deliberately not the same
+    /// number `Self::painted_char_width` reports (`cached_char_width` is
+    /// seeded once at `setup()`, `painted_char_width` is the live
+    /// per-frame max with the backend's measured width — see
+    /// `App::painted_char_width`'s own doc, #555/#947), so a test computing
+    /// its own "expected" column count from the painted width wouldn't
+    /// reliably match what the fix under test actually divides by. A much
+    /// wider window producing a much larger column count is: (a) the
+    /// user-visible bug this issue reports, and (b) impossible under either
+    /// hardcode, which fixes the total regardless of the driver's width.
+    ///
+    /// **Verified RED against unfixed `develop`:** with `ctx.terminal_cols`
+    /// pinned to `self.terminal_cols() == 80`, both the narrow and the wide
+    /// window's two new panes sum to the same fixed total (`80` halved and
+    /// doubled back), so the final `assert!(wide_total > narrow_total)`
+    /// fails.
+    #[test]
+    fn terminal_split_open_sizes_panes_off_the_real_window_width_on_gtk() {
+        const HEIGHT: i32 = 900;
+
+        /// Open a single terminal tab, click the toolbar's "split" segment
+        /// (AddTab, ToggleSplit, ToggleMaximize, CloseTab —
+        /// `resolve_terminal_toolbar_click`), and return the two new PTY
+        /// panes' combined column count.
+        fn split_total_cols(width: i32) -> u16 {
+            let mut engine = Engine::new_for_test();
+            engine.settings.use_nerd_fonts = Some(false);
+            // `terminal_new_tab` opens the panel and focuses it, mirroring
+            // opening the panel for the first time.
+            engine.terminal_new_tab(80, 10);
+
+            let mut h = harness(engine, width, HEIGHT);
+            h.driver.render();
+
+            let (seg_x, seg_y) = {
+                let engine = h.engine.borrow();
+                let hits = engine.terminal_toolbar_hits.borrow();
+                let crate::core::engine::TerminalToolbarHits::TabStrip(bar_hits) = hits
+                    .as_ref()
+                    .expect("the terminal toolbar must have painted a tab strip")
+                else {
+                    panic!("expected a tab-strip toolbar before any split exists");
+                };
+                let &(sx, ex) = bar_hits
+                    .right_segment_bounds
+                    .get(1)
+                    .expect("AddTab, ToggleSplit, ToggleMaximize, CloseTab must all paint");
+                let geom = engine
+                    .bottom_panel_geometry
+                    .borrow()
+                    .expect("the bottom panel must have painted");
+                // The toolbar row spans `[toolbar_y, content_y)` relative to
+                // `top_y` (`Engine::resolve_bottom_panel_zone`) — distinct
+                // from the tab-bar row above it (`[0, toolbar_y)`), which is
+                // what `bottom_panel_tab_strip_click_switches_the_painted_
+                // panel` targets instead.
+                (
+                    (sx + ex) / 2.0,
+                    geom.top_y + (geom.toolbar_y + geom.content_y) / 2.0,
+                )
+            };
+
+            h.driver.click(seg_x as f32, seg_y as f32);
+            h.driver.render();
+
+            assert!(
+                h.engine.borrow().terminal_split,
+                "clicking the toolbar's split segment must open a split \
+                 (width {width})"
+            );
+            assert_eq!(
+                h.engine.borrow().terminal_panes.len(),
+                2,
+                "a freshly opened split must have exactly two PTY panes \
+                 (width {width})"
+            );
+
+            let engine = h.engine.borrow();
+            engine.terminal_panes[0].session.cols() + engine.terminal_panes[1].session.cols()
+        }
+
+        let narrow_total = split_total_cols(800);
+        let wide_total = split_total_cols(4000);
+
+        assert!(
+            wide_total > narrow_total,
+            "a terminal split opened in a 4000px-wide window must get more \
+             total columns ({wide_total}) than the same split opened in an \
+             800px-wide window ({narrow_total}) — both pinned to the same \
+             total means the split is still sized off a hardcoded width \
+             fallback, not the real one"
+        );
+    }
+
+    /// #1058: finalizing a terminal-split divider *drag* (as opposed to the
+    /// initial split-open covered by the sibling test above) must also
+    /// convert the real live panel pixel width to columns, not the fixed
+    /// `da_w = 800.0` guess — `App::handle_mouse_up_msg`'s
+    /// `terminal_split_dragging` arm.
+    ///
+    /// Same before/after-widths comparison as the sibling test, for the same
+    /// reason (`cached_char_width` vs `painted_char_width` staleness, #555/
+    /// #947, makes an exact predicted column count unreliable): a fixed
+    /// pixel-delta drag finalized in a much wider window must land on a
+    /// larger total than the identical drag finalized in a narrow one.
+    ///
+    /// **Verified RED against unfixed `develop`:** with `da_w` hardcoded to
+    /// `800.0`, `total_cols` is `((800.0 - 6.0) / cached_char_width) as u16`
+    /// regardless of the driver's actual width, so both the narrow and the
+    /// wide window finalize to the same total and the final
+    /// `assert!(wide_total > narrow_total)` fails.
+    #[test]
+    fn terminal_split_drag_finalize_uses_the_real_window_width_on_gtk() {
+        const HEIGHT: i32 = 900;
+
+        /// Open a terminal already in split mode, drag the divider a fixed
+        /// 10px to the right, release, and return the two panes' combined
+        /// column count after the finalize.
+        fn drag_finalize_total_cols(width: i32) -> u16 {
+            let mut engine = Engine::new_for_test();
+            engine.settings.use_nerd_fonts = Some(false);
+            // Opens two PTY panes side-by-side and marks the panel
+            // open/focused, mirroring what the terminal toolbar's "split"
+            // button does.
+            engine.terminal_open_split(20, 10);
+
+            let mut h = harness(engine, width, HEIGHT);
+            h.driver.render();
+
+            let (divider_x, divider_y) = {
+                let engine = h.engine.borrow();
+                let split = engine.terminal_split_layout.borrow();
+                let sl = split
+                    .as_ref()
+                    .expect("a live split must have painted a TerminalSplitLayout");
+                (
+                    (sl.divider_x + sl.divider_width / 2.0) as f32,
+                    (sl.left.y + sl.left.height / 2.0) as f32,
+                )
+            };
+
+            // Grab the divider and drag it 10px right, then release — this
+            // is the drag `MouseDragRoute::TerminalSplitDivider` tracks live
+            // and `handle_mouse_up_msg`'s `terminal_split_dragging` arm
+            // finalizes on release. A small, fixed delta so the drag lands
+            // well inside both a narrow and a wide window's valid range.
+            h.driver
+                .drag(divider_x, divider_y, divider_x + 10.0, divider_y);
+
+            let engine = h.engine.borrow();
+            engine.terminal_panes[0].session.cols() + engine.terminal_panes[1].session.cols()
+        }
+
+        let narrow_total = drag_finalize_total_cols(800);
+        let wide_total = drag_finalize_total_cols(4000);
+
+        assert!(
+            wide_total > narrow_total,
+            "finalizing the same divider drag in a 4000px-wide window must \
+             land on more total columns ({wide_total}) than finalizing it in \
+             an 800px-wide window ({narrow_total}) — both pinned to the same \
+             total means the finalize is still sized off a hardcoded width \
+             (`da_w = 800.0`), not the real one"
+        );
+    }
+
     /// The sidebar hover rung must exist **on this backend at all**.
     ///
     /// Before #754 the Source Control toolbar's hover highlight was driven by
