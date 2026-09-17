@@ -14407,6 +14407,161 @@ mod tests {
         );
     }
 
+    // ── #1051: explorer paints VS Code's 'U' for untracked, not git's '?' ──
+
+    /// The explorer's git-status badge for an untracked file must be VS
+    /// Code's `U`, not git's own `--porcelain` `?` notation leaking into the
+    /// UI — and a modified file's badge must still read `M`, proving the
+    /// fix didn't just blanket-recolor/relabel every status. Reads the
+    /// *painted* badge glyph (`styled_row`, cell-by-cell), never
+    /// `engine.sc_file_statuses` — that field was already populated with
+    /// `StatusKind::Untracked` before this fix; the bug was entirely in
+    /// what character `StatusKind::label()` painted from it.
+    ///
+    /// RED against unfixed `develop`: the untracked row's badge cell holds
+    /// `?`, so the first assertion fails.
+    #[test]
+    fn explorer_tree_paints_u_for_untracked_not_git_porcelain_question_mark() {
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_test_1051_explorer_{:?}",
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&dir)
+            .output()
+            .ok();
+        // Short names: the explorer sidebar column is narrow, and a longer
+        // name (e.g. "untracked1051.txt") truncates before the badge column
+        // — `find_bounds` on the full name would then never match.
+        let untracked_file = dir.join("u1051.txt");
+        let modified_file = dir.join("m1051.txt");
+        std::fs::write(&untracked_file, "new\n").unwrap();
+        std::fs::write(&modified_file, "changed\n").unwrap();
+
+        let mut app = app_with_sidebar_open();
+        app.engine.cwd = dir.clone();
+        app.engine.sc_file_statuses = vec![
+            crate::core::git::FileStatus {
+                path: "u1051.txt".to_string(),
+                staged: None,
+                unstaged: Some(crate::core::git::StatusKind::Untracked),
+                unmerged: None,
+            },
+            crate::core::git::FileStatus {
+                path: "m1051.txt".to_string(),
+                staged: None,
+                unstaged: Some(crate::core::git::StatusKind::Modified),
+                unmerged: None,
+            },
+        ];
+        app.engine.explorer_reveal_path(&untracked_file);
+
+        let driver = driver_with_shell(app, config(), 100, 24);
+
+        let untracked_bounds = driver
+            .find_bounds("u1051.txt")
+            .expect("untracked file row should be painted in the explorer");
+        let modified_bounds = driver
+            .find_bounds("m1051.txt")
+            .expect("modified file row should be painted in the explorer");
+
+        let untracked_row = driver.styled_row(untracked_bounds.y as u16);
+        let modified_row = driver.styled_row(modified_bounds.y as u16);
+
+        // The badge is right-aligned within the explorer tree's own area,
+        // well before the editor pane begins (`draw_tree` clears the whole
+        // tree area to background before painting text/badge) — the first
+        // non-space cell after the filename ends is the badge glyph.
+        let badge_after = |row: &[(char, _)], name_end_x: usize| {
+            row.iter()
+                .skip(name_end_x)
+                .map(|(c, _)| *c)
+                .find(|c| *c != ' ')
+        };
+
+        let untracked_badge = badge_after(
+            &untracked_row,
+            (untracked_bounds.x + untracked_bounds.width) as usize,
+        );
+        let modified_badge = badge_after(
+            &modified_row,
+            (modified_bounds.x + modified_bounds.width) as usize,
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(
+            untracked_badge,
+            Some('U'),
+            "untracked file's explorer badge must be VS Code's 'U', not \
+             git's own '?' porcelain notation"
+        );
+        assert_eq!(
+            modified_badge,
+            Some('M'),
+            "modified file's explorer badge must still read 'M'"
+        );
+    }
+
+    /// #1051: VS Code paints the untracked badge green — the same family as
+    /// Added — distinct from Modified's orange/yellow. Swapping
+    /// `StatusKind::Untracked::label()` from `?` to `U` alone would have
+    /// left `populate_sc_sidebar_system`'s color match falling through its
+    /// `_ => mod_fg` arm (the same arm `?` used to hit), painting the
+    /// now-correct `U` glyph in the *wrong* color — indistinguishable from
+    /// an ordinary Modified row. This reads the actual painted cell color
+    /// (`styled_row`'s `CellStyle`), not just the glyph.
+    ///
+    /// RED against a fix that only swaps the letter (no color arm added):
+    /// the untracked badge's `fg` equals the modified badge's `fg`.
+    #[test]
+    fn sc_panel_paints_untracked_badge_in_a_distinct_color_from_modified() {
+        // Short names: the SC panel column is narrow and a longer name
+        // (e.g. "untracked1051.txt") truncates before it fully paints, so
+        // `find_bounds` on the full name would never match.
+        let porcelain = "?? u1051.txt\n M m1051.txt\n";
+        let app = sc_app_with_porcelain(porcelain);
+        let driver = driver_with_shell(app, config(), 100, 30);
+
+        let untracked_bounds = driver
+            .find_bounds("u1051.txt")
+            .expect("untracked row should be painted in the SC panel");
+        let modified_bounds = driver
+            .find_bounds("m1051.txt")
+            .expect("modified row should be painted in the SC panel");
+
+        let untracked_row = driver.styled_row(untracked_bounds.y as u16);
+        let modified_row = driver.styled_row(modified_bounds.y as u16);
+
+        // `populate_sc_sidebar_system`'s `file_row` closure paints the
+        // status glyph as its own span, immediately followed by a literal
+        // space then the path — so the glyph sits exactly 2 cells before
+        // where the filename text starts (see `draw_tree`'s leaf leading
+        // gap + the "<ch> <path>" span layout).
+        let untracked_badge_x = untracked_bounds.x as usize - 2;
+        let modified_badge_x = modified_bounds.x as usize - 2;
+
+        let (untracked_ch, untracked_style) = untracked_row[untracked_badge_x];
+        let (modified_ch, modified_style) = modified_row[modified_badge_x];
+
+        assert_eq!(
+            untracked_ch, 'U',
+            "untracked row's SC panel badge glyph must be 'U'"
+        );
+        assert_eq!(
+            modified_ch, 'M',
+            "modified row's SC panel badge glyph must remain 'M'"
+        );
+        assert_ne!(
+            untracked_style.fg, modified_style.fg,
+            "untracked (VS Code: green, same family as Added) and modified \
+             (orange/yellow) badges must not share a color"
+        );
+    }
+
     // ── Minimap (#35) ───────────────────────────────────────────────────
 
     /// Buffer with a lopsided indentation shape, long enough that the

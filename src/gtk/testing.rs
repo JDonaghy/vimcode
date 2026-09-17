@@ -2127,6 +2127,108 @@ mod tests {
         );
     }
 
+    // ── #1051: explorer paints VS Code's 'U' for untracked, not git's '?' ──
+
+    /// A fresh temp dir containing one file, with an `Engine` whose explorer
+    /// has revealed it and whose `sc_file_statuses` marks it with `kind`.
+    /// Separate single-file fixtures per case (mirroring
+    /// `engine_revealing_one_explorer_file` above) rather than one shared
+    /// screen with both files, because `GtkDriver::find_bounds` matches the
+    /// *first* run containing the needle anywhere on screen — a shared
+    /// fixture couldn't tell "this row's own badge" from "some other row's
+    /// badge" for a single-character needle like `"U"`.
+    fn engine_revealing_one_explorer_file_with_status(
+        file_name: &str,
+        tag: &str,
+        kind: crate::core::git::StatusKind,
+    ) -> (Engine, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "vc1051_gtk_explorer_{tag}_{:?}",
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // `Engine::explorer_indicators` only paints a git badge at all when
+        // `git::find_repo_root` resolves — a real (if minimal) repo is
+        // required, `sc_file_statuses` alone is not enough.
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&dir)
+            .output()
+            .ok();
+        let file = dir.join(file_name);
+        std::fs::write(&file, "marker\n").unwrap();
+
+        let mut engine = Engine::new();
+        engine.cwd = dir.clone();
+        engine.sc_file_statuses = vec![crate::core::git::FileStatus {
+            path: file_name.to_string(),
+            staged: None,
+            unstaged: Some(kind),
+            unmerged: None,
+        }];
+        engine.explorer_reveal_path(&file);
+        (engine, dir)
+    }
+
+    /// The explorer's git-status badge for an untracked file must paint VS
+    /// Code's `U`, not git's own `--porcelain` `?` notation (#1051's bug
+    /// report: the root row and an untracked doc both rendered a bare `?`
+    /// that read as a missing-glyph box). A modified file's badge must still
+    /// read `M` — the differential proof this codebase's icon tests use
+    /// (see `explorer_tree_paints_a_distinct_icon_for_cs_files` above):
+    /// checking the untracked case alone can't distinguish "got its own
+    /// correct badge" from "some unrelated chrome happens to contain that
+    /// character".
+    ///
+    /// # Why this fails against unfixed `develop`
+    ///
+    /// Before this fix, `StatusKind::Untracked::label()` returns `?`, so
+    /// `find_bounds("U")` finds nothing in the untracked fixture and the
+    /// first assertion fails.
+    #[test]
+    fn explorer_tree_paints_u_for_untracked_not_git_porcelain_question_mark() {
+        // Tags deliberately contain no 'u'/'U': the explorer's root row
+        // uppercases the directory's own basename (`build_explorer_rows`),
+        // so a tag like "untracked" would bake a stray capital 'U' into the
+        // root row and make `find_bounds("U")` pass vacuously against that,
+        // not against the file row's badge under test.
+        let (untracked_engine, untracked_dir) = engine_revealing_one_explorer_file_with_status(
+            "untracked1051.txt",
+            "case1051a",
+            crate::core::git::StatusKind::Untracked,
+        );
+        let mut h_untracked = harness(untracked_engine, 1400, 900);
+        let untracked_has_u_badge = h_untracked.driver.find_bounds("U").is_some();
+        let untracked_has_question_mark = h_untracked.driver.screen_contains("?");
+        let _ = std::fs::remove_dir_all(&untracked_dir);
+
+        let (modified_engine, modified_dir) = engine_revealing_one_explorer_file_with_status(
+            "modified1051.txt",
+            "case1051b",
+            crate::core::git::StatusKind::Modified,
+        );
+        let h_modified = harness(modified_engine, 1400, 900);
+        let modified_has_m_badge = h_modified.driver.find_bounds("M").is_some();
+        let _ = std::fs::remove_dir_all(&modified_dir);
+
+        assert!(
+            untracked_has_u_badge,
+            "an untracked file's explorer row must paint the VS-Code-style \
+             'U' badge somewhere on screen"
+        );
+        assert!(
+            !untracked_has_question_mark,
+            "an untracked file's explorer row must not leak git's own '?' \
+             porcelain notation anywhere on screen"
+        );
+        assert!(
+            modified_has_m_badge,
+            "a modified file's explorer row must still paint 'M' \
+             (proving the fix didn't just blanket-relabel every status)"
+        );
+    }
+
     /// An engine whose active buffer has a real (multi-component) file path
     /// under `cwd`, so `build_breadcrumbs_for_group` produces one clickable
     /// segment per path component.

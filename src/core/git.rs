@@ -39,7 +39,12 @@ impl StatusKind {
             StatusKind::Deleted => 'D',
             StatusKind::Renamed => 'R',
             StatusKind::Copied => 'C',
-            StatusKind::Untracked => '?',
+            // VS Code's explorer/SC badge for an untracked file. Git's own
+            // porcelain notation uses `?` here (see `parse_status_char`
+            // below, which stays `?` — it parses `git status --porcelain`
+            // output, a wire format this display label must not leak into
+            // and must not be confused with) (#1051).
+            StatusKind::Untracked => 'U',
             // VS Code's conflict marker.
             StatusKind::Unmerged => '!',
         }
@@ -2417,7 +2422,9 @@ mod sc_tests {
         assert_eq!(StatusKind::Deleted.label(), 'D');
         assert_eq!(StatusKind::Renamed.label(), 'R');
         assert_eq!(StatusKind::Copied.label(), 'C');
-        assert_eq!(StatusKind::Untracked.label(), '?');
+        // #1051: VS Code's explorer/SC badge, not git's own '?' porcelain
+        // notation (`parse_status_char` above still parses that '?').
+        assert_eq!(StatusKind::Untracked.label(), 'U');
         // #991: VS Code's conflict marker.
         assert_eq!(StatusKind::Unmerged.label(), '!');
     }

@@ -14626,6 +14626,12 @@ pub fn populate_sc_sidebar_system(engine: &Engine, theme: &Theme) {
         let ch = kind.map(|k| k.label()).unwrap_or('?');
         let color = match ch {
             'A' => add_fg,
+            // #1051: VS Code paints Untracked the same green family as
+            // Added — distinct from Modified's orange/yellow. Falling
+            // through to `mod_fg` here (the pre-#1051 behavior, back when
+            // this arm was still '?') left the badge miscolored even after
+            // the letter itself was corrected.
+            'U' => add_fg,
             'D' => del_fg,
             '!' => del_fg,
             _ => mod_fg,
