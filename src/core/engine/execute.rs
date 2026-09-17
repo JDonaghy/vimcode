@@ -3467,7 +3467,6 @@ impl Engine {
                 done_lines: Vec::new(),
                 last_end_in_out: None,
                 last_was_multiline: false,
-                first_change_cursor: None,
                 cur,
                 chained,
             });
@@ -3854,9 +3853,6 @@ impl Engine {
         state.out.push_str(&m.rendered);
         state.copied = m.mend;
         state.n_subs += 1;
-        if state.first_change_cursor.is_none() {
-            state.first_change_cursor = Some(first_cursor);
-        }
         state.last_end_in_out = Some(state.out.len());
         state.last_was_multiline = m.eline > m.sline;
         // Mirrors the non-confirm scan: a multiline match's start line is
@@ -5015,9 +5011,6 @@ pub(crate) struct ConfirmSubState {
     /// Whether the most recently applied replacement swallowed a line
     /// break, same meaning as the non-confirm path's `last_was_multiline`.
     last_was_multiline: bool,
-    /// Cursor `u` should restore to — the position of the *first* applied
-    /// replacement (#886's rule), or `None` if nothing has been applied yet.
-    first_change_cursor: Option<Cursor>,
     /// The cursor's line when `:s///c` was invoked — the fallback used if
     /// nothing ever gets applied (mirrors the non-confirm path's `cur`).
     cur: usize,
