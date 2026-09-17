@@ -8096,14 +8096,18 @@ pub fn check_frame_order(composed: &[FrameOp]) -> Result<(), String> {
 //     the two arms would mean growing quadraui's `Backend` trait first
 //     (Platform-Neutrality Rule: build the shared capability upstream,
 //     then consume it here) — nothing is filed for that yet.
-//   * `FrameOp::TabSwitcher` — GTK feeds `TabSwitcherGeometry::visible_rows`
-//     (the height-capped row count) into `tab_switcher_to_quadraui_list_view`;
-//     TUI feeds `max_visible` (the uncapped height budget) — see that
-//     struct's doc comment for the distinction. Whether that's a harmless
-//     pre-existing divergence (the list adapter may already clamp by
-//     `items.len()`) or a latent bug is a question a duplication-convergence
-//     pass shouldn't answer by silently picking one field for a shared
-//     function — left for a follow-up with the room to investigate it.
+//   * `FrameOp::TabSwitcher` — both backends now feed
+//     `TabSwitcherGeometry::visible_rows` (the height-capped row count) into
+//     `tab_switcher_to_quadraui_list_view`. TUI used to feed `max_visible`
+//     (the uncapped height budget) instead (#1056); investigating turned up
+//     that the swap was inert in practice — `ListView::layout` clips the
+//     painted row count from the popup's own bounds height, which both
+//     backends already derive from `visible_rows`, and `max_visible`'s only
+//     other use (the adapter's `scroll_offset` calc) can't diverge from
+//     `visible_rows` either, since `tab_switcher_selected` is always a valid
+//     `% len` index into the MRU list. Fixed anyway, since a shared function
+//     taking the wrong field by name is a landmine for the next caller even
+//     when today's invariants happen to save it.
 //
 // `FrameOp::MenuRow`, `SidebarPanel`, `MenuDropdown` and `FolderPicker` are
 // the other four arms; each was already established (by #815/#763/#766) as
