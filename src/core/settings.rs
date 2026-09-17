@@ -1026,8 +1026,37 @@ pub fn parse_key_binding_named(s: &str) -> Option<(bool, bool, bool, String)> {
     Some((ctrl, shift, alt, key_str))
 }
 
+/// #1069: `"Monospace"` is a fontconfig *generic alias* — GTK/Pango on
+/// Linux resolves it, and Win-GUI's DirectWrite has an equivalent, but
+/// CoreText has no such alias and rejects it outright.
+/// `App::render_content` pushes this value onto the paint backend every
+/// frame via `backend.set_editor_font(&settings.font_family, ...)`
+/// (`src/app.rs`, #947) unconditionally — no gate, unlike the chrome font
+/// below — and on macOS that method is `MacBackend::set_editor_font`,
+/// which no-ops unless `make_font_exact` finds an *exact* installed
+/// family (quadraui's own `make_font_exact_rejects_an_unknown_family_...`
+/// test pins that contract). So `"Monospace"` silently failed to resolve
+/// on macOS: `current_font` stayed `None` forever and the editor painted
+/// at quadraui's placeholder metrics (`current_char_width: 8.0pt`,
+/// `current_line_height: 16.0pt`) regardless of `font_size` — see
+/// `mac_driver_tests::editor_font_family_default_resolves_a_real_font_on_macos`
+/// in `src/macos/mod.rs` for the black-box proof.
+///
+/// `"Menlo"` is the first name in VS Code's own macOS editor default
+/// (`Menlo, Monaco, 'Courier New', monospace`) and — unlike the rest of
+/// that CSS-style fallback list — resolves standalone via
+/// `make_font_exact` (quadraui's
+/// `make_font_exact_accepts_family_and_postscript_spellings` test pins
+/// this with `Menlo` by name). Defined with `cfg!(target_os = "macos")`
+/// here, in shared code, rather than a branch in `src/gtk/`/`src/macos/`
+/// — `default_use_nerd_fonts` above is the same shape (Platform-
+/// Neutrality Rule).
 fn default_font_family() -> String {
-    "Monospace".to_string()
+    if cfg!(target_os = "macos") {
+        "Menlo".to_string()
+    } else {
+        "Monospace".to_string()
+    }
 }
 
 fn default_font_size() -> i32 {
@@ -2620,7 +2649,17 @@ mod tests {
     fn test_settings_default() {
         let settings = Settings::default();
         assert_eq!(settings.line_numbers, LineNumberMode::None);
-        assert_eq!(settings.font_family, "Monospace");
+        // #1069: platform-aware — "Monospace" is a fontconfig alias with no
+        // CoreText equivalent, so macOS gets a directly-resolvable family
+        // instead (see `default_font_family`'s doc comment).
+        assert_eq!(
+            settings.font_family,
+            if cfg!(target_os = "macos") {
+                "Menlo"
+            } else {
+                "Monospace"
+            }
+        );
         assert_eq!(settings.font_size, 14);
         // #700 item 6: VS Code draws indent guides by default; nothing
         // previously pinned this, so a future edit to
