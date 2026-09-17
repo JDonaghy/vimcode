@@ -11466,6 +11466,182 @@ mod engine_key_from_ui_gtk_tests {
              handle_vscode_key's word-level branch"
         );
     }
+
+    /// #1060: the four keys this module's own doc comment used to list as
+    /// deliberately kept on GTK's own spelling (`BackTab`, `PageUp`,
+    /// `PageDown`, `Insert`) now go through this same shared decoder too.
+    ///
+    /// `NamedKey::BackTab` used to decode to GTK's own `"BackTab"`; the
+    /// shared decoder spells it `"ISO_Left_Tab"` (TUI's spelling, and
+    /// X11/GDK's). `Engine::handle_key`'s Ctrl+Shift+Tab
+    /// tab-switcher-backward binding (`keys.rs`, `ctrl && key_name ==
+    /// "ISO_Left_Tab"`) only ever recognised that spelling — TUI already
+    /// sent it and the binding already worked there — so on unfixed GTK,
+    /// which sent `"BackTab"`, Ctrl+Shift+Tab silently did nothing: no
+    /// match in `keys.rs`, so `open_tab_switcher` was never called and the
+    /// popup never painted.
+    ///
+    /// **Verified RED against unfixed `develop`:** with the old
+    /// `NamedKey::BackTab => "BackTab".to_string()` GTK special case
+    /// restored, `key_name == "ISO_Left_Tab"` never matches,
+    /// `tab_switcher_popup_rect` stays `None`, and the final assertion
+    /// fails.
+    #[test]
+    fn ctrl_shift_tab_opens_the_tab_switcher_on_gtk() {
+        let mut engine = Engine::new_for_test();
+        // A second tab so `open_tab_switcher` has more than one MRU entry
+        // (it no-ops, leaving `tab_switcher_open` false, with only one).
+        engine.new_tab(None);
+
+        let mut h = harness(engine, 1400, 900);
+        h.driver.render();
+        assert!(
+            h.tab_switcher_popup_rect.get().is_none(),
+            "precondition: the tab switcher starts closed"
+        );
+
+        press(
+            &mut h,
+            Key::Named(NamedKey::BackTab),
+            Modifiers {
+                ctrl: true,
+                shift: true,
+                ..Default::default()
+            },
+        );
+        h.driver.render();
+
+        assert!(
+            h.tab_switcher_popup_rect.get().is_some(),
+            "Ctrl+Shift+Tab decoded via the shared `engine_key_from_ui` \
+             (\"ISO_Left_Tab\") must open and paint the tab switcher popup, \
+             exactly as it already did on TUI"
+        );
+    }
+
+    /// #1060: `NamedKey::PageDown`/`PageUp` used to decode to GTK's own
+    /// `"PageDown"`/`"PageUp"` spelling; the shared decoder spells them
+    /// `"Page_Down"`/`"Page_Up"` (TUI's spelling). `Engine::sc_sidebar_
+    /// navigate`'s nav-key table (`source_control.rs`) only ever recognised
+    /// `"Page_Up"`/`"Page_Down"` — a pre-existing GTK gap the old inline
+    /// decoder comment called out explicitly — so on unfixed GTK, PageUp/
+    /// PageDown in the Source Control sidebar silently did nothing.
+    ///
+    /// `sc_file_statuses` is populated directly (no real git repo, no
+    /// `sc_refresh()`) — it is a plain field `build_source_control_data`
+    /// reads unconditionally, so this is deterministic and has no
+    /// filesystem dependency (unlike `sc_open_the_tab_switcher`'s sibling
+    /// tests elsewhere that shell out to real `git`).
+    ///
+    /// Asserts on repainted pixels across the sidebar body (`CLAUDE.md`
+    /// rule 1), not on `sc_selected_from_sidebar_system()` — the same
+    /// technique this file's `source_control_toolbar_button_highlights_on_hover`
+    /// / `clicking_editor_clears_a_pressed_sc_toolbar_button_highlight`
+    /// tests already use for this exact panel.
+    ///
+    /// **Verified RED against unfixed `develop`:** with the old
+    /// `NamedKey::PageDown => "PageDown".to_string()` / `NamedKey::PageUp
+    /// => "PageUp".to_string()` GTK special cases restored, neither string
+    /// matches `sc_sidebar_navigate`'s nav-key table, the SidebarSystem's
+    /// selection never moves, and both `assert_ne!`s below fail (`before
+    /// == after_down == after_up`).
+    #[test]
+    fn page_down_and_page_up_navigate_the_sc_sidebar_on_gtk() {
+        use crate::core::git::{FileStatus, StatusKind};
+
+        let mut engine = Engine::new_for_test();
+        engine.settings.use_nerd_fonts = Some(false);
+        engine.app_shell.show_panel(&quadraui::WidgetId::new(
+            crate::core::engine::sidebar::PANEL_GIT,
+        ));
+        engine.sc_has_focus = true;
+        // Staged, not unstaged: `SC_SECTION_STAGED` is the SidebarSystem's
+        // default active section, and PageUp/PageDown navigate *within the
+        // active section* — files with no staged entries would leave that
+        // section's row list empty and any key navigate nothing, which is
+        // a test-fixture bug, not evidence about the fix under test.
+        engine.sc_file_statuses = vec![
+            FileStatus {
+                path: "zqxw1060_a.rs".to_string(),
+                staged: Some(StatusKind::Modified),
+                ..Default::default()
+            },
+            FileStatus {
+                path: "zqxw1060_b.rs".to_string(),
+                staged: Some(StatusKind::Modified),
+                ..Default::default()
+            },
+            FileStatus {
+                path: "zqxw1060_c.rs".to_string(),
+                staged: Some(StatusKind::Modified),
+                ..Default::default()
+            },
+        ];
+
+        let mut h = harness(engine, 1400, 900);
+        h.driver.render();
+        assert!(
+            h.driver.screen_contains("zqxw1060_a.rs"),
+            "precondition: the synthetic Changes section must paint; \
+             painted: {:?}",
+            h.driver.painted_texts()
+        );
+
+        let body_rect = h.engine.borrow().sc_sidebar_body_rect.get();
+        let sample = |h: &mut Harness<_>| -> Vec<(u8, u8, u8)> {
+            let mut px = Vec::new();
+            let mut y = body_rect.y as i32;
+            while y < (body_rect.y + body_rect.height) as i32 {
+                let mut x = body_rect.x as i32;
+                while x < (body_rect.x + body_rect.width) as i32 {
+                    px.push(h.driver.pixel(x, y));
+                    x += 3;
+                }
+                y += 2;
+            }
+            px
+        };
+        let nothing_selected = sample(&mut h);
+
+        // First PageDown: nothing selected -> row 0 (`(1, 0)` via
+        // `sc_selected_from_sidebar_system`, verified while writing this
+        // test). Establishes a starting selection so the second PageDown
+        // below has somewhere to move *from*.
+        press(&mut h, Key::Named(NamedKey::PageDown), Modifiers::default());
+        h.driver.render();
+        let at_row_0 = sample(&mut h);
+        assert_ne!(
+            nothing_selected, at_row_0,
+            "PageDown decoded via the shared `engine_key_from_ui` \
+             (\"Page_Down\") must move the SC sidebar's selection and \
+             repaint the highlight"
+        );
+
+        // Second PageDown: row 0 -> row 2 (the last row — all three fit in
+        // one page at this window height).
+        press(&mut h, Key::Named(NamedKey::PageDown), Modifiers::default());
+        h.driver.render();
+        let at_row_2 = sample(&mut h);
+        assert_ne!(
+            at_row_0, at_row_2,
+            "a second PageDown must move the selection further (row 0 -> \
+             row 2), not clamp back to where the first PageDown already \
+             landed"
+        );
+
+        // PageUp: row 2 -> row 0 — the return trip, proving `NamedKey::
+        // PageUp` reaches the same nav-key table via the shared decoder's
+        // `"Page_Up"` spelling, not just `NamedKey::PageDown`'s `"Page_Down"`.
+        press(&mut h, Key::Named(NamedKey::PageUp), Modifiers::default());
+        h.driver.render();
+        let after_up = sample(&mut h);
+        assert_eq!(
+            after_up, at_row_0,
+            "PageUp decoded via the shared `engine_key_from_ui` (\"Page_Up\") \
+             must move the selection back to row 0, matching the highlight \
+             the first PageDown produced"
+        );
+    }
 }
 
 // ── #928 proof slice: `crate::harness::ConformanceHarness` on `GtkDriver` ──

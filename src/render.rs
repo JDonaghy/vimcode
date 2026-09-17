@@ -2915,13 +2915,20 @@ pub fn engine_key_from_ui(
             NamedKey::PageUp => Some(("Page_Up".to_string(), None, false)),
             NamedKey::PageDown => Some(("Page_Down".to_string(), None, false)),
             NamedKey::F(n) => Some((format!("F{n}"), None, false)),
+            // #1060: GTK used to bypass this decoder for `Insert` entirely
+            // (returning `None` here would have silently dropped its
+            // terminal PTY passthrough, which reads the literal `"Insert"`
+            // name — see `terminal_ops::key_to_pty_bytes`). Naming it here
+            // instead lets GTK route through the shared decoder like the
+            // other named keys, and gives TUI a working `Insert` key (routed
+            // through the same `"Insert"`-accepting PTY passthrough) instead
+            // of the silent no-op it got before, since TUI already decodes
+            // crossterm's `KeyCode::Insert` into this same `NamedKey::Insert`
+            // (quadraui `tui/events.rs`) but had nowhere for it to go.
+            NamedKey::Insert => Some(("Insert".to_string(), None, false)),
             // No engine binding today — same set `translate_key` (via
             // crossterm's reverse `KeyCode` mapping) used to drop.
-            NamedKey::Insert
-            | NamedKey::CapsLock
-            | NamedKey::NumLock
-            | NamedKey::ScrollLock
-            | NamedKey::Menu => None,
+            NamedKey::CapsLock | NamedKey::NumLock | NamedKey::ScrollLock | NamedKey::Menu => None,
         },
     }
 }
@@ -3142,10 +3149,13 @@ mod engine_key_from_ui_tests {
 
     /// Named keys carry no engine binding today for the handful crossterm
     /// can decode but the engine never asked for.
+    ///
+    /// `NamedKey::Insert` used to be in this list — see
+    /// `insert_key_decodes_to_the_gtk_terminal_pty_spelling` below for why
+    /// #1060 gave it a real arm instead.
     #[test]
     fn unbound_named_keys_return_none() {
         for named in [
-            NamedKey::Insert,
             NamedKey::CapsLock,
             NamedKey::NumLock,
             NamedKey::ScrollLock,
@@ -3153,6 +3163,28 @@ mod engine_key_from_ui_tests {
         ] {
             assert!(engine_key_from_ui(&Key::Named(named), Modifiers::default(), false).is_none());
         }
+    }
+
+    /// #1060: GTK's `handle_dispatch` used to special-case `NamedKey::Insert`
+    /// to `"Insert"` *outside* this decoder specifically because routing it
+    /// through here used to return `None` — which would have silently
+    /// dropped the key (nothing reaches `handle_key_press`, so GTK's
+    /// terminal PTY passthrough — `terminal_ops::key_to_pty_bytes`'s
+    /// `"Insert"` arm, reached via `canonical_terminal_key_name`'s
+    /// pass-through — would never see it). Now that this decoder names it
+    /// directly, GTK's special case was deleted with no change in the
+    /// string it hands `handle_key_press` (still `"Insert"`), and TUI gains
+    /// a working `Insert` key (it already decodes crossterm's
+    /// `KeyCode::Insert` to this same `NamedKey::Insert` — quadraui's
+    /// `tui/events.rs` — but had nowhere for it to go before this arm
+    /// existed).
+    #[test]
+    fn insert_key_decodes_to_the_gtk_terminal_pty_spelling() {
+        let (name, unicode, ctrl) =
+            engine_key_from_ui(&Key::Named(NamedKey::Insert), Modifiers::default(), true).unwrap();
+        assert_eq!(name, "Insert");
+        assert_eq!(unicode, None);
+        assert!(!ctrl);
     }
 
     /// Shift+Up (no ctrl): VSCode-mode selection-extension spelling, shared

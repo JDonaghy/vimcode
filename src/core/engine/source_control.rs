@@ -1426,7 +1426,10 @@ impl Engine {
             "Page_Up" => Some(Key::Named(NamedKey::PageUp)),
             "Page_Down" => Some(Key::Named(NamedKey::PageDown)),
             "Tab" => Some(Key::Named(NamedKey::Tab)),
-            "BackTab" => Some(Key::Named(NamedKey::BackTab)),
+            // "ISO_Left_Tab" is TUI's (and, since #1060, GTK's own)
+            // `render::engine_key_from_ui` spelling for Shift+Tab;
+            // "BackTab" is kept for any caller still on the pre-#1060 name.
+            "BackTab" | "ISO_Left_Tab" => Some(Key::Named(NamedKey::BackTab)),
             _ => None,
         };
         if let Some(k) = nav_key {
