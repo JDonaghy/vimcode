@@ -2923,6 +2923,12 @@ pub struct Engine {
     /// changing as the cursor jumps to search matches.
     pub find_replace_visual_end: Option<crate::core::cursor::Cursor>,
 
+    // --- `:s///c` confirm loop (#1031, #801 Phase 2) ---
+    /// `Some` while a `:s///c` confirm prompt is awaiting an answer;
+    /// intercepts all keys (see `handle_key`) until `y`/`n`/`a`/`q`/`l` (or
+    /// `<Esc>`) resolves it. `<C-e>`/`<C-y>` scroll without consuming it.
+    pub(crate) confirm_sub: Option<execute::ConfirmSubState>,
+
     // --- Breadcrumb focus mode ---
     /// Whether breadcrumb keyboard navigation is active (entered via `<leader>b`).
     pub breadcrumb_focus: bool,
@@ -3960,6 +3966,7 @@ impl Engine {
             find_replace_options: FindReplaceOptions::default(),
             find_replace_selection_range: None,
             find_replace_visual_end: None,
+            confirm_sub: None,
             workspace_file: None,
             workspace_root: Some(cwd.clone()),
             base_settings: None,

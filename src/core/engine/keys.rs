@@ -91,6 +91,14 @@ impl Engine {
         // this call returns, by `advance_macro_playback`.
         self.command_failed = false;
 
+        // `:s///c` confirm-loop prompt intercepts all keys while a match is
+        // pending an answer (#1031, #801 Phase 2) — highest priority, same
+        // as the other modal-input interceptions below, since none of
+        // Normal/Insert/Command-mode dispatch makes sense mid-prompt.
+        if self.confirm_sub.is_some() {
+            return self.handle_confirm_sub_key(key_name, unicode, ctrl);
+        }
+
         // Spell suggestion selection intercepts all keys.
         if self.spell_suggestions.is_some() {
             self.handle_spell_suggestion_key(key_name, unicode);

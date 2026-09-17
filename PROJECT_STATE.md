@@ -1,6 +1,41 @@
 # VimCode Project State
 
-**Last updated:** September 14, 2026 (#951 — ACP-0: `src/core/acp.rs`, NDJSON JSON-RPC transport + session lifecycle, foundation of the ACP track, epic #531). Prior revisions: September 14 (#522 — Track A foundation: generic external-tool JSON seam, `src/core/tool_client.rs`, no coordinator vocabulary in core), September 14 (#970 — confirmed the two "failing GTK click-geometry tests" are the already-known/already-documented Darwin font-rasteriser divergence from #926/#933, not a new bug; no code change), September 14 (#950 review fix round — driver-tier pixel test added for the SEARCH_COD→SEARCH glyph change, self-contradictory pure-refactor claim corrected), September 14 (#950 — ShellApp convergence decomposition + cheap wins), September 14 (#949 review fix round — driver-tier test added, macOS/Win-GUI claim corrected), September 14 (#949 — GTK-only settings-reload watcher deleted), September 11 (macOS native-menu audit — #901/#902 filed, milestone #7 reopened), September 10 (#862 — `src/app.rs` no longer needs the `gui` feature to compile), September 5 (#827 correction pass), September 4 (#801), September 3 (platform-neutrality chain drained). Milestone #7 is **2 open** (#901, #902 — 2026-09-11 macOS native-menu audit). **#47 is reopened, in milestone #5** — its blocker (quadraui#699/#704) closed 2026-09-03, and #811 already ported the TUI side onto the new API. See `GOALS.md` for the full correction history.
+**Last updated:** September 16, 2026 (#1031 — `:s///c` confirm loop built, #801 Phase 2 / #986 fix: `Engine::confirm_sub` + `handle_confirm_sub_key` in `execute.rs`). Prior revisions: September 14 (#951 — ACP-0: `src/core/acp.rs`, NDJSON JSON-RPC transport + session lifecycle, foundation of the ACP track, epic #531), September 14 (#522 — Track A foundation: generic external-tool JSON seam, `src/core/tool_client.rs`, no coordinator vocabulary in core), September 14 (#970 — confirmed the two "failing GTK click-geometry tests" are the already-known/already-documented Darwin font-rasteriser divergence from #926/#933, not a new bug; no code change), September 14 (#950 review fix round — driver-tier pixel test added for the SEARCH_COD→SEARCH glyph change, self-contradictory pure-refactor claim corrected), September 14 (#950 — ShellApp convergence decomposition + cheap wins), September 14 (#949 review fix round — driver-tier test added, macOS/Win-GUI claim corrected), September 14 (#949 — GTK-only settings-reload watcher deleted), September 11 (macOS native-menu audit — #901/#902 filed, milestone #7 reopened), September 10 (#862 — `src/app.rs` no longer needs the `gui` feature to compile), September 5 (#827 correction pass), September 4 (#801), September 3 (platform-neutrality chain drained). Milestone #7 is **2 open** (#901, #902 — 2026-09-11 macOS native-menu audit). **#47 is reopened, in milestone #5** — its blocker (quadraui#699/#704) closed 2026-09-03, and #811 already ported the TUI side onto the new API. See `GOALS.md` for the full correction history.
+
+## #1031 — `:s///c` confirm loop built (#801 Phase 2, #986 fix)
+
+#986's v0.11.0 bug suite shipped only oracle-backed, `KNOWN_BUGS`-gated reproductions for the
+`:s///c` confirm flag — `execute.rs`'s `flags.contains('c')` check errored loudly
+("E-vimcode: the :s 'c' (confirm) flag is not implemented") rather than misbehaving, but the
+gate reported that expected-fail as a pass, so the feature shipped in v0.12.0 looking green
+while never having existed. #1031 is the fix, per `CLAUDE.md` Testing rules 3/4's requirement
+that a test-only issue get a follow-up before it may close.
+
+**`run_substitute` (`src/core/engine/execute.rs`)** now enters a real confirm loop instead of
+erroring: `collect_confirm_candidates` precomputes every match `:s///c` will offer (same
+global/same-line-dedup/multiline rules the non-confirm scan already used, just not applied
+yet) against the buffer text frozen at invocation time, then `Engine::confirm_sub` holds that
+list plus in-progress `out`/`copied`/`n_subs`/`done_lines` state between keystrokes.
+`handle_key` (`src/core/engine/keys.rs`) intercepts all keys at top priority while
+`confirm_sub` is `Some`, routing to `handle_confirm_sub_key`, which implements
+`y`/`n`/`a`/`q`/`l`/`<Esc>`/`<C-e>`/`<C-y>` per `:h :s_c`. The real buffer is spliced once, at
+the end of the loop — behaviorally identical to the non-confirm path's single splice, just
+gated per-candidate by the user's answer.
+
+**Verified against a live interactive Neovim** (`nvim --headless --listen` +
+`--remote-send`, v0.12.5 — the suite's usual `-es` batch-mode oracle silently short-circuits
+`:s///c` entirely, so this had to be checked by hand outside `cargo test`) for a handful of
+non-obvious rules the two gated scenarios alone didn't cover: the prompt's cursor sits at the
+pending match's *start*, not its line's first non-blank; `q`/`<Esc>` freeze the cursor there
+and print no report even if an earlier answer replaced something; `l` ("last") *does* re-land
+the cursor the way a natural completion would but still prints nothing; and any unrecognised
+key is silently ignored (re-prompts the same candidate) rather than treated as `n`. 5 new
+`tests/nvim_conformance.rs` cases (`"sub:c ..."`) pin these against the real oracle, and the
+11 pre-existing `sub:c` cases #986 had already shipped, `KNOWN_DEVIATIONS`-gated, all now pass
+— #1007's coverage ratchet moved (11 entries deleted). Both gated `src/harness.rs` scenarios
+(`confirm_prompt_text_is_painted`, `confirm_report_line_excludes_skipped_matches`, each
+backing both a `::gtk` and `::tui` test via the shared macro) now pass on both backends; their
+`KNOWN_BUGS` entries are deleted. No per-backend code — the fix is entirely in `src/core/`.
 
 ## #951 — ACP-0: `src/core/acp.rs`, NDJSON JSON-RPC transport + session lifecycle (foundation)
 
