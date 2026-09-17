@@ -1184,15 +1184,17 @@ pub(super) fn handle_mouse(
                                 engine.handle_debug_output_scroll(delta.y);
                                 return sidebar_width;
                             }
-                            "explorer:sb" => {
-                                let delta = if down {
-                                    step as isize
-                                } else {
-                                    -(step as isize)
-                                };
-                                engine.explorer_scroll(delta);
-                                return sidebar_width;
-                            }
+                            // #1055: an `"explorer:sb"` arm lived here. Dead:
+                            // `render_sidebar_content` only registers the
+                            // `"explorer:sb"` `ScrollSurface` (panels.rs) when
+                            // `!ext_panel_showing && active_panel_is(PANEL_EXPLORER)`
+                            // — the exact condition the early-return block above
+                            // (this function, `PANEL_EXPLORER` arm) already
+                            // handles and returns from first. `dispatch_scroll`
+                            // can only ever emit an id present in
+                            // `engine.scroll_surfaces`, so this arm could never
+                            // run. Confirmed dead by the #1044 audit; deleted
+                            // rather than wired up.
                             "ext_panel:sb" => {
                                 let flat_len = engine.ext_panel_flat_len();
                                 if down {
@@ -1205,10 +1207,19 @@ pub(super) fn handle_mouse(
                                 }
                                 return sidebar_width;
                             }
-                            "tui:search_results" => {
-                                // SidebarSystem handles scroll internally
-                                return sidebar_width;
-                            }
+                            // #1055: a `"tui:search_results"` arm lived here.
+                            // Dead: grepped the tree for
+                            // `WidgetId::new("tui:search_results")` and for any
+                            // `modal_stack.push` of that id — neither exists.
+                            // The only `ScrollSurface`s ever registered are
+                            // `"explorer:sb"`, `"ext_panel:sb"` (panels.rs) and
+                            // `"terminal_scrollback"` (render.rs), so
+                            // `dispatch_scroll` could never hand back this id.
+                            // Search-panel wheel scroll is already handled
+                            // earlier in this function, in the
+                            // `active_panel_is(PANEL_SEARCH)` block that calls
+                            // `engine.handle_search_sidebar_ui_event` and
+                            // returns before this match ever runs.
                             other if other.starts_with("debug_sidebar:") => {
                                 // SidebarSystem handles scroll internally
                                 return sidebar_width;
@@ -3858,6 +3869,165 @@ mod tests {
         assert!(
             engine.context_menu.is_some(),
             "right-click at the painted tab-bar position ({col}, {tab_bar_row}) must open the tab context menu"
+        );
+    }
+
+    // ── #1055: wheel-scroll dead-arm deletion is provably inert ────────────
+
+    /// Dispatch a single mouse-wheel `MouseEvent` at `(col, row)` through
+    /// `handle_mouse`, mirroring `dispatch_right_click` above but for
+    /// `ScrollUp`/`ScrollDown`.
+    fn dispatch_wheel_scroll(engine: &mut Engine, col: u16, row: u16, up: bool) {
+        let ev = MouseEvent {
+            kind: if up {
+                MouseEventKind::ScrollUp
+            } else {
+                MouseEventKind::ScrollDown
+            },
+            column: col,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+        let mut sidebar = TuiSidebar::new();
+        let mut drag_state = quadraui::DragState::default();
+        let mut modal_stack = quadraui::ModalStack::new();
+        let mut should_quit = false;
+
+        handle_mouse(
+            ev,
+            &mut sidebar,
+            engine,
+            &Some(Size {
+                width: 120,
+                height: 40,
+            }),
+            SIDEBAR_WIDTH,
+            &mut false,
+            &mut false,
+            &mut false,
+            &mut None,
+            &mut drag_state,
+            &mut modal_stack,
+            None,
+            false,
+            &mut None,
+            &mut should_quit,
+            &mut None,
+            &mut None,
+            &mut render::TabDragState::default(),
+            &[],
+            None,
+            None,
+            &[],
+            None,
+            &mut false,
+            &mut false,
+            None,
+            None,
+            None,
+            None,
+        );
+    }
+
+    /// Render the sidebar body (whatever panel is active) into an in-memory
+    /// buffer and return it as trimmed lines. Same `TestBackend`
+    /// rasterisation pattern `panels.rs`'s `sc_panel_tests::render_sc` uses,
+    /// generalised to `render_sidebar_content` (the dispatcher, rather than
+    /// one specific panel's renderer) so it also covers Explorer.
+    fn render_sidebar_lines(engine: &Engine, width: u16, height: u16) -> Vec<String> {
+        let backend = ratatui::backend::TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let theme = crate::render::Theme::onedark();
+        let mut tui_backend = super::backend::TuiBackend::new();
+        let sidebar = TuiSidebar::new();
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width,
+            height,
+        };
+        terminal
+            .draw(|frame| {
+                super::with_frame_scope(&mut tui_backend, frame, |backend, _frame| {
+                    super::panels::render_sidebar_content(backend, area, &sidebar, engine, &theme);
+                });
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        (0..height)
+            .map(|y| {
+                let mut line = String::new();
+                for x in 0..width {
+                    line.push_str(buf[(x, y)].symbol());
+                }
+                line.trim_end().to_string()
+            })
+            .collect()
+    }
+
+    /// #1055: the `"explorer:sb"` arm inside the scroll-surface wheel
+    /// dispatch (`handle_mouse`'s `match id.as_str()`) was deleted as dead —
+    /// shadowed by the `PANEL_EXPLORER` early-return block earlier in the
+    /// same function, which already handles every wheel-scroll event that
+    /// reaches the sidebar column range while Explorer is active (the exact
+    /// condition under which `render_explorer_sidebar_content` registers the
+    /// `"explorer:sb"` `ScrollSurface` the deleted arm was keyed on).
+    ///
+    /// This drives the *actual* live path end-to-end (`handle_mouse` ->
+    /// `Engine::explorer_scroll` -> `TreeController` -> rendered rows) and
+    /// asserts on painted text, not on `explorer_tree`'s scroll-offset field
+    /// being set — see CLAUDE.md's Testing section on why a state-only
+    /// assertion would have passed straight through the #587/#592 paint bugs.
+    ///
+    /// Observed RED against unfixed `develop` by temporarily short-circuiting
+    /// `Engine::explorer_scroll` to a no-op (simulating a bad refactor of the
+    /// live path this deletion leans on): the first row then never leaves
+    /// the screen and the final assertion fails. Restored before committing.
+    #[test]
+    fn wheel_scroll_over_explorer_sidebar_still_scrolls_it() {
+        let mut engine = Engine::new();
+        engine.focus_sidebar_panel(PANEL_EXPLORER);
+        // Overwrite (not push onto) `explorer_rows` — `Engine::new()` already
+        // populated it from this test process's real cwd (an arbitrary,
+        // environment-dependent row count/order); see the same note on
+        // `right_click_below_last_explorer_row_is_a_no_op` above. Many more
+        // rows than any plausible viewport height, so a real scroll always
+        // moves the first row out of view.
+        engine.explorer_rows = (0..60)
+            .map(|i| crate::core::engine::ExplorerRow {
+                depth: 0,
+                name: format!("file{i:04}.txt"),
+                path: std::path::PathBuf::from(format!("/tmp/file{i:04}.txt")),
+                is_dir: false,
+                is_expanded: false,
+            })
+            .collect();
+
+        let width = 40;
+        let height = 20;
+
+        let before = render_sidebar_lines(&engine, width, height);
+        assert!(
+            before.iter().any(|l| l.contains("file0000.txt")),
+            "expected the first row visible before any scroll, got: {before:#?}"
+        );
+        assert!(
+            !before.iter().any(|l| l.contains("file0059.txt")),
+            "row 59 should start below the fold, got: {before:#?}"
+        );
+
+        // Wheel-scroll down repeatedly over the sidebar column — the same
+        // `MouseEventKind::ScrollDown` `event_loop` (mod.rs) feeds
+        // `handle_mouse` in production.
+        for _ in 0..30 {
+            dispatch_wheel_scroll(&mut engine, ACTIVITY_BAR_WIDTH + 1, 5, false);
+        }
+
+        let after = render_sidebar_lines(&engine, width, height);
+        assert!(
+            !after.iter().any(|l| l.contains("file0000.txt")),
+            "the first row must have scrolled out of view after 30 wheel \
+             ticks, got: {after:#?}"
         );
     }
 }
