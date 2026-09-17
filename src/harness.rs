@@ -3917,22 +3917,44 @@ mod issue_1059_tab_bar_dispatch_routes_through_shared_click_fn {
 /// render` paints from **its own**, entirely separate, `active_panel()` —
 /// has no channel to learn about the switch other than a click hit-test or
 /// this poll, so it silently kept showing the previous panel's title
-/// forever. `screen_has("EXPLORER")`/`screen_has("SEARCH")` are safe proxies
-/// for that title specifically: neither literal all-caps string appears
-/// anywhere in either panel's own painted *content* (checked directly —
-/// `render.rs`/`tui_main/panels.rs` have no such literals), only in the
+/// forever. `screen_has("EXPLORER")` is a safe proxy for that title
+/// specifically: that literal all-caps string appears nowhere in either
+/// panel's own painted *content* (checked directly — `render.rs`/
+/// `tui_main/panels.rs` have no such literal), only in the
 /// `PanelDefinition::title` fields `Engine::new` seeds the shadow
 /// `app_shell` with, which `quadraui::AppShell::render` echoes into the
-/// header.
+/// header. `screen_has("SEARCH")` is *not* an equally clean proxy — the
+/// Search panel's own content pane paints that literal too, via
+/// `Engine::new`'s `search_sidebar_system`
+/// (`SidebarSectionDef::form("chrome", "SEARCH")` at
+/// `src/core/engine/mod.rs:3977`), which `quadraui::SidebarSystem::render`
+/// paints as a section header regardless of runner-chrome convergence. The
+/// assertion below is a conjunction (`screen_has("SEARCH") &&
+/// !screen_has("EXPLORER")`), so it is the `!screen_has("EXPLORER")` half
+/// that actually diagnoses the bug; `screen_has("SEARCH")` alone would pass
+/// even with the header stuck on the wrong panel.
 ///
-/// `TuiShellApp::take_requested_panel` already had this override — the
-/// `tui`/`tui_prod` arms below both stay green throughout, proving `App`'s
-/// new override converges on the same contract rather than merely doing
-/// *something* plausible in isolation (this issue's "Proving it actually
-/// converged" section). `tui_prod`'s own arm can't reach the trigger the
-/// `gtk`/`tui` arms use below (a direct `engine.focus_sidebar_panel` call
-/// through `ConformanceHarness::engine` — `conformance_harness_prod`'s own
-/// doc: that field is a disconnected placeholder for this arm, since
+/// `gtk` and `tui` below both wrap the shared `crate::app::App` — `gtk` on
+/// GTK, `tui` on `quadraui::tui::TuiBackend` (`crate::tui_main::testing::
+/// conformance_harness`) — the same shape as `crate::gtk::testing::
+/// conformance_harness`, just on a different `quadraui::Backend`.
+/// `take_requested_panel` lives on `App` itself with no backend-conditional
+/// code inside it, so both arms exercise the identical new override and
+/// both are expected to flip together. `tui_prod`
+/// (`crate::tui_main::testing::conformance_harness_prod`) is different in
+/// kind: it wraps `TuiShellApp`, the independently hand-written production
+/// TUI shell, which already had its own equivalent
+/// `take_requested_panel`/`last_shell_panel`/`suppress_shell_panel_echo`
+/// override *before* this issue — untouched by this fix — so it was
+/// already green and stays green throughout. Its role here is not to prove
+/// the new code red/green like `gtk`/`tui`; it's the "Proving it actually
+/// converged" check from the issue: showing the newly-added `App` override
+/// reconciles the same contract the shipped TUI shell already enforced,
+/// rather than merely doing *something* plausible on `App` in isolation.
+/// `tui_prod`'s own arm can't reach the trigger the `gtk`/`tui` arms use
+/// below (a direct `engine.focus_sidebar_panel` call through
+/// `ConformanceHarness::engine` — `conformance_harness_prod`'s own doc:
+/// that field is a disconnected placeholder for this arm, since
 /// `TuiShellApp` owns its `Engine` directly, not behind a shared `Rc`), so
 /// it drives the identical reconciliation through the Search-focus panel
 /// accelerator instead — see its own doc below for why that is a
@@ -3940,10 +3962,13 @@ mod issue_1059_tab_bar_dispatch_routes_through_shared_click_fn {
 ///
 /// Verified RED against unfixed `develop`: deleting `App`'s
 /// `take_requested_panel` override (falling back to the trait default
-/// `None`) turns only the `gtk` arm red — the header stays on "EXPLORER"
-/// forever after the direct `focus_sidebar_panel(PANEL_SEARCH)` call below,
-/// while `tui`/`tui_prod` stay green (TUI's own override was never
-/// touched). Restored after confirming red.
+/// `None`) and running this whole module — including `tui()`, not just
+/// `gtk()` — turns **both** the `gtk` and `tui` arms red, exactly as
+/// expected from them sharing `App`: the header stays on "EXPLORER"
+/// forever after the direct `focus_sidebar_panel(PANEL_SEARCH)` call
+/// below, in each arm. `tui_prod` stays green throughout, since
+/// `TuiShellApp`'s own override was never touched. Restored after
+/// confirming red.
 #[cfg(test)]
 mod issue_1064_take_requested_panel {
     use super::*;
