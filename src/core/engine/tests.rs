@@ -30560,6 +30560,52 @@ fn test_tab_bar_handle_click_close_dirty_tab_with_other_view_does_not_confirm() 
     );
 }
 
+// #1038 regression: the tab-bar close path's "does another view survive"
+// check must exclude the *entire* set of windows the closing tab owns, not
+// just the currently-focused window. An in-tab split (`:split`/`:vsplit`
+// with no file argument, i.e. `Engine::split_window`) puts a second
+// `Window` on the *same* buffer inside the *same* tab that's about to be
+// closed — that sibling window is destroyed along with the rest of the tab
+// by `close_tab`, so it must not count as a surviving view. Before this
+// fix, the check excluded only the active window, found the
+// about-to-be-destroyed sibling split, and concluded (wrongly) that
+// another view survives — so no confirmation was shown and the whole tab
+// (both windows) closed silently, discarding the dirty buffer's only copy.
+#[test]
+fn test_tab_bar_handle_click_close_dirty_tab_with_in_tab_split_still_confirms() {
+    let mut engine = Engine::new();
+    // Split the *current* tab (not a new editor group) so both windows
+    // belong to the same tab and share the same buffer.
+    engine.split_window(SplitDirection::Vertical, None);
+    assert_eq!(
+        engine.active_tab().window_ids().len(),
+        2,
+        "setup: the split must land in the current tab, not a new group"
+    );
+
+    engine.buffer_mut().insert(0, "dirty");
+    engine
+        .buffer_manager
+        .get_mut(engine.active_buffer_id())
+        .unwrap()
+        .dirty = true;
+
+    let group_id = engine.active_group;
+    let tab_idx = engine.active_group().active_tab;
+    let needs_confirm = engine.handle_tab_bar_click(group_id, TabBarClickTarget::CloseTab(tab_idx));
+    assert!(
+        needs_confirm,
+        "closing a tab whose only other view is an in-tab split being \
+         destroyed in the same operation must still prompt — that split is \
+         not a surviving view (#1038)"
+    );
+    // Confirmation was requested, so the caller (not this call) is
+    // responsible for actually closing — the tab and both its windows
+    // must still be open.
+    assert_eq!(engine.active_group().tabs.len(), 1);
+    assert_eq!(engine.active_tab().window_ids().len(), 2);
+}
+
 // --- Explorer reveal on tab switch (#232) ---
 
 fn explorer_selected_file(engine: &Engine) -> Option<std::path::PathBuf> {
