@@ -1869,59 +1869,32 @@ pub(super) fn handle_mouse(
     // Click landed outside the bottom panel — return focus to the editor.
     engine.terminal_has_focus = false;
 
-    // ── Activity bar ──────────────────────────────────────────────────────────
+    // ── Activity bar (swallow only — #1053) ─────────────────────────────────
+    // A genuine single click here never reaches this function in production:
+    // `TuiShellApp::shell_config` registers every activity-bar item
+    // (including the hamburger) as a real `quadraui::PanelDefinition`, so
+    // `ShellAdapter::handle` -> `AppShell::handle_activity_click` consumes
+    // the `MouseDown` into a semantic `AppShellEvent` upstream of
+    // `TuiShellApp::handle` -> `mouse::handle_mouse` (see `shell_app.rs`'s
+    // `driver_click_on_every_activity_bar_icon_opens_its_panel_via_shell_app`,
+    // which proves all 8 `ActivityBarTarget` kinds plus the hamburger
+    // resolve via that path). #1053 deleted the dead target-resolution that
+    // used to live here (`resolve_activity_bar_click` + the
+    // `ActivityBarTarget`/`MenuToggle` dispatch, including a hand-rolled
+    // menu-close) as confirmed-unreachable — see `GOALS.md`'s 2026-09-16
+    // audit (#1044) and `on_shell_event`'s `PanelChanged`/`BottomItemClicked`
+    // arms for the real dispatch.
+    //
+    // This early return itself stays: `AppShell::handle` only intercepts
+    // `UiEvent::MouseDown`, not `DoubleClick` (quadraui's own `_ =>
+    // AppShellEvent::Ignored` catch-all), so a double-click landing in the
+    // activity-bar columns — `handle_mouse_event`'s own doc, "fold
+    // `DoubleClick` back to `MouseDown`" — still reaches this function with
+    // `col < ab_width`. Without a guard here, that click would fall through
+    // into the sidebar-panel-area arm below, which indexes `col` assuming
+    // it already lies in `[ab_width, ab_width + sidebar_width)` and has no
+    // bounds check of its own for the activity-bar columns to its left.
     if col < ab_width {
-        // Activity bar spans full height below the menu bar row (matching GTK layout).
-        if row < menu_rows {
-            return sidebar_width;
-        }
-        let bar_row = row - menu_rows;
-        let bar_height = term_height.saturating_sub(menu_rows);
-        // Resolve click target using shared function
-        let mut ext_names: Vec<_> = engine.ext_panels.keys().cloned().collect();
-        ext_names.sort();
-        let ab_target =
-            crate::core::engine::resolve_activity_bar_click(bar_row, bar_height, &ext_names);
-        use crate::core::engine::{ActivityBarTarget, SidebarPanel};
-        if matches!(ab_target, Some(ActivityBarTarget::MenuToggle)) {
-            engine.toggle_menu_bar();
-            if !engine.menu_bar_visible {
-                // Close the dropdown. MenuSystem::close() needs &mut Backend,
-                // but the mouse handler only has (drag_state, modal_stack).
-                // Pop the modal directly and reset the MenuSystem state by
-                // re-creating it with the same menu definitions.
-                modal_stack.pop(&quadraui::WidgetId::new("menu-system-dropdown"));
-                let menus = crate::render::build_menu_defs(engine.is_vscode_mode());
-                *engine.menu_system.borrow_mut() = quadraui::MenuSystem::new(menus);
-            }
-            return sidebar_width;
-        }
-        // #754: the ext-panel toggle and the built-in panel switch — which used
-        // to be ~50 lines here and a near-copy in GTK's `App::switch_panel` —
-        // are one call to `render::apply_activity_panel_switch`.
-        let target_panel_id = match ab_target {
-            Some(ActivityBarTarget::ExtensionPanel(name)) => Some(format!("ext:{name}")),
-            Some(ActivityBarTarget::Panel(p)) => Some(
-                match p {
-                    SidebarPanel::Explorer => PANEL_EXPLORER,
-                    SidebarPanel::Search => PANEL_SEARCH,
-                    SidebarPanel::Debug => PANEL_DEBUG,
-                    SidebarPanel::Git => PANEL_GIT,
-                    SidebarPanel::Extensions => PANEL_EXTENSIONS,
-                    SidebarPanel::Ai => PANEL_AI,
-                }
-                .to_string(),
-            ),
-            Some(ActivityBarTarget::Settings) => Some(PANEL_SETTINGS.to_string()),
-            _ => None,
-        };
-        if let Some(panel_id) = target_panel_id {
-            let switched = render::apply_activity_panel_switch(engine, &panel_id);
-            sidebar.ext_panel_name = switched.ext_panel;
-            if switched.sidebar_visible {
-                sidebar.has_focus = true;
-            }
-        }
         return sidebar_width;
     }
 
