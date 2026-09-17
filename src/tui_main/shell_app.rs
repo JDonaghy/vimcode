@@ -19012,6 +19012,124 @@ mod tests {
         }
     }
 
+    // ── #1085: point-sample → block-aggregation ────────────────────────
+
+    /// Rightmost screen column, on `row`, carrying a *non-blank* braille
+    /// glyph (`\u{2801}'..='\u{28FF}`), or `None` if the row paints no
+    /// braille at all.
+    fn rightmost_braille_col(screen: &str, row: usize) -> Option<usize> {
+        screen
+            .lines()
+            .nth(row)?
+            .chars()
+            .enumerate()
+            .filter(|(_, c)| ('\u{2801}'..='\u{28FF}').contains(c))
+            .map(|(i, _)| i)
+            .last()
+    }
+
+    /// #1085 acceptance criterion 1 (black-box tier — criterion 4 demands a
+    /// real `TuiDriver` test reading the *painted* strip, not only a unit
+    /// test on the sampling helpers; see the render.rs-level
+    /// `a_stride_skipped_distinctive_line_still_shows_up` for the exact,
+    /// white-box-precise twin of this test).
+    ///
+    /// # Mechanism
+    ///
+    /// A buffer of many 1-character lines (`"x\n"`) plus **one** distinctive
+    /// line, much longer, whose buffer index is computed — not
+    /// guessed — from the strip's own *measured* row capacity
+    /// (`minimap_rows_for_line_count`'s probe), so the distinctive line
+    /// always lands squarely inside a block the aggregation must read
+    /// several lines out of, never at a block's own first line (which even
+    /// the pre-#1085 point-sampler would have happened to read by luck).
+    ///
+    /// Every 1-char `"x"` line can only ever set a dot in braille **cell
+    /// 0** of its row (source column 0 is the only column it has content
+    /// at — `cols_per_dot` is 1 at the default scale, so cell 1 needs
+    /// source column 2 or 3, which a 1-char line never reaches). So any
+    /// row whose rightmost painted braille column sits *past* the strip's
+    /// own first cell can only be explained by the distinctive line's own
+    /// content reaching the rasteriser — which, under the pre-#1085
+    /// point-sampler, only happened when the distinctive line's index
+    /// happened to be exactly `floor(r * stride)` for some row `r`. This
+    /// fixture's index is deliberately the opposite: `5 * (target_lines /
+    /// 2) + 2`, i.e. 2 lines *past* a stride-5 block boundary, never a
+    /// boundary itself.
+    ///
+    /// **RED against unfixed `develop`:** confirmed by hand — reverting
+    /// `build_minimap_data`'s block-aggregation back to the pre-#1085
+    /// single-line-per-block point sample (keeping this test and the
+    /// function signature unchanged) makes every painted row's rightmost
+    /// braille column equal the strip's very first column: the
+    /// distinctive line's index is never one of the exact points the old
+    /// sampler reads, so its content never reaches any row, and the
+    /// assertion below fails.
+    #[test]
+    fn a_stride_skipped_distinctive_line_still_paints_via_shell_app() {
+        // Measure the strip's real row capacity at this test's own
+        // terminal size first — never hardcode the sampling geometry (it's
+        // derived from `rect.height`, tab bar/status row reservations,
+        // etc., none of which this test wants to re-derive by hand).
+        let (probe_rows, probe_screen) = minimap_rows_for_line_count(2000);
+        assert!(
+            probe_rows.len() >= 4,
+            "precondition: the strip must paint at least 4 rows for this \
+             test to have room to place a mid-block line; got \
+             {probe_rows:?}; screen:\n{probe_screen}"
+        );
+        let strip_rows = probe_rows.len();
+        // Mirrors `render::MINIMAP_LINES_PER_ROW` (4 buffer lines per
+        // braille row) — not imported (it's module-private), measured
+        // instead via the probe above, consistent with this test's own
+        // "never hardcode geometry" rule.
+        let target_lines = strip_rows * 4;
+        let stride = 5usize;
+        let total_lines = target_lines * stride;
+        // 2 lines past a block boundary (`5 * k`), never on one.
+        let distinctive_line = stride * (target_lines / 2) + 2;
+        assert!(distinctive_line + 1 < total_lines);
+
+        let mut app = app_for_minimap_test();
+        let mut text = String::with_capacity(total_lines * 2);
+        for i in 0..total_lines {
+            if i == distinctive_line {
+                text.push_str(&"z".repeat(20));
+            } else {
+                text.push('x');
+            }
+            text.push('\n');
+        }
+        app.engine.buffer_mut().insert(0, &text);
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        driver.press_named(quadraui::NamedKey::Escape);
+        let screen = driver.screen();
+
+        let cols: Vec<usize> = (0..24)
+            .filter_map(|row| braille_col(&screen, row))
+            .collect();
+        let strip_start = *cols.iter().min().unwrap_or_else(|| {
+            panic!("precondition: the strip must paint braille somewhere; screen:\n{screen}")
+        });
+        let farthest_right = (0..24)
+            .filter_map(|row| rightmost_braille_col(&screen, row))
+            .max()
+            .unwrap_or(strip_start);
+
+        assert!(
+            farthest_right > strip_start,
+            "every line in this fixture is a single non-whitespace \
+             character except line {distinctive_line} (20 characters), \
+             deliberately placed 2 lines past a stride-{stride} block \
+             boundary rather than on one — so any braille dot past the \
+             strip's own first cell can only be explained by that one \
+             line's content reaching the minimap. Got every row's \
+             rightmost braille dot at the strip's own first column \
+             ({strip_start}), meaning the distinctive line never reached \
+             the minimap at all; screen:\n{screen}"
+        );
+    }
+
     /// #1008 review: `page_up` (`<C-b>`)'s clamped-scroll cursor landing
     /// position changed from a fixed offset off the *old* topline to the
     /// **bottom of the new window** (minus `'scrolloff'`) — see `page_up`
