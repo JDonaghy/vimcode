@@ -430,6 +430,85 @@ mod mac_driver_tests {
         );
     }
 
+    /// #1069: on macOS, `Settings::default().font_family` must resolve a
+    /// *real* CoreText family, not silently fail. Before this issue,
+    /// `default_font_family()` (`src/core/settings.rs`) returned
+    /// `"Monospace"` on every platform — a fontconfig *generic alias* with
+    /// no CoreText equivalent. `App::render_content` pushes it onto the
+    /// paint backend every frame via `backend.set_editor_font(family,
+    /// size)` unconditionally (#947, no gate) — on macOS that reaches
+    /// `MacBackend::set_editor_font`, which no-ops unless `make_font_exact`
+    /// finds an *exact* installed family. `"Monospace"` never matched, so
+    /// `current_font` stayed `None` forever and `char_width`/`line_height`
+    /// stuck at quadraui's placeholder seed values (`MacBackend::new`'s
+    /// `current_char_width: 8.0`, `current_line_height: 16.0`) regardless
+    /// of `font_size` — the editor was laid out against numbers no
+    /// installed font actually has.
+    ///
+    /// RED-verified against unfixed `develop`: temporarily reverting
+    /// `default_font_family()`'s macOS arm back to `"Monospace".to_string()`
+    /// and re-running this test with `cargo test --no-default-features
+    /// --features macos` fails — `char_width`/`line_height` land exactly on
+    /// the 8.0/16.0 placeholders instead of matching Menlo's real metrics.
+    ///
+    /// Goes straight through `Backend::set_editor_font` on a bare
+    /// `MacBackend` — same shape as the sibling
+    /// `mac_backend_applies_line_height_and_char_width` above — rather than
+    /// through a full `driver()`/`App` frame: this is specifically about
+    /// `default_font_family()` resolving on CoreText, not about paint or
+    /// dispatch, and a full frame drags in `install_menu_bar`'s unrelated
+    /// (and here, harmless) main-thread panic noise.
+    #[test]
+    fn editor_font_family_default_resolves_a_real_font_on_macos() {
+        use quadraui::Backend;
+
+        let settings = crate::core::settings::Settings::default();
+        let mut backend = MacBackend::new();
+        backend.set_editor_font(&settings.font_family, settings.font_size as f32);
+
+        // The exact 8.0/16.0 placeholders `MacBackend::new` seeds
+        // `current_char_width`/`current_line_height` with before any font is
+        // successfully installed — a real font's metrics landing on these
+        // exact values is not a realistic coincidence.
+        assert_ne!(
+            backend.char_width(),
+            8.0,
+            "current_char_width is still quadraui's placeholder seed value \
+             — Settings::default().font_family ({:?}) never resolved a real \
+             font via make_font_exact",
+            settings.font_family
+        );
+        assert_ne!(
+            backend.line_height(),
+            16.0,
+            "current_line_height is still quadraui's placeholder seed value \
+             — Settings::default().font_family ({:?}) never resolved a real \
+             font via make_font_exact",
+            settings.font_family
+        );
+
+        // Positive control: the resolved metrics must be Menlo's own, not
+        // some other font `make_font` silently substituted.
+        let menlo = quadraui::macos::text::make_font_exact(
+            &settings.font_family,
+            settings.font_size as f64,
+        )
+        .expect("Settings::default().font_family must be exactly resolvable on macOS (#1069)");
+        let expected = quadraui::macos::text::font_metrics(&menlo);
+        assert!(
+            (backend.char_width() as f64 - expected.char_width).abs() < 0.01,
+            "char_width {} does not match Menlo's own metrics {}",
+            backend.char_width(),
+            expected.char_width
+        );
+        assert!(
+            (backend.line_height() as f64 - expected.line_height).abs() < 0.01,
+            "line_height {} does not match Menlo's own metrics {}",
+            backend.line_height(),
+            expected.line_height
+        );
+    }
+
     // ── #901: native menu bar adoption ──────────────────────────────────
 
     /// A plain engine, safe to drive through `MacBackend` — same
