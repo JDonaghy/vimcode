@@ -6765,7 +6765,7 @@ impl App {
         backend: &mut dyn quadraui::Backend,
         ctx: &quadraui::ShellContext<'_>,
     ) -> quadraui::Reaction {
-        use quadraui::{Key, MouseButton, NamedKey, UiEvent};
+        use quadraui::{Key, MouseButton, UiEvent};
 
         // ── Menu system intercept (#552) ─────────────────────────────────────
         // GTK's menu bar is always visible (see `ShellApp::setup`) and its
@@ -7037,7 +7037,7 @@ impl App {
                 };
                 let (key_name, unicode) = match key {
                     Key::Char(c) => (c.to_string(), Some(c)),
-                    Key::Named(ref named) => {
+                    Key::Named(_) => {
                         // #826: `Escape`/`Enter`->`Return`/`Backspace`->
                         // `BackSpace`/`Delete`/`Tab`/`Home`/`End`/the arrows/
                         // F-keys are byte-identical to TUI's spelling, so
@@ -7046,44 +7046,47 @@ impl App {
                         // TUI's dispatch now calls — instead of restating an
                         // identical table a second time here.
                         //
-                        // Four keys keep GTK's own spelling rather than
-                        // being folded into the shared call, because the two
-                        // backends' *current* behaviour genuinely diverges
-                        // here and swapping would be a silent regression,
-                        // not a cleanup:
-                        //  * `BackTab` → `"BackTab"`, not TUI's
-                        //    `"ISO_Left_Tab"` — `panels.rs`/`ext_panel.rs`/
-                        //    `search.rs` already dual-alias both spellings,
-                        //    but nothing forces GTK to switch.
-                        //  * `PageUp`/`PageDown` → `"PageUp"`/`"PageDown"`,
-                        //    not TUI's `"Page_Up"`/`"Page_Down"` —
-                        //    `source_control.rs`/`ext_panel.rs` accept only
-                        //    the TUI spelling (a pre-existing GTK gap, out of
-                        //    scope here), while `explorer_ops.rs` and the
-                        //    terminal rung's `canonical_terminal_key_name`
-                        //    already accept both; switching GTK's spelling
-                        //    needs its own audit, not a side effect of this
-                        //    decoder unification.
-                        //  * `Insert` → `"Insert"` — the shared decoder
-                        //    returns `None` for it (no engine binding from
-                        //    TUI, which never plumbed it through crossterm),
-                        //    but GTK's terminal PTY passthrough
-                        //    (`terminal_ops::key_to_pty_bytes`'s `"Insert"`
-                        //    arm) relies on receiving the name today; using
-                        //    the shared decoder here would silently drop
-                        //    Insert-key passthrough in a focused GTK
-                        //    terminal.
-                        // Reconciling all four is real follow-up work, not
-                        // this issue's "delete the TUI round trip" scope.
-                        let n = match named {
-                            NamedKey::BackTab => "BackTab".to_string(),
-                            NamedKey::PageUp => "PageUp".to_string(),
-                            NamedKey::PageDown => "PageDown".to_string(),
-                            NamedKey::Insert => "Insert".to_string(),
-                            _ => render::engine_key_from_ui(&key, modifiers, true)
-                                .map(|(name, _, _)| name)
-                                .unwrap_or_default(),
-                        };
+                        // #1060: the remaining four keys that used to keep
+                        // GTK's own spelling now go through the same shared
+                        // decoder too, matching TUI's spelling exactly
+                        // (`render::engine_key_from_ui` spellings on the
+                        // right):
+                        //  * `BackTab`: `"BackTab"` -> `"ISO_Left_Tab"`.
+                        //    `panels.rs`/`ext_panel.rs`'s hover-key arm
+                        //    already dual-aliased both spellings; the three
+                        //    sites that only recognised `"BackTab"`
+                        //    (`search.rs`'s `handle_search_input_key`,
+                        //    `source_control.rs`'s sidebar nav,
+                        //    `ext_panel.rs`'s `dispatch_ext_sidebar_key_unified`)
+                        //    now also accept `"ISO_Left_Tab"` — TUI already
+                        //    sent that spelling to all three and was
+                        //    silently dropping Shift+Tab there before this
+                        //    fix, so this closes a live TUI bug, not just a
+                        //    GTK one. The main-editor command-line wildmenu
+                        //    and Ctrl+Shift+Tab tab-switcher-backward binds
+                        //    (`keys.rs`) already only recognised
+                        //    `"ISO_Left_Tab"`, so GTK gains working
+                        //    Ctrl+Shift+Tab / Shift+Tab-in-`:`-wildmenu as a
+                        //    side effect.
+                        //  * `PageUp`/`PageDown`: `"PageUp"`/`"PageDown"` ->
+                        //    `"Page_Up"`/`"Page_Down"`. Every consumer
+                        //    (`source_control.rs`, `ext_panel.rs`,
+                        //    `search.rs`, `explorer_ops.rs`,
+                        //    `canonical_terminal_key_name`) already only
+                        //    recognised the TUI spelling, so this closes the
+                        //    pre-existing GTK gap noted at the old comment
+                        //    here rather than needing its own audit.
+                        //  * `Insert`: was `"Insert"`, and the shared decoder
+                        //    used to return `None` for `NamedKey::Insert`
+                        //    (dropping the key entirely — GTK's terminal PTY
+                        //    passthrough bypassed the shared decoder just to
+                        //    avoid that). `render::engine_key_from_ui` now
+                        //    has an `NamedKey::Insert => Some(("Insert", ..))`
+                        //    arm so both backends get the same, still-working
+                        //    `"Insert"` spelling.
+                        let n = render::engine_key_from_ui(&key, modifiers, true)
+                            .map(|(name, _, _)| name)
+                            .unwrap_or_default();
                         (n, None)
                     }
                 };

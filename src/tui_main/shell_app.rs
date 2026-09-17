@@ -19111,4 +19111,223 @@ mod tests {
             driver.screen()
         );
     }
+
+    // ── #1060: converge GTK's 4 kept-GTK-spelled keys onto the shared
+    // `render::engine_key_from_ui` ─────────────────────────────────────
+    //
+    // TUI's own decode of `BackTab`/`PageUp`/`PageDown` was already routed
+    // through `render::engine_key_from_ui` before this issue (`Insert` was
+    // not — see `render::engine_key_from_ui_tests::
+    // insert_key_decodes_to_the_gtk_terminal_pty_spelling`). What #1060
+    // actually changed on the TUI side is three consumers that only ever
+    // recognised `"BackTab"` (`search.rs`'s `handle_search_input_key`,
+    // `source_control.rs`'s `sc_sidebar_navigate` nav-key table,
+    // `ext_panel.rs`'s `dispatch_ext_sidebar_key_unified`) gaining an
+    // `"ISO_Left_Tab"` alias — the spelling TUI has sent all along. Before
+    // this fix, Shift+Tab in those three places was a silent TUI no-op.
+    //
+    // The GTK half of both tests below (proving PageUp/PageDown already
+    // worked and BackTab now does too) is
+    // `gtk::testing::engine_key_from_ui_gtk_tests::
+    // page_down_and_page_up_navigate_the_sc_sidebar_on_gtk` /
+    // `ctrl_shift_tab_opens_the_tab_switcher_on_gtk`.
+
+    /// PageUp/PageDown navigating the Source Control sidebar already worked
+    /// on TUI before #1060 (TUI always sent `"Page_Up"`/`"Page_Down"`, the
+    /// only spelling `sc_sidebar_navigate`'s nav-key table ever recognised).
+    /// This is the required TUI-side half of "driver test on both backends
+    /// for each of the four [keys]" — proving the behaviour the GTK fix
+    /// (which *did* change) now matches, not a TUI regression.
+    #[test]
+    fn page_down_and_page_up_navigate_the_sc_sidebar_via_shell_app() {
+        let mut app = TuiShellApp::new_for_test();
+        // Staged, not unstaged: `SC_SECTION_STAGED` is the SidebarSystem's
+        // default active section, and PageUp/PageDown navigate *within the
+        // active section* (see the GTK twin's identical fixture comment).
+        app.engine.sc_file_statuses = vec![
+            crate::core::git::FileStatus {
+                path: "zqxw1060_a.rs".to_string(),
+                staged: Some(crate::core::git::StatusKind::Modified),
+                unstaged: None,
+                unmerged: None,
+            },
+            crate::core::git::FileStatus {
+                path: "zqxw1060_b.rs".to_string(),
+                staged: Some(crate::core::git::StatusKind::Modified),
+                unstaged: None,
+                unmerged: None,
+            },
+            crate::core::git::FileStatus {
+                path: "zqxw1060_c.rs".to_string(),
+                staged: Some(crate::core::git::StatusKind::Modified),
+                unstaged: None,
+                unmerged: None,
+            },
+        ];
+        app.engine
+            .app_shell
+            .show_panel(&quadraui::WidgetId::new(PANEL_GIT));
+        app.engine.sc_has_focus = true;
+        app.sidebar.has_focus = true;
+
+        let mut driver = driver_with_shell(app, config(), 100, 30);
+
+        fn row_bounds<A: quadraui::AppLogic>(
+            d: &mut quadraui::tui::testing::TuiDriver<A>,
+            text: &str,
+        ) -> quadraui::Rect {
+            d.find_bounds(text)
+                .unwrap_or_else(|| panic!("row {text:?} must paint; screen:\n{}", d.screen()))
+        }
+        fn sample<A: quadraui::AppLogic>(
+            d: &mut quadraui::tui::testing::TuiDriver<A>,
+            rows: &[quadraui::Rect],
+        ) -> Vec<Option<quadraui::tui::testing::CellStyle>> {
+            rows.iter()
+                .map(|r| d.style_at(r.x as u16, r.y as u16))
+                .collect()
+        }
+
+        let rows: Vec<_> = ["zqxw1060_a.rs", "zqxw1060_b.rs", "zqxw1060_c.rs"]
+            .iter()
+            .map(|t| row_bounds(&mut driver, t))
+            .collect();
+
+        let nothing_selected = sample(&mut driver, &rows);
+
+        // First PageDown: nothing selected -> row 0 (verified empirically
+        // while writing the GTK twin — quadraui's SidebarSystem selects the
+        // first row of the active section rather than the last).
+        press_with(
+            &mut driver,
+            quadraui::Key::Named(quadraui::NamedKey::PageDown),
+            quadraui::Modifiers::default(),
+        );
+        let at_row_0 = sample(&mut driver, &rows);
+        assert_ne!(
+            nothing_selected,
+            at_row_0,
+            "PageDown must move the SC sidebar's selection and repaint the \
+             highlight; screen:\n{}",
+            driver.screen()
+        );
+
+        // Second PageDown: row 0 -> row 2 (the last row — all three rows
+        // fit in one page at this window height).
+        press_with(
+            &mut driver,
+            quadraui::Key::Named(quadraui::NamedKey::PageDown),
+            quadraui::Modifiers::default(),
+        );
+        let at_row_2 = sample(&mut driver, &rows);
+        assert_ne!(
+            at_row_0,
+            at_row_2,
+            "a second PageDown must move the selection further (row 0 -> \
+             row 2), not clamp back to where the first PageDown already \
+             landed; screen:\n{}",
+            driver.screen()
+        );
+
+        // PageUp: row 2 -> row 0, the return trip.
+        press_with(
+            &mut driver,
+            quadraui::Key::Named(quadraui::NamedKey::PageUp),
+            quadraui::Modifiers::default(),
+        );
+        let after_up = sample(&mut driver, &rows);
+        assert_eq!(
+            after_up,
+            at_row_0,
+            "PageUp must move the selection back to row 0, matching the \
+             highlight the first PageDown produced; screen:\n{}",
+            driver.screen()
+        );
+    }
+
+    /// #1060: `source_control.rs`'s `sc_sidebar_navigate` nav-key table used
+    /// to recognise only `"BackTab"` — TUI always sent `"ISO_Left_Tab"` (via
+    /// `render::engine_key_from_ui`), so Shift+Tab silently did nothing in
+    /// the Source Control sidebar on unfixed `develop`. Tab/BackTab cycle
+    /// which section (Staged/Changes/…) is active
+    /// (`quadraui::SidebarSystem::handle_inner`'s `cycle_active`), so this
+    /// drives Tab forward then BackTab back and asserts the header rows
+    /// repaint each time.
+    ///
+    /// **Verified RED against unfixed `develop`:** with `"ISO_Left_Tab"`
+    /// removed from `sc_sidebar_navigate`'s nav-key match (restoring the
+    /// pre-#1060 `"BackTab"`-only arm), the second `assert_ne!` below fails
+    /// — Tab still cycles forward (GTK's spelling was never TUI's problem),
+    /// but BackTab's `"ISO_Left_Tab"` no longer reaches `Key::Named(NamedKey
+    /// ::BackTab)`, so the section never cycles back and the header styles
+    /// after BackTab equal the styles right after Tab.
+    #[test]
+    fn back_tab_cycles_the_sc_sidebar_section_backward_via_shell_app() {
+        let mut app = TuiShellApp::new_for_test();
+        // One file in each of the two always-shown sections (Staged,
+        // Changes) so both headers paint.
+        app.engine.sc_file_statuses = vec![
+            crate::core::git::FileStatus {
+                path: "zqxwbts.rs".to_string(),
+                staged: Some(crate::core::git::StatusKind::Modified),
+                unstaged: None,
+                unmerged: None,
+            },
+            crate::core::git::FileStatus {
+                path: "zqxwbtc.rs".to_string(),
+                staged: None,
+                unstaged: Some(crate::core::git::StatusKind::Modified),
+                unmerged: None,
+            },
+        ];
+        app.engine
+            .app_shell
+            .show_panel(&quadraui::WidgetId::new(PANEL_GIT));
+        app.engine.sc_has_focus = true;
+        app.sidebar.has_focus = true;
+
+        let mut driver = driver_with_shell(app, config(), 100, 30);
+
+        // `render::populate_sc_sidebar_system` auto-selects `SC_SECTION_
+        // STAGED` as the active section whenever `sc_has_focus` is true and
+        // nothing is active yet, and quadraui's multi-section view paints
+        // the active section's header prefixed with "▶ " (see the screen
+        // dump this test's `assert!`s below quote on failure) — a *content*
+        // difference between sections, not just a style one, so
+        // `screen_contains` reads it directly with no substring-collision
+        // risk ("▶ CHANGES" cannot appear inside "▶ STAGED CHANGES", unlike
+        // the bare header names).
+        assert!(
+            driver.screen_contains("▶ STAGED CHANGES"),
+            "precondition: Staged must be the initially active section; \
+             screen:\n{}",
+            driver.screen()
+        );
+
+        press_with(
+            &mut driver,
+            quadraui::Key::Named(quadraui::NamedKey::Tab),
+            quadraui::Modifiers::default(),
+        );
+        assert!(
+            driver.screen_contains("▶ CHANGES") && !driver.screen_contains("▶ STAGED CHANGES"),
+            "Tab must cycle the SC sidebar's active section forward, from \
+             Staged to Changes; screen:\n{}",
+            driver.screen()
+        );
+
+        press_with(
+            &mut driver,
+            quadraui::Key::Named(quadraui::NamedKey::BackTab),
+            quadraui::Modifiers::default(),
+        );
+        assert!(
+            driver.screen_contains("▶ STAGED CHANGES"),
+            "BackTab (TUI's `\"ISO_Left_Tab\"` spelling) must cycle the \
+             active section back to Staged, proving `sc_sidebar_navigate` \
+             recognises it — before #1060 this was a silent no-op and the \
+             active section would have stayed on Changes; screen:\n{}",
+            driver.screen()
+        );
+    }
 }

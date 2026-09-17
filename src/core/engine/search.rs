@@ -631,7 +631,10 @@ impl Engine {
                 self.search_input_move_caret(is_replace, key);
                 SearchInputAction::Consumed
             }
-            "Tab" | "BackTab" => {
+            // "ISO_Left_Tab" is TUI's (and, since #1060, GTK's own)
+            // `render::engine_key_from_ui` spelling for Shift+Tab;
+            // "BackTab" is kept for any caller still on the pre-#1060 name.
+            "Tab" | "BackTab" | "ISO_Left_Tab" => {
                 if is_query {
                     self.search_panel_form_focus
                         .replace(Some("search:replace".to_string()));
