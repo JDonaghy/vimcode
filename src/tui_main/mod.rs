@@ -174,14 +174,26 @@ pub mod testing {
     /// "Two TUI arms" doc (top of file) explains why this exists alongside
     /// [`conformance_harness`] rather than replacing it.
     ///
-    /// Built via [`TuiShellApp::new_for_test`] — deterministic, in-memory
-    /// startup state — rather than the production [`TuiShellApp::new`],
-    /// mirroring the same requirement [`conformance_harness`] gets for free
-    /// from `App::new_headless_with_backend`: a conformance scenario needs
-    /// to start from a known fixture, not the machine's real
-    /// `~/.config/vimcode`. See [`TuiShellApp::new_for_test`]'s own doc for
-    /// exactly which two ambient reads that constructor substitutes and why
-    /// [`TuiShellApp::new`] cannot be used here instead.
+    /// Built via [`TuiShellApp::from_engine`] called directly on the
+    /// caller's fixture `engine` — **not** [`TuiShellApp::new_for_test`]
+    /// followed by swapping `app.engine` afterwards, which is what this
+    /// function did before #1043's review caught it. That
+    /// build-then-swap shape ran `from_engine`'s one-time setup (sidebar
+    /// `set_backend_info`, `setup_tui_clipboard`, nerd-font resolution —
+    /// see [`TuiShellApp::from_engine`]'s own doc) against a disposable
+    /// `Engine::new_for_test()` and then discarded that engine in favour of
+    /// the caller's, so none of that setup ever touched the engine the
+    /// scenario actually drives. Calling `from_engine` on the caller's
+    /// `engine` directly — passing `file_path: None, restore_session:
+    /// false`, the same arguments [`TuiShellApp::new_for_test`] uses —
+    /// mirrors the same requirement [`conformance_harness`] gets for free
+    /// from `App::new_headless_with_backend`, which operates on the
+    /// caller's actual `Engine` rather than a throwaway one: a conformance
+    /// scenario needs to start from a known fixture, not the machine's real
+    /// `~/.config/vimcode`, *and* needs that fixture to be the engine that's
+    /// actually wired up. See [`TuiShellApp::new_for_test`]'s own doc for
+    /// exactly which two ambient reads `restore_session: false` substitutes
+    /// and why [`TuiShellApp::new`] cannot be used here instead.
     ///
     /// `#[cfg(test)]`, unlike [`conformance_harness`] above (reachable under
     /// `feature = "test-support"` alone): every call site this issue adds
@@ -227,8 +239,14 @@ pub mod testing {
     ) -> ConformanceHarness<TuiDriver<impl quadraui::AppLogic>> {
         let paint = crate::test_paint::PaintGuard::acquire();
         let cwd = crate::test_cwd::CwdReadGuard::acquire();
-        let mut app = TuiShellApp::new_for_test();
-        app.engine = engine;
+        // #1043 review: run `from_engine`'s one-time setup (sidebar
+        // `set_backend_info`, `setup_tui_clipboard`, nerd-font resolution)
+        // directly against the caller's fixture `engine`, rather than
+        // against a throwaway `Engine::new_for_test()` that then gets
+        // discarded in favour of `engine` — see `from_engine`'s own doc for
+        // why that used to leave the scenario's real engine's sidebar
+        // systems without `set_backend_info` and its clipboard unset.
+        let app = TuiShellApp::from_engine(engine, None, false);
         let config = TuiShellApp::shell_config(false);
         let driver = driver_with_shell(app, config, width, height);
         let placeholder_engine = Rc::new(RefCell::new(Engine::new_for_test()));

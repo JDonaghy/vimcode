@@ -939,7 +939,32 @@ impl TuiShellApp {
     /// `restore_session` is `true` for the production constructor and `false`
     /// for [`TuiShellApp::new_for_test`]; see that method for why skipping the
     /// per-workspace session restore is required for determinism.
-    fn from_engine(mut engine: Engine, file_path: Option<PathBuf>, restore_session: bool) -> Self {
+    ///
+    /// `pub(crate)` (rather than private) since #1043:
+    /// `crate::tui_main::testing::conformance_harness_prod` calls this
+    /// directly on the caller's fixture `Engine` — the *specific* instance a
+    /// scenario built and mutated (e.g. `explorer_visible`,
+    /// `explorer_expanded`) — rather than running it against a throwaway
+    /// `Engine::new_for_test()` and swapping the fixture engine in
+    /// afterwards. Swapping in afterwards was the bug #1043's review caught:
+    /// `set_backend_info` (required before `SidebarSystem::handle_cached`
+    /// does anything, see `render.rs`'s doc on that method) and
+    /// `setup_tui_clipboard` both ran against the discarded throwaway
+    /// engine, leaving the scenario's real engine with unset sidebar
+    /// backend info and no clipboard — invisible today only because no
+    /// `tui_prod` scenario yet touches SC/Ext/Search sidebars or
+    /// yank/paste. Calling this directly on the fixture engine, the same
+    /// way `App::new_headless_with_backend` operates on the caller's actual
+    /// `Engine` rather than a throwaway one, closes that gap: `file_path:
+    /// None, restore_session: false` mirrors [`TuiShellApp::new_for_test`]'s
+    /// own arguments, and `startup_without_session_restore(None)` is a
+    /// no-op when `file_path` is `None` (see `Engine::startup_inner`), so
+    /// this never overwrites whatever state the fixture already set up.
+    pub(crate) fn from_engine(
+        mut engine: Engine,
+        file_path: Option<PathBuf>,
+        restore_session: bool,
+    ) -> Self {
         let msv_metrics = quadraui::MsvLayoutMetrics {
             header_size: 1.0,
             divider_size: 0.0,
