@@ -3222,6 +3222,69 @@ mod tests {
         );
     }
 
+    /// #1038 (GTK half of the shared-engine fix): `handle_mouse_click`
+    /// routes a tab-bar × click through the very same
+    /// `Engine::handle_tab_bar_click` `CloseTab` arm the TUI does
+    /// (`gtk/click.rs`'s `tab_bar_split_right_button_...` test documents the
+    /// same shared dispatch for the split-right button). That arm now
+    /// skips the close-tab-confirm dialog when another window still shows
+    /// the buffer being closed — the buffer isn't going away, so there is
+    /// nothing to lose. This is the sibling of
+    /// `close_dirty_tab_button_opens_confirm_dialog` above: same dirty
+    /// buffer, same × click, but with a second tab in the *same* group
+    /// pointed at the identical buffer, so no confirm should appear at
+    /// all.
+    ///
+    /// RED-verified: reverting `handle_tab_bar_click`'s `CloseTab` arm to
+    /// the pre-#1038 `if self.dirty() { return true; }` (no other-views
+    /// check at all) makes this test fail — a dialog opens even though tab
+    /// 1 still shows the buffer; restored before committing.
+    #[test]
+    fn close_dirty_tab_button_with_other_tab_showing_same_buffer_does_not_confirm() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "alpha");
+        let buf_id = engine.active_buffer_id();
+        if let Some(buf) = engine.buffer_manager.get_mut(buf_id) {
+            buf.dirty = true;
+        }
+        engine.new_tab(None);
+        // Point tab 1's window at the same (dirty) buffer as tab 0 — a
+        // second *tab* on the same buffer is another legitimate "other
+        // view", alongside a same-tab split or a second editor group.
+        // Keeping it as a second tab in one group (rather than a second
+        // group) means this test can use the same single `editor_tab_bar_id`
+        // as the sibling test above instead of juggling two tab bars.
+        let win1 = engine.active_window_id();
+        if let Some(w) = engine.windows.get_mut(&win1) {
+            w.buffer_id = buf_id;
+        }
+        engine.active_group_mut().active_tab = 0; // focus tab 0 so its × is clicked
+        let mut h = harness(engine, 1400, 900);
+
+        let (x, y) = h
+            .driver
+            .tab_close_center(&editor_tab_bar_id(), 0)
+            .expect("the single-group tab bar must have painted tab 0's close button");
+        h.driver.click(x, y);
+        h.driver.render();
+
+        assert!(
+            !h.native_dialog_shown.get(),
+            "closing tab 0's \u{d7} must not open the close-tab-confirm \
+             dialog: tab 1 still shows the same dirty buffer, so nothing \
+             would be lost by closing this view (#1038)"
+        );
+        assert!(
+            h.pending_native_dialog.take().is_none(),
+            "no confirm needed, so no native dialog present should be queued"
+        );
+        assert_eq!(
+            h.engine.borrow().active_group().tabs.len(),
+            1,
+            "with no confirmation needed, the click must actually close the tab"
+        );
+    }
+
     /// #727's native path only covers dialogs `quadraui::native_dialog_options`
     /// reports as natively expressible — a dialog carrying a text input
     /// (e.g. the move-file destination prompt) is not, and must keep

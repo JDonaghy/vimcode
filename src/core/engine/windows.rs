@@ -1945,13 +1945,23 @@ impl Engine {
                     g.active_tab = idx;
                 }
                 self.line_annotations.clear();
-                // Only prompt when this is the *last* window showing the
-                // buffer — another view can still save it, so silently
-                // closing this one loses nothing (#1038).
+                // Only prompt when closing this tab would remove the last
+                // view of the buffer — another view can still save it, so
+                // silently closing this one loses nothing (#1038). A tab can
+                // own more than one window (an in-tab split on the same
+                // buffer), and `close_tab` destroys all of them together, so
+                // the whole set of the tab's windows — not just the
+                // currently-focused one — must be excluded when looking for
+                // a surviving view.
                 if self.dirty() {
                     let buf_id = self.active_buffer_id();
-                    let current_win = self.active_window_id();
-                    if !self.buffer_has_other_views(buf_id, current_win) {
+                    let closing_windows: Vec<WindowId> = self
+                        .editor_groups
+                        .get(&group_id)
+                        .and_then(|g| g.tabs.get(idx))
+                        .map(|t| t.window_ids())
+                        .unwrap_or_default();
+                    if !self.buffer_has_views_outside(buf_id, &closing_windows) {
                         return true; // Caller should show confirmation
                     }
                 }
