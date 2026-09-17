@@ -301,6 +301,39 @@ fn test_q_blocks_when_single_buffer_dirty() {
     assert!(engine.message.contains("No write since last change"));
 }
 
+// #1038: `:q`'s "another window still shows this buffer" check moved into
+// the shared `Engine::buffer_has_other_views` helper (also now used by
+// `handle_tab_bar_click`'s `CloseTab` arm). This pins `:q`'s own behavior
+// unchanged by that extraction: a dirty buffer with a second view open
+// must still close quietly rather than blocking with "No write since last
+// change".
+#[test]
+fn test_q_does_not_block_when_dirty_buffer_has_another_view() {
+    let mut engine = Engine::new();
+    engine.open_editor_group(SplitDirection::Vertical);
+    engine.buffer_mut().insert(0, "dirty");
+    engine.set_dirty(true);
+
+    let groups_before = engine.editor_groups.len();
+    let action = type_command_action(&mut engine, "q");
+    assert_eq!(
+        action,
+        EngineAction::None,
+        "another view of the buffer survives, so `:q` must not block with \
+         \"No write since last change\""
+    );
+    assert!(
+        !engine.message.contains("No write since last change"),
+        "unexpected block message: {}",
+        engine.message
+    );
+    assert_eq!(
+        engine.editor_groups.len(),
+        groups_before - 1,
+        "the closed group should be gone"
+    );
+}
+
 #[test]
 fn test_q_bang_closes_dirty_tab_when_multiple() {
     let mut engine = Engine::new();
@@ -30473,6 +30506,104 @@ fn test_tab_bar_handle_click_close_dirty_tab_returns_true() {
     assert!(needs_confirm); // Should request confirmation
                             // Tab should NOT be closed yet
     assert_eq!(engine.active_group().tabs.len(), 2);
+}
+
+// #1038: closing one of several views of a dirty buffer must not prompt —
+// only closing the *last* view should. `Engine::dirty()` is buffer-level and
+// has no idea how many windows display that buffer, so the tab-bar close
+// path used to prompt on every close, however many views remained. The `:q`
+// path already got this right (see `execute.rs`'s "quit" handler); this test
+// covers the tab-bar path sharing the same `buffer_has_other_views` check.
+#[test]
+fn test_tab_bar_handle_click_close_dirty_tab_with_other_view_does_not_confirm() {
+    let mut engine = Engine::new();
+    // Split into a second editor group showing the *same* buffer.
+    engine.open_editor_group(SplitDirection::Vertical);
+    let group_a = engine.prev_active_group.unwrap();
+    let group_b = engine.active_group;
+    assert_ne!(group_a, group_b);
+
+    // Dirty the shared buffer.
+    engine.buffer_mut().insert(0, "dirty");
+    engine
+        .buffer_manager
+        .get_mut(engine.active_buffer_id())
+        .unwrap()
+        .dirty = true;
+
+    // Closing group B's tab must NOT prompt — group A still shows the buffer.
+    let needs_confirm = engine.handle_tab_bar_click(group_b, TabBarClickTarget::CloseTab(0));
+    assert!(!needs_confirm, "another view remains — must not prompt");
+    assert!(
+        !engine.editor_groups.contains_key(&group_b),
+        "the closed group should be gone"
+    );
+    assert!(
+        engine.editor_groups.contains_key(&group_a),
+        "the other view's group must survive"
+    );
+    // The buffer is still open (and still dirty) in the surviving group.
+    assert!(engine
+        .buffer_manager
+        .get(engine.active_buffer_id())
+        .is_some());
+    assert!(engine.dirty());
+
+    // Negative case: closing the *last* remaining view of the still-dirty
+    // buffer must still prompt. Without the other-views check this would
+    // also pass trivially — the check has to actually gate on something.
+    engine.active_group = group_a;
+    let needs_confirm = engine.handle_tab_bar_click(group_a, TabBarClickTarget::CloseTab(0));
+    assert!(
+        needs_confirm,
+        "last view of a dirty buffer must still prompt"
+    );
+}
+
+// #1038 regression: the tab-bar close path's "does another view survive"
+// check must exclude the *entire* set of windows the closing tab owns, not
+// just the currently-focused window. An in-tab split (`:split`/`:vsplit`
+// with no file argument, i.e. `Engine::split_window`) puts a second
+// `Window` on the *same* buffer inside the *same* tab that's about to be
+// closed — that sibling window is destroyed along with the rest of the tab
+// by `close_tab`, so it must not count as a surviving view. Before this
+// fix, the check excluded only the active window, found the
+// about-to-be-destroyed sibling split, and concluded (wrongly) that
+// another view survives — so no confirmation was shown and the whole tab
+// (both windows) closed silently, discarding the dirty buffer's only copy.
+#[test]
+fn test_tab_bar_handle_click_close_dirty_tab_with_in_tab_split_still_confirms() {
+    let mut engine = Engine::new();
+    // Split the *current* tab (not a new editor group) so both windows
+    // belong to the same tab and share the same buffer.
+    engine.split_window(SplitDirection::Vertical, None);
+    assert_eq!(
+        engine.active_tab().window_ids().len(),
+        2,
+        "setup: the split must land in the current tab, not a new group"
+    );
+
+    engine.buffer_mut().insert(0, "dirty");
+    engine
+        .buffer_manager
+        .get_mut(engine.active_buffer_id())
+        .unwrap()
+        .dirty = true;
+
+    let group_id = engine.active_group;
+    let tab_idx = engine.active_group().active_tab;
+    let needs_confirm = engine.handle_tab_bar_click(group_id, TabBarClickTarget::CloseTab(tab_idx));
+    assert!(
+        needs_confirm,
+        "closing a tab whose only other view is an in-tab split being \
+         destroyed in the same operation must still prompt — that split is \
+         not a surviving view (#1038)"
+    );
+    // Confirmation was requested, so the caller (not this call) is
+    // responsible for actually closing — the tab and both its windows
+    // must still be open.
+    assert_eq!(engine.active_group().tabs.len(), 1);
+    assert_eq!(engine.active_tab().window_ids().len(), 2);
 }
 
 // --- Explorer reveal on tab switch (#232) ---

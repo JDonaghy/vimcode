@@ -10440,20 +10440,27 @@ const MINIMAP_LINES_PER_ROW: usize = 4;
 /// Buffer columns folded into one aggregated colour cell — quadraui's TUI
 /// braille cell width, used for both backends for the same reason as
 /// [`MINIMAP_LINES_PER_ROW`].
-const MINIMAP_COLS_PER_CELL: usize = 2;
+///
+/// `pub(crate)` since #1030 so the TUI black-box scenario
+/// (`tui_main::shell_app`'s `minimap_paints_syntax_colour_for_indented_code`)
+/// can derive "how many source columns does an N-cell braille strip cover"
+/// from the same constant production uses, instead of hardcoding the `22`
+/// that happens to fall out of an 11-cell strip at 100x24.
+pub(crate) const MINIMAP_COLS_PER_CELL: usize = 2;
 
-/// Column ceiling for colour aggregation. Syntax past this column does not
-/// influence any painted cell, so aggregating it would be wasted work.
-const MINIMAP_SPAN_COLS: usize = 200;
+/// Ceiling on how many characters into a line `build_minimap_data`'s
+/// `to_col` closure ever looks when measuring a highlight's own column.
+/// Past this many characters, `aggregate_spans` would discard the column
+/// anyway (see `grid.cols` below), so counting further is wasted, unbounded
+/// work on a long (e.g. minified) line (#728). Renamed from
+/// `MINIMAP_SPAN_COLS` by #1030, which stopped using it to size
+/// `grid.cols` itself (that now comes from the painted strip's own width)
+/// — it survives purely as this scan cap.
+const MINIMAP_MAX_RELEVANT_COLS: usize = 400;
 
-/// Character-count ceiling for `build_minimap_data`'s `to_col` closure
-/// (#728). `aggregate_spans` never looks past `MINIMAP_SPAN_COLS` cells of
-/// `MINIMAP_COLS_PER_CELL` raw columns each, so a byte offset past that many
-/// characters always maps to a column `aggregate_spans` discards anyway —
-/// scanning further just to report an exact (and irrelevant) larger number
-/// is wasted, unbounded work on a long line. The `+ 1` keeps the boundary
-/// value itself exact rather than off-by-one short.
-const MINIMAP_COL_SCAN_LIMIT: usize = MINIMAP_SPAN_COLS * MINIMAP_COLS_PER_CELL + 1;
+/// The `+ 1` keeps `to_col`'s boundary value itself exact rather than
+/// off-by-one short (#728).
+const MINIMAP_COL_SCAN_LIMIT: usize = MINIMAP_MAX_RELEVANT_COLS + 1;
 
 /// Buffer line numbers `build_minimap_data` will actually sample, computed
 /// **before** any line text is fetched (#728).
@@ -10615,6 +10622,62 @@ pub fn build_minimap_data(
     for (i, l) in lines.iter().enumerate() {
         sampled_at.entry(l.line_idx).or_insert(i);
     }
+    // #1030 (review round 2): the colour grid's raw-column budget comes
+    // from the strip this rasteriser actually paints, not a fixed
+    // constant — but `rect.width` alone cannot answer that for both
+    // backends, because it is in the *caller's own unit*
+    // (`RenderedMinimap::rect`'s doc comment: cells for TUI, pixels for
+    // GTK) and the two backends do not turn that unit into painted
+    // columns the same way:
+    //
+    // - TUI's braille cell packs `MINIMAP_COLS_PER_CELL` (2) raw columns
+    //   per painted cell, so `rect.width` cells of TUI strip consult
+    //   exactly `rect.width * 2` raw columns — `rect.width` really is a
+    //   column count here, and the formula is dimensionally exact.
+    // - GTK's rasteriser (`quadraui::gtk::minimap::draw_minimap`) does
+    //   *not* scale its per-row paint walk with `rect.width`'s pixel value
+    //   at all: every row is capped at a fixed
+    //   `quadraui::primitives::minimap::COLUMN_CAPACITY` (120) character
+    //   columns regardless of how wide the strip is in pixels (see that
+    //   constant's doc comment upstream). There is no formula that
+    //   converts GTK's `rect.width` (px) into "columns painted" — the two
+    //   are unrelated — so treating `rect.width` as a column count for GTK
+    //   the way the first version of this fix did was wrong: at
+    //   `MINIMAP_MIN_PX` (48) it produced a grid of only 96 raw columns,
+    //   under the 120 GTK's own paint walk can reach.
+    //
+    // Rather than branch on backend identity here (Platform-Neutrality
+    // Rule — this is shared code, not per-backend wiring), take the max of
+    // both backends' real requirements: TUI's exact
+    // `rect.width * COLS_PER_CELL` and GTK's fixed `COLUMN_CAPACITY`. An
+    // overestimate only ever costs unreachable aggregation work (bounded,
+    // and far smaller than the old flat 400 either backend ever hit); an
+    // underestimate silently drops colour data for columns a backend does
+    // paint (#990). GTK's real requirement (120) is a constant, so it is
+    // always included in the max — GTK is correct unconditionally,
+    // independent of `rect.width`'s pixel value — while TUI stays as tight
+    // as the strip it actually paints whenever that exceeds 120.
+    //
+    // Columns are **not** compressed to fit — quadraui#993 (landed in the
+    // pin this issue also bumps) made the TUI dot rasteriser stop
+    // per-line-normalising indentation for exactly this reason: a shared,
+    // literal column scale is what makes indentation on one line
+    // comparable to indentation on another, and content past
+    // `width_cells * COLS_PER_CELL` is meant to clip, not squeeze into
+    // view (VS Code parity). Colour aggregation already used literal
+    // columns before this fix and still does — only the grid's `cols` was
+    // wrong (too large to matter, never too small to drop anything in the
+    // visible range), so right-sizing it changes nothing about *which*
+    // columns are visible, only how much unreachable aggregation work the
+    // old 200-cell grid wasted on columns neither backend's paint loop was
+    // ever going to query.
+    //
+    // No trailing `.max(1)`: `COLUMN_CAPACITY` (120) is a non-zero constant
+    // and is always in the max, so the result is positive by construction
+    // (review nit, fix iteration 2 — the extra clamp was unreachable).
+    let visible_span_cols = ((rect.width.round().max(1.0)) as usize * MINIMAP_COLS_PER_CELL)
+        .max(quadraui::primitives::minimap::COLUMN_CAPACITY);
+
     let mut raw_spans: Vec<quadraui::SyntaxSpan> = Vec::new();
     for (start, end, scope) in &buffer_state.highlights {
         if end <= start || *start >= rope.len_bytes() {
@@ -10635,13 +10698,12 @@ pub fn build_minimap_data(
         // (GTK converts them back to byte offsets for Pango attributes), so
         // convert here rather than handing over raw byte deltas. Capped at
         // `MINIMAP_COL_SCAN_LIMIT` chars: columns past
-        // `MINIMAP_SPAN_COLS` * `MINIMAP_COLS_PER_CELL` never affect
-        // `aggregate_spans`'s output (it drops any cell at/past
-        // `grid.cols`), so counting further into a long — e.g. minified —
-        // line is wasted, and unbounded: a span's byte offset can land
-        // arbitrarily far into it. Without the cap this was an O(line
-        // length) rescan run up to twice per highlight span on that line
-        // (#728).
+        // `MINIMAP_MAX_RELEVANT_COLS` never affect `aggregate_spans`'s
+        // output (it drops any cell at/past `grid.cols`), so counting
+        // further into a long — e.g. minified — line is wasted, and
+        // unbounded: a span's byte offset can land arbitrarily far into
+        // it. Without the cap this was an O(line length) rescan run up to
+        // twice per highlight span on that line (#728).
         let to_col = |b: usize| -> usize {
             let b = b.min(line_str.len());
             line_str
@@ -10666,7 +10728,7 @@ pub fn build_minimap_data(
 
     let grid = quadraui::MinimapGrid {
         rows: lines.len().div_ceil(MINIMAP_LINES_PER_ROW).max(1),
-        cols: MINIMAP_SPAN_COLS,
+        cols: visible_span_cols.div_ceil(MINIMAP_COLS_PER_CELL).max(1),
         lines_per_row: MINIMAP_LINES_PER_ROW,
         cols_per_cell: MINIMAP_COLS_PER_CELL,
     };
@@ -19385,6 +19447,25 @@ fn to_quadraui_theme_editor(theme: &Theme, chrome: quadraui::Theme) -> quadraui:
 /// against the same per-span-attributed layout `draw_editor` painted
 /// with; TUI: `EditorLayout::col_at_x`'s uniform monospace division) —
 /// neither backend hand-rolls its own text-column inverse anymore.
+///
+/// **GTK-correct, TUI-unsafe (#1040).** For GTK, `rw.rect` *is* the exact
+/// sub-pixel float geometry Cairo paints into, so `editor.rect` genuinely
+/// matches paint here. For TUI it does not: `rw.rect` comes from
+/// continuous float split math (`quadraui::SplitTree::layout`, zero
+/// divider thickness) and is not integer-valued in general — a vertical
+/// group split at the default 50/50 ratio over an odd content width gives
+/// the *right* pane's `rect.x` a `.5`-cell fractional origin. TUI's paint
+/// path truncates that away to whole cells before drawing
+/// (`tui_main::render_impl`'s `win_rect`/`editor_area`, both `rect.x as
+/// u16`) — bypassing `editor.rect` entirely, since `Backend::draw_editor`
+/// takes its viewport as an explicit `Rect` argument, not from the
+/// `Editor` struct. Calling this function directly from TUI click code
+/// therefore resolves columns against a viewport that was never actually
+/// painted, landing one column left of the real one (clamped to 0 at the
+/// pane's first column, so it "sometimes" doesn't — exactly the #1040
+/// report). TUI click/drag/hover call sites must use
+/// [`tui_editor_text_layout`] instead, which resolves against
+/// [`tui_window_paint_rect`]'s whole-cell-truncated viewport.
 pub fn editor_text_layout(
     rw: &RenderedWindow,
     char_width: f64,
@@ -19392,6 +19473,45 @@ pub fn editor_text_layout(
 ) -> (quadraui::Editor, quadraui::EditorLayout) {
     let editor = to_q_editor(rw);
     let layout = editor.layout(editor.rect, char_width as f32, line_height as f32);
+    (editor, layout)
+}
+
+/// Truncate a window rect to whole terminal cells — the exact conversion
+/// TUI's paint path applies before handing a window's geometry to
+/// `ratatui`/quadraui's cell-grid rasteriser (`tui_main::render_impl`'s
+/// `win_rect` in `render_all_windows`, and the `editor_area` derived from
+/// it in `render_window`, both `rect.x as u16` etc.).
+///
+/// See [`editor_text_layout`]'s doc for why this exists: `RenderedWindow`
+/// rects are produced by continuous float split math and are not
+/// integer-valued in general, so click resolution must snap to the same
+/// grid paint already snapped to, or it silently resolves against
+/// geometry that was never painted (#1040).
+///
+/// TUI-only — GTK rects are real sub-pixel float geometry that Cairo
+/// paints exactly as given; do not call this from `gtk/click.rs`.
+pub fn tui_window_paint_rect(rect: &WindowRect) -> WindowRect {
+    WindowRect::new(
+        (rect.x as u16) as f64,
+        (rect.y as u16) as f64,
+        (rect.width as u16) as f64,
+        (rect.height as u16) as f64,
+    )
+}
+
+/// TUI-only variant of [`editor_text_layout`]: builds the same
+/// [`quadraui::Editor`], but lays it out against
+/// [`tui_window_paint_rect`]'s whole-cell-truncated viewport instead of
+/// the raw (possibly fractional) `rw.rect` — the viewport TUI's paint
+/// path actually drew into. `Editor::layout` only reads its `viewport`
+/// argument for geometry (never the `Editor.rect` field itself), so this
+/// does not disturb anything else `to_q_editor`'s `editor.rect` is used
+/// for. Every TUI click/drag/hover call site that resolves a text column
+/// must use this, not `editor_text_layout` (#1040).
+pub fn tui_editor_text_layout(rw: &RenderedWindow) -> (quadraui::Editor, quadraui::EditorLayout) {
+    let editor = to_q_editor(rw);
+    let viewport = quadraui::Rect::from(tui_window_paint_rect(&rw.rect));
+    let layout = editor.layout(viewport, 1.0, 1.0);
     (editor, layout)
 }
 

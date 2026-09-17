@@ -77,6 +77,31 @@
 //! widest available on the backend you happen to be testing against first
 //! — a `DriverInput`-bounded body written against `GtkDriver` costs nothing
 //! extra to also run on `TuiDriver` via [`crate::tui_main::testing::conformance_harness`].
+//!
+//! # `tui` vs `tui_prod` — which TUI shell a scenario actually drives (#1043)
+//!
+//! "TUI" above names one *bound*, but [`backend_conformance!`] wires it to
+//! **two different shells**, each its own arm:
+//!
+//! - `tui` → [`crate::tui_main::testing::conformance_harness`], wrapping
+//!   [`App`] (the cross-backend-shared shell every other arm also wraps) on
+//!   `quadraui::tui::TuiBackend`. This is the *control*: a scenario failing
+//!   only here means the two rasterisers disagree, nothing about the TUI
+//!   binary users actually run.
+//! - `tui_prod` → [`crate::tui_main::testing::conformance_harness_prod`],
+//!   wrapping [`crate::tui_main::testing::TuiShellApp`] — the independently
+//!   hand-written shell `tui_main::run` really ships (its own mouse
+//!   routing, its own render path). A scenario green on `gtk`+`tui` but red
+//!   on `tui_prod` is, by construction, the shipped TUI diverging from the
+//!   shared shell — exactly the class of bug #1025 was, caught mechanically
+//!   here instead of by a user.
+//!
+//! Before #1043 only `tui` existed, so nothing in this file could ever see
+//! the second kind of divergence. `tui_prod` cannot yet accept every
+//! scenario — see [`crate::tui_main::testing::conformance_harness_prod`]'s
+//! own doc for the `ConformanceHarness::engine`/`::screen_layout` gap that
+//! currently excludes the #987 scrollbar-drag family and #983's
+//! `_resetting` sweep from it.
 
 #![cfg(any(test, feature = "test-support"))]
 
@@ -1239,51 +1264,51 @@ pub(crate) fn assert_text_metrics_backend_applies_metrics<B: TextMetricsBackend>
 /// measurements and for the (stronger) property those scenarios assert
 /// now that they are ungated.
 pub(crate) const KNOWN_BUGS: &[&str] = &[
-    // #990: v0.11.0 bug report -- three separate TUI minimap rendering
-    // defects, each with its own painted-output scenario in
-    // `src/tui_main/shell_app.rs`. TUI-only labels: all three are measured
-    // off the braille strip the TUI rasteriser paints, which has no GTK
-    // analogue to probe the same way.
+    // #1043: the first `tui_prod`-only divergence this harness found — the
+    // shared `App`'s `::gtk`/`::tui` arms have long since fixed #984 (a
+    // core `Engine::dispatch_explorer_tree_event` gap), but the shipped
+    // TUI's own, independently hand-written mouse routing has a *second*,
+    // TUI-only bug that reproduces the identical user-visible symptom by a
+    // completely different mechanism — confirmed by adding a temporary
+    // probe print at the call site and reading the captured state, not
+    // guessed:
     //
-    // Defect 1 -- large gaps for a short file, upstream **quadraui#992**:
-    // `MinimapSizing::Fill` stretches the row pitch up to `MAX_ROW_PITCH`
-    // (8 cells on TUI) while `draw_minimap` paints exactly one cell row per
-    // visible line, so the shorter the file the more untouched rows are
-    // left between painted ones (measured at 100x24: a 400-line file paints
-    // rows 2..=21 contiguously, a 20-line file paints only
-    // [2,5,9,12,15,19]). Per the Platform-Neutrality Rule the fix is
-    // quadraui's rasteriser -- this entry exists so bumping the pinned
-    // `rev` flips the scenario to "fix landed, delete the entry" rather
-    // than the fix (or a regression of it) passing unnoticed on our side of
-    // the pin. See `minimap_paints_contiguous_rows_for_short_files`.
-    "minimap_paints_contiguous_rows_for_short_files::tui", // #990, quadraui#992 — fix: #1030
-    // Defect 2 -- indentation bears little resemblance to the file's,
-    // upstream **quadraui#993**: each line is normalised by its own
-    // `chars.len()` instead of a scale shared across the file, so every
-    // line is stretched to fill the whole strip -- a 1-character line and a
-    // 300-character line in the same file paint identical full-width runs.
-    // Note the issue's originally-proposed assertion ("adding a long line
-    // must not move the short lines' dots") is trivially TRUE against this
-    // bug and does not discriminate; the scenario's extent assertions are
-    // what actually fail. See
-    // `minimap_indent_marks_track_the_files_own_indentation`.
-    "minimap_indent_marks_track_the_files_own_indentation::tui", // #990, quadraui#993 — fix: #1030
-    // Defect 3 -- no colouring. Diagnosed as **vimcode's own**, not
-    // quadraui's (the issue's candidate 4): `render::build_minimap_data`
-    // builds its `MinimapGrid` with a hardcoded `cols: MINIMAP_SPAN_COLS`
-    // (200) / `cols_per_cell: 2`, a colour grid covering character columns
-    // 0..400, while the painted TUI strip is ~12 cells wide -- so only
-    // character columns 0..~24 are ever consulted and any token indented
-    // past that falls back to the default colour. Measured collapse with
-    // 400 highlights present throughout: 5 distinct painted colours at
-    // indent 0, 3 at 8, 2 at 20, 1 (fallback only) at 40 and 80. The
-    // issue's candidate 1 ("highlights are empty under the TUI") is
-    // disproven and asserted against, ungated, in the scenario itself.
-    // Test-only here by this issue's own scope. The fix is #1030 (filed
-    // 2026-09-16 -- at the time this comment was first written it claimed a
-    // separate vimcode fix issue existed, and none did). See
-    // `minimap_paints_syntax_colour_for_indented_code`.
-    "minimap_paints_syntax_colour_for_indented_code::tui", // #990 — fix: #1030
+    // `TuiShellApp::handle_mouse_event`'s own `TreeController` intercept
+    // (`shell_app.rs` ~1476-1487) requires *three* things before it will
+    // even look at a `MouseDown` inside `explorer_tree_rect`:
+    // `!intercepts_blocked`, `self.engine.active_panel_is(PANEL_EXPLORER)`,
+    // and `self.engine.app_shell.sidebar_visible()`. The shared dispatch
+    // both `gtk` and the `tui` control arm go through instead —
+    // `App::explorer_ui_event` (`app.rs` ~5744-5750) — has no equivalent of
+    // that third condition: it claims the event whenever
+    // `explorer_tree_rect.width > 0.0`, i.e. whenever the tree was actually
+    // painted this frame. Reproduced here: this scenario's fixture sets
+    // `engine.session.explorer_visible = true` *after* the engine is built
+    // (the same "post-hoc `e.session = ...` assignment" pattern
+    // `Engine::new_for_test`'s own doc warns never retroactively updates
+    // `app_shell`'s already-baked-in visibility decision — see that
+    // constructor's doc, `src/core/engine/mod.rs` ~3770). The explorer tree
+    // (chevron included) paints correctly regardless — painting does not
+    // consult `app_shell.sidebar_visible()` — but a captured probe at the
+    // click site read `is_explorer_event=false, sidebar_visible=false`
+    // despite a non-zero, correctly-populated `explorer_tree_rect`, so
+    // `TuiShellApp`'s own intercept declines to claim a click the shared
+    // dispatch would have claimed. The `MouseDown` then falls through to
+    // `mouse::handle_mouse`'s legacy crossterm-shaped path, which gates the
+    // same sidebar body on the identical (also-false) flag and hands the
+    // click to whatever comes after — observed effect: the whole sidebar
+    // collapses instead of the chevron toggling.
+    //
+    // This is a genuine `tui_main`-only asymmetry (an extra, staler
+    // condition `TuiShellApp`'s intercept imposes that the shared dispatch
+    // does not), independent of whether a real interactive session can
+    // reach the exact same `session.explorer_visible`/`app_shell` desync
+    // this fixture forces — the fix (drop the redundant
+    // `sidebar_visible()` check, or resync it from the same ground truth
+    // `App` uses) lives entirely in `shell_app.rs`, outside this
+    // harness-wiring issue's file scope; a follow-up fix issue is required
+    // before this label can be removed.
+    "explorer_chevron_click_toggles_dir_with_same_arity_as_label_click::tui_prod", // #1043 — fix: needs a follow-up issue (filed by the coordinator from this PR)
 ];
 
 /// A saved `std::panic::set_hook`/`take_hook` closure — named so
@@ -1457,7 +1482,7 @@ where
 /// ```ignore
 /// crate::backend_conformance! {
 ///     label: my_scenario,
-///     backends: [gtk, tui],
+///     backends: [gtk, tui, tui_prod],
 ///     engine: my_engine_fixture(),
 ///     size: (800, 480),
 ///     body: |driver| {
@@ -1466,18 +1491,37 @@ where
 /// }
 /// ```
 ///
-/// expands to a `mod my_scenario { fn gtk() { .. } fn tui() { .. } }` with
-/// one `#[test]` per backend arm — `cargo test`'s own `mod_path::backend`
-/// test-name nesting is what keeps a single-backend failure self-locating,
-/// the same property `..._on_gtk`/`..._on_tui` naming would give, without
-/// needing identifier concatenation (no `concat_idents!`/proc-macro
-/// dependency to get there). The `gtk` arm is gated on `feature = "gui"`,
-/// the same gate `vimcode`'s own `required-features` puts on the GTK bin;
-/// the `tui` arm has no gate — `quadraui/tui` is an unconditional feature
-/// of the pinned dependency (see `Cargo.toml`), not an optional vimcode one.
+/// expands to a `mod my_scenario { fn gtk() { .. } fn tui() { .. } fn
+/// tui_prod() { .. } }` with one `#[test]` per backend arm — `cargo test`'s
+/// own `mod_path::backend` test-name nesting is what keeps a single-backend
+/// failure self-locating, the same property `..._on_gtk`/`..._on_tui`
+/// naming would give, without needing identifier concatenation (no
+/// `concat_idents!`/proc-macro dependency to get there). The `gtk` arm is
+/// gated on `feature = "gui"`, the same gate `vimcode`'s own
+/// `required-features` puts on the GTK bin; the `tui`/`tui_prod` arms have
+/// no gate — `quadraui/tui` is an unconditional feature of the pinned
+/// dependency (see `Cargo.toml`), not an optional vimcode one.
 ///
-/// Only `gtk`/`tui` are wired today. Growing this to `macos`/`win` is
-/// adding their own `@arm` match below, mirroring their existing
+/// # `tui` vs `tui_prod` (#1043)
+///
+/// These are **two different TUI arms**, not a typo for one — see
+/// `crate::tui_main::testing`'s own "Two TUI arms" doc for the full
+/// reasoning. In short: `tui` wraps [`crate::app::App`] (the
+/// cross-backend-shared shell, also what `gtk` wraps) on
+/// `quadraui::tui::TuiBackend` — it is the *control* that isolates
+/// "rasteriser difference" from "implementation difference". `tui_prod`
+/// wraps [`crate::tui_main::testing::TuiShellApp`] — the independently
+/// hand-written shell `tui_main::run` actually ships. A scenario green on
+/// `gtk`+`tui` but red on `tui_prod` is, by construction, the shipped TUI
+/// diverging from the shared shell, not a paint-surface artifact — exactly
+/// the class of bug #1025 was before a user found it by hand. Not every
+/// scenario can run on `tui_prod` yet — see
+/// `crate::tui_main::testing::conformance_harness_prod`'s own doc for
+/// which trait bounds it satisfies and which (`ConformanceHarness::engine`/
+/// `::screen_layout`) it does not.
+///
+/// Only `gtk`/`tui`/`tui_prod` are wired today. Growing this to `macos`/
+/// `win` is adding their own `@arm` match below, mirroring their existing
 /// `conformance_harness` constructors (`src/macos/mod.rs:243`,
 /// `src/win/mod.rs:188`) — each behind that backend's own vimcode feature
 /// gate, same shape as the `gtk` arm.
@@ -1532,6 +1576,17 @@ macro_rules! backend_conformance {
         #[test]
         fn tui() {
             let mut __h = $crate::tui_main::testing::conformance_harness(
+                $engine, $w as u16, $h as u16,
+            );
+            let $driver = &mut __h.driver;
+            $body
+        }
+    };
+
+    (@arm tui_prod, $engine:expr, $w:expr, $h:expr, |$driver:ident| $body:block) => {
+        #[test]
+        fn tui_prod() {
+            let mut __h = $crate::tui_main::testing::conformance_harness_prod(
                 $engine, $w as u16, $h as u16,
             );
             let $driver = &mut __h.driver;
@@ -1603,9 +1658,14 @@ mod tests {
     // (reverting the GTK/macOS `TextMetricsBackend` fix takes the *gtk*
     // arm here red), confirming this is the same shared scenario body,
     // not a fork of it.
+    //
+    // #1043 adds `tui_prod`: `TuiShellApp`'s own explorer click routing
+    // (`tui_main::mouse`) is a completely independent implementation of the
+    // same #967 hit-band contract, so this is genuine new coverage, not
+    // just a third copy of the same assertion.
     crate::backend_conformance! {
         label: sweep_hit_band_integrity_proof,
-        backends: [gtk, tui],
+        backends: [gtk, tui, tui_prod],
         engine: engine_with_expanded_explorer("sweep"),
         size: (800, 480),
         body: |driver| {
@@ -2069,10 +2129,12 @@ mod issue_983_row_click_selects_the_row_below {
     // creeping into either row-pitch formula later, and they cost nothing
     // extra to also run on TUI (`ConformanceDriver + DriverInput` is
     // TUI's own bound, not a GTK-only one — see this module's top doc on
-    // "Which trait bound a scenario needs").
+    // "Which trait bound a scenario needs"), nor on `tui_prod` (#1043) —
+    // `TuiShellApp` renders the Settings panel through the same
+    // `render::handle_settings_form_ui_event` shared code `App` does.
     crate::backend_conformance! {
         label: settings_row_sweep_hit_band_integrity,
-        backends: [gtk, tui],
+        backends: [gtk, tui, tui_prod],
         engine: engine_settings_scrolled_to_lsp(),
         size: (1400, 900),
         body: |driver| {
@@ -2177,6 +2239,22 @@ mod issue_983_row_click_selects_the_row_below {
             |d| ConformanceDriver::screen_has(d, "Zqxw983Avail"),
         );
     }
+
+    // #1043: deliberately no `_tui_prod` twin of the two tests above.
+    // Both need `h.engine.clone()` — a live `Rc<RefCell<Engine>>` handle
+    // that keeps working *after* the harness's own app is moved into
+    // `driver_with_shell` — to force-reset the section's collapsed flag
+    // between samples. `crate::tui_main::testing::conformance_harness_prod`
+    // cannot offer that: `App` (what `conformance_harness`, used above,
+    // wraps) stores its engine behind `Rc<RefCell<Engine>>` specifically so
+    // a harness can keep such a handle; `TuiShellApp` (what
+    // `conformance_harness_prod` wraps) owns its `Engine` directly, so
+    // `ConformanceHarness::engine` for that arm is a disconnected
+    // placeholder (see that function's own doc). Porting this scenario
+    // needs either a `TuiShellApp`-side accessor this harness-wiring issue
+    // does not add, or a rewrite of `sweep_hit_band_integrity_resetting`'s
+    // reset step to go through painted-output-only means — filed as a
+    // follow-up rather than silently skipped.
 }
 
 // #984: v0.11.0 bug report -- the file explorer's expand/collapse chevron
@@ -2295,6 +2373,33 @@ mod issue_984_explorer_chevron_needs_a_double_click {
         );
     }
 
+    // #1043: the `tui_prod` twin — same scenario, driven through the actual
+    // production TUI shell (`TuiShellApp`, its own independently
+    // hand-written `tui_main::mouse` hit-testing) instead of the shared
+    // `App`. Its own `::tui_prod`-suffixed `KNOWN_BUGS` label, per this
+    // module's own disambiguation rule (each backend arm needs its own
+    // suffix once a body can diverge per-arm — see the `::gtk`/`::tui`
+    // labels above).
+    #[test]
+    fn explorer_chevron_click_toggles_dir_with_same_arity_as_label_click_tui_prod() {
+        let mut __h = crate::tui_main::testing::conformance_harness_prod(
+            engine_with_collapsed_explorer_dir("chevron_tui_prod"),
+            800,
+            480,
+        );
+        let driver = &mut __h.driver;
+        crate::harness::known_bug_gate(
+            "explorer_chevron_click_toggles_dir_with_same_arity_as_label_click::tui_prod",
+            || {
+                crate::harness::explorer_chevron_click_toggles_dir_with_same_arity_as_label_click(
+                    driver,
+                    "kkxxqq_dir984",
+                    "child984mk",
+                );
+            },
+        );
+    }
+
     // ── Deliverable 3: sweep_hit_band_integrity across the directory
     // row's own painted label (the vertical axis of the same row) ──────
     //
@@ -2306,9 +2411,15 @@ mod issue_984_explorer_chevron_needs_a_double_click {
     // drift on the explorer's own expand/collapse toggle -- exactly the
     // self-restoring toggle that helper's doc names as the reference
     // case it was built for.
+    //
+    // #1043: also registered on `tui_prod` — the explorer tree is exactly
+    // the surface #1025's production-only right-click regression lived in
+    // (`tui_main::mouse`'s own, independently hand-written hit-testing), so
+    // this is a scenario worth actually pointing at the shipped TUI rather
+    // than only at the shared `App`.
     crate::backend_conformance! {
         label: explorer_row_sweep_hit_band_integrity,
-        backends: [gtk, tui],
+        backends: [gtk, tui, tui_prod],
         engine: engine_with_collapsed_explorer_dir("sweep"),
         size: (800, 480),
         body: |driver| {
@@ -2388,6 +2499,21 @@ mod issue_984_explorer_chevron_needs_a_double_click {
 // undisturbed here since fixing it is out of this test-only issue's scope
 // and its own file is not part of `src/harness.rs` + per-backend
 // registration.)
+// #1043: no `tui_prod` coverage in this module. Every scenario here
+// (`drag_group_scrollbar_column`, `drag_group_divider_resizes`) takes the
+// whole `&mut ConformanceHarness<D>` and reads `h.screen_layout` to locate
+// a window's own painted rect (a scrollbar thumb has no text run to search
+// for) — `App`'s `cached_screen_layout` is an `Rc<RefCell<Option<ScreenLayout>>>`
+// specifically so `ConformanceHarness::new_with_screen_layout` can keep a
+// live handle to it after `App` is moved into `driver_with_shell`.
+// `TuiShellApp`'s own layout cache (`last_layout`) is a private, non-`Rc`
+// `RefCell`, so `crate::tui_main::testing::conformance_harness_prod` has no
+// live handle to hand back (`ConformanceHarness::screen_layout` is `None`
+// there — see that function's own doc). Porting this family needs either a
+// `TuiShellApp`-side `Rc`-wrapped accessor (a `shell_app.rs` change outside
+// this harness-wiring issue's file scope) or a window-rect probe that
+// doesn't depend on it — filed as a follow-up rather than silently
+// skipped.
 #[cfg(test)]
 mod issue_987_group_scrollbar_inert_and_click_resizes {
     use super::*;
@@ -2740,9 +2866,16 @@ mod issue_986_confirm_prompt_never_built {
     // implemented" message instead, so `screen_has(NVIM_CONFIRM_PROMPT)` is
     // false on both. Restored (entry back in place) and confirmed green
     // again on both.
+    //
+    // #1043 adds `tui_prod`, still under the same un-suffixed
+    // `KNOWN_BUGS` label: `execute.rs`'s `flags.contains('c')` early return
+    // is core code every shell (`App` and `TuiShellApp` alike) calls
+    // through the same `Engine::execute_command` path, so this bug (and
+    // its eventual fix) is identical on all three arms — see this module's
+    // own top doc on why the label is shared rather than per-backend here.
     crate::backend_conformance! {
         label: confirm_prompt_text_is_painted,
-        backends: [gtk, tui],
+        backends: [gtk, tui, tui_prod],
         engine: engine_with_multi_match_buffer(),
         size: (1400, 900),
         body: |driver| {
@@ -2775,9 +2908,12 @@ mod issue_986_confirm_prompt_never_built {
     // confirm loop exists yet, so nothing ever paints a report line at
     // all, let alone the correctly-counted one). Restored and confirmed
     // green again on both.
+    //
+    // #1043 adds `tui_prod`, same shared-label rationale as
+    // `confirm_prompt_text_is_painted` above.
     crate::backend_conformance! {
         label: confirm_report_line_excludes_skipped_matches,
-        backends: [gtk, tui],
+        backends: [gtk, tui, tui_prod],
         engine: engine_with_four_single_match_lines(),
         size: (1400, 900),
         body: |driver| {

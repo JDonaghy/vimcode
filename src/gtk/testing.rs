@@ -3222,6 +3222,69 @@ mod tests {
         );
     }
 
+    /// #1038 (GTK half of the shared-engine fix): `handle_mouse_click`
+    /// routes a tab-bar × click through the very same
+    /// `Engine::handle_tab_bar_click` `CloseTab` arm the TUI does
+    /// (`gtk/click.rs`'s `tab_bar_split_right_button_...` test documents the
+    /// same shared dispatch for the split-right button). That arm now
+    /// skips the close-tab-confirm dialog when another window still shows
+    /// the buffer being closed — the buffer isn't going away, so there is
+    /// nothing to lose. This is the sibling of
+    /// `close_dirty_tab_button_opens_confirm_dialog` above: same dirty
+    /// buffer, same × click, but with a second tab in the *same* group
+    /// pointed at the identical buffer, so no confirm should appear at
+    /// all.
+    ///
+    /// RED-verified: reverting `handle_tab_bar_click`'s `CloseTab` arm to
+    /// the pre-#1038 `if self.dirty() { return true; }` (no other-views
+    /// check at all) makes this test fail — a dialog opens even though tab
+    /// 1 still shows the buffer; restored before committing.
+    #[test]
+    fn close_dirty_tab_button_with_other_tab_showing_same_buffer_does_not_confirm() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "alpha");
+        let buf_id = engine.active_buffer_id();
+        if let Some(buf) = engine.buffer_manager.get_mut(buf_id) {
+            buf.dirty = true;
+        }
+        engine.new_tab(None);
+        // Point tab 1's window at the same (dirty) buffer as tab 0 — a
+        // second *tab* on the same buffer is another legitimate "other
+        // view", alongside a same-tab split or a second editor group.
+        // Keeping it as a second tab in one group (rather than a second
+        // group) means this test can use the same single `editor_tab_bar_id`
+        // as the sibling test above instead of juggling two tab bars.
+        let win1 = engine.active_window_id();
+        if let Some(w) = engine.windows.get_mut(&win1) {
+            w.buffer_id = buf_id;
+        }
+        engine.active_group_mut().active_tab = 0; // focus tab 0 so its × is clicked
+        let mut h = harness(engine, 1400, 900);
+
+        let (x, y) = h
+            .driver
+            .tab_close_center(&editor_tab_bar_id(), 0)
+            .expect("the single-group tab bar must have painted tab 0's close button");
+        h.driver.click(x, y);
+        h.driver.render();
+
+        assert!(
+            !h.native_dialog_shown.get(),
+            "closing tab 0's \u{d7} must not open the close-tab-confirm \
+             dialog: tab 1 still shows the same dirty buffer, so nothing \
+             would be lost by closing this view (#1038)"
+        );
+        assert!(
+            h.pending_native_dialog.take().is_none(),
+            "no confirm needed, so no native dialog present should be queued"
+        );
+        assert_eq!(
+            h.engine.borrow().active_group().tabs.len(),
+            1,
+            "with no confirmation needed, the click must actually close the tab"
+        );
+    }
+
     /// #727's native path only covers dialogs `quadraui::native_dialog_options`
     /// reports as natively expressible — a dialog carrying a text input
     /// (e.g. the move-file destination prompt) is not, and must keep
@@ -6929,6 +6992,159 @@ mod minimap {
              either pane's painted rect (i.e. must not reflow either \
              pane's text width); before={before:?}, after={after:?}"
         );
+    }
+
+    /// #1030 review round 2 — deliverable 3 requires checking GTK does not
+    /// regress from `build_minimap_data`'s `visible_span_cols` formula
+    /// (`src/render.rs`) and stating what was measured. This pins that
+    /// measurement against real painted GTK pixels instead of leaving it as
+    /// an unverified comment.
+    ///
+    /// # Why this cannot be RED against either formula this issue produced
+    ///
+    /// GTK's own rasteriser (`quadraui::gtk::minimap::draw_minimap` ->
+    /// `paint_row_blocks`) paints one 1px-wide block per non-blank
+    /// character column at exactly `strip.x + col`, and `draw_minimap`
+    /// clips all painting to the strip rect (`cr.clip()`) — so a strip only
+    /// ever shows columns `0..strip.width` on screen, no matter how many
+    /// columns the *aggregated colour grid* covers. Both the first
+    /// reviewed formula (`rect.width * MINIMAP_COLS_PER_CELL` raw columns,
+    /// with no floor) and the fixed one (the same, floored at
+    /// `quadraui::primitives::minimap::COLUMN_CAPACITY`) always resolve to
+    /// at least `rect.width` raw columns for any positive `rect.width`
+    /// (`2 * w >= w`), so the aggregated grid has *always* covered every
+    /// column GTK can actually paint — there is no strip width at which
+    /// GTK's rendered pixels can differ between the two formulas. This test
+    /// cannot be red against either and is not trying to be; it exists so
+    /// "no GTK regression" is a measured fact rather than a comment's
+    /// claim, and so a future change that actually does shrink the grid
+    /// below GTK's real requirement gets caught here.
+    ///
+    /// # What it measures
+    ///
+    /// Opens a real, tree-sitter-highlighted `.rs` buffer and samples
+    /// pixels inside the painted minimap strip, counting distinct
+    /// non-background colours — the GTK analogue of the TUI test's
+    /// `colors.len()` probe (`minimap_paints_syntax_colour_for_indented_code`
+    /// in `src/tui_main/shell_app.rs`). At a 1400px-wide pane the strip
+    /// resolves to exactly `MINIMAP_TARGET_COLS` (120px, == GTK's
+    /// `COLUMN_CAPACITY`), so indents of 20, **40 and 80** columns all land
+    /// inside the range every formula this issue considered ever covered —
+    /// which is what lets the caller assert #1030's deliverable 2 ("colour
+    /// must survive at indent 40 and 80") literally, here, on GTK. The TUI's
+    /// braille strip cannot reach those columns at all (22 source columns
+    /// wide, hardcoded upstream); see the TUI scenario's own doc and
+    /// `docs/PENDING_QUADRAUI_ISSUES.md`.
+    fn minimap_gtk_distinct_colors_for_indent(indent: usize) -> usize {
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_test_1030_gtk_minimap_colour_{}_{:?}_{indent}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("colour1030.rs");
+        let pad = " ".repeat(indent);
+        let text: String = (0..60)
+            .map(|i| format!("{pad}let value_{i} = 1;\n"))
+            .collect();
+        std::fs::write(&file, &text).unwrap();
+
+        // `syntax_max_lines` lives in a process-global atomic another test
+        // in this binary can have moved; pin it so "were there any
+        // highlights at all" is deterministic here (mirrors the TUI
+        // fixture's own reasoning).
+        crate::core::buffer_manager::set_syntax_max_lines(20_000);
+
+        let mut engine = Engine::new();
+        engine
+            .open_file_with_mode(&file, crate::core::engine::OpenMode::Permanent)
+            .unwrap();
+        let win_id = engine.active_window_id();
+        let buf_id = engine.windows.get(&win_id).unwrap().buffer_id;
+        let n_highlights = engine.buffer_manager.get(buf_id).unwrap().highlights.len();
+        assert!(
+            n_highlights > 0,
+            "precondition: tree-sitter must produce highlights for this \
+             fixture, or the colour assertions below are vacuous"
+        );
+
+        let mut h = harness(engine, 1400, 900);
+        h.window_center(win_id)
+            .expect("editor pane must paint with the minimap on");
+
+        let theme = crate::render::Theme::from_name(&h.engine.borrow().settings.colorscheme);
+        let bg = (theme.background.r, theme.background.g, theme.background.b);
+
+        let strip = {
+            let layout = h.screen_layout.borrow();
+            layout
+                .as_ref()
+                .unwrap()
+                .minimap
+                .iter()
+                .find(|m| m.window_id == win_id)
+                .expect("the layout must carry a minimap for the pane")
+                .rect
+        };
+
+        let x0 = strip.x.round() as i32;
+        let x1 = (strip.x + strip.width).round() as i32;
+        let y0 = strip.y.round() as i32;
+        let y1 = (strip.y + strip.height).round() as i32;
+        let mut seen = std::collections::HashSet::new();
+        for y in (y0..y1).step_by(2) {
+            for x in x0..x1 {
+                let c = h.driver.pixel(x, y);
+                if c != bg {
+                    seen.insert(c);
+                }
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        seen.len()
+    }
+
+    #[test]
+    fn minimap_paints_distinct_syntax_colors_at_indentation_via_gtk_driver() {
+        // Indents 0 and 20 are deliverable 3's no-regression measurement;
+        // **40 and 80 are #1030's deliverable 2 verbatim** — "Colour must
+        // survive at indent 40 and 80, not only near column 0" — and they
+        // pass here, on the backend where that is physically reachable.
+        // GTK's strip resolves to 120px at this pane width and its
+        // rasteriser paints one 1px block per character column up to
+        // `COLUMN_CAPACITY` (120), so columns 40 and 80 are both inside the
+        // painted range. See `minimap_gtk_distinct_colors_for_indent`'s doc
+        // for the geometry, and `src/tui_main/shell_app.rs`'s
+        // `minimap_paints_syntax_colour_for_indented_code` for why the same
+        // deliverable is *not* reachable on TUI (an 11-cell braille strip
+        // represents 22 source columns, hardcoded upstream — drafted as a
+        // quadraui issue in `docs/PENDING_QUADRAUI_ISSUES.md`).
+        //
+        // Measured on this machine (macOS, 1400x900 harness, 60-line `.rs`
+        // fixture, GTK 4.22): 7 / 7 / 7 / 7 distinct non-background colours
+        // at indents 0 / 20 / 40 / 80 — i.e. GTK's minimap colouring is
+        // flat-out indifferent to indentation across the whole range this
+        // issue measured, which is the "GTK does not regress" claim
+        // deliverable 3 asks for, stated as numbers.
+        for indent in [0usize, 20, 40, 80] {
+            let seen = minimap_gtk_distinct_colors_for_indent(indent);
+            println!("#1030 GTK measurement: indent {indent} -> {seen} distinct colours");
+            assert!(
+                seen > 1,
+                "#1030: code indented by {indent} columns must paint more \
+                 than one distinct syntax colour in the GTK minimap strip \
+                 (the strip is 120px wide here and GTK paints up to \
+                 COLUMN_CAPACITY = 120 character columns, so column \
+                 {indent} is inside the painted range) — got {seen}. For \
+                 indent 0 this is the precondition/regression guard; for 20 \
+                 it is deliverable 3's no-regression measurement; for 40 and \
+                 80 it is deliverable 2 itself. If this fails, \
+                 `build_minimap_data`'s `visible_span_cols` floor \
+                 (`src/render.rs`) has regressed below what GTK's rasteriser \
+                 actually needs."
+            );
+        }
     }
 }
 

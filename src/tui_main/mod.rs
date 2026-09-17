@@ -46,6 +46,35 @@ mod shell_app;
 ///
 /// Compiled under `cfg(test)` too so the in-crate suite and the sealed suite
 /// cannot drift onto different seams.
+///
+/// # Two TUI arms: `tui` vs `tui_prod` (#1043)
+///
+/// This module offers **two** `crate::harness::ConformanceHarness`
+/// constructors for TUI, and `crate::backend_conformance!` correspondingly
+/// has two TUI arms — `tui` and `tui_prod` — not one:
+///
+/// - [`conformance_harness`] wraps [`crate::app::App`] (the
+///   *cross-backend-shared* shell) on `quadraui::tui::TuiBackend`. This is
+///   the **control**: it isolates "the two rasterisers disagree" from "the
+///   two implementations disagree" by proving the one shared shell paints
+///   the same thing on GTK's Cairo surface and on a ratatui `TestBackend`.
+///   A scenario failing here has nothing to do with the TUI binary users
+///   run — it would fail identically on any other `App`-hosting backend.
+/// - [`conformance_harness_prod`] wraps [`TuiShellApp`] — the *actual*
+///   production TUI shell `tui_main::run` hands to `driver_with_shell` for
+///   real, independently hand-written from `App` (its own mouse routing in
+///   `tui_main::mouse`, its own render path in `tui_main::render_impl`,
+///   etc.). A scenario green on `gtk` **and** `tui` but red on `tui_prod`
+///   is, by construction, the shipped TUI diverging from the shared shell
+///   both other arms agree on — not a rasteriser artifact, and not
+///   ambiguous about which of the two implementations is at fault.
+///
+/// Before #1043 only the first existed, so a `crate::harness` scenario
+/// could never see the second kind of bug (#1025's right-click-selects-the-
+/// row-below regression lived entirely in `tui_main::mouse` and was
+/// invisible to every `tui`-arm scenario) — a user had to hit it first.
+/// `tui_prod`'s `KNOWN_BUGS`-gated entries in `src/harness.rs` are exactly
+/// that inventory, generated mechanically instead of by hand.
 #[cfg(any(test, feature = "test-support"))]
 pub mod testing {
     pub use super::shell_app::TuiShellApp;
@@ -71,6 +100,11 @@ pub mod testing {
     // is what gets wrapped here, so a scenario written once genuinely
     // exercises the same dispatch/paint code on every backend, rather than
     // running against a second, TUI-only reimplementation.
+    //
+    // #1043 adds the missing second half — [`conformance_harness_prod`],
+    // below — that wraps *that* second, TUI-only reimplementation, so a
+    // scenario can finally tell the two apart instead of only ever seeing
+    // the first.
     use std::cell::RefCell;
     use std::rc::Rc;
 
@@ -130,6 +164,93 @@ pub mod testing {
         let screen_layout = Rc::clone(&app.cached_screen_layout);
         let driver = driver_with_shell(app, config, width, height);
         ConformanceHarness::new_with_screen_layout(driver, engine, screen_layout, paint, cwd)
+    }
+
+    // ── #1043: TUI wiring for `crate::harness::ConformanceHarness`, wrapping
+    // the *production* TUI shell rather than the cross-backend-shared `App`
+    // wrapped above ──────────────────────────────────────────────────────
+    /// The `TuiDriver<TuiShellApp>` instantiation of
+    /// `crate::harness::ConformanceHarness` (#1043) — this module's own
+    /// "Two TUI arms" doc (top of file) explains why this exists alongside
+    /// [`conformance_harness`] rather than replacing it.
+    ///
+    /// Built via [`TuiShellApp::from_engine`] called directly on the
+    /// caller's fixture `engine` — **not** [`TuiShellApp::new_for_test`]
+    /// followed by swapping `app.engine` afterwards, which is what this
+    /// function did before #1043's review caught it. That
+    /// build-then-swap shape ran `from_engine`'s one-time setup (sidebar
+    /// `set_backend_info`, `setup_tui_clipboard`, nerd-font resolution —
+    /// see [`TuiShellApp::from_engine`]'s own doc) against a disposable
+    /// `Engine::new_for_test()` and then discarded that engine in favour of
+    /// the caller's, so none of that setup ever touched the engine the
+    /// scenario actually drives. Calling `from_engine` on the caller's
+    /// `engine` directly — passing `file_path: None, restore_session:
+    /// false`, the same arguments [`TuiShellApp::new_for_test`] uses —
+    /// mirrors the same requirement [`conformance_harness`] gets for free
+    /// from `App::new_headless_with_backend`, which operates on the
+    /// caller's actual `Engine` rather than a throwaway one: a conformance
+    /// scenario needs to start from a known fixture, not the machine's real
+    /// `~/.config/vimcode`, *and* needs that fixture to be the engine that's
+    /// actually wired up. See [`TuiShellApp::new_for_test`]'s own doc for
+    /// exactly which two ambient reads `restore_session: false` substitutes
+    /// and why [`TuiShellApp::new`] cannot be used here instead.
+    ///
+    /// `#[cfg(test)]`, unlike [`conformance_harness`] above (reachable under
+    /// `feature = "test-support"` alone): every call site this issue adds
+    /// lives inside a `#[cfg(test)]`-gated scenario module in
+    /// `src/harness.rs`, so this needs no wider reach, and
+    /// [`TuiShellApp::new_for_test`] is itself `#[cfg(test)]`-only — widening
+    /// *that* constructor's own gate to also serve the sealed acceptance
+    /// suite (`tests/acceptance.rs`) is a separate, larger change this
+    /// harness-wiring issue does not make.
+    ///
+    /// # `ConformanceHarness::engine` / `::screen_layout` are not live here
+    ///
+    /// `App` stores its `Engine` and painted `render::ScreenLayout` cache
+    /// behind `Rc<RefCell<_>>` *specifically* so a conformance harness can
+    /// keep a handle to either after the app itself is moved into
+    /// `driver_with_shell` — see [`ConformanceHarness::screen_layout`]'s own
+    /// doc. `TuiShellApp` owns its `Engine` directly (a bare `Engine`, not
+    /// `Rc<RefCell<Engine>>`) and caches its own layout in a private,
+    /// non-`Rc` `RefCell` — neither is retrievable once `self` is consumed
+    /// by `driver_with_shell` below, and changing either field's type to
+    /// match `App`'s would be a `shell_app.rs`-wide change (hundreds of
+    /// `self.engine.*` call sites) well outside this harness-wiring issue's
+    /// scope.
+    ///
+    /// Concretely: this harness's `engine` field is a disconnected,
+    /// freshly-constructed `Engine::new_for_test()` placeholder — the same
+    /// "nothing live to hand back" shape [`ConformanceHarness::new`]'s own
+    /// doc already documents for every pre-#987 caller — and its
+    /// `screen_layout` is `None`. Every scenario registered on the
+    /// `tui_prod` arm in `src/harness.rs` is therefore one bounded by
+    /// `ConformanceDriver`/`DriverInput` alone (reads painted output via the
+    /// `driver`, never `ConformanceHarness::engine`/`::screen_layout`) — a
+    /// scenario that needs either (the #987 scrollbar-drag family, #983's
+    /// `_resetting` sweep) cannot run against this arm yet; see
+    /// `issue_987_group_scrollbar_inert_and_click_resizes`'s and
+    /// `issue_983_row_click_selects_the_row_below`'s own module docs in
+    /// `src/harness.rs` for that explicit, filed gap.
+    #[cfg(test)]
+    pub fn conformance_harness_prod(
+        engine: Engine,
+        width: u16,
+        height: u16,
+    ) -> ConformanceHarness<TuiDriver<impl quadraui::AppLogic>> {
+        let paint = crate::test_paint::PaintGuard::acquire();
+        let cwd = crate::test_cwd::CwdReadGuard::acquire();
+        // #1043 review: run `from_engine`'s one-time setup (sidebar
+        // `set_backend_info`, `setup_tui_clipboard`, nerd-font resolution)
+        // directly against the caller's fixture `engine`, rather than
+        // against a throwaway `Engine::new_for_test()` that then gets
+        // discarded in favour of `engine` — see `from_engine`'s own doc for
+        // why that used to leave the scenario's real engine's sidebar
+        // systems without `set_backend_info` and its clipboard unset.
+        let app = TuiShellApp::from_engine(engine, None, false);
+        let config = TuiShellApp::shell_config(false);
+        let driver = driver_with_shell(app, config, width, height);
+        let placeholder_engine = Rc::new(RefCell::new(Engine::new_for_test()));
+        ConformanceHarness::new(driver, placeholder_engine, paint, cwd)
     }
 }
 

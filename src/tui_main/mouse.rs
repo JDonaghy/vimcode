@@ -238,7 +238,11 @@ fn apply_tui_editor_text_drag(
     // #560: resolve via the shared quadraui text-layout inverse
     // (`EditorLayout::col_at_x`) instead of hand-rolled cell math, so TUI and
     // GTK column resolution can never diverge.
-    let (editor, editor_layout) = render::editor_text_layout(rw, 1.0, 1.0);
+    // #1040: `tui_editor_text_layout`, not `editor_text_layout` — the
+    // latter lays out against `rw.rect` verbatim, which is fractional for
+    // a group's non-origin pane and was never what TUI's paint path
+    // actually drew into (see that function's doc for the full mechanism).
+    let (editor, editor_layout) = render::tui_editor_text_layout(rw);
     let col_in_text = editor_layout.col_at_x(&editor, view_row, col as f32);
     engine.mouse_drag(rw.window_id, buf_line, col_in_text);
 }
@@ -1560,8 +1564,10 @@ pub(super) fn handle_mouse(
                 } = zone
                 {
                     // #560: shared quadraui text-layout inverse (see the
-                    // drag handler above for the full rationale).
-                    let (editor, editor_layout) = render::editor_text_layout(rw, 1.0, 1.0);
+                    // drag handler above for the full rationale). #1040:
+                    // `tui_editor_text_layout`, not `editor_text_layout` —
+                    // see that function's doc.
+                    let (editor, editor_layout) = render::tui_editor_text_layout(rw);
                     let text_col = editor_layout.col_at_x(&editor, view_row, col as f32);
                     engine.editor_hover_mouse_move(buf_line, text_col, mouse_on_editor_hover);
                     found = true;
@@ -2671,7 +2677,13 @@ pub(super) fn handle_mouse(
                 // itself) instead of hand-rolled cell math — the same
                 // function GTK's `Backend::editor_col_at_x` falls back to,
                 // so both backends' click math derives from one source.
-                let (editor, editor_layout) = crate::render::editor_text_layout(rw, 1.0, 1.0);
+                // #1040: `tui_editor_text_layout`, not `editor_text_layout`
+                // — the latter lays out against `rw.rect` verbatim, which
+                // carries a fractional cell origin for a group's
+                // non-origin (right/bottom) pane and was never the
+                // viewport TUI's paint path actually drew into. See that
+                // function's doc for the full mechanism.
+                let (editor, editor_layout) = crate::render::tui_editor_text_layout(rw);
                 let col_in_text = editor_layout.col_at_x(&editor, view_row, col as f32);
 
                 // #817: double-click verdict from the backend's

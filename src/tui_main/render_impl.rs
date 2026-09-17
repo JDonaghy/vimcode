@@ -791,13 +791,53 @@ pub(super) fn render_all_windows(
     windows: &[RenderedWindow],
     theme: &Theme,
 ) {
-    for window in windows {
-        // #550: `window.rect` is already absolute terminal-screen coordinates.
+    // #1039: paint the active window *last*.
+    //
+    // `render_window`'s own `frame: Some(_)` branch below already gates
+    // correctly (it only calls `Frame::set_cursor_position` when
+    // `cursor_position_native` is `Some`, and `render::build_rendered_window`
+    // already only ever gives a non-active `RenderedWindow` a `None` cursor)
+    // — but that branch is dead in the live app today: both call sites of
+    // `render_all_windows` (this module's own live path and
+    // `TuiShellApp::render_content`) pass `frame: None`, so real cursor
+    // placement happens entirely through quadraui's `TuiBackend`, which
+    // caches the *last* `Backend::draw_editor` call's `cursor_position` on
+    // itself (`last_cursor_position`) and applies it to the real `Frame`
+    // once `render_content` returns (see this fn's own doc comment for the
+    // #604 handoff). That cache is overwritten unconditionally on *every*
+    // `draw_editor` call — including ones for inactive windows, which
+    // always report `cursor_position: None` — so whichever window happens
+    // to paint last decides the whole frame's caret, active or not. Since
+    // exactly one window is ever active, and only the active one ever
+    // reports a `Bar`/`Underline` position, painting it last guarantees
+    // its position is the one still standing when the frame's done — no
+    // new state, just reordering against data (`is_active`) already on
+    // `RenderedWindow`. The real fix belongs in quadraui (the cache should
+    // not let a `None` clobber a `Some` within one frame); this is the
+    // vimcode-side workaround pending that. That gap is drafted, ready to
+    // file, in `docs/PENDING_QUADRAUI_ISSUES.md` ("`TuiBackend` lets a
+    // `None` cursor_position clobber a `Some` within one frame", blocks
+    // vimcode#1039); it is not filed yet because filing GitHub issues is a
+    // coordinator/human action this worker session cannot perform
+    // (`git`-only). Once that lands upstream, this partition-and-reorder
+    // becomes redundant (order stops mattering) and can be deleted as a
+    // deliberate follow-up — don't assume it's still needed without
+    // rechecking.
+    let (active, inactive): (Vec<&RenderedWindow>, Vec<&RenderedWindow>) =
+        windows.iter().partition(|w| w.is_active);
+    for window in inactive.into_iter().chain(active) {
+        // #550: `window.rect` is already absolute terminal-screen
+        // coordinates. #1040: this truncation to whole cells is the one
+        // `render::tui_window_paint_rect`/`render::tui_editor_text_layout`
+        // must reproduce exactly for click resolution to agree with what
+        // gets painted — route through the shared helper rather than
+        // repeating the `as u16` formula a second time.
+        let paint_rect = render::tui_window_paint_rect(&window.rect);
         let win_rect = Rect {
-            x: window.rect.x as u16,
-            y: window.rect.y as u16,
-            width: window.rect.width as u16,
-            height: window.rect.height as u16,
+            x: paint_rect.x as u16,
+            y: paint_rect.y as u16,
+            width: paint_rect.width as u16,
+            height: paint_rect.height as u16,
         };
         render_window(backend, frame.as_deref_mut(), win_rect, window, theme);
     }

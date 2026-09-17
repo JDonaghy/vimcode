@@ -191,6 +191,44 @@ impl Engine {
             .any(|id| self.buffer_manager.get(id).is_some_and(|s| s.dirty))
     }
 
+    /// True if some window other than `except_win` still displays `buf_id`.
+    ///
+    /// A dirty buffer can be abandoned in one window/tab as long as another
+    /// window still shows it — the buffer itself isn't going anywhere, so
+    /// there's nothing to lose (`:h E37`). Only when `except_win` is the
+    /// *last* window showing `buf_id` is closing it a real "discard my only
+    /// copy" decision that deserves a confirmation prompt.
+    ///
+    /// This predicate used to be duplicated: the `:q` path
+    /// (`execute.rs`) got it right, but the tab-bar close path
+    /// (`handle_tab_bar_click`'s `CloseTab` arm) never applied it and
+    /// prompted on every view of a dirty buffer, not just the last one
+    /// (#1038). `:q` only ever closes a single window, so a single
+    /// `except_win` is enough for it; see `buffer_has_views_outside` for
+    /// the multi-window case (closing a whole tab).
+    pub fn buffer_has_other_views(&self, buf_id: BufferId, except_win: WindowId) -> bool {
+        self.buffer_has_views_outside(buf_id, std::slice::from_ref(&except_win))
+    }
+
+    /// True if some window outside `excluded` still displays `buf_id`.
+    ///
+    /// Closing an entire tab (`CloseTab`) can destroy more than one window
+    /// at once: an ordinary in-tab split (`split_window`/
+    /// `split_window_with_new_first`) puts a second `Window` on the *same*
+    /// buffer inside the *same* tab, and `close_tab` removes every window
+    /// the tab owns, not just the currently-focused one. Excluding only the
+    /// active window (as `buffer_has_other_views` does) would find that
+    /// sibling split and wrongly conclude another view survives, even
+    /// though it's being destroyed in the very same operation — silently
+    /// discarding the only copy of the dirty buffer (#1038). Callers that
+    /// close more than one window at a time must exclude the *whole* set of
+    /// windows about to disappear.
+    pub fn buffer_has_views_outside(&self, buf_id: BufferId, excluded: &[WindowId]) -> bool {
+        self.windows
+            .values()
+            .any(|w| w.buffer_id == buf_id && !excluded.contains(&w.id))
+    }
+
     /// Compute explorer tree indicators: git status + deduplicated diagnostic counts.
     /// Returns (git_statuses, diag_counts) where:
     /// - git_statuses: canonical path → git status char (M, A, D, R, ?)

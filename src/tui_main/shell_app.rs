@@ -939,7 +939,32 @@ impl TuiShellApp {
     /// `restore_session` is `true` for the production constructor and `false`
     /// for [`TuiShellApp::new_for_test`]; see that method for why skipping the
     /// per-workspace session restore is required for determinism.
-    fn from_engine(mut engine: Engine, file_path: Option<PathBuf>, restore_session: bool) -> Self {
+    ///
+    /// `pub(crate)` (rather than private) since #1043:
+    /// `crate::tui_main::testing::conformance_harness_prod` calls this
+    /// directly on the caller's fixture `Engine` — the *specific* instance a
+    /// scenario built and mutated (e.g. `explorer_visible`,
+    /// `explorer_expanded`) — rather than running it against a throwaway
+    /// `Engine::new_for_test()` and swapping the fixture engine in
+    /// afterwards. Swapping in afterwards was the bug #1043's review caught:
+    /// `set_backend_info` (required before `SidebarSystem::handle_cached`
+    /// does anything, see `render.rs`'s doc on that method) and
+    /// `setup_tui_clipboard` both ran against the discarded throwaway
+    /// engine, leaving the scenario's real engine with unset sidebar
+    /// backend info and no clipboard — invisible today only because no
+    /// `tui_prod` scenario yet touches SC/Ext/Search sidebars or
+    /// yank/paste. Calling this directly on the fixture engine, the same
+    /// way `App::new_headless_with_backend` operates on the caller's actual
+    /// `Engine` rather than a throwaway one, closes that gap: `file_path:
+    /// None, restore_session: false` mirrors [`TuiShellApp::new_for_test`]'s
+    /// own arguments, and `startup_without_session_restore(None)` is a
+    /// no-op when `file_path` is `None` (see `Engine::startup_inner`), so
+    /// this never overwrites whatever state the fixture already set up.
+    pub(crate) fn from_engine(
+        mut engine: Engine,
+        file_path: Option<PathBuf>,
+        restore_session: bool,
+    ) -> Self {
         let msv_metrics = quadraui::MsvLayoutMetrics {
             header_size: 1.0,
             divider_size: 0.0,
@@ -5422,10 +5447,25 @@ mod tests {
     /// special-case in `Self::on_shell_event_ctx`) and re-running — the
     /// `!screen_contains("File")` assertion below fails; the menu row is
     /// still painted after the second, correctly re-located click.
+    ///
+    /// Built with [`TuiShellApp::new_for_test`], not `TuiShellApp::new(None)`
+    /// (#868): the latter is ambient in exactly the way that method's own doc
+    /// comment warns about — `Engine::new()` reads the developer's real
+    /// `~/.config/vimcode/{settings,session}.json`, and a machine that has
+    /// ever opened the explorer has a persisted `explorer_visible: true` that
+    /// boots this app with the sidebar *showing*. This scenario is about the
+    /// hamburger's own reserved-but-contentless sidebar region, so it only
+    /// holds from the "no real panel open" state a fresh checkout and CI
+    /// boot into: with an ambient sidebar already visible the second click
+    /// takes the real-panel path instead and the menu row stays painted,
+    /// which made this test red on a dev box and green in CI. `new_for_test`
+    /// substitutes in-memory `Settings::default()`/`SessionState::default()`
+    /// and skips the per-workspace session restore, so the starting state is
+    /// the same everywhere.
     #[test]
     fn hamburger_relocated_click_after_reveal_hides_menu_bar() {
         let mut driver = driver_with_shell(
-            TuiShellApp::new(None),
+            TuiShellApp::new_for_test(),
             TuiShellApp::shell_config(false),
             80,
             24,
@@ -7603,6 +7643,136 @@ mod tests {
         }
     }
 
+    /// #1038: closing one of *several* views of a dirty buffer must not
+    /// prompt to save/discard — only closing the **last** view should.
+    /// `Engine::dirty()` is buffer-level and has no idea how many windows
+    /// display that buffer, so the tab-bar close path used to prompt on
+    /// every close, however many views remained (the `:q` path already got
+    /// this right; see `execute.rs`'s "quit" handler and the new shared
+    /// `Engine::buffer_has_other_views` helper both now call).
+    ///
+    /// End to end through the real `driver_with_shell` pipeline: a genuine
+    /// mouse click on the painted × closes one group's tab, and the
+    /// assertion reads the **painted screen** (`CLAUDE.md` rule 1) — not
+    /// `engine.dialog.is_some()` — for both the positive case (no dialog,
+    /// one view survives) and the negative case in the same fixture
+    /// (closing the last remaining view still prompts).
+    ///
+    /// Fixture shape borrowed from
+    /// `render_content_paints_group_divider_via_shell_app` below: a short
+    /// scratch buffer split into two editor groups via `open_editor_group`,
+    /// which points the new group's window at the *same* buffer id — the
+    /// same "two views, one buffer" shape #1038 reports.
+    ///
+    /// Built with [`TuiShellApp::new_for_test`], not `TuiShellApp::new(None)`
+    /// (#868): the production constructor reads the developer's real
+    /// `~/.config/vimcode/{settings,session}.json` and restores that
+    /// workspace's session files, so the number of painted `[No Name]` tabs
+    /// this test counts would depend on whose machine it runs on.
+    /// `hide_single_tab` is additionally pinned off regardless of what
+    /// `Settings::default()` says: after the first close only one group
+    /// remains, and with that flag on `is_tab_bar_hidden` would suppress the
+    /// second click's tab bar entirely.
+    ///
+    /// RED-verified: with the `buffer_has_other_views` guard removed from
+    /// `handle_tab_bar_click`'s `CloseTab` arm (i.e. prompting on
+    /// `self.dirty()` alone, the pre-#1038 behaviour), this test fails at
+    /// the first `screen_contains("Unsaved Changes")` assertion — the
+    /// dialog paints after closing the *first* of two views. Restored
+    /// before committing.
+    #[test]
+    fn tab_bar_close_dirty_tab_with_other_view_does_not_confirm_via_shell_app() {
+        let mut app = TuiShellApp::new_for_test();
+        app.engine.settings.hide_single_tab = false;
+        app.engine.buffer_mut().insert(0, "short\n");
+        app.engine.open_editor_group(SplitDirection::Vertical);
+        let buf_id = app.engine.active_buffer_id();
+        app.engine.buffer_manager.get_mut(buf_id).unwrap().dirty = true;
+
+        let mut driver = driver_with_shell(app, config(), 80, 24);
+
+        // Precondition: two groups, both showing the dirty shared buffer,
+        // no dialog yet.
+        let tab_bar_id = quadraui::WidgetId::new(crate::render::EDITOR_TAB_BAR_WIDGET_ID);
+        let starts_before = driver
+            .screen()
+            .lines()
+            .next()
+            .unwrap()
+            .match_indices("[No Name]")
+            .count();
+        assert_eq!(
+            starts_before,
+            2,
+            "precondition: two editor groups must both show the shared \
+             buffer; screen:\n{}",
+            driver.screen()
+        );
+        assert!(
+            !driver.screen_contains("Unsaved Changes"),
+            "precondition: no confirm dialog before any close"
+        );
+
+        // Close one group's only tab through a real click on its painted ×.
+        // With two groups sharing the "tabs:group" widget id, this resolves
+        // to whichever group's bar painted last this frame — it doesn't
+        // matter which, since both show the identical dirty buffer.
+        let (cx, cy) = driver
+            .tab_close_center(&tab_bar_id, 0)
+            .expect("a group's tab bar must have painted tab 0's close button");
+        driver.click(cx, cy);
+
+        assert!(
+            !driver.screen_contains("Unsaved Changes"),
+            "closing one of two views of a dirty buffer must not prompt \
+             (#1038) — the other view can still save it; screen:\n{}",
+            driver.screen()
+        );
+        let starts_after_first = driver
+            .screen()
+            .lines()
+            .next()
+            .unwrap()
+            .match_indices("[No Name]")
+            .count();
+        assert_eq!(
+            starts_after_first,
+            1,
+            "the closed group is gone but the other view of the buffer \
+             must survive; screen:\n{}",
+            driver.screen()
+        );
+
+        // Negative case, same fixture: only one view is left now, so
+        // closing it must still prompt — otherwise deleting the
+        // other-views check entirely would also pass this test.
+        let (cx2, cy2) = driver
+            .tab_close_center(&tab_bar_id, 0)
+            .expect("the surviving group's tab bar must still paint a close button");
+        driver.click(cx2, cy2);
+
+        assert!(
+            driver.screen_contains("Unsaved Changes"),
+            "closing the LAST view of a still-dirty buffer must still \
+             prompt (#1038 negative case); screen:\n{}",
+            driver.screen()
+        );
+        let starts_after_second = driver
+            .screen()
+            .lines()
+            .next()
+            .unwrap()
+            .match_indices("[No Name]")
+            .count();
+        assert_eq!(
+            starts_after_second,
+            1,
+            "the tab must not actually be closed yet — the confirm dialog \
+             intercepts it; screen:\n{}",
+            driver.screen()
+        );
+    }
+
     /// #609: `render_content` must also paint the *group-level* divider
     /// line between split editor groups — `render_group_dividers`, ported
     /// from `draw_frame`'s raw-`Buffer`-read loop to
@@ -7672,6 +7842,203 @@ mod tests {
             "expected the group divider glyph '│' to paint via \
              TuiShellApp::render_content; screen:\n{screen}"
         );
+    }
+
+    /// #1040: clicking in the RIGHT group of a vertical split must land the
+    /// cursor on the exact character clicked, not the one one cell to its
+    /// left.
+    ///
+    /// Root cause: `RenderedWindow::rect`'s x/width come from continuous
+    /// float split math (`quadraui::SplitTree::layout`, zero divider
+    /// thickness) and are not integer-valued in general. At the default
+    /// 50/50 ratio, an *odd* editor content width gives the right pane's
+    /// `rect.x` a `.5`-cell fractional origin (e.g. content width 81 ->
+    /// right `rect.x = 40.5`). TUI's paint path truncates that away before
+    /// drawing (`tui_main::render_impl`'s `win_rect`/`editor_area`, both
+    /// `rect.x as u16`) — so the right pane's text is actually painted
+    /// starting at column 40 — but the *old* click math
+    /// (`render::editor_text_layout`, shared verbatim with GTK, which is
+    /// not itself buggy since GTK's rects really are the sub-pixel
+    /// geometry Cairo paints) fed the raw, untruncated `40.5` into
+    /// `EditorLayout::col_at_x`'s `floor()` division instead. That
+    /// resolves every clicked column one cell short of the real one
+    /// (column 0 clamps to 0 via `.max(0.0)`, correct by luck — matching
+    /// the report's "at least some of the time"). The left pane never
+    /// shows this: its `rect.x` is always the group's own whole-cell
+    /// screen edge, never fractional.
+    ///
+    /// Fixed via `render::tui_editor_text_layout`, which resolves against
+    /// [`crate::render::tui_window_paint_rect`]'s whole-cell-truncated
+    /// viewport — the same one paint actually used — instead of the raw
+    /// `RenderedWindow::rect`. TUI-only: GTK's `gtk/click.rs` callers of
+    /// `editor_text_layout` are untouched.
+    ///
+    /// **Confirmed RED against unfixed `develop`**: with the three TUI
+    /// call sites in `tui_main/mouse.rs` reverted to
+    /// `render::editor_text_layout(rw, 1.0, 1.0)`, this test fails at
+    /// every odd-content-width entry in `WIDTHS` for every marker column
+    /// past the first, with the painted cursor landing exactly one column
+    /// left of the clicked one.
+    ///
+    /// Sweeps several terminal widths — rather than hand-deriving
+    /// vimcode's activity-bar/sidebar reservation arithmetic to predict
+    /// exactly which raw terminal width yields an odd editor content
+    /// width, this tries a spread and requires every one to pass, per the
+    /// issue's "characterise, don't guess" framing — and several columns
+    /// per width. For each column it checks both scenarios the issue asks
+    /// about: the right group already active (its state immediately after
+    /// `open_editor_group`, i.e. a "later" click) and the first click back
+    /// into the right group right after deliberately defocusing to the
+    /// left pane. Both come back identical, which is exactly what the
+    /// root cause above predicts — nothing about this bug is
+    /// focus-dependent, only geometry-dependent.
+    #[test]
+    fn right_group_click_resolves_to_the_clicked_column_via_shell_app() {
+        const WIDTHS: [u16; 6] = [79, 80, 81, 100, 101, 121];
+        const HEIGHT: u16 = 24;
+        const MARKER_WORD: &str = "QWERTYUIOP";
+
+        /// The row `MARKER_WORD` paints on, found by scanning every row for
+        /// one that shows it *exactly twice* (once per pane). This doesn't
+        /// assume a fixed sidebar width/visibility or tab-bar height: the
+        /// explorer sidebar's default is closed, but a prior interactive
+        /// session against this checkout can leave it open showing this
+        /// checkout's own directory tree — as observed while writing this
+        /// test, it also pushes editor content down by an extra row versus
+        /// a clean sidebar-closed run. Locating content by what's actually
+        /// painted sidesteps both instead of hard-coding a row index.
+        fn find_content_row(
+            driver: &quadraui::tui::testing::TuiDriver<impl quadraui::AppLogic>,
+            height: u16,
+            needle: &str,
+        ) -> u16 {
+            let needle_chars: Vec<char> = needle.chars().collect();
+            for y in 0..height {
+                let row = driver.styled_row(y);
+                let chars: Vec<char> = row.iter().map(|&(c, _)| c).collect();
+                let count = chars
+                    .windows(needle_chars.len())
+                    .filter(|w| *w == needle_chars.as_slice())
+                    .count();
+                if count == 2 {
+                    return y;
+                }
+            }
+            panic!(
+                "expected \"{needle}\" painted exactly twice (once per pane) on \
+                 some row within height {height}"
+            );
+        }
+
+        /// The two screen columns where `needle` starts on `row_y` — one per
+        /// pane, left then right. Uses [`quadraui::tui::testing::TuiDriver::
+        /// styled_row`]'s per-*cell* vec, not a `screen()` string index,
+        /// because `screen()` undercounts columns wherever a preceding
+        /// wide glyph (e.g. the explorer's icons) painted — see
+        /// `divider_col_on_row`'s doc below for the same concern.
+        fn needle_starts_on_row(
+            driver: &quadraui::tui::testing::TuiDriver<impl quadraui::AppLogic>,
+            row_y: u16,
+            needle: &str,
+        ) -> (u16, u16) {
+            let row = driver.styled_row(row_y);
+            let chars: Vec<char> = row.iter().map(|&(c, _)| c).collect();
+            let needle_chars: Vec<char> = needle.chars().collect();
+            let starts: Vec<u16> = chars
+                .windows(needle_chars.len())
+                .enumerate()
+                .filter(|(_, w)| *w == needle_chars.as_slice())
+                .map(|(i, _)| i as u16)
+                .collect();
+            match starts.as_slice() {
+                [l, r] => (*l, *r),
+                other => panic!(
+                    "expected \"{needle}\" painted exactly twice on row {row_y}, \
+                     found {}; row: {chars:?}",
+                    other.len()
+                ),
+            }
+        }
+
+        fn painted_cursor_col(
+            driver: &quadraui::tui::testing::TuiDriver<impl quadraui::AppLogic>,
+            width: u16,
+            row_y: u16,
+            cursor_bg: quadraui::tui::testing::Color,
+        ) -> Option<u16> {
+            (0..width).find(|&x| driver.style_at(x, row_y).map(|s| s.bg) == Some(cursor_bg))
+        }
+
+        for &width in &WIDTHS {
+            let mut app = TuiShellApp::new_for_test();
+            app.engine
+                .buffer_mut()
+                .insert(0, &format!("{MARKER_WORD}\n"));
+            app.engine.open_editor_group(SplitDirection::Vertical);
+
+            let theme = Theme::from_name(&app.engine.settings.colorscheme);
+            let cursor_bg =
+                quadraui::tui::ratatui_color(super::quadraui_tui::q_theme(&theme).cursor);
+
+            let mut driver = driver_with_shell(app, config(), width, HEIGHT);
+            // This test's synthetic clicks land close together with no
+            // real wall-clock gap, which would otherwise fold consecutive
+            // same-spot clicks into a double-click (word-select) — turn
+            // that off so every click is a plain single click placing the
+            // cursor at the exact column, as a real user's well-spaced
+            // clicks would.
+            driver.set_double_click_folding(false);
+            driver.render();
+            // Frame zero renders with the *runner*'s `AppShell` default
+            // (`sidebar_visible: true`, showing this checkout's own
+            // directory tree) rather than the shadow `engine.app_shell`'s
+            // setting-derived one (closed) — the two only get synced to
+            // agree inside `TuiShellApp::handle`'s sidebar-visibility sync,
+            // which runs on the first real dispatch. A throwaway `Escape`
+            // (a no-op in Normal mode) forces that sync before this test
+            // starts measuring columns/clicking for real, so the layout it
+            // clicks against is the stable, settings-derived one — not the
+            // one-frame-only runner default that would otherwise flip
+            // (and reflow the whole screen) on whatever the *first real*
+            // click happens to be.
+            driver.press_named(quadraui::NamedKey::Escape);
+            driver.render();
+
+            let content_row = find_content_row(&driver, HEIGHT, MARKER_WORD);
+            let (left_start, right_start) = needle_starts_on_row(&driver, content_row, MARKER_WORD);
+
+            for (k, marker) in MARKER_WORD.chars().enumerate() {
+                let left_col = left_start + k as u16;
+                let right_col = right_start + k as u16;
+
+                // Scenario A: right group already active — the "later click"
+                // case.
+                driver.click(right_col as f32, content_row as f32);
+                driver.render();
+                assert_eq!(
+                    painted_cursor_col(&driver, width, content_row, cursor_bg),
+                    Some(right_col),
+                    "width {width}, marker '{marker}' (col {k}): clicking \
+                     column {right_col} in an already-active right group \
+                     should land the cursor there, not one column to the left"
+                );
+
+                // Scenario B: defocus to the left pane, then click straight
+                // back into the right group — the "first click into a
+                // just-unfocused group" case the issue asks about.
+                driver.click(left_col as f32, content_row as f32);
+                driver.render();
+                driver.click(right_col as f32, content_row as f32);
+                driver.render();
+                assert_eq!(
+                    painted_cursor_col(&driver, width, content_row, cursor_bg),
+                    Some(right_col),
+                    "width {width}, marker '{marker}' (col {k}): the FIRST \
+                     click back into a just-defocused right group should \
+                     also land on column {right_col}"
+                );
+            }
+        }
     }
 
     /// Terminal column of the group divider glyph in one painted row,
@@ -12411,6 +12778,140 @@ mod tests {
             Some((expected.0 + 1, expected.1)),
             "a later frame's draw_editor call must overwrite the previous cursor position"
         );
+    }
+
+    /// #1039 fixture: two editor **groups** (`open_editor_group` —
+    /// VSCode-style split panes — not `:split`'s in-tab window split), each
+    /// showing a *different* file. Distinct files (rather than the same
+    /// buffer split two ways, as `app_with_split_shaped_buffer` uses) mean
+    /// each pane's content is unambiguous on screen: a marker typed into
+    /// one pane can never collide with the other pane's own text, so the
+    /// two tests below can locate it with a plain `TuiDriver::find` instead
+    /// of the split-column arithmetic `focus_change_does_not_move_either_
+    /// panes_text_via_shell_app` needs for a same-buffer split.
+    ///
+    /// `open_editor_group` leaves the *new* (right) group focused — callers
+    /// that want the left group active call `Engine::focus_other_group`
+    /// themselves, exactly as a real `<C-w>w` keybinding would.
+    ///
+    /// Returns the temp dir alongside the app so callers can remove it once
+    /// the driver built from the app is done with it.
+    fn app_with_two_file_groups(tag: &str) -> (TuiShellApp, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_test_1039_{tag}_{:?}",
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_left = dir.join("left1039.txt");
+        let file_right = dir.join("right1039.txt");
+        std::fs::write(&file_left, "left file\n").unwrap();
+        std::fs::write(&file_right, "right file\n").unwrap();
+
+        let mut app = TuiShellApp::new(None);
+        app.engine
+            .open_file_with_mode(&file_left, crate::core::engine::OpenMode::Permanent)
+            .unwrap();
+        app.engine.open_editor_group(SplitDirection::Vertical);
+        // `open_editor_group` focuses the new (right) group, so this opens
+        // into the right pane only — the left pane keeps showing file_left.
+        app.engine
+            .open_file_with_mode(&file_right, crate::core::engine::OpenMode::Permanent)
+            .unwrap();
+        (app, dir)
+    }
+
+    /// #1039 acceptance, painted-output tier: with two editor groups open
+    /// and the **left** one focused, insert mode's `Bar` cursor must land
+    /// inside the left pane — not vanish, and not land in the right pane.
+    ///
+    /// Root cause (see the issue): quadraui's `TuiBackend` caches the most
+    /// recent `Backend::draw_editor` call's cursor position on itself and
+    /// applies it to the real `Frame` once the frame's done painting, but
+    /// that cache is overwritten unconditionally on *every* `draw_editor`
+    /// call in the frame — including calls for inactive windows, which
+    /// always report `cursor_position: None`. `render_all_windows` used to
+    /// paint windows in a fixed (layout) order regardless of which one was
+    /// active, so painting the left pane (active here) *before* the right
+    /// pane (inactive) meant the right pane's `None` clobbered the left
+    /// pane's real position last — no caret at all, anywhere.
+    ///
+    /// RED against unfixed develop (confirmed by hand, reverting
+    /// `render_all_windows`'s active-last reordering back to plain
+    /// iteration order): `driver.terminal_cursor_position()` comes back
+    /// `None` instead of `Some(expected)`, because the left pane is
+    /// `window_rects`' first entry and the right pane paints after it.
+    #[test]
+    fn insert_mode_bar_cursor_focuses_left_group_of_split_via_shell_app() {
+        const MARKER: &str = "ZQXW_LEFT_1039";
+
+        let (mut app, dir) = app_with_two_file_groups("left");
+        app.engine.focus_other_group(); // right -> left (only two groups)
+
+        let mut driver = driver_with_shell(app, config(), 160, 30);
+        driver.type_char('i'); // Normal -> Insert, Bar cursor shape.
+        for c in MARKER.chars() {
+            driver.type_char(c);
+        }
+
+        let (marker_x, marker_y) = driver
+            .find(MARKER)
+            .expect("left-group marker should be visible on screen");
+        let marker_col = (marker_x - 0.5).round() as u16;
+        let expected = (
+            marker_col + MARKER.chars().count() as u16,
+            (marker_y - 0.5).round() as u16,
+        );
+
+        assert_eq!(
+            driver.terminal_cursor_position(),
+            Some(expected),
+            "the focused left group's Bar cursor should reach the terminal \
+             frame, not be clobbered by the unfocused right group's paint; \
+             screen:\n{}",
+            driver.screen()
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1039 acceptance, mirror case: same fixture, **right** group
+    /// focused (the default after `open_editor_group`, so no explicit
+    /// focus change needed here) — the caret must land in the right pane.
+    /// Paired with `insert_mode_bar_cursor_focuses_left_group_of_split_
+    /// via_shell_app` above so a fix that just hardcodes "paint window 0
+    /// last" or "first window always wins" can't pass both.
+    #[test]
+    fn insert_mode_bar_cursor_focuses_right_group_of_split_via_shell_app() {
+        const MARKER: &str = "ZQXW_RIGHT_1039";
+
+        let (app, dir) = app_with_two_file_groups("right");
+        // `app_with_two_file_groups` already leaves the right group active.
+
+        let mut driver = driver_with_shell(app, config(), 160, 30);
+        driver.type_char('i');
+        for c in MARKER.chars() {
+            driver.type_char(c);
+        }
+
+        let (marker_x, marker_y) = driver
+            .find(MARKER)
+            .expect("right-group marker should be visible on screen");
+        let marker_col = (marker_x - 0.5).round() as u16;
+        let expected = (
+            marker_col + MARKER.chars().count() as u16,
+            (marker_y - 0.5).round() as u16,
+        );
+
+        assert_eq!(
+            driver.terminal_cursor_position(),
+            Some(expected),
+            "the focused right group's Bar cursor should reach the terminal \
+             frame; screen:\n{}",
+            driver.screen()
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// #603 acceptance: once the command palette is open
@@ -17373,6 +17874,30 @@ mod tests {
         colors
     }
 
+    /// The minimap strip's real width **in braille cells**, measured off
+    /// the painted frame (the widest run of braille glyphs on any row,
+    /// blank `\u{2800}` cells included — those are cells the rasteriser
+    /// touched too) rather than recomputed from
+    /// `render::minimap_reserved_width`'s formula.
+    ///
+    /// Multiplied by `render::MINIMAP_COLS_PER_CELL` this is exactly the
+    /// range of *source character columns* the strip can represent, since
+    /// quadraui's TUI rasteriser maps one braille dot column to one source
+    /// column at a fixed scale (`braille_char_for_cell`'s
+    /// `cols_per_dot = (COLS_PER_CELL / 2).max(1)`, i.e. 1) — see
+    /// [`minimap_paints_syntax_colour_for_indented_code`]'s doc.
+    fn minimap_strip_width_cells(screen: &str) -> usize {
+        screen
+            .lines()
+            .map(|line| {
+                line.chars()
+                    .filter(|c| ('\u{2800}'..='\u{28FF}').contains(c))
+                    .count()
+            })
+            .max()
+            .unwrap_or(0)
+    }
+
     /// A `TuiShellApp` with the ambient panel state pinned so the minimap
     /// strip's geometry is the same on every machine — same reasoning as
     /// [`app_with_split_shaped_buffer`]'s own doc comment.
@@ -17633,14 +18158,57 @@ mod tests {
     fn minimap_colors_for_indent(
         indent: usize,
     ) -> (std::collections::HashMap<String, usize>, usize, String) {
+        minimap_colors_for_fixture(indent, "colour990.rs")
+    }
+
+    /// The theme-default foreground the TUI rasteriser falls back to for a
+    /// minimap cell with no aggregated syntax span behind it
+    /// (`quadraui::tui::minimap::cell_color`'s `unwrap_or(default_fg)`,
+    /// where `default_fg` is the painting theme's own `foreground`).
+    ///
+    /// **Measured, not hardcoded**, and measured through the same painted
+    /// frame every other assertion here reads: the identical fixture in a
+    /// `.txt` file, which tree-sitter does not highlight at all, so *every*
+    /// dot it paints is by construction a fallback dot. That keeps the
+    /// "this dot carries its own syntax colour, not the fallback"
+    /// assertions below theme-independent — they never name an RGB triple,
+    /// exactly as [`minimap_dot_fg_colors`]'s own doc requires — and it is
+    /// what makes them falsifiable: the #990 symptom was a strip painted
+    /// **entirely** in this one colour.
+    fn minimap_fallback_dot_color() -> String {
+        let (colors, highlights, screen) = minimap_colors_for_fixture(0, "colour990.txt");
+        assert_eq!(
+            highlights, 0,
+            "probe precondition: the `.txt` fixture must produce no \
+             highlights at all, or its painted colours are not purely \
+             fallback ones; screen:\n{screen}"
+        );
+        assert_eq!(
+            colors.len(),
+            1,
+            "probe precondition: an unhighlighted buffer must paint every \
+             minimap dot in exactly one colour (the theme fallback); got \
+             {colors:?}; screen:\n{screen}"
+        );
+        colors.into_keys().next().expect("length checked above")
+    }
+
+    /// Shared body of [`minimap_colors_for_indent`] and
+    /// [`minimap_fallback_dot_color`] — `name`'s extension is what decides
+    /// whether tree-sitter highlights the fixture, and therefore whether
+    /// the painted dots can carry a syntax colour at all.
+    fn minimap_colors_for_fixture(
+        indent: usize,
+        name: &str,
+    ) -> (std::collections::HashMap<String, usize>, usize, String) {
         let dir = std::env::temp_dir().join(format!(
-            "vimcode_test_990_minimap_colour_{}_{:?}_{indent}",
+            "vimcode_test_990_minimap_colour_{}_{:?}_{indent}_{name}",
             std::process::id(),
             std::thread::current().id()
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let file = dir.join("colour990.rs");
+        let file = dir.join(name);
         let pad = " ".repeat(indent);
         let text: String = (0..100)
             .map(|i| format!("{pad}let value_{i} = 1;\n"))
@@ -17673,60 +18241,159 @@ mod tests {
         (colors, n_highlights, screen)
     }
 
-    /// #990 deliverable 3 — the minimap paints **no** colour for indented
-    /// code. Diagnosed here; the cause is **vimcode's**, not quadraui's.
+    /// #990 deliverable 3, fixed by **#1030**. Originally diagnosed as
+    /// vimcode's own (`render::build_minimap_data` handed
+    /// `quadraui::aggregate_spans` a `MinimapGrid` with a hardcoded
+    /// `cols: MINIMAP_SPAN_COLS` (200) covering character columns 0..400,
+    /// while the TUI strip is only ~11 cells wide) — but that diagnosis
+    /// turned out to be a red herring: `cols: 200` never dropped anything
+    /// the strip's own paint loop would have read anyway (200 cells ⊇ 11),
+    /// so resizing it changes only how much unreachable aggregation work
+    /// happens, never what gets painted. `render::build_minimap_data` still
+    /// derives the grid from the painted strip's own width now (#1030) —
+    /// legitimate cleanup, not the fix.
     ///
-    /// # Diagnosis
+    /// # What was actually entangled
     ///
-    /// The issue listed four candidates. Measured against unfixed
-    /// `develop`, with a 100-line `.rs` buffer whose every line is
-    /// `let value_N = 1;` indented by a varying number of spaces:
+    /// Colour lookup (`quadraui::tui::minimap::cell_color`) was *always*
+    /// literal: cell `col` reads real character columns
+    /// `col*COLS_PER_CELL..(col+1)*COLS_PER_CELL`, clipped to the strip's
+    /// own `width_cells` — unaffected by anything vimcode's grid contains.
+    /// The actual bug was quadraui#993: dot rendering
+    /// (`braille_char_for_cell`) normalised each line by its *own*
+    /// `chars.len()`, so a deeply-indented line's content was stretched to
+    /// fill the *entire* visible strip regardless of its real column —
+    /// every cell painted *some* dot. Colour's literal lookup found no
+    /// aggregated span that far out and fell back to the theme default, so
+    /// every one of those stretched-into-view dots painted in the same
+    /// fallback colour: `colors.len() == 1` for any indent past the
+    /// strip's real width (measured against unfixed `develop`, a 100-line
+    /// `.rs` buffer of `let value_N = 1;` indented by 0/8/20/40/80 spaces:
+    /// 5/3/2/1/1 distinct colours — the collapse tracked how much of each
+    /// line's *stretched* content still overlapped literal columns
+    /// 0..~22, not real indentation at all).
     ///
-    /// | indent | tree-sitter highlights | distinct painted dot colours |
-    /// |---|---|---|
-    /// | 0  | 400 | 5 |
-    /// | 8  | 400 | 3 |
-    /// | 20 | 400 | 2 |
-    /// | 40 | 400 | **1** (the fallback only) |
-    /// | 80 | 400 | **1** (the fallback only) |
+    /// quadraui#993's fix (landed in the `rev` #1030 also bumps) made
+    /// `braille_char_for_cell` literal too — clipped, not stretched, at
+    /// exactly the same `width_cells * COLS_PER_CELL` boundary colour
+    /// already used. Dots and colour now agree: a line indented past the
+    /// strip's real width paints **no** dots at all (nothing to colour),
+    /// rather than stretched-but-wrongly-coloured ones.
     ///
-    /// * Candidate 1 (*`buffer_state.highlights` is empty under the TUI*)
-    ///   is **disproven** — 400 highlights in every row of that table, and
-    ///   the colour count still collapses to 1. The test below asserts the
-    ///   highlight count is non-zero explicitly and ungated, so this stays
-    ///   disproven rather than re-guessed.
-    /// * Candidate 2 (*sampling drops spans*) is real but secondary — it
-    ///   makes colour *sparse* on long files (measured: ~68% fallback cells
-    ///   on a deliberately sparse 19 000-line fixture), never absent.
-    /// * Candidate 4 (*grid granularity mismatch*) matches the measured
-    ///   cutoff exactly, and is **vimcode-side**:
-    ///   `render::build_minimap_data` hands `quadraui::aggregate_spans` a
-    ///   `MinimapGrid` with a hardcoded `cols: MINIMAP_SPAN_COLS` (200) and
-    ///   `cols_per_cell: 2` — a 200-cell colour grid covering character
-    ///   columns 0..400 — while the TUI strip the rasteriser paints is only
-    ///   ~12 cells wide. Only grid cells 0..~12 are ever consulted, i.e.
-    ///   character columns 0..~24. Every span on a line indented past that
-    ///   lands in a grid cell nothing reads, which is precisely the
-    ///   observed monotonic collapse and its cutoff between indent 20 and
-    ///   indent 40. Real source is nested, so in practice nearly every
-    ///   token is past the cutoff — hence "no colouring".
+    /// # What this scenario asserts, and where it stops
     ///
-    /// The fix therefore belongs in vimcode (derive the grid's `cols` /
-    /// `cols_per_cell` from the strip's actual painted width instead of a
-    /// fixed 200), and is **not** attempted here: this issue is test-only,
-    /// and the entangled quadraui#993 defect above means the dots and the
-    /// colours are on two different horizontal scales until that lands too.
-    /// Filed separately as a vimcode issue.
+    /// Measured on the pinned rev at 100x24 (this test's own fixture: 100
+    /// lines of `let value_N = 1;` at a given indent, 400 highlights
+    /// throughout), the strip is **11 braille cells** wide and therefore
+    /// represents source columns `0..22` — one dot column per source
+    /// column, fixed scale. Distinct painted dot colours by indent:
     ///
-    /// **RED against unfixed `develop`:** confirmed by running this
-    /// scenario with its `KNOWN_BUGS` entry removed — the gated assertion
-    /// fails with `the minimap must paint more than one distinct
-    /// foreground colour … got 1`.
+    /// ```text
+    /// indent   0   4   8  12  16  18  20 | 22  24  28  40  80
+    /// colours  5   5   3   2   2   1   1 |  0   0   0   0   0
+    /// dot rows 20  20  20  20  20  20  20|  0   0   0   0   0
+    /// ```
+    ///
+    /// Two separate properties fall out of that, and this test asserts
+    /// both:
+    ///
+    /// 1. **Inside the strip's own column range, colour survives at every
+    ///    depth — not just near column 0.** The shrinking count is not a
+    ///    colour failure: it is the *visible window of the line* shrinking
+    ///    as indentation pushes content right (fewer tokens left in view,
+    ///    each still painted in its own colour). The assertion below is
+    ///    therefore not "N distinct colours" but the property that
+    ///    discriminates against #990's actual symptom: at every indent up
+    ///    to and including the deepest one the strip can show, at least one
+    ///    painted dot carries a real **syntax** colour rather than the
+    ///    theme fallback ([`minimap_fallback_dot_color`], measured, not
+    ///    hardcoded). #990's symptom was a strip painted *entirely* in that
+    ///    fallback.
+    /// 2. **The cut-off is exactly the strip's own width**, derived here as
+    ///    `minimap_strip_width_cells * render::MINIMAP_COLS_PER_CELL`, not
+    ///    a hardcoded 22/24. Indent `covered - 2` still paints; indent
+    ///    `covered` paints nothing at all. That pins the boundary from both
+    ///    sides, so neither a narrower strip nor a rasteriser that resumed
+    ///    stretching could slip through.
+    ///
+    /// # ⚠️ #1030 deliverable 2 is met on GTK, NOT on TUI, and is left open
+    ///
+    /// Issue #1030's written deliverable 2 says "colour must survive at
+    /// indent 40 and 80, not only near column 0". On **GTK that holds
+    /// literally and is asserted** —
+    /// `gtk::testing::minimap::minimap_paints_distinct_syntax_colors_at_indentation_via_gtk_driver`
+    /// measures 7 distinct painted colours at indents 0, 20, 40 *and* 80,
+    /// because GTK's strip is 120px wide and its rasteriser paints one 1px
+    /// block per character column out to `COLUMN_CAPACITY` (120).
+    ///
+    /// On **TUI** property 1 above is as far as it is achievable, and the
+    /// gap is **not** a vimcode defect and **not** something this test is
+    /// entitled to redefine away: the TUI strip physically represents 22
+    /// source columns (11 cells x 2), because quadraui's TUI rasteriser
+    /// hardcodes
+    /// `COLS_PER_CELL = 2` with `cols_per_dot = (COLS_PER_CELL / 2).max(1)`
+    /// = **1 source column per dot column** in both
+    /// `braille_char_for_cell` and `cell_color`. Nothing vimcode passes in
+    /// — including the `MinimapGrid` this issue resized — can change that,
+    /// and the vimcode-side alternative (raise
+    /// `render::MINIMAP_TARGET_COLS_TUI` from 12 cells to the 60 needed to
+    /// cover GTK's/VS Code's 120 columns) would hand 60 of an 80-column
+    /// terminal to the minimap, which is not a real option.
+    ///
+    /// The missing upstream API — an optional *shared* horizontal scale, so
+    /// a narrow braille strip can represent N source columns per dot
+    /// column without reintroducing quadraui#993's per-line normalisation —
+    /// is drafted in full in `docs/PENDING_QUADRAUI_ISSUES.md` ("TUI
+    /// minimap has no horizontal downsampling"). Per the Platform-Neutrality
+    /// Rule it is quadraui's to build, and per `GOALS.md`'s
+    /// milestone-discipline rule #1030's deliverable 2 stays **open behind
+    /// it** — the coordinator/human owns either filing that issue and
+    /// amending #1030's acceptance text to match the clip-not-stretch
+    /// behaviour verified here, or explicitly waiving the deliverable. This
+    /// test does not silently assert the deliverable away: the assertion
+    /// that a line past the boundary paints nothing carries that pointer,
+    /// so the unmet deliverable is findable by grep from the code that
+    /// depends on it.
+    ///
+    /// **RED against unfixed `develop`:** confirmed twice — by the original
+    /// fix round and again, on this exact test body, in fix iteration 2 — by
+    /// pointing `Cargo.toml`'s `rev` back at the unbumped pin
+    /// (`ed402b4ae0d9b753279bebe1bba4284dbe515d8a`, pre-quadraui#993) and
+    /// re-running `cargo test --no-default-features --lib
+    /// minimap_paints_syntax_colour_for_indented_code`. Property **2** is
+    /// the discriminator, and it fails at the very first past-boundary
+    /// indent:
+    ///
+    /// ```text
+    /// indent 22 is past the strip's own 22-column range (11 braille cells
+    /// x 2 columns), so it must paint NO dots at all — not dots stretched
+    /// into view (quadraui#993) and painted in a fallback colour that does
+    /// not belong to them. 400 highlights exist for this buffer. Got 1
+    /// distinct colour(s) on painted dots: {"Rgb(229, 229, 229)": 100}
+    /// ```
+    ///
+    /// — `Rgb(229, 229, 229)` is exactly the fallback colour
+    /// [`minimap_fallback_dot_color`] measures, and the painted strip in
+    /// that failure's screen dump reads `⠀⠀⠀⠀⠀⠀⣿⣿⣿⣿⣿` on all 20 rows:
+    /// 100 fully-set dot cells with nothing real behind them, stretched in
+    /// from a line whose content starts 22 columns off the right edge of an
+    /// 11-cell strip, against the `0` asserted now.
+    ///
+    /// Property **1** is *not* the discriminator and is not claimed to be:
+    /// it passes against the old pin too (stretching happened to leave real
+    /// tokens overlapping literal columns `0..22` at these indents). It is
+    /// there to stop the opposite regression — a future change that makes
+    /// the strip paint nothing, or paint only fallback dots, inside its own
+    /// column range — and to hold the achievable half of deliverable 2.
     #[test]
     fn minimap_paints_syntax_colour_for_indented_code() {
-        // Ungated, and the reason this test can't be green for the wrong
-        // reason: un-indented code *is* coloured today, so the probe works
-        // and the gated failure below is about indentation alone.
+        // Ungated (#1030 deleted this scenario's `KNOWN_BUGS` entry, and
+        // fix iteration 2 dropped the now-vestigial `known_bug_gate`
+        // wrapper with it — an unlisted label's gate is just a plain
+        // assertion with extra indirection). The reason it can't be green
+        // for the wrong reason: un-indented code *is* coloured today, so
+        // the probe demonstrably works, and every assertion below is about
+        // indentation alone.
         let (flat_colors, flat_highlights, flat_screen) = minimap_colors_for_indent(0);
         assert!(
             flat_highlights > 0,
@@ -17740,28 +18407,78 @@ mod tests {
              {flat_colors:?}; screen:\n{flat_screen}"
         );
 
-        let (colors, highlights, screen) = minimap_colors_for_indent(40);
-        // Ungated: candidate 1 stays disproven — the highlights are there.
+        let fallback = minimap_fallback_dot_color();
+        let cols_per_cell = crate::render::MINIMAP_COLS_PER_CELL;
+        let strip_cells = minimap_strip_width_cells(&flat_screen);
         assert!(
-            highlights > 0,
-            "precondition: indenting the fixture must not stop tree-sitter \
-             highlighting it (candidate 1 of this issue's diagnosis); got \
-             {highlights} highlights"
+            strip_cells >= 4,
+            "precondition: the minimap strip must be at least 4 braille \
+             cells wide for the indent sweep below to have any depth to \
+             sweep; got {strip_cells}; screen:\n{flat_screen}"
         );
+        let covered = strip_cells * cols_per_cell;
 
-        crate::harness::known_bug_gate(
-            "minimap_paints_syntax_colour_for_indented_code::tui",
-            || {
-                assert!(
-                    colors.len() > 1,
-                    "the minimap must paint more than one distinct foreground \
-                 colour for syntax-highlighted code, even when that code is \
-                 indented ({highlights} highlights exist for this buffer) — \
-                 got {}: {colors:?}; screen:\n{screen}",
-                    colors.len()
-                );
-            },
-        );
+        // Property 1 — colour survives at every depth the strip can show,
+        // right out to its last cell, and is the code's own syntax colour
+        // rather than the theme fallback (#990's symptom).
+        let deepest = covered - cols_per_cell;
+        let mut sweep = vec![0, 4, 8, deepest / 2, deepest];
+        sweep.sort_unstable();
+        sweep.dedup();
+        for indent in sweep {
+            let (colors, highlights, screen) = minimap_colors_for_indent(indent);
+            // Candidate 1 of the issue's diagnosis ("highlights are empty
+            // under the TUI") stays disproven at every depth, ungated.
+            assert!(
+                highlights > 0,
+                "precondition: indenting the fixture by {indent} must not \
+                 stop tree-sitter highlighting it (candidate 1 of this \
+                 issue's diagnosis); got {highlights} highlights"
+            );
+            let syntax_coloured: Vec<&String> = colors.keys().filter(|c| **c != fallback).collect();
+            assert!(
+                !syntax_coloured.is_empty(),
+                "indent {indent} is inside the strip's own {covered}-column \
+                 range ({strip_cells} braille cells x {cols_per_cell} \
+                 columns), so the code painted there must still carry its \
+                 own syntax colour — a strip painted *only* in the theme \
+                 fallback ({fallback}) is #990's symptom. Got {colors:?}; \
+                 screen:\n{screen}"
+            );
+        }
+
+        // Property 2 — and nothing past the strip's own width, in either
+        // direction: clipped, never stretched into view under a fallback
+        // colour that doesn't belong to it.
+        //
+        // ⚠️ This is also where #1030's deliverable 2 ("colour must survive
+        // at indent 40 and 80") stands **unmet and open** — see this test's
+        // doc comment and the drafted upstream issue in
+        // `docs/PENDING_QUADRAUI_ISSUES.md` ("TUI minimap has no horizontal
+        // downsampling"). Do not read this assertion as the deliverable
+        // being satisfied or withdrawn; it is the measurement that shows
+        // the deliverable needs an upstream API vimcode does not have.
+        for indent in [covered, covered + 18, 80] {
+            let (colors, highlights, screen) = minimap_colors_for_indent(indent);
+            assert!(
+                highlights > 0,
+                "precondition: indenting the fixture by {indent} must not \
+                 stop tree-sitter highlighting it (candidate 1 of this \
+                 issue's diagnosis); got {highlights} highlights"
+            );
+            assert!(
+                colors.is_empty(),
+                "indent {indent} is past the strip's own {covered}-column \
+                 range ({strip_cells} braille cells x {cols_per_cell} \
+                 columns), so it must paint NO dots at all — not dots \
+                 stretched into view (quadraui#993) and painted in a \
+                 fallback colour that does not belong to them. \
+                 {highlights} highlights exist for this buffer. Got {} \
+                 distinct colour(s) on painted dots: {colors:?}; \
+                 screen:\n{screen}",
+                colors.len()
+            );
+        }
     }
 
     /// #1008 review: `page_up` (`<C-b>`)'s clamped-scroll cursor landing
