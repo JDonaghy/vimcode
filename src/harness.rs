@@ -3252,8 +3252,19 @@ mod issue_1057_bottom_item_click_toggles_sidebar {
 /// did either), so TUI no longer does either. That only affects a
 /// split-view edge case (which group's tab bar highlights as active while a
 /// *different* group's action-menu popup is open), and aligns TUI with the
-/// behaviour GTK already shipped -- not exercised here since it needs a
-/// split-group fixture and adds no coverage of the actual dispatch rung.
+/// behaviour GTK already shipped -- not exercised here since it's a
+/// highlight-only cosmetic edge case (there is no rendered proxy for "which
+/// group is `engine.active_group`" that isn't itself state, per this repo's
+/// own "assert on rendered output, never on state" testing rule) and adds no
+/// coverage of the actual dispatch rung; worth a tracking issue if it ever
+/// needs to be locked down.
+///
+/// The split-group tab-bar arm itself -- the *other* rung this issue
+/// converged, `mouse.rs`'s `if let Some(ref split) = layout.editor_group_split`
+/// branch -- **is** exercised, by the `split_two_group_fixture`-based
+/// scenarios below: every scenario above builds from `two_tab_fixture()`,
+/// which has a single editor group, so `editor_group_split` is always `None`
+/// for them and only the single-group arm ever runs.
 ///
 /// Registered on `gtk`, `tui` **and** `tui_prod` for the Tab-switch scenario
 /// below (`gtk`/`tui` both wrap the shared `App`, which already routed
@@ -3409,6 +3420,159 @@ mod issue_1059_tab_bar_dispatch_routes_through_shared_click_fn {
                 !driver.screen_has("a1059") && driver.screen_has("BBBB_1059_CONTENT"),
                 "clicking a1059.txt's close button must close it and fall \
                  back to the only remaining tab, b1059.txt, on every backend"
+            );
+        },
+    }
+
+    // ── Split-group coverage (review follow-up) ─────────────────────────
+    //
+    // Every scenario above builds its fixture from `two_tab_fixture()`,
+    // which has exactly one editor group. `render::build_screen_layout`
+    // only produces `Some(editor_group_split)` once `n >= 2` groups exist
+    // (`editor_group_split = (n >= 2).then_some(...)`), so with a single
+    // group `mouse.rs`'s `if let Some(ref split) = layout.editor_group_split`
+    // branch -- the *split*-group tab-bar arm, the other rung #1059 routed
+    // through `click::dispatch_tab_bar_target` -- is never entered; only the
+    // single-group arm below it runs. That left the split-group rung
+    // "asserted, not verified": a future typo, wrong `idx`, or a hand-rolled
+    // shortcut reintroduced for that branch only would compile and pass every
+    // test above without being caught, reproducing the exact #1025 "one rung
+    // shared, one hand-rolled, free to drift" shape this issue exists to
+    // close -- for the one rung this issue's own fix touches that had no
+    // execution coverage at all.
+    //
+    // `split_two_group_fixture` below gives `editor_group_split` a genuine
+    // `Some` by opening a second editor group, so a click aimed at the
+    // *non-active* (left) group's tab bar row is hit-tested and dispatched by
+    // the split branch specifically.
+    fn split_two_group_fixture() -> crate::core::Engine {
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_test_1059_split_tab_bar_dispatch_{:?}",
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let left_a = dir.join("left_a1059.txt");
+        let left_b = dir.join("left_b1059.txt");
+        let right = dir.join("right1059.txt");
+        std::fs::write(&left_a, "AAAA_LEFT_1059_CONTENT\n").unwrap();
+        std::fs::write(&left_b, "BBBB_LEFT_1059_CONTENT\n").unwrap();
+        std::fs::write(&right, "RIGHT_1059_CONTENT\n").unwrap();
+
+        let mut engine = crate::core::Engine::new_for_test();
+        engine.settings.use_nerd_fonts = Some(false);
+        engine.settings.minimap = false;
+
+        // Left group: two file-backed tabs, mirroring `two_tab_fixture`'s
+        // shape -- `left_a1059.txt` ends up inactive (index 0),
+        // `left_b1059.txt` active (index 1).
+        engine.new_tab(Some(&left_a));
+        engine.new_tab(Some(&left_b));
+        engine.goto_tab(0); // the seeded scratch tab
+        engine.close_tab();
+        engine.goto_tab(1); // left_b1059.txt active; left_a1059.txt is not
+
+        // Split: `open_editor_group` makes the new group active and seeds it
+        // with a duplicate window onto the buffer that was active in the
+        // left group (`left_b1059.txt`'s buffer). Add the real
+        // `right1059.txt` tab, then close that duplicate so the right group
+        // ends up with exactly one, distinctly-content-tagged tab -- keeping
+        // "which content belongs to which group" unambiguous for
+        // `screen_has` assertions below.
+        engine.open_editor_group(crate::core::window::SplitDirection::Vertical);
+        engine.new_tab(Some(&right));
+        engine.goto_tab(0);
+        engine.close_tab();
+
+        engine
+    }
+
+    // ── Split-group Tab arm ──────────────────────────────────────────────
+    // Click the *inactive* tab (`left_a1059.txt`) in the *non-active* (left)
+    // group's tab bar, while the right group holds global focus. Resolves to
+    // `TabBarClickTarget::Tab`, dispatched by the *split*-group arm in
+    // `mouse.rs` (the `if let Some(ref split) = layout.editor_group_split`
+    // branch) rather than the single-group arm every scenario above
+    // exercises.
+    //
+    // `size: (1600, 480)`, twice every other scenario in this module: at
+    // 800 wide, halving the editor area across two groups (minus the
+    // sidebar) left too little room for a full two-tab strip in the left
+    // group on `gtk` -- `left_a1059.txt`'s label never painted at all (only
+    // its breadcrumb copy did), confirmed by dumping `driver.inventory()`
+    // before settling on this width. 1600 gives each group's tab bar the
+    // same effective room `two_tab_fixture`'s single, unsplit group gets at
+    // 800.
+    crate::backend_conformance! {
+        label: split_tab_bar_click_switches_via_shared_dispatch,
+        backends: [gtk, tui, tui_prod],
+        engine: split_two_group_fixture(),
+        size: (1600, 480),
+        body: |driver| {
+            assert!(
+                driver.screen_has("BBBB_LEFT_1059_CONTENT")
+                    && !driver.screen_has("AAAA_LEFT_1059_CONTENT")
+                    && driver.screen_has("RIGHT_1059_CONTENT"),
+                "precondition: left_b1059.txt is active in the left group, \
+                 left_a1059.txt is not, and the right group's own tab is \
+                 unaffected"
+            );
+
+            driver.drag_text("left_a1059", "left_a1059");
+            assert!(
+                driver.screen_has("AAAA_LEFT_1059_CONTENT")
+                    && !driver.screen_has("BBBB_LEFT_1059_CONTENT"),
+                "clicking left_a1059.txt's label in the split (non-active) \
+                 group's tab bar must switch to it, on every backend"
+            );
+            assert!(
+                driver.screen_has("RIGHT_1059_CONTENT"),
+                "switching tabs in the left group must never disturb the \
+                 right group's own content"
+            );
+        },
+    }
+
+    // ── Split-group CloseTab arm ──────────────────────────────────────────
+    // Click the *inactive* tab's (`left_a1059.txt`) close button directly, in
+    // the non-active (left) group's tab bar. Resolves to
+    // `ClickTarget::CloseTab`, which -- same as the single-group scenario
+    // above -- `dispatch_tab_bar_target` deliberately leaves unapplied for
+    // the caller; `mouse.rs`'s split-group arm makes the
+    // `Engine::handle_tab_bar_click` call that decides confirm vs. close.
+    //
+    // No `tui` arm, for the same reason `tab_bar_click_closes_via_shared_dispatch`
+    // above has none: a close-button click resolves as a plain tab-select on
+    // `tui` (`App` + `quadraui::tui::TuiBackend`'s own generic `TabBar`
+    // widget hit-test), independent of which group the tab bar belongs to.
+    // See that scenario's doc comment for the full call-out; the same
+    // quadraui-side gap applies here unchanged.
+    crate::backend_conformance! {
+        label: split_tab_bar_click_closes_via_shared_dispatch,
+        backends: [gtk, tui_prod],
+        engine: split_two_group_fixture(),
+        // Same `(1600, 480)` widening as `split_tab_bar_click_switches_via_shared_dispatch`
+        // above, for the same reason: full width for the left group's
+        // two-tab strip to actually paint on `gtk`.
+        size: (1600, 480),
+        body: |driver| {
+            assert!(
+                driver.screen_has("left_a1059") && driver.screen_has("left_b1059"),
+                "precondition: both left-group tabs are painted"
+            );
+
+            let (cx, cy) = tab_close_button_center(driver, "left_a1059");
+            driver.drag(cx, cy, cx, cy);
+            assert!(
+                !driver.screen_has("left_a1059") && driver.screen_has("BBBB_LEFT_1059_CONTENT"),
+                "clicking left_a1059.txt's close button in the split \
+                 (non-active) group's tab bar must close it and fall back to \
+                 the only remaining tab in that group, left_b1059.txt"
+            );
+            assert!(
+                driver.screen_has("RIGHT_1059_CONTENT"),
+                "closing a tab in the left group must never disturb the \
+                 right group's own content"
             );
         },
     }
