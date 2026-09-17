@@ -3898,3 +3898,196 @@ mod issue_1059_tab_bar_dispatch_routes_through_shared_click_fn {
         },
     }
 }
+
+/// #1064 (GOALS.md's 2026-09-16 audit, #1044, wave 2 item 12):
+/// `quadraui::ShellApp::take_requested_panel` was unoverridden on `App` —
+/// the trait default always returns `None` — so `ShellAdapter::
+/// apply_requested_panel` (polled once after every `handle()`/`tick()`
+/// dispatch) never saw a switch to apply on GTK, no matter what the engine
+/// did to its own `app_shell`/`ext_panel_active`.
+///
+/// The gap only shows up for an **app-initiated** panel switch — one the
+/// engine makes on its own, with no runner click involved
+/// (`Engine::process_pending_sidebar`'s DAP `dap_wants_sidebar` reveal, or
+/// `App::toggle_focus_explorer`/`App::toggle_focus_search`'s keyboard
+/// accelerators, are the production callers). `App::render_content` paints
+/// the sidebar's *content* from `engine.app_shell`/`engine.ext_panel_active`
+/// directly (the shadow), so that part always painted correctly. But the
+/// runner's own chrome — the sidebar-header title `quadraui::AppShell::
+/// render` paints from **its own**, entirely separate, `active_panel()` —
+/// has no channel to learn about the switch other than a click hit-test or
+/// this poll, so it silently kept showing the previous panel's title
+/// forever. `screen_has("EXPLORER")`/`screen_has("SEARCH")` are safe proxies
+/// for that title specifically: neither literal all-caps string appears
+/// anywhere in either panel's own painted *content* (checked directly —
+/// `render.rs`/`tui_main/panels.rs` have no such literals), only in the
+/// `PanelDefinition::title` fields `Engine::new` seeds the shadow
+/// `app_shell` with, which `quadraui::AppShell::render` echoes into the
+/// header.
+///
+/// `TuiShellApp::take_requested_panel` already had this override — the
+/// `tui`/`tui_prod` arms below both stay green throughout, proving `App`'s
+/// new override converges on the same contract rather than merely doing
+/// *something* plausible in isolation (this issue's "Proving it actually
+/// converged" section). `tui_prod`'s own arm can't reach the trigger the
+/// `gtk`/`tui` arms use below (a direct `engine.focus_sidebar_panel` call
+/// through `ConformanceHarness::engine` — `conformance_harness_prod`'s own
+/// doc: that field is a disconnected placeholder for this arm, since
+/// `TuiShellApp` owns its `Engine` directly, not behind a shared `Rc`), so
+/// it drives the identical reconciliation through the Search-focus panel
+/// accelerator instead — see its own doc below for why that is a
+/// genuinely equivalent trigger, not a weaker substitute.
+///
+/// Verified RED against unfixed `develop`: deleting `App`'s
+/// `take_requested_panel` override (falling back to the trait default
+/// `None`) turns only the `gtk` arm red — the header stays on "EXPLORER"
+/// forever after the direct `focus_sidebar_panel(PANEL_SEARCH)` call below,
+/// while `tui`/`tui_prod` stay green (TUI's own override was never
+/// touched). Restored after confirming red.
+#[cfg(test)]
+mod issue_1064_take_requested_panel {
+    use super::*;
+    use crate::core::engine::sidebar::PANEL_SEARCH;
+
+    fn engine_fixture() -> crate::core::Engine {
+        let mut engine = crate::core::Engine::new_for_test();
+        engine.settings.use_nerd_fonts = Some(false);
+        engine
+    }
+
+    /// Shared by the `gtk` and `tui` arms below — both wrap the shared
+    /// `App` this issue's fix touches, and both hand back a *live*
+    /// `ConformanceHarness::engine` (an `Rc<RefCell<Engine>>` shared with
+    /// the running app), which is exactly what this scenario needs to
+    /// simulate an app-initiated switch: reaching in and moving the shadow
+    /// `engine.app_shell` directly, with no runner click at all.
+    fn app_initiated_switch_reconciles_runner_chrome<D>(
+        driver: &mut D,
+        engine: &std::rc::Rc<std::cell::RefCell<crate::core::Engine>>,
+    ) where
+        D: ConformanceDriver + DriverInput,
+    {
+        // `Engine::new_for_test()`'s `AppShell` (and the runner's own,
+        // built from the same panel list in `App::shell_config`) both
+        // start with the sidebar already open on Explorer — the default
+        // active panel (index 0) with `sidebar_visible() == true` — so
+        // shadow and runner already agree before anything below runs; the
+        // switch below is the *only* variable under test. (Clicking the
+        // Explorer icon here, as the other panel-open scenarios in this
+        // file do for their own non-default target panel, would instead
+        // *close* it — `AppShell::handle_activity_click`'s own "click on
+        // the already-active, already-visible panel" branch.)
+        assert!(
+            driver.screen_has("EXPLORER"),
+            "precondition: a fresh engine must start with the sidebar \
+             open on Explorer"
+        );
+
+        // App-initiated switch: touches only the shadow `engine.app_shell`,
+        // the same shape `Engine::process_pending_sidebar`'s DAP
+        // `dap_wants_sidebar` reveal and `App::toggle_focus_search`'s
+        // keyboard accelerator both take — no runner click, so no chance
+        // for `AppShell::handle`'s own hit-testing to update the runner's
+        // chrome on its own.
+        engine.borrow_mut().focus_sidebar_panel(PANEL_SEARCH);
+
+        // Poke the runner so `ShellAdapter::handle`/`apply_requested_panel`
+        // polls `take_requested_panel` again — the same "direct engine
+        // mutation, then a dispatch to force the poll" shape
+        // `TuiShellApp`'s own `take_requested_panel_reconciles_keyboard_
+        // switch_once` unit test uses (`shell_app.rs`), applied here as a
+        // black-box assertion on painted output instead of the
+        // `Option<WidgetId>` `take_requested_panel` returns directly.
+        // `dispatch` repaints on its own whenever the reaction is
+        // `Redraw` (both `GtkDriver`/`TuiDriver`'s own doc), so no
+        // separate `render()` call is needed here — and isn't available
+        // through the `ConformanceDriver + DriverInput` bound anyway.
+        driver.dispatch(quadraui::UiEvent::WindowFocused(true));
+
+        assert!(
+            driver.screen_has("SEARCH") && !driver.screen_has("EXPLORER"),
+            "#1064: an app-initiated panel switch (no runner click) must \
+             steer the runner's own chrome to the new panel — without \
+             `take_requested_panel`, the sidebar-header title stays on the \
+             previous panel forever even though the content pane (reading \
+             the shadow `engine.app_shell` directly) already switched"
+        );
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn gtk() {
+        let mut h = crate::gtk::testing::conformance_harness(engine_fixture(), 800, 480);
+        app_initiated_switch_reconciles_runner_chrome(&mut h.driver, &h.engine);
+    }
+
+    #[test]
+    fn tui() {
+        let mut h = crate::tui_main::testing::conformance_harness(engine_fixture(), 800, 480);
+        app_initiated_switch_reconciles_runner_chrome(&mut h.driver, &h.engine);
+    }
+
+    /// `conformance_harness_prod` wraps the shipped `TuiShellApp`, which
+    /// owns its `Engine` directly rather than behind a shared `Rc` — its
+    /// `ConformanceHarness::engine` is a disconnected placeholder (see that
+    /// constructor's own doc), so the direct-mutation trigger the `gtk`/
+    /// `tui` arms above use has nothing live to reach on this arm.
+    ///
+    /// Dispatching the Search-focus panel accelerator instead reaches the
+    /// identical code shape: `TuiAccelHost::focus_search`
+    /// (`shell_app.rs`) calls `engine.toggle_sidebar_panel(PANEL_SEARCH)`
+    /// directly on the shadow, synchronously inside this one
+    /// `TuiShellApp::handle` dispatch — no runner click, exactly like the
+    /// direct-mutation trigger above. (GTK's own accelerator host instead
+    /// *defers* the equivalent call to `tick()` via `App::
+    /// toggle_focus_search`'s `DeferredAction` queue — `GtkDriver`'s
+    /// headless harness has no way to pump `tick()` at all, per its own
+    /// module doc's "No main loop" limit, which is why the `gtk` arm above
+    /// needs the direct-engine-mutation shape instead of this one.)
+    #[test]
+    fn tui_prod() {
+        let mut h = crate::tui_main::testing::conformance_harness_prod(engine_fixture(), 800, 480);
+        let driver = &mut h.driver;
+
+        // Unlike `App::new_headless_with_backend` (the `gtk`/`tui` arms'
+        // own constructor), `TuiShellApp::from_engine` boots with the
+        // sidebar hidden — Explorer is still the default *active* panel
+        // (index 0), just not visible yet, so one real click reveals it
+        // (`AppShell::handle_activity_click`'s "different panel, or
+        // already-active-but-hidden" branch — see the shared function
+        // above for the mirror-image case, an already-*visible* active
+        // panel, which toggles closed instead).
+        driver.click_text(crate::icons::EXPLORER.s());
+        assert!(
+            driver.screen_has("Explorer"),
+            "precondition: clicking the Explorer icon must open the \
+             sidebar on Explorer via the real runner click path"
+        );
+
+        driver.dispatch(quadraui::UiEvent::Accelerator(
+            quadraui::AcceleratorId::new(crate::render::ACC_FOCUS_SEARCH),
+            quadraui::Modifiers::default(),
+        ));
+
+        // Not `screen_has("Search")`: `TuiShellApp::shell_config`'s own
+        // panel titles are title-case ("Explorer"/"Search"), unlike the
+        // shared `App`'s all-caps `PanelDefinition`s — and the Search
+        // panel's own *content* paints a "Search…" input placeholder
+        // (`render.rs`) regardless of whether the runner's chrome caught
+        // up, so a positive `screen_has("Search")` can't tell the two
+        // apart here (it already passed before this issue's fix, since
+        // the content pane was never the broken half). `!screen_has
+        // ("Explorer")` is the half that's actually diagnostic: the
+        // runner's stale chrome is the only remaining place "Explorer"
+        // could still be painted once the shadow has moved to Search.
+        assert!(
+            !driver.screen_has("Explorer"),
+            "#1064: an app-initiated panel switch (the Search-focus \
+             accelerator, which moves only the shadow `engine.app_shell`, \
+             not the runner's own chrome) must still steer the runner's \
+             sidebar-header title off the previous panel — proving \
+             TuiShellApp's own pre-existing `take_requested_panel` still \
+             agrees with App's new one"
+        );
+    }
+}

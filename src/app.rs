@@ -959,6 +959,35 @@ pub(crate) struct App {
     /// `backend::GtkBackend` (#813) — see that trait's doc comment for why
     /// a bare `Box<dyn quadraui::Backend>` isn't quite enough on its own.
     pub(crate) backend: Rc<RefCell<Box<dyn TextMetricsBackend>>>,
+    /// #1064: what this app believes the **runner's** `AppShell` (the
+    /// `ShellAdapter`-owned instance that paints the activity bar and
+    /// sidebar header — NOT `engine.app_shell`, the shadow copy
+    /// `render_content` reads for panel content) currently has as its
+    /// active panel. Updated only from [`Self::on_shell_event`]'s
+    /// `PanelChanged` notifications — the single channel through which the
+    /// runner reports its own state — and compared against the shadow's
+    /// `active_panel_id()`/`ext_panel_active` in
+    /// [`quadraui::ShellApp::take_requested_panel`] to detect an
+    /// **app-initiated** switch (e.g. `Engine::process_pending_sidebar`'s
+    /// DAP `dap_wants_sidebar` reveal, or the `toggle_focus_explorer`/
+    /// `toggle_focus_search` keyboard accelerators) the runner would
+    /// otherwise never learn about. Mirrors `TuiShellApp::last_shell_panel`
+    /// verbatim — see that field's own doc for the full rationale. Plain
+    /// field, not `Rc`/`RefCell`: `take_requested_panel` and
+    /// [`Self::on_shell_event`] both take `&mut self`, so no interior
+    /// mutability is needed (matching `TuiShellApp`'s own field).
+    pub(crate) last_shell_panel: Option<quadraui::WidgetId>,
+    /// #1064: set by `take_requested_panel` just before it returns `Some`,
+    /// consumed by the `PanelChanged` arm of [`Self::on_shell_event`].
+    /// `ShellAdapter::apply_requested_panel` re-notifies the app with the
+    /// same `PanelChanged` a mouse click produces — but for a
+    /// reconciliation echo the engine *already* holds that state, so the
+    /// echo must only update [`Self::last_shell_panel`] and must NOT
+    /// re-run the click path in `switch_panel`/`draw_needed`, which for an
+    /// already-active `ext:` panel would toggle the sidebar back **off**
+    /// (see `render::apply_activity_panel_switch`'s `already_showing`
+    /// arm). Mirrors `TuiShellApp::suppress_shell_panel_echo`.
+    pub(crate) suppress_shell_panel_echo: bool,
 }
 
 /// Decode an activity bar widget ID into a panel ID for [`App::switch_panel`].
@@ -1640,6 +1669,17 @@ impl App {
             css_provider,
             last_colorscheme,
             backend,
+            // #1064: seeded to `None` rather than the active panel — GTK
+            // has no hamburger `PanelDefinition` (unlike TUI's `AppShell`,
+            // which activates index 0 = hamburger at construction while
+            // the shadow starts on Explorer), so the runner's initial
+            // active panel already matches the shadow's default
+            // (`shell_config`'s `top_panels` come straight from
+            // `engine.app_shell.panels()`). The first `take_requested_panel`
+            // poll still reconciles cleanly from `None`: it just re-applies
+            // whichever panel is already active, a harmless no-op switch.
+            last_shell_panel: None,
+            suppress_shell_panel_echo: false,
         }
     }
 
@@ -8439,6 +8479,55 @@ impl quadraui::ShellApp for App {
         reaction
     }
 
+    /// #1064 (GOALS.md's 2026-09-16 audit, #1044, wave 2 item 12): the
+    /// app-initiated half of the runner ↔ shadow panel sync. Was
+    /// unoverridden on `App` (the trait default always returns `None`), so
+    /// `ShellAdapter::apply_requested_panel` — polled once after every
+    /// `handle()`/`tick()` dispatch — never saw a switch to apply, no
+    /// matter what the engine did to its own `app_shell`/`ext_panel_active`.
+    ///
+    /// The gap: `App::render_content` paints the sidebar's *content* by
+    /// reading `engine.app_shell`/`engine.ext_panel_active` directly (the
+    /// shadow), so a panel switch the engine makes on its own — with no
+    /// runner click involved, e.g. `Engine::process_pending_sidebar`'s DAP
+    /// `dap_wants_sidebar` reveal, or `Self::toggle_focus_explorer`/
+    /// `Self::toggle_focus_search`'s keyboard accelerators — always painted
+    /// the *right* content. But the runner's own chrome (the activity-bar
+    /// highlight, and the sidebar-header title `quadraui::AppShell::render`
+    /// paints from **its own**, entirely separate, `active_panel()`) has no
+    /// other channel to learn about the change — it only ever moves in
+    /// response to `AppShell::handle`'s own click hit-testing, or this poll
+    /// — so it silently kept showing the previous panel's title forever.
+    ///
+    /// `TuiShellApp::take_requested_panel` already had this override (see
+    /// its own doc for the shared mechanics, mirrored verbatim here); this
+    /// is the same logic against `App`'s fields.
+    fn take_requested_panel(&mut self) -> Option<quadraui::WidgetId> {
+        let engine = self.engine.borrow();
+        if !engine.app_shell.sidebar_visible() {
+            return None;
+        }
+        // #557: an extension panel takes over the sidebar body *without*
+        // touching the shadow `app_shell`'s active-panel id (`switch_panel`'s
+        // `render::apply_activity_panel_switch` call leaves it alone for an
+        // `ext:` id), so `engine.ext_panel_active` — not `active_panel_id()`
+        // — is what the runner has to follow while one is open.
+        if let Some(name) = engine.ext_panel_active.as_deref() {
+            let id = quadraui::WidgetId::new(crate::core::engine::sidebar::ext_panel_id(name));
+            if self.last_shell_panel.as_ref() == Some(&id) {
+                return None;
+            }
+            self.suppress_shell_panel_echo = true;
+            return Some(id);
+        }
+        let current = engine.app_shell.active_panel_id()?.clone();
+        if self.last_shell_panel.as_ref() == Some(&current) {
+            return None;
+        }
+        self.suppress_shell_panel_echo = true;
+        Some(current)
+    }
+
     fn on_shell_event(&mut self, event: &quadraui::AppShellEvent) {
         use quadraui::AppShellEvent;
         // #1062: the shadow-`engine.app_shell` sync, unconditionally and
@@ -8454,6 +8543,22 @@ impl quadraui::ShellApp for App {
         }
         match event {
             AppShellEvent::PanelChanged { panel_id } => {
+                // #1064: record what the runner's own `AppShell` now
+                // believes is active, whether this notification came from
+                // a real click or from `take_requested_panel`'s own echo
+                // below — see `Self::last_shell_panel`'s doc.
+                self.last_shell_panel = Some(panel_id.clone());
+                if std::mem::take(&mut self.suppress_shell_panel_echo) {
+                    // Echo of our own `take_requested_panel` reconciliation:
+                    // the engine already holds this state (an app-initiated
+                    // switch, e.g. a DAP reveal or a panel-focus keyboard
+                    // accelerator) — re-running `switch_panel` below would
+                    // toggle an already-active `ext:` panel back **off**
+                    // (`render::apply_activity_panel_switch`'s
+                    // `already_showing` arm treats a second "click" on the
+                    // active plugin panel as a close).
+                    return;
+                }
                 // #557: plugin-provided panels are now real `PanelDefinition`s
                 // in the runner's `AppShell` (`build_shell_config`), so their
                 // icon clicks arrive here like any built-in panel's. They are
