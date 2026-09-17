@@ -4685,37 +4685,45 @@ impl App {
                         {
                             let max_scroll = scroll_range.round() as usize;
                             let page_cols = (track_w / cw).floor() as usize;
-                            if x < thumb_x {
-                                let mut engine = self.engine.borrow_mut();
-                                let new_left = scroll_left.saturating_sub(page_cols);
-                                engine.set_scroll_left_for_window(win_id, new_left);
-                                self.draw_needed.set(true);
-                                return;
-                            } else if x >= thumb_x + thumb_w {
-                                let mut engine = self.engine.borrow_mut();
-                                let new_left = (scroll_left + page_cols).min(max_scroll);
-                                engine.set_scroll_left_for_window(win_id, new_left);
-                                self.draw_needed.set(true);
-                                return;
+                            // #1061: shared with TUI's own h/v scrollbar
+                            // click handlers (`tui_main/mouse.rs`) via
+                            // `render::resolve_editor_scrollbar_click` —
+                            // see that function's doc for the full
+                            // rationale.
+                            match render::resolve_editor_scrollbar_click(
+                                x as f32,
+                                thumb_x as f32,
+                                (thumb_x + thumb_w) as f32,
+                                page_cols,
+                                max_scroll,
+                                scroll_left,
+                            ) {
+                                render::EditorScrollbarClick::PageTo(new_left) => {
+                                    let mut engine = self.engine.borrow_mut();
+                                    engine.set_scroll_left_for_window(win_id, new_left);
+                                    self.draw_needed.set(true);
+                                    return;
+                                }
+                                render::EditorScrollbarClick::BeginDrag { grab_offset } => {
+                                    let drag_rc = self.backend.borrow().drag_state_handle();
+                                    drag_rc
+                                        .borrow_mut()
+                                        .begin(quadraui::DragTarget::ScrollbarX {
+                                            widget: quadraui::WidgetId::new(format!(
+                                                "editor:h_sb:{}",
+                                                win_id.0
+                                            )),
+                                            track_start: track_x as f32,
+                                            track_length: track_w as f32,
+                                            thumb_length: thumb_w as f32,
+                                            max_scroll,
+                                            grab_offset,
+                                            inverted: false,
+                                        });
+                                    self.draw_needed.set(true);
+                                    return;
+                                }
                             }
-                            let grab_offset = (x - thumb_x) as f32;
-                            let drag_rc = self.backend.borrow().drag_state_handle();
-                            drag_rc
-                                .borrow_mut()
-                                .begin(quadraui::DragTarget::ScrollbarX {
-                                    widget: quadraui::WidgetId::new(format!(
-                                        "editor:h_sb:{}",
-                                        win_id.0
-                                    )),
-                                    track_start: track_x as f32,
-                                    track_length: track_w as f32,
-                                    thumb_length: thumb_w as f32,
-                                    max_scroll,
-                                    grab_offset,
-                                    inverted: false,
-                                });
-                            self.draw_needed.set(true);
-                            return;
                         }
                     }
                 }
@@ -4772,39 +4780,46 @@ impl App {
                         {
                             let max_scroll = scroll_range.round() as usize;
                             let page_rows = (track_h / lh.max(1.0)).floor() as usize;
-                            if y < thumb_y {
-                                let mut engine = self.engine.borrow_mut();
-                                let new_top = scroll_top.saturating_sub(page_rows);
-                                engine.set_scroll_top_for_window(win_id, new_top);
-                                engine.sync_scroll_binds();
-                                self.draw_needed.set(true);
-                                return;
-                            } else if y >= thumb_y + thumb_h {
-                                let mut engine = self.engine.borrow_mut();
-                                let new_top = (scroll_top + page_rows).min(max_scroll);
-                                engine.set_scroll_top_for_window(win_id, new_top);
-                                engine.sync_scroll_binds();
-                                self.draw_needed.set(true);
-                                return;
+                            // #1061: shared with TUI's own h/v scrollbar
+                            // click handlers (`tui_main/mouse.rs`) via
+                            // `render::resolve_editor_scrollbar_click` —
+                            // see that function's doc for the full
+                            // rationale.
+                            match render::resolve_editor_scrollbar_click(
+                                y as f32,
+                                thumb_y as f32,
+                                (thumb_y + thumb_h) as f32,
+                                page_rows,
+                                max_scroll,
+                                scroll_top,
+                            ) {
+                                render::EditorScrollbarClick::PageTo(new_top) => {
+                                    let mut engine = self.engine.borrow_mut();
+                                    engine.set_scroll_top_for_window(win_id, new_top);
+                                    engine.sync_scroll_binds();
+                                    self.draw_needed.set(true);
+                                    return;
+                                }
+                                render::EditorScrollbarClick::BeginDrag { grab_offset } => {
+                                    let drag_rc = self.backend.borrow().drag_state_handle();
+                                    drag_rc
+                                        .borrow_mut()
+                                        .begin(quadraui::DragTarget::ScrollbarY {
+                                            widget: quadraui::WidgetId::new(format!(
+                                                "editor:v_sb:{}",
+                                                win_id.0
+                                            )),
+                                            track_start: track_y as f32,
+                                            track_length: track_h as f32,
+                                            thumb_length: thumb_h as f32,
+                                            max_scroll,
+                                            grab_offset,
+                                            inverted: false,
+                                        });
+                                    self.draw_needed.set(true);
+                                    return;
+                                }
                             }
-                            let grab_offset = (y - thumb_y) as f32;
-                            let drag_rc = self.backend.borrow().drag_state_handle();
-                            drag_rc
-                                .borrow_mut()
-                                .begin(quadraui::DragTarget::ScrollbarY {
-                                    widget: quadraui::WidgetId::new(format!(
-                                        "editor:v_sb:{}",
-                                        win_id.0
-                                    )),
-                                    track_start: track_y as f32,
-                                    track_length: track_h as f32,
-                                    thumb_length: thumb_h as f32,
-                                    max_scroll,
-                                    grab_offset,
-                                    inverted: false,
-                                });
-                            self.draw_needed.set(true);
-                            return;
                         }
                     }
                 }

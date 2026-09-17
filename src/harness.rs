@@ -2763,6 +2763,110 @@ mod issue_987_group_scrollbar_inert_and_click_resizes {
     }
 }
 
+/// #1061 (GOALS.md's 2026-09-16 audit, #1044, wave 2 item 9): the editor
+/// scrollbar's click-vs-drag decision was hand-rolled **twice** — once in
+/// `tui_main/mouse.rs` (TUI's own v/h scrollbar arms), once in `app.rs`
+/// (GTK's v/h scrollbar arms) — the exact "one rung shared, the other
+/// hand-rolled and free to drift" shape #987 itself was before it reproduced
+/// a user-visible bug in this same neighbourhood. Both hand-rolled copies
+/// now call `render::resolve_editor_scrollbar_click` (see that function's
+/// own doc for the shared three-way page-back/page-forward/begin-drag
+/// decision) instead of re-deriving it — TUI additionally had a *fifth*
+/// stand-alone re-derivation of the same thumb math
+/// (`scrollbar_grab_offset`), deleted outright rather than routed through
+/// the shared function, since its only job (computing `grab_offset`) is
+/// now the shared function's own job too.
+///
+/// This is a structural convergence fix, not a bug fix: neither hand-rolled
+/// copy had a known bug (unlike #987's own scrollbar-inert/click-resizes
+/// report), so this scenario is not expected to go red against pre-#1061
+/// `develop` — what it proves is that the *architecture* converged. Per the
+/// issue's own "Proving it actually converged" section: `#1043`'s
+/// `tui_prod` arm is the only harness lens that actually drives
+/// `TuiShellApp`/`mouse.rs` — `issue_987_group_scrollbar_inert_and_click_
+/// resizes`'s own `tui` arm (immediately above) wraps the *shared* `App`
+/// instead (see that module's own "no `tui_prod` coverage" note), so it
+/// could never have caught `mouse.rs`'s copy drifting from `app.rs`'s. This
+/// module is that missing coverage.
+///
+/// # Why not `drag_group_scrollbar_column`
+///
+/// That helper (used by `issue_987_...`'s `gtk`/`tui` arms) locates a
+/// window's own painted rect via `ConformanceHarness::screen_layout` —
+/// unavailable on `tui_prod`, whose harness has no live `App` to clone it
+/// from (see `conformance_harness_prod`'s own doc, "`ConformanceHarness::
+/// engine`/`::screen_layout` are not live here"). This scenario instead
+/// uses a single, unsplit window filling the whole terminal (no sidebar, no
+/// minimap) so the window's own right edge — where `quadraui::Editor::
+/// layout_with_options` always reserves the vertical scrollbar's one-cell
+/// column, on both backends — coincides with the *terminal's* own right
+/// edge, a structurally known quantity (`width - 1`) rather than a magic
+/// number, mirroring the reasoning `drag_group_scrollbar_column`'s own doc
+/// gives for its `target.rect.x + target.rect.width - 1.0`. The row is
+/// located via `driver.find` against the buffer's own first painted line —
+/// never a hardcoded coordinate.
+#[cfg(test)]
+mod issue_1061_scrollbar_click_resolution_shared {
+    use super::*;
+
+    /// A single, unsplit window showing a buffer far taller than any
+    /// viewport this scenario paints (500 lines against a 30-row terminal),
+    /// so a vertical scrollbar is guaranteed and its thumb starts at the
+    /// very top of the track while `scroll_top == 0` — exactly where this
+    /// scenario's drag begins.
+    fn tall_buffer_fixture() -> crate::core::Engine {
+        let mut engine = crate::core::Engine::new_for_test();
+        engine.settings.use_nerd_fonts = Some(false);
+        engine.settings.minimap = false;
+        let buf = engine.active_buffer_id();
+        let content: String = (0..500).map(|i| format!("scr1061line{i}\n")).collect();
+        if let Some(st) = engine.buffer_manager.get_mut(buf) {
+            st.buffer.content = ropey::Rope::from_str(&content);
+        }
+        engine
+    }
+
+    #[test]
+    fn editor_v_scrollbar_thumb_drag_scrolls_via_shared_resolve_fn_tui_prod() {
+        let mut h =
+            crate::tui_main::testing::conformance_harness_prod(tall_buffer_fixture(), 60, 30);
+        let driver = &mut h.driver;
+        driver.dispatch(quadraui::UiEvent::WindowFocused(true));
+        driver.render();
+
+        assert!(
+            driver.screen_has("scr1061line0"),
+            "precondition: the buffer's own first line must be painted; \
+             screen:\n{}",
+            driver.screen()
+        );
+        let (_, y0) = driver.find("scr1061line0").unwrap_or_else(|| {
+            panic!(
+                "the first line must be painted to locate the scrollbar's \
+                 own row; screen:\n{}",
+                driver.screen()
+            )
+        });
+        // One cell inside the window's own right edge, which here is also
+        // the terminal's (no sidebar, no minimap to narrow it) — see this
+        // module's own doc for why that's a structurally derived column,
+        // not a magic number.
+        let x = 59.0_f32;
+        let y1 = y0 + 15.0;
+
+        driver.drag(x, y0, x, y1);
+
+        assert!(
+            !driver.screen_has("scr1061line0"),
+            "dragging the editor's own vertical-scrollbar thumb must scroll \
+             the window, via the same `render::resolve_editor_scrollbar_click` \
+             decision `app.rs`'s own scrollbar handler uses (#1061); \
+             screen:\n{}",
+            driver.screen()
+        );
+    }
+}
+
 // ── #986: v0.11.0 bug suite -- oracle-backed `:s///c` confirm-prompt spec
 // (#801 Phase 2 never built) ────────────────────────────────────────────
 //
