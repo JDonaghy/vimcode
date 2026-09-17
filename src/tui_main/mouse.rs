@@ -3,46 +3,6 @@ use super::*;
 use crate::click;
 use crate::core::engine::TabBarClickTarget;
 
-/// Compute the `grab_offset` to seed [`quadraui::DragTarget::ScrollbarY`]
-/// at click-down time so the thumb doesn't jump out from under the cursor.
-///
-/// Mirrors the thumb math `dispatch_mouse_drag` uses: if `cursor_y` lands
-/// inside the visible thumb (between `thumb_top` and `thumb_top + thumb_length`),
-/// returns the cursor's offset from the thumb top — the cursor stays at
-/// the same relative spot on the thumb during the drag.
-///
-/// If `cursor_y` is on the track outside the thumb (or above/below the
-/// track entirely), returns `0.0` — the standard "click track to jump"
-/// behavior where the thumb hops to put its top at the cursor.
-fn scrollbar_grab_offset(
-    cursor_y: f32,
-    track_start: f32,
-    track_length: f32,
-    visible_rows: usize,
-    total_items: usize,
-    current_scroll: usize,
-) -> f32 {
-    if track_length <= 0.0 || total_items == 0 {
-        return 0.0;
-    }
-    let thumb_ratio = (visible_rows as f32 / total_items as f32).min(1.0);
-    let thumb_length = (track_length * thumb_ratio).max(1.0);
-    let max_scroll = total_items.saturating_sub(visible_rows);
-    let effective_track = (track_length - thumb_length).max(1.0);
-    let scroll_ratio = if max_scroll == 0 {
-        0.0
-    } else {
-        (current_scroll as f32 / max_scroll as f32).clamp(0.0, 1.0)
-    };
-    let thumb_top = track_start + scroll_ratio * effective_track;
-    let dy = cursor_y - thumb_top;
-    if dy >= 0.0 && dy < thumb_length {
-        dy
-    } else {
-        0.0
-    }
-}
-
 /// Run [`quadraui::dispatch_mouse_drag`] for an active drag and apply the
 /// resulting `ScrollOffsetChanged` events to the matching scroll-state
 /// fields. Returns `true` if any event was handled (caller can short-circuit).
@@ -2492,73 +2452,76 @@ pub(super) fn handle_mouse(
                     let track_len =
                         content_height.saturating_sub(if has_h_scrollbar { 1 } else { 0 });
                     let track_visible = track_len as usize;
-                    // Track-click vs thumb-click: page-jump on empty
-                    // track, drag-start on thumb. Standard editor UX —
-                    // clicking the empty track moves by one viewport
-                    // toward the click direction; clicking the thumb
-                    // begins a drag.
-                    let (thumb_start, thumb_len) = quadraui::fit_thumb(
+                    // Quantize the continuous thumb to whole cells so the
+                    // click decision matches what's actually painted — a
+                    // terminal grid has no fractional cell boundaries.
+                    let (thumb_start_f, thumb_len_f) = quadraui::fit_thumb(
                         rw.scroll_top as f32,
                         rw.total_lines as f32,
                         track_visible as f32,
                         track_len as f32,
                         1.0,
                     );
-                    let thumb_top = thumb_start.floor() as u16;
-                    let thumb_size = thumb_len.ceil().max(1.0) as u16;
-                    let cursor_offset = row.saturating_sub(track_abs_start);
-                    if cursor_offset < thumb_top {
-                        let new_scroll = rw.scroll_top.saturating_sub(track_visible);
-                        engine.set_scroll_top_for_window(rw.window_id, new_scroll);
-                        engine.sync_scroll_binds();
-                        return sidebar_width;
-                    } else if cursor_offset >= thumb_top.saturating_add(thumb_size) {
-                        let max_scroll = rw.total_lines.saturating_sub(track_visible);
-                        let new_scroll = (rw.scroll_top + track_visible).min(max_scroll);
-                        engine.set_scroll_top_for_window(rw.window_id, new_scroll);
-                        engine.sync_scroll_binds();
-                        return sidebar_width;
-                    }
-                    // Phase B.4 Stage 5d: editor scrollbars on the shared
-                    // `quadraui::DragState`. Widget id encodes the window id
-                    // so the apply-side router can call
-                    // `engine.set_scroll_*_for_window(...)` against the
-                    // right window. `grab_offset` preserves cursor position
-                    // on the thumb during drag — same UX every other
-                    // migrated scrollbar gives.
-                    let grab_offset = scrollbar_grab_offset(
+                    let thumb_abs_start = track_abs_start as f32 + thumb_start_f.floor();
+                    let thumb_abs_end = thumb_abs_start + thumb_len_f.ceil().max(1.0);
+                    let max_scroll = rw.total_lines.saturating_sub(track_visible);
+
+                    // #1061: page-vs-thumb decision and grab_offset now
+                    // share `render::resolve_editor_scrollbar_click` with
+                    // GTK's own v/h scrollbar click handlers (`app.rs`)
+                    // instead of a hand-rolled copy plus a second,
+                    // independent re-derivation of the same thumb math
+                    // (the deleted `scrollbar_grab_offset`).
+                    match render::resolve_editor_scrollbar_click(
                         row as f32,
-                        track_abs_start as f32,
-                        track_len as f32,
+                        thumb_abs_start,
+                        thumb_abs_end,
                         track_visible,
-                        rw.total_lines,
+                        max_scroll,
                         rw.scroll_top,
-                    );
-                    let tl = track_len as f32;
-                    drag_state.begin(quadraui::DragTarget::ScrollbarY {
-                        widget: quadraui::WidgetId::new(format!(
-                            "tui:editor:{}:vsb",
-                            rw.window_id.0
-                        )),
-                        track_start: track_abs_start as f32,
-                        track_length: tl,
-                        thumb_length: (tl * track_visible as f32 / rw.total_lines.max(1) as f32)
-                            .max(1.0),
-                        max_scroll: rw.total_lines.saturating_sub(track_visible),
-                        grab_offset,
-                        inverted: false,
-                    });
-                    apply_scrollbar_drag(
-                        drag_state,
-                        quadraui::Point {
-                            x: col as f32,
-                            y: row as f32,
-                        },
-                        engine,
-                        sidebar,
-                    );
-                    engine.sync_scroll_binds();
-                    return sidebar_width;
+                    ) {
+                        render::EditorScrollbarClick::PageTo(new_scroll) => {
+                            engine.set_scroll_top_for_window(rw.window_id, new_scroll);
+                            engine.sync_scroll_binds();
+                            return sidebar_width;
+                        }
+                        render::EditorScrollbarClick::BeginDrag { grab_offset } => {
+                            // Phase B.4 Stage 5d: editor scrollbars on the
+                            // shared `quadraui::DragState`. Widget id
+                            // encodes the window id so the apply-side
+                            // router can call
+                            // `engine.set_scroll_*_for_window(...)` against
+                            // the right window. `grab_offset` preserves
+                            // cursor position on the thumb during drag —
+                            // same UX every other migrated scrollbar gives.
+                            let tl = track_len as f32;
+                            drag_state.begin(quadraui::DragTarget::ScrollbarY {
+                                widget: quadraui::WidgetId::new(format!(
+                                    "tui:editor:{}:vsb",
+                                    rw.window_id.0
+                                )),
+                                track_start: track_abs_start as f32,
+                                track_length: tl,
+                                thumb_length: (tl * track_visible as f32
+                                    / rw.total_lines.max(1) as f32)
+                                    .max(1.0),
+                                max_scroll,
+                                grab_offset,
+                                inverted: false,
+                            });
+                            apply_scrollbar_drag(
+                                drag_state,
+                                quadraui::Point {
+                                    x: col as f32,
+                                    y: row as f32,
+                                },
+                                engine,
+                                sidebar,
+                            );
+                            engine.sync_scroll_binds();
+                            return sidebar_width;
+                        }
+                    }
                 }
 
                 // Horizontal scrollbar click/drag-start.
@@ -2580,61 +2543,61 @@ pub(super) fn handle_mouse(
                         // #550: `track_x` (derived from `wx`) is already absolute.
                         let track_abs_start = track_x;
                         let track_visible = viewport_cols;
-                        // Track-click vs thumb-click: page-jump on the
-                        // empty track, drag-start on the thumb (mirrors
-                        // the v-scrollbar above).
-                        let (thumb_start, thumb_len) = quadraui::fit_thumb(
+                        // Quantize the continuous thumb to whole cells,
+                        // mirroring the v-scrollbar rung above.
+                        let (thumb_start_f, thumb_len_f) = quadraui::fit_thumb(
                             rw.scroll_left as f32,
                             rw.max_col as f32,
                             track_visible as f32,
                             track_w as f32,
                             1.0,
                         );
-                        let thumb_left = thumb_start.floor() as u16;
-                        let thumb_size = thumb_len.ceil().max(1.0) as u16;
-                        let cursor_offset = col.saturating_sub(track_abs_start);
-                        if cursor_offset < thumb_left {
-                            let new_left = rw.scroll_left.saturating_sub(track_visible);
-                            engine.set_scroll_left_for_window(rw.window_id, new_left);
-                            return sidebar_width;
-                        } else if cursor_offset >= thumb_left.saturating_add(thumb_size) {
-                            let max_left = rw.max_col.saturating_sub(track_visible);
-                            let new_left = (rw.scroll_left + track_visible).min(max_left);
-                            engine.set_scroll_left_for_window(rw.window_id, new_left);
-                            return sidebar_width;
-                        }
-                        let grab_offset = scrollbar_grab_offset(
+                        let thumb_abs_start = track_abs_start as f32 + thumb_start_f.floor();
+                        let thumb_abs_end = thumb_abs_start + thumb_len_f.ceil().max(1.0);
+                        let max_left = rw.max_col.saturating_sub(track_visible);
+
+                        // #1061: shared decision — see the v-scrollbar rung
+                        // above for the full rationale.
+                        match render::resolve_editor_scrollbar_click(
                             col as f32,
-                            track_abs_start as f32,
-                            track_w as f32,
+                            thumb_abs_start,
+                            thumb_abs_end,
                             track_visible,
-                            rw.max_col,
+                            max_left,
                             rw.scroll_left,
-                        );
-                        let tl = track_w as f32;
-                        drag_state.begin(quadraui::DragTarget::ScrollbarX {
-                            widget: quadraui::WidgetId::new(format!(
-                                "tui:editor:{}:hsb",
-                                rw.window_id.0
-                            )),
-                            track_start: track_abs_start as f32,
-                            track_length: tl,
-                            thumb_length: (tl * track_visible as f32 / rw.max_col.max(1) as f32)
-                                .max(1.0),
-                            max_scroll: rw.max_col.saturating_sub(track_visible),
-                            grab_offset,
-                            inverted: false,
-                        });
-                        apply_scrollbar_drag(
-                            drag_state,
-                            quadraui::Point {
-                                x: col as f32,
-                                y: row as f32,
-                            },
-                            engine,
-                            sidebar,
-                        );
-                        return sidebar_width;
+                        ) {
+                            render::EditorScrollbarClick::PageTo(new_left) => {
+                                engine.set_scroll_left_for_window(rw.window_id, new_left);
+                                return sidebar_width;
+                            }
+                            render::EditorScrollbarClick::BeginDrag { grab_offset } => {
+                                let tl = track_w as f32;
+                                drag_state.begin(quadraui::DragTarget::ScrollbarX {
+                                    widget: quadraui::WidgetId::new(format!(
+                                        "tui:editor:{}:hsb",
+                                        rw.window_id.0
+                                    )),
+                                    track_start: track_abs_start as f32,
+                                    track_length: tl,
+                                    thumb_length: (tl * track_visible as f32
+                                        / rw.max_col.max(1) as f32)
+                                        .max(1.0),
+                                    max_scroll: max_left,
+                                    grab_offset,
+                                    inverted: false,
+                                });
+                                apply_scrollbar_drag(
+                                    drag_state,
+                                    quadraui::Point {
+                                        x: col as f32,
+                                        y: row as f32,
+                                    },
+                                    engine,
+                                    sidebar,
+                                );
+                                return sidebar_width;
+                            }
+                        }
                     }
                 }
 

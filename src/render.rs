@@ -20731,6 +20731,131 @@ pub fn window_zone_hit_test(
     }
 }
 
+/// Outcome of resolving a click against an editor window's own scrollbar
+/// track (vertical or horizontal), returned by
+/// [`resolve_editor_scrollbar_click`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum EditorScrollbarClick {
+    /// The click landed on the empty track, outside the thumb: page one
+    /// viewport toward the click. The new scroll offset to apply.
+    PageTo(usize),
+    /// The click landed on the thumb itself: begin a drag. `grab_offset`
+    /// (native units — pixels for GTK, whole cells for TUI) is the click's
+    /// offset from the thumb's leading edge, preserved so the thumb doesn't
+    /// jump out from under the cursor when the drag starts.
+    BeginDrag { grab_offset: f32 },
+}
+
+/// Resolve a click on an editor window's scrollbar track — thumb-drag vs.
+/// track page-jump — independent of axis (vertical/horizontal) and backend
+/// geometry units (`unit_w`/`unit_h` convention: pixels for GTK, whole
+/// cells for TUI).
+///
+/// #1061: this exact three-way decision (page toward the click on the empty
+/// track either side of the thumb; begin a drag, with a grab offset that
+/// keeps the cursor's relative position on the thumb, when the click lands
+/// on the thumb itself) was hand-rolled four times — once per axis, once
+/// per backend (`tui_main/mouse.rs`'s v/h scrollbar arms, `app.rs`'s v/h
+/// scrollbar arms) — plus a fifth, independent re-derivation of the same
+/// thumb math inside TUI's own `scrollbar_grab_offset` helper (now
+/// deleted), which the other three copies never needed because their
+/// grab-offset math already reused the same thumb bounds as their
+/// page-vs-thumb decision. This is that one decision, shared.
+///
+/// `click_pos` is the click's position along the scroll axis (row for
+/// vertical, column for horizontal — TUI; y/x — GTK), in the same native
+/// unit and coordinate origin as `thumb_start`/`thumb_end`. `thumb_start`/
+/// `thumb_end` are the thumb's absolute bounds along that axis — callers
+/// derive them however their own backend already does (both currently via
+/// `quadraui::fit_thumb`, TUI additionally quantizing to whole cells so the
+/// click decision matches what's actually painted on a terminal grid).
+/// `track_visible` is how many lines/cols fit in one page (a click-derived
+/// scroll jumps by exactly this much); `max_scroll` is the largest valid
+/// scroll offset; `current_scroll` is the scroll offset at click time.
+pub fn resolve_editor_scrollbar_click(
+    click_pos: f32,
+    thumb_start: f32,
+    thumb_end: f32,
+    track_visible: usize,
+    max_scroll: usize,
+    current_scroll: usize,
+) -> EditorScrollbarClick {
+    if click_pos < thumb_start {
+        EditorScrollbarClick::PageTo(current_scroll.saturating_sub(track_visible))
+    } else if click_pos >= thumb_end {
+        EditorScrollbarClick::PageTo((current_scroll + track_visible).min(max_scroll))
+    } else {
+        EditorScrollbarClick::BeginDrag {
+            grab_offset: click_pos - thumb_start,
+        }
+    }
+}
+
+#[cfg(test)]
+mod editor_scrollbar_click_tests {
+    //! #1061: `resolve_editor_scrollbar_click` replaces four hand-rolled
+    //! copies (TUI v/h in `tui_main/mouse.rs`, GTK v/h in `app.rs`) of this
+    //! same three-way decision. These pin the pure decision logic directly;
+    //! `harness.rs`'s `issue_987_group_scrollbar_inert_and_click_resizes`
+    //! module and its new `tui_prod`-arm sibling drive it end-to-end through
+    //! both backends' real click handlers.
+    use super::*;
+
+    #[test]
+    fn click_above_thumb_pages_backward_by_one_viewport() {
+        // Track [0, 100), thumb [40, 50), click at 10 (above the thumb).
+        let outcome = resolve_editor_scrollbar_click(10.0, 40.0, 50.0, 20, 80, 40);
+        assert_eq!(outcome, EditorScrollbarClick::PageTo(20));
+    }
+
+    #[test]
+    fn click_above_thumb_saturates_at_zero() {
+        let outcome = resolve_editor_scrollbar_click(2.0, 40.0, 50.0, 20, 80, 5);
+        assert_eq!(outcome, EditorScrollbarClick::PageTo(0));
+    }
+
+    #[test]
+    fn click_below_thumb_pages_forward_by_one_viewport() {
+        // Track [0, 100), thumb [40, 50), click at 90 (below the thumb).
+        let outcome = resolve_editor_scrollbar_click(90.0, 40.0, 50.0, 20, 80, 40);
+        assert_eq!(outcome, EditorScrollbarClick::PageTo(60));
+    }
+
+    #[test]
+    fn click_below_thumb_clamps_to_max_scroll() {
+        let outcome = resolve_editor_scrollbar_click(90.0, 40.0, 50.0, 20, 55, 40);
+        assert_eq!(outcome, EditorScrollbarClick::PageTo(55));
+    }
+
+    #[test]
+    fn click_on_thumb_begins_a_drag_with_the_grab_offset_preserved() {
+        // Thumb spans [40, 50); a click at 43 is 3 units into it.
+        let outcome = resolve_editor_scrollbar_click(43.0, 40.0, 50.0, 20, 80, 40);
+        assert_eq!(
+            outcome,
+            EditorScrollbarClick::BeginDrag { grab_offset: 3.0 }
+        );
+    }
+
+    #[test]
+    fn click_exactly_on_thumb_start_begins_a_drag_at_zero_offset() {
+        let outcome = resolve_editor_scrollbar_click(40.0, 40.0, 50.0, 20, 80, 40);
+        assert_eq!(
+            outcome,
+            EditorScrollbarClick::BeginDrag { grab_offset: 0.0 }
+        );
+    }
+
+    #[test]
+    fn click_exactly_on_thumb_end_is_track_not_drag() {
+        // `thumb_end` is exclusive — this is the boundary #987's own
+        // negative-space case cares about: a click one unit past the
+        // thumb must not be swallowed as a drag.
+        let outcome = resolve_editor_scrollbar_click(50.0, 40.0, 50.0, 20, 80, 40);
+        assert_eq!(outcome, EditorScrollbarClick::PageTo(60));
+    }
+}
+
 /// Resolve a gutter click to an action based on column and line data.
 pub fn resolve_gutter_action(
     rw: &RenderedWindow,
