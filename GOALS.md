@@ -6,11 +6,15 @@
 > line. The `Platform-Neutrality Rule` at the top of `CLAUDE.md` is the *operational
 > rule*; **this file is the source of truth for *intent* and *sequencing*.**
 >
-> _Last updated: 2026-09-11 (macOS native-menu audit — milestone #7 reopened with
-> #901/#902; the "0 open" claim had itself gone stale the moment quadraui#184's
-> supply side landed. The 2026-09-05 entry it replaces recorded the *previous*
-> staleness incident; see "#47 was closed without its blocker" below).
-> Milestone #7 is **2 open** (#901, #902)._
+> _Last updated: 2026-09-16 (#1044 — the `TuiShellApp`/`mouse.rs` rung-decomposition
+> audit: 98 rungs enumerated, 26 convergeable and sequenced into 16 child issues
+> below, one new `IRREDUCIBLE_SURFACE.md` fact, one quadraui gap drafted. No
+> production code changed — see "2026-09-16 audit" section below. Prior entry
+> (2026-09-11, macOS native-menu audit — milestone #7 reopened with #901/#902) kept
+> for its own history).
+> Milestone #7 is **3 open** (#901, #902, #1044 — #1044 itself closes once its
+> 16 drafted child issues are filed; they are not yet filed and are not counted
+> here)._
 
 ## 🎯 North star
 
@@ -53,6 +57,231 @@ recurring failure mode this doc exists to fix: **infra lands in quadraui but the
 adoption issue never gets picked up**, so the bespoke code lingers as tech debt.
 **It just happened again in a new shape — see "#47 was closed without its blocker"
 below.**
+
+## 🔬 2026-09-16 audit — #1044: TuiShellApp/mouse.rs decomposed into 98 rungs
+
+**What #1044 asked for:** an inventory, not a rewrite. Enumerate every rung of
+`impl ShellApp for TuiShellApp` and `mouse::handle_mouse`, against its
+`crate::app::App` counterpart, classify each as already-shared / convergeable /
+irreducible / quadraui-gap, and produce a sequenced work order. **No production
+code changed in this pass** — see `PROJECT_STATE.md` if that ever needs
+re-confirming.
+
+### Current sizing (regenerated 2026-09-16, `scripts/prod_lines.py`)
+
+| File | Production lines |
+|---|---:|
+| `src/gtk/` | **1,020** |
+| `src/tui_main/` (all files) | **10,471** |
+| — of which `src/tui_main/shell_app.rs` | 4,459 (18,442 incl. tests — the issue's "17,947" cited the whole-file count on an older commit) |
+| — of which `src/tui_main/mouse.rs` | 2,881 (3,878 incl. tests) |
+| `src/app.rs` | 8,313 |
+| `src/render.rs` | 20,997 |
+| `src/macos/` | 138 |
+| `src/win/` | 178 |
+
+Two things worth stating plainly before the inventory: **GTK is not "1,020 lines
+of shell logic"** — it's 1,020 lines of thin wiring calling into `src/app.rs`
+(8,313) and `render.rs` (20,997), which is exactly the north-star shape. And
+**most of `shell_app.rs`/`mouse.rs`'s bulk is tests, not production** —
+18,442 + 3,878 = 22,320 raw lines, of which only 7,340 (33%) is production; the
+issue's headline "10,437 TUI production lines vs GTK's 1,020" is real but is a
+whole-directory figure (`src/tui_main/`, 5 files), not these two files alone.
+
+### The prerequisite: the conformance harness has no `TuiShellApp` arm yet
+
+The issue's prerequisite — "the conformance harness must be able to see
+production-TUI divergence first" — is not hypothetical, it's already the
+measured state of `src/harness.rs`/`src/tui_main/mod.rs`. `crate::harness::
+ConformanceHarness<TuiDriver<...>>` (`tui_main/mod.rs`'s `testing::
+conformance_harness`) deliberately wraps **`crate::app::App`**, not
+`TuiShellApp` — its own doc comment explains why: a scenario written once
+should exercise "the same dispatch/paint code on every backend," and `App`
+(unconditionally compiled, no `gui` gate on the impl block) is the one thing
+GTK/macOS/Win/TUI's harnesses all share. That is exactly right for what #982
+was building, and exactly why it **cannot** also prove a `TuiShellApp`/
+`mouse.rs` rung converged: today, zero `crate::harness` scenarios ever run
+against production TUI code. A "converged" rung and a merely *deleted* one look
+identical to the harness as it stands.
+
+**P0 (land before any convergence child issue below):** add a `::tui_prod` (or
+similarly named) harness arm that wraps the *actual* `TuiShellApp` +
+`mouse::handle_mouse` path — mirroring `tui_main::testing::conformance_harness`
+but built the way `src/tui_main/shell_app.rs`'s own `#[cfg(test)]` suite drives
+`TuiShellApp` directly via `quadraui::tui::testing::driver_with_shell`, not via
+`App`. This can reuse that suite's existing fixtures rather than building new
+ones. Small, self-contained, unblocks everything else in this section.
+
+### The inventory: 98 rungs, four verdicts
+
+Two independent passes enumerated every rung — one at the `ShellApp`
+trait-method level (`setup`/`handle`/`on_shell_event_ctx`/`take_requested_panel`/
+`on_bottom_panel_event`/`tick`/`render_content`'s `FrameOp` arms), one across
+every branch of `mouse::handle_mouse`. Verdict counts, reconciled (the
+command-line-selection rung was flagged by both passes as the same underlying
+gap, counted once):
+
+| Verdict | Count |
+|---|---:|
+| Already-shared | 40 |
+| Convergeable (incl. 5 pending a product decision) | 26 |
+| Irreducible | 31 — reduces to 3 facts, see `docs/IRREDUCIBLE_SURFACE.md` §1/§7 |
+| quadraui-gap | 1 — `CommandLine::selection` paint field, drafted in `docs/PENDING_QUADRAUI_ISSUES.md` |
+| **Total rungs** | **98** |
+
+**The headline finding: the mouse-router "epic" #950 flagged is smaller than
+feared.** #950 (`docs/SHELLAPP_CONVERGENCE.md`) called converging `mouse.rs`
+onto `src/click.rs` "the worst finding" and explicitly scoped it as multi-PR
+epic work, not a cheap win. This audit's rung-by-rung walk of all 60 `mouse.rs`
+rungs found **30 of them already call the same shared `render::`/`click::`
+function `app.rs` does** — the #733/#751–#756/#815/#817/#823/#987 chain already
+converged almost all of the actual hit-test/apply *decisions*. What's left
+un-shared is not one monolithic reimplementation; it's the 16 named items
+below (waves 1–3), plus the architectural cleanup of retiring the
+`UiEvent`→crossterm round-trip wrapper once nothing needs it (wave 4) — a
+materially smaller and more tractable backlog than #950's framing implied.
+
+#### ShellApp trait-method rungs (`setup`/`handle`/`on_shell_event_ctx`/`take_requested_panel`/`on_bottom_panel_event`/`tick`/`render_content`)
+
+| Rung | Verdict | Note |
+|---|---|---|
+| `render_content`: 12 of 14 `FrameOp` arms | already-shared | #824. |
+| `FrameOp::CommandLine` base paint | irreducible | px/cell paint substrate. |
+| `FrameOp::CommandLine` click→offset hit-test | already-shared | `render::command_line_click_char_idx`, quadraui#705 — corrects `IRREDUCIBLE_SURFACE.md` §2a, see §2c. |
+| `FrameOp::CommandLine` selection-highlight paint | **quadraui-gap** | `CommandLine::selection` field missing upstream; drafted in `PENDING_QUADRAUI_ISSUES.md`. |
+| `FrameOp::TabSwitcher` | convergeable | `max_visible` vs `visible_rows` field mixup — looks like a live bug, not intentional (wave 1, item 4 below). |
+| Menu system / Command Center click / sidebar hover / panel-key accelerators / `ClipboardPaste` | already-shared | Each already calls one `render::` router (#752/#754/#755). |
+| Window-control buttons, CSD drag/resize, outer-edge resize cursor, native menu/context menu, `CharTyped` IME, `WindowClose`, native-menu `setup`, initial CSS load | irreducible | All one fact — "TUI has no OS window," new row in `IRREDUCIBLE_SURFACE.md` §1. |
+| Alt-menu-letter reveal shim, hamburger-corner one-shot guard | irreducible | Flip side of the existing "GTK menu bar is the CSD titlebar" fact. |
+| `KeyPressed` decode | convergeable | GTK keeps 4 keys (`BackTab`/`PageUp`/`PageDown`/`Insert`) GTK-spelled instead of routing through the shared `render::engine_key_from_ui` TUI already fully uses (wave 2, item 8). |
+| Menu-action → `EngineAction` applier | convergeable | TUI's `dispatch_post_key_action`+`handle_action` vs GTK's `handle_menu_action` — both start from the same shared `Engine::dispatch_menu_action` then hand-roll separate appliers (wave 2, item 11). |
+| `PanelChanged`/`SidebarHidden`/`SidebarResized` shadow-`AppShell` sync | convergeable | Same shape, independently written 3×  (wave 2, item 10). |
+| `BottomItemClicked` (Settings) | convergeable | TUI toggles, GTK only shows — behavioral drift, no platform reason (wave 1, item 5). |
+| `take_requested_panel` | convergeable | GTK doesn't override it (stays `None`) — a real gap *on GTK*, not TUI (wave 2, item 12). |
+| `on_bottom_panel_event` | convergeable, low priority | Dead hook on both sides — neither backend sets `ShellConfig.bottom_panel` (blocked the same way `TabGroupController`/`BottomPanelController` adoption already is — see `PENDING_QUADRAUI_ISSUES.md`). |
+| `tick` chore lists | irreducible | #950 already classified this; only the *comments* are a (low-priority) doc-consolidation follow-up. |
+
+#### `mouse.rs` rungs
+
+| Area | Verdict | Note |
+|---|---|---|
+| Modal overlay apply, drag-route apply, chrome click/hover, tab hover, editor hover popup, folder picker, divider grab, minimap, gutter, sidebar hover/resize | already-shared | 30 rungs total — one router each (`render::route_modal_overlay_click`, `route_mouse_drag`, `route_chrome_click`, `route_sidebar_hover`, `route_editor_hover_popup_click`, `route_folder_picker_click`, `route_divider_grab`, `apply_minimap_click`, `apply_gutter_action`), resolving #825's items 1/2/4 as fully converged already. |
+| Dead activity-bar block (incl. hamburger `MenuToggle`) | convergeable — **delete** | ~55 lines, confirmed unreachable: `shell_config` registers the hamburger as a real `PanelDefinition`, so `AppShell::handle` intercepts it upstream (wave 1, item 1). |
+| `h_sb_drag_cell` field (`app.rs`) | convergeable — **delete** | Write-only, never read anywhere (wave 1, item 2). |
+| Dead-shadowed wheel-scroll arms (`explorer:sb`, likely `tui:search_results`) | convergeable — **delete** | Shadowed by earlier direct-dispatch blocks that already `return` first (wave 1, item 3). |
+| GTK terminal-split finalize: hardcoded `da_w = 800.0` / `terminal_cols()` hardcoded `80` | **bug, not convergence — file separately** | Live correctness bug found incidentally; out of #1044's scope, needs its own fix issue. |
+| Tab-bar post-hit-test dispatch (duplicated 2× in `mouse.rs`, `click::dispatch_tab_bar_target` exists but unused by TUI) | convergeable | Clearest concrete mechanical win (wave 2, item 7). |
+| Editor v/h scrollbar click+drag geometry | convergeable | Both sides hand-roll the identical track/thumb math independently (wave 2, item 9). |
+| Wheel scroll: GTK missing `PANEL_GIT`/`SEARCH`/`SETTINGS`/ext-panel scroll; TUI missing hover-window (unfocused-pane) scroll | convergeable-pending-design | Mechanical shape known for both; needs a product nod, not a design question (wave 3, items 13/14). |
+| Hover-link click-to-copy (TUI-only) | convergeable-pending-design | Real, previously-unflagged asymmetry — GTK gap or intentional (native Pango hyperlinks)? (wave 3, item 15). |
+| Explorer drag-and-drop finalize | **feature gap, not irreducible-surface** | TUI-only capability, nothing on GTK to converge with — see `IRREDUCIBLE_SURFACE.md` §7's note on scope. |
+| Command-line selection (full rung) | quadraui-gap (same as above, cited once) | See `PENDING_QUADRAUI_ISSUES.md`. |
+| Tab-bar hit-test, right-click resolution, text-selection drag-origin encoding, chrome-band geometry caching | irreducible | Cell-vs-pixel geometry (`click.rs`'s own documented reason) — instances of the existing frame-metrics fact. |
+| Remaining `MouseDown`/`Up`/`Move`/`Scroll` top-level round-trip (`uievent_to_crossterm`) | convergeable, epic, **last** | #950's original finding — now known to be much smaller in practice since the decisions it wraps are already shared (wave 4, item 16). |
+
+### Sequenced work order — cheapest & highest-divergence-risk first
+
+Each item below is sized to be its own small, independently mergeable issue.
+None of them are filed yet — this worker session has no `gh` access
+(`CLAUDE.md`); coordinator/human: file each as its own vimcode issue into
+milestone #7, referencing #1044.
+
+**P0 — prerequisite, land first:** the `::tui_prod` conformance-harness arm
+(above). Blocks every item below that claims a "converged" verdict needs
+proof, not just the diff looking smaller.
+
+**Wave 1 — dead code + live bugs, zero design risk (do first):**
+1. Delete the dead activity-bar block in `mouse.rs` (~55 lines, incl. hamburger
+   arm) — add a black-box regression test first (all 8 activity-bar targets +
+   hamburger still work via the `ShellApp` path) before deleting.
+2. Delete the dead `h_sb_drag_cell` field in `app.rs` (~3 lines, pure refactor).
+3. Delete the dead-shadowed wheel-scroll arms (`explorer:sb`, and
+   `tui:search_results` pending a quick shadow-confirmation grep).
+4. Fix the `FrameOp::TabSwitcher` `max_visible`/`visible_rows` field mixup —
+   likely a live, user-visible bug; needs a driver test on both backends
+   (many-tabs-than-fit scenario, assert the visible-row count matches the
+   intended capped value), observed red against unfixed `develop` first.
+5. Fix `BottomItemClicked` toggle-vs-show drift between `TuiShellApp` (toggles)
+   and `App` (only shows) — decide the intended behavior, converge, driver
+   test on both backends.
+6. File separately (not a #1044 child, a plain bug): GTK's terminal-split
+   finalize hardcodes `da_w = 800.0`/`terminal_cols() == 80` instead of real
+   pixel→cell conversion.
+
+**Wave 2 — mechanical convergence, no design decision needed:**
+7. Route `mouse.rs`'s two tab-bar-dispatch matches through `click::
+   dispatch_tab_bar_target` (already exists, already backend-neutral, only
+   called by GTK today) instead of hand-rolling it twice.
+8. Converge `KeyPressed` decode: point GTK's 4 kept-GTK-spelled keys through
+   the shared `render::engine_key_from_ui`.
+9. Extract `resolve_editor_scrollbar_click(...)` into `render.rs` (same
+   `unit_w`/`unit_h`-convention shape as existing shared geometry helpers);
+   call from both `mouse.rs` and `app.rs`; delete the two hand-rolled copies.
+10. Converge the `PanelChanged`/`SidebarHidden`/`SidebarResized` shadow-
+    `AppShell`-sync trio into one shared helper (same `Host`-trait shape as
+    `dispatch_panel_accelerator`).
+11. Converge the menu-action `EngineAction` applier into a shared
+    `apply_engine_action` taking a `Host` trait — larger; needs a small `Host`
+    design, not a product decision.
+12. Adopt `take_requested_panel` on `App` (currently unoverridden, stays
+    `None`) — this **adds** ~20 lines to GTK rather than removing TUI lines,
+    closing a real cross-backend behavior gap (item 4's divergence-bug-class
+    below), not a line-count win.
+
+**Wave 3 — needs a product decision before converging:**
+13. Should GTK gain `PANEL_GIT`/`SEARCH`/`SETTINGS`/ext-panel wheel scroll to
+    match TUI? Mechanical shape already known (route through the same
+    `handle_*_sidebar_ui_event` calls when the pointer is over the sidebar
+    body).
+14. Should TUI's editor wheel scroll the hovered (unfocused) pane the way
+    GTK's `hovered_window_id` does? Mechanical shape known (`render::
+    find_window_at` + a `_for_window` scroll call).
+15. Is TUI's hover-link click-to-copy a feature GTK should also get, or
+    intentionally TUI-only?
+
+**Wave 4 — the epic, last, gated on P0:**
+16. Retire `events::uievent_to_crossterm` + `mouse.rs`'s remaining
+    non-shared entry-point plumbing by routing through `src/click.rs` + a new
+    shared dispatch layer, per #950's own stage-2 ordering — now scoped down
+    to Git/Search/Settings panel intercepts (Debug/Explorer/ExtPanel are
+    already ported ahead of `mouse.rs`, confirmed this pass) plus the general
+    `MouseDown`/`Up`/`Move` top-level routing. Ends when `uievent_to_crossterm`
+    has no TUI callers left and can be deleted from `src/tui_main/events.rs`.
+
+**Not #1044's scope, filed for reference:** the `CommandLine::selection`
+quadraui gap (item 3 of the trait-method table) is drafted in
+`docs/PENDING_QUADRAUI_ISSUES.md`, coordinator/human action to file per that
+doc's standing note.
+
+### Target end state — numerically
+
+**`src/tui_main/` cannot shrink to `src/macos/mod.rs`'s size (138 lines)** —
+unlike macOS, TUI's `shell_app.rs`/`mouse.rs`/`render_impl.rs`/`panels.rs` carry
+real, irreducible responsibility no other backend has: the entire
+ratatui/ANSI paint substrate (the TUI-side equivalent of GTK's Cairo calls,
+themselves already routed through `render.rs`), the raw-mode-safe panic hook,
+per-frame cell-grid viewport recomputation, keyboard-enhancement probing, PTY
+resize handling, and genuine TUI-only features (explorer drag-and-drop,
+minimap braille rendering). Converging waves 1–4 above nets roughly **−400 to
+−900 production lines**, mostly out of `mouse.rs` and `shell_app.rs` — landing
+`src/tui_main/`'s total near **9,600–10,000**, not lower. This matches
+`IRREDUCIBLE_SURFACE.md` §4's existing estimate ("~2,000 ± 500 duplicated code
+lines, nets −300 to −1,000") — this audit itemizes that estimate into 16 named,
+mostly-small issues instead of leaving it as an aggregate guess.
+
+**Which files survive, and in what shape:** `shell_app.rs` (the `ShellApp`
+impl + the irreducible `setup`/`tick`/window-absence `handle` arms — thinner,
+not gone), `mouse.rs` (the irreducible cell-hit-test math + apply bodies for
+geometry that genuinely differs per backend — thinner once waves 1–2 land),
+`backend.rs`/`panels.rs`/`render_impl.rs`/`quadraui_tui.rs`/`services.rs`
+(**not audited by #1044** — the issue scoped this pass to `ShellApp` +
+`mouse.rs` only; a future round should cover these if the goal wants full
+`src/tui_main/` coverage), `events.rs` (shrinks as wave 4 removes
+`uievent_to_crossterm` callers — plausibly deletable entirely once wave 4
+finishes, if no `UiEvent`-shape conversion is still needed for the Git/Search/
+Settings migration). No file is targeted for outright deletion by this
+audit — that is explicitly out of scope ("Deleting `TuiShellApp` is the last
+child issue, not this one").
 
 ## ⚠️ Milestone #7 is NOT drained — 2 open (2026-09-11)
 
@@ -353,6 +582,7 @@ count.
 | **#657** | Put vimcode on the oracle loop | ✅ Closed. `[lib] vimcode_core` + sealed `tests/acceptance/`. |
 | **#47** | Native macOS GUI, as a thin wrapper | 🔓 **Reopened 2026-09-03, OPEN in milestone #5.** Blocker resolved (quadraui#699/#704); #811 already ported the TUI side. Stage 1 (GTK side) is the actual next work — see `PLAN.md`. |
 | **quadraui#481 / #482** | Duplication one level down — largely refuted, see §2 above | 🔓 Open, un-milestoned. Don't plan against their headline numbers. |
+| **#1044** | TuiShellApp/mouse.rs rung-decomposition audit | 🔓 **Open, milestone #7.** Audit complete (98 rungs, this file's 2026-09-16 section); 16 sequenced child issues drafted, not yet filed — coordinator/human action. Closes once filed. |
 
 ### The two decisions this file was holding open — both now moot
 
@@ -367,11 +597,21 @@ every fix ahead of #657 was verified by tests its own author wrote. It is now
 follow-up is to decide whether any of #751–#766 warrants a retro-fitted
 oracle-authored test, rather than re-litigating the sequencing.
 
-## Status (2026-09-11, macOS native-menu audit)
+## Status (2026-09-16, #1044 rung-decomposition audit)
 
-- ⚠️ **Milestone #7 is 2 open** (#901, #902) — the 09-01 critical path plus 16
-  slices all landed, but the 2026-09-11 audit reopened the milestone: quadraui
-  shipped `install_menu_bar` / `show_context_menu` and vimcode adopted neither.
+- 🔬 **Milestone #7 is 3 open** (#901, #902, #1044). #1044 enumerated all 98
+  rungs of `TuiShellApp`/`mouse.rs` against `App`: 40 already-shared, 26
+  convergeable (sequenced into 16 child issues, see the 2026-09-16 section
+  above), 31 irreducible (all instances of 3 facts, one of them new —
+  `docs/IRREDUCIBLE_SURFACE.md` §1/§7), 1 quadraui-gap (drafted in
+  `docs/PENDING_QUADRAUI_ISSUES.md`). **No production code changed** — this was
+  the audit, not the convergence. Target: `src/tui_main/` lands near
+  9,600–10,000 production lines once the 16 child issues land, not lower —
+  see that section's "Target end state" for why it can't reach `src/macos/`'s
+  138.
+- ⚠️ **#901/#902 still open** (the 09-01 critical path plus 16 slices all
+  landed, but the 2026-09-11 audit reopened the milestone: quadraui shipped
+  `install_menu_bar` / `show_context_menu` and vimcode adopted neither).
   See the milestone section above for the additive-vs-substitutive rule.
 - ✅ **The oracle loop is live here** (#657) and `draw_frame` is gone (#766).
 - 📉 **The audit is run and the chain missed by ~12×.** Measured over its own range

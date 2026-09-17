@@ -288,6 +288,60 @@ it is recorded here.
 
 ---
 
+## `quadraui::CommandLine` has no `selection` field to paint (blocks vimcode#194, found by vimcode#1044)
+
+**Title:** `CommandLine`/`draw_command_line` cannot paint a selection highlight —
+`CommandLineLayout::hit_test`/`selection_bounds` compute the geometry but nothing
+carries it to either backend's paint call
+
+**Body:**
+
+vimcode#1044 (the ShellApp/mouse.rs decomposition audit) re-verified
+`docs/IRREDUCIBLE_SURFACE.md` §2a's existing verdict on command-line text
+selection and found it **stale, not wrong in direction**: that section says
+`CommandLineLayout::hit_test` "does not exist anywhere in quadraui" — true when
+written (2026-09-03), but quadraui#705 shipped
+`CommandLineLayout::hit_test`/`selection_bounds` (`quadraui/src/primitives/command_line.rs:98,134`,
+present at the currently-pinned rev `8abca3a`) and vimcode already adopted both,
+unconditionally shared by both backends: `render::command_line_click_char_idx`
+and `render::command_line_selection_rect` (`src/render.rs:19933,19979`) call
+straight through to them. So the **hit-test** half of the old verdict is now
+`already-shared`, not a gap — no issue needed there.
+
+What's left, and is real and current: `render::command_line_selection_rect`'s
+own doc comment already names it — `quadraui::CommandLine` carries no
+`selection` field, and neither the GTK nor TUI `draw_command_line` in quadraui
+paints one. `command_line_selection_rect` computes the paintable highlight rect
+and has never been wired into either paint path (its doc: "Not wired into
+either backend's paint path yet (#816 review)"). TUI works around this by
+painting the command line cell-by-cell with the selection baked into the
+foreground/background inversion (`tui_main::panels::render_command_line`) —
+so TUI *has* a visible selection highlight today, just via a hand-rolled paint
+path instead of the shared primitive. GTK has **no visible highlight at all**:
+a user who drags a selection over the GTK command line gets `cmd_sel`/Ctrl+C
+behavior with zero visual feedback, because there is nowhere in
+`quadraui::CommandLine` to put the selection so GTK's `draw_command_line` could
+paint it.
+
+**Ask:** add a `selection: Option<(usize, usize)>` (or similar) field to
+`quadraui::CommandLine`, and have both backends' `draw_command_line`
+(GTK/Cairo, TUI/ratatui) paint the corresponding highlight rect/cell-inversion
+when it's set — the geometry math for GTK is already done and waiting
+(`render::command_line_selection_rect`); the ratatui side would let TUI stop
+hand-painting the highlight itself and instead pass `selection` through like
+every other `CommandLine` field.
+
+**Blocks:** `JDonaghy/vimcode#194` ("Status-bar / command-line messages aren't
+mouse-selectable — GTK can't; TUI has offset bug") — the hit-test half of #194
+is unblocked (already-shared, as above); the visual-highlight half stays
+blocked on this. Leave #194 open behind this one per `GOALS.md`'s
+milestone-discipline rule. Also update `docs/IRREDUCIBLE_SURFACE.md` §2a once
+this is filed — that section's "does not exist anywhere in quadraui" claim
+needs correcting to point at this narrower, still-open gap instead (done in
+this same PR, see that file's new §2c).
+
+---
+
 ## `TuiBackend` lets a `None` cursor_position clobber a `Some` within one frame (blocks vimcode#1039)
 
 **Title:** `TuiBackend::last_cursor_position` is overwritten unconditionally
