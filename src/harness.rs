@@ -3325,6 +3325,102 @@ mod issue_1057_bottom_item_click_toggles_sidebar {
     }
 }
 
+/// #1062 (GOALS.md's 2026-09-16 audit, #1044, wave 2 item 10): the third of
+/// the three `AppShellEvent` shadow-`engine.app_shell` sync arms this issue
+/// converges -- `PanelChanged`/`SidebarHidden`/`SidebarResized` -- onto one
+/// shared function, [`render::sync_shell_event_shadow`]. #988 was one of
+/// these three forgetting the sync entirely: `PanelChanged { hamburger }`
+/// returned early, before any shadow-sync statement ran, because the sync
+/// used to be spelled out fresh at each call site instead of owned by one
+/// function every call site is required to reach. That specific hamburger
+/// scenario already has its own `tui_prod` coverage
+/// (`issue_1053_dead_activity_bar_block`, above); this scenario covers the
+/// *other* two arms, `PanelChanged`/`SidebarHidden` for an ordinary panel,
+/// on all three backends.
+///
+/// This is a structural-convergence scenario, not a bug reproduction --
+/// the closest sibling in this wave is #1059's tab-bar-dispatch rung, whose
+/// own doc makes the same call: both `App::on_shell_event` and
+/// `TuiShellApp::on_shell_event` already produced the *same* observable
+/// result for a real (non-hamburger, non-`ext:`) panel's open/close pair
+/// before this issue -- what was duplicated was the sync statements
+/// themselves, not the behaviour they produced. So this is not expected to
+/// go red against pre-#1062 `develop`; what it proves, registered on `gtk`,
+/// `tui` **and** `tui_prod`, is that all three arms still agree *after*
+/// being collapsed onto the one shared function -- per the issue's own
+/// "Proving it actually converged" section, the `tui_prod` arm is the only
+/// one that could have caught `TuiShellApp::on_shell_event`'s copy
+/// drifting from `App`'s during the convergence, since it is the only arm
+/// that drives the shipped `TuiShellApp` rather than the shared `App`.
+///
+/// Exercises the Search panel's activity-bar icon: one click opens it
+/// (`PanelChanged`), a second click on the now-open icon closes it
+/// (`SidebarHidden`) -- covering two of this issue's three converged arms
+/// end to end through painted output. The third, `SidebarResized`, has no
+/// rendered proxy on TUI to assert on: `render::sync_shell_event_shadow`'s
+/// `SidebarResized` arm now pushes the drag-settled width into the shadow
+/// `engine.app_shell` on TUI too (previously nothing did -- nothing reads
+/// that copy's width back on TUI, `TuiShellApp::sidebar_width` is the
+/// separate field its own column math actually reads), so there is no
+/// painted difference to assert on without asserting on state directly,
+/// which this repo's own testing rule (`CLAUDE.md`, "Rendered output, not
+/// state") forbids.
+#[cfg(test)]
+mod issue_1062_shell_event_shadow_sync {
+    use super::*;
+
+    fn engine_fixture() -> crate::core::Engine {
+        let mut engine = crate::core::Engine::new_for_test();
+        engine.settings.use_nerd_fonts = Some(false);
+        engine
+    }
+
+    crate::backend_conformance! {
+        label: activity_bar_panel_click_open_then_close_via_converged_shadow_sync,
+        backends: [gtk, tui, tui_prod],
+        engine: engine_fixture(),
+        size: (800, 480),
+        body: |driver| {
+            // Two genuine, independent, fully-released clicks on the same
+            // icon -- `drag_text`, not `click_text`, and double-click
+            // folding disabled, for the same reason
+            // `bottom_item_second_click_collapses_sidebar` (#1057, above)
+            // needs both: a bare down-only click leaves the simulated
+            // button latched for the second press, and two real clicks
+            // close together in simulated time would otherwise fold into a
+            // `DoubleClick`, which bypasses `ShellAdapter`'s semantic
+            // `AppShellEvent` dispatch -- and so this scenario's own
+            // subject -- entirely.
+            driver.set_double_click_folding(false);
+
+            assert!(
+                !driver.screen_has("Replace…"),
+                "precondition: Search is not the default active panel, so \
+                 its form must not be painted yet"
+            );
+
+            let search = crate::icons::SEARCH.s();
+            driver.drag_text(search, search);
+            assert!(
+                driver.screen_has("Replace…"),
+                "clicking the Search icon once must open the Search panel \
+                 -- AppShellEvent::PanelChanged synced onto the shadow \
+                 engine.app_shell via render::sync_shell_event_shadow, on \
+                 every backend"
+            );
+
+            driver.drag_text(search, search);
+            assert!(
+                !driver.screen_has("Replace…"),
+                "clicking the Search icon again, while its own panel is \
+                 already open, must close the sidebar -- \
+                 AppShellEvent::SidebarHidden synced onto the shadow via \
+                 the same shared function, on every backend"
+            );
+        },
+    }
+}
+
 /// #1059 (GOALS.md's 2026-09-16 audit, #1044, wave 2 item 7): `tui_main::mouse`
 /// hand-rolled the tab-bar-row dispatch match **twice** (once for a split
 /// group's tab bar, once for a single group's) instead of calling the shared

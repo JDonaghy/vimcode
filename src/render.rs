@@ -4621,6 +4621,85 @@ pub fn dispatch_panel_accelerator(
     Some(action)
 }
 
+// ─── Shell-event shadow-sync rung (#1062) ────────────────────────────────────
+//
+// `AppShellEvent::PanelChanged`/`SidebarHidden`/`SidebarResized` all report a
+// decision the *runner's* own `AppShell` already made — an activity-bar
+// click, a divider drag. Both backends mirror that decision into
+// `engine.app_shell`, the "shadow" copy every engine-side consumer actually
+// reads (`render_sidebar_content`'s panel dispatch, `active_panel_is`,
+// `sidebar_visible()` hit-test gates, session persistence): the runner's own
+// `AppShell` is what the *paint* geometry comes from, but `Engine` itself
+// never consults it directly.
+//
+// #988 was one of these three forgetting the mirror entirely:
+// `PanelChanged { hamburger }` returned early, before any shadow-sync
+// statement ran, because the sync was spelled out fresh at each call site
+// instead of owned by one function every call site is required to reach.
+// [`sync_shell_event_shadow`] is that one function. Both `App::on_shell_event`
+// (GTK) and `TuiShellApp::on_shell_event` (TUI) now call it unconditionally,
+// as the first thing they do, before any of their own id-specific branching —
+// so the shadow mutation itself can no longer be skipped by an early
+// `return` reached before it. The only door left for a backend to exclude an
+// id from the shadow sync is [`ShellShadowSyncHost::panel_absent_from_shadow`],
+// a declarative predicate with no side effects of its own, answered inside
+// this function rather than around it.
+
+/// Host hook for [`sync_shell_event_shadow`] — same shape as
+/// [`PanelAcceleratorHost`] and for the same reason: the sync itself is one
+/// shared body, but *which* panel ids even have a shadow `PanelDefinition`
+/// to sync differs per backend.
+pub trait ShellShadowSyncHost {
+    /// True when `panel_id` has no matching `PanelDefinition` in the shadow
+    /// `engine.app_shell`, so a `PanelChanged` for it must skip the generic
+    /// sync below rather than call `show_panel` on an id the shadow doesn't
+    /// know (a silent no-op) or clobber state a different subsystem owns.
+    ///
+    /// `ext:`-prefixed plugin panels qualify on *both* backends —
+    /// `render::apply_activity_panel_switch`'s `ext:` branch already handles
+    /// them through `engine.ext_panel_active`, not a shadow
+    /// `PanelDefinition` — so [`sync_shell_event_shadow`] checks that case
+    /// itself rather than asking the host. TUI's hamburger id is the one
+    /// case that genuinely needs a host answer: the shadow `AppShell`
+    /// (built in `Engine::new` from only the real content panels) has no
+    /// hamburger `PanelDefinition` at all, for reasons specific enough to
+    /// TUI that GTK's impl is simply `false`.
+    fn panel_absent_from_shadow(&self, panel_id: &quadraui::WidgetId) -> bool;
+}
+
+/// Mirror a runner-decided [`quadraui::AppShellEvent`] onto the shadow
+/// `engine.app_shell` (#1062). Shared by `App::on_shell_event` (GTK) and
+/// `TuiShellApp::on_shell_event` (TUI) — call this first, unconditionally,
+/// before any of the event's other id-specific handling; see the rung's
+/// header comment above for why the call must come first.
+pub fn sync_shell_event_shadow(
+    event: &quadraui::AppShellEvent,
+    engine: &mut Engine,
+    host: &impl ShellShadowSyncHost,
+) {
+    match event {
+        quadraui::AppShellEvent::PanelChanged { panel_id } => {
+            if crate::app_support::is_ext_panel_id(panel_id.as_str())
+                || host.panel_absent_from_shadow(panel_id)
+            {
+                return;
+            }
+            engine.app_shell.show_panel(panel_id);
+            engine.ext_panel_active = None;
+            engine.ext_panel_has_focus = false;
+        }
+        quadraui::AppShellEvent::SidebarHidden => {
+            engine.app_shell.hide_sidebar();
+            engine.ext_panel_active = None;
+            engine.ext_panel_has_focus = false;
+        }
+        quadraui::AppShellEvent::SidebarResized { new_width } => {
+            engine.app_shell.set_sidebar_width(*new_width);
+        }
+        _ => {}
+    }
+}
+
 // ─── Chrome mouse rung (#752 / #733 slice 2) ─────────────────────────────────
 //
 // The rung directly beneath [`route_modal_overlay_click`]: once no modal

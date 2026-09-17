@@ -3071,6 +3071,14 @@ impl ShellApp for TuiShellApp {
     /// the sync itself, on the same frame the click fires, closing that
     /// gap without waiting for a second event.
     fn on_shell_event(&mut self, event: &quadraui::AppShellEvent) {
+        // #1062: the shadow-`engine.app_shell` sync, unconditionally and
+        // first — see `render::sync_shell_event_shadow`'s rung comment for
+        // why this call has to come before any of the id-specific branching
+        // below (including the hamburger check right after it) rather than
+        // be repeated, or omitted, inside each arm. #988 was exactly a
+        // hamburger `return` reached before an equivalent statement used to
+        // exist here at all.
+        render::sync_shell_event_shadow(event, &mut self.engine, &TuiShellShadowHost);
         match event {
             quadraui::AppShellEvent::PanelChanged { panel_id } => {
                 if panel_id.as_str() == HAMBURGER_PANEL_ID {
@@ -3181,10 +3189,14 @@ impl ShellApp for TuiShellApp {
                 // Mirrors `mouse.rs`'s `target_panel_id` arm minus the
                 // toggle decision (the runner already made it: a
                 // same-panel-while-visible click arrives as
-                // `SidebarHidden`, not `PanelChanged`).
+                // `SidebarHidden`, not `PanelChanged`). The
+                // `ext_panel_active`/`ext_panel_has_focus` clear now happens
+                // unconditionally in `render::sync_shell_event_shadow`,
+                // above — `focus_sidebar_panel` still owns the extra
+                // TUI-only bookkeeping (`clear_sidebar_focus`,
+                // per-panel focus flag, session) that has no GTK equivalent
+                // (GTK gets real widget focus from the toolkit instead).
                 self.sidebar.ext_panel_name = None;
-                self.engine.ext_panel_has_focus = false;
-                self.engine.ext_panel_active = None;
                 self.engine.focus_sidebar_panel(panel_id.as_str());
                 self.sidebar.has_focus = true;
             }
@@ -3212,13 +3224,18 @@ impl ShellApp for TuiShellApp {
                 // the same three fields in its own hide branch. Leaving them
                 // set would make `take_requested_panel` keep steering the
                 // runner back onto a panel whose sidebar the user just closed.
+                // The `ext_panel_active`/`ext_panel_has_focus` half of that
+                // clear (plus `app_shell.hide_sidebar()` itself) now runs
+                // unconditionally in `render::sync_shell_event_shadow`,
+                // above; `collapse_sidebar()` below is TUI's own superset —
+                // it additionally clears every *other* sidebar-panel focus
+                // flag and persists the session, neither of which GTK's
+                // widget-focus model needs.
                 // #1029 (review, fix iteration 2): another shell-consumed
                 // user click that never reaches `Self::handle` — spend the
                 // stale-corner guard.
                 self.disarm_hamburger_stale_click_guard();
                 self.sidebar.ext_panel_name = None;
-                self.engine.ext_panel_has_focus = false;
-                self.engine.ext_panel_active = None;
                 self.engine.collapse_sidebar();
             }
             // ── #634 smoke retry, generalised by #1057: bottom items
@@ -3246,7 +3263,12 @@ impl ShellApp for TuiShellApp {
             // the way out — when `AppShell` resolves its *own* divider drag
             // it reports the settled width here, and vimcode's copy has to
             // follow or the next `handle()` would immediately push the stale
-            // value back and undo the drag.
+            // value back and undo the drag. `render::sync_shell_event_shadow`
+            // above already pushed `new_width` into the shadow
+            // `engine.app_shell` (#1062 — previously nothing did, since
+            // nothing reads that copy's width back on TUI);
+            // `self.sidebar_width` here is the separate TUI-local field
+            // the column math in `tick()`/`mouse.rs` actually reads.
             quadraui::AppShellEvent::SidebarResized { new_width } => {
                 self.disarm_hamburger_stale_click_guard();
                 self.sidebar_width = new_width.round().max(0.0) as u16;
@@ -3599,6 +3621,20 @@ impl render::PanelAcceleratorHost for TuiAccelHost<'_> {
             ),
             ctx,
         );
+    }
+}
+
+/// [`render::ShellShadowSyncHost`] impl for TUI (#1062): the one id that
+/// exists in the runner's `AppShell` but has no matching shadow
+/// `PanelDefinition` — see
+/// [`render::ShellShadowSyncHost::panel_absent_from_shadow`]'s doc for why.
+/// GTK has no such id at all (`GtkShellShadowHost` in `app.rs` answers
+/// `false` unconditionally).
+struct TuiShellShadowHost;
+
+impl render::ShellShadowSyncHost for TuiShellShadowHost {
+    fn panel_absent_from_shadow(&self, panel_id: &quadraui::WidgetId) -> bool {
+        panel_id.as_str() == HAMBURGER_PANEL_ID
     }
 }
 
