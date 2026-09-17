@@ -10561,7 +10561,46 @@ pub fn build_minimap_data(
     if display_rows == 0 {
         return None;
     }
-    let target_lines = display_rows.saturating_mul(MINIMAP_LINES_PER_ROW).max(1);
+    // #1052: GTK's minimap rasteriser paints each sampled line at a
+    // **fixed** `ROW_PITCH_PX` (2px) row pitch, completely decoupled from
+    // the editor's own `line_height` (`quadraui::gtk::minimap`'s module
+    // doc: "Rows tile at a fixed ROW_PITCH_PX ... independent of the
+    // file's length"). `display_rows` above assumes the opposite — that
+    // one minimap display row costs one `line_height` — which is correct
+    // for TUI (whose braille row genuinely is cell-native, `lh == 1.0`)
+    // but drastically under-samples for GTK: at a typical ~20px
+    // `line_height`, GTK can actually paint ~10x more 2px rows in the same
+    // strip height than `display_rows * MINIMAP_LINES_PER_ROW` ever
+    // samples. Once those too-few samples run out, GTK's rasteriser (which
+    // paints sampled rows top-aligned, not stretched to fill the strip —
+    // see `Minimap::layout_with_sizing`'s `FixedPitch` arm) simply stops,
+    // leaving the rest of the strip flat/background — a *vertical* colour
+    // falloff by buffer line, reproduced and measured in
+    // `gtk::testing::minimap::minimap_paints_syntax_colour_near_the_bottom_of_a_long_file_via_gtk_driver`
+    // (distinct colours per decile of strip height dropped from ~9 to 1
+    // right where this under-sampling predicted, on an unfixed `develop`).
+    //
+    // This mirrors `visible_span_cols`'s column-axis fix immediately below
+    // (#1030): take the max of both backends' real row requirements rather
+    // than branching on backend identity (Platform-Neutrality Rule — this
+    // stays shared code). `rect.height` is in the caller's own native unit
+    // (pixels for GTK, cell rows for TUI), exactly like `rect.width` was
+    // for columns, so GTK's real requirement —
+    // `rect.height / ROW_PITCH_PX`, at GTK's own 1-buffer-line-per-row
+    // granularity — is only dimensionally meaningful when `rect.height` is
+    // pixels. It is still safe to fold into the max unconditionally on the
+    // TUI side too: TUI's own requirement is `rect.height *
+    // MINIMAP_LINES_PER_ROW` there (`lh` is always `1.0` for TUI), which
+    // exceeds `rect.height / ROW_PITCH_PX` for any positive `rect.height`
+    // since `MINIMAP_LINES_PER_ROW` (4) is larger than `1.0 /
+    // ROW_PITCH_PX` (0.5) — so this candidate can only ever win on GTK's
+    // own numbers, never accidentally overriding TUI's.
+    let gtk_row_capacity =
+        (rect.height / quadraui::primitives::minimap::ROW_PITCH_PX).floor() as usize;
+    let target_lines = display_rows
+        .saturating_mul(MINIMAP_LINES_PER_ROW)
+        .max(gtk_row_capacity)
+        .max(1);
 
     let window = engine.windows.get(&window_id)?;
     let buffer_state = engine.buffer_manager.get(window.buffer_id)?;
