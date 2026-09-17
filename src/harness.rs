@@ -3000,3 +3000,99 @@ mod issue_986_confirm_prompt_never_built {
     // future confirm-loop implementation issue should add the highlight
     // assertion once its actual rendering mechanism is known.
 }
+
+/// #1053 (GOALS.md's 2026-09-16 audit, #1044, wave 1 item 1): `mouse.rs`
+/// used to carry a ~55-line hand-rolled `ActivityBarTarget` dispatch block
+/// (resolving `resolve_activity_bar_click`, including a `MenuToggle` arm)
+/// that #988's own "likely shape" guess pointed at as the bug site, wrongly
+/// -- it was confirmed-unreachable for a genuine single click: `AppShell`
+/// (`TuiShellApp::shell_config` registers every activity-bar item,
+/// including the hamburger, as a real `PanelDefinition`) consumes the click
+/// into a semantic `AppShellEvent` upstream of `TuiShellApp::handle` ->
+/// `mouse::handle_mouse` entirely. Deleted.
+///
+/// `tui_prod`-only (not `backend_conformance!`'s usual `[gtk, tui,
+/// tui_prod]`): the dead block, and the deletion, are both specific to
+/// `src/tui_main/mouse.rs` -- there is no GTK or shared-`App` counterpart to
+/// register a twin against (GTK never had an equivalent hand-rolled
+/// dispatch; `App`'s own activity-bar handling is a different, already-
+/// shared rung -- see `GOALS.md`'s audit table).
+///
+/// This is the systematic convergence-audit registration the issue's own
+/// "Proving it actually converged" section asks for, alongside (not instead
+/// of) the more thorough in-crate black-box coverage in
+/// `shell_app.rs`'s `driver_click_on_every_activity_bar_icon_opens_its_
+/// panel_via_shell_app` (all 6 fixed panels, Settings, and the hamburger,
+/// via `TuiShellApp::new_for_test` + real single clicks). This scenario
+/// samples two of those targets through the independent `conformance_
+/// harness_prod` lens instead of repeating all of them: an ordinary fixed
+/// panel (Search) and the specific arm #988 named (the hamburger).
+#[cfg(test)]
+mod issue_1053_dead_activity_bar_block {
+    /// A bare `Engine::new_for_test()` fixture with Nerd Fonts off, so the
+    /// hamburger/search icons this scenario looks for are the ASCII
+    /// fallback glyphs `crate::icons::Icon::s()` resolves consistently
+    /// against (same thread, same flag -- see `icons.rs`'s module doc on
+    /// why that's safe across a `cargo test` process without cross-test
+    /// interference).
+    fn engine_fixture() -> crate::core::Engine {
+        let mut engine = crate::core::Engine::new_for_test();
+        engine.settings.use_nerd_fonts = Some(false);
+        engine
+    }
+
+    #[test]
+    fn activity_bar_click_routes_via_shell_app_not_dead_mouse_block_tui_prod() {
+        let mut __h = crate::tui_main::testing::conformance_harness_prod(engine_fixture(), 80, 24);
+        let driver = &mut __h.driver;
+        crate::icons::set_nerd_fonts(false);
+        driver.set_double_click_folding(false);
+        driver.dispatch(quadraui::UiEvent::WindowFocused(true));
+        driver.render();
+
+        assert!(
+            !driver.screen_contains("Replace…"),
+            "precondition: Search is not the default active panel; \
+             screen:\n{}",
+            driver.screen()
+        );
+        let search = crate::icons::SEARCH.s();
+        let (sx, sy) = driver.find(search).unwrap_or_else(|| {
+            panic!(
+                "Search icon must paint on the activity bar; screen:\n{}",
+                driver.screen()
+            )
+        });
+        driver.click(sx, sy);
+        driver.dispatch(quadraui::UiEvent::WindowFocused(true));
+        driver.render();
+        assert!(
+            driver.screen_contains("Replace…"),
+            "clicking the Search icon must open the Search panel via the \
+             real ShellApp path, with the dead mouse.rs activity-bar block \
+             gone; screen:\n{}",
+            driver.screen()
+        );
+
+        assert!(
+            !driver.screen_contains("File"),
+            "precondition: menu bar starts hidden; screen:\n{}",
+            driver.screen()
+        );
+        let hamburger = crate::icons::HAMBURGER.s();
+        let (hx, hy) = driver
+            .find(hamburger)
+            .expect("hamburger icon must paint on the activity bar");
+        driver.click(hx, hy);
+        driver.dispatch(quadraui::UiEvent::WindowFocused(true));
+        driver.render();
+        assert!(
+            driver.screen_contains("File"),
+            "clicking the hamburger -- the specific arm #988's own \
+             \"likely shape\" guess pointed at -- must reveal the menu bar \
+             via the real ShellApp path, with the dead \
+             `ActivityBarTarget::MenuToggle` arm gone; screen:\n{}",
+            driver.screen()
+        );
+    }
+}

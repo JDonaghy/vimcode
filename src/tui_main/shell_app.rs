@@ -4968,6 +4968,22 @@ mod tests {
     /// placeholder — content only `render_search_panel` paints, never the
     /// explorer tree or the runner's own " Search " header chrome (which
     /// updated even while the content pane was stuck — the smoke bug).
+    ///
+    /// #1053 review: `set_double_click_folding(false)` added. Without it,
+    /// these two `driver.click(1.0, 2.0)` calls — identical coordinates,
+    /// no simulated time between them — folded into a single
+    /// `UiEvent::DoubleClick` (`TuiDriver`'s `DoubleClickDetector`, same
+    /// mechanism `hamburger_relocated_click_after_reveal_hides_menu_bar`'s
+    /// doc comment documents in full). A folded `DoubleClick` bypasses
+    /// `ShellAdapter`'s semantic dispatch and falls through to
+    /// `TuiShellApp::handle` -> `mouse::handle_mouse` — before #1053 that
+    /// path's activity-bar block resolved it anyway (identically to a
+    /// single click, since the deleted block never distinguished the
+    /// two), so the "second click toggles closed" assertion below passed,
+    /// but for the wrong reason: it was never proving the *real* second-
+    /// single-click path (`AppShell::handle_activity_click`'s "already
+    /// active + visible -> hide" branch) at all. Folding disabled makes
+    /// this test what its own doc comment always claimed it was.
     #[test]
     fn driver_click_on_search_icon_switches_and_toggles_sidebar() {
         let mut driver = driver_with_shell(
@@ -4976,6 +4992,7 @@ mod tests {
             80,
             24,
         );
+        driver.set_double_click_folding(false);
         assert!(
             !driver.screen_contains("Replace…"),
             "precondition: startup sidebar shows Explorer, not Search"
@@ -5113,6 +5130,131 @@ mod tests {
             "clicking an extension panel's activity-bar icon must open its \
              sidebar body; screen:\n{screen}"
         );
+    }
+
+    /// #1053: before deleting `mouse.rs`'s dead activity-bar block (the
+    /// hand-rolled `ActivityBarTarget` dispatch, including the
+    /// `ActivityBarTarget::MenuToggle` arm #988's own "likely shape" guess
+    /// pointed at, wrongly — see `hamburger_relocated_click_after_reveal_
+    /// hides_menu_bar`'s doc comment for the mechanism), prove every target
+    /// that block used to (claim to) resolve is actually reachable through
+    /// the real production path: `ShellAdapter::handle` ->
+    /// `AppShell::handle_activity_click`, which consumes a genuine single
+    /// `MouseDown` into a semantic `AppShellEvent` *before*
+    /// `TuiShellApp::handle` -> `mouse::handle_mouse` ever sees it.
+    ///
+    /// Covers 7 of the 8 `ActivityBarTarget` kinds plus the hamburger: the
+    /// 6 fixed panels (`Panel(SidebarPanel::*)`), `Settings` (a *bottom*
+    /// item, dispatched as `AppShellEvent::BottomItemClicked`, not
+    /// `PanelChanged` — see `on_shell_event`'s `BottomItemClicked` arm),
+    /// and `MenuToggle`. The 8th kind, `ExtensionPanel`, already has its
+    /// own dedicated click-driven coverage just above
+    /// (`driver_click_on_extension_icon_opens_the_plugin_panel`) — not
+    /// repeated here.
+    ///
+    /// Every click is genuine and independent (`set_double_click_folding
+    /// (false)`, matching the hamburger tests' own rationale — two clicks
+    /// close together in simulated time would otherwise fold into a
+    /// `DoubleClick`, which bypasses `ShellAdapter`'s semantic dispatch
+    /// entirely and falls through to the very `mouse::handle_mouse` path
+    /// this test exists to prove is *not* load-bearing), located fresh
+    /// from the just-painted frame via `driver.find` (never a stored
+    /// coordinate — `hamburger_stale_click_position_after_reveal_still_
+    /// hides_menu_bar` documents why a stale coordinate can silently
+    /// exercise a different code path). Built with
+    /// `TuiShellApp::new_for_test` (`#868`) and the real production
+    /// `TuiShellApp::shell_config(false)` — not the single-panel test
+    /// `config()` helper — so this is the actual activity bar a user
+    /// clicks, not a stand-in.
+    ///
+    /// The hamburger is clicked last, after every real panel: revealing
+    /// the menu bar reserves a title-bar row and shifts the whole activity
+    /// bar down by one, which `driver.find` handles automatically for
+    /// anything clicked afterwards, but there is no need to keep clicking
+    /// after the hamburger's own assertion, so it's simplest to end there.
+    #[test]
+    fn driver_click_on_every_activity_bar_icon_opens_its_panel_via_shell_app() {
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_test_1053_activity_bar_all_targets_{:?}",
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker_file = dir.join("zqxw1053.txt");
+        std::fs::write(&marker_file, "marker").unwrap();
+
+        let mut app = TuiShellApp::new_for_test();
+        app.engine.cwd = dir.clone();
+        app.engine.explorer_reveal_path(&marker_file);
+
+        let mut driver = driver_with_shell(app, TuiShellApp::shell_config(false), 80, 24);
+        driver.set_double_click_folding(false);
+        driver.dispatch(quadraui::UiEvent::WindowFocused(true));
+        driver.render();
+
+        assert!(
+            !driver.screen_contains("zqxw1053.txt"),
+            "precondition: Explorer is the default active panel but starts \
+             hidden (sidebar visibility defaults to false — see \
+             `app_with_sidebar_open`'s doc); screen:\n{}",
+            driver.screen()
+        );
+        assert!(
+            !driver.screen_contains("File"),
+            "precondition: menu bar starts hidden; screen:\n{}",
+            driver.screen()
+        );
+
+        // Click each icon, freshly located, and confirm the click actually
+        // switched the sidebar's *content* (not just chrome) via the real
+        // `ShellAdapter` path.
+        let mut click_icon_and_expect = |icon: &str, marker: &str, label: &str| {
+            let (x, y) = driver.find(icon).unwrap_or_else(|| {
+                panic!(
+                    "{label} icon must paint on the activity bar; screen:\n{}",
+                    driver.screen()
+                )
+            });
+            driver.click(x, y);
+            driver.dispatch(quadraui::UiEvent::WindowFocused(true));
+            driver.render();
+            let screen = driver.screen();
+            assert!(
+                screen.contains(marker),
+                "clicking the {label} icon must open its panel via the \
+                 real ShellApp path (marker {marker:?} missing); \
+                 screen:\n{screen}"
+            );
+        };
+
+        click_icon_and_expect(crate::icons::SEARCH.s(), "Replace…", "Search");
+        click_icon_and_expect(crate::icons::DEBUG.s(), "DEBUG", "Debug");
+        click_icon_and_expect(
+            crate::icons::GIT_BRANCH.s(),
+            "SOURCE CONTROL",
+            "Source Control",
+        );
+        click_icon_and_expect(crate::icons::EXTENSIONS.s(), "EXTENSIONS", "Extensions");
+        click_icon_and_expect(crate::icons::AI_CHAT.s(), "AI ASSISTANT", "AI");
+        click_icon_and_expect(crate::icons::SETTINGS.s(), "SETTINGS", "Settings");
+        click_icon_and_expect(crate::icons::EXPLORER.s(), "zqxw1053.txt", "Explorer");
+
+        // Hamburger last: `ActivityBarTarget::MenuToggle`, the specific arm
+        // #988's "likely shape" guess named.
+        let (hx, hy) = driver
+            .find(crate::icons::HAMBURGER.s())
+            .expect("hamburger icon must paint on the activity bar");
+        driver.click(hx, hy);
+        driver.dispatch(quadraui::UiEvent::WindowFocused(true));
+        driver.render();
+        assert!(
+            driver.screen_contains("File"),
+            "clicking the hamburger must reveal the menu bar via the real \
+             ShellApp path; screen:\n{}",
+            driver.screen()
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Unit half of the click path: `AppShell` reports an extension icon
@@ -12123,6 +12265,25 @@ mod tests {
     ///
     /// Both are exactly the "stops responding" symptom, and both
     /// reproduce on any machine regardless of installed extensions.
+    ///
+    /// #1053 review: this test's setup step used to drive
+    /// `handle_mouse_event` directly with a raw `MouseDown` at the plugin
+    /// icon's activity-bar coordinates, relying on `mouse::handle_mouse`'s
+    /// (now-deleted) `ActivityBarTarget::ExtensionPanel` arm to resolve it.
+    /// That bypassed `ShellAdapter`/`AppShell::handle` entirely — in
+    /// production a genuine single click there never reaches
+    /// `handle_mouse_event` at all (see `driver_click_on_every_activity_
+    /// bar_icon_opens_its_panel_via_shell_app`'s doc comment), so the raw
+    /// coordinate was never representative of the real dispatch. Replaced
+    /// with the actual semantic event `ShellAdapter` produces for that
+    /// click — `AppShellEvent::PanelChanged { panel_id: "ext:git-insights"
+    /// }` — driven through `on_shell_event`, the same "unit half of the
+    /// click path" `on_shell_event_extension_panel_changed_opens_the_
+    /// plugin_panel` above already exercises. The rest of this test (the
+    /// stale-`ext_sidebar_body_rect` click below) is untouched: that lands
+    /// inside the sidebar body, not the activity bar, so it was never
+    /// depending on the deleted block.
+    #[allow(deprecated)]
     #[test]
     fn plugin_ext_panel_wins_focus_and_clicks_after_marketplace_visit() {
         let mut app = TuiShellApp::new(None);
@@ -12149,18 +12310,13 @@ mod tests {
 
         let mut backend = backend_at(80.0, 24.0);
 
-        // Click the plugin panel's activity-bar icon — row 7, after
-        // menu(0)/explorer(1)/search(2)/debug(3)/git(4)/extensions(5)/ai(6)
-        // (`resolve_activity_bar_click`).
-        app.handle_mouse_event(
-            UiEvent::MouseDown {
-                widget: None,
-                button: quadraui::MouseButton::Left,
-                position: quadraui::Point::new(1.0, 7.0),
-                modifiers: quadraui::Modifiers::default(),
-            },
-            &mut backend,
-        );
+        // The plugin panel's activity-bar icon click, as `ShellAdapter`
+        // actually reports it: a semantic `PanelChanged` for its `"ext:"`
+        // id, consumed by `on_shell_event` before `handle_mouse_event`
+        // would ever see a raw `MouseDown` for it.
+        app.on_shell_event(&quadraui::AppShellEvent::PanelChanged {
+            panel_id: quadraui::WidgetId::new("ext:git-insights"),
+        });
         assert_eq!(app.sidebar.ext_panel_name.as_deref(), Some("git-insights"));
         assert!(
             app.engine.ext_panel_has_focus && !app.engine.ext_sidebar_has_focus,
