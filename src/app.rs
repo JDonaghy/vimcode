@@ -149,6 +149,18 @@ impl render::PanelAcceleratorHost for GtkAccelHost<'_> {
     }
 }
 
+/// [`render::ShellShadowSyncHost`] impl for GTK (#1062): GTK has no panel id
+/// that's absent from the shadow `engine.app_shell` other than the `ext:`
+/// ids `render::sync_shell_event_shadow` already excludes itself, so this is
+/// a unit struct answering `false` unconditionally.
+struct GtkShellShadowHost;
+
+impl render::ShellShadowSyncHost for GtkShellShadowHost {
+    fn panel_absent_from_shadow(&self, _panel_id: &quadraui::WidgetId) -> bool {
+        false
+    }
+}
+
 /// Work that a GTK callback with no `&mut App` in hand must hand back to the
 /// next frame.
 ///
@@ -8348,6 +8360,17 @@ impl quadraui::ShellApp for App {
 
     fn on_shell_event(&mut self, event: &quadraui::AppShellEvent) {
         use quadraui::AppShellEvent;
+        // #1062: the shadow-`engine.app_shell` sync, unconditionally and
+        // first — see `render::sync_shell_event_shadow`'s rung comment for
+        // why this call has to come before any of the id-specific branching
+        // below rather than be repeated inside each arm. GTK has no id that
+        // needs `ShellShadowSyncHost::panel_absent_from_shadow` to answer
+        // `true` (it has no hamburger panel), so `GtkShellShadowHost` is a
+        // unit struct.
+        {
+            let mut engine = self.engine.borrow_mut();
+            render::sync_shell_event_shadow(event, &mut engine, &GtkShellShadowHost);
+        }
         match event {
             AppShellEvent::PanelChanged { panel_id } => {
                 // #557: plugin-provided panels are now real `PanelDefinition`s
@@ -8355,50 +8378,28 @@ impl quadraui::ShellApp for App {
                 // icon clicks arrive here like any built-in panel's. They are
                 // *not* engine-`AppShell` panels though — `render_content`
                 // dispatches on `engine.ext_panel_active`, which
-                // `show_panel` would leave untouched (and, since the engine's
-                // AppShell has no such panel, it would no-op entirely) — so
-                // route them through the existing `switch_panel` handler
-                // that owns the ext-panel focus/toggle bookkeeping.
+                // `sync_shell_event_shadow` deliberately leaves untouched for
+                // an `ext:` id (see that function's doc) — so route them
+                // through the existing `switch_panel` handler that owns the
+                // ext-panel focus/toggle bookkeeping.
                 if is_ext_panel_id(panel_id.as_str()) {
                     self.switch_panel(panel_id.as_str().to_string());
                     return;
                 }
-                // Sync the runner's active panel into the engine's AppShell so
-                // render_content() draws the correct sidebar panel content.
-                {
-                    let mut engine = self.engine.borrow_mut();
-                    engine.app_shell.show_panel(panel_id);
-                    // Switching to a built-in panel has to drop the plugin
-                    // panel's claim on the sidebar body, or
-                    // `current_active_panel_id` keeps synthesising
-                    // `ext:{name}` and the built-in panel never paints.
-                    engine.ext_panel_active = None;
-                    engine.ext_panel_has_focus = false;
-                }
                 self.draw_needed.set(true);
             }
             AppShellEvent::SidebarHidden => {
-                {
-                    let mut engine = self.engine.borrow_mut();
-                    engine.app_shell.hide_sidebar();
-                    // #557: this is also how a *second* click on an open
-                    // extension panel's icon arrives, so drop the plugin
-                    // panel's claim too (`switch_panel`'s own toggle
-                    // branch clears the same two fields). Re-opening still
-                    // works: `AppShell::handle_activity_click` reports a click
-                    // on the active panel as `PanelChanged`, not
-                    // `SidebarHidden`, once the sidebar is hidden.
-                    engine.ext_panel_active = None;
-                    engine.ext_panel_has_focus = false;
-                }
+                // #557: this is also how a *second* click on an open
+                // extension panel's icon arrives — `sync_shell_event_shadow`
+                // already dropped the plugin panel's claim (its
+                // `SidebarHidden` arm clears the same two fields
+                // unconditionally). Re-opening still works:
+                // `AppShell::handle_activity_click` reports a click on the
+                // active panel as `PanelChanged`, not `SidebarHidden`, once
+                // the sidebar is hidden.
                 self.draw_needed.set(true);
             }
-            AppShellEvent::SidebarResized { new_width } => {
-                self.engine
-                    .borrow_mut()
-                    .app_shell
-                    .set_sidebar_width(*new_width);
-            }
+            AppShellEvent::SidebarResized { .. } => {}
             AppShellEvent::BottomItemClicked { id } => {
                 // The runner treats bottom activity-bar items as action
                 // buttons (not sidebar panels), so it never toggles or
