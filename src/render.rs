@@ -10702,28 +10702,187 @@ const MINIMAP_MAX_RELEVANT_COLS: usize = 400;
 /// off-by-one short (#728).
 const MINIMAP_COL_SCAN_LIMIT: usize = MINIMAP_MAX_RELEVANT_COLS + 1;
 
-/// Buffer line numbers `build_minimap_data` will actually sample, computed
-/// **before** any line text is fetched (#728).
+/// Buffer-line boundaries `build_minimap_data` partitions `0..total_lines`
+/// into — `target_lines.min(total_lines)` contiguous, non-overlapping
+/// **blocks**, one per output `MinimapLine` (#1085).
 ///
-/// Mirrors `quadraui::sample_lines`'s own stride formula exactly (never
-/// upscales — keep every line when `total_lines <= target_lines` — otherwise
-/// stride every `total_lines / target_lines` lines), so handing exactly
-/// these `total_lines.min(target_lines)`-many candidates back into
-/// `sample_lines` with `target_rows` set to that same count always takes its
-/// cheap "keep every candidate, in order" path. That lets the caller fetch
-/// only these lines' text from the rope instead of materialising a `String`
-/// for every line in the buffer, while still going through `sample_lines`
-/// for the actual `MinimapLine` construction.
-fn minimap_sample_indices(total_lines: usize, target_lines: usize) -> Vec<usize> {
+/// Returns `bounds` such that block `r` covers `bounds[r]..bounds[r + 1]`;
+/// `bounds.len()` is always the block count plus one. Mirrors
+/// `quadraui::sample_lines`'s own stride formula (never upscales — one
+/// line per block when `total_lines <= target_lines` — otherwise stride
+/// every `total_lines / target_lines` lines) so the block count handed to
+/// `sample_lines` afterwards always takes its cheap "keep every candidate,
+/// in order" path, exactly like the point-sampler this replaced.
+///
+/// The point-sampler this replaced (`minimap_sample_indices`, pre-#1085)
+/// picked exactly one buffer line per block and read only that line —
+/// every other line in the block (on average `stride - 1` of them, e.g. 4
+/// of every 5 at the ratio #1085 reported) was invisible to the minimap no
+/// matter what it contained. `build_minimap_data` now reads every line in
+/// a block (capped — see `MINIMAP_BLOCK_LINE_SAMPLE_CAP`) and aggregates
+/// them via `minimap_block_text`, so a block's returned range is a
+/// *read budget*, not a single index to fetch.
+fn minimap_block_bounds(total_lines: usize, target_lines: usize) -> Vec<usize> {
     if total_lines == 0 || target_lines == 0 {
-        return Vec::new();
+        return vec![0];
     }
     if total_lines <= target_lines {
-        return (0..total_lines).collect();
+        return (0..=total_lines).collect();
     }
     let stride = total_lines as f64 / target_lines as f64;
-    (0..target_lines)
-        .map(|r| ((r as f64 * stride) as usize).min(total_lines - 1))
+    let mut bounds = Vec::with_capacity(target_lines + 1);
+    for r in 0..target_lines {
+        bounds.push(((r as f64 * stride) as usize).min(total_lines));
+    }
+    bounds.push(total_lines);
+    bounds
+}
+
+/// Ceiling on how many real buffer lines `minimap_block_text` reads out of
+/// one block, regardless of how large the block is (#1085).
+///
+/// This is the perf guard #728 demands: a block's size grows with
+/// `total_lines / target_lines`, so reading every line in every block
+/// would cost O(buffer) per frame again on a big-enough file — exactly the
+/// regression `minimap_scroll_does_not_scale_with_buffer_size` pins. Capping
+/// the read at a small constant, evenly spread across the block
+/// (`minimap_block_sample_indices`), keeps the per-frame cost at
+/// `O(target_lines * MINIMAP_BLOCK_LINE_SAMPLE_CAP)` — independent of
+/// `total_lines` — while still reading *every* line in any block small
+/// enough to fit under the cap (true for the issue's own 647-line/33-row
+/// repro, whose blocks average ~5 lines).
+const MINIMAP_BLOCK_LINE_SAMPLE_CAP: usize = 8;
+
+/// Buffer line indices `minimap_block_text` will actually read for one
+/// block spanning `[start, end)` — every line when the block fits under
+/// `cap`, otherwise `cap` lines evenly spaced across the block (#1085).
+fn minimap_block_sample_indices(start: usize, end: usize, cap: usize) -> Vec<usize> {
+    let len = end.saturating_sub(start);
+    if len == 0 {
+        return Vec::new();
+    }
+    if len <= cap {
+        return (start..end).collect();
+    }
+    let step = len as f64 / cap as f64;
+    (0..cap)
+        .map(|i| (start + (i as f64 * step) as usize).min(end - 1))
+        .collect()
+}
+
+/// Which block (index into `bounds`'s implied range list, and thus into the
+/// `lines`/`MinimapLine` vector `build_minimap_data` builds from it) a real
+/// buffer line falls into (#1085) — the replacement for the old exact-match
+/// `sampled_at` lookup, which only ever hit the one line each block used to
+/// point-sample and silently dropped every highlight on any other line.
+fn minimap_block_index_for_line(bounds: &[usize], buf_line: usize) -> usize {
+    if bounds.len() < 2 {
+        return 0;
+    }
+    let idx = bounds.partition_point(|&b| b <= buf_line);
+    idx.saturating_sub(1).min(bounds.len() - 2)
+}
+
+/// 4x4 ordered-dither (Bayer) threshold matrix, values `0..16`.
+///
+/// A vertical-axis twin of quadraui's own `tui::braille::BAYER4`
+/// (`pub(crate)` there, so not reusable directly from vimcode) — same
+/// matrix, same reasoning, applied along the opposite axis. Quadraui's
+/// dither (quadraui#1007) turns a *column*-bucket's coverage fraction into
+/// a boolean per dot; `minimap_block_dither_threshold_met` below turns a
+/// *block*'s (several real buffer lines collapsed into one output row,
+/// #1085) per-column coverage fraction into a boolean the same way, so a
+/// block that is mostly-but-not-entirely covered at some column reads as a
+/// textured partial fill instead of either "invisible" (a hard cutoff
+/// below 50%, which erases a rare long line surrounded by short ones — see
+/// `minimap_block_text`'s doc) or "solid" (any non-whitespace anywhere in
+/// the block sets the dot, which is the union strategy #1085 measured and
+/// rejected for saturating the strip's right edge).
+const MINIMAP_BAYER4: [[u8; 4]; 4] = [[0, 8, 2, 10], [12, 4, 14, 6], [3, 11, 1, 9], [15, 7, 13, 5]];
+
+/// Threshold a block-column's coverage (`covered` of the block's `total`
+/// sampled lines non-whitespace at this column) against [`MINIMAP_BAYER4`],
+/// indexed by the output row/column's own absolute position so the pattern
+/// tiles across the whole strip rather than repeating per block. Pure
+/// integer arithmetic, mirroring quadraui's `dither_threshold_met` exactly
+/// (see that function's doc for why `covered == total` and `covered == 0`
+/// always resolve to `true`/`false` respectively).
+fn minimap_block_dither_threshold_met(
+    covered: usize,
+    total: usize,
+    row: usize,
+    col: usize,
+) -> bool {
+    if total == 0 {
+        return false;
+    }
+    let threshold = MINIMAP_BAYER4[row & 3][col & 3] as usize;
+    covered * 16 > total * threshold
+}
+
+/// Read buffer line `i`'s text, trimming the trailing newline — the exact
+/// line-fetch `build_minimap_data` used inline before #1085 split it out
+/// so `minimap_block_text` and the highlight-mapping loop can share it.
+fn minimap_line_text(rope: &ropey::Rope, i: usize) -> String {
+    rope.line(i)
+        .as_str()
+        .map(|s| s.trim_end_matches(['\n', '\r']).to_string())
+        .unwrap_or_else(|| {
+            rope.line(i)
+                .to_string()
+                .trim_end_matches(['\n', '\r'])
+                .to_string()
+        })
+}
+
+/// Build one output `MinimapLine`'s text by aggregating a block of real
+/// buffer lines (`indices`, already capped by `minimap_block_sample_indices`)
+/// into a single row — the fix for #1085's point-sampler: instead of
+/// keeping one line's text and discarding the rest of the block, every
+/// sampled line in the block votes on every column.
+///
+/// Per column, `covered` is how many of the block's sampled lines are
+/// non-whitespace there; that fraction is thresholded through
+/// [`minimap_block_dither_threshold_met`] rather than a hard majority
+/// cutoff — #1085 measured a plain 50%-or-more vote (the "union" family's
+/// opposite failure mode) as *erasing* a distinctive single long line
+/// surrounded by short ones, since only that one line's tail would ever
+/// reach the far columns (well under 50% of the block). Dithering instead
+/// gives a low-but-nonzero coverage fraction a proportionally small,
+/// evenly-spread chance of setting each dot — enough for a rare long
+/// line's tail to still register as a sparse trace rather than nothing —
+/// while a typical densely-covered column (most of the block's lines
+/// reach it) still reads as solid, and a mostly-blank one still reads as
+/// blank. `block_row` (the output row's own index, so the pattern tiles
+/// across the whole strip like quadraui's own dither does) and the column
+/// index key the dither matrix.
+fn minimap_block_text(rope: &ropey::Rope, indices: &[usize], block_row: usize) -> String {
+    if indices.is_empty() {
+        return String::new();
+    }
+    let char_rows: Vec<Vec<char>> = indices
+        .iter()
+        .map(|&i| {
+            minimap_line_text(rope, i)
+                .chars()
+                .take(MINIMAP_COL_SCAN_LIMIT)
+                .collect()
+        })
+        .collect();
+    let max_len = char_rows.iter().map(Vec::len).max().unwrap_or(0);
+    let total = char_rows.len();
+    (0..max_len)
+        .map(|c| {
+            let covered = char_rows
+                .iter()
+                .filter(|row| row.get(c).is_some_and(|ch| !ch.is_whitespace()))
+                .count();
+            if minimap_block_dither_threshold_met(covered, total, block_row, c) {
+                'x'
+            } else {
+                ' '
+            }
+        })
         .collect()
 }
 
@@ -10786,12 +10945,22 @@ pub fn minimap_reserved_width(
 /// reduction (`aggregate_spans`) is quadraui's — this function only maps
 /// vimcode's tree-sitter byte-offset highlights into quadraui's
 /// `SyntaxSpan` input type.
+///
+/// `editor_visible_rows` is the *editor pane's* own visible row count —
+/// deliberately a separate parameter from `rect`/`line_height` (which size
+/// the minimap *strip*, and drive `target_lines`, the sampling budget)
+/// since #1085: the two only coincide because the strip is as tall as the
+/// editor pane today. Passing the editor's own count rather than
+/// re-deriving it from the strip's height keeps the viewport highlight
+/// band correct even if a future layout ever makes the strip shorter than
+/// the editor.
 pub fn build_minimap_data(
     engine: &Engine,
     theme: &Theme,
     window_id: WindowId,
     rect: WindowRect,
     line_height: f64,
+    editor_visible_rows: usize,
 ) -> Option<RenderedMinimap> {
     if rect.width <= 0.0 || rect.height <= 0.0 {
         return None;
@@ -10850,56 +11019,42 @@ pub fn build_minimap_data(
         return None;
     }
 
-    // #728: pick *which* buffer lines to sample before fetching any line
-    // text — mirrors `quadraui::sample_lines`'s own stride formula (never
-    // upscales; otherwise strides every `total / target` lines) so only the
-    // ~`target_lines` candidates that will actually survive get fetched
-    // from the rope, instead of materialising a `String` for every line in
-    // the buffer on every frame (the fix this pins in
-    // `minimap_scroll_does_not_scale_with_buffer_size`). `sample_lines` is
-    // still the function that turns text into `MinimapLine`s below — this
-    // only decides which lines are worth reading in the first place.
-    let sample_indices = minimap_sample_indices(total_buffer_lines, target_lines);
-    if sample_indices.is_empty() {
+    // #1085: partition the buffer into `target_lines`-many blocks *before*
+    // fetching any line text (same #728 discipline the old point-sampler
+    // followed — decide what's worth reading before reading it), then
+    // aggregate each block's lines (capped, see `MINIMAP_BLOCK_LINE_SAMPLE_CAP`)
+    // into one representative row instead of keeping one line and
+    // discarding the rest of the block outright.
+    let bounds = minimap_block_bounds(total_buffer_lines, target_lines);
+    if bounds.len() < 2 {
         return None;
     }
-    let owned: Vec<String> = sample_indices
-        .iter()
-        .map(|&i| {
-            rope.line(i)
-                .as_str()
-                .map(|s| s.trim_end_matches(['\n', '\r']).to_string())
-                .unwrap_or_else(|| {
-                    rope.line(i)
-                        .to_string()
-                        .trim_end_matches(['\n', '\r'])
-                        .to_string()
-                })
+    let owned: Vec<String> = (0..bounds.len() - 1)
+        .map(|r| {
+            let indices = minimap_block_sample_indices(
+                bounds[r],
+                bounds[r + 1],
+                MINIMAP_BLOCK_LINE_SAMPLE_CAP,
+            );
+            minimap_block_text(rope, &indices, r)
         })
         .collect();
+    if owned.is_empty() {
+        return None;
+    }
     let borrowed: Vec<&str> = owned.iter().map(String::as_str).collect();
-    // `sample_indices.len()` candidates against a `target_rows` of exactly
-    // that count always takes `sample_lines`'s "never upscales, keep every
-    // candidate" branch, so `line_idx` below is just each candidate's
-    // position in `borrowed`/`owned` — remapped to the real buffer line
-    // number via `sample_indices` right after, since `sample_lines` only
-    // knows positions within the slice it was given, not buffer line
-    // numbers.
+    // `owned.len()` candidates against a `target_rows` of exactly that
+    // count always takes `sample_lines`'s "never upscales, keep every
+    // candidate" branch, so `line_idx` below is just each block's position
+    // in `borrowed`/`owned` — remapped to the block's *starting* real
+    // buffer line number right after, since `sample_lines` only knows
+    // positions within the slice it was given, not buffer line numbers.
     let mut lines = quadraui::sample_lines(&borrowed, borrowed.len());
-    for (line, &real_idx) in lines.iter_mut().zip(sample_indices.iter()) {
-        line.line_idx = real_idx;
+    for (i, line) in lines.iter_mut().enumerate() {
+        line.line_idx = bounds[i];
     }
     if lines.is_empty() {
         return None;
-    }
-
-    // Map tree-sitter highlights (whole-buffer byte offsets) onto the sampled
-    // rows. `SyntaxSpan::line_idx` is an index into `lines`, not a buffer line
-    // number, so build a buffer-line → sampled-index lookup first.
-    let mut sampled_at: std::collections::HashMap<usize, usize> =
-        std::collections::HashMap::with_capacity(lines.len());
-    for (i, l) in lines.iter().enumerate() {
-        sampled_at.entry(l.line_idx).or_insert(i);
     }
     // #1030 (review round 2): the colour grid's raw-column budget comes
     // from the strip this rasteriser actually paints, not a fixed
@@ -10957,22 +11112,39 @@ pub fn build_minimap_data(
     let visible_span_cols = ((rect.width.round().max(1.0)) as usize * MINIMAP_COLS_PER_CELL)
         .max(quadraui::primitives::minimap::COLUMN_CAPACITY);
 
+    // #1085: every real buffer line now maps to *some* block (`lines`
+    // aggregates the whole buffer, not just the point-sampled lines), so a
+    // highlight is looked up by which block its own line falls into
+    // (`minimap_block_index_for_line`) rather than requiring an exact
+    // match against a point-sampled line — the old `sampled_at` exact
+    // lookup silently dropped every highlight whose line wasn't itself the
+    // one line each block happened to sample. `line_text_cache` avoids
+    // re-fetching the same buffer line's text for multiple highlight spans
+    // on it.
+    let mut line_text_cache: std::collections::HashMap<usize, String> =
+        std::collections::HashMap::new();
     let mut raw_spans: Vec<quadraui::SyntaxSpan> = Vec::new();
     for (start, end, scope) in &buffer_state.highlights {
         if end <= start || *start >= rope.len_bytes() {
             continue;
         }
         let buf_line = rope.byte_to_line(*start);
-        let Some(&idx) = sampled_at.get(&buf_line) else {
+        if buf_line >= total_buffer_lines {
             continue;
-        };
+        }
+        let idx = minimap_block_index_for_line(&bounds, buf_line);
+        if idx >= lines.len() {
+            continue;
+        }
         let line_start = rope.line_to_byte(buf_line);
-        // `owned`/`borrowed`/`lines` are all indexed by *sampled* position
-        // (`idx`), not by real buffer line number (`buf_line`) — `owned` no
-        // longer has one entry per buffer line since #728 stopped
-        // materialising the whole buffer, so `sampled_at`'s value (the
-        // sampled index) is what indexes it now.
-        let line_str = &owned[idx];
+        // The highlight's own real line text — not the block's aggregated
+        // `owned[idx]`, which may be built from a *different* set of
+        // sampled lines and generally has a different length. Byte offsets
+        // (`start`/`end`) are only meaningful against the line they
+        // actually came from.
+        let line_str = line_text_cache
+            .entry(buf_line)
+            .or_insert_with(|| minimap_line_text(rope, buf_line));
         // quadraui's rasterisers treat span columns as *character* columns
         // (GTK converts them back to byte offsets for Pango attributes), so
         // convert here rather than handing over raw byte deltas. Capped at
@@ -11013,9 +11185,12 @@ pub fn build_minimap_data(
     };
     let syntax_spans = quadraui::aggregate_spans(&raw_spans, grid);
 
-    // Where the editor's viewport lands inside `lines`.
+    // Where the editor's viewport lands inside `lines`. Uses the editor
+    // pane's own visible row count (`editor_visible_rows`), not
+    // `display_rows` (the minimap *strip's* sampling budget, above) — see
+    // this function's doc comment (#1085).
     let scroll_top = window.view.scroll_top.min(total_buffer_lines);
-    let viewport_end = scroll_top.saturating_add(display_rows.max(1));
+    let viewport_end = scroll_top.saturating_add(editor_visible_rows.max(1));
     let visible_row_start = lines
         .iter()
         .position(|l| l.line_idx >= scroll_top)
@@ -13486,6 +13661,16 @@ pub fn build_screen_layout_with_breadcrumb_row(
             } else {
                 0.0
             };
+            // The editor pane's own visible row count — the same
+            // computation the `windows` map above runs over the same
+            // `window_rects` entry — handed to `build_minimap_data`
+            // separately from the strip's own `rect`/`line_height` (#1085:
+            // see that function's doc comment for why these must not be
+            // conflated).
+            let mut editor_visible_rows = (r.height / line_height).floor() as usize;
+            if own_status_row && editor_visible_rows > 1 {
+                editor_visible_rows -= 1;
+            }
             build_minimap_data(
                 engine,
                 theme,
@@ -13497,6 +13682,7 @@ pub fn build_screen_layout_with_breadcrumb_row(
                     (r.height - status_h).max(0.0),
                 ),
                 line_height,
+                editor_visible_rows,
             )
         })
         .collect();
@@ -24052,7 +24238,7 @@ mod tests {
                 w.view.scroll_top = i % n_lines;
             }
             let t0 = std::time::Instant::now();
-            let mm = build_minimap_data(e, &theme, wid, rect, 1.0);
+            let mm = build_minimap_data(e, &theme, wid, rect, 1.0, 40);
             total += t0.elapsed();
             assert!(mm.is_some(), "minimap must build for every simulated frame");
         }
@@ -24661,6 +24847,165 @@ mod tests {
                 && l.line_idx < 160
                 && l.text.starts_with("            ")),
             "the deeply-indented middle band must appear in the sample"
+        );
+    }
+
+    // ── #1085: point-sample → block-aggregation ────────────────────────
+
+    /// #1085 acceptance criterion 1, white-box precise tier: a distinctive
+    /// single line landing squarely *inside* a stride-5 block (not on its
+    /// boundary) must still reach the minimap it feeds. This is the exact
+    /// numeric twin of `tui_main::shell_app::tests::
+    /// a_stride_skipped_distinctive_line_still_paints_via_shell_app`,
+    /// which proves the same thing through real painted braille but has no
+    /// access to `render`'s private sampling internals and so can't pin an
+    /// exact stride the way this white-box test can.
+    ///
+    /// At `rect = WindowRect::new(0.0, 0.0, 100.0, 40.0)`, `line_height =
+    /// 1.0`: `display_rows = 40`, `target_lines = (40 *
+    /// MINIMAP_LINES_PER_ROW).max(gtk_row_capacity) = 160`. `TOTAL =
+    /// target_lines * 5 = 800` makes the block stride exactly `5.0` — an
+    /// exact integer, so block boundaries land on exact multiples of 5
+    /// with no floating-point rounding ambiguity — block `r` covers `[5r,
+    /// 5r + 5)`. Line 133 sits 3 lines into block 26's `[130, 135)` range,
+    /// never on a boundary — the precondition assertions below prove that
+    /// arithmetic rather than assuming it.
+    ///
+    /// **RED against unfixed `develop`:** confirmed by hand — temporarily
+    /// making `minimap_block_sample_indices` always return `vec![start]`
+    /// (the pre-#1085 point-sample behaviour: exactly one line per block,
+    /// its first) makes the "must not itself be a sampled block-start"
+    /// precondition irrelevant and the final assertion fail outright: the
+    /// block's aggregated text is built from line 130 alone (a 1-char
+    /// `"x"` line), so nothing past column 1 is ever non-whitespace.
+    /// Reverted before landing this test.
+    #[test]
+    fn a_stride_skipped_distinctive_line_still_shows_up() {
+        const TOTAL: usize = 800;
+        const DISTINCTIVE_LINE: usize = 133;
+        let mut text = String::with_capacity(TOTAL * 2);
+        for i in 0..TOTAL {
+            if i == DISTINCTIVE_LINE {
+                text.push_str(&"z".repeat(200));
+            } else {
+                text.push('x');
+            }
+            text.push('\n');
+        }
+        let e = test_engine(&text);
+        let theme = Theme::onedark();
+        let wid = e.active_window_id();
+        let rect = WindowRect::new(0.0, 0.0, 100.0, 40.0);
+        let mm = build_minimap_data(&e, &theme, wid, rect, 1.0, 40)
+            .expect("minimap must build")
+            .minimap;
+
+        assert!(
+            mm.lines.len() < TOTAL,
+            "precondition: fixture must be large enough to force \
+             downsampling, or this test proves nothing; sampled {} rows \
+             from {TOTAL} lines",
+            mm.lines.len()
+        );
+        assert!(
+            !mm.lines.iter().any(|l| l.line_idx == DISTINCTIVE_LINE),
+            "precondition: line {DISTINCTIVE_LINE} must not itself be a \
+             sampled block-start, or this test doesn't exercise the \
+             cross-line aggregation path at all"
+        );
+
+        let containing = mm
+            .lines
+            .iter()
+            .rev()
+            .find(|l| l.line_idx <= DISTINCTIVE_LINE)
+            .expect("some sampled block must start at or before the distinctive line");
+        assert!(
+            containing.text.chars().skip(50).any(|c| !c.is_whitespace()),
+            "the block covering line {DISTINCTIVE_LINE} (a single \
+             200-char line among otherwise 1-char lines) must show \
+             content past column 50 — every other line in its block is \
+             1 character wide, so nothing else could set a dot that far \
+             right; text={:?}",
+            containing.text
+        );
+    }
+
+    /// #1085 acceptance criterion 2: the viewport highlight band's own
+    /// *content* must differ between a blank run and a dense block of the
+    /// same file — not just which rows are highlighted (already covered
+    /// by `minimap_click_at_the_middle_seeks_to_half_the_file` and
+    /// friends), but what the aggregation actually painted into those
+    /// rows. A fix that only stops saturating (quadraui#1007's rasteriser
+    /// half) without also making vimcode's own sampling represent every
+    /// line would still show a band that doesn't track *where* on screen
+    /// the editor actually is.
+    ///
+    /// The dense region's every 5th line (`j % 5 == 2`, never `== 0`) is
+    /// the only non-blank content, deliberately never a block boundary
+    /// (`HALF` is itself a multiple of the stride, so a block boundary is
+    /// always `≡ 0 (mod 5)`, absolute or region-relative) — a fixture
+    /// where the dense region's content sat *on* the sampled point would
+    /// pass under the pre-#1085 point-sampler too and prove nothing about
+    /// this issue.
+    ///
+    /// **RED against unfixed `develop`:** confirmed by hand with the same
+    /// `minimap_block_sample_indices` → `vec![start]` revert criterion 1
+    /// uses — the point-sampler only ever reads each block's first line,
+    /// which is blank in *both* regions by construction here, so
+    /// `dense_dots` collapses to `0` too and `dense_dots > blank_dots * 4`
+    /// (`0 > 0`) fails. Reverted before landing this test.
+    #[test]
+    fn viewport_band_content_differs_between_a_blank_run_and_a_dense_block() {
+        const HALF: usize = 400;
+        let mut text = String::with_capacity(HALF * 22);
+        for _ in 0..HALF {
+            text.push('\n'); // blank run
+        }
+        for j in 0..HALF {
+            if j % 5 == 2 {
+                text.push_str(&"x".repeat(20));
+            }
+            text.push('\n');
+        }
+        let mut e = test_engine(&text);
+        let theme = Theme::onedark();
+        let wid = e.active_window_id();
+        let rect = WindowRect::new(0.0, 0.0, 100.0, 40.0);
+
+        let count_band_dots = |e: &mut Engine, scroll_top: usize| -> usize {
+            if let Some(w) = e.windows.get_mut(&wid) {
+                w.view.scroll_top = scroll_top;
+            }
+            let mm = build_minimap_data(e, &theme, wid, rect, 1.0, 40)
+                .expect("minimap must build")
+                .minimap;
+            let end = (mm.visible_row_start + mm.visible_row_count).min(mm.lines.len());
+            mm.lines[mm.visible_row_start..end]
+                .iter()
+                .map(|l| l.text.chars().filter(|c| !c.is_whitespace()).count())
+                .sum()
+        };
+
+        let blank_dots = count_band_dots(&mut e, 10);
+        let dense_dots = count_band_dots(&mut e, HALF + 10);
+
+        assert_eq!(
+            blank_dots, 0,
+            "the viewport band over a blank run (scroll_top=10) must show \
+             zero set columns"
+        );
+        assert!(
+            dense_dots > 0,
+            "the viewport band over a dense block (scroll_top={}) must \
+             show at least one set column",
+            HALF + 10
+        );
+        assert!(
+            dense_dots > blank_dots * 4,
+            "the viewport band's own content must differ measurably \
+             between a blank run ({blank_dots} set columns) and a dense \
+             block ({dense_dots} set columns) of the same file"
         );
     }
 
