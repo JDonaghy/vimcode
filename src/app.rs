@@ -480,8 +480,6 @@ pub(crate) struct App {
     pub(crate) char_width_cell: Rc<Cell<f64>>,
     /// Current mouse position, updated directly from the motion callback (no Relm4 message).
     pub(crate) mouse_pos_cell: Rc<Cell<(f64, f64)>>,
-    /// Shared with draw closure: which window (if any) has an active h scrollbar drag.
-    pub(crate) h_sb_drag_cell: Rc<Cell<Option<core::WindowId>>>,
     /// True while user is drag-selecting text inside a find/replace input field.
     pub(crate) fr_input_dragging: bool,
     pub(crate) deferred: DeferredQueue,
@@ -1433,7 +1431,6 @@ impl App {
             line_height_cell: Rc::new(Cell::new(24.0)),
             char_width_cell: Rc::new(Cell::new(9.0)),
             mouse_pos_cell: Rc::new(Cell::new((-1.0, -1.0))),
-            h_sb_drag_cell: Rc::new(Cell::new(None)),
             fr_input_dragging: false,
             deferred,
             last_clipboard_content: None,
@@ -4683,7 +4680,6 @@ impl App {
                                     grab_offset,
                                     inverted: false,
                                 });
-                            self.h_sb_drag_cell.set(Some(win_id));
                             self.draw_needed.set(true);
                             return;
                         }
@@ -5464,7 +5460,6 @@ impl App {
             self.engine.borrow_mut().terminal_resize(cols, rows);
             let _ = self.engine.borrow().session.save();
         }
-        self.h_sb_drag_cell.set(None);
         self.divider_grab = None;
         self.engine.borrow().cmd_dragging.set(false);
         {
