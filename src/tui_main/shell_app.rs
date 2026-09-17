@@ -4351,14 +4351,90 @@ fn handle_key_pressed(
     Reaction::Redraw
 }
 
+/// [`render::EngineActionHost`] impl for TUI (#1063) — the TUI-only state
+/// (`TuiSidebar`, the `quadraui::FolderPickerController` slot, and the
+/// screen geometry needed for terminal column/row counts) that
+/// [`dispatch_post_key_action`], below, packages up so it can call the one
+/// shared applier both backends now use. Mirrors GTK's
+/// `GtkEngineActionHost` (`app.rs`) — see [`render::apply_engine_action`]'s
+/// rung header comment in `render.rs` for why this convergence exists.
+struct TuiEngineActionHost<'a> {
+    sidebar: &'a mut TuiSidebar,
+    folder_picker: &'a mut Option<quadraui::FolderPickerController>,
+    screen_w: u16,
+    screen_h: u16,
+    sidebar_width: u16,
+}
+
+impl render::EngineActionHost for TuiEngineActionHost<'_> {
+    fn open_terminal(&mut self, engine: &mut Engine) {
+        let cols = terminal_panel_cols(engine, self.screen_w, self.sidebar_width);
+        let rows = engine.session.terminal_panel_rows;
+        engine.terminal_new_tab(cols, rows);
+    }
+    fn toggle_terminal_maximize(&mut self, engine: &mut Engine) {
+        let ctx = crate::core::engine::UiEventContext {
+            terminal_cols: terminal_panel_cols(engine, self.screen_w, self.sidebar_width),
+            terminal_max_rows: terminal_target_maximize_rows_tui(engine, self.screen_h),
+        };
+        engine.handle_ui_event(
+            crate::core::engine::UiEvent::Accelerator(
+                quadraui::AcceleratorId::new(render::ACC_TERMINAL_TOGGLE_MAX),
+                quadraui::Modifiers::default(),
+            ),
+            ctx,
+        );
+    }
+    fn run_in_terminal(&mut self, engine: &mut Engine, cmd: String) {
+        let rows = engine.session.terminal_panel_rows;
+        engine.terminal_run_command(&cmd, self.screen_w, rows);
+    }
+    fn open_folder_dialog(&mut self, engine: &mut Engine) {
+        *self.folder_picker = Some(new_folder_picker_controller(engine));
+    }
+    fn open_workspace_dialog(&mut self, engine: &mut Engine) {
+        *self.sidebar = TuiSidebar::new();
+        engine.explorer_rebuild_rows();
+    }
+    fn save_workspace_as_dialog(&mut self, engine: &mut Engine) {
+        let ws_path = engine.cwd.join(".vimcode-workspace");
+        engine.save_workspace_as(&ws_path);
+    }
+    fn open_recent_dialog(&mut self, engine: &mut Engine) {
+        if engine.session.recent_workspaces.is_empty() {
+            engine.message = "No recent workspaces".to_string();
+        } else {
+            engine.open_picker(crate::core::engine::PickerSource::RecentWorkspaces);
+        }
+    }
+    /// TUI has no widget tree to resync — the engine already applied the
+    /// toggle internally. Matches `handle_action`'s `ToggleSidebar` no-op.
+    fn sidebar_toggled(&mut self, _engine: &mut Engine) {}
+    fn quit_with_unsaved(&mut self, engine: &mut Engine) {
+        engine.show_quit_confirm();
+    }
+    fn quit(&mut self, engine: &mut Engine) {
+        engine.cleanup_all_swaps();
+        engine.lsp_shutdown();
+        save_session(engine);
+    }
+    fn quit_with_error(&mut self, engine: &mut Engine) -> ! {
+        engine.cleanup_all_swaps();
+        engine.lsp_shutdown();
+        save_session(engine);
+        std::process::exit(1);
+    }
+}
+
 /// TUI's counterpart to GTK's `App::dispatch_engine_action`: apply the
-/// [`EngineAction`] the general keyboard fallback produced. Returns `true`
-/// when the app should exit.
+/// [`EngineAction`] the general keyboard fallback (and the menu-activation
+/// arm above) produced. Returns `true` when the app should exit.
 ///
-/// The eight named arms are the ones whose effect needs TUI-only state — the
-/// terminal panel's column/row geometry, the `quadraui::FolderPickerController`
-/// (#815; GTK's `App` carries the identical field), and `TuiSidebar`.
-/// Everything else falls through to `handle_action`.
+/// A thin wrapper around [`render::apply_engine_action`] (#1063) that
+/// packages the TUI-only state ([`TuiEngineActionHost`], above) the shared
+/// applier's backend hooks need — the terminal panel's column/row geometry,
+/// the `quadraui::FolderPickerController` (#815; GTK's `App` carries the
+/// identical field), and `TuiSidebar`.
 #[allow(clippy::too_many_arguments)]
 fn dispatch_post_key_action(
     action: EngineAction,
@@ -4369,45 +4445,14 @@ fn dispatch_post_key_action(
     screen_h: u16,
     sidebar_width: u16,
 ) -> bool {
-    if action == EngineAction::OpenTerminal {
-        let cols = terminal_panel_cols(engine, screen_w, sidebar_width);
-        let rows = engine.session.terminal_panel_rows;
-        engine.terminal_new_tab(cols, rows);
-    } else if action == EngineAction::ToggleTerminalMaximize {
-        let ctx = crate::core::engine::UiEventContext {
-            terminal_cols: terminal_panel_cols(engine, screen_w, sidebar_width),
-            terminal_max_rows: terminal_target_maximize_rows_tui(engine, screen_h),
-        };
-        engine.handle_ui_event(
-            crate::core::engine::UiEvent::Accelerator(
-                quadraui::AcceleratorId::new(render::ACC_TERMINAL_TOGGLE_MAX),
-                quadraui::Modifiers::default(),
-            ),
-            ctx,
-        );
-    } else if let EngineAction::RunInTerminal(cmd) = &action {
-        let rows = engine.session.terminal_panel_rows;
-        engine.terminal_run_command(cmd, screen_w, rows);
-    } else if action == EngineAction::OpenFolderDialog {
-        *folder_picker = Some(new_folder_picker_controller(engine));
-    } else if action == EngineAction::OpenRecentDialog {
-        if engine.session.recent_workspaces.is_empty() {
-            engine.message = "No recent workspaces".to_string();
-        } else {
-            engine.open_picker(crate::core::engine::PickerSource::RecentWorkspaces);
-        }
-    } else if action == EngineAction::OpenWorkspaceDialog {
-        *sidebar = TuiSidebar::new();
-        engine.explorer_rebuild_rows();
-    } else if action == EngineAction::SaveWorkspaceAsDialog {
-        let ws_path = engine.cwd.join(".vimcode-workspace");
-        engine.save_workspace_as(&ws_path);
-    } else if action == EngineAction::QuitWithUnsaved {
-        engine.show_quit_confirm();
-    } else if handle_action(engine, action) {
-        return true;
-    }
-    false
+    let mut host = TuiEngineActionHost {
+        sidebar,
+        folder_picker,
+        screen_w,
+        screen_h,
+        sidebar_width,
+    };
+    render::apply_engine_action(action, engine, &mut host)
 }
 
 /// Apply a resolved [`render::ModalKeyRoute`] on the TUI side.
