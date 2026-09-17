@@ -552,7 +552,11 @@ pub(crate) fn resolve_tab_right_click(
 ///   anything closes, so resolution only identifies *which* tab was
 ///   targeted — `handle_mouse_click`'s `CloseTab` arm makes the one call into
 ///   `Engine::handle_tab_bar_click` that decides confirm-vs-close.
-fn dispatch_tab_bar_target(
+///
+/// `pub(crate)` (not just `fn`, #1059) so `tui_main/mouse.rs` can call it
+/// directly — it hand-rolled this exact arm-by-arm match twice, the same
+/// shape as the GTK duplicate #814 deleted, free to drift the same way.
+pub(crate) fn dispatch_tab_bar_target(
     engine: &mut Engine,
     group_id: GroupId,
     target: Option<crate::core::engine::TabBarClickTarget>,

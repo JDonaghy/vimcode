@@ -3220,3 +3220,196 @@ mod issue_1057_bottom_item_click_toggles_sidebar {
         },
     }
 }
+
+/// #1059 (GOALS.md's 2026-09-16 audit, #1044, wave 2 item 7): `tui_main::mouse`
+/// hand-rolled the tab-bar-row dispatch match **twice** (once for a split
+/// group's tab bar, once for a single group's) instead of calling the shared
+/// `click::dispatch_tab_bar_target` GTK has called since #814 -- the same
+/// "one rung routed through the shared function, the other hand-rolled, free
+/// to drift" shape #1025 was before a user hit it. Both hand-rolled copies
+/// are now deleted: `src/tui_main/mouse.rs`'s two tab-bar-row arms call
+/// `click::dispatch_tab_bar_target` directly and only handle its two
+/// deliberately-deferred exceptions (`ActionMenuButton`'s popup placement,
+/// `CloseTab`'s confirm-or-close decision) themselves -- exactly as
+/// `src/click.rs::handle_mouse_click` (GTK's own caller of the same
+/// function) already did.
+///
+/// This is a structural convergence fix, not a bug fix: both hand-rolled
+/// copies already produced the same tab-switch/tab-close behaviour the
+/// shared function produces (confirmed by reading both match arms side by
+/// side against `dispatch_tab_bar_target`'s body -- there is no reported
+/// user-visible bug here to reproduce), so this scenario is not expected to
+/// go red against pre-#1059 `develop`; what it proves is that the
+/// *architecture* actually converged -- the #1043 `tui_prod` arm is the only
+/// one that drives `TuiShellApp`/`mouse.rs` rather than the shared `App`, so
+/// it's the only arm that could ever have caught the two deleted copies
+/// drifting apart from each other or from GTK, per the issue's "Proving it
+/// actually converged" section.
+///
+/// One behavioural difference *is* deliberate and left uncovered here: the
+/// old `ActionMenu` arms set `engine.active_group` before opening the popup;
+/// `dispatch_tab_bar_target` doesn't (`src/click.rs`'s own GTK caller never
+/// did either), so TUI no longer does either. That only affects a
+/// split-view edge case (which group's tab bar highlights as active while a
+/// *different* group's action-menu popup is open), and aligns TUI with the
+/// behaviour GTK already shipped -- not exercised here since it needs a
+/// split-group fixture and adds no coverage of the actual dispatch rung.
+///
+/// Registered on `gtk`, `tui` **and** `tui_prod` for the Tab-switch scenario
+/// below (`gtk`/`tui` both wrap the shared `App`, which already routed
+/// through `click::dispatch_tab_bar_target` before this issue -- they're the
+/// control, expected green before and after; `tui_prod` wraps the real
+/// `TuiShellApp`/`mouse.rs` this issue's fix touches, so it's the arm that
+/// actually exercises the deleted hand-rolled copies' replacement). The
+/// CloseTab scenario drops the `tui` arm -- see its own doc comment for an
+/// unrelated pre-existing gap that scenario's development surfaced.
+#[cfg(test)]
+mod issue_1059_tab_bar_dispatch_routes_through_shared_click_fn {
+    use super::*;
+
+    /// Two file-backed tabs with distinct, greppable label *and* content
+    /// text, so a click can be aimed by name and its effect confirmed by
+    /// what's actually painted in the editor pane -- never a hardcoded
+    /// coordinate, never a populated-but-unpainted state field (engine
+    /// state isn't even reachable on the `tui_prod` arm -- see
+    /// `conformance_harness_prod`'s own doc on why `ConformanceHarness::
+    /// engine` is a disconnected placeholder there). `new_for_test`'s own
+    /// seeded scratch tab is closed immediately so exactly two tabs remain:
+    /// `a1059.txt` at index 0 (inactive), `b1059.txt` at index 1 (active).
+    fn two_tab_fixture() -> crate::core::Engine {
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_test_1059_tab_bar_dispatch_{:?}",
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = dir.join("a1059.txt");
+        let b = dir.join("b1059.txt");
+        std::fs::write(&a, "AAAA_1059_CONTENT\n").unwrap();
+        std::fs::write(&b, "BBBB_1059_CONTENT\n").unwrap();
+
+        let mut engine = crate::core::Engine::new_for_test();
+        engine.settings.use_nerd_fonts = Some(false);
+        engine.new_tab(Some(&a));
+        engine.new_tab(Some(&b));
+        engine.goto_tab(0); // the seeded scratch tab
+        engine.close_tab();
+        engine.goto_tab(1); // b1059.txt active; a1059.txt (index 0) is not
+        engine
+    }
+
+    /// Locate the `×` sharing a row with *a* run containing `label_needle`
+    /// and sitting to that run's right -- not simply "the first `×`" or
+    /// "the first `label_needle`" on screen, and not a hardcoded coordinate
+    /// either. Both single-needle shortcuts were tried while developing this
+    /// scenario and each broke on at least one backend (confirmed by
+    /// dumping `driver.inventory()`): a bare `×` needle resolves to `App`'s
+    /// own window-close control on the `gtk`/`tui` arms (not `tui_prod`) --
+    /// `App`'s shell chrome paints a bare `×` in its title bar, above the
+    /// tab row -- and a bare filename needle can resolve to the status
+    /// bar's/breadcrumb's copy of the same name on `gtk` specifically,
+    /// whose paint order (native Pango/Cairo widget tree, not TUI's cell
+    /// grid) puts it before the tab bar. Requiring *both* "a `label_needle`
+    /// run" *and* "a `×` run to its right on the same row" only matches the
+    /// tab itself -- neither the title bar (no filename text) nor the
+    /// status bar (no `×` to its right) can satisfy both at once.
+    fn tab_close_button_center<D: ConformanceDriver>(driver: &D, label_needle: &str) -> (f32, f32) {
+        let inventory = driver.inventory();
+        let runs = inventory.text_runs();
+        let close = runs
+            .iter()
+            .filter(|r| r.text.contains(label_needle))
+            .find_map(|label| {
+                runs.iter().find(|r| {
+                    r.text.contains('\u{00d7}')
+                        && r.bounds.y == label.bounds.y
+                        && r.bounds.x > label.bounds.x
+                })
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "{label_needle:?}'s tab label and its close button must both be \
+                     painted, on the same row, close button to the right"
+                )
+            })
+            .bounds;
+        (close.x + close.width / 2.0, close.y + close.height / 2.0)
+    }
+
+    // ── Tab arm ──────────────────────────────────────────────────────────
+    // Click the *inactive* tab's label. Resolves to `TabBarClickTarget::Tab`,
+    // applied via one `Engine::handle_tab_bar_click` call inside
+    // `click::dispatch_tab_bar_target` -- the same call #752's comment
+    // (right above the single-group arm in `mouse.rs`) says the hand-rolled
+    // copy it replaced used to skip for an unsplit window, silently leaving
+    // the LSP pointed at the previously-active buffer.
+    crate::backend_conformance! {
+        label: tab_bar_click_switches_via_shared_dispatch,
+        backends: [gtk, tui, tui_prod],
+        engine: two_tab_fixture(),
+        size: (800, 480),
+        body: |driver| {
+            assert!(
+                driver.screen_has("BBBB_1059_CONTENT") && !driver.screen_has("AAAA_1059_CONTENT"),
+                "precondition: b1059.txt is the active tab, a1059.txt is not"
+            );
+
+            // A genuine, fully-released press (`drag_text(x, x)`: down ->
+            // move -> up, all at the same point) rather than the bare
+            // `click_text`/`click` (down only, no release) -- same
+            // rationale as `issue_1057_bottom_item_click_toggles_sidebar`'s
+            // own doc.
+            driver.drag_text("a1059", "a1059");
+            assert!(
+                driver.screen_has("AAAA_1059_CONTENT") && !driver.screen_has("BBBB_1059_CONTENT"),
+                "clicking tab a1059's label must switch to it, on every backend"
+            );
+        },
+    }
+
+    // ── CloseTab arm ───────────────────────────────────────────────────────
+    // Click the *inactive* tab's (a1059.txt) close button directly. Resolves
+    // to `ClickTarget::CloseTab`, which `dispatch_tab_bar_target`
+    // deliberately leaves unapplied for the caller -- `mouse.rs`'s own arm
+    // (mirroring `click::handle_mouse_click`'s) makes the one
+    // `Engine::handle_tab_bar_click` call that decides confirm vs. close.
+    //
+    // No `tui` arm here (only `gtk` and `tui_prod`, unlike every other
+    // scenario in this module): while developing this scenario, a click at
+    // the close button's own painted center resolved as a plain tab-select
+    // instead of a close specifically on `tui` -- `App` driven by
+    // `quadraui::tui::TuiBackend`, i.e. quadraui's own generic ratatui
+    // `TabBar` widget rendering, as opposed to `tui_main::render_impl`'s
+    // independent hand-written rasteriser (`tui_prod`) or GTK's pixel-precise
+    // `tab_pixel_hits` cache (`gtk`) -- both of which resolved the same
+    // click correctly. That is a paint/hit-test disagreement inside
+    // quadraui's own TUI backend rendering of a primitive neither of this
+    // issue's two files (`mouse.rs`, `click.rs`) builds or interprets, so
+    // it's out of scope here; `App`+`TuiBackend` is also never what
+    // `tui_main::run` actually ships (`tui_prod` is), so no real user is
+    // affected by it. Left as a call-out rather than silently dropped: worth
+    // its own follow-up investigation before anyone adds a `tui`-arm
+    // scenario that clicks a TUI tab bar's close button specifically.
+    crate::backend_conformance! {
+        label: tab_bar_click_closes_via_shared_dispatch,
+        backends: [gtk, tui_prod],
+        engine: two_tab_fixture(),
+        size: (800, 480),
+        body: |driver| {
+            assert!(
+                driver.screen_has("b1059") && driver.screen_has("a1059"),
+                "precondition: both tabs are painted"
+            );
+
+            let (cx, cy) = tab_close_button_center(driver, "a1059");
+            // A real down -> up at the same point, not the bare press-only
+            // `click` default.
+            driver.drag(cx, cy, cx, cy);
+            assert!(
+                !driver.screen_has("a1059") && driver.screen_has("BBBB_1059_CONTENT"),
+                "clicking a1059.txt's close button must close it and fall \
+                 back to the only remaining tab, b1059.txt, on every backend"
+            );
+        },
+    }
+}
