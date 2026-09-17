@@ -4627,7 +4627,11 @@ impl App {
                     self.terminal_resize_dragging = false;
                 }
                 let ctx = crate::core::engine::UiEventContext {
-                    terminal_cols: self.terminal_cols(),
+                    // #1058: was `self.terminal_cols()` (pinned at 80) — this
+                    // handler already has the real live panel width, so use
+                    // it. This is what feeds `ToggleSplit`'s initial
+                    // full_cols when opening a split.
+                    terminal_cols: self.terminal_panel_cols(width),
                     terminal_max_rows: self.terminal_target_maximize_rows(),
                 };
                 let effect =
@@ -5311,9 +5315,9 @@ impl App {
             }
             render::MouseDragRoute::TerminalSplitDivider => {
                 if self.cached_char_width > 0.0 {
-                    const SB_W: f64 = 6.0;
                     let min_x = self.cached_char_width * 5.0;
-                    let max_x = (width - SB_W - self.cached_char_width * 5.0).max(min_x);
+                    let max_x = (width - Self::TERMINAL_PANEL_SB_W - self.cached_char_width * 5.0)
+                        .max(min_x);
                     let clamped_x = x.clamp(min_x, max_x);
                     let left_cols = (clamped_x / self.cached_char_width) as u16;
                     self.engine
@@ -5421,7 +5425,12 @@ impl App {
         self.draw_needed.set(true);
     }
 
-    fn handle_mouse_up_msg(&mut self) {
+    /// `width` is the live terminal-panel pixel width — the same
+    /// `ctx.layout.main_content_bounds.width` `UiEvent::MouseMoved` already
+    /// threads into `handle_mouse_drag_msg` — needed to finalize a
+    /// terminal-split divider drag with the real pixel→cell conversion
+    /// instead of a fixed guess (#1058).
+    fn handle_mouse_up_msg(&mut self, width: f64) {
         // Clear debug toolbar pressed state (#510).
         if self.engine.borrow().debug_button_pressed.is_some() {
             self.engine.borrow_mut().debug_button_pressed = None;
@@ -5467,12 +5476,14 @@ impl App {
                 let rows = engine.session.terminal_panel_rows;
                 drop(engine);
                 if left_cols > 0 {
-                    // #731: was `if let Some(da) = self.drawing_area…`,
-                    // permanently `None` under the ShellApp runner — see
-                    // `terminal_cols`.
-                    let da_w = 800.0;
-                    const SB_W: f64 = 6.0;
-                    let total_cols = ((da_w - SB_W) / self.cached_char_width) as u16;
+                    // #1058: was `let da_w = 800.0;` — a fixed guess that
+                    // only produced the right column count in a window that
+                    // happened to be exactly 800px wide. `width` is the real
+                    // live panel width the caller (`UiEvent::MouseUp`) reads
+                    // off `ctx.layout.main_content_bounds`, same source
+                    // `handle_mouse_drag_msg`'s `TerminalSplitDivider` arm
+                    // already uses while the drag is in progress.
+                    let total_cols = self.terminal_panel_cols(width);
                     let right_cols = total_cols.saturating_sub(left_cols);
                     self.engine
                         .borrow_mut()
@@ -6605,9 +6616,38 @@ impl App {
     /// callers currently have in scope) — until then this is pinned at the
     /// fallback, same as it was silently pinned at runtime before the dead
     /// field was deleted.
+    ///
+    /// Callers that DO have a live pixel width in scope (a click/drag's own
+    /// `width` parameter, or `ctx.layout.main_content_bounds` off the
+    /// `ShellContext` `handle_dispatch` already receives) must call
+    /// [`Self::terminal_panel_cols`] instead — see #1058, where the
+    /// terminal-split finalize path used this method's `80` fallback (and a
+    /// separate `da_w = 800.0` guess) rather than converting the real width,
+    /// so any window that wasn't exactly 800px wide split the terminal into
+    /// the wrong column counts.
     #[allow(dead_code)]
     fn terminal_cols(&self) -> u16 {
         80
+    }
+
+    /// Terminal panel pixel width reserved for the panel's own vertical
+    /// scrollbar — the same strip `render_content` paints one into and
+    /// `MouseDragRoute::TerminalSplitDivider` already clamps the divider
+    /// drag against (`handle_mouse_drag_msg`).
+    const TERMINAL_PANEL_SB_W: f64 = 6.0;
+
+    /// Convert a *live* terminal-panel pixel width to a column count using
+    /// the last-painted char advance (`cached_char_width`) — the real
+    /// pixel→cell conversion `terminal_cols()` cannot do because it has no
+    /// width in scope. Falls back to `terminal_cols()`'s pinned `80` only
+    /// when no char width has been measured yet (`cached_char_width <= 0.0`,
+    /// i.e. before the first paint).
+    fn terminal_panel_cols(&self, width: f64) -> u16 {
+        if self.cached_char_width > 0.0 {
+            ((width - Self::TERMINAL_PANEL_SB_W).max(0.0) / self.cached_char_width) as u16
+        } else {
+            self.terminal_cols()
+        }
     }
 
     /// #731: see `terminal_cols` — was `if let Some(da) =
@@ -7263,7 +7303,8 @@ impl App {
                 }
             }
             UiEvent::MouseUp { .. } => {
-                self.handle_mouse_up_msg();
+                let main = ctx.layout.main_content_bounds;
+                self.handle_mouse_up_msg(main.width as f64);
             }
             UiEvent::Scroll {
                 delta, position, ..
