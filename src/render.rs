@@ -19447,6 +19447,25 @@ fn to_quadraui_theme_editor(theme: &Theme, chrome: quadraui::Theme) -> quadraui:
 /// against the same per-span-attributed layout `draw_editor` painted
 /// with; TUI: `EditorLayout::col_at_x`'s uniform monospace division) —
 /// neither backend hand-rolls its own text-column inverse anymore.
+///
+/// **GTK-correct, TUI-unsafe (#1040).** For GTK, `rw.rect` *is* the exact
+/// sub-pixel float geometry Cairo paints into, so `editor.rect` genuinely
+/// matches paint here. For TUI it does not: `rw.rect` comes from
+/// continuous float split math (`quadraui::SplitTree::layout`, zero
+/// divider thickness) and is not integer-valued in general — a vertical
+/// group split at the default 50/50 ratio over an odd content width gives
+/// the *right* pane's `rect.x` a `.5`-cell fractional origin. TUI's paint
+/// path truncates that away to whole cells before drawing
+/// (`tui_main::render_impl`'s `win_rect`/`editor_area`, both `rect.x as
+/// u16`) — bypassing `editor.rect` entirely, since `Backend::draw_editor`
+/// takes its viewport as an explicit `Rect` argument, not from the
+/// `Editor` struct. Calling this function directly from TUI click code
+/// therefore resolves columns against a viewport that was never actually
+/// painted, landing one column left of the real one (clamped to 0 at the
+/// pane's first column, so it "sometimes" doesn't — exactly the #1040
+/// report). TUI click/drag/hover call sites must use
+/// [`tui_editor_text_layout`] instead, which resolves against
+/// [`tui_window_paint_rect`]'s whole-cell-truncated viewport.
 pub fn editor_text_layout(
     rw: &RenderedWindow,
     char_width: f64,
@@ -19454,6 +19473,45 @@ pub fn editor_text_layout(
 ) -> (quadraui::Editor, quadraui::EditorLayout) {
     let editor = to_q_editor(rw);
     let layout = editor.layout(editor.rect, char_width as f32, line_height as f32);
+    (editor, layout)
+}
+
+/// Truncate a window rect to whole terminal cells — the exact conversion
+/// TUI's paint path applies before handing a window's geometry to
+/// `ratatui`/quadraui's cell-grid rasteriser (`tui_main::render_impl`'s
+/// `win_rect` in `render_all_windows`, and the `editor_area` derived from
+/// it in `render_window`, both `rect.x as u16` etc.).
+///
+/// See [`editor_text_layout`]'s doc for why this exists: `RenderedWindow`
+/// rects are produced by continuous float split math and are not
+/// integer-valued in general, so click resolution must snap to the same
+/// grid paint already snapped to, or it silently resolves against
+/// geometry that was never painted (#1040).
+///
+/// TUI-only — GTK rects are real sub-pixel float geometry that Cairo
+/// paints exactly as given; do not call this from `gtk/click.rs`.
+pub fn tui_window_paint_rect(rect: &WindowRect) -> WindowRect {
+    WindowRect::new(
+        (rect.x as u16) as f64,
+        (rect.y as u16) as f64,
+        (rect.width as u16) as f64,
+        (rect.height as u16) as f64,
+    )
+}
+
+/// TUI-only variant of [`editor_text_layout`]: builds the same
+/// [`quadraui::Editor`], but lays it out against
+/// [`tui_window_paint_rect`]'s whole-cell-truncated viewport instead of
+/// the raw (possibly fractional) `rw.rect` — the viewport TUI's paint
+/// path actually drew into. `Editor::layout` only reads its `viewport`
+/// argument for geometry (never the `Editor.rect` field itself), so this
+/// does not disturb anything else `to_q_editor`'s `editor.rect` is used
+/// for. Every TUI click/drag/hover call site that resolves a text column
+/// must use this, not `editor_text_layout` (#1040).
+pub fn tui_editor_text_layout(rw: &RenderedWindow) -> (quadraui::Editor, quadraui::EditorLayout) {
+    let editor = to_q_editor(rw);
+    let viewport = quadraui::Rect::from(tui_window_paint_rect(&rw.rect));
+    let layout = editor.layout(viewport, 1.0, 1.0);
     (editor, layout)
 }
 

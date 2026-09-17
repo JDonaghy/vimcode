@@ -7819,6 +7819,203 @@ mod tests {
         );
     }
 
+    /// #1040: clicking in the RIGHT group of a vertical split must land the
+    /// cursor on the exact character clicked, not the one one cell to its
+    /// left.
+    ///
+    /// Root cause: `RenderedWindow::rect`'s x/width come from continuous
+    /// float split math (`quadraui::SplitTree::layout`, zero divider
+    /// thickness) and are not integer-valued in general. At the default
+    /// 50/50 ratio, an *odd* editor content width gives the right pane's
+    /// `rect.x` a `.5`-cell fractional origin (e.g. content width 81 ->
+    /// right `rect.x = 40.5`). TUI's paint path truncates that away before
+    /// drawing (`tui_main::render_impl`'s `win_rect`/`editor_area`, both
+    /// `rect.x as u16`) — so the right pane's text is actually painted
+    /// starting at column 40 — but the *old* click math
+    /// (`render::editor_text_layout`, shared verbatim with GTK, which is
+    /// not itself buggy since GTK's rects really are the sub-pixel
+    /// geometry Cairo paints) fed the raw, untruncated `40.5` into
+    /// `EditorLayout::col_at_x`'s `floor()` division instead. That
+    /// resolves every clicked column one cell short of the real one
+    /// (column 0 clamps to 0 via `.max(0.0)`, correct by luck — matching
+    /// the report's "at least some of the time"). The left pane never
+    /// shows this: its `rect.x` is always the group's own whole-cell
+    /// screen edge, never fractional.
+    ///
+    /// Fixed via `render::tui_editor_text_layout`, which resolves against
+    /// [`crate::render::tui_window_paint_rect`]'s whole-cell-truncated
+    /// viewport — the same one paint actually used — instead of the raw
+    /// `RenderedWindow::rect`. TUI-only: GTK's `gtk/click.rs` callers of
+    /// `editor_text_layout` are untouched.
+    ///
+    /// **Confirmed RED against unfixed `develop`**: with the three TUI
+    /// call sites in `tui_main/mouse.rs` reverted to
+    /// `render::editor_text_layout(rw, 1.0, 1.0)`, this test fails at
+    /// every odd-content-width entry in `WIDTHS` for every marker column
+    /// past the first, with the painted cursor landing exactly one column
+    /// left of the clicked one.
+    ///
+    /// Sweeps several terminal widths — rather than hand-deriving
+    /// vimcode's activity-bar/sidebar reservation arithmetic to predict
+    /// exactly which raw terminal width yields an odd editor content
+    /// width, this tries a spread and requires every one to pass, per the
+    /// issue's "characterise, don't guess" framing — and several columns
+    /// per width. For each column it checks both scenarios the issue asks
+    /// about: the right group already active (its state immediately after
+    /// `open_editor_group`, i.e. a "later" click) and the first click back
+    /// into the right group right after deliberately defocusing to the
+    /// left pane. Both come back identical, which is exactly what the
+    /// root cause above predicts — nothing about this bug is
+    /// focus-dependent, only geometry-dependent.
+    #[test]
+    fn right_group_click_resolves_to_the_clicked_column_via_shell_app() {
+        const WIDTHS: [u16; 6] = [79, 80, 81, 100, 101, 121];
+        const HEIGHT: u16 = 24;
+        const MARKER_WORD: &str = "QWERTYUIOP";
+
+        /// The row `MARKER_WORD` paints on, found by scanning every row for
+        /// one that shows it *exactly twice* (once per pane). This doesn't
+        /// assume a fixed sidebar width/visibility or tab-bar height: the
+        /// explorer sidebar's default is closed, but a prior interactive
+        /// session against this checkout can leave it open showing this
+        /// checkout's own directory tree — as observed while writing this
+        /// test, it also pushes editor content down by an extra row versus
+        /// a clean sidebar-closed run. Locating content by what's actually
+        /// painted sidesteps both instead of hard-coding a row index.
+        fn find_content_row(
+            driver: &quadraui::tui::testing::TuiDriver<impl quadraui::AppLogic>,
+            height: u16,
+            needle: &str,
+        ) -> u16 {
+            let needle_chars: Vec<char> = needle.chars().collect();
+            for y in 0..height {
+                let row = driver.styled_row(y);
+                let chars: Vec<char> = row.iter().map(|&(c, _)| c).collect();
+                let count = chars
+                    .windows(needle_chars.len())
+                    .filter(|w| *w == needle_chars.as_slice())
+                    .count();
+                if count == 2 {
+                    return y;
+                }
+            }
+            panic!(
+                "expected \"{needle}\" painted exactly twice (once per pane) on \
+                 some row within height {height}"
+            );
+        }
+
+        /// The two screen columns where `needle` starts on `row_y` — one per
+        /// pane, left then right. Uses [`quadraui::tui::testing::TuiDriver::
+        /// styled_row`]'s per-*cell* vec, not a `screen()` string index,
+        /// because `screen()` undercounts columns wherever a preceding
+        /// wide glyph (e.g. the explorer's icons) painted — see
+        /// `divider_col_on_row`'s doc below for the same concern.
+        fn needle_starts_on_row(
+            driver: &quadraui::tui::testing::TuiDriver<impl quadraui::AppLogic>,
+            row_y: u16,
+            needle: &str,
+        ) -> (u16, u16) {
+            let row = driver.styled_row(row_y);
+            let chars: Vec<char> = row.iter().map(|&(c, _)| c).collect();
+            let needle_chars: Vec<char> = needle.chars().collect();
+            let starts: Vec<u16> = chars
+                .windows(needle_chars.len())
+                .enumerate()
+                .filter(|(_, w)| *w == needle_chars.as_slice())
+                .map(|(i, _)| i as u16)
+                .collect();
+            match starts.as_slice() {
+                [l, r] => (*l, *r),
+                other => panic!(
+                    "expected \"{needle}\" painted exactly twice on row {row_y}, \
+                     found {}; row: {chars:?}",
+                    other.len()
+                ),
+            }
+        }
+
+        fn painted_cursor_col(
+            driver: &quadraui::tui::testing::TuiDriver<impl quadraui::AppLogic>,
+            width: u16,
+            row_y: u16,
+            cursor_bg: quadraui::tui::testing::Color,
+        ) -> Option<u16> {
+            (0..width).find(|&x| driver.style_at(x, row_y).map(|s| s.bg) == Some(cursor_bg))
+        }
+
+        for &width in &WIDTHS {
+            let mut app = TuiShellApp::new_for_test();
+            app.engine
+                .buffer_mut()
+                .insert(0, &format!("{MARKER_WORD}\n"));
+            app.engine.open_editor_group(SplitDirection::Vertical);
+
+            let theme = Theme::from_name(&app.engine.settings.colorscheme);
+            let cursor_bg =
+                quadraui::tui::ratatui_color(super::quadraui_tui::q_theme(&theme).cursor);
+
+            let mut driver = driver_with_shell(app, config(), width, HEIGHT);
+            // This test's synthetic clicks land close together with no
+            // real wall-clock gap, which would otherwise fold consecutive
+            // same-spot clicks into a double-click (word-select) — turn
+            // that off so every click is a plain single click placing the
+            // cursor at the exact column, as a real user's well-spaced
+            // clicks would.
+            driver.set_double_click_folding(false);
+            driver.render();
+            // Frame zero renders with the *runner*'s `AppShell` default
+            // (`sidebar_visible: true`, showing this checkout's own
+            // directory tree) rather than the shadow `engine.app_shell`'s
+            // setting-derived one (closed) — the two only get synced to
+            // agree inside `TuiShellApp::handle`'s sidebar-visibility sync,
+            // which runs on the first real dispatch. A throwaway `Escape`
+            // (a no-op in Normal mode) forces that sync before this test
+            // starts measuring columns/clicking for real, so the layout it
+            // clicks against is the stable, settings-derived one — not the
+            // one-frame-only runner default that would otherwise flip
+            // (and reflow the whole screen) on whatever the *first real*
+            // click happens to be.
+            driver.press_named(quadraui::NamedKey::Escape);
+            driver.render();
+
+            let content_row = find_content_row(&driver, HEIGHT, MARKER_WORD);
+            let (left_start, right_start) = needle_starts_on_row(&driver, content_row, MARKER_WORD);
+
+            for (k, marker) in MARKER_WORD.chars().enumerate() {
+                let left_col = left_start + k as u16;
+                let right_col = right_start + k as u16;
+
+                // Scenario A: right group already active — the "later click"
+                // case.
+                driver.click(right_col as f32, content_row as f32);
+                driver.render();
+                assert_eq!(
+                    painted_cursor_col(&driver, width, content_row, cursor_bg),
+                    Some(right_col),
+                    "width {width}, marker '{marker}' (col {k}): clicking \
+                     column {right_col} in an already-active right group \
+                     should land the cursor there, not one column to the left"
+                );
+
+                // Scenario B: defocus to the left pane, then click straight
+                // back into the right group — the "first click into a
+                // just-unfocused group" case the issue asks about.
+                driver.click(left_col as f32, content_row as f32);
+                driver.render();
+                driver.click(right_col as f32, content_row as f32);
+                driver.render();
+                assert_eq!(
+                    painted_cursor_col(&driver, width, content_row, cursor_bg),
+                    Some(right_col),
+                    "width {width}, marker '{marker}' (col {k}): the FIRST \
+                     click back into a just-defocused right group should \
+                     also land on column {right_col}"
+                );
+            }
+        }
+    }
+
     /// Terminal column of the group divider glyph in one painted row,
     /// scanning only to the right of `after` so the sidebar's own tree-indent
     /// guides (a different screen region entirely) cannot be mistaken for it.

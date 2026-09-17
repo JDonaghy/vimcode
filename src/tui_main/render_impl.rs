@@ -826,12 +826,18 @@ pub(super) fn render_all_windows(
     let (active, inactive): (Vec<&RenderedWindow>, Vec<&RenderedWindow>) =
         windows.iter().partition(|w| w.is_active);
     for window in inactive.into_iter().chain(active) {
-        // #550: `window.rect` is already absolute terminal-screen coordinates.
+        // #550: `window.rect` is already absolute terminal-screen
+        // coordinates. #1040: this truncation to whole cells is the one
+        // `render::tui_window_paint_rect`/`render::tui_editor_text_layout`
+        // must reproduce exactly for click resolution to agree with what
+        // gets painted — route through the shared helper rather than
+        // repeating the `as u16` formula a second time.
+        let paint_rect = render::tui_window_paint_rect(&window.rect);
         let win_rect = Rect {
-            x: window.rect.x as u16,
-            y: window.rect.y as u16,
-            width: window.rect.width as u16,
-            height: window.rect.height as u16,
+            x: paint_rect.x as u16,
+            y: paint_rect.y as u16,
+            width: paint_rect.width as u16,
+            height: paint_rect.height as u16,
         };
         render_window(backend, frame.as_deref_mut(), win_rect, window, theme);
     }
