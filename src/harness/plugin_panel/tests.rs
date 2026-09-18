@@ -21,8 +21,17 @@
 use super::*;
 use crate::harness::known_bug_gate;
 
+/// Pixel viewport for the GTK/macOS arms. Gated because the TUI-only lane
+/// (`cargo test --no-default-features`) compiles neither arm, and an
+/// unconditional constant would be dead code there — which
+/// `cargo clippy --no-default-features -- -D warnings`, the lint CI
+/// actually runs, treats as a failure.
+#[cfg(any(feature = "gui", all(feature = "macos", target_os = "macos")))]
 const W: u32 = 1400;
+#[cfg(any(feature = "gui", all(feature = "macos", target_os = "macos")))]
 const H: u32 = 900;
+/// Cell viewport for the two TUI arms. 100x30 leaves the whole unscrolled
+/// fixture (21 rows) on screen with room for the chrome above it.
 const TUI_W: u16 = 100;
 const TUI_H: u16 = 30;
 
@@ -36,9 +45,8 @@ const TUI_H: u16 = 30;
 
 fn prod(
     fx: &PluginPanelFixture,
-) -> crate::harness::ConformanceHarness<
-    quadraui::tui::testing::TuiDriver<impl quadraui::AppLogic>,
-> {
+) -> crate::harness::ConformanceHarness<quadraui::tui::testing::TuiDriver<impl quadraui::AppLogic>>
+{
     let mut h = crate::tui_main::testing::conformance_harness_prod(
         engine_with_plugin_panel(fx),
         TUI_W,
@@ -161,7 +169,7 @@ fn plugin_panel_hover_card_anchors_beside_the_row_on_tui_prod() {
 
 #[test]
 fn plugin_panel_reveal_selects_the_revealed_row_on_tui_prod() {
-    let h = prod(&PluginPanelFixture::new().with_reveal(SEC_COMMITS, REVEAL_QUERY));
+    let mut h = prod(&PluginPanelFixture::new().with_reveal(SEC_COMMITS, REVEAL_QUERY));
     let bg_at = |d: &quadraui::tui::testing::TuiDriver<_>, r: quadraui::Rect| {
         d.style_at(r.x as u16, r.y as u16).map(|s| s.bg)
     };
@@ -170,7 +178,7 @@ fn plugin_panel_reveal_selects_the_revealed_row_on_tui_prod() {
     // instead of a hardcoded colour keeps the assertion theme-independent.
     let reference = painted_bounds(&h.driver, ROW_CHILD_B);
     let reference_bg = bg_at(&h.driver, reference);
-    reveal_selects_the_revealed_row(&h.driver, ROW_COMMIT_A, ROW_COMMIT_B, |d, r| {
+    reveal_selects_the_revealed_row(&mut h.driver, ROW_COMMIT_A, ROW_COMMIT_B, |d, r| {
         bg_at(d, r) != reference_bg
     });
 }
@@ -210,17 +218,14 @@ fn plugin_panel_item_row_hit_band_on_gtk() {
 #[cfg(feature = "gui")]
 #[test]
 fn plugin_panel_section_header_hit_band_scrolled_on_gtk() {
-    known_bug_gate(
-        "plugin_panel_section_header_hit_band_scrolled::gtk",
-        || {
-            let mut h = crate::gtk::testing::conformance_harness(
-                engine_with_plugin_panel(&PluginPanelFixture::new().scrolled()),
-                W as i32,
-                H as i32,
-            );
-            section_header_hit_band(&mut h.driver);
-        },
-    );
+    known_bug_gate("plugin_panel_section_header_hit_band_scrolled::gtk", || {
+        let mut h = crate::gtk::testing::conformance_harness(
+            engine_with_plugin_panel(&PluginPanelFixture::new().scrolled()),
+            W as i32,
+            H as i32,
+        );
+        section_header_hit_band(&mut h.driver);
+    });
 }
 
 #[cfg(feature = "gui")]
@@ -265,7 +270,7 @@ fn plugin_panel_hover_card_anchors_beside_the_row_on_gtk() {
 #[test]
 fn plugin_panel_reveal_selects_the_revealed_row_on_gtk() {
     known_bug_gate("plugin_panel_reveal_selects_the_revealed_row::gtk", || {
-        let h = crate::gtk::testing::conformance_harness(
+        let mut h = crate::gtk::testing::conformance_harness(
             engine_with_plugin_panel(
                 &PluginPanelFixture::new().with_reveal(SEC_COMMITS, REVEAL_QUERY),
             ),
@@ -273,11 +278,15 @@ fn plugin_panel_reveal_selects_the_revealed_row_on_gtk() {
             H as i32,
         );
         let reference = painted_bounds(&h.driver, ROW_CHILD_B);
-        let px = |d: &quadraui::gtk::testing::GtkDriver<_>, r: quadraui::Rect| {
+        // Probe just left of the row's own glyph — inside the selection
+        // band, clear of the text itself — so the colour read is the row's
+        // background fill, the same technique `crate::harness`'s
+        // `probe_band` uses for #1028.
+        let px = |d: &mut quadraui::gtk::testing::GtkDriver<_>, r: quadraui::Rect| {
             d.pixel((r.x - 4.0).max(0.0) as i32, (r.y + r.height / 2.0) as i32)
         };
-        let reference_px = px(&h.driver, reference);
-        reveal_selects_the_revealed_row(&h.driver, ROW_COMMIT_A, ROW_COMMIT_B, |d, r| {
+        let reference_px = px(&mut h.driver, reference);
+        reveal_selects_the_revealed_row(&mut h.driver, ROW_COMMIT_A, ROW_COMMIT_B, |d, r| {
             px(d, r) != reference_px
         });
     });
