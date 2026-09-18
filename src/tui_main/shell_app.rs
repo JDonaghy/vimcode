@@ -6473,8 +6473,9 @@ mod tests {
     }
 
     /// #1134: `gx` used to shell out directly from `core/engine/keys.rs` via
-    /// a bare `Command::new("xdg-open")` with no `target_os` guard at all —
-    /// it ran the Linux opener even on macOS/Windows, and (being
+    /// a bare `Command::new` call to the Linux freedesktop.org opener, with
+    /// no `target_os` guard at all — it ran that opener even on
+    /// macOS/Windows, and (being
     /// `#[cfg(not(test))]`) was structurally unreachable from any test, so
     /// nothing could have caught that. Now `gx` queues a
     /// `PendingPlatformAction::OpenUrl` onto `Engine::pending_platform_actions`
