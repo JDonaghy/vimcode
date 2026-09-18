@@ -43,8 +43,26 @@ pub(crate) use crate::click::{TabBarPixelHits, TabPixelHitMap};
 /// `pub` rather than `pub(crate)` since #657: the caller is `src/main.rs`,
 /// which is now a separate crate from this module's.
 pub fn run(file_path: Option<PathBuf>) {
+    // #1106: this used to silently invent `DISPLAY=:0` whenever neither
+    // `DISPLAY` nor `WAYLAND_DISPLAY` was set. That's a guess, not a
+    // fallback — `:0` is far from guaranteed to be the display anyone
+    // actually wants (Xvfb commonly picks `:99`, a second X session `:1`,
+    // etc.), and if it happens to be wrong `gtk4::init()` below still fails,
+    // just later and against a display name nobody chose, which is exactly
+    // the "surfaces later and less legibly" failure mode #979 hit for
+    // `--help`. Fail loudly here instead, before touching GTK at all, and
+    // name the actual problem: no display was configured. (Deliberately not
+    // an opt-in env var either — there is no way to guess a *correct*
+    // display, only a hardcoded one, so an opt-in would just move the same
+    // wrong guess behind a flag.)
     if std::env::var_os("WAYLAND_DISPLAY").is_none() && std::env::var_os("DISPLAY").is_none() {
-        std::env::set_var("DISPLAY", ":0");
+        eprintln!(
+            "vimcode: no display found (neither DISPLAY nor WAYLAND_DISPLAY is set).\n\
+             The GTK backend needs a running X11 or Wayland session. Set one of\n\
+             those environment variables, or run the TUI backend instead (`vcd`),\n\
+             which needs neither."
+        );
+        std::process::exit(1);
     }
 
     // Install panic hook that flushes swap files + writes crash log.
