@@ -17664,6 +17664,100 @@ fn test_is_safe_url_rejects_dangerous_schemes() {
     assert!(!is_safe_url(""));
 }
 
+// ─── #1134: platform actions queued instead of hand-rolled per-OS openers ──
+//
+// Before #1134, `Engine::open_url`, `reveal_in_file_manager`, and `gx` each
+// shelled out directly (`std::process::Command::new("open"/"xdg-open"/
+// "cmd")`), gated only by `#[cfg(not(test))]` — meaning none of this was
+// ever exercised by `cargo test` at all, hand-rolled or otherwise. Now they
+// push a `PendingPlatformAction` onto `Engine::pending_platform_actions`
+// instead of touching the process table, so these *are* testable: assert on
+// the queue, the same way `PendingFileDialog` (#572) callers assert on
+// `pending_file_dialog` rather than mocking a file chooser.
+
+#[test]
+fn test_engine_open_url_queues_platform_action_for_safe_scheme() {
+    let mut e = engine_with_text("hello\n");
+    assert!(e.pending_platform_actions.is_empty());
+    e.open_url("https://example.com/1134");
+    assert_eq!(
+        e.pending_platform_actions,
+        vec![PendingPlatformAction::OpenUrl(
+            "https://example.com/1134".to_string()
+        )]
+    );
+}
+
+#[test]
+fn test_engine_open_url_does_not_queue_for_unsafe_scheme() {
+    let mut e = engine_with_text("hello\n");
+    e.open_url("javascript:alert(1)");
+    assert!(
+        e.pending_platform_actions.is_empty(),
+        "an unsafe scheme must never reach the platform-action queue"
+    );
+}
+
+#[test]
+fn test_reveal_in_file_manager_queues_platform_action() {
+    let mut e = engine_with_text("hello\n");
+    let path = std::path::PathBuf::from("/tmp/vimcode-1134-test-file.txt");
+    e.reveal_in_file_manager(&path);
+    assert_eq!(
+        e.pending_platform_actions,
+        vec![PendingPlatformAction::Reveal(path)]
+    );
+}
+
+/// Exercises the editor-action-menu "reveal" item's real `context_menu_confirm`
+/// call site in `windows.rs` (`reveal_in_file_manager`'s 3rd of 3 in-tree
+/// callers) end-to-end, not just the method in isolation above.
+#[test]
+fn test_editor_action_menu_reveal_queues_platform_action() {
+    let mut e = engine_with_text("hello\n");
+    let path = std::path::PathBuf::from("/tmp/vimcode-1134-menu-file.txt");
+    e.active_buffer_state_mut().file_path = Some(path.clone());
+    let gid = e.active_group;
+    e.open_editor_action_menu(gid, 0, 0, 1.0);
+    {
+        let cm = e.context_menu.as_mut().expect("menu must be open");
+        assert_eq!(cm.items[7].action, "reveal");
+        cm.selected = 7;
+    }
+    let action = e.context_menu_confirm();
+    assert_eq!(action.as_deref(), Some("reveal"));
+    assert_eq!(
+        e.pending_platform_actions,
+        vec![PendingPlatformAction::Reveal(path)]
+    );
+}
+
+/// **RED-verified against unfixed `develop`:** before #1134, `gx`'s body was
+/// `#[cfg(not(test))] { Command::new("xdg-open")... }` with no `target_os`
+/// guard — a bare Linux-only shell-out with nothing gating it on macOS or
+/// Windows. That whole block was also `#[cfg(not(test))]`, i.e. structurally
+/// unreachable from `cargo test`, which is exactly why the cross-platform
+/// bug shipped unnoticed: there was no queue, no field, nothing this test
+/// (or any test) could assert on. This test fails to compile against
+/// unfixed `develop` (no `pending_platform_actions` field exists at all),
+/// which is as RED as a reproduction of a "does nothing observable" bug can
+/// get.
+#[test]
+fn test_gx_queues_open_url_platform_action_for_word_under_cursor() {
+    let mut e = engine_with_text("README\n");
+    // Cursor starts at (0, 0), on "README" — a single `is_word_char` token,
+    // matching what `word_under_cursor` can actually return (see the `gx`
+    // handler's own comment on why it can't require `is_safe_url`: no
+    // scheme can survive that tokenizer intact).
+    e.handle_key("g", Some('g'), false);
+    e.handle_key("x", Some('x'), false);
+    assert_eq!(
+        e.pending_platform_actions,
+        vec![PendingPlatformAction::OpenUrl("README".to_string())]
+    );
+    assert!(e.message.contains("Opening: README"), "got: {}", e.message);
+}
+
 #[test]
 fn test_hover_links_filtered_by_safe_url() {
     let mut e = engine_with_text("hello\n");

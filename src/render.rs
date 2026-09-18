@@ -4701,7 +4701,7 @@ pub fn apply_engine_action(
     engine: &mut Engine,
     host: &mut impl EngineActionHost,
 ) -> bool {
-    use crate::core::engine::EngineAction;
+    use crate::core::engine::{EngineAction, PendingPlatformAction};
     match action {
         EngineAction::None | EngineAction::Error => false,
         EngineAction::Quit | EngineAction::SaveQuit => {
@@ -4752,7 +4752,15 @@ pub fn apply_engine_action(
             false
         }
         EngineAction::OpenUrl(url) => {
-            crate::core::engine::open_url_in_browser(&url);
+            // #1134: queue rather than shell out here — `apply_engine_action`
+            // is shared by both backends via `EngineActionHost` and has no
+            // `backend` handle of its own. `App::tick_dispatch` (GTK) /
+            // `TuiShellApp::tick` (TUI) drain `pending_platform_actions`
+            // through `PlatformServices` (`is_safe_url` was already applied
+            // by whichever engine path produced this `EngineAction`).
+            engine
+                .pending_platform_actions
+                .push(PendingPlatformAction::OpenUrl(url));
             false
         }
     }

@@ -321,7 +321,7 @@ use ratatui::style::{Color as RColor, Modifier};
 #[cfg(test)]
 use ratatui::Terminal;
 
-use crate::core::engine::EngineAction;
+use crate::core::engine::{EngineAction, PendingPlatformAction};
 use crate::core::window::{GroupDivider, GroupId, SplitDirection};
 use crate::core::{Engine, Mode, OpenMode, WindowRect};
 use crate::icons;
@@ -807,7 +807,15 @@ fn handle_action(engine: &mut Engine, action: EngineAction) -> bool {
             std::process::exit(1);
         }
         EngineAction::OpenUrl(url) => {
-            crate::core::engine::open_url_in_browser(&url);
+            // #1134: queue rather than shell out here — this fn has no
+            // `backend` handle. `TuiShellApp::tick` drains
+            // `pending_platform_actions` through `PlatformServices`
+            // (`is_safe_url` was already applied by whichever engine path
+            // produced this `EngineAction`, e.g. `panels.rs`'s
+            // `open_ext_url:` handler).
+            engine
+                .pending_platform_actions
+                .push(PendingPlatformAction::OpenUrl(url));
             false
         }
         EngineAction::None | EngineAction::Error => false,

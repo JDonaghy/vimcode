@@ -2556,17 +2556,29 @@ impl Engine {
                     self.clamp_cursor_col();
                 }
                 Some('x') => {
-                    // gx: open URL or file path under cursor externally
-                    if let Some(url) = self.word_under_cursor() {
-                        #[cfg(not(test))]
-                        {
-                            let _ = std::process::Command::new("xdg-open")
-                                .arg(&url)
-                                .stdout(std::process::Stdio::null())
-                                .stderr(std::process::Stdio::null())
-                                .spawn();
-                        }
-                        self.message = format!("Opening: {}", url);
+                    // gx: open the word/URL under cursor externally. #1134:
+                    // this used to shell out to a bare call to the Linux
+                    // freedesktop.org opener with no `target_os` guard at
+                    // all — the most severe of the four hand-rolled per-OS
+                    // openers this issue removed, since it ran that Linux
+                    // opener even on macOS and Windows.
+                    //
+                    // No `is_safe_url` gate here, deliberately, unlike
+                    // `Engine::open_url`'s markdown-link callers: this was
+                    // never gated before (any word went straight to the
+                    // opener) and `word_under_cursor` only ever returns
+                    // `[a-zA-Z0-9_]+` (`Engine::is_word_char`) — a scheme
+                    // like `https://…` can never survive that tokenizer
+                    // intact, so an `is_safe_url` check here would reject
+                    // every input and make `gx` permanently inert. Queuing
+                    // unconditionally preserves the exact pre-#1134
+                    // behavior; only the opener mechanism changed, from a
+                    // raw per-OS `Command::new` to
+                    // `PlatformServices::open_url_result` via the queue.
+                    if let Some(word) = self.word_under_cursor() {
+                        self.message = format!("Opening: {}", word);
+                        self.pending_platform_actions
+                            .push(PendingPlatformAction::OpenUrl(word));
                     }
                 }
                 Some('\'') => {

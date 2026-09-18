@@ -91,7 +91,7 @@ use crate::core;
 use crate::icons;
 use crate::render;
 
-use core::engine::EngineAction;
+use core::engine::{EngineAction, PendingPlatformAction};
 use core::{Engine, WindowRect};
 use render::Theme;
 
@@ -1842,6 +1842,34 @@ impl App {
         self.draw_needed.set(true);
     }
 
+    /// Carry out a platform action queued by engine logic this frame — `gx`,
+    /// the "Reveal in File Manager" context-menu item, an extension-supplied
+    /// link, ... — using the runner-owned `backend`'s `PlatformServices`
+    /// (#1134). `core/engine/` has no `backend` handle of its own, hence the
+    /// queue-and-drain-in-`tick` shape; mirrors `run_pending_file_dialog` /
+    /// `run_pending_native_dialog` above. On failure, reports it via
+    /// `engine.message` (the same status-line surface `gx`'s own "Opening:"
+    /// message already uses) rather than silently doing nothing.
+    fn run_pending_platform_action(
+        &mut self,
+        action: PendingPlatformAction,
+        backend: &mut dyn quadraui::Backend,
+    ) {
+        match action {
+            PendingPlatformAction::OpenUrl(url) => {
+                if let Err(e) = backend.services().open_url_result(&url) {
+                    self.engine.borrow_mut().message = format!("Could not open URL: {e:?}");
+                }
+            }
+            PendingPlatformAction::Reveal(path) => {
+                if let Err(e) = backend.services().reveal_in_file_manager(&path) {
+                    self.engine.borrow_mut().message =
+                        format!("Could not reveal in file manager: {e:?}");
+                }
+            }
+        }
+    }
+
     /// Apply the `EngineAction` produced by dismissing a dialog — clears
     /// `explorer_needs_refresh` (some dialog outcomes, e.g. "Discard &
     /// Close", can trigger a sidebar refresh) and handles quit/save-quit.
@@ -2914,7 +2942,11 @@ impl App {
         );
         let effect = render::apply_editor_hover_popup_route(&mut self.engine.borrow_mut(), route);
         if let Some(url) = effect.open_url {
-            open_url(&url);
+            // #1134: `Engine::open_url` validates `is_safe_url` and queues a
+            // `PendingPlatformAction::OpenUrl` for `tick_dispatch` to carry
+            // out through `PlatformServices` — this method has no `backend`
+            // handle of its own (see `Engine::pending_platform_actions`'s doc).
+            self.engine.borrow_mut().open_url(&url);
         }
         if let Some(target) = effect.begin_drag {
             let drag_rc = self.backend.borrow().drag_state_handle();
@@ -2966,7 +2998,9 @@ impl App {
         }
         let effect = render::apply_panel_hover_popup_route(&mut self.engine.borrow_mut(), route);
         if let Some(url) = effect.open_url {
-            open_url(&url);
+            // #1134: see `route_and_apply_editor_hover_popup`'s identical
+            // comment above — `Engine::open_url` validates + queues.
+            self.engine.borrow_mut().open_url(&url);
         }
         self.draw_needed.set(true);
         effect.consumed
@@ -7667,6 +7701,16 @@ impl App {
         // `render_content`'s paint callback must not block inside.
         if let Some(opts) = self.pending_native_dialog.take() {
             self.run_pending_native_dialog(opts, backend);
+        }
+
+        // Drain platform actions (open URL / reveal in file manager) queued
+        // by engine logic this frame — needs the runner-owned `backend` for
+        // `PlatformServices`, which `core/engine/` has no handle to (#1134).
+        // See `Engine::pending_platform_actions`'s doc; mirrors the file
+        // dialog and native dialog drains just above.
+        let actions = std::mem::take(&mut self.engine.borrow_mut().pending_platform_actions);
+        for action in actions {
+            self.run_pending_platform_action(action, backend);
         }
 
         // Periodic background work: LSP, DAP, git, search, etc.

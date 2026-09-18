@@ -1613,40 +1613,34 @@ pub fn is_safe_url(url: &str) -> bool {
     lower.starts_with("https://") || lower.starts_with("http://") || lower.starts_with("command:")
 }
 
-/// Open a URL in the platform's default browser. Validates the URL scheme
-/// first via `is_safe_url`. This is shared across all backends (GTK, TUI,
-/// Win-GUI) to avoid duplicating platform-specific logic.
-pub fn open_url_in_browser(url: &str) {
-    if !is_safe_url(url) {
-        return;
-    }
-    #[cfg(target_os = "windows")]
-    {
-        // `cmd /c start "" "url"` — empty title needed for start.
-        let mut cmd = crate::core::git::hidden_command("cmd");
-        cmd.args(["/c", "start", "", url])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
-        cmd.spawn().ok();
-    }
-    #[cfg(target_os = "macos")]
-    {
-        std::process::Command::new("open")
-            .arg(url)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .ok();
-    }
-    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-    {
-        std::process::Command::new("xdg-open")
-            .arg(url)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .ok();
-    }
+/// A platform action requested by engine logic that must be carried out via
+/// the runner-owned `backend`'s `quadraui::PlatformServices` (#1134) — see
+/// [`Engine::pending_platform_actions`]'s doc for why this can't happen
+/// inline in `core/engine/`.
+///
+/// Before #1134, `core/engine/` hand-rolled four separate per-OS opener
+/// implementations (`open_url_in_browser` here, `gx` in `keys.rs`,
+/// `Engine::open_url` in `ext_panel.rs`, `reveal_in_file_manager` in
+/// `windows.rs`) — each its own `#[cfg(target_os = ...)]` triple of
+/// `Command::new` calls out to `open`, the Linux freedesktop.org opener, or
+/// `cmd`, and one of the four (`gx`) had no `target_os` guard at all, so it
+/// ran the Linux opener unconditionally on every platform including macOS
+/// and Windows. `quadraui::PlatformServices` (quadraui#956) already carries
+/// a correct, tested opener per backend (`gio::AppInfo::launch_default_for_uri`
+/// on GTK, `ShellExecuteW` on Win-GUI, `open`/`open -R` on macOS, and TUI's
+/// own shell-out-with-OSC-8-fallback, quadraui#969) — this enum plus
+/// [`Engine::pending_platform_actions`] is the one place all four call
+/// sites now route through instead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PendingPlatformAction {
+    /// Open a URL in the platform's default browser/handler
+    /// (`PlatformServices::open_url_result`). Always `is_safe_url`-validated
+    /// *before* being queued (at each push site — `Engine::open_url`, `gx`),
+    /// never here, so an unsafe scheme can never even enter the queue.
+    OpenUrl(String),
+    /// Reveal a path in the platform's file manager, selected
+    /// (`PlatformServices::reveal_in_file_manager`).
+    Reveal(PathBuf),
 }
 
 /// Convert a hex ASCII byte to its numeric value (0–15), or `None`.
@@ -3727,6 +3721,20 @@ pub struct Engine {
     /// and clear this flag.
     pub explorer_needs_refresh: bool,
 
+    /// Platform actions (open a URL, reveal a path in the file manager)
+    /// queued by engine logic for the runner to carry out via the
+    /// runner-owned `backend`'s `PlatformServices` (#1134). `Engine` has no
+    /// `Backend` handle of its own — see `PendingFileDialog` (#572, `app.rs`)
+    /// for the identical reason file dialogs are deferred rather than
+    /// actioned inline. Drained every frame by `App::tick_dispatch` (GTK)
+    /// and `TuiShellApp::tick` (TUI), in FIFO order, via
+    /// `backend.services().open_url_result(..)` /
+    /// `.reveal_in_file_manager(..)`. A `Vec` rather than a single `Option`
+    /// (unlike `PendingFileDialog`) because a single frame can legitimately
+    /// queue more than one — e.g. `Engine::open_plugin_context`'s `for url in
+    /// ctx.open_urls { self.open_url(&url); }` loop.
+    pub pending_platform_actions: Vec<PendingPlatformAction>,
+
     /// Inline rename state for the explorer sidebar.  When `Some`, the
     /// sidebar row matching `path` should render an editable text input
     /// instead of the plain filename.
@@ -4318,6 +4326,7 @@ impl Engine {
             pending_move: None,
             pending_delete: None,
             explorer_needs_refresh: false,
+            pending_platform_actions: Vec::new(),
             explorer_rename: None,
             explorer_new_entry: None,
             app_shell: {
