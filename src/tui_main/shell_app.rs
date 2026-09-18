@@ -16494,6 +16494,103 @@ mod tests {
         );
     }
 
+    /// #1117 (review iteration 2): the companion to
+    /// `click_outside_picker_popup_dismisses_it_via_shell_app` above, for
+    /// exactly the case that test deliberately *avoids* — an outside-click
+    /// that lands inside a **visible sidebar panel's own painted body**.
+    /// That test's own doc comment spells out why it can't cover this: it
+    /// pins the sidebar hidden and clicks plain editor body at column 5,
+    /// because with the sidebar visible the panel's intercept in
+    /// `handle_mouse_event` claims the click before the modal-overlay rung
+    /// ever sees it and the picker never dismisses.
+    ///
+    /// That "claimed by the panel intercept instead" behaviour *was* the
+    /// shipped behaviour until #1117 added `picker_blocks_event`
+    /// (`handle_mouse_event`, ~line 1397) to `intercepts_blocked`. All four
+    /// panel intercepts (debug sidebar, extensions sidebar, debug toolbar,
+    /// explorer `TreeController`) read that one flag, so this test covers
+    /// the shared gate through the Explorer arm — the arm #1117's chevron
+    /// fix made reachable in this configuration in the first place, by
+    /// dropping the stale `app_shell.sidebar_visible()` read that used to
+    /// make the intercept decline here by accident.
+    ///
+    /// Mirrors GTK, where `App::try_route_sidebar_mouse_event` (`app.rs`
+    /// ~6169-6172) returns `false` on `engine.picker_open` *before* it looks
+    /// at the click position at all, for the same reason: falling through is
+    /// what makes dismissal work.
+    ///
+    /// Two identically-seeded drivers (the `app_with_expanded_explorer`
+    /// pattern documented on the #1025 tests above): `TuiDriver` has no
+    /// accessor back to the concrete `TuiShellApp` under `driver_with_shell`,
+    /// so the probe driver locates the painted tree row and the real driver
+    /// clicks the same painted cell. 120x30 keeps the centred picker popup
+    /// clear of the sidebar's columns, and the re-`find` in the second driver
+    /// asserts that directly rather than assuming it — without it the click
+    /// could be landing on the popup itself and the test would pass
+    /// vacuously.
+    ///
+    /// RED-verified: reverting `picker_blocks_event` to `false` (or dropping
+    /// it from `intercepts_blocked`) makes this fail — the Explorer intercept
+    /// claims the `MouseDown`, `route_modal_overlay_click` is never reached,
+    /// and the picker title is still painted after the click.
+    #[test]
+    fn click_on_explorer_tree_dismisses_open_picker_via_shell_app() {
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_test_1117_picker_over_explorer_{:?}",
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("zq1117.txt"), "marker").unwrap();
+
+        // Probe driver: same seed, no picker — locates the painted row.
+        let mut probe = driver_with_shell(app_with_expanded_explorer(&dir), config(), 120, 30);
+        probe.render();
+        let (rx, ry) = probe.find("zq1117.txt").unwrap_or_else(|| {
+            panic!(
+                "precondition: the expanded explorer tree must paint the \
+                 seeded file row; screen:\n{}",
+                probe.screen()
+            )
+        });
+
+        // Real driver: identical seed, plus an open picker.
+        let mut app = app_with_expanded_explorer(&dir);
+        app.engine
+            .open_picker(crate::core::engine::PickerSource::LineEndings);
+        let title = app.engine.picker_title.clone();
+        let mut driver = driver_with_shell(app, config(), 120, 30);
+        driver.render();
+
+        assert!(
+            driver.screen_contains(&title),
+            "precondition: the picker's title must paint; screen:\n{}",
+            driver.screen()
+        );
+        assert_eq!(
+            driver.find("zq1117.txt"),
+            Some((rx, ry)),
+            "precondition: the click target must still be a painted explorer \
+             tree row with the picker open — if the popup covered it, this \
+             would be an *inside*-the-popup click and the dismissal \
+             assertion below would prove nothing; screen:\n{}",
+            driver.screen()
+        );
+
+        driver.click(rx, ry);
+        driver.render();
+        let screen = driver.screen();
+        assert!(
+            !screen.contains(&title),
+            "a click that lands inside the visible explorer panel's own body \
+             must still fall through to the picker's dismiss routing \
+             (`picker_blocks_event` -> `intercepts_blocked`), not be \
+             swallowed by the panel intercept; screen:\n{screen}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Black-box regression for #815 (adopting
     /// `quadraui::FolderPickerController`, replacing the deleted TUI-local
     /// `FolderPickerState`): the open picker must actually *paint* its
