@@ -3656,6 +3656,18 @@ pub struct Engine {
     pub ext_panel_help_open: bool,
     /// Extension panel help bindings: panel_name -> [(key, description)]
     pub ext_panel_help_bindings: HashMap<String, Vec<(String, String)>>,
+    /// The `AppShellLayout::sidebar_content_bounds` rect `render_ext_panel`
+    /// was last painted into — i.e. its own `area` parameter, verbatim,
+    /// *before* subtracting the panel's own header/search chrome. #1086:
+    /// click routing (`mouse.rs`'s `SidebarOwner::ExtPanel` arm) derives its
+    /// row index from this cached, painter-used rect via
+    /// `render::SidebarBodyGeometry::content_row`, instead of re-deriving
+    /// the sidebar content's top row from the menu-bar row count by hand —
+    /// that hand-rolled arithmetic never budgeted for `AppShellLayout`'s own
+    /// one-row sidebar header *above* `sidebar_content_bounds`, landing
+    /// every click one row low. Mirrors `explorer_tree_rect` /
+    /// `dap_sidebar_body_rect`'s "cache what was actually painted" pattern.
+    pub ext_panel_content_rect: std::cell::Cell<quadraui::Rect>,
 
     // --- Notifications (background operation progress) ---
     /// Active notifications (spinner/bell indicators in status bar).
@@ -4283,6 +4295,7 @@ impl Engine {
             ext_panel_focus_pending: None,
             ext_panel_help_open: false,
             ext_panel_help_bindings: HashMap::new(),
+            ext_panel_content_rect: std::cell::Cell::new(quadraui::Rect::new(0.0, 0.0, 0.0, 0.0)),
             notifications: Vec::new(),
             next_notification_id: 1,
             toasts: Vec::new(),

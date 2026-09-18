@@ -9093,20 +9093,16 @@ mod tests {
         let header = driver
             .find_bounds("AlphaZQXW817")
             .expect("the section header should be painted");
-        let header_col = header.x as u16 + 1;
-        // The row to *click*, mirroring `mouse.rs`'s `SidebarOwner::ExtPanel`
-        // arm's own formula (`sidebar_row = content_start + flat_idx`, here
-        // `flat_idx = 0` for the section header) rather than the row
-        // `find_bounds` reports the header *painted* at — the two disagree by
-        // one row in this fixture (menu bar hidden, so `menu_rows == 0`; no
-        // search input active, so `content_start == 1`), the same kind of
-        // paint/click-router mismatch
-        // `tui_settings_double_click_toggles_a_boolean_row_via_shared_dispatch`
-        // documents and works around for the Settings sidebar, unrelated to
-        // #817.
-        let header_click_row = 1u16;
 
-        driver.double_click(header_col as f32, header_click_row as f32 + 0.5);
+        // #1086: click the row `find_bounds` reports the header *painted*
+        // at, directly — no hand-rolled `content_start`/`sidebar_row`
+        // formula to disagree with it. Before #1086 this test hardcoded
+        // `header_click_row = 1` (mirroring `mouse.rs`'s old formula) because
+        // that formula and the painted row disagreed by one; the click
+        // router now derives its row from the same painted rect
+        // (`ext_panel_content_rect`) `find_bounds` reads here, so the two
+        // cannot drift apart again.
+        driver.double_click(header.x + 1.0, header.y + header.height / 2.0);
 
         assert!(
             driver.screen_contains("AlphaItemZQXW817"),
@@ -9117,6 +9113,171 @@ mod tests {
              section disappeared, meaning the double-click was mis-read as a \
              plain click; screen:\n{}",
             driver.screen()
+        );
+    }
+
+    /// A `TuiShellApp` with a "git-insights" ext panel registered, two
+    /// sections ("Branches" then "Log", so the fixture exercises a
+    /// *non-first* section header too — #499's report was specifically that
+    /// only the top section header toggled), the second carrying two items.
+    /// Shared by the #1086 click-routing tests below.
+    fn app_with_two_ext_panel_sections() -> TuiShellApp {
+        let mut app = TuiShellApp::new_for_test();
+        app.engine.settings.use_nerd_fonts = Some(false);
+        crate::icons::set_nerd_fonts(false);
+        app.engine.ext_panels.clear();
+        app.engine.ext_panels.insert(
+            "git-insights".to_string(),
+            crate::core::plugin::PanelRegistration {
+                name: "git-insights".to_string(),
+                title: "Git Insights".to_string(),
+                icon: '\u{f113}',
+                fallback_icon: Some(EXT_ICON),
+                sections: vec!["Branches".to_string(), "Log".to_string()],
+            },
+        );
+        app.engine.ext_panel_items.insert(
+            ("git-insights".to_string(), "Branches".to_string()),
+            vec![crate::core::plugin::ExtPanelItem {
+                text: "mainZQXW1086".to_string(),
+                id: "branch1".to_string(),
+                ..Default::default()
+            }],
+        );
+        app.engine.ext_panel_items.insert(
+            ("git-insights".to_string(), "Log".to_string()),
+            vec![
+                crate::core::plugin::ExtPanelItem {
+                    text: "commit1ZQXW1086".to_string(),
+                    id: "commit1".to_string(),
+                    ..Default::default()
+                },
+                crate::core::plugin::ExtPanelItem {
+                    text: "commit2ZQXW1086".to_string(),
+                    id: "commit2".to_string(),
+                    ..Default::default()
+                },
+            ],
+        );
+        // See `tui_ext_panel_double_click_on_a_section_header_does_not_toggle_it`'s
+        // comment: start on a non-Explorer panel so frame 1 never paints (and
+        // leaves a stale claim from) the explorer tree.
+        app.engine
+            .app_shell
+            .show_panel(&quadraui::WidgetId::new(PANEL_SETTINGS));
+        app
+    }
+
+    /// #1086: a single left-click on a section header must toggle *that*
+    /// section's expand/collapse state — the root-cause bug this issue fixes
+    /// resolved every click to the row one below the one clicked, so a click
+    /// on "Log" actually selected/acted on "commit1ZQXW1086" (the first row
+    /// *under* Log) and no section could ever be collapsed with the mouse
+    /// (#484/#499).
+    ///
+    /// Clicks the row `find_bounds` reports the header *painted* at —
+    /// never a hand-derived row — so this test can't encode the same bug it's
+    /// meant to catch. Verified RED against unfixed `develop`: reverting the
+    /// `mouse.rs`/`panels.rs`/`core/engine/mod.rs` changes this issue makes
+    /// (restoring the old `sidebar_row.saturating_sub(menu_rows)` /
+    /// `content_start = 1 + input_rows` arithmetic) reproduces exactly the
+    /// bug — the click lands on "commit1ZQXW1086" instead of "Log", so the
+    /// first assertion below (`commit1ZQXW1086` disappearing) fails.
+    #[test]
+    fn tui_ext_panel_click_on_a_section_header_toggles_it() {
+        let app = app_with_two_ext_panel_sections();
+        let cfg = TuiShellApp::live_shell_config(&app.engine);
+        let mut driver = driver_with_shell(app, cfg, 80, 24);
+        // Two deliberately separate single clicks on the same header below
+        // (collapse, then re-expand) — not a double-click (quadraui#592's
+        // 400ms/1.5-cell fold window has no wall-clock meaning inside a
+        // single synchronous test).
+        driver.set_double_click_folding(false);
+        driver.dispatch(quadraui::UiEvent::WindowFocused(true));
+        driver.render();
+        driver.click(1.0, 7.0);
+
+        assert!(
+            driver.screen_contains("commit1ZQXW1086"),
+            "precondition: the Log section defaults to expanded, so its \
+             items must already be painted; screen:\n{}",
+            driver.screen()
+        );
+
+        let header = driver
+            .find_bounds("Log")
+            .expect("the Log section header should be painted");
+        let click_x = header.x + 1.0;
+        let click_y = header.y + header.height / 2.0;
+
+        driver.click(click_x, click_y);
+        assert!(
+            !driver.screen_contains("commit1ZQXW1086"),
+            "clicking the Log section header must collapse it, but its item \
+             is still painted — the click resolved to a different row; \
+             screen:\n{}",
+            driver.screen()
+        );
+
+        driver.click(click_x, click_y);
+        assert!(
+            driver.screen_contains("commit1ZQXW1086"),
+            "clicking the (now collapsed) Log header a second time must \
+             re-expand it; screen:\n{}",
+            driver.screen()
+        );
+    }
+
+    /// #1086: a single left-click on an ordinary (non-header) item row must
+    /// select *that* row, painted as the tree's selection highlight
+    /// (`quadraui::tui::tree::draw_tree`'s `sel_bg`) — not the row below it.
+    /// Clicks "commit2ZQXW1086", the *second* item of the *second* section,
+    /// so the fixed offset the bug applied (independent of scroll position or
+    /// which row/section) can't accidentally cancel out.
+    ///
+    /// Asserts on the rendered cell style at the clicked row and at a
+    /// neighboring, un-clicked row — never on `engine.ext_panel_selected` —
+    /// per CLAUDE.md's "rendered output, not state" rule: the selected index
+    /// could be populated correctly while still painting the highlight one
+    /// row off, if the paint side used a different origin than the state
+    /// update (not the case here, but state-only wouldn't catch it).
+    ///
+    /// Verified RED against unfixed `develop` the same way as the header
+    /// test above: the old arithmetic selects "commit2ZQXW1086"'s neighbor
+    /// (there being no item below it in this fixture, the click misses the
+    /// list entirely and nothing highlights), so this test's highlight
+    /// assertion fails.
+    #[test]
+    fn tui_ext_panel_click_on_an_item_row_selects_it() {
+        let app = app_with_two_ext_panel_sections();
+        let cfg = TuiShellApp::live_shell_config(&app.engine);
+        let mut driver = driver_with_shell(app, cfg, 80, 24);
+        driver.dispatch(quadraui::UiEvent::WindowFocused(true));
+        driver.render();
+        driver.click(1.0, 7.0);
+
+        let target = driver
+            .find_bounds("commit2ZQXW1086")
+            .expect("the second Log item should be painted");
+        let neighbor = driver
+            .find_bounds("commit1ZQXW1086")
+            .expect("the first Log item should be painted");
+
+        driver.click(target.x + 1.0, target.y + target.height / 2.0);
+
+        let target_style = driver
+            .style_at(target.x as u16, target.y as u16)
+            .expect("the clicked row must have a paintable cell");
+        let neighbor_style = driver
+            .style_at(neighbor.x as u16, neighbor.y as u16)
+            .expect("the neighboring row must have a paintable cell");
+
+        assert_ne!(
+            target_style.bg, neighbor_style.bg,
+            "clicking \"commit2ZQXW1086\" must paint its row with the \
+             selection background, distinct from its un-clicked neighbor \
+             \"commit1ZQXW1086\" — but the two rows share a background, \
+             meaning the click resolved to the wrong row (or no row)"
         );
     }
 
