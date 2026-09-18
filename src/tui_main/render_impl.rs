@@ -200,7 +200,22 @@ pub(super) fn build_screen_for_shell_content(
     // `Backend` trait's default, since TUI has no overlay scrollbar chrome
     // to dodge), but this is the one call site whose value should track
     // the trait, not restate the constant.
-    build_screen_layout(
+    //
+    // #1097 (residual minimap-off click-cost profiling): this is the
+    // *live* per-frame path — `TuiShellApp::render_content` calls this once
+    // per redraw, and `handle_mouse_event` returns `Reaction::Redraw`
+    // unconditionally for every dispatched mouse event, including every
+    // coalesced `MouseMoved` fired while the mouse merely moves over the
+    // editor (mouse capture reports motion, not just clicks). The
+    // pre-existing `PERF build_screen_layout` hook on `build_screen_for_tui`
+    // above only instruments that `#[cfg(test)]`-only helper — it can never
+    // fire on a live run, since nothing outside tests calls it (see that
+    // function's own gating). This is the timer that actually sees what a
+    // live click/hover session costs. Threshold is 1ms, not that helper's
+    // 10ms: the residual cost #1097 chases is *many small frames*, not one
+    // slow one, and a 10ms floor would hide exactly that shape.
+    let bsl_t0 = std::time::Instant::now();
+    let result = build_screen_layout(
         engine,
         theme,
         &window_rects,
@@ -209,7 +224,15 @@ pub(super) fn build_screen_for_shell_content(
         true,
         backend.scrollbar_reserve() as f64,
         render::TUI_MINIMAP_SIZING,
-    )
+    );
+    let bsl_elapsed = bsl_t0.elapsed();
+    if bsl_elapsed.as_millis() >= 1 {
+        debug_log!(
+            "PERF build_screen_layout(live): {:.2}ms",
+            bsl_elapsed.as_secs_f64() * 1000.0
+        );
+    }
+    result
 }
 
 /// Quickfix panel + bottom panel (terminal/debug output) rects for
@@ -2672,6 +2695,121 @@ mod tests {
             div_cells.contains(&(48, 1)),
             "the divider must still paint on the tab-bar row, where no pane \
              separator covers it; got {div_cells:?}"
+        );
+    }
+
+    // ── #1097: residual (minimap-off) click-cost profile ────────────────────
+    //
+    // Manual perf probe, not a regression gate — `#[ignore]`d so it never
+    // runs in the normal suite. Opens this repo's own `src/app.rs`
+    // (8,800+ lines, real tree-sitter Rust highlighting), forces `:set
+    // nominimap`, and times the two things #1097 asked to have measured
+    // apart from each other:
+    //
+    //  * the per-frame layout cost — `build_screen_for_shell_content`, the
+    //    actual *live* render path (`TuiShellApp::render_content` calls this
+    //    once per redraw; see that function's own doc comment, added by
+    //    this issue, for why the pre-existing `build_screen_for_tui` PERF
+    //    hook above can never fire on a live run — nothing outside
+    //    `#[cfg(test)]` calls that helper at all);
+    //  * the syntax/buffer-layer cost — `BufferState::update_syntax_with_limit`'s
+    //    two whole-buffer passes, the issue's "unverified lead".
+    //
+    // Run with:
+    //   cargo test --release --lib \
+    //     tui_main::render_impl::tests::profile_minimap_off_click_cost \
+    //     -- --ignored --nocapture
+    #[test]
+    #[ignore = "manual perf probe for #1097 — run with --ignored --nocapture"]
+    fn profile_minimap_off_click_cost() {
+        crate::core::session::suppress_disk_saves();
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/app.rs");
+        let mut e = Engine::new_for_test();
+        e.startup_without_session_restore(Some(path.as_path()));
+        e.settings.minimap = false;
+
+        let line_count = e.active_buffer_state().buffer.content.len_lines();
+        assert!(
+            line_count > 8_000,
+            "fixture precondition: src/app.rs must still be an 8,000+ line \
+             file for this probe to reproduce #1097's repro shape (got \
+             {line_count} lines)"
+        );
+        assert_eq!(
+            render::minimap_reserved_width(&e, 200.0, 1.0, render::TUI_MINIMAP_SIZING),
+            0.0,
+            "scope guard: this probe measures the *minimap-off* residual \
+             cost only — if this fails, `:set nominimap` didn't take, and \
+             any numbers below are measuring #1096 (already root-caused), \
+             not #1097"
+        );
+
+        let theme = crate::render::Theme::onedark();
+        let tui_backend = super::backend::TuiBackend::new();
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 200,
+            height: 50,
+        };
+
+        // Warm-up: pays any one-time allocation/cache cost outside the
+        // timed loop.
+        let _ = build_screen_for_shell_content(&e, &theme, area, &tui_backend);
+
+        const N: u32 = 100;
+        let t0 = Instant::now();
+        for _ in 0..N {
+            let _ = std::hint::black_box(build_screen_for_shell_content(
+                &e,
+                &theme,
+                area,
+                &tui_backend,
+            ));
+        }
+        let layout_total = t0.elapsed();
+
+        let bid = {
+            let wid = e.active_window_id();
+            e.windows.get(&wid).unwrap().buffer_id
+        };
+        let max_lines = crate::core::buffer_manager::syntax_max_lines();
+        let t1 = Instant::now();
+        for _ in 0..N {
+            e.buffer_manager
+                .get_mut(bid)
+                .unwrap()
+                .update_syntax_with_limit(max_lines);
+        }
+        let syntax_total = t1.elapsed();
+
+        // Third number: the *full* per-frame paint (compose + style-every-
+        // visible-cell + write into the ratatui buffer), not just the
+        // layout step above — `render_tui_buffer_impl` runs the same
+        // `build_screen_for_shell_content` plus the paint walk
+        // `TuiShellApp::render_content` performs on every live redraw
+        // (`render_all_windows` et al.). Layout alone turned out cheap
+        // above; this checks whether the *paint* half of the frame — which
+        // the layout-only number can't see — is where a click-driven
+        // redraw storm would actually spend its time.
+        let _ = render_tui_buffer_impl(&e, area.width, area.height);
+        let t2 = Instant::now();
+        for _ in 0..N {
+            let _ = std::hint::black_box(render_tui_buffer_impl(&e, area.width, area.height));
+        }
+        let paint_total = t2.elapsed();
+
+        println!(
+            "#1097 profile ({line_count}-line file, minimap off, N={N}):\n  \
+             build_screen_for_shell_content (layout only):   {:.3}ms/call ({:.1}ms total)\n  \
+             render_tui_buffer_impl (layout + full paint):   {:.3}ms/call ({:.1}ms total)\n  \
+             update_syntax_with_limit (syntax, full-buffer): {:.3}ms/call ({:.1}ms total)",
+            layout_total.as_secs_f64() * 1000.0 / N as f64,
+            layout_total.as_secs_f64() * 1000.0,
+            paint_total.as_secs_f64() * 1000.0 / N as f64,
+            paint_total.as_secs_f64() * 1000.0,
+            syntax_total.as_secs_f64() * 1000.0 / N as f64,
+            syntax_total.as_secs_f64() * 1000.0,
         );
     }
 }
