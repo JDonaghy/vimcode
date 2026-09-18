@@ -105,6 +105,14 @@
 
 #![cfg(any(test, feature = "test-support"))]
 
+/// #1090: the shared plugin-panel fixture and the six painted-geometry
+/// scenarios built on it. A submodule rather than more of this file
+/// because it owns a fixture (a genuine `PanelRegistration`, not the
+/// marketplace) as well as scenario bodies, and because its per-lane
+/// registration is hand-written rather than `backend_conformance!`-driven —
+/// see its own module doc.
+pub mod plugin_panel;
+
 use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -1294,7 +1302,43 @@ pub(crate) fn assert_text_metrics_backend_applies_metrics<B: TextMetricsBackend>
 // meant to dismiss an open picker could be swallowed by a panel intercept
 // instead of ever reaching the picker's own dismiss routing. Folded into
 // the same `intercepts_blocked` gate every panel intercept already shares.
-pub(crate) const KNOWN_BUGS: &[&str] = &[];
+pub(crate) const KNOWN_BUGS: &[&str] = &[
+    // ── #1090's plugin-panel scenarios, on every lane that is not
+    // `tui_prod` ──────────────────────────────────────────────────────
+    //
+    // Not a new bug and not a regression: #1089, already filed, is that
+    // `crate::app::App` — the cross-backend-shared shell `gtk`, `macos`,
+    // `win` and the `tui` *control* arm all wrap — paints every
+    // `ext:<name>` panel through `render::populate_ext_sidebar_system`,
+    // which builds its rows from the extension **marketplace** manifest
+    // list regardless of which plugin id is active (`src/app.rs`, the
+    // `id if id.starts_with("ext:")` arm). A `PanelRegistration`'s own
+    // sections reach the screen through exactly one call site in this
+    // crate — `crate::tui_main::panels::render_ext_panel` ->
+    // `render::ext_panel_to_tree_view` — which only the shipped TUI shell
+    // (`TuiShellApp`, the `tui_prod` arm) goes through.
+    //
+    // So each body below asserts *correct* plugin-panel behaviour against
+    // a backend that paints a different panel entirely, and fails on its
+    // own precondition ("SEC_COMMITS is not painted"). #1090 is explicit
+    // that this is the intended outcome — "land the scenarios, let the GUI
+    // lanes go red, and let #1089 turn them green" — and equally explicit
+    // that they must not be `#[cfg]`-gated per backend, which would make
+    // them vacuously pass. This gate is the opposite of vacuous: the
+    // moment #1089's fix makes one of these pass, `known_bug_gate` fails
+    // the build until its entry here is deleted.
+    "plugin_panel_section_header_hit_band::gtk", // #1089
+    "plugin_panel_item_row_hit_band::gtk",       // #1089
+    "plugin_panel_section_header_hit_band_scrolled::gtk", // #1089
+    "plugin_panel_section_header_hit_band_with_search_input::gtk", // #1089
+    "plugin_panel_hover_card_anchors::gtk",      // #1089
+    "plugin_panel_reveal_selects_the_revealed_row::gtk", // #1089
+    "plugin_panel_section_header_hit_band::tui", // #1089
+    "plugin_panel_item_row_hit_band::tui",       // #1089
+    "plugin_panel_section_header_hit_band::macos", // #1089
+    "plugin_panel_item_row_hit_band::macos",     // #1089
+    "plugin_panel_hover_card_anchors::macos",    // #1089
+];
 
 /// A saved `std::panic::set_hook`/`take_hook` closure — named so
 /// `known_bug_gate_outcome`'s suppress/restore `RestoreHook` doesn't need

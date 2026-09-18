@@ -136,6 +136,38 @@ pub fn run(file_path: Option<PathBuf>) -> ExitCode {
     quadraui::macos::shell_runner::run_with_shell(app, config)
 }
 
+/// The `MacDriver` instantiation of [`crate::harness::ConformanceHarness`]
+/// — the macOS twin of `crate::gtk::testing::conformance_harness` and
+/// `crate::tui_main::testing::conformance_harness`, lifted out of
+/// [`mac_driver_tests`]'s own private `conformance_proof_slice` module
+/// (#1090) so a shared scenario registered outside this file can reach it.
+///
+/// Thin wiring only, per this module's own "no decision lives here" bar:
+/// the concrete driver type is the one thing a backend module has to
+/// supply, and [`crate::harness::build_app_and_config`] owns everything
+/// above it. `#[cfg(test)]` because it is test-only plumbing and the
+/// `macos` feature already gates the whole module.
+#[cfg(test)]
+pub(crate) fn conformance_harness(
+    engine: crate::core::Engine,
+    width: u32,
+    height: u32,
+) -> crate::harness::ConformanceHarness<
+    quadraui::macos::testing::MacDriver<impl quadraui::AppLogic>,
+> {
+    use quadraui::macos::testing::driver_with_shell;
+    use quadraui::macos::MacBackend;
+
+    let paint = crate::test_paint::PaintGuard::acquire();
+    let cwd = crate::test_cwd::CwdReadGuard::acquire();
+    let engine = std::rc::Rc::new(std::cell::RefCell::new(engine));
+    let backend: std::rc::Rc<std::cell::RefCell<Box<dyn TextMetricsBackend>>> =
+        std::rc::Rc::new(std::cell::RefCell::new(Box::new(MacBackend::new())));
+    let (app, config) = crate::harness::build_app_and_config(std::rc::Rc::clone(&engine), backend);
+    let driver = driver_with_shell(app, config, width, height);
+    crate::harness::ConformanceHarness::new(driver, engine, paint, cwd)
+}
+
 #[cfg(test)]
 mod mac_driver_tests {
     //! Driver-tier coverage for the native macOS GUI (#896, closing #859's
