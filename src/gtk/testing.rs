@@ -3645,6 +3645,163 @@ mod sidebar_panel_clicks {
         );
     }
 
+    /// Git: the wheel must scroll the sidebar's content list, not the editor
+    /// behind it (#1065).
+    ///
+    /// #1065's own investigation found this rung *already wired* — GTK's
+    /// generic `try_route_sidebar_mouse_event` has routed `UiEvent::Scroll`
+    /// to `route_sc_sidebar_event` -> `render::route_sc_sidebar_click` ->
+    /// `Engine::handle_sc_sidebar_ui_event` since #544/#754, well before the
+    /// #1044 audit that (incorrectly) filed this as a GTK gap to match TUI.
+    /// This is regression coverage for behaviour that already worked, not a
+    /// new feature — there is no unfixed-`develop` RED state to cite because
+    /// nothing needed fixing here (contrast the Search test below).
+    ///
+    /// Injects 80 fake unstaged files (no real git repo needed —
+    /// `sc_file_statuses` is the engine's own source of truth) so the panel
+    /// body overflows, then reads the *painted* geometry of a mid-list
+    /// filename before and after a wheel notch — `find_bounds`, not an
+    /// internal scroll-offset field, per `CLAUDE.md`'s "assert on rendered
+    /// output" rule.
+    #[test]
+    fn git_panel_scrolls_under_the_wheel() {
+        let mut engine = Engine::new();
+        engine.settings.use_nerd_fonts = Some(false);
+        engine.sc_file_statuses = (0..80)
+            .map(|i| crate::core::git::FileStatus {
+                path: format!("zqxw1065_file_{i:03}.rs"),
+                unstaged: Some(crate::core::git::StatusKind::Modified),
+                ..Default::default()
+            })
+            .collect();
+        engine
+            .app_shell
+            .show_panel(&quadraui::WidgetId::new(PANEL_GIT));
+        let mut h = harness(engine, 1400, 900);
+        h.driver.render();
+        if h.engine.borrow().sc_panel_layout.borrow().is_none() {
+            return; // no SourceControl screen in this checkout state
+        }
+        let sb = h
+            .painted_sidebar_bounds
+            .get()
+            .expect("the git panel must have painted into a sidebar rect");
+        let before = h
+            .driver
+            .find_bounds("zqxw1065_file_005")
+            .expect("file_005 must be painted before any scroll");
+
+        for _ in 0..20 {
+            h.driver.dispatch(UiEvent::Scroll {
+                widget: None,
+                // Negative y = wheel down in quadraui's convention.
+                delta: ScrollDelta::new(0.0, -1.0),
+                position: Point::new(sb.x + 20.0, sb.y + 100.0),
+            });
+        }
+        h.driver.render();
+        let after = h
+            .driver
+            .find_bounds("zqxw1065_file_005")
+            .expect("file_005 must still be painted (just scrolled) after the wheel");
+
+        assert!(
+            after.y < before.y,
+            "20 wheel-down notches over the git sidebar must have scrolled the \
+             content up (file_005's painted y should have decreased from \
+             {} to something less, got {})",
+            before.y,
+            after.y
+        );
+    }
+
+    /// Search: the wheel must scroll the results tree, not the editor behind
+    /// it (#1065).
+    ///
+    /// **Was actually broken**, unlike Git/Settings: `paint_sidebar_panel_rung`'s
+    /// `PANEL_SEARCH` arm never called `search_sidebar_system.set_backend_info`
+    /// — the exact #971 gap (`render::gui_sidebar_system_metrics`'s own doc)
+    /// already fixed for `sc_sidebar_system` and `ext_sidebar_system` but
+    /// missed for search. `SidebarSystem::handle_cached` returns
+    /// `SidebarEvent::Ignored` unconditionally until `set_backend_info` has
+    /// been called at least once, so every wheel notch over the results list
+    /// (and every content-row click) silently no-op'd.
+    /// `search_panel_click_focuses_the_query_field` never caught this
+    /// because its click lands on the query text box, a separate hit-test
+    /// that doesn't go through `handle_cached`.
+    ///
+    /// **Verified RED against unfixed `develop`:** with the `set_backend_info`
+    /// call removed from the `PANEL_SEARCH` arm, this test fails — the
+    /// scrolled position stays fixed at the pre-scroll row window (file_005
+    /// still visible, file_015 never appears); restored before committing.
+    ///
+    /// Injects 80 fake results across 80 distinct files (no filesystem
+    /// search needed — `project_search_results` is the engine's own source
+    /// of truth) so the results tree overflows the panel, then asserts on
+    /// **painted text** — this tree virtualizes (unlike the git panel's,
+    /// which paints every row regardless of clip), so `screen_contains` is a
+    /// direct, unambiguous visibility check here.
+    #[test]
+    fn search_panel_scrolls_under_the_wheel() {
+        let mut engine = Engine::new();
+        engine.settings.use_nerd_fonts = Some(false);
+        engine
+            .app_shell
+            .show_panel(&quadraui::WidgetId::new(PANEL_SEARCH));
+        engine.project_search_query = "zqxw1065".to_string();
+        engine.project_search_results = (0..80)
+            .map(|i| crate::core::project_search::ProjectMatch {
+                file: std::path::PathBuf::from(format!("zqxw1065_file_{i:03}.rs")),
+                line: 0,
+                col: 0,
+                line_text: format!("zqxw1065 match {i}"),
+            })
+            .collect();
+        let mut h = harness(engine, 1400, 900);
+        h.driver.render();
+        let sb = h
+            .painted_sidebar_bounds
+            .get()
+            .expect("the search panel must have painted into a sidebar rect");
+
+        assert!(
+            h.driver.screen_contains("zqxw1065_file_005"),
+            "precondition: file_005 must be in the initial (unscrolled) \
+             results window; painted: {:?}",
+            h.driver.painted_texts()
+        );
+        assert!(
+            !h.driver.screen_contains("zqxw1065_file_060"),
+            "precondition: file_060 must be well outside the initial \
+             results window, or this test can't tell scrolled from \
+             unscrolled"
+        );
+
+        // Scroll deep enough into the results tree (below the search form's
+        // query/replace/toggle/button rows) that the wheel lands on content,
+        // not chrome.
+        for _ in 0..20 {
+            h.driver.dispatch(UiEvent::Scroll {
+                widget: None,
+                delta: ScrollDelta::new(0.0, -1.0),
+                position: Point::new(sb.x + 20.0, sb.y + 600.0),
+            });
+        }
+        h.driver.render();
+
+        assert!(
+            !h.driver.screen_contains("zqxw1065_file_005"),
+            "a wheel notch over the search results must scroll file_005 out \
+             of view; painted: {:?}",
+            h.driver.painted_texts()
+        );
+        assert!(
+            h.driver.screen_contains("zqxw1065_file_015"),
+            "and scroll a later file into view; painted: {:?}",
+            h.driver.painted_texts()
+        );
+    }
+
     // ── #754 (mouse ladder slice 4: panels) ────────────────────────────────
 
     /// GTK half of `bottom_panel_tab_strip_click_switches_the_painted_panel_
