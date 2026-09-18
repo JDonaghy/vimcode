@@ -2326,6 +2326,16 @@ mod tests {
     /// RED-first: commenting out `render_content`'s `draw_minimap_strip`
     /// call makes the non-blank-braille assertion below fail — confirmed by
     /// hand before restoring the fix.
+    ///
+    /// #1093 updated the golden file: the strip now holds a fixed-scale
+    /// *window* onto the buffer (121 lines, well over this geometry's
+    /// ~52-line window) rather than the whole file squeezed to fit, so the
+    /// indent step — real buffer lines 40..80 — now shows only the
+    /// `40..52` slice that falls inside the window, one row earlier than
+    /// before (the pre-#1093 compression happened to land it at row 4;
+    /// windowing, with one buffer line per `lines` entry, lands it at row
+    /// 10 — `40 / MINIMAP_LINES_PER_ROW`). Confirmed by hand: this is the
+    /// same fixture, same terminal size, only the sampling scale changed.
     #[test]
     fn snapshot_minimap_braille() {
         let text: String = (0..120)
