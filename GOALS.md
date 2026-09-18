@@ -253,9 +253,22 @@ proof, not just the diff looking smaller.
     comment as "not this issue's to fix"). Needs its own vimcode issue before
     ext-panel wheel scroll can be tested/fixed for real; once that lands,
     scroll comes for free through the same rung Git/Search/Settings use.
-14. Should TUI's editor wheel scroll the hovered (unfocused) pane the way
-    GTK's `hovered_window_id` does? Mechanical shape known (`render::
-    find_window_at` + a `_for_window` scroll call).
+14. ✅ **Decided (#1066): yes — converged.** Scroll-follows-pointer is the norm
+    in GUI editors, but the decisive weight was terminal-native precedent: real
+    Vim's own mouse behaviour already scrolls the window *under the pointer*
+    on a `:split`, independent of focus — the exact thing a "vim-like" editor
+    should match, not GTK parity for its own sake. TUI's editor-viewport wheel
+    fallback in `mouse.rs` (the `#825` comment had flagged it as the one place
+    this diverged) was rewired onto the same shared primitives GTK's
+    `handle_mouse_scroll_msg` already uses — `render::find_window_at` +
+    `Engine::scroll_viewport_with_cursor_for_window` — no new per-backend
+    logic. Surfaced (and fixed) a latent `find_window_at` call-site bug along
+    the way: an odd number of available rows splits a horizontal `:split`
+    unevenly (e.g. 37 -> two 18.5-row panes), so a pane boundary can land on a
+    half-row; querying the integer row itself (rather than its cell *center*,
+    `+ 0.5`) lands just outside the pane that visually owns that row. Driver
+    test added (`wheel_scrolls_the_hovered_pane_not_the_focused_one_via_shell_
+    app`, `tui_main/shell_app.rs`), RED-verified against unfixed `develop`.
 15. ✅ **Decided (#1067): GTK should get it — converged, not TUI-only.**
     TUI's panel-hover-popup (source-control / extension-panel item dwell
     tooltip) link click was a hand-rolled inline hit test in `mouse.rs`; GTK
