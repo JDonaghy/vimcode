@@ -152,9 +152,8 @@ pub(crate) fn conformance_harness(
     engine: crate::core::Engine,
     width: u32,
     height: u32,
-) -> crate::harness::ConformanceHarness<
-    quadraui::macos::testing::MacDriver<impl quadraui::AppLogic>,
-> {
+) -> crate::harness::ConformanceHarness<quadraui::macos::testing::MacDriver<impl quadraui::AppLogic>>
+{
     use quadraui::macos::testing::driver_with_shell;
     use quadraui::macos::MacBackend;
 

@@ -465,7 +465,10 @@ pub fn sweep_row_hit_band<D: ConformanceDriver + DriverInput>(
     // as cleanly as one that works — every sample agrees with the
     // (unchanged) baseline either way. #971 learned this the expensive way.
     let centre = painted_bounds(driver, needle);
-    driver.click(centre.x + centre.width / 2.0, centre.y + centre.height / 2.0);
+    driver.click(
+        centre.x + centre.width / 2.0,
+        centre.y + centre.height / 2.0,
+    );
     assert!(
         !driver.screen_has(probe),
         "sanity: a centre click on {needle:?} must collapse it and hide \
@@ -599,14 +602,19 @@ pub fn hover_card_anchors_beside_the_hovered_row<D: ConformanceDriver>(
 ///
 /// #1088: `ext_panel_find_flat_index`'s three-way fuzzy id match treated
 /// the empty-id separator row as a prefix of every hash, so a reveal landed
-/// on flat index 1 (the separator) instead of the commit. This fixture
-/// keeps that separator in `SEC_SUMMARY` on purpose, ahead of the commits,
-/// so the trap is still reachable.
+/// on the separator instead of the commit. The fixture keeps a leading
+/// empty-id separator at the head of `SEC_COMMITS` — the section the reveal
+/// actually searches — precisely so that trap stays reachable.
+///
+/// Takes `&mut D` and an `FnMut` probe, not `&D`/`Fn`: `GtkDriver::pixel`
+/// needs `&mut self` (it re-reads the Cairo surface), so a shared-reference
+/// signature would exclude the one backend whose probe is a real pixel
+/// read.
 pub fn reveal_selects_the_revealed_row<D: ConformanceDriver>(
-    driver: &D,
+    driver: &mut D,
     revealed: &str,
     unrelated: &str,
-    is_highlighted: impl Fn(&D, quadraui::Rect) -> bool,
+    mut is_highlighted: impl FnMut(&mut D, quadraui::Rect) -> bool,
 ) {
     let target = painted_bounds(driver, revealed);
     let other = painted_bounds(driver, unrelated);
