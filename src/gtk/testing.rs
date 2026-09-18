@@ -5165,6 +5165,104 @@ mod panel_surfaces {
         );
     }
 
+    /// Engine fixture for the GTK #1087 regression test below: a
+    /// `git-insights` ext panel with 30 "Log" items and a panel-hover popup
+    /// open on the item at flat index `item_index`, scrolled to
+    /// `scroll_top`. Mirrors `tui_main::shell_app`'s
+    /// `tui_ext_panel_hover_card_anchors_to_the_scrolled_row_not_the_flat_index`
+    /// fixture so the two backends' regression tests stay comparable.
+    fn ext_panel_hover_engine(scroll_top: usize, item_index: usize) -> Engine {
+        let mut engine = small_engine();
+        engine.ext_panels.insert(
+            "git-insights".to_string(),
+            crate::core::plugin::PanelRegistration {
+                name: "git-insights".to_string(),
+                title: "Git Insights".to_string(),
+                icon: '\u{f113}',
+                fallback_icon: Some('X'),
+                sections: vec!["Log".to_string()],
+            },
+        );
+        let items: Vec<crate::core::plugin::ExtPanelItem> = (0..30)
+            .map(|i| crate::core::plugin::ExtPanelItem {
+                text: format!("hover1087item{i:02}"),
+                id: format!("item{i}"),
+                ..Default::default()
+            })
+            .collect();
+        engine
+            .ext_panel_items
+            .insert(("git-insights".to_string(), "Log".to_string()), items);
+        engine.ext_panel_active = Some("git-insights".to_string());
+        engine.ext_panel_scroll_top = scroll_top;
+        engine.show_panel_hover(
+            "git-insights",
+            &format!("item{}", item_index.saturating_sub(1)),
+            item_index,
+            "HOVERCARD1087GTK body text",
+        );
+        engine
+    }
+
+    /// #1087 GTK twin of TUI's `tui_ext_panel_hover_card_anchors_to_the_
+    /// scrolled_row_not_the_flat_index`. `panel_hover_anchor_y`'s
+    /// non-source-control branch (`render.rs`) is shared code reached from
+    /// both backends: GTK's `App::paint_bottom_band` calls
+    /// `render::panel_hover_popup_paint` unconditionally whenever
+    /// `screen.panel_hover` is set (`src/app.rs`'s `BottomOp::PanelHover`
+    /// arm), with no gate on `panel_name` — so the fixed anchor math is
+    /// exercised on GTK even though nothing under `src/gtk/`/`src/app.rs`
+    /// paints a plugin ext panel's own tree body yet
+    /// (`render::ext_panel_to_tree_view` has exactly one caller today, TUI's
+    /// `tui_main::panels::render_ext_panel`). That means there's no painted
+    /// row text on this backend to `find_bounds` against the way the TUI
+    /// test locates the hovered row, so this instead asserts the invariant
+    /// the fix establishes: the popup's anchor depends only on the
+    /// *on-screen* row (`item_index - ext_panel_scroll_top`), never on the
+    /// raw flat index or the scroll offset individually. Two fixtures reach
+    /// the same on-screen row (3) via different (scroll_top, item_index)
+    /// pairs — (0, 3) and (20, 23) — and must paint the popup at the same
+    /// y.
+    ///
+    /// **Verified RED against unfixed `develop`:** the pre-fix code
+    /// anchored at `sidebar_top_y + unit_h + item_index * unit_h` with no
+    /// scroll subtraction, so (scroll_top=0, item_index=3) anchored ~4 rows
+    /// down while (scroll_top=20, item_index=23) anchored ~24 rows down —
+    /// tens of pixels apart, not equal; temporarily reverting
+    /// `panel_hover_anchor_y`'s ext-panel branch to the old formula fails
+    /// the equality assertion below.
+    #[test]
+    fn panel_hover_ext_panel_card_anchors_to_the_scrolled_row_not_the_flat_index_on_gtk() {
+        let unscrolled = ext_panel_hover_engine(0, 3);
+        let h_unscrolled = harness(unscrolled, 1400, 900);
+        let rect_unscrolled = h_unscrolled
+            .panel_hover_popup_rect
+            .get()
+            .expect("popup must paint & cache bounds for the unscrolled fixture");
+
+        let scrolled = ext_panel_hover_engine(20, 23);
+        let h_scrolled = harness(scrolled, 1400, 900);
+        let rect_scrolled = h_scrolled
+            .panel_hover_popup_rect
+            .get()
+            .expect("popup must paint & cache bounds for the scrolled fixture");
+
+        assert!(
+            rect_scrolled.width > 0.0 && rect_scrolled.height > 0.0,
+            "precondition: the scrolled fixture's popup must have painted \
+             non-empty bounds; got {rect_scrolled:?}"
+        );
+        assert!(
+            (rect_unscrolled.y - rect_scrolled.y).abs() < 1.0,
+            "hovering on-screen row 3 must anchor the popup at the same y \
+             regardless of scroll offset — unscrolled (scroll_top=0, \
+             item_index=3) painted at y={}, scrolled (scroll_top=20, \
+             item_index=23) painted at y={}",
+            rect_unscrolled.y,
+            rect_scrolled.y,
+        );
+    }
+
     /// #1067: clicking a link inside the panel-hover popup (source-control /
     /// extension-panel item dwell tooltip) was a complete no-op on GTK —
     /// this backend painted and cached `panel_hover_link_rects` (exercised

@@ -9158,7 +9158,16 @@ pub(crate) fn ext_panel_hover_screen_row(panel: &ExtPanelData, item_index: usize
 /// own `chrome_h` (`tui_main/panels.rs`) — the same condition
 /// `mouse.rs`'s `SidebarOwner::ExtPanel` click arm uses for
 /// `SidebarBodyGeometry::header_rows` (#1086) — so hover and click can't
-/// drift on what counts as chrome.
+/// drift on what counts as chrome, *except* in the degenerate case
+/// `render_ext_panel` guards and this doesn't: its `chrome_h` is
+/// `.min(area.height)`, clamped to whatever the panel's viewport actually
+/// has room for, while this always returns 1 or 2 regardless of viewport
+/// size. Only matters for an ext-panel area under 2 rows tall (an
+/// unusably narrow sidebar), where a hover anchor could drift by a row
+/// from what was actually painted — not worth threading `area.height`
+/// through the hover path for that corner case today, but a future
+/// `SidebarBodyGeometry`-style unification (#1086) should derive both from
+/// one place.
 pub(crate) fn ext_panel_chrome_rows(panel: &ExtPanelData) -> usize {
     if panel.input_active || !panel.input_text.is_empty() {
         2
