@@ -2599,6 +2599,7 @@ mod tests {
             total_lines,
             gutter_char_width: 0,
             text_viewport_cols: 0,
+            minimap_reserved_w: 0.0,
             is_active: true,
             show_active_bg: false,
             has_git_diff: false,

@@ -1109,6 +1109,18 @@ pub struct RenderedWindow {
     /// to `Engine::set_viewport_for_window` so `ensure_cursor_visible`
     /// uses accurate geometry.
     pub text_viewport_cols: usize,
+    /// Width reserved to the right of the text for the minimap strip plus
+    /// the scroll-affordance gutter it always leaves clear alongside it
+    /// (#1094 review), in the caller's own unit — `0.0` when the strip is
+    /// off/self-suppressed for this window. `rect` reaches the pane's true
+    /// right edge (#1094's own fix), so `window_zone_hit_test` needs this
+    /// to find the strip's boundary and exclude it from `TextArea`/gutter
+    /// click routing without re-deriving `scroll_gutter_width` (a private,
+    /// backend-`scrollbar_reserve`-dependent quantity) a second time from
+    /// scratch. Mirrors exactly what `build_rendered_window` already
+    /// subtracted to produce `text_viewport_cols` above, so the two can
+    /// never drift from each other.
+    pub minimap_reserved_w: f64,
     /// Whether this is the focused window.
     pub is_active: bool,
     /// Whether to render with the slightly-different active-window background
@@ -11154,6 +11166,21 @@ pub fn minimap_reserved_width(
 /// `pub(crate)` (not private) since #1094's GTK driver tests
 /// (`gtk::testing::minimap`) need the same formula to predict the real
 /// paint path's column count, not just this module's own tests.
+///
+/// #1094 review: on GTK the `.max` does *not* reliably resolve to
+/// `scrollbar_reserve` — `gtk::testing`'s own
+/// `cols_without_reserve`/`cols_with_reserve` fixture asserts real editor
+/// char widths already exceed the 8px overlay reserve
+/// (`cw_probe > SCROLLBAR_RESERVE_PX`), so `char_width` is the *ordinary*
+/// winner on GTK, not a rare very-large-font edge case. That's still
+/// correct here — reserving a full extra text column's worth of gutter
+/// alongside the strip is a superset of the ~8px the real scrollbar
+/// overlay needs, never a shortfall — but it does mean the strip can end
+/// up a little narrower than `minimap_reserved_width` alone would afford
+/// whenever `char_width > scrollbar_reserve`, everyday on GTK rather than
+/// only at unusually large font sizes. Left as a comment rather than a
+/// `debug_assert!`: there is no threshold here that's actually wrong to
+/// cross, only a width trade-off worth knowing about.
 pub(crate) fn scroll_gutter_width(scrollbar_reserve: f64, char_width: f64) -> f64 {
     scrollbar_reserve.max(char_width)
 }
@@ -17742,6 +17769,7 @@ fn build_rendered_window(
         total_lines: 0,
         gutter_char_width: 0,
         text_viewport_cols: 0,
+        minimap_reserved_w: 0.0,
         is_active,
         show_active_bg: false,
         has_git_diff: false,
@@ -17849,28 +17877,33 @@ fn build_rendered_window(
     // function has no opinion on what that value is; it only subtracts
     // whatever the caller measured.
     //
-    // `minimap_w` (#1094): `rect` is now the *pane's* rect, not a
-    // minimap-narrowed copy of it — the caller stopped narrowing `rect`
-    // before handing it here so that `rect` itself (which becomes
-    // `RenderedWindow.rect`, i.e. the same rect quadraui's `draw_editor`
-    // anchors its own inline scrollbar column to, at `rect`'s own right
-    // edge) reaches all the way to the pane's true right edge, past where
-    // the strip paints. The text column count still has to exclude the
-    // strip's width, or it would overestimate by `minimap_w` — the file's
-    // actual visible columns end where the strip starts, even though
-    // `rect` itself now runs wider than that (see this function's caller
-    // for the strip's own placement in that same gap). The caller's
-    // `minimap_w` already folds in the sliver between the strip and
-    // `scrollbar_reserve` alone (`scroll_gutter_width` minus
-    // `scrollbar_reserve`) when a strip is present, so subtracting it here
-    // alongside `scrollbar_reserve` lands the text's last column exactly
-    // where the strip's first column starts — not past it.
+    // `minimap_w` (#1094): `rect` is now the *pane's* rect, unmodified by
+    // the strip — see this function's caller (`build_screen_layout`'s
+    // `minimap_widths`/`windows` map, where `minimap_w` is derived) for
+    // the full rationale on why `rect` stopped being narrowed and what
+    // `minimap_w` folds in. Subtracting it here alongside
+    // `scrollbar_reserve` keeps the text column count from overestimating
+    // into the strip's own columns, even though `rect` itself runs wider
+    // than that now.
     let render_viewport_cols = if char_width > 0.0 {
         let total_chars =
             ((rect.width - scrollbar_reserve - minimap_w) / char_width).floor() as usize;
         total_chars.saturating_sub(gutter_char_width).max(1)
     } else {
         view.viewport_cols.max(1)
+    };
+
+    // #1094 review: `RenderedWindow.minimap_reserved_w` — the same
+    // strip-plus-gutter width just subtracted above, but re-expressed
+    // relative to `rect.width` (i.e. with `scrollbar_reserve` folded back
+    // in) so `window_zone_hit_test` can find the strip's boundary directly
+    // from `rect.width` without needing `scrollbar_reserve` threaded
+    // through as a parameter of its own. `minimap_w` is already `0.0` when
+    // there's no strip for this window, matching the field's own contract.
+    let minimap_reserved_w = if minimap_w > 0.0 {
+        minimap_w + scrollbar_reserve
+    } else {
+        0.0
     };
 
     // Narrow the highlights slice to only the visible window using binary search.
@@ -18638,6 +18671,7 @@ fn build_rendered_window(
         total_lines,
         gutter_char_width,
         text_viewport_cols: render_viewport_cols,
+        minimap_reserved_w,
         is_active,
         show_active_bg: is_active && multi_window,
         has_git_diff: has_git,
@@ -21047,6 +21081,21 @@ pub enum WindowZone {
         seg_col_offset: usize,
         text_rel_x: f64,
     },
+    /// The minimap strip's own column range, plus the scroll-affordance
+    /// gutter it always leaves clear alongside it (#1094 review). Neither
+    /// is text: real presses on the strip are resolved earlier by
+    /// `apply_minimap_click`, before `window_zone_hit_test` ever runs, so
+    /// every caller here treats this as a dead zone — the `_` arm in
+    /// `click.rs::pixel_to_click_target`'s match, and the `let ... else` /
+    /// `if let WindowZone::TextArea` patterns in `tui_main/mouse.rs`, both
+    /// already fall through to "not resolved" for any non-`TextArea`
+    /// variant without needing an explicit arm for this one. It exists so a
+    /// text-selection drag whose pointer sweeps over the strip's pixels
+    /// stops extending the selection there, matching the pre-#1094 outcome
+    /// (when the narrower `rect` made such a point fall outside the window
+    /// entirely) without re-narrowing `rect`, which #1094 deliberately
+    /// stopped doing.
+    Minimap,
 }
 
 /// Action to take on a gutter click.
@@ -21503,13 +21552,17 @@ pub fn window_zone_hit_test(
     let gutter_w = rw.gutter_char_width as f64 * char_width;
     let has_v_sb = rw.total_lines > viewport_lines;
     let sb_w = if has_v_sb { char_width } else { 0.0 };
-    let viewport_cols = if char_width > 0.0 {
-        ((rw.rect.width - sb_w) / char_width).floor() as usize
-    } else {
-        1
-    }
-    .saturating_sub(rw.gutter_char_width)
-    .max(1);
+    // #1094 review: reuse `rw.text_viewport_cols` — already computed by
+    // `build_rendered_window` with the minimap strip's width (and any
+    // scrollbar overlay reserve) subtracted — instead of an independent
+    // recomputation from `rw.rect.width` that had no knowledge of the strip
+    // at all. `rw.rect` now reaches the pane's *true* right edge (#1094's
+    // own fix moved the scrollbar there), so re-deriving `viewport_cols`
+    // from it directly would silently include the strip's columns,
+    // undercounting how often `has_h_sb` should be true and letting a
+    // click on a visibly-painted horizontal scrollbar fall through to
+    // `TextArea` instead.
+    let viewport_cols = rw.text_viewport_cols.max(1);
     let has_h_sb = rw.max_col > viewport_cols && viewport_lines > 1;
 
     // 2. Vertical scrollbar (rightmost column).
@@ -21517,7 +21570,20 @@ pub fn window_zone_hit_test(
         return WindowZone::VerticalScrollbar { view_row };
     }
 
-    // 3. Horizontal scrollbar (bottom content row, above status bar).
+    // 3. Minimap strip, plus the scroll-affordance gutter it always leaves
+    // clear alongside it (#1094 review) — see `WindowZone::Minimap`'s doc
+    // comment for why this has to be excluded here rather than relying on
+    // `apply_minimap_click` alone (that resolver is skipped for
+    // text-selection drag continuations). Checked after the vertical
+    // scrollbar so a shown scrollbar's own pixels still resolve to
+    // `VerticalScrollbar` above; this only ever matches the strip itself,
+    // or (when the vertical scrollbar isn't currently shown) the sliver of
+    // gutter that stays reserved for it regardless.
+    if rw.minimap_reserved_w > 0.0 && rel_x >= rw.rect.width - rw.minimap_reserved_w {
+        return WindowZone::Minimap;
+    }
+
+    // 4. Horizontal scrollbar (bottom content row, above status bar).
     let h_sb_y = content_h - line_height;
     if has_h_sb && rel_y >= h_sb_y && rel_y < content_h {
         return WindowZone::HorizontalScrollbar {
@@ -21532,7 +21598,7 @@ pub fn window_zone_hit_test(
         .map(|rl| (rl.line_idx, rl.segment_col_offset))
         .unwrap_or((rw.scroll_top + view_row, 0));
 
-    // 4. Gutter.
+    // 5. Gutter.
     if gutter_w > 0.0 && rel_x < gutter_w {
         let gutter_col = if char_width > 0.0 {
             (rel_x / char_width).floor() as usize
@@ -21546,7 +21612,7 @@ pub fn window_zone_hit_test(
         };
     }
 
-    // 5. Text area.
+    // 6. Text area.
     let text_rel_x = rel_x - gutter_w;
     WindowZone::TextArea {
         view_row,
@@ -25180,6 +25246,138 @@ mod tests {
             with_reserve.windows[0].text_viewport_cols > 0,
             "self-suppressing the strip must not leave the pane with zero \
              text columns either"
+        );
+    }
+
+    // ─── window_zone_hit_test / minimap click-drag routing (#1094 review) ──
+    //
+    // `window_zone_hit_test` is the shared classifier both `click.rs`'s
+    // `pixel_to_click_target` (GTK) and `tui_main/mouse.rs` (TUI) route
+    // through. #1094's own fix widened `RenderedWindow.rect` back out to
+    // the pane's true right edge (so the scrollbar paints there, past the
+    // strip) but initially left this function computing its own
+    // `viewport_cols` straight from that wider `rect.width`, with no idea
+    // the minimap strip eats into it. The two tests below pin the two
+    // resulting drifts: a real horizontal-scrollbar click misclassified as
+    // `TextArea`, and — worse — a text-selection drag whose pointer sweeps
+    // over the strip's own pixels extending the selection underneath
+    // painted minimap content instead of being treated as a miss.
+
+    /// Minimal `RenderedWindow` fixture with every field controllable,
+    /// mirroring `build_rendered_window`'s own `empty` closure (this
+    /// struct has no `Default` impl) — used here instead of driving a full
+    /// `Engine`/buffer through `build_screen_layout` so `max_col` and
+    /// `text_viewport_cols` can be set to the exact values needed to land
+    /// in the narrow gap the pre-fix and post-fix formulas disagree on.
+    fn fixture_window(
+        rect: WindowRect,
+        gutter_char_width: usize,
+        total_lines: usize,
+        max_col: usize,
+        text_viewport_cols: usize,
+        minimap_reserved_w: f64,
+    ) -> RenderedWindow {
+        RenderedWindow {
+            window_id: WindowId(0),
+            rect,
+            lines: vec![],
+            cursor: None,
+            extra_cursors: vec![],
+            selection: None,
+            extra_selections: vec![],
+            yank_highlight: None,
+            scroll_top: 0,
+            scroll_left: 0,
+            total_lines,
+            gutter_char_width,
+            text_viewport_cols,
+            minimap_reserved_w,
+            is_active: true,
+            show_active_bg: false,
+            has_git_diff: false,
+            has_breakpoints: false,
+            max_col,
+            diagnostic_gutter: std::collections::HashMap::new(),
+            code_action_lines: std::collections::HashSet::new(),
+            bracket_match_positions: Vec::new(),
+            active_indent_col: None,
+            tabstop: 4,
+            cursorline: false,
+            status_line: None,
+        }
+    }
+
+    /// RED against the pre-fix shape: `has_h_sb` was computed from a
+    /// `viewport_cols` re-derived straight off `rw.rect.width` (with no
+    /// minimap subtraction), so a line that overflows the real, narrower
+    /// `text_viewport_cols` but not that inflated rect-width-only figure
+    /// reported `has_h_sb == false` — a click on the horizontal scrollbar
+    /// that's actually painted on screen fell through to `TextArea`
+    /// instead of `HorizontalScrollbar`. Picks `max_col` to sit exactly in
+    /// that disagreement gap: greater than `text_viewport_cols` (so the
+    /// fixed formula, which reuses `rw.text_viewport_cols` directly, must
+    /// report overflow) but not greater than `rect.width` itself (so the
+    /// old buggy formula, which never subtracted the minimap's width at
+    /// all, would have reported none).
+    #[test]
+    fn window_zone_hit_test_h_scrollbar_click_accounts_for_the_minimap_strip() {
+        let rect = WindowRect::new(0.0, 0.0, 40.0, 10.0);
+        let text_viewport_cols = 30; // rect.width(40) - minimap_reserved_w(10)
+        let max_col = text_viewport_cols + 1; // overflows the real viewport...
+        assert!(
+            max_col <= rect.width as usize,
+            "fixture invariant broken: max_col must still fall short of the \
+             old rect-width-only formula, or this test isn't exercising the \
+             regression at all"
+        );
+        let rw = fixture_window(rect, 0, 1, max_col, text_viewport_cols, 10.0);
+
+        // Row just above the (absent) status bar, inside the horizontal
+        // scrollbar's one-line band: `content_h(10) - line_height(1) = 9`.
+        let zone = window_zone_hit_test(&rw, 5.0, 9.5, 1.0, 1.0);
+        assert!(
+            matches!(zone, WindowZone::HorizontalScrollbar { .. }),
+            "a line overflowing the real (minimap-narrowed) text viewport \
+             must resolve a click on its scrollbar row to \
+             WindowZone::HorizontalScrollbar, not fall through to \
+             TextArea; got {zone:?}"
+        );
+    }
+
+    /// A point over the minimap strip's own column range must not resolve
+    /// to `TextArea` — pre-#1094, `RenderedWindow.rect` was narrowed by the
+    /// strip's width, so such a point fell outside the window entirely
+    /// (`find_window_at` never even reached this function for it). Post-
+    /// #1094, `rect` reaches the pane's true right edge instead, so
+    /// `window_zone_hit_test` has to exclude the strip's columns
+    /// explicitly or a text-selection drag whose pointer sweeps over the
+    /// strip's pixels (`apply_tui_editor_text_drag`, and
+    /// `pixel_to_click_target`'s `mutate_focus == false` continuation path)
+    /// would extend the selection underneath the painted strip instead of
+    /// being treated as a miss.
+    #[test]
+    fn window_zone_hit_test_excludes_the_minimap_strip_from_text_area() {
+        let rect = WindowRect::new(0.0, 0.0, 40.0, 10.0);
+        let rw = fixture_window(rect, 0, 1, 1, 30, 10.0);
+
+        // Comfortably inside the reserved strip+gutter band (the
+        // rightmost 10 columns of a 40-wide rect).
+        let strip_x = 35.0;
+        let zone = window_zone_hit_test(&rw, strip_x, 0.0, 1.0, 1.0);
+        assert!(
+            matches!(zone, WindowZone::Minimap),
+            "a point over the minimap strip's own pixels must classify as \
+             WindowZone::Minimap, not TextArea/Gutter/HorizontalScrollbar; \
+             got {zone:?}"
+        );
+
+        // A point well inside the real text columns must still resolve to
+        // TextArea — the exclusion must not eat real text.
+        let zone = window_zone_hit_test(&rw, 2.0, 0.0, 1.0, 1.0);
+        assert!(
+            matches!(zone, WindowZone::TextArea { .. }),
+            "a point in the real text columns must still resolve to \
+             WindowZone::TextArea; got {zone:?}"
         );
     }
 
