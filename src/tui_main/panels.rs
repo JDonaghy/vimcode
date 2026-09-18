@@ -646,6 +646,20 @@ pub(super) fn render_ext_panel(
         return;
     };
 
+    // #1086: cache the exact rect this frame painted the ext panel into —
+    // `AppShellLayout::sidebar_content_bounds`, verbatim, before subtracting
+    // this function's own chrome — so click routing (`mouse.rs`'s
+    // `SidebarOwner::ExtPanel` arm) can derive its row index from what was
+    // actually painted instead of re-deriving the sidebar content's top row
+    // from the menu-bar row count by hand. Mirrors `explorer_tree_rect` /
+    // `dap_sidebar_body_rect`.
+    engine.ext_panel_content_rect.set(quadraui::Rect::new(
+        area.x as f32,
+        area.y as f32,
+        area.width as f32,
+        area.height as f32,
+    ));
+
     // ── Chrome: header (always) + search input (only when active or text). ─
     let input_visible = panel.input_active || !panel.input_text.is_empty();
     let chrome_h: u16 = (if input_visible { 2 } else { 1 }).min(area.height);

@@ -6731,7 +6731,7 @@ pub struct SidebarBodyGeometry {
 impl SidebarBodyGeometry {
     /// Content-row index under `y`, or `None` when `y` is in the chrome above
     /// the first content row (or outside the body entirely).
-    fn content_row(&self, y: f32) -> Option<usize> {
+    pub(crate) fn content_row(&self, y: f32) -> Option<usize> {
         if self.row_h <= 0.0 || y < self.bounds.y || y >= self.bounds.y + self.bounds.height {
             return None;
         }
