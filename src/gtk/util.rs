@@ -74,15 +74,94 @@ fn rasterise_app_icon_png() -> Option<Vec<u8>> {
     scaled.save_to_bufferv("png", &[]).ok()
 }
 
+/// Sizes (in pixels) the SVG is rasterised to for compositors/WMs that only
+/// read fixed-size `_NET_WM_ICON` pixel data instead of looking up the
+/// scalable SVG. Shared between the installer and the up-to-date check below
+/// so the two can never drift out of sync.
+const ICON_PNG_SIZES: [u32; 5] = [48, 64, 128, 256, 512];
+
+/// Name of the stamp file [`install_icon_and_desktop_at`] writes after a
+/// successful install, holding the `CARGO_PKG_VERSION` it installed.
+///
+/// #1106: before this stamp existed, the installer — writes to
+/// `~/.local/share/icons/hicolor`, a `.desktop` file, and a
+/// `gtk-update-icon-cache` subprocess spawn — ran unconditionally on *every*
+/// launch, even though the files it writes never change between runs of the
+/// same build. The stamp lets [`install_icon_and_desktop_at`] recognise "this
+/// version is already installed" and skip straight to returning.
+const ICON_INSTALL_STAMP_FILE: &str = ".vimcode-icon-install-version";
+
+/// Whether a previous [`install_icon_and_desktop_at`] call already installed
+/// `current_version` and every file it wrote is still present — i.e. whether
+/// this call can skip all filesystem writes and the `gtk-update-icon-cache`
+/// spawn.
+///
+/// Split out as a pure function (#1106) so the decision is unit-testable
+/// without touching a filesystem or spawning a subprocess: given the stamp
+/// file's contents (if any) and whether the installed files are still there,
+/// decide once, the same way [`install_icon_and_desktop_at`] and its test
+/// both need to.
+fn icon_install_up_to_date(
+    stamp_contents: Option<&str>,
+    current_version: &str,
+    files_present: bool,
+) -> bool {
+    files_present && stamp_contents.map(str::trim) == Some(current_version)
+}
+
+/// Whether every file [`install_icon_and_desktop_at`] writes is present
+/// under `data_dir` — the SVG, every rasterised PNG size, and the `.desktop`
+/// entry. If any is missing (a partial prior install, or a user/package
+/// manager having removed one) a re-install is needed even if the version
+/// stamp still matches.
+fn icon_install_files_present(hicolor: &std::path::Path, app_dir: &std::path::Path) -> bool {
+    let svg_present = hicolor
+        .join("scalable/apps")
+        .join(format!("{APP_ID}.svg"))
+        .exists();
+    let pngs_present = ICON_PNG_SIZES.iter().all(|size| {
+        hicolor
+            .join(format!("{size}x{size}/apps"))
+            .join(format!("{APP_ID}.png"))
+            .exists()
+    });
+    let desktop_present = app_dir.join(format!("{APP_ID}.desktop")).exists();
+    svg_present && pngs_present && desktop_present
+}
+
 pub(super) fn install_icon_and_desktop() {
-    use std::fs;
     use std::path::PathBuf;
 
     let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
         return;
     };
-    let data_dir = home.join(".local/share");
+    install_icon_and_desktop_at(&home.join(".local/share"));
+}
+
+/// Does the actual writing, parameterised on the `~/.local/share`-equivalent
+/// directory so tests can point it at a scratch directory instead of the
+/// real one (#1106). [`install_icon_and_desktop`] is the real entry point;
+/// this is `pub(super)` only so `super::tests` below can drive it directly.
+pub(super) fn install_icon_and_desktop_at(data_dir: &std::path::Path) {
+    use std::fs;
+
     let hicolor = data_dir.join("icons/hicolor");
+    let app_dir = data_dir.join("applications");
+    let stamp_path = data_dir.join(ICON_INSTALL_STAMP_FILE);
+    let current_version = env!("CARGO_PKG_VERSION");
+
+    let stamp_contents = fs::read_to_string(&stamp_path).ok();
+    if icon_install_up_to_date(
+        stamp_contents.as_deref(),
+        current_version,
+        icon_install_files_present(&hicolor, &app_dir),
+    ) {
+        // #1106: this version is already installed and every file it wrote
+        // is still there — skip the writes and the `gtk-update-icon-cache`
+        // subprocess spawn below entirely, rather than redoing packaging
+        // work on every single launch.
+        return;
+    }
 
     // SVG icon for scalable size (GTK/GNOME renders SVGs natively). Same
     // bytes as the shipped `data/icons/io.github.jdonaghy.VimCode.svg` —
@@ -105,12 +184,13 @@ pub(super) fn install_icon_and_desktop() {
     // managers that don't support SVG lookup (or only read _NET_WM_ICON
     // pixel data at a fixed size) get a crisp icon in alt-tab / taskbar.
     if svg_path.exists() {
-        for size in [48, 64, 128, 256, 512] {
+        for size in ICON_PNG_SIZES {
             let png_dir = hicolor.join(format!("{size}x{size}/apps"));
             let png_path = png_dir.join(format!("{APP_ID}.png"));
             if png_path.exists() {
                 // already rendered
             } else if fs::create_dir_all(&png_dir).is_ok() {
+                let size = size as i32;
                 if let Ok(pixbuf) =
                     gtk4::gdk_pixbuf::Pixbuf::from_file_at_size(&svg_path, size, size)
                 {
@@ -133,7 +213,6 @@ pub(super) fn install_icon_and_desktop() {
     // `data/io.github.jdonaghy.VimCode.desktop`, so a non-flatpak build
     // launched from this runtime-written entry resolves to the same WM
     // identity as a flatpak install.
-    let app_dir = data_dir.join("applications");
     let desktop_path = app_dir.join(format!("{APP_ID}.desktop"));
     let exe = std::env::current_exe()
         .map(|p| p.display().to_string())
@@ -145,6 +224,10 @@ pub(super) fn install_icon_and_desktop() {
     // by a pre-fix install would otherwise keep shadowing the correct one
     // in some desktop-shell indexes across an upgrade.
     let _ = fs::remove_file(app_dir.join("com.vimcode.VimCode.desktop"));
+
+    // #1106: record what we just installed so the next launch (same
+    // version, files intact) can skip straight past the check above.
+    let _ = fs::write(&stamp_path, current_version);
 }
 
 /// Contents of the runtime-installed `.desktop` file. Factored out from
@@ -309,5 +392,158 @@ mod tests {
         assert_eq!(img.id, shared.id);
         assert_eq!(img.fit, shared.fit);
         assert_eq!(img.fallback_text, shared.fallback_text);
+    }
+
+    /// #1106: the gate that lets a second launch skip the install entirely.
+    /// Pure-logic coverage of [`icon_install_up_to_date`] — no filesystem,
+    /// no subprocess — for every combination the real callsite can hit.
+    #[test]
+    fn icon_install_up_to_date_requires_matching_version_and_present_files() {
+        let current = "1.2.3";
+
+        // No stamp at all (first-ever launch): never up to date.
+        assert!(!icon_install_up_to_date(None, current, true));
+        assert!(!icon_install_up_to_date(None, current, false));
+
+        // Stamp matches, but a file went missing (e.g. deleted underneath
+        // us): still needs a re-install.
+        assert!(!icon_install_up_to_date(Some(current), current, false));
+
+        // Stamp is a different (older or newer) version: re-install even
+        // though the files are all present, so a version bump's changed
+        // artwork/`.desktop` contents actually land (#716's symptom).
+        assert!(!icon_install_up_to_date(Some("1.2.2"), current, true));
+
+        // A trailing newline (as `fs::read_to_string` would hand back from a
+        // file written with a newline) must not defeat the match.
+        assert!(icon_install_up_to_date(
+            Some(&format!("{current}\n")),
+            current,
+            true
+        ));
+
+        // The one case that should actually skip the install: same version,
+        // every file still there.
+        assert!(icon_install_up_to_date(Some(current), current, true));
+    }
+
+    /// Scratch directory under the OS temp dir, unique per call so parallel
+    /// `cargo test` threads (and repeated runs) never collide. Not a
+    /// dependency addition (`tempfile`) — this file has no prior fixture
+    /// pattern to match, and one bespoke helper is cheaper than a new crate
+    /// for a single test.
+    fn scratch_data_dir(tag: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("vimcode-test-{tag}-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create scratch data dir");
+        dir
+    }
+
+    /// #1106 regression test: a second call with an unchanged version must
+    /// perform **no** filesystem writes and spawn **no**
+    /// `gtk-update-icon-cache` — both gated by the same early return, so
+    /// proving the writes didn't happen proves the spawn didn't either.
+    ///
+    /// Observed RED against unfixed `develop` (which had no gate at all):
+    /// with the early-return removed, the second call always rewrites
+    /// `desktop_path`, so the sentinel content this test plants gets
+    /// clobbered and the final assertion fails.
+    #[test]
+    fn second_install_with_unchanged_version_is_a_no_op() {
+        if cached_app_icon_png().is_none() {
+            // Same environment gap as `painted_app_icon_is_the_rasterised_png_not_the_raw_svg`
+            // above: no SVG loader means the first install's PNG rasterisation
+            // never succeeds, so `icon_install_files_present` can never see a
+            // complete install and this test can't reach its "up to date"
+            // branch.
+            eprintln!(
+                "skipping second_install_with_unchanged_version_is_a_no_op: \
+                 no gdk-pixbuf SVG loader on this host"
+            );
+            return;
+        }
+
+        let data_dir = scratch_data_dir("icon-install-noop");
+
+        // First call: real install, creates everything including the stamp.
+        install_icon_and_desktop_at(&data_dir);
+
+        let desktop_path = data_dir
+            .join("applications")
+            .join(format!("{APP_ID}.desktop"));
+        assert!(
+            desktop_path.exists(),
+            "first call should have written the .desktop file"
+        );
+
+        // Plant a sentinel so a second, unwanted write is observable.
+        let sentinel = "SENTINEL: should not be overwritten by a no-op install\n";
+        std::fs::write(&desktop_path, sentinel).unwrap();
+        let stamp_path = data_dir.join(ICON_INSTALL_STAMP_FILE);
+        let stamp_mtime_before = std::fs::metadata(&stamp_path).unwrap().modified().unwrap();
+
+        // Second call, same version, files all still present: must skip.
+        install_icon_and_desktop_at(&data_dir);
+
+        assert_eq!(
+            std::fs::read_to_string(&desktop_path).unwrap(),
+            sentinel,
+            "second install must not rewrite the .desktop file when the \
+             version and files are unchanged"
+        );
+        let stamp_mtime_after = std::fs::metadata(&stamp_path).unwrap().modified().unwrap();
+        assert_eq!(
+            stamp_mtime_before, stamp_mtime_after,
+            "second install must not rewrite the stamp file either"
+        );
+
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// #1106: a version bump must still trigger a real re-install (#716's
+    /// symptom — a stale icon in the WM app bar/alt-tab — must not return).
+    #[test]
+    fn install_after_version_bump_still_reinstalls() {
+        if cached_app_icon_png().is_none() {
+            eprintln!(
+                "skipping install_after_version_bump_still_reinstalls: \
+                 no gdk-pixbuf SVG loader on this host"
+            );
+            return;
+        }
+
+        let data_dir = scratch_data_dir("icon-install-version-bump");
+        install_icon_and_desktop_at(&data_dir);
+
+        let desktop_path = data_dir
+            .join("applications")
+            .join(format!("{APP_ID}.desktop"));
+        std::fs::write(&desktop_path, "stale contents from an old version\n").unwrap();
+        // Simulate "the running binary is a newer version than what's
+        // installed" by rewinding the stamp instead.
+        std::fs::write(data_dir.join(ICON_INSTALL_STAMP_FILE), "0.0.0-older").unwrap();
+
+        install_icon_and_desktop_at(&data_dir);
+
+        assert_eq!(
+            std::fs::read_to_string(&desktop_path).unwrap(),
+            desktop_entry_contents(
+                &std::env::current_exe()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|_| "vimcode".to_string())
+            ),
+            "a version bump must reinstall the .desktop file, not leave the stale one"
+        );
+        assert_eq!(
+            std::fs::read_to_string(data_dir.join(ICON_INSTALL_STAMP_FILE)).unwrap(),
+            env!("CARGO_PKG_VERSION"),
+            "the stamp must be updated to the currently-running version"
+        );
+
+        let _ = std::fs::remove_dir_all(&data_dir);
     }
 }
