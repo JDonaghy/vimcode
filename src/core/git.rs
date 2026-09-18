@@ -619,27 +619,57 @@ pub fn commit(dir: &Path, message: &str) -> Result<String, String> {
 ///     verifiable-by-construction choice rather than a bet on which `ssh`
 ///     a given install resolves.
 ///
-/// The passphrase itself is passed through an env var
-/// (`VIMCODE_ASKPASS_PHRASE`) rather than embedded as literal text in the
-/// script/batch body, so neither leg needs to shell- or batch-escape
-/// arbitrary passphrase content.
+/// ## Passphrase delivery differs per leg (review fix, #1105)
+///
+/// The POSIX leg passes the passphrase through the `VIMCODE_ASKPASS_PHRASE`
+/// env var and echoes it with `echo "$VIMCODE_ASKPASS_PHRASE"` — safe,
+/// because the shell expands a quoted `"$VAR"` to a single literal argument
+/// with no re-parsing.
+///
+/// The `.bat` leg does **not** use `%VAR%` expansion for the passphrase,
+/// because cmd.exe expands `%VAR%` while it is still scanning the line for
+/// `&`/`|`/`<`/`>`/`^`, so a passphrase containing any of those characters
+/// would be spliced into the batch file as a second command instead of
+/// printed literally — and an empty passphrase collapses `echo ` (no
+/// argument) into cmd printing its own echo-toggle state (`ECHO is off.`)
+/// instead of a blank line. Both are real, deterministic bugs, not edge
+/// cases: the first fires on every passphrase containing a cmd.exe
+/// metacharacter, the second on every no-passphrase / agent-loaded-key
+/// push. Instead, the Windows leg writes the passphrase to a sibling
+/// "phrase file" and has the `.bat` stream it with `type "<path>"`. `type`
+/// copies the file's bytes to stdout with no command-line re-parsing, so it
+/// has neither failure mode — the empty-passphrase file just produces an
+/// empty (newline-only) line, and any byte sequence in the passphrase file
+/// is passed through unparsed.
 fn run_git_remote(
     dir: &Path,
     args: &[&str],
     label: &str,
     passphrase: Option<&str>,
 ) -> Result<String, String> {
-    // Build an ephemeral askpass helper that echoes the passphrase (via the
-    // VIMCODE_ASKPASS_PHRASE env var set on the git Command below).
+    // Build an ephemeral askpass helper. On Windows the passphrase is
+    // delivered via a sibling "phrase file" streamed with `type` (see the
+    // doc comment above for why `%VAR%` expansion isn't safe there); on
+    // POSIX it's delivered via the VIMCODE_ASKPASS_PHRASE env var, which the
+    // shell script echoes back quoted.
     let phrase = passphrase.unwrap_or("");
     let askpass_dir = std::env::temp_dir();
+    let pid = std::process::id();
     #[cfg(windows)]
-    let askpass_path = askpass_dir.join(format!("vimcode_askpass_{}.bat", std::process::id()));
+    let askpass_path = askpass_dir.join(format!("vimcode_askpass_{}.bat", pid));
     #[cfg(not(windows))]
-    let askpass_path = askpass_dir.join(format!("vimcode_askpass_{}", std::process::id()));
+    let askpass_path = askpass_dir.join(format!("vimcode_askpass_{}", pid));
 
     #[cfg(windows)]
-    let script = "@echo off\r\necho %VIMCODE_ASKPASS_PHRASE%\r\n".to_string();
+    let phrase_path = askpass_dir.join(format!("vimcode_askpass_phrase_{}.txt", pid));
+    #[cfg(windows)]
+    {
+        std::fs::write(&phrase_path, windows_askpass_phrase_file_contents(phrase))
+            .map_err(|e| format!("{} failed: cannot create askpass phrase file: {}", label, e))?;
+    }
+
+    #[cfg(windows)]
+    let script = windows_askpass_script(&phrase_path);
     #[cfg(not(windows))]
     let script = "#!/bin/sh\necho \"$VIMCODE_ASKPASS_PHRASE\"\n".to_string();
 
@@ -651,7 +681,8 @@ fn run_git_remote(
         std::fs::set_permissions(&askpass_path, std::fs::Permissions::from_mode(0o700)).ok();
     }
 
-    let output = git_command()
+    let mut command = git_command();
+    command
         .arg("-C")
         .arg(dir)
         .args(args)
@@ -661,14 +692,19 @@ fn run_git_remote(
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("SSH_ASKPASS", &askpass_path)
         .env("SSH_ASKPASS_REQUIRE", "force")
-        .env("VIMCODE_ASKPASS_PHRASE", phrase)
         // DISPLAY must be set for SSH_ASKPASS to work on some systems.
-        .env("DISPLAY", std::env::var("DISPLAY").unwrap_or_default())
+        .env("DISPLAY", std::env::var("DISPLAY").unwrap_or_default());
+    #[cfg(not(windows))]
+    command.env("VIMCODE_ASKPASS_PHRASE", phrase);
+
+    let output = command
         .output()
         .map_err(|e| format!("{} failed: {}", label, e));
 
-    // Clean up the askpass script.
+    // Clean up the askpass script (and, on Windows, the phrase file).
     let _ = std::fs::remove_file(&askpass_path);
+    #[cfg(windows)]
+    let _ = std::fs::remove_file(&phrase_path);
 
     let output = output?;
     if output.status.success() {
@@ -683,6 +719,31 @@ fn run_git_remote(
             err
         })
     }
+}
+
+/// Build the contents of the Windows askpass "phrase file" (#1105): the
+/// passphrase plus a trailing newline, matching the POSIX leg's
+/// `echo "$VIMCODE_ASKPASS_PHRASE"` output (which always terminates with a
+/// newline, including when the phrase is empty). Kept as a standalone,
+/// platform-independent function — no `cfg(windows)` gate — so the exact
+/// bytes SSH will receive can be unit-tested without a Windows host.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn windows_askpass_phrase_file_contents(phrase: &str) -> String {
+    let mut contents = phrase.to_string();
+    contents.push('\n');
+    contents
+}
+
+/// Build the Windows askpass `.bat` body. It streams `phrase_path`'s bytes
+/// via `type` rather than interpolating the passphrase into the script
+/// through `%VAR%` expansion — see the doc comment on `run_git_remote` for
+/// why that's unsafe (metacharacter injection, and a mis-rendered empty
+/// line). The passphrase itself must never appear in this string; platform-
+/// independent — no `cfg(windows)` gate — so that invariant is
+/// unit-testable without a Windows host.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn windows_askpass_script(phrase_path: &Path) -> String {
+    format!("@echo off\r\ntype \"{}\"\r\n", phrase_path.display())
 }
 
 /// Returns `true` when the error message looks like an SSH authentication
@@ -1081,6 +1142,46 @@ fn parse_unified_diff(diff: &str, total_lines: usize) -> Vec<Option<GitLineStatu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Windows askpass leg (#1105) ─────────────────────────────────────────
+    // These exercise the pure string-building helpers directly so the two
+    // review-flagged bugs (empty-passphrase mis-render, metacharacter
+    // injection via %VAR% expansion) stay caught without needing a Windows
+    // host to run the actual .bat file.
+
+    #[test]
+    fn windows_askpass_phrase_file_empty_phrase_is_just_a_newline() {
+        // The old `echo %VIMCODE_ASKPASS_PHRASE%` leg rendered an empty
+        // phrase as the literal text "ECHO is off." (cmd.exe's bare-`echo`
+        // toggle-state message) instead of a blank line. The phrase-file
+        // approach must produce exactly a newline, with no such artifact.
+        assert_eq!(windows_askpass_phrase_file_contents(""), "\n");
+    }
+
+    #[test]
+    fn windows_askpass_phrase_file_preserves_metacharacters_literally() {
+        // A passphrase containing cmd.exe metacharacters must survive
+        // byte-for-byte in the phrase file — no reinterpretation, since
+        // `type` never re-parses file contents as commands.
+        let phrase = "abc&whoami|echo^pwned<x>y";
+        assert_eq!(
+            windows_askpass_phrase_file_contents(phrase),
+            format!("{}\n", phrase)
+        );
+    }
+
+    #[test]
+    fn windows_askpass_script_never_embeds_the_passphrase() {
+        // The .bat body must only ever reference the phrase file's path —
+        // never the passphrase text itself. If a future edit reintroduces
+        // `%VAR%`-style interpolation of the phrase into the script, this
+        // test catches it.
+        let phrase_path = Path::new(r"C:\Temp\vimcode_askpass_phrase_1234.txt");
+        let script = windows_askpass_script(phrase_path);
+        assert!(script.starts_with("@echo off"));
+        assert!(script.contains("type "));
+        assert!(script.contains("vimcode_askpass_phrase_1234.txt"));
+    }
 
     // ── parse_diff_hunks ───────────────────────────────────────────────────
 
