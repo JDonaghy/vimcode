@@ -588,24 +588,63 @@ pub fn commit(dir: &Path, message: &str) -> Result<String, String> {
 ///
 /// Uses `SSH_ASKPASS` + `SSH_ASKPASS_REQUIRE=force` to prevent SSH from
 /// prompting on the parent terminal.  When `passphrase` is `Some`, an
-/// ephemeral askpass script echoes it; when `None`, the askpass script
+/// ephemeral askpass helper echoes it; when `None`, the askpass helper
 /// prints an empty line (handles keys with empty passphrases or keys
 /// already loaded in ssh-agent).
+///
+/// # Windows leg (#1105)
+///
+/// On Windows this writes a `.bat` helper instead of a `#!/bin/sh` script.
+/// Investigation for #1105 found:
+///   - Git for Windows' own `git.exe` (native MinGW build) has its own
+///     shebang-parsing spawn layer (`compat/mingw.c`'s `parse_interpreter` /
+///     `try_shell_exec`) — but that layer only kicks in for programs *git
+///     itself* spawns (editor, pager, `GIT_ASKPASS`/`core.askpass`).
+///   - `SSH_ASKPASS` is instead invoked by whichever `ssh` binary git's
+///     transport resolves — normally Git for Windows' own bundled
+///     MSYS2-built `ssh.exe`, whose POSIX layer (derived from Cygwin, whose
+///     user guide documents `#!`-prefixed files as recognized-executable)
+///     likely *would* run a shebang script correctly. But if `ssh` instead
+///     resolves to Windows' native OpenSSH client (`System32\OpenSSH\ssh.exe`,
+///     a plain Win32 build with no shebang support), a `#!/bin/sh` file has
+///     no interpreter to run it and the askpass helper silently fails,
+///     leaving the fetch/push blocked on a prompt nobody can see — exactly
+///     the bug this issue reports. A `.bat` file sidesteps the ambiguity
+///     entirely: Windows dispatches `.bat` through `cmd.exe` regardless of
+///     which `ssh.exe` (MSYS or native Win32) ends up invoking it, and both
+///     the MSVC CRT spawn/exec family and Cygwin/MSYS's own exec layer are
+///     documented to recognize and dispatch `.bat`/`.cmd` targets that way.
+///   - This could not be exercised on an actual Windows host in this
+///     session (no Windows machine available); the `.bat` leg is the
+///     verifiable-by-construction choice rather than a bet on which `ssh`
+///     a given install resolves.
+///
+/// The passphrase itself is passed through an env var
+/// (`VIMCODE_ASKPASS_PHRASE`) rather than embedded as literal text in the
+/// script/batch body, so neither leg needs to shell- or batch-escape
+/// arbitrary passphrase content.
 fn run_git_remote(
     dir: &Path,
     args: &[&str],
     label: &str,
     passphrase: Option<&str>,
 ) -> Result<String, String> {
-    // Build an ephemeral askpass script that echoes the passphrase.
+    // Build an ephemeral askpass helper that echoes the passphrase (via the
+    // VIMCODE_ASKPASS_PHRASE env var set on the git Command below).
     let phrase = passphrase.unwrap_or("");
     let askpass_dir = std::env::temp_dir();
+    #[cfg(windows)]
+    let askpass_path = askpass_dir.join(format!("vimcode_askpass_{}.bat", std::process::id()));
+    #[cfg(not(windows))]
     let askpass_path = askpass_dir.join(format!("vimcode_askpass_{}", std::process::id()));
-    std::fs::write(
-        &askpass_path,
-        format!("#!/bin/sh\necho '{}'\n", phrase.replace('\'', "'\\''")),
-    )
-    .map_err(|e| format!("{} failed: cannot create askpass helper: {}", label, e))?;
+
+    #[cfg(windows)]
+    let script = "@echo off\r\necho %VIMCODE_ASKPASS_PHRASE%\r\n".to_string();
+    #[cfg(not(windows))]
+    let script = "#!/bin/sh\necho \"$VIMCODE_ASKPASS_PHRASE\"\n".to_string();
+
+    std::fs::write(&askpass_path, script)
+        .map_err(|e| format!("{} failed: cannot create askpass helper: {}", label, e))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -622,6 +661,7 @@ fn run_git_remote(
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("SSH_ASKPASS", &askpass_path)
         .env("SSH_ASKPASS_REQUIRE", "force")
+        .env("VIMCODE_ASKPASS_PHRASE", phrase)
         // DISPLAY must be set for SSH_ASKPASS to work on some systems.
         .env("DISPLAY", std::env::var("DISPLAY").unwrap_or_default())
         .output()

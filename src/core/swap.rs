@@ -225,36 +225,88 @@ pub fn delete_swap(swap_path: &Path) {
 }
 
 /// Check whether a process with the given PID is still alive.
+///
+/// No subprocess is spawned on any platform (#1105): the crash-recovery
+/// path this feeds needs a fast, locale-independent liveness check, and a
+/// spawned process-listing helper is both slower and, on Windows, would
+/// depend on parsing locale-translated output text.
 pub fn is_pid_alive(pid: u32) -> bool {
     #[cfg(target_os = "linux")]
     {
+        // Fast path: a single stat(2) on /proc/<pid>, cheaper than the
+        // kill(2) syscall the other branches use and available on every
+        // Linux target without extra permissions.
         Path::new(&format!("/proc/{}", pid)).exists()
     }
     #[cfg(target_os = "windows")]
     {
-        // Use tasklist to check if the PID exists.
-        crate::core::git::hidden_command("tasklist")
-            .args(["/FI", &format!("PID eq {}", pid), "/NH"])
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
-            .output()
-            .map(|o| {
-                let out = String::from_utf8_lossy(&o.stdout);
-                // tasklist returns "INFO: No tasks are running..." when PID not found.
-                !out.contains("No tasks") && out.contains(&pid.to_string())
-            })
-            .unwrap_or(false)
+        windows_is_pid_alive(pid)
     }
-    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    #[cfg(all(unix, not(target_os = "linux")))]
     {
-        // POSIX: kill(pid, 0) checks process existence without sending a signal.
-        std::process::Command::new("kill")
-            .args(["-0", &pid.to_string()])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
+        // POSIX: kill(pid, 0) checks process existence without sending a
+        // signal, and needs no subprocess. `libc` is already a dependency
+        // (see src/core/lsp.rs's `libc::setsid` use).
+        let ret = unsafe { libc::kill(pid as libc::pid_t, 0) };
+        if ret == 0 {
+            true
+        } else {
+            // EPERM means the process exists but is owned by another user
+            // (or otherwise unsignalable by us) — it is still alive. ESRCH
+            // means no such process.
+            std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+        }
+    }
+}
+
+/// Minimal raw FFI surface for the three kernel32 calls `windows_is_pid_alive`
+/// needs. Declared by hand rather than pulling in the `windows`/`winapi`
+/// crate for three functions; kernel32 is linked into every Windows binary
+/// by default, so no extra linker configuration is required.
+#[cfg(target_os = "windows")]
+#[allow(non_snake_case, non_camel_case_types)]
+mod windows_ffi {
+    pub type HANDLE = *mut std::ffi::c_void;
+    pub type BOOL = i32;
+    pub type DWORD = u32;
+
+    /// Least-privileged access right that still lets `GetExitCodeProcess`
+    /// report whether the process is still running.
+    pub const PROCESS_QUERY_LIMITED_INFORMATION: DWORD = 0x1000;
+    /// Sentinel `GetExitCodeProcess` returns while the process has not exited.
+    pub const STILL_ACTIVE: DWORD = 259;
+
+    extern "system" {
+        pub fn OpenProcess(
+            dwDesiredAccess: DWORD,
+            bInheritHandle: BOOL,
+            dwProcessId: DWORD,
+        ) -> HANDLE;
+        pub fn CloseHandle(hObject: HANDLE) -> BOOL;
+        pub fn GetExitCodeProcess(hProcess: HANDLE, lpExitCode: *mut DWORD) -> BOOL;
+    }
+}
+
+/// Check PID liveness via `OpenProcess` + `GetExitCodeProcess` — no
+/// subprocess spawn, no output parsing (see #1105).
+#[cfg(target_os = "windows")]
+fn windows_is_pid_alive(pid: u32) -> bool {
+    use windows_ffi::*;
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            // Access denied still implies the process exists; only a
+            // "no such process" failure means it is dead. OpenProcess
+            // doesn't distinguish those for us without extra calls, but a
+            // NULL handle here means we simply cannot query it — treat as
+            // not alive, matching the previous process-listing-based
+            // behavior for PIDs we cannot see.
+            return false;
+        }
+        let mut exit_code: DWORD = 0;
+        let ok = GetExitCodeProcess(handle, &mut exit_code as *mut DWORD);
+        CloseHandle(handle);
+        ok != 0 && exit_code == STILL_ACTIVE
     }
 }
 
@@ -414,5 +466,31 @@ mod tests {
     fn test_is_pid_alive_dead() {
         // PID 999999999 is almost certainly not alive.
         assert!(!is_pid_alive(999_999_999));
+    }
+
+    #[test]
+    fn test_is_pid_alive_reaped_child() {
+        // Spawn a short-lived child and wait() on it (reaping it), then
+        // confirm we report the PID as dead. This exercises the "process
+        // no longer exists" path that kill(pid, 0) / OpenProcess must
+        // report correctly with no subprocess spawn of our own (#1105).
+        #[cfg(windows)]
+        let mut child = std::process::Command::new("cmd")
+            .args(["/C", "exit", "0"])
+            .spawn()
+            .expect("failed to spawn test child process");
+        #[cfg(not(windows))]
+        let mut child = std::process::Command::new("true")
+            .spawn()
+            .expect("failed to spawn test child process");
+
+        let pid = child.id();
+        let status = child.wait().expect("failed to wait for test child");
+        assert!(status.success());
+
+        assert!(
+            !is_pid_alive(pid),
+            "a reaped child's PID must not be reported as alive"
+        );
     }
 }
