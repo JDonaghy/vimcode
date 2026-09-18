@@ -119,6 +119,8 @@ const COMPILED_GUI_BACKEND: GuiBackend = GuiBackend::None;
 /// argument) — are testable without spawning a process.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct Args {
+    /// `--help` / `-h`: print usage and exit.
+    help: bool,
     /// `--version` / `-V`: print the version banner and exit.
     version: bool,
     /// `--tui` / `-t`: force the terminal UI.
@@ -132,6 +134,7 @@ struct Args {
 impl Args {
     /// Parse an `argv`-shaped slice (element 0 is the program name).
     fn parse(argv: &[String]) -> Self {
+        let help = argv.iter().any(|a| a == "--help" || a == "-h");
         let version = argv.iter().any(|a| a == "--version" || a == "-V");
         let tui = argv.iter().any(|a| a == "--tui" || a == "-t");
 
@@ -156,12 +159,34 @@ impl Args {
             .map(|(_, a)| PathBuf::from(a));
 
         Self {
+            help,
             version,
             tui,
             debug_log,
             file_path,
         }
     }
+}
+
+/// The usage text for `--help` / `-h`.
+///
+/// Printed before any GUI backend is touched (#979 — GTK init used to run
+/// ahead of flag handling, so `--help` crashed on any host without a
+/// display, e.g. over SSH or in CI). Kept as a plain function, like
+/// [`version_banner`], so it is unit-testable without spawning a process.
+fn usage_text() -> String {
+    format!(
+        "VimCode {}\n\n\
+         Usage: vimcode [OPTIONS] [FILE]\n\n\
+         Options:\n\
+         \x20\x20-h, --help          Print this help message and exit\n\
+         \x20\x20-V, --version       Print the version and exit\n\
+         \x20\x20-t, --tui           Force the terminal UI (no GTK4 required)\n\
+         \x20\x20    --debug <FILE>  Write a debug log to FILE\n\n\
+         Arguments:\n\
+         \x20\x20[FILE]              File to open on startup\n",
+        env!("CARGO_PKG_VERSION"),
+    )
 }
 
 /// The version banner, including which quadraui this binary is made of
@@ -240,6 +265,11 @@ fn main() -> ExitCode {
     let argv: Vec<String> = std::env::args().collect();
     let args = Args::parse(&argv);
 
+    if args.help {
+        println!("{}", usage_text());
+        return ExitCode::SUCCESS;
+    }
+
     if args.version {
         println!("{}", version_banner(COMPILED_GUI_BACKEND));
         return ExitCode::SUCCESS;
@@ -291,6 +321,19 @@ mod arg_parsing_tests {
         assert!(Args::parse(&argv(&["-t"])).tui);
         assert!(Args::parse(&argv(&["--version"])).version);
         assert!(Args::parse(&argv(&["-V"])).version);
+        assert!(Args::parse(&argv(&["--help"])).help);
+        assert!(Args::parse(&argv(&["-h"])).help);
+    }
+
+    /// #979: `--help` must not be mistaken for a positional file argument —
+    /// it starts with `-`, so the existing positional-arg scan already skips
+    /// it, but pin it explicitly since this is the exact flag the bug was
+    /// filed about.
+    #[test]
+    fn help_flag_does_not_become_the_file_path() {
+        let a = Args::parse(&argv(&["--help"]));
+        assert!(a.help);
+        assert_eq!(a.file_path, None);
     }
 
     #[test]
@@ -371,5 +414,19 @@ mod gui_backend_tests {
                 .collect::<Vec<_>>(),
         );
         assert!(a.version && a.tui);
+    }
+
+    /// The usage text names every flag `main`'s dispatcher understands, so a
+    /// future flag added to `Args` without a matching `usage_text` line is
+    /// at least visible in a diff review, even though nothing enforces it
+    /// mechanically.
+    #[test]
+    fn usage_text_documents_every_flag() {
+        let text = usage_text();
+        assert!(text.starts_with(&format!("VimCode {}", env!("CARGO_PKG_VERSION"))));
+        assert!(text.contains("Usage: vimcode"));
+        for flag in ["--help", "-h", "--version", "-V", "--tui", "-t", "--debug"] {
+            assert!(text.contains(flag), "usage text missing {flag:?}: {text}");
+        }
     }
 }

@@ -17,6 +17,25 @@ use vimcode_core::tui_main;
 fn main() {
     let args: Vec<String> = std::env::args().collect();
 
+    // --help / -h: print usage and exit (#979 — this used to print nothing
+    // at all and exit 0, which is a smaller bug than the GTK-binary crash
+    // this issue was filed for, but the same neighbourhood: fixed alongside
+    // it rather than filed separately).
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        println!(
+            "VimCode {} (terminal UI)\n\n\
+             Usage: vcd [OPTIONS] [FILE]\n\n\
+             Options:\n\
+             \x20\x20-h, --help          Print this help message and exit\n\
+             \x20\x20-V, --version       Print the version and exit\n\
+             \x20\x20    --debug <FILE>  Write a debug log to FILE\n\n\
+             Arguments:\n\
+             \x20\x20[FILE]              File to open on startup\n",
+            env!("CARGO_PKG_VERSION"),
+        );
+        return;
+    }
+
     // --version / -V: print version and exit
     if args.iter().any(|a| a == "--version" || a == "-V") {
         // Name the quadraui this binary is made of (#638): it is a path dep, so
