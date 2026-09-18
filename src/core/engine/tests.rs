@@ -17667,9 +17667,10 @@ fn test_is_safe_url_rejects_dangerous_schemes() {
 // ─── #1134: platform actions queued instead of hand-rolled per-OS openers ──
 //
 // Before #1134, `Engine::open_url`, `reveal_in_file_manager`, and `gx` each
-// shelled out directly (`std::process::Command::new("open"/"xdg-open"/
-// "cmd")`), gated only by `#[cfg(not(test))]` — meaning none of this was
-// ever exercised by `cargo test` at all, hand-rolled or otherwise. Now they
+// shelled out directly (`std::process::Command::new`, spawning `open`, the
+// Linux freedesktop.org opener, or `cmd`), gated only by `#[cfg(not(test))]`
+// — meaning none of this was ever exercised by `cargo test` at all,
+// hand-rolled or otherwise. Now they
 // push a `PendingPlatformAction` onto `Engine::pending_platform_actions`
 // instead of touching the process table, so these *are* testable: assert on
 // the queue, the same way `PendingFileDialog` (#572) callers assert on
@@ -17733,9 +17734,10 @@ fn test_editor_action_menu_reveal_queues_platform_action() {
 }
 
 /// **RED-verified against unfixed `develop`:** before #1134, `gx`'s body was
-/// `#[cfg(not(test))] { Command::new("xdg-open")... }` with no `target_os`
-/// guard — a bare Linux-only shell-out with nothing gating it on macOS or
-/// Windows. That whole block was also `#[cfg(not(test))]`, i.e. structurally
+/// `#[cfg(not(test))] { Command::new(...) }`, shelling out to the Linux
+/// freedesktop.org opener with no `target_os` guard — a bare Linux-only
+/// shell-out with nothing gating it on macOS or Windows. That whole block
+/// was also `#[cfg(not(test))]`, i.e. structurally
 /// unreachable from `cargo test`, which is exactly why the cross-platform
 /// bug shipped unnoticed: there was no queue, no field, nothing this test
 /// (or any test) could assert on. This test fails to compile against
