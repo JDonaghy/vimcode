@@ -11133,6 +11133,31 @@ pub fn minimap_reserved_width(
     quadraui::reserved_width(want as f32, has) as f64
 }
 
+/// Width of the scroll-affordance gutter a pane's rightmost edge must keep
+/// clear of the minimap strip (#1094), in the caller's own unit.
+///
+/// `scrollbar_reserve` (0.0 for TUI) states only GTK's overlay-chrome
+/// concept (`quadraui::Backend::scrollbar_reserve()`, #828/quadraui#776) —
+/// it says nothing about TUI's own vertical scrollbar, which is an inline
+/// column `quadraui::tui::editor::draw_editor` always paints at its own
+/// `area.right - 1` whenever the window overflows (`quadraui`'s `Editor`
+/// primitive, not a value this crate controls — see the doc comment on the
+/// `Surface::Editor` push in `app.rs`). That column is exactly one
+/// `char_width` wide. Taking the larger of the two generalises to both
+/// backends without branching on which one is asking: on TUI
+/// (`scrollbar_reserve == 0.0`, `char_width == 1.0`) this resolves to
+/// exactly one cell; on GTK it resolves to `scrollbar_reserve` whenever
+/// that's already the wider of the two, which is the ordinary case (a GTK
+/// `char_width` in pixels and its 8px overlay reserve are the same order of
+/// magnitude).
+///
+/// `pub(crate)` (not private) since #1094's GTK driver tests
+/// (`gtk::testing::minimap`) need the same formula to predict the real
+/// paint path's column count, not just this module's own tests.
+pub(crate) fn scroll_gutter_width(scrollbar_reserve: f64, char_width: f64) -> f64 {
+    scrollbar_reserve.max(char_width)
+}
+
 /// Build the quadraui `Minimap` for `window_id` over the strip `rect`.
 ///
 /// Returns `None` when the setting is off (the caller passes a zero-width
@@ -13925,19 +13950,51 @@ pub fn build_screen_layout_with_breadcrumb_row(
     let window_dividers = engine.calculate_window_dividers(window_rects);
 
     // Minimap strip (#35, #722). Reserved off *every* window's right edge —
-    // not just the active one — and subtracted from that same window's rect
-    // before its text is laid out, so each pane reclaims exactly its own
+    // not just the active one — and subtracted from that same window's text
+    // width before it's laid out, so each pane reclaims exactly its own
     // strip's width when `:set nominimap` turns the strip off. Keyed per
     // window (rather than a single scalar) because `minimap_reserved_width`
     // is a function of that window's own rect width, so unevenly split
     // panes legitimately get differently-sized strips.
+    //
+    // #1094: VS Code's order is text, then the strip, then the scroll
+    // column at the pane's outermost edge — but both backends' scrollbars
+    // anchor to *their own painted rect's* right edge (quadraui's TUI
+    // `draw_editor` always reserves one inline column at `area.right - 1`
+    // when the window overflows; a future GTK native scrollbar would do the
+    // same at its own widget's right edge, per the doc comment on the
+    // `Surface::Editor` push in `app.rs`). The only way to make that edge
+    // land past the strip rather than immediately before it is for the rect
+    // this module hands to the paint path (`RenderedWindow.rect`, below) to
+    // reach the pane's *true* right edge — not a copy narrowed by the
+    // strip's width, as it used to be. The strip itself is then positioned
+    // in the gap that opens up between the (now-narrower) text and that
+    // rect's edge — see `scroll_gutter_width` and the strip's own `x` below.
+    //
+    // Narrowing the affordability check the same way the strip's own
+    // position now is: `minimap_reserved_width`'s own budget only checks
+    // against the *pane's* width, with no notion of the scroll gutter now
+    // sitting beyond the strip — a narrow pane could otherwise reserve both
+    // and leave less than `MINIMAP_MIN_TEXT_COLS` for the text between them.
+    // Suppressing the strip (falling back to the width it already returns
+    // for "off") is the same self-suppression behaviour a pane too narrow
+    // to afford the strip alone already has.
     let minimap_widths: std::collections::HashMap<WindowId, f64> = window_rects
         .iter()
         .map(|(id, r)| {
-            (
-                *id,
-                minimap_reserved_width(engine, r.width, char_width, minimap_sizing),
-            )
+            let raw = minimap_reserved_width(engine, r.width, char_width, minimap_sizing);
+            let w = if raw > 0.0 {
+                let cw = if char_width > 0.0 { char_width } else { 1.0 };
+                let gutter = scroll_gutter_width(scrollbar_reserve, char_width);
+                if r.width - raw - gutter < MINIMAP_MIN_TEXT_COLS * cw {
+                    0.0
+                } else {
+                    raw
+                }
+            } else {
+                0.0
+            };
+            (*id, w)
         })
         .collect();
 
@@ -13949,14 +14006,28 @@ pub fn build_screen_layout_with_breadcrumb_row(
                 visible_lines -= 1; // reserve bottom row for per-window status bar
             }
             let is_active = *window_id == active_window_id;
-            let minimap_w = minimap_widths.get(window_id).copied().unwrap_or(0.0);
-            let narrowed = WindowRect::new(
-                rect.x,
-                rect.y,
-                (rect.width - minimap_w).max(0.0),
-                rect.height,
-            );
-            let rect = &narrowed;
+            let raw_minimap_w = minimap_widths.get(window_id).copied().unwrap_or(0.0);
+            // `rect` reaches the pane's true right edge unmodified (#1094,
+            // see the doc comment above) — `build_rendered_window` takes a
+            // `minimap_w` to keep the text-column count excluding the strip
+            // without narrowing the rect it's painted into.
+            //
+            // The strip's own `x` (below) sits a full `scroll_gutter_width`
+            // in from that edge, not just `raw_minimap_w` — so when a strip
+            // is actually present, the text has to give up that same extra
+            // sliver too, or its last column and the strip's first column
+            // would coincide (whichever paints later, the strip, would
+            // silently eat the text's own last character on a long enough
+            // line). No-op when there's no strip (`raw_minimap_w == 0.0`,
+            // off or self-suppressed) — nothing to leave room *for* then,
+            // and reserving it anyway would cost the minimap-off case a
+            // column it doesn't owe (acceptance criterion 2).
+            let minimap_w = if raw_minimap_w > 0.0 {
+                raw_minimap_w
+                    + (scroll_gutter_width(scrollbar_reserve, char_width) - scrollbar_reserve)
+            } else {
+                0.0
+            };
             let mut rw = build_rendered_window(
                 engine,
                 theme,
@@ -13968,6 +14039,7 @@ pub fn build_screen_layout_with_breadcrumb_row(
                 multi_window,
                 color_headings,
                 scrollbar_reserve,
+                minimap_w,
             );
             if own_status_row {
                 rw.status_line = Some(build_window_status_line(
@@ -13982,11 +14054,16 @@ pub fn build_screen_layout_with_breadcrumb_row(
         })
         .collect();
 
-    // The strips themselves: the sliver just reclaimed off each window above,
-    // minus the per-window status row when one is painted inside that window.
-    // One `RenderedMinimap` per window that has a strip, in `window_rects`
-    // order — a `:vsplit` therefore carries two independent strips, each
-    // over its own pane's buffer, instead of one that migrates with focus.
+    // The strips themselves, minus the per-window status row when one is
+    // painted inside that window. One `RenderedMinimap` per window that has
+    // a strip, in `window_rects` order — a `:vsplit` therefore carries two
+    // independent strips, each over its own pane's buffer, instead of one
+    // that migrates with focus.
+    //
+    // #1094: positioned one `scroll_gutter_width` in from the pane's right
+    // edge rather than flush against it, so the scroll column painted at
+    // that edge (see the doc comment above `minimap_widths`) lands outside
+    // the strip instead of colliding with its last column.
     let minimap: Vec<RenderedMinimap> = window_rects
         .iter()
         .filter_map(|(id, r)| {
@@ -14009,12 +14086,13 @@ pub fn build_screen_layout_with_breadcrumb_row(
             if own_status_row && editor_visible_rows > 1 {
                 editor_visible_rows -= 1;
             }
+            let gutter = scroll_gutter_width(scrollbar_reserve, char_width);
             build_minimap_data(
                 engine,
                 theme,
                 *id,
                 WindowRect::new(
-                    r.x + r.width - minimap_w,
+                    r.x + r.width - gutter - minimap_w,
                     r.y,
                     minimap_w,
                     (r.height - status_h).max(0.0),
@@ -17648,6 +17726,7 @@ fn build_rendered_window(
     multi_window: bool,
     color_headings: bool,
     scrollbar_reserve: f64,
+    minimap_w: f64,
 ) -> RenderedWindow {
     let empty = |id: WindowId| RenderedWindow {
         window_id: id,
@@ -17769,8 +17848,26 @@ fn build_rendered_window(
     // `ScrolledWindow`; TUI has none, so its backend returns `0.0`). This
     // function has no opinion on what that value is; it only subtracts
     // whatever the caller measured.
+    //
+    // `minimap_w` (#1094): `rect` is now the *pane's* rect, not a
+    // minimap-narrowed copy of it — the caller stopped narrowing `rect`
+    // before handing it here so that `rect` itself (which becomes
+    // `RenderedWindow.rect`, i.e. the same rect quadraui's `draw_editor`
+    // anchors its own inline scrollbar column to, at `rect`'s own right
+    // edge) reaches all the way to the pane's true right edge, past where
+    // the strip paints. The text column count still has to exclude the
+    // strip's width, or it would overestimate by `minimap_w` — the file's
+    // actual visible columns end where the strip starts, even though
+    // `rect` itself now runs wider than that (see this function's caller
+    // for the strip's own placement in that same gap). The caller's
+    // `minimap_w` already folds in the sliver between the strip and
+    // `scrollbar_reserve` alone (`scroll_gutter_width` minus
+    // `scrollbar_reserve`) when a strip is present, so subtracting it here
+    // alongside `scrollbar_reserve` lands the text's last column exactly
+    // where the strip's first column starts — not past it.
     let render_viewport_cols = if char_width > 0.0 {
-        let total_chars = ((rect.width - scrollbar_reserve) / char_width).floor() as usize;
+        let total_chars =
+            ((rect.width - scrollbar_reserve - minimap_w) / char_width).floor() as usize;
         total_chars.saturating_sub(gutter_char_width).max(1)
     } else {
         view.viewport_cols.max(1)
@@ -24813,7 +24910,13 @@ mod tests {
             1,
             "the minimap must be present when the setting is on"
         );
-        let expected_cols = minimap_reserved_width(&e, 120.0, 1.0, TUI_MINIMAP_SIZING) as usize;
+        // #1094: `render_engine` is TUI-shaped (`scrollbar_reserve == 0.0`,
+        // `char_width == 1.0`), so the strip now also claims the one-column
+        // gutter that keeps its own boundary clear of the pane's outermost
+        // (scroll) column — see `scroll_gutter_width`'s doc comment. Turning
+        // the minimap off reclaims that sliver along with the strip itself.
+        let expected_cols = minimap_reserved_width(&e, 120.0, 1.0, TUI_MINIMAP_SIZING) as usize
+            + scroll_gutter_width(0.0, 1.0) as usize;
 
         e.settings.minimap = false;
         let without = render_engine(&e, 120.0, 30.0);
@@ -24827,8 +24930,8 @@ mod tests {
             cols_without - cols_with,
             expected_cols,
             "turning the minimap off must hand the editor back exactly the \
-             reserved width (with={cols_with}, without={cols_without}, \
-             expected={expected_cols})"
+             reserved width, strip plus its scroll gutter (with={cols_with}, \
+             without={cols_without}, expected={expected_cols})"
         );
     }
 
@@ -24866,12 +24969,16 @@ mod tests {
                 .iter()
                 .find(|w| w.window_id == w_with.window_id)
                 .expect("window set must be identical with/without the minimap");
-            // `w_with.rect.width` is already narrowed by its own strip;
-            // `w_without.rect.width` is the same pane's un-narrowed width
-            // (minimap off ⇒ no narrowing), which is what
-            // `minimap_reserved_width` expects to be fed back in.
+            // #1094: `w_with.rect.width`/`w_without.rect.width` are now the
+            // pane's own (un-narrowed either way) width — the strip no
+            // longer narrows `rect` itself, only the text-column count — so
+            // either carries the same pane width `minimap_reserved_width`
+            // expects. The expected reclaim adds `scroll_gutter_width`'s
+            // one-column TUI gutter to the strip's own raw width, same as
+            // the single-window test above.
             let expected_cols =
-                minimap_reserved_width(&e, w_without.rect.width, 1.0, TUI_MINIMAP_SIZING) as usize;
+                minimap_reserved_width(&e, w_without.rect.width, 1.0, TUI_MINIMAP_SIZING) as usize
+                    + scroll_gutter_width(0.0, 1.0) as usize;
             assert_eq!(
                 w_without.text_viewport_cols - w_with.text_viewport_cols,
                 expected_cols,
@@ -24994,6 +25101,85 @@ mod tests {
             0.0,
             "a 20-column window cannot spare the minimap's floor width plus \
              MINIMAP_MIN_TEXT_COLS of surviving text"
+        );
+    }
+
+    /// #1094 acceptance ("A narrow pane still resolves to a sane layout
+    /// rather than squeezing the text out"): `minimap_reserved_width`'s own
+    /// affordability check only knows about the *pane's* width — it has no
+    /// notion of the scroll gutter that now sits beyond the strip too (see
+    /// `scroll_gutter_width`), so a pane that can afford the strip *alone*
+    /// can still be too narrow to afford the strip *and* the gutter without
+    /// squeezing the text below `MINIMAP_MIN_TEXT_COLS`. `build_screen_
+    /// layout` has to re-check with the gutter folded in and self-suppress
+    /// the same way a pane too narrow for the strip alone already does —
+    /// this is that interaction, driven through the real entry point
+    /// rather than `minimap_reserved_width` in isolation (which cannot see
+    /// `scrollbar_reserve` at all).
+    ///
+    /// RED against a `build_screen_layout` that never re-checks
+    /// (equivalently, against reverting this fix): at `scrollbar_reserve =
+    /// 10.0`, the strip still shows and squeezes the pane's 40 columns down
+    /// to `40 - 6 (strip) - 10 (reserve) = 24` — below `MINIMAP_MIN_TEXT_
+    /// COLS` (30) — instead of self-suppressing. Confirmed by hand against
+    /// the pre-fix `render.rs`.
+    #[test]
+    fn minimap_suppresses_itself_when_the_pane_cannot_afford_both_the_strip_and_the_scroll_gutter()
+    {
+        let engine = test_engine(
+            "a line of text long enough to fill the whole pane width and then some more text",
+        );
+        let theme = Theme::onedark();
+        // Same 40-column pane `build_screen_layout_honors_an_explicit_
+        // scrollbar_reserve_even_at_char_width_one` uses: wide enough to
+        // afford the strip (`minimap_reserved_width` alone returns non-zero
+        // here) but not wide enough to *also* clear `MINIMAP_MIN_TEXT_COLS`
+        // once a real scroll gutter is reserved beyond it.
+        let bounds = WindowRect::new(0.0, 0.0, 40.0, 10.0);
+        let (rects, _) = engine.calculate_group_window_rects(bounds, 1.0);
+
+        let no_reserve = build_screen_layout(
+            &engine,
+            &theme,
+            &rects,
+            1.0,
+            1.0,
+            false,
+            0.0,
+            TUI_MINIMAP_SIZING,
+        );
+        assert!(
+            !no_reserve.minimap.is_empty(),
+            "fixture precondition: this 40-column pane must afford the strip \
+             on its own (no scroll gutter competing for the same width), or \
+             this test isn't exercising the interaction at all"
+        );
+
+        let with_reserve = build_screen_layout(
+            &engine,
+            &theme,
+            &rects,
+            1.0,
+            1.0,
+            false,
+            10.0,
+            TUI_MINIMAP_SIZING,
+        );
+        assert!(
+            with_reserve.minimap.is_empty(),
+            "a pane that can only afford the strip *or* the scroll gutter, \
+             not both without squeezing text below MINIMAP_MIN_TEXT_COLS, \
+             must self-suppress the strip rather than paint a squeezed \
+             layout; got minimap: {:?}",
+            with_reserve.minimap
+        );
+        // And the editor still gets a sane (non-zero, no-panic) viewport —
+        // "resolves to a sane layout" means real text columns survive, not
+        // just "doesn't crash".
+        assert!(
+            with_reserve.windows[0].text_viewport_cols > 0,
+            "self-suppressing the strip must not leave the pane with zero \
+             text columns either"
         );
     }
 
@@ -25181,9 +25367,17 @@ mod tests {
     /// `char_width == 1.0`.
     #[test]
     fn build_screen_layout_honors_an_explicit_scrollbar_reserve_even_at_char_width_one() {
-        let engine = test_engine(
+        let mut engine = test_engine(
             "a line of text long enough to fill the whole pane width and then some more text",
         );
+        // #1094: minimap off, to isolate `scrollbar_reserve`'s own effect on
+        // the viewport from the (new, intentional) interaction where a pane
+        // too narrow to afford both the strip and the scroll gutter beside
+        // it suppresses the strip instead — this fixture's 40-col pane is
+        // narrow enough for a 10-unit reserve to trip exactly that
+        // suppression, which would otherwise make `cols_with` reflect a
+        // *lost strip*, not the reserve alone.
+        engine.settings.minimap = false;
         let theme = Theme::onedark();
         let bounds = WindowRect::new(0.0, 0.0, 40.0, 10.0);
         let (rects, _) = engine.calculate_group_window_rects(bounds, 1.0);

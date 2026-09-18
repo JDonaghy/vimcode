@@ -1,10 +1,11 @@
 ---
 source: src/tui_main/render_impl.rs
+assertion_line: 2367
 expression: "lines.join(\"\\n\")"
 ---
      [No Name] ×                       ⋯  [No Name] ×                 󰤲    ⋯
                                           │
-     left pane content              ⠉⠉⠈⠉⠁⠉│left pane content              ⠉⠉⠈⠉⠁⠉
+     left pane content             ⠉⠉⠈⠉⠁⠉ │left pane content             ⠉⠉⠈⠉⠁⠉
                                           │
                                           │
                                           │
@@ -16,5 +17,5 @@ expression: "lines.join(\"\\n\")"
                                           │
                                           │
                                           │
-     [No Name]          Ln 1, Col 1       │NORMAL  [No Name]  Ln 1, Col 1
+     [No Name]                Ln 1, Col 1 │NORMAL  [No Name]        Ln 1, Col 1
     Editor split
