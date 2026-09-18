@@ -1033,6 +1033,42 @@ impl TuiShellApp {
             None
         };
 
+        // #1117: re-derive `engine.app_shell`'s sidebar visibility from
+        // `engine.session.explorer_visible` one more time here, rather than
+        // trusting whatever `app_shell` already baked in at `Engine::new`/
+        // `Engine::new_for_test` construction time. In the ordinary
+        // production path the two never drift — `Engine::new` reads the
+        // persisted session *before* constructing `app_shell`, so the two
+        // start in lockstep and every later toggle (Ctrl+B, panel
+        // accelerators, autohide) updates `app_shell` directly, keeping it
+        // authoritative from then on. But a caller is free to mutate
+        // `engine.session` on an already-built `Engine` before handing it
+        // here — `Engine::new_for_test`'s own doc warns this never
+        // retroactively updates `app_shell` — and when that happens
+        // downstream consumers of the shadow (this file's own
+        // `handle_mouse_event` `TreeController` intercept, and the
+        // runner-vs-shadow sidebar-visibility resync at the tail of
+        // `Self::handle`) read a stale `app_shell` and can force the
+        // *runner's* sidebar hidden even though the tree just painted and a
+        // click landed on it (#1117). Recomputing here — the same
+        // `autohide_panels` / `explorer_visible` derivation
+        // `Engine::new_from_state` runs at construction — makes `app_shell`
+        // agree with whatever `session` state `engine` actually carries by
+        // the time the shell app takes ownership of it, regardless of when
+        // or how that state was set.
+        let show_sidebar = if engine.settings.autohide_panels {
+            false
+        } else {
+            engine.session.explorer_visible || engine.settings.explorer_visible_on_startup
+        };
+        if show_sidebar != engine.app_shell.sidebar_visible() {
+            if show_sidebar {
+                engine.app_shell.toggle_sidebar();
+            } else {
+                engine.app_shell.hide_sidebar();
+            }
+        }
+
         let now = Instant::now();
         Self {
             engine,
@@ -1508,6 +1544,31 @@ impl TuiShellApp {
             let is_explorer_event = match &event {
                 UiEvent::MouseDown { position, .. } | UiEvent::DoubleClick { position, .. } => {
                     let rect = self.engine.explorer_tree_rect.get();
+                    // #1117: `self.engine.app_shell.sidebar_visible()` here
+                    // is a live, accurate read of the same ground truth
+                    // `App::explorer_ui_event` (`app.rs`) effectively
+                    // consults on GTK — it's kept in lockstep with the
+                    // runner's own `AppShell` sidebar visibility (the
+                    // `ShellAdapter`-owned instance that actually decides
+                    // what painted this frame) by `Self::from_engine`'s
+                    // construction-time resync and by every subsequent
+                    // toggle path in this file, so it is not the "extra,
+                    // staler condition" it used to be. It is still needed
+                    // *in addition to* `rect.width > 0.0`: unlike GTK (whose
+                    // `explorer_ui_event` is gated by the freshly-computed
+                    // `ctx.layout.sidebar_content_bounds` one level up, in
+                    // `try_route_sidebar_mouse_event`), `explorer_tree_rect`
+                    // here is a plain `Cell` that only ever gets *set* when
+                    // the sidebar body actually paints — it is never reset
+                    // to zero on a frame where the sidebar is hidden, so
+                    // once hidden it keeps reporting the *last* rect it was
+                    // painted at. Dropping this check made a click that
+                    // landed in the editor, at the same screen position the
+                    // sidebar last occupied before being hidden, get
+                    // mis-claimed by this intercept instead of reaching the
+                    // editor (see this issue's regression on
+                    // `tui_editor_double_click_selects_the_word_via_shared_dispatch`
+                    // and its siblings).
                     !intercepts_blocked
                         && self.engine.app_shell.sidebar_visible()
                         && self.engine.active_panel_is(PANEL_EXPLORER)
