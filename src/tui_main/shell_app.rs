@@ -19540,6 +19540,73 @@ mod tests {
         );
     }
 
+    /// #1096 black-box acceptance (CLAUDE.md: drive the running app, not
+    /// only unit tests on the helpers): a real highlighted file, opened and
+    /// painted through the full `TuiShellApp`/`TuiDriver` stack, must not
+    /// cost proportionally more minimap work than a 10x-smaller one at the
+    /// same strip geometry. `render.rs`'s own
+    /// `minimap_line_fetch_count_tracks_target_lines_not_buffer_size` pins
+    /// the same invariant by calling `build_minimap_data` directly; this is
+    /// its through-the-app twin, proving the fix reaches the path a real
+    /// keystroke/redraw actually takes (`TuiShellApp::render_content` ->
+    /// `build_screen_layout` -> `build_minimap_data`), not just the
+    /// function in isolation.
+    ///
+    /// **RED against the #1096 regression:** confirmed by hand against the
+    /// unfixed highlight-mapping loop (no `sampled_at`/binary-search
+    /// early-out, a `line_text_cache: HashMap<usize, String>` fetching
+    /// every distinct highlighted line instead) — `large_fetches` grew
+    /// with the buffer instead of staying pinned to the small fixture's
+    /// count, failing the equality assertion below. Reverted before
+    /// landing this test.
+    #[test]
+    fn minimap_line_fetches_do_not_scale_with_buffer_size_via_shell_app() {
+        fn highlighted_app(n_lines: usize) -> TuiShellApp {
+            let mut app = app_for_minimap_test();
+            let mut text = String::with_capacity(n_lines * 24);
+            for i in 0..n_lines {
+                text.push_str(&format!("fn line_{i}() {{ do_something({i}); }}\n"));
+            }
+            app.engine.buffer_mut().insert(0, &text);
+            let state = app.engine.active_buffer_state_mut();
+            state.syntax = Some(crate::core::syntax::Syntax::new_for_language(
+                crate::core::syntax::SyntaxLanguage::Rust,
+            ));
+            // Explicit, generous limit rather than the process-wide
+            // `SYNTAX_MAX_LINES` atomic, which other tests write (see
+            // `render.rs`'s `large_minimap_engine` doc comment for why).
+            state.update_syntax_with_limit(n_lines.saturating_add(1));
+            assert!(
+                !state.highlights.is_empty(),
+                "fixture must produce real highlights or this test doesn't \
+                 exercise the #1096 regression class at all"
+            );
+            app
+        }
+
+        const SMALL_LINES: usize = 2_000;
+        const LARGE_LINES: usize = 20_000;
+
+        let small_fetches = crate::render::count_minimap_line_fetches(|| {
+            let mut driver = driver_with_shell(highlighted_app(SMALL_LINES), config(), 100, 24);
+            driver.press_named(quadraui::NamedKey::Escape);
+            let _ = driver.screen();
+        });
+        let large_fetches = crate::render::count_minimap_line_fetches(|| {
+            let mut driver = driver_with_shell(highlighted_app(LARGE_LINES), config(), 100, 24);
+            driver.press_named(quadraui::NamedKey::Escape);
+            let _ = driver.screen();
+        });
+
+        assert_eq!(
+            small_fetches, large_fetches,
+            "minimap line fetches through the real app must depend only on \
+             strip geometry, not buffer length ({SMALL_LINES}-line buffer: \
+             {small_fetches} fetches, {LARGE_LINES}-line buffer: \
+             {large_fetches} fetches)"
+        );
+    }
+
     /// #1008 review: `page_up` (`<C-b>`)'s clamped-scroll cursor landing
     /// position changed from a fixed offset off the *old* topline to the
     /// **bottom of the new window** (minus `'scrolloff'`) — see `page_up`
