@@ -5,6 +5,74 @@
 //! sight. `src/gtk/css.rs` keeps `load_css` (which actually constructs a
 //! `gtk4::CssProvider`) and re-exports these two so the rest of `crate::gtk`
 //! keeps resolving them unchanged.
+//!
+//! # #1103: this file used to be 501 lines styling the Relm4-era native
+//! widget tree (`.activity-bar`, `.tab-bar`, custom sidebar/search/settings
+//! classes, a native `treeview`, `.window-control`, `headerbar`, …). #540
+//! removed Relm4 and #731 deleted the last orphaned native-widget handles;
+//! the activity bar, tab bar, sidebars, search UI and settings form are all
+//! painted directly by quadraui's Cairo rasterisers now (`quadraui::gtk::
+//! activity_bar`/`sidebar_panel`/`tab_bar`/`scrollbar`/`dialog`, confirmed
+//! by reading those modules — they only `use gtk4::cairo::Context`/
+//! `gtk4::pango`, never construct a `gtk4::Widget`). None of that CSS had a
+//! live consumer, so it was deleted.
+//!
+//! **What's still here is not dead**, and was kept only after live
+//! verification. `gtk4::style_context_add_provider_for_display` registers
+//! this stylesheet at the *display* level — it applies to every GTK widget
+//! in the process, not just vimcode's own canvas. The one place vimcode
+//! still constructs unstyled, stock GTK widgets is the native file dialog
+//! (`gtk4::FileDialog`, `src/gtk/services.rs` upstream in quadraui). On a
+//! desktop with no `xdg-desktop-portal` running — confirmed to be this
+//! project's dev/CI baseline — `GtkFileDialog` falls back to its own
+//! in-process `GtkFileChooserDialog` implementation, which *does* share
+//! this display and *does* land inside the reach of a couple of these
+//! selectors.
+//!
+//! Verified live (2026-09-18, #1103) by registering this exact provider via
+//! `crate::gtk::css::load_css` and opening a real `gtk4::FileDialog` under
+//! `GDK_BACKEND=x11` (this dev machine's WSLg `DISPLAY=:0`; no
+//! `xdg-desktop-portal` binary is installed here, so the dialog took the
+//! native fallback path), then walking `gtk4::Window::list_toplevels()` and
+//! dumping every widget's `css_name()`/`css_classes()`. Findings (GTK
+//! 4.14.5, `gtk4` crate 0.11.4):
+//!
+//! - The dialog's `GtkPlacesSidebar` (the Recent/Home/bookmarks list on the
+//!   left) carries the literal class **`sidebar`** — the same class name
+//!   vimcode's own (quadraui-painted) sidebar concept used, so every
+//!   `.sidebar ...` rule below reaches it.
+//!   - `GtkLabel` nodes are nested directly inside its rows (confirmed in
+//!     the dump) → `.sidebar label` is live.
+//!   - Its own `GtkScrolledWindow`/`GtkViewport` are direct children
+//!     (confirmed) → `.sidebar scrolledwindow`/`.sidebar scrolledwindow >
+//!     viewport` are live.
+//!   - No `GtkEntry`, `GtkSearchEntry`, `GtkDropDown` or `GtkSpinButton`
+//!     appeared nested under it in the (idle, freshly-opened) dump, so the
+//!     old `.sidebar entry`/`.sidebar searchentry`/`.sidebar dropdown`/
+//!     `.sidebar spinbutton` rules had no confirmed live target and were
+//!     deleted along with the rest.
+//! - Every scrollable area in the dialog (places sidebar, path bar,
+//!   column view, popovers) uses a real `GtkScrollbar` (`css_name=
+//!   scrollbar`) — the bare `scrollbar`/`scrollbar slider` rules below are
+//!   live across the whole dialog, not just the sidebar.
+//! - The dialog uses several `GtkPopover`/`GtkPopoverContent` pairs
+//!   (location-bar popup, type-filter dropdown, connect-to-server popup,
+//!   bookmark-rename popup) — the bare `popover contents`/`popover.menu
+//!   contents` rule is live. No widget anywhere in the dump had
+//!   `css_name() == "modelbutton"`, so the old `popover modelbutton` rule
+//!   was dead and is gone.
+//! - No `treeview` node appeared anywhere — GTK4's file chooser uses
+//!   `GtkColumnView`/`GtkListView`, not the deprecated `GtkTreeView` — so
+//!   the whole `treeview` block was dead and is gone.
+//! - No `headerbar` node appeared — this GTK build's native file dialog
+//!   uses a classic button-box action area (Cancel/Open), not a
+//!   `GtkHeaderBar` — so the bare `headerbar` rule was dead and is gone.
+//!
+//! If `xdg-desktop-portal` is installed at some point, `GtkFileDialog`
+//! prefers the portal (an out-of-process dialog this CSS provider cannot
+//! reach at all) and every rule below goes quiet again without needing a
+//! code change — nothing here assumes the portal's absence, it only
+//! documents why the current dev/CI baseline can observe it.
 use crate::render::{ColorExt, Theme};
 
 /// Generate the full CSS string with colors taken from the active theme.
@@ -16,71 +84,14 @@ pub(crate) fn make_theme_css(theme: &Theme) -> String {
     } else {
         theme.status_fg.to_hex()
     };
-    let editor_bg = theme.background.to_hex();
     let text_fg = theme.foreground.to_hex();
-    let accent = theme.function.to_hex();
-    let sel_bg = theme.fuzzy_selected_bg.to_hex();
-    // Selected item text: white on dark selection bg for both light/dark themes.
-    let sel_fg = if theme.is_light() {
-        theme.foreground.darken(0.9).to_hex()
-    } else {
-        bar_fg.clone()
-    };
-    let hover_bg = theme.tab_active_bg.to_hex();
-    let dim_fg = theme.line_number_fg.to_hex();
     let entry_bg = theme.active_background.to_hex();
     let border_col = theme.separator.to_hex();
     let sb_thumb = theme.scrollbar_thumb.to_hex();
-    let _comment_fg = theme.comment.to_hex();
     format!(
         r#"
-        /* Activity Bar */
-        .activity-bar {{
-            background-color: {bar_bg};
-            border-right: 1px solid {border_col};
-        }}
-
-        .activity-button {{
-            background: transparent;
-            border: none;
-            border-radius: 0;
-            font-family: 'Symbols Nerd Font', monospace;
-            font-size: 24px;
-            color: {dim_fg};
-            padding: 0;
-        }}
-
-        .activity-button:hover {{
-            background-color: {hover_bg};
-            color: {bar_fg};
-        }}
-
-        .activity-button.active {{
-            color: {bar_fg};
-            border-left: 2px solid {accent};
-        }}
-
-        .custom-titlebar {{
-            background-color: {bar_bg};
-        }}
-
-        /* Window control buttons (min/max/close) */
-        .window-control {{
-            color: {dim_fg};
-        }}
-        .window-control:hover {{
-            background-color: {hover_bg};
-            color: {bar_fg};
-        }}
-        .window-control:active {{
-            background-color: {hover_bg};
-        }}
-
-        /* Sidebar */
-        .sidebar-container {{
-            background-color: {bar_bg};
-        }}
-
+        /* Sidebar — native GTK file dialog's GtkPlacesSidebar carries this
+           exact class (see module docs above). */
         .sidebar {{
             background-color: {bar_bg};
             border-right: 1px solid {border_col};
@@ -90,184 +101,10 @@ pub(crate) fn make_theme_css(theme: &Theme) -> String {
             color: {bar_fg};
         }}
 
-        /* Tree View */
-        treeview {{
-            background-color: {bar_bg};
-            color: {bar_fg};
-            border: none;
-            outline: none;
-        }}
-
-        treeview:selected {{
-            background-color: {sel_bg};
-            color: {sel_fg};
-            border-left: 3px solid {accent};
-        }}
-
-        treeview:selected:focus {{
-            background-color: {sel_bg};
-            color: {sel_fg};
-        }}
-
-        treeview row:hover {{
-            background-color: {hover_bg};
-        }}
-
-        treeview row {{
-            padding: 4px 8px;
-            min-height: 22px;
-        }}
-
-        treeview expander {{
-            min-width: 16px;
-            min-height: 16px;
-        }}
-
-        treeview expander:checked {{
-            color: {bar_fg};
-        }}
-
-        treeview expander:not(:checked) {{
-            color: {dim_fg};
-        }}
-
-        /* Inline editing entry (rename / new file/folder) */
-        treeview entry {{
-            border: 1px solid {accent};
-            border-radius: 2px;
-            padding: 2px 4px;
-            background-color: {editor_bg};
-            color: {text_fg};
-            min-height: 20px;
-        }}
-
-        /* Search results */
-        .search-results-list {{
-            background-color: {bar_bg};
-            color: {bar_fg};
-        }}
-
-        .search-results-list > row {{
-            background-color: {bar_bg};
-            color: {bar_fg};
-            padding: 2px 4px;
-        }}
-
-        .search-results-list > row:selected,
-        .search-results-list > row:selected:focus {{
-            background-color: {sel_bg};
-        }}
-
-        .search-results-list > row:selected label,
-        .search-results-list > row:selected:focus label {{
-            color: {sel_fg};
-        }}
-
-        .search-results-scroll {{
-            background-color: {bar_bg};
-        }}
-
-        /* Search file header */
-        .search-file-header {{
-            color: {accent};
-            font-weight: bold;
-            font-size: 12px;
-        }}
-
-        /* Search input entry inside sidebar */
-        .sidebar entry {{
-            background-color: {entry_bg};
-            color: {text_fg};
-            border: 1px solid {border_col};
-            border-radius: 2px;
-            padding: 4px;
-            min-width: 0;
-        }}
-
-        .sidebar entry > text {{
-            min-width: 0;
-        }}
-
-        .sidebar searchentry {{
-            min-width: 0;
-        }}
-
-        .sidebar searchentry > text {{
-            min-width: 0;
-        }}
-
-        .sidebar entry:focus {{
-            border-color: {accent};
-        }}
-
-        /* Search toggle buttons */
-        .search-toggle-btn {{
-            background: transparent;
-            color: {dim_fg};
-            border: 1px solid {border_col};
-            border-radius: 2px;
-            padding: 2px 6px;
-            min-width: 0;
-            min-height: 0;
-            font-size: 12px;
-        }}
-        .search-toggle-btn:hover {{
-            background-color: {hover_bg};
-        }}
-        .search-toggle-btn:checked {{
-            background-color: {accent};
-            color: {editor_bg};
-            border-color: {accent};
-        }}
-
-        /* Settings form widgets — theme-aware */
-        .settings-category-header {{
-            color: {dim_fg};
-        }}
-        .sidebar spinbutton {{
-            background-color: {entry_bg};
-            color: {text_fg};
-            border: 1px solid {border_col};
-        }}
-        .sidebar spinbutton entry {{
-            color: {text_fg};
-        }}
-        .sidebar spinbutton button {{
-            background-color: {entry_bg};
-            color: {text_fg};
-        }}
-        .sidebar spinbutton button:hover {{
-            background-color: {hover_bg};
-        }}
-        .sidebar dropdown {{
-            background-color: {entry_bg};
-            color: {text_fg};
-            border: 1px solid {border_col};
-        }}
-        .sidebar dropdown button {{
-            color: {text_fg};
-        }}
-        .sidebar dropdown button:hover {{
-            background-color: {hover_bg};
-        }}
         popover.menu contents,
         popover contents {{
             background-color: {entry_bg};
             color: {text_fg};
-        }}
-        popover.menu modelbutton,
-        popover modelbutton {{
-            color: {text_fg};
-        }}
-        popover.menu modelbutton:hover,
-        popover modelbutton:hover {{
-            background-color: {sel_bg};
-            color: {sel_fg};
-        }}
-        .sidebar entry {{
-            background-color: {entry_bg};
-            color: {text_fg};
-            border: 1px solid {border_col};
         }}
 
         /* Scrollbar — theme-aware overrides.
@@ -288,14 +125,6 @@ pub(crate) fn make_theme_css(theme: &Theme) -> String {
             background: alpha({sb_thumb}, 0.9);
         }}
 
-        /* Horizontal editor scrollbar — theme-aware */
-        .h-editor-scrollbar slider {{
-            background: alpha({sb_thumb}, 0.45);
-        }}
-        .h-editor-scrollbar slider:hover {{
-            background: alpha({sb_thumb}, 0.7);
-        }}
-
         "#
     )
 }
@@ -303,61 +132,16 @@ pub(crate) fn make_theme_css(theme: &Theme) -> String {
 /// Static structural CSS that never changes with the theme.
 /// Theme-specific colours live in `make_theme_css()` and are appended after this.
 pub(crate) const STATIC_CSS: &str = "
-        /* Custom titlebar — matches status bar color.
-           CSD provides edge resize handles; WindowHandle enables drag-to-move. */
-        .custom-titlebar {
-            background-color: transparent;
-            min-height: 0;
-            padding: 0;
-            margin: 0;
-            border: none;
-            box-shadow: none;
-        }
-        headerbar {
-            min-height: 0;
-            padding: 0;
-            margin: 0;
-            border: none;
-            box-shadow: none;
-            background: transparent;
-        }
-
         /* VSCode UI font stack — 'Segoe UI' on Windows, 'Ubuntu' on Ubuntu,
-           system-ui/sans elsewhere.  13px matches VSCode default UI size. */
+           system-ui/sans elsewhere. 13px matches VSCode default UI size.
+           Also reaches the native file dialog's GtkPlacesSidebar (see
+           module docs above) — deliberately: it keeps the sidebar text
+           legible at the same size as the rest of the app chrome. */
         .sidebar,
-        .sidebar *,
-        .sidebar-header,
-        .sidebar-title,
-        .search-results-list,
-        .search-results-list *,
-        .search-file-header {
+        .sidebar * {
             font-family: 'Segoe UI', system-ui, -apple-system, 'Ubuntu', 'Droid Sans', sans-serif;
             font-size: 13px;
         }
-
-        /* Window control buttons — VSCode style (transparent bg, subtle hover) */
-        .window-control {
-            background: transparent;
-            border: none;
-            border-radius: 0;
-            font-size: 13px;
-            padding: 0;
-            min-width: 46px;
-            min-height: 30px;
-        }
-        /* Close button: red on hover, matching Windows/VSCode */
-        .window-control:last-child:hover {
-            background-color: #e81123;
-            color: #ffffff;
-        }
-        .window-control:last-child:active {
-            background-color: #f1707a;
-            color: #ffffff;
-        }
-
-        /* Activity bar, sidebar, treeview: see make_theme_css() — applied dynamically */
-        
-        /* treeview: see make_theme_css() — applied dynamically */
 
         /* Thin overlay scrollbars */
         scrollbar {
@@ -401,101 +185,12 @@ pub(crate) const STATIC_CSS: &str = "
             opacity: 0.4;
         }
 
-        /* search-results-list, sidebar entry, search-toggle-btn: see make_theme_css() */
-        /* Search toggle buttons (Aa / Ab| / .*) — base layout only, colors via make_theme_css */
-        .search-toggle-btn {
-            background: transparent;
-            color: #808080;
-            border: 1px solid #3e3e42;
-            border-radius: 2px;
-            padding: 2px 6px;
-            min-width: 0;
-            min-height: 0;
-            font-size: 12px;
-        }
-        .search-toggle-btn:hover {
-            background-color: #2a2d2e;
-        }
-        .search-toggle-btn:checked {
-            background-color: #0e639c;
-            color: #ffffff;
-            border-color: #0e639c;
-        }
-
-        /* Horizontal editor scrollbar — overlays the bottom of editor content.
-           Semi-transparent like VSCode so text beneath is still visible.
-           min-height/min-width: 0 prevents the GTK theme from forcing the
-           widget taller than our height_request(10), which would push it
-           into the status line. */
-        .h-editor-scrollbar {
-            background: transparent;
-            border: none;
-            padding: 0;
-            min-height: 0;
-            min-width: 0;
-        }
-        .h-editor-scrollbar trough {
-            background: transparent;
-            border: none;
-            min-height: 0;
-            min-width: 0;
-            padding: 0;
-        }
-        .h-editor-scrollbar slider {
-            background: rgba(100, 100, 100, 0.45);
-            border-radius: 2px;
-            min-height: 0;
-            min-width: 20px;
-            margin: 1px 0;
-        }
-        .h-editor-scrollbar slider:hover {
-            background: rgba(150, 150, 150, 0.7);
-        }
-
-        /* Settings sidebar form — color-dependent rules in make_theme_css() */
-        .settings-category-header {
-            font-size: 11px;
-            font-weight: bold;
-            letter-spacing: 1px;
-        }
-
-        /* Make ScrolledWindow transparent so sidebar background shows through */
+        /* Make ScrolledWindow transparent so the sidebar background shows
+           through — reaches the native file dialog's GtkPlacesSidebar,
+           whose GtkScrolledWindow/GtkViewport are direct children of the
+           `.sidebar`-classed widget (see module docs above). */
         .sidebar scrolledwindow,
         .sidebar scrolledwindow > viewport {
             background-color: transparent;
-        }
-
-        /* SpinButton layout */
-        .sidebar spinbutton {
-            border-radius: 2px;
-        }
-        .sidebar spinbutton entry {
-            background-color: transparent;
-            min-width: 44px;
-            padding: 2px 4px;
-        }
-        .sidebar spinbutton button {
-            border: none;
-            min-width: 20px;
-            padding: 0 2px;
-        }
-
-        /* DropDown layout */
-        .sidebar dropdown {
-            min-height: 24px;
-            padding: 0 4px;
-            border-radius: 2px;
-        }
-        .sidebar dropdown button {
-            background-color: transparent;
-            border: none;
-            padding: 2px 4px;
-        }
-
-        /* Entry layout */
-        .sidebar entry {
-            min-height: 24px;
-            padding: 2px 6px;
-            border-radius: 2px;
         }
         ";
