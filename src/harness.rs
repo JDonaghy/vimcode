@@ -111,6 +111,17 @@
 /// marketplace) as well as scenario bodies, and because its per-lane
 /// registration is hand-written rather than `backend_conformance!`-driven —
 /// see its own module doc.
+///
+/// `#[cfg(test)]`, narrower than this module's own
+/// `any(test, feature = "test-support")` gate, for the same reason
+/// `crate::tui_main::testing::conformance_harness_prod` is: the fixture is
+/// built on `Engine::new_for_test`, which is itself `#[cfg(test)]`-only,
+/// and the `tui_prod` arm — the one lane these scenarios are green on —
+/// can only be constructed through that `#[cfg(test)]` constructor anyway.
+/// Widening either gate to also serve the sealed acceptance suite
+/// (`tests/*.rs`, which compiles against `feature = "test-support"`) is a
+/// separate change.
+#[cfg(test)]
 pub mod plugin_panel;
 
 use std::cell::RefCell;
