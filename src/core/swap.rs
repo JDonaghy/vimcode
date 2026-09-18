@@ -275,6 +275,10 @@ mod windows_ffi {
     pub const PROCESS_QUERY_LIMITED_INFORMATION: DWORD = 0x1000;
     /// Sentinel `GetExitCodeProcess` returns while the process has not exited.
     pub const STILL_ACTIVE: DWORD = 259;
+    /// `GetLastError()` code for "the caller lacks rights to open this
+    /// object" — set by `OpenProcess` when the target process exists but is
+    /// protected (elevated/protected process, or owned by another token).
+    pub const ERROR_ACCESS_DENIED: DWORD = 5;
 
     extern "system" {
         pub fn OpenProcess(
@@ -284,6 +288,7 @@ mod windows_ffi {
         ) -> HANDLE;
         pub fn CloseHandle(hObject: HANDLE) -> BOOL;
         pub fn GetExitCodeProcess(hProcess: HANDLE, lpExitCode: *mut DWORD) -> BOOL;
+        pub fn GetLastError() -> DWORD;
     }
 }
 
@@ -295,13 +300,15 @@ fn windows_is_pid_alive(pid: u32) -> bool {
     unsafe {
         let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
         if handle.is_null() {
-            // Access denied still implies the process exists; only a
-            // "no such process" failure means it is dead. OpenProcess
-            // doesn't distinguish those for us without extra calls, but a
-            // NULL handle here means we simply cannot query it — treat as
-            // not alive, matching the previous process-listing-based
-            // behavior for PIDs we cannot see.
-            return false;
+            // A NULL handle means we couldn't open the process, but that's
+            // ambiguous by itself: it covers both "no such process" (dead)
+            // and "process exists but we lack rights to open it" (alive —
+            // an elevated/protected process, or one owned by another
+            // token). GetLastError() disambiguates the same way the Unix
+            // branch above uses errno: EPERM there means "exists, just not
+            // signalable by us"; ERROR_ACCESS_DENIED here means the same
+            // thing for OpenProcess.
+            return GetLastError() == ERROR_ACCESS_DENIED;
         }
         let mut exit_code: DWORD = 0;
         let ok = GetExitCodeProcess(handle, &mut exit_code as *mut DWORD);
