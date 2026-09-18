@@ -30869,6 +30869,129 @@ fn test_ext_panel_left_focuses_activity_bar() {
     assert_eq!(engine.activity_bar_selected, 8);
 }
 
+// --- #1088: ext panel reveal-by-id match rule ---
+
+/// Registers a "test-panel" extension panel with a single "Log" section
+/// carrying `items`, mirroring how `git_log_panel.lua` populates
+/// `engine.ext_panel_items` via `panel.set_items`.
+fn engine_with_ext_panel_items(items: Vec<crate::core::plugin::ExtPanelItem>) -> Engine {
+    use crate::core::plugin::PanelRegistration;
+    let mut engine = Engine::new();
+    engine.ext_panels.insert(
+        "test-panel".to_string(),
+        PanelRegistration {
+            name: "test-panel".to_string(),
+            title: "Test Panel".to_string(),
+            icon: 'T',
+            fallback_icon: Some('T'),
+            sections: vec!["Log".to_string()],
+        },
+    );
+    engine
+        .ext_panel_items
+        .insert(("test-panel".to_string(), "Log".to_string()), items);
+    engine
+}
+
+/// Rule 1: an exact `id` match wins outright, even when a longer id would
+/// also satisfy the (now gone) fuzzy `starts_with` arms.
+#[test]
+fn ext_panel_find_flat_index_matches_exact_id() {
+    use crate::core::plugin::ExtPanelItem;
+    let engine = engine_with_ext_panel_items(vec![
+        ExtPanelItem {
+            id: "abc".to_string(),
+            ..Default::default()
+        },
+        ExtPanelItem {
+            id: "abcdef".to_string(),
+            ..Default::default()
+        },
+    ]);
+    // flat index 0 is the "Log" section header; items start at 1.
+    assert_eq!(
+        engine.ext_panel_find_flat_index("test-panel", "Log", "abc"),
+        Some(1),
+        "an exact id match must win, landing on the \"abc\" row (flat index 1)"
+    );
+}
+
+/// Rule 2: a short-hash query with no exact match falls back to a hash-prefix
+/// match against the one row whose full id starts with it.
+#[test]
+fn ext_panel_find_flat_index_matches_unambiguous_hash_prefix() {
+    use crate::core::plugin::ExtPanelItem;
+    let engine = engine_with_ext_panel_items(vec![ExtPanelItem {
+        id: "26cf7ef8aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+        ..Default::default()
+    }]);
+    assert_eq!(
+        engine.ext_panel_find_flat_index("test-panel", "Log", "26cf7ef8"),
+        Some(1),
+        "a short-hash query must prefix-match the one full-hash commit row"
+    );
+}
+
+/// #1088 regression: `git_log_panel.lua` gives separators (and some other
+/// rows) an empty `id`. The old three-way-fuzzy match
+/// (`item_id.starts_with(&items[vi].id)`) treated an empty id as a prefix of
+/// *every* query, so a separator listed ahead of the target commit won the
+/// match instead. Empty ids must never match, exact or prefix.
+#[test]
+fn ext_panel_find_flat_index_never_matches_an_empty_id() {
+    use crate::core::plugin::ExtPanelItem;
+    let engine = engine_with_ext_panel_items(vec![
+        ExtPanelItem {
+            id: String::new(),
+            is_separator: true,
+            ..Default::default()
+        },
+        ExtPanelItem {
+            id: "26cf7ef8aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            ..Default::default()
+        },
+    ]);
+    // flat index 0 = section header, 1 = separator, 2 = the commit row.
+    assert_eq!(
+        engine.ext_panel_find_flat_index("test-panel", "Log", "26cf7ef8"),
+        Some(2),
+        "the empty-id separator (flat index 1) must never match; the query \
+         must resolve to the commit row (flat index 2) instead"
+    );
+}
+
+/// #1088 regression: a `<hash>:<path>` file-child row shares its parent
+/// commit's hash prefix and must never satisfy a hash-prefix match itself —
+/// only a top-level (non-child) row can. Ordered with the child *before* its
+/// parent in the backing `Vec` to prove the exclusion isn't just an accident
+/// of list order.
+#[test]
+fn ext_panel_find_flat_index_prefix_match_excludes_hash_path_children() {
+    use crate::core::plugin::ExtPanelItem;
+    let hash = "26cf7ef8aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let engine = engine_with_ext_panel_items(vec![
+        ExtPanelItem {
+            id: format!("{hash}:src/main.rs"),
+            parent_id: hash.to_string(),
+            ..Default::default()
+        },
+        ExtPanelItem {
+            id: hash.to_string(),
+            expandable: true,
+            expanded: true,
+            ..Default::default()
+        },
+    ]);
+    // flat index 0 = section header, 1 = the child row, 2 = the commit row.
+    assert_eq!(
+        engine.ext_panel_find_flat_index("test-panel", "Log", "26cf7ef8"),
+        Some(2),
+        "the hash-prefix match must land on the commit row (flat index 2), \
+         never on its file child (flat index 1) even though the child's id \
+         also starts with the queried hash"
+    );
+}
+
 // --- Context menu hit regions ---
 
 #[test]

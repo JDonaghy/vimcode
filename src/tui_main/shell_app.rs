@@ -9288,6 +9288,131 @@ mod tests {
         );
     }
 
+    /// A "git-insights" ext panel with a single "Log" section shaped like
+    /// `git_log_panel.lua`'s real output: a leading empty-id separator (the
+    /// #1088 fuzzy-match trap — `item_id.starts_with(&items[vi].id)` used to
+    /// treat that empty id as a prefix of *every* hash), the target commit,
+    /// a `<hash>:<path>` file child under it, and one unrelated commit.
+    fn app_with_git_log_panel_for_reveal() -> TuiShellApp {
+        let mut app = TuiShellApp::new_for_test();
+        app.engine.settings.use_nerd_fonts = Some(false);
+        crate::icons::set_nerd_fonts(false);
+        app.engine.ext_panels.clear();
+        app.engine.ext_panels.insert(
+            "git-insights".to_string(),
+            crate::core::plugin::PanelRegistration {
+                name: "git-insights".to_string(),
+                title: "Git Insights".to_string(),
+                icon: '\u{f113}',
+                fallback_icon: Some(EXT_ICON),
+                sections: vec!["Log".to_string()],
+            },
+        );
+        let hash = "26cf7ef8aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        app.engine.ext_panel_items.insert(
+            ("git-insights".to_string(), "Log".to_string()),
+            vec![
+                crate::core::plugin::ExtPanelItem {
+                    text: String::new(),
+                    id: String::new(),
+                    is_separator: true,
+                    ..Default::default()
+                },
+                crate::core::plugin::ExtPanelItem {
+                    text: "26cf7ef8ZQXW1088".to_string(),
+                    id: hash.to_string(),
+                    expandable: true,
+                    expanded: true,
+                    ..Default::default()
+                },
+                crate::core::plugin::ExtPanelItem {
+                    text: "src/main.rsZQXW1088".to_string(),
+                    id: format!("{hash}:src/main.rs"),
+                    parent_id: hash.to_string(),
+                    ..Default::default()
+                },
+                crate::core::plugin::ExtPanelItem {
+                    text: "deadbeefZQXW1088".to_string(),
+                    id: "deadbeefbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
+                    ..Default::default()
+                },
+            ],
+        );
+        app
+    }
+
+    /// #1088: `Engine::ext_panel_reveal_item` — the same call
+    /// `Engine::apply_plugin_ctx`'s `panel_reveal_request` handling makes for
+    /// `:GitShow`'s "Open Commit" link — must land the *painted* selection
+    /// highlight on the commit row matching the queried short hash, not on
+    /// whatever row happened to occupy that flat index under the old
+    /// three-way-fuzzy id match (here, the leading empty-id separator).
+    ///
+    /// Drives the same engine-state + `ext_panel_focus_pending` handoff
+    /// `plugins.rs` does — applied to the `TuiShellApp` *before* it's handed
+    /// to `driver_with_shell` (the wrapped `ShellAdapter<TuiShellApp>` the
+    /// driver owns keeps its inner app crate-private, so a test can't reach
+    /// `driver.app_mut().engine` after construction) — then lets the real
+    /// `ShellAdapter`/`TuiShellApp` reconciliation (`take_requested_panel`,
+    /// polled every `tick()`) apply the panel switch — the same mechanism
+    /// the mouse-click tests above exercise — before asserting on the
+    /// rendered grid via `style_at`, never on `engine.ext_panel_selected`.
+    ///
+    /// Verified RED against unfixed `ext_panel.rs` (restoring the old
+    /// `id == item_id || id.starts_with(item_id) ||
+    /// item_id.starts_with(&id)` match): the empty-id separator satisfies the
+    /// third arm for any query, so the reveal selects flat index 1 (the
+    /// separator) instead of flat index 2 (the commit), and this test's
+    /// `assert_ne!` fails because the commit row then shares the separator's
+    /// (non-highlighted) background instead of the selection highlight.
+    #[test]
+    fn tui_ext_panel_reveal_by_short_hash_selects_the_commit_row_not_the_separator() {
+        let mut app = app_with_git_log_panel_for_reveal();
+        // Mirrors `Engine::apply_plugin_ctx`'s `panel_reveal_request` arm
+        // (`src/core/engine/plugins.rs`): activate the panel, resolve+select
+        // the target row, then hand the panel switch to the backend via
+        // `ext_panel_focus_pending`.
+        app.engine.ext_panel_active = Some("git-insights".to_string());
+        app.engine.ext_panel_has_focus = true;
+        app.engine
+            .ext_panel_reveal_item("git-insights", "Log", "26cf7ef8");
+        app.engine.ext_panel_focus_pending = Some("git-insights".to_string());
+
+        let cfg = TuiShellApp::live_shell_config(&app.engine);
+        let mut driver = driver_with_shell(app, cfg, 80, 24);
+        // `TuiShellApp::tick` is what consumes `ext_panel_focus_pending`
+        // (setting `sidebar.ext_panel_name` and making the sidebar visible),
+        // and `ShellAdapter::tick` polls `take_requested_panel` right after —
+        // one `tick()` both reveals the sidebar and switches it onto the
+        // panel `ext_panel_active` names.
+        driver.tick();
+        driver.render();
+
+        let commit_row = driver
+            .find_bounds("26cf7ef8ZQXW1088")
+            .expect("the target commit row should be painted");
+        let other_commit_row = driver
+            .find_bounds("deadbeefZQXW1088")
+            .expect("the unrelated commit row should be painted");
+
+        let commit_style = driver
+            .style_at(commit_row.x as u16, commit_row.y as u16)
+            .expect("the commit row must have a paintable cell");
+        let other_style = driver
+            .style_at(other_commit_row.x as u16, other_commit_row.y as u16)
+            .expect("the unrelated commit row must have a paintable cell");
+
+        assert_ne!(
+            commit_style.bg,
+            other_style.bg,
+            "reveal for short hash \"26cf7ef8\" must paint the selection \
+             highlight on \"26cf7ef8ZQXW1088\", distinct from \
+             the unrelated commit row — but the two share a background, \
+             meaning the reveal landed on the wrong row; screen:\n{}",
+            driver.screen()
+        );
+    }
+
     /// #817 regression coverage, git/source-control sidebar site
     /// (`mouse.rs`'s `SidebarOwner::Git` arm, one of the four hand-rolled
     /// 400ms/position detectors this issue deleted — formerly around
