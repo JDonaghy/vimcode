@@ -19876,4 +19876,100 @@ mod tests {
             driver.screen()
         );
     }
+
+    /// #1087: the ext-panel hover card anchors to `hover.item_index`, a
+    /// **flat** index across the whole panel list
+    /// (`route_sidebar_hover`'s `ExtPanel` arm: `flat_idx =
+    /// ext_panel_scroll_top + row`). The old anchor code added
+    /// `ext_panel_scroll_top` back into the index at hover time but never
+    /// subtracted it out again at paint time, so once the panel was
+    /// scrolled the card was anchored dozens of rows below the hovered
+    /// item — off the bottom of the viewport.
+    ///
+    /// Scrolls the "Log" section 20 rows down, then injects a hover
+    /// (`Engine::show_panel_hover`, the same direct-state approach
+    /// `panel_hover_popup_link_click_copies_and_dismisses_via_shell_app`
+    /// above uses — real dwell requires a round trip through a plugin
+    /// host this test has none of) for the item at screen row 3 of the
+    /// scrolled viewport. Asserts on **painted** geometry only — the
+    /// hovered item's row (`find_bounds` on its label) and the popup's own
+    /// body text (`find_bounds` on its markdown) — never on
+    /// `engine.panel_hover.item_index` alone, which is exactly the state
+    /// that was already correct while the paint step ignored it.
+    ///
+    /// **Verified RED against unfixed `develop`:** reverting this issue's
+    /// `panels.rs` change (restoring `ph.item_index as u16 + 1` as the ext
+    /// panel's `item_row`) anchors the popup at row `23 + 1 = 24` instead
+    /// of the correct row `4` (chrome row 1 + on-screen row 3) — over 20
+    /// rows off — so the distance assertion below fails.
+    #[test]
+    fn tui_ext_panel_hover_card_anchors_to_the_scrolled_row_not_the_flat_index() {
+        let mut app = TuiShellApp::new(None);
+        app.engine.settings.use_nerd_fonts = Some(false);
+        crate::icons::set_nerd_fonts(false);
+        app.engine.ext_panels.insert(
+            "git-insights".to_string(),
+            crate::core::plugin::PanelRegistration {
+                name: "git-insights".to_string(),
+                title: "Git Insights".to_string(),
+                icon: '\u{f113}',
+                fallback_icon: Some(EXT_ICON),
+                sections: vec!["Log".to_string()],
+            },
+        );
+        let items: Vec<crate::core::plugin::ExtPanelItem> = (0..30)
+            .map(|i| crate::core::plugin::ExtPanelItem {
+                text: format!("hover1087item{i:02}"),
+                id: format!("item{i}"),
+                ..Default::default()
+            })
+            .collect();
+        app.engine
+            .ext_panel_items
+            .insert(("git-insights".to_string(), "Log".to_string()), items);
+        app.engine.ext_panel_active = Some("git-insights".to_string());
+        app.sidebar.ext_panel_name = Some("git-insights".to_string());
+
+        // Scroll well past the first screenful. `tree.rows[0]` is the "Log"
+        // section header, `tree.rows[1 + i]` is item `i` — so with
+        // `scroll_top == 20`, the item painted at on-screen row 3 (0-based,
+        // relative to the panel's own content rows) is `tree.rows[23]`,
+        // i.e. item 22.
+        app.engine.ext_panel_scroll_top = 20;
+        let flat_idx = 23usize;
+        app.engine.show_panel_hover(
+            "git-insights",
+            "item22",
+            flat_idx,
+            "HOVERCARD1087 body text",
+        );
+
+        let mut driver = driver_with_shell(app, config(), 100, 30);
+        driver.render();
+
+        let item_row = driver.find_bounds("hover1087item22").expect(
+            "precondition: the hovered item must be painted on screen after \
+             scrolling — it should sit at on-screen row 3 of the panel body",
+        );
+        let popup_row = driver
+            .find_bounds("HOVERCARD1087")
+            .expect("the hover popup body must paint somewhere on screen");
+
+        assert!(
+            (popup_row.y - item_row.y).abs() <= 2.0,
+            "the hover card must anchor next to the hovered row (painted at \
+             y={}), not dozens of rows below it — the popup painted at \
+             y={}; screen:\n{}",
+            item_row.y,
+            popup_row.y,
+            driver.screen()
+        );
+        assert!(
+            popup_row.y >= 0.0 && popup_row.y < 30.0,
+            "the popup must land inside the 30-row viewport, not be pushed \
+             off it; popup y={}; screen:\n{}",
+            popup_row.y,
+            driver.screen()
+        );
+    }
 }

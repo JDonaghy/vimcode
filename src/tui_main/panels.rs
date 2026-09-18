@@ -857,7 +857,23 @@ pub(super) fn render_panel_hover_popup(
             .unwrap_or(2u16);
         section_start + ph.item_index as u16
     } else {
-        ph.item_index as u16 + 1
+        // #1087: `ph.item_index` is a flat index across the whole panel list
+        // (`route_sidebar_hover`'s `ExtPanel` arm sets `flat_idx =
+        // ext_panel_scroll_top + row`), not a screen row — this used to
+        // anchor straight off the flat index (`item_index + 1`), landing the
+        // card dozens of rows below the viewport once the panel scrolled.
+        // `ext_panel_hover_screen_row`/`ext_panel_chrome_rows` are the same
+        // shared derivation `panel_hover_anchor_y` (GTK's twin of this
+        // function) now uses, so the two backends can't drift on this again.
+        let Some(panel) = screen.ext_panel.as_ref() else {
+            return (vec![], None);
+        };
+        let Some(screen_row) = render::ext_panel_hover_screen_row(panel, ph.item_index) else {
+            // Stale frame right after a scroll: `item_index` hasn't caught
+            // up with `scroll_top` yet. Skip painting rather than underflow.
+            return (vec![], None);
+        };
+        render::ext_panel_chrome_rows(panel) as u16 + screen_row as u16
     };
     let raw_y = sidebar_y + item_row;
     // Same secondary clamp the legacy renderer applied: don't let the
