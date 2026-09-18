@@ -89,7 +89,17 @@ const ICON_PNG_SIZES: [u32; 5] = [48, 64, 128, 256, 512];
 /// launch, even though the files it writes never change between runs of the
 /// same build. The stamp lets [`install_icon_and_desktop_at`] recognise "this
 /// version is already installed" and skip straight to returning.
-const ICON_INSTALL_STAMP_FILE: &str = ".vimcode-icon-install-version";
+///
+/// #1106 review (nit): lives under [`ICON_INSTALL_STAMP_DIR`] — a
+/// vimcode-specific subdirectory of `data_dir` — rather than directly in the
+/// shared XDG data root, so it can't be mistaken for someone else's stray
+/// dotfile at that level the way `hicolor`/`applications` (namespaced by
+/// `APP_ID` within themselves) never are.
+const ICON_INSTALL_STAMP_FILE: &str = "icon-install-version";
+
+/// App-specific subdirectory of `data_dir` the install stamp lives under —
+/// `~/.local/share/vimcode/`, not `~/.local/share/` directly.
+const ICON_INSTALL_STAMP_DIR: &str = "vimcode";
 
 /// Whether a previous [`install_icon_and_desktop_at`] call already installed
 /// `current_version` and every file it wrote is still present — i.e. whether
@@ -147,7 +157,8 @@ pub(super) fn install_icon_and_desktop_at(data_dir: &std::path::Path) {
 
     let hicolor = data_dir.join("icons/hicolor");
     let app_dir = data_dir.join("applications");
-    let stamp_path = data_dir.join(ICON_INSTALL_STAMP_FILE);
+    let stamp_dir = data_dir.join(ICON_INSTALL_STAMP_DIR);
+    let stamp_path = stamp_dir.join(ICON_INSTALL_STAMP_FILE);
     let current_version = env!("CARGO_PKG_VERSION");
 
     let stamp_contents = fs::read_to_string(&stamp_path).ok();
@@ -183,13 +194,22 @@ pub(super) fn install_icon_and_desktop_at(data_dir: &std::path::Path) {
     // Render the SVG to PNG at multiple sizes so compositors and window
     // managers that don't support SVG lookup (or only read _NET_WM_ICON
     // pixel data at a fixed size) get a crisp icon in alt-tab / taskbar.
+    //
+    // #1106 review: this used to skip re-rendering a size whose PNG already
+    // existed on disk, regardless of whether its bytes matched the SVG this
+    // call just wrote. That was harmless when the function ran on every
+    // launch (an existing PNG was always current, since nothing else changes
+    // the artwork), but the version-stamp gate above means reaching this
+    // point at all now means "the version changed or a file went missing" —
+    // exactly the case where a stale PNG from a previous version's artwork
+    // must NOT be left in place. So: unconditionally (re)render every size
+    // whenever we've decided a reinstall is needed at all, matching the SVG
+    // and `.desktop` file below, which already do the same.
     if svg_path.exists() {
         for size in ICON_PNG_SIZES {
             let png_dir = hicolor.join(format!("{size}x{size}/apps"));
             let png_path = png_dir.join(format!("{APP_ID}.png"));
-            if png_path.exists() {
-                // already rendered
-            } else if fs::create_dir_all(&png_dir).is_ok() {
+            if fs::create_dir_all(&png_dir).is_ok() {
                 let size = size as i32;
                 if let Ok(pixbuf) =
                     gtk4::gdk_pixbuf::Pixbuf::from_file_at_size(&svg_path, size, size)
@@ -227,7 +247,9 @@ pub(super) fn install_icon_and_desktop_at(data_dir: &std::path::Path) {
 
     // #1106: record what we just installed so the next launch (same
     // version, files intact) can skip straight past the check above.
-    let _ = fs::write(&stamp_path, current_version);
+    if fs::create_dir_all(&stamp_dir).is_ok() {
+        let _ = fs::write(&stamp_path, current_version);
+    }
 }
 
 /// Contents of the runtime-installed `.desktop` file. Factored out from
@@ -427,12 +449,34 @@ mod tests {
         assert!(icon_install_up_to_date(Some(current), current, true));
     }
 
+    /// RAII guard around a [`scratch_data_dir`] temp directory: removes it on
+    /// drop, including via unwinding, so a panicking `assert_eq!` partway
+    /// through a test (#1106 review nit) can't leak the directory the way a
+    /// plain `let _ = std::fs::remove_dir_all(&data_dir);` at the *end* of
+    /// the test body would — that line is simply never reached if an earlier
+    /// assertion panics first. `Deref<Target = Path>` lets call sites keep
+    /// using it exactly like the `PathBuf` it used to be.
+    struct ScratchDataDir(std::path::PathBuf);
+
+    impl std::ops::Deref for ScratchDataDir {
+        type Target = std::path::Path;
+        fn deref(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl Drop for ScratchDataDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
     /// Scratch directory under the OS temp dir, unique per call so parallel
     /// `cargo test` threads (and repeated runs) never collide. Not a
     /// dependency addition (`tempfile`) — this file has no prior fixture
     /// pattern to match, and one bespoke helper is cheaper than a new crate
     /// for a single test.
-    fn scratch_data_dir(tag: &str) -> std::path::PathBuf {
+    fn scratch_data_dir(tag: &str) -> ScratchDataDir {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -440,7 +484,7 @@ mod tests {
         let dir =
             std::env::temp_dir().join(format!("vimcode-test-{tag}-{}-{nanos}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("create scratch data dir");
-        dir
+        ScratchDataDir(dir)
     }
 
     /// #1106 regression test: a second call with an unchanged version must
@@ -483,7 +527,9 @@ mod tests {
         // Plant a sentinel so a second, unwanted write is observable.
         let sentinel = "SENTINEL: should not be overwritten by a no-op install\n";
         std::fs::write(&desktop_path, sentinel).unwrap();
-        let stamp_path = data_dir.join(ICON_INSTALL_STAMP_FILE);
+        let stamp_path = data_dir
+            .join(ICON_INSTALL_STAMP_DIR)
+            .join(ICON_INSTALL_STAMP_FILE);
         let stamp_mtime_before = std::fs::metadata(&stamp_path).unwrap().modified().unwrap();
 
         // Second call, same version, files all still present: must skip.
@@ -500,8 +546,6 @@ mod tests {
             stamp_mtime_before, stamp_mtime_after,
             "second install must not rewrite the stamp file either"
         );
-
-        let _ = std::fs::remove_dir_all(&data_dir);
     }
 
     /// #1106: a version bump must still trigger a real re-install (#716's
@@ -525,7 +569,13 @@ mod tests {
         std::fs::write(&desktop_path, "stale contents from an old version\n").unwrap();
         // Simulate "the running binary is a newer version than what's
         // installed" by rewinding the stamp instead.
-        std::fs::write(data_dir.join(ICON_INSTALL_STAMP_FILE), "0.0.0-older").unwrap();
+        std::fs::write(
+            data_dir
+                .join(ICON_INSTALL_STAMP_DIR)
+                .join(ICON_INSTALL_STAMP_FILE),
+            "0.0.0-older",
+        )
+        .unwrap();
 
         install_icon_and_desktop_at(&data_dir);
 
@@ -539,11 +589,14 @@ mod tests {
             "a version bump must reinstall the .desktop file, not leave the stale one"
         );
         assert_eq!(
-            std::fs::read_to_string(data_dir.join(ICON_INSTALL_STAMP_FILE)).unwrap(),
+            std::fs::read_to_string(
+                data_dir
+                    .join(ICON_INSTALL_STAMP_DIR)
+                    .join(ICON_INSTALL_STAMP_FILE)
+            )
+            .unwrap(),
             env!("CARGO_PKG_VERSION"),
             "the stamp must be updated to the currently-running version"
         );
-
-        let _ = std::fs::remove_dir_all(&data_dir);
     }
 }

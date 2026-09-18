@@ -80,6 +80,22 @@ name = "acceptance"
 path = "tests/acceptance.rs"
 required-features = ["test-support", "gui"]
 
+# #1106 review: `tests/gtk_no_display.rs` spawns the compiled `vimcode` binary
+# and asserts on the "no display found" message that `src/gtk/mod.rs` prints
+# before `gtk4::init()`. That codepath only exists when the binary was built
+# with the `gui` feature — under `--no-default-features`, `launch_gui` falls
+# straight through to the TUI (see the #859 comment above), so the same
+# no-DISPLAY invocation instead starts the TUI against a piped, immediately-
+# EOF stdin, which is not what this test is exercising and can fail or hang
+# unpredictably in that lane. Pinning `required-features = ["gui"]` makes
+# `cargo test --no-default-features` skip this target instead of running it
+# against the wrong backend (the same trap `tests/acceptance.rs` above and
+# `tests/cli_help.rs`'s `--help` sidestep were written to avoid).
+[[test]]
+name = "gtk_no_display"
+path = "tests/gtk_no_display.rs"
+required-features = ["gui"]
+
 [features]
 default = ["gui"]
 
