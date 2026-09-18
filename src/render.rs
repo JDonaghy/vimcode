@@ -10914,19 +10914,6 @@ fn minimap_block_sample_indices(start: usize, end: usize, cap: usize) -> Vec<usi
         .collect()
 }
 
-/// Which block (index into `bounds`'s implied range list, and thus into the
-/// `lines`/`MinimapLine` vector `build_minimap_data` builds from it) a real
-/// buffer line falls into (#1085) — the replacement for the old exact-match
-/// `sampled_at` lookup, which only ever hit the one line each block used to
-/// point-sample and silently dropped every highlight on any other line.
-fn minimap_block_index_for_line(bounds: &[usize], buf_line: usize) -> usize {
-    if bounds.len() < 2 {
-        return 0;
-    }
-    let idx = bounds.partition_point(|&b| b <= buf_line);
-    idx.saturating_sub(1).min(bounds.len() - 2)
-}
-
 /// 4x4 ordered-dither (Bayer) threshold matrix, values `0..16`.
 ///
 /// A vertical-axis twin of quadraui's own `tui::braille::BAYER4`
@@ -10964,10 +10951,52 @@ fn minimap_block_dither_threshold_met(
     covered * 16 > total * threshold
 }
 
+// #1096: how many times `minimap_line_text` has actually fetched a buffer
+// line's text — a deterministic work counter, not a wall-clock ceiling.
+// `pub(crate)` and `#[cfg(test)]`-only (compiled out of any non-test build)
+// so both this file's own tests and the black-box companion in
+// `tui_main::shell_app` (which only has a `TuiDriver`, not this file's
+// private sampling internals, to assert against) can pin "line fetches per
+// frame is bounded by strip geometry, not buffer length" without the flake
+// risk an absolute-time budget has — the old #728 guard's own doc comment
+// records 517-586ms flakes at a ~20% margin under full-suite contention,
+// and a *constant*-factor regression (e.g. 8x more reads at unchanged strip
+// geometry) cancels out of a same-geometry ratio entirely, which is exactly
+// why that guard stayed green through #1096's regression. Use
+// `count_minimap_line_fetches` rather than touching this directly.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static MINIMAP_LINE_FETCH_COUNT: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Reset [`MINIMAP_LINE_FETCH_COUNT`] and return its value after running
+/// `f` — isolates exactly the line fetches `f` itself triggers (one
+/// `build_minimap_data` call, or one driver redraw).
+#[cfg(test)]
+pub(crate) fn count_minimap_line_fetches(f: impl FnOnce()) -> usize {
+    MINIMAP_LINE_FETCH_COUNT.with(|c| c.set(0));
+    f();
+    MINIMAP_LINE_FETCH_COUNT.with(|c| c.get())
+}
+
 /// Read buffer line `i`'s text, trimming the trailing newline — the exact
 /// line-fetch `build_minimap_data` used inline before #1085 split it out
-/// so `minimap_block_text` and the highlight-mapping loop can share it.
+/// so `minimap_block_text` can build a block's aggregated row text.
+///
+/// #1096: the highlight-mapping loop this doc comment used to say shared
+/// this fetch no longer does — see `minimap_line_content_byte_len` below,
+/// which answers the loop's only real question (a byte offset's character
+/// column within one line) directly against the rope, without ever
+/// materialising the line as a `String`. So every call to this function is
+/// now bounded by `minimap_block_text`'s own caller, which reads at most
+/// `MINIMAP_BLOCK_LINE_SAMPLE_CAP` lines per block — `target_lines *
+/// MINIMAP_BLOCK_LINE_SAMPLE_CAP` `String`s per frame, never buffer length
+/// (the #728 invariant `minimap_line_fetch_count_tracks_target_lines_not_buffer_size`
+/// pins with [`MINIMAP_LINE_FETCH_COUNT`], incremented here in tests only).
 fn minimap_line_text(rope: &ropey::Rope, i: usize) -> String {
+    #[cfg(test)]
+    MINIMAP_LINE_FETCH_COUNT.with(|c| c.set(c.get() + 1));
     rope.line(i)
         .as_str()
         .map(|s| s.trim_end_matches(['\n', '\r']).to_string())
@@ -10977,6 +11006,29 @@ fn minimap_line_text(rope: &ropey::Rope, i: usize) -> String {
                 .trim_end_matches(['\n', '\r'])
                 .to_string()
         })
+}
+
+/// Byte length of a buffer line's content, excluding any trailing line
+/// terminator (`\n`, `\r\n`, or `\r`) — the same trim `minimap_line_text`
+/// applies, but read directly off the caller's own `RopeSlice` (a single
+/// line, already fetched) so it costs no allocation and no further
+/// whole-rope traversal. Used by `build_minimap_data`'s highlight loop
+/// (#1096) to clamp a highlight span's byte offset to the real line it was
+/// measured against, the same clamp `to_col` used to get for free from
+/// `line_str.len()` before that loop fetched a `String` per line.
+fn minimap_line_content_byte_len(slice: ropey::RopeSlice) -> usize {
+    let mut n = slice.len_chars();
+    let mut len = slice.len_bytes();
+    while n > 0 {
+        let ch = slice.char(n - 1);
+        if ch == '\n' || ch == '\r' {
+            len -= ch.len_utf8();
+            n -= 1;
+        } else {
+            break;
+        }
+    }
+    len
 }
 
 /// Build one output `MinimapLine`'s text by aggregating a block of real
@@ -11169,20 +11221,99 @@ pub fn build_minimap_data(
     // aggregate each block's lines (capped, see `MINIMAP_BLOCK_LINE_SAMPLE_CAP`)
     // into one representative row instead of keeping one line and
     // discarding the rest of the block outright.
+    //
+    // #1096: build each block's aggregated text *and* its syntax spans in
+    // this same pass over the same bounded set of sampled lines
+    // (`minimap_block_sample_indices`, at most `MINIMAP_BLOCK_LINE_SAMPLE_CAP`
+    // per block), instead of a second, separate pass over the *entire*
+    // `buffer_state.highlights` vec — `highlights` spans the whole buffer
+    // (`update_syntax` always parses in full; the viewport-scoped
+    // `refresh_syntax_visible` has no callers), so a full scan of it is
+    // itself O(buffer) even when every non-matching entry is skipped in
+    // O(1) (confirmed by hand: an O(1)-per-skip `sampled_at: HashMap<line,
+    // block>` early-out, checked once per entry via
+    // `rope.byte_to_line(*start)`, still left the ratio guard failing —
+    // `buffer_state.highlights.len()` itself grows with the buffer, so
+    // *touching* every entry once already costs more the bigger the file
+    // is, allocation or not).
+    //
+    // `buffer_state.highlights` is sorted by start byte
+    // (`update_syntax_with_limit` sorts it), so for each sampled line this
+    // binary-searches straight to the handful of spans that start on it —
+    // O(log highlights.len()) to find them, not O(highlights.len()) to
+    // filter them. The same sorted-highlights-plus-`partition_point` idiom
+    // already narrows highlights to the viewport a few thousand lines up in
+    // this file; this is that same trick applied per sampled line instead
+    // of to one contiguous window, since the minimap's sampled lines are
+    // scattered across the whole buffer rather than contiguous.
     let bounds = minimap_block_bounds(total_buffer_lines, target_lines);
     if bounds.len() < 2 {
         return None;
     }
-    let owned: Vec<String> = (0..bounds.len() - 1)
-        .map(|r| {
-            let indices = minimap_block_sample_indices(
-                bounds[r],
-                bounds[r + 1],
-                MINIMAP_BLOCK_LINE_SAMPLE_CAP,
-            );
-            minimap_block_text(rope, &indices, r)
-        })
-        .collect();
+    let mut owned: Vec<String> = Vec::with_capacity(bounds.len() - 1);
+    let mut raw_spans: Vec<quadraui::SyntaxSpan> = Vec::new();
+    for r in 0..bounds.len() - 1 {
+        let indices =
+            minimap_block_sample_indices(bounds[r], bounds[r + 1], MINIMAP_BLOCK_LINE_SAMPLE_CAP);
+        owned.push(minimap_block_text(rope, &indices, r));
+        for &i in &indices {
+            let line_start = rope.line_to_byte(i);
+            let line_end = if i + 1 < total_buffer_lines {
+                rope.line_to_byte(i + 1)
+            } else {
+                rope.len_bytes()
+            };
+            let lo = buffer_state
+                .highlights
+                .partition_point(|h| h.0 < line_start);
+            let hi = buffer_state.highlights.partition_point(|h| h.0 < line_end);
+            if lo >= hi {
+                continue;
+            }
+            let slice = rope.line(i);
+            // Clamp to this line's own content, excluding its terminator —
+            // a highlight's byte offsets are only meaningful against the
+            // line they actually came from, and a span that runs past it
+            // (or into the next line) must not paint columns as if they
+            // belonged here.
+            let content_byte_len = minimap_line_content_byte_len(slice);
+            // quadraui's rasterisers treat span columns as *character*
+            // columns (GTK converts them back to byte offsets for Pango
+            // attributes), so convert here rather than handing over raw
+            // byte deltas — locally, against this one line's own
+            // `RopeSlice`, which costs only O(log line_length) and does not
+            // grow with the buffer the way a whole-rope `byte_to_char`
+            // would (measured across #1096's fix iterations: an earlier
+            // version that binary-searched to the right lines but still
+            // converted columns via `rope.byte_to_char` on the whole rope
+            // left the large side of the ratio guard over 600ms/frame).
+            // Capped at `MINIMAP_COL_SCAN_LIMIT` chars: columns past
+            // `MINIMAP_MAX_RELEVANT_COLS` never affect `aggregate_spans`'s
+            // output (it drops any cell at/past `grid.cols`), so counting
+            // further into a long — e.g. minified — line is wasted (#728).
+            let to_col = |b: usize| -> usize {
+                let b = b.min(content_byte_len);
+                slice.byte_to_char(b).min(MINIMAP_COL_SCAN_LIMIT)
+            };
+            for (start, end, scope) in &buffer_state.highlights[lo..hi] {
+                if end <= start {
+                    continue;
+                }
+                let start_col = to_col(start.saturating_sub(line_start));
+                let end_col = to_col(end.saturating_sub(line_start));
+                if end_col <= start_col {
+                    continue;
+                }
+                let c = theme.scope_color(scope);
+                raw_spans.push(quadraui::SyntaxSpan {
+                    line_idx: r,
+                    start_col,
+                    end_col,
+                    color: quadraui::Color::rgb(c.r, c.g, c.b),
+                });
+            }
+        }
+    }
     if owned.is_empty() {
         return None;
     }
@@ -11255,71 +11386,6 @@ pub fn build_minimap_data(
     // (review nit, fix iteration 2 — the extra clamp was unreachable).
     let visible_span_cols = ((rect.width.round().max(1.0)) as usize * MINIMAP_COLS_PER_CELL)
         .max(quadraui::primitives::minimap::COLUMN_CAPACITY);
-
-    // #1085: every real buffer line now maps to *some* block (`lines`
-    // aggregates the whole buffer, not just the point-sampled lines), so a
-    // highlight is looked up by which block its own line falls into
-    // (`minimap_block_index_for_line`) rather than requiring an exact
-    // match against a point-sampled line — the old `sampled_at` exact
-    // lookup silently dropped every highlight whose line wasn't itself the
-    // one line each block happened to sample. `line_text_cache` avoids
-    // re-fetching the same buffer line's text for multiple highlight spans
-    // on it.
-    let mut line_text_cache: std::collections::HashMap<usize, String> =
-        std::collections::HashMap::new();
-    let mut raw_spans: Vec<quadraui::SyntaxSpan> = Vec::new();
-    for (start, end, scope) in &buffer_state.highlights {
-        if end <= start || *start >= rope.len_bytes() {
-            continue;
-        }
-        let buf_line = rope.byte_to_line(*start);
-        if buf_line >= total_buffer_lines {
-            continue;
-        }
-        let idx = minimap_block_index_for_line(&bounds, buf_line);
-        if idx >= lines.len() {
-            continue;
-        }
-        let line_start = rope.line_to_byte(buf_line);
-        // The highlight's own real line text — not the block's aggregated
-        // `owned[idx]`, which may be built from a *different* set of
-        // sampled lines and generally has a different length. Byte offsets
-        // (`start`/`end`) are only meaningful against the line they
-        // actually came from.
-        let line_str = line_text_cache
-            .entry(buf_line)
-            .or_insert_with(|| minimap_line_text(rope, buf_line));
-        // quadraui's rasterisers treat span columns as *character* columns
-        // (GTK converts them back to byte offsets for Pango attributes), so
-        // convert here rather than handing over raw byte deltas. Capped at
-        // `MINIMAP_COL_SCAN_LIMIT` chars: columns past
-        // `MINIMAP_MAX_RELEVANT_COLS` never affect `aggregate_spans`'s
-        // output (it drops any cell at/past `grid.cols`), so counting
-        // further into a long — e.g. minified — line is wasted, and
-        // unbounded: a span's byte offset can land arbitrarily far into
-        // it. Without the cap this was an O(line length) rescan run up to
-        // twice per highlight span on that line (#728).
-        let to_col = |b: usize| -> usize {
-            let b = b.min(line_str.len());
-            line_str
-                .char_indices()
-                .take(MINIMAP_COL_SCAN_LIMIT)
-                .take_while(|&(byte_idx, _)| byte_idx < b)
-                .count()
-        };
-        let start_col = to_col(start.saturating_sub(line_start));
-        let end_col = to_col(end.saturating_sub(line_start));
-        if end_col <= start_col {
-            continue;
-        }
-        let c = theme.scope_color(scope);
-        raw_spans.push(quadraui::SyntaxSpan {
-            line_idx: idx,
-            start_col,
-            end_col,
-            color: quadraui::Color::rgb(c.r, c.g, c.b),
-        });
-    }
 
     let grid = quadraui::MinimapGrid {
         rows: lines.len().div_ceil(MINIMAP_LINES_PER_ROW).max(1),
@@ -24356,15 +24422,43 @@ mod tests {
     }
 
     /// A synthetic file large enough to make an O(buffer) per-frame cost
-    /// visible: 10,000 lines, none of them trivially short (so a full
+    /// visible: `n_lines` lines, none of them trivially short (so a full
     /// buffer-wide `String` materialisation actually does real allocation
-    /// work, not just touch 10,000 empty strings).
+    /// work, not just touch thousands of empty strings).
+    ///
+    /// #1096 (repairing the #728 guard's blind spot 2): installs a real
+    /// `Syntax` and forces a full reparse, so `buffer_state.highlights` is
+    /// actually populated — `test_engine` alone leaves `syntax: None` (no
+    /// filetype), which is exactly how the #1096 regression (an unbounded
+    /// per-highlighted-line `String` cache in `build_minimap_data`'s
+    /// highlight-mapping loop) went unexercised by every test using this
+    /// fixture: with `highlights` empty, that loop's body never ran at all.
+    /// The text itself (`fn line_N() { do_something(N); }`) was already
+    /// valid enough tree-sitter-Rust input to produce dense, realistic
+    /// highlight spans once a language is actually attached.
     fn large_minimap_engine(n_lines: usize) -> Engine {
         let mut text = String::with_capacity(n_lines * 24);
         for i in 0..n_lines {
             text.push_str(&format!("fn line_{i}() {{ do_something({i}); }}\n"));
         }
-        test_engine(&text)
+        let mut e = test_engine(&text);
+        let state = e.active_buffer_state_mut();
+        state.syntax = Some(crate::core::syntax::Syntax::new_for_language(
+            crate::core::syntax::SyntaxLanguage::Rust,
+        ));
+        // Explicit, generous limit rather than `update_syntax()`'s
+        // process-wide `SYNTAX_MAX_LINES` atomic — other tests write that
+        // atomic (see `test_syntax_max_lines_gate`'s own doc comment), so
+        // reading it here would make this fixture's highlight population
+        // racy under `cargo test`'s default parallelism.
+        state.update_syntax_with_limit(n_lines.saturating_add(1));
+        assert!(
+            !state.highlights.is_empty(),
+            "fixture must produce real highlights or the #1096 regression \
+             class (unbounded per-line allocation in the highlight-mapping \
+             loop) goes unexercised again"
+        );
+        e
     }
 
     /// Time `frames` simulated wheel-scroll frames of `build_minimap_data`
@@ -24424,6 +24518,25 @@ mod tests {
     ///
     /// So the discriminator is ~1x (fixed) vs ~10x (linear); the 4x
     /// threshold below sits between them with generous room on both sides.
+    ///
+    /// #1096 repaired this guard's own blind spot: `large_minimap_engine`
+    /// now installs real Rust highlights (see that fixture's doc comment),
+    /// so this same measurement now also covers the highlight-mapping loop
+    /// — which is exactly where #1096's regression lived, and which the
+    /// unhighlighted fixture used to skip entirely. Re-measured after that
+    /// fix, same machine/build, same 1,000- vs 10,000-line/150-frame setup:
+    ///   - #1096 regression, allocation only removed (highlight loop still
+    ///     scans every entry in `buffer_state.highlights`, itself O(buffer)):
+    ///     up to **~3,167ms/frame** at 10,000 lines, ratio up to ~9.9x —
+    ///     failed this guard outright.
+    ///   - #1096 fix (binary-search each sampled line directly into the
+    ///     sorted `highlights` vec, `partition_point`, instead of scanning
+    ///     it): **~34-44ms/frame**, ratio ~1.3x. The residual ~22ms/frame
+    ///     floor (measured with `highlights` forced empty, same fixture) is
+    ///     #1085's own block-aggregation cost — inherent to that issue's
+    ///     correctness fix, unrelated to highlighting, and out of this
+    ///     issue's scope (see #1093, which replaces this whole sampling
+    ///     strategy, and #1097, the separate non-minimap CPU cost).
     #[test]
     fn minimap_scroll_does_not_scale_with_buffer_size() {
         const SMALL_LINES: usize = 1_000;
@@ -24465,6 +24578,91 @@ mod tests {
              lines: {large_ms:.4}ms/frame) — the per-frame cost must track \
              the strip's display rows, not the buffer; this smells like a \
              return of the whole-buffer materialisation"
+        );
+    }
+
+    /// #1096 regression guard, repairing both of the #728 guard's blind
+    /// spots at once:
+    ///
+    /// - **Blind spot 1** (`minimap_scroll_does_not_scale_with_buffer_size`
+    ///   asserts a *ratio*, not a ceiling): a same-geometry constant-factor
+    ///   regression multiplies both sides of that ratio equally and cancels
+    ///   out exactly — which is what let #1096 land invisibly (8x more line
+    ///   reads, ~20x more surviving highlight spans, at unchanged
+    ///   `target_lines`). This test instead counts real work
+    ///   (`MINIMAP_LINE_FETCH_COUNT`, incremented once per
+    ///   `minimap_line_text` call) and checks it against a formula derived
+    ///   from `target_lines`, not against a sibling run's own — possibly
+    ///   also regressed — cost.
+    /// - **Blind spot 2** (that test's fixture never set a filetype, so
+    ///   `highlights` stayed empty and the loop #1096 regressed never ran):
+    ///   `large_minimap_engine` now installs a real `Syntax` and asserts
+    ///   its own highlights are non-empty (see that fixture's doc comment).
+    ///
+    /// Both buffers use blocks large enough to saturate
+    /// `MINIMAP_BLOCK_LINE_SAMPLE_CAP` (`n_lines / target_lines` well over
+    /// the cap in both cases), so both should hit the exact same fetch
+    /// ceiling regardless of the 10x difference in buffer size — the #728
+    /// invariant this test exists to pin, stated as a number instead of a
+    /// ratio.
+    ///
+    /// **RED against the unfixed highlight-mapping loop:** confirmed by
+    /// hand — reinstating the per-call `line_text_cache: HashMap<usize,
+    /// String>` the loop used before this fix makes `large_fetches` grow
+    /// with the highlighted line count (~buffer size) instead of staying
+    /// pinned to the block-sampling ceiling, so `large_fetches >
+    /// small_fetches` (and both blow past `ceiling`) once `n_lines` is
+    /// large enough that most highlighted lines aren't themselves block
+    /// starts. Reverted before landing this test.
+    #[test]
+    fn minimap_line_fetch_count_tracks_target_lines_not_buffer_size() {
+        const SMALL_LINES: usize = 2_000;
+        const LARGE_LINES: usize = 20_000;
+
+        let small = large_minimap_engine(SMALL_LINES);
+        let large = large_minimap_engine(LARGE_LINES);
+        let theme = Theme::onedark();
+        let rect = WindowRect::new(0.0, 0.0, 100.0, 40.0);
+        let wid_small = small.active_window_id();
+        let wid_large = large.active_window_id();
+
+        let small_fetches = count_minimap_line_fetches(|| {
+            let mm = build_minimap_data(&small, &theme, wid_small, rect, 1.0, 40);
+            assert!(mm.is_some(), "minimap must build for the small fixture");
+        });
+        let large_fetches = count_minimap_line_fetches(|| {
+            let mm = build_minimap_data(&large, &theme, wid_large, rect, 1.0, 40);
+            assert!(mm.is_some(), "minimap must build for the large fixture");
+        });
+
+        assert_eq!(
+            small_fetches, large_fetches,
+            "line fetches must depend only on strip geometry, not buffer \
+             length ({SMALL_LINES}-line buffer: {small_fetches} fetches, \
+             {LARGE_LINES}-line buffer: {large_fetches} fetches) — a \
+             mismatch means some path (most likely the highlight-mapping \
+             loop) is scanning proportionally to the buffer again"
+        );
+
+        // The ceiling itself, computed the same way `build_minimap_data`
+        // derives `target_lines` at this rect/line_height, so this stays in
+        // lockstep with that formula rather than hardcoding a number that
+        // could silently drift from it.
+        let display_rows = 40usize;
+        let gtk_row_capacity =
+            (rect.height / quadraui::primitives::minimap::ROW_PITCH_PX).floor() as usize;
+        let target_lines = display_rows
+            .saturating_mul(MINIMAP_LINES_PER_ROW)
+            .max(gtk_row_capacity)
+            .max(1);
+        let ceiling = target_lines * MINIMAP_BLOCK_LINE_SAMPLE_CAP;
+        assert!(
+            small_fetches <= ceiling,
+            "expected at most {ceiling} line fetches (target_lines=\
+             {target_lines} * MINIMAP_BLOCK_LINE_SAMPLE_CAP=\
+             {MINIMAP_BLOCK_LINE_SAMPLE_CAP}), got {small_fetches} — the \
+             #728 invariant (bounded by strip size, not buffer length) no \
+             longer holds"
         );
     }
 
