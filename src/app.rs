@@ -2943,6 +2943,35 @@ impl App {
         effect.consumed
     }
 
+    /// Run the shared panel-hover-popup click rung (#1067) against this
+    /// frame's painted link rects.
+    ///
+    /// Before #1067 this backend painted and cached `panel_hover_link_rects`
+    /// (`render::panel_hover_popup_paint`, called from `render_content`) but
+    /// never read them back on click — clicking a link in the source-control
+    /// / extension-panel item dwell tooltip was a complete no-op on GTK,
+    /// where TUI already copied the URL (or ran the `command:` link) via its
+    /// own inline hit test in `mouse::handle_mouse`. `panel_hover_popup_paint`'s
+    /// own doc traces this back to the #540 Relm4->ShellApp migration
+    /// retiring `Msg::PanelHoverClick` without a replacement.
+    ///
+    /// Returns `true` when the press landed on a link and must not fall
+    /// through to whatever is painted underneath.
+    fn route_and_apply_panel_hover_popup(&self, x: f64, y: f64) -> bool {
+        let links = self.panel_hover_link_rects.borrow();
+        let route = render::route_panel_hover_popup_click(&links, x, y);
+        drop(links);
+        if route == render::PanelHoverPopupRoute::None {
+            return false;
+        }
+        let effect = render::apply_panel_hover_popup_route(&mut self.engine.borrow_mut(), route);
+        if let Some(url) = effect.open_url {
+            open_url(&url);
+        }
+        self.draw_needed.set(true);
+        effect.consumed
+    }
+
     /// Popup-content column under `rel_x` (pixels from the content origin).
     ///
     /// Used by the hover-selection *drag* follow-through; the press itself
@@ -4598,6 +4627,18 @@ impl App {
         // behind it (#229/#486). It runs above that dispatch now — where TUI
         // always had it — because the popup paints on top of the editor.
         if self.route_and_apply_editor_hover_popup(x, y) {
+            return;
+        }
+
+        // ── Panel-hover popup link click (#1067) ──────────────────────────
+        //
+        // Shared with TUI's `mouse::handle_mouse` via `render::
+        // route_panel_hover_popup_click` + `render::
+        // apply_panel_hover_popup_route` — see `route_and_apply_panel_hover_
+        // popup`'s doc for why this backend never had it before. Checked
+        // above the scroll-surface dispatch for the same reason the editor
+        // hover popup is: the popup paints on top of whatever is under it.
+        if self.route_and_apply_panel_hover_popup(x, y) {
             return;
         }
 

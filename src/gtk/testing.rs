@@ -135,6 +135,10 @@ pub struct Harness<A: AppLogic> {
     /// Sidebar-item hover popup bounds the last frame painted,
     /// or `None` if that frame drew no panel-hover popup (#670).
     pub panel_hover_popup_rect: Rc<std::cell::Cell<Option<quadraui::Rect>>>,
+    /// The panel-hover popup's painted link rects (rect, uri, is_native).
+    /// Exposed for #1067's click-rung coverage — same "aim at what was
+    /// painted" reasoning as `editor_hover_link_rects` above.
+    pub panel_hover_link_rects: Rc<RefCell<Vec<(quadraui::Rect, String, bool)>>>,
     /// Tab-switcher popup bounds the last frame painted, or
     /// `None` if that frame drew no tab switcher (#671). Same field
     /// `handle_mouse_press`'s "Tab switcher modal arbitration" block reads
@@ -477,6 +481,7 @@ pub fn harness(engine: Engine, width: i32, height: i32) -> Harness<impl AppLogic
     let editor_hover_scrollbar = Rc::clone(&app.editor_hover_scrollbar);
     let editor_hover_link_rects = Rc::clone(&app.editor_hover_link_rects);
     let panel_hover_popup_rect = Rc::clone(&app.panel_hover_popup_rect);
+    let panel_hover_link_rects = Rc::clone(&app.panel_hover_link_rects);
     let tab_switcher_popup_rect = Rc::clone(&app.tab_switcher_popup_rect);
     let composed_frame = Rc::clone(&app.composed_frame);
     let composed_editor_band = Rc::clone(&app.composed_editor_band);
@@ -502,6 +507,7 @@ pub fn harness(engine: Engine, width: i32, height: i32) -> Harness<impl AppLogic
         editor_hover_scrollbar,
         editor_hover_link_rects,
         panel_hover_popup_rect,
+        panel_hover_link_rects,
         tab_switcher_popup_rect,
         composed_frame,
         composed_editor_band,
@@ -4999,6 +5005,65 @@ mod panel_surfaces {
             differing > 0,
             "panel hover popup must paint new pixels within its own cached bounds; \
              {differing}/{total} sampled pixels differed"
+        );
+    }
+
+    /// #1067: clicking a link inside the panel-hover popup (source-control /
+    /// extension-panel item dwell tooltip) was a complete no-op on GTK —
+    /// this backend painted and cached `panel_hover_link_rects` (exercised
+    /// above by `panel_hover_popup_paints_and_caches_bounds`, whose own doc
+    /// called it "the same cache a future click handler would read") but
+    /// never read them back on click. TUI already had this via its own
+    /// inline hit test in `mouse::handle_mouse`; #1067 moved that hit test
+    /// into the shared `render::route_panel_hover_popup_click` +
+    /// `render::apply_panel_hover_popup_route` rung and wired GTK's
+    /// `App::route_and_apply_panel_hover_popup` onto it.
+    ///
+    /// The link's rect comes from what was painted, never hardcoded.
+    ///
+    /// **RED against unfixed `develop`:** without `route_and_apply_panel_
+    /// hover_popup`'s call in `handle_mouse_click_msg`, the click below
+    /// lands on the link's painted rect but nothing on this backend reads
+    /// `panel_hover_link_rects` back — the popup stays open and
+    /// `PANELHOVER1067` keeps painting.
+    #[test]
+    fn panel_hover_popup_link_click_dismisses_the_popup_on_gtk() {
+        let mut engine = small_engine();
+        engine.show_panel_hover(
+            "source_control",
+            "item0",
+            0,
+            "PANELHOVER1067 [commit1067](https://example.com/panelhover1067)",
+        );
+        let mut h = harness(engine, 1400, 900);
+        assert!(
+            h.driver.screen_contains("PANELHOVER1067"),
+            "precondition: the panel hover popup body must paint; screen was {:?}",
+            h.driver.painted_texts()
+        );
+
+        let (rect, uri, _is_native) = h
+            .panel_hover_link_rects
+            .borrow()
+            .first()
+            .cloned()
+            .expect("the popup's link must have painted a hit rect");
+        assert_eq!(uri, "https://example.com/panelhover1067");
+
+        h.driver.dispatch(quadraui::UiEvent::MouseDown {
+            widget: None,
+            button: quadraui::MouseButton::Left,
+            position: quadraui::Point::new(rect.x + rect.width / 2.0, rect.y + rect.height / 2.0),
+            modifiers: quadraui::Modifiers::default(),
+        });
+        h.driver.render();
+
+        assert!(
+            !h.driver.screen_contains("PANELHOVER1067"),
+            "a click on the panel-hover popup's link must be consumed by the \
+             shared panel-hover click rung — dismissing the popup — not fall \
+             through as a no-op (#1067); screen was {:?}",
+            h.driver.painted_texts()
         );
     }
 }

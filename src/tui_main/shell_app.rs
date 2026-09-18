@@ -366,14 +366,20 @@ use quadraui::{Reaction, ShellApp, ShellContext, UiEvent};
 
 use super::*;
 
-/// Link hit rects from a hover popup render: `(rect, url)`, matching
-/// `event_loop`'s `hover_link_rects`/`editor_hover_link_rects` locals
-/// verbatim. Named alias so the `TuiShellApp` fields below don't trip
-/// clippy's `type_complexity` lint. `quadraui::Rect` (#831) — TUI passes
-/// cell coordinates as `f32`, same as GTK's pixel coordinates; there is no
-/// unit parameter in quadraui's layout API, so both backends share this
-/// exact type.
+/// Link hit rects from the editor-hover-popup render: `(rect, url)`, matching
+/// `event_loop`'s `editor_hover_link_rects` local verbatim. Named alias so
+/// the `TuiShellApp` fields below don't trip clippy's `type_complexity`
+/// lint. `quadraui::Rect` (#831) — TUI passes cell coordinates as `f32`,
+/// same as GTK's pixel coordinates; there is no unit parameter in
+/// quadraui's layout API, so both backends share this exact type.
 type HoverLinkRects = Vec<(quadraui::Rect, String)>;
+
+/// Link hit rects from the panel-hover-popup render: `(rect, url,
+/// is_native)`. Matches GTK's `App::panel_hover_link_rects` element-for-
+/// element (#1067) — before this, TUI's cache dropped the trailing
+/// `is_native` flag GTK's carried, which is why the two could not share one
+/// click router.
+type PanelHoverLinkRects = Vec<(quadraui::Rect, String, bool)>;
 
 /// Activity-bar item id for the menu hamburger.
 ///
@@ -436,7 +442,7 @@ pub struct TuiShellApp {
     last_clipboard_content: Option<String>,
     pending_startup_msg: Option<String>,
     had_popup_overlay: Cell<bool>,
-    hover_link_rects: RefCell<HoverLinkRects>,
+    hover_link_rects: RefCell<PanelHoverLinkRects>,
     hover_popup_rect: Cell<Option<quadraui::Rect>>,
     editor_hover_popup_rect: Cell<Option<quadraui::Rect>>,
     editor_hover_link_rects: RefCell<HoverLinkRects>,
@@ -698,12 +704,13 @@ impl TuiShellApp {
                 // The rasteriser stays per-backend here — the `EditorOp
                 // ::Windows` precedent. TUI's `hover_popup_rect` /
                 // `hover_link_rects` caches are `quadraui::Rect` now (#831),
-                // same as GTK's — GTK's link rects still carry a trailing
-                // `is_native` flag TUI's don't need, so the two `Vec` element
-                // shapes aren't byte-identical, but both express the rect
-                // itself in the one shared type rather than two backend-local
-                // tuple layouts. What #765 fixes is that the rung is now
-                // composed — and cleared — at the top level on both backends.
+                // same as GTK's, and (#1067) `hover_link_rects`' element
+                // shape now matches GTK's `panel_hover_link_rects` exactly
+                // (trailing `is_native` flag included), so
+                // `render::route_panel_hover_popup_click` is callable from
+                // both without an adapter. What #765 fixes is that the rung
+                // is now composed — and cleared — at the top level on both
+                // backends.
                 render::BottomOp::PanelHover => {
                     let Some(sb) = layout.sidebar_content_bounds else {
                         continue;
@@ -19526,6 +19533,68 @@ mod tests {
              active section back to Staged, proving `sc_sidebar_navigate` \
              recognises it — before #1060 this was a silent no-op and the \
              active section would have stayed on Changes; screen:\n{}",
+            driver.screen()
+        );
+    }
+
+    /// #1067: the panel-hover popup's link-click-to-copy rung moved out of
+    /// an inline hit test in `mouse::handle_mouse` into the shared
+    /// `render::route_panel_hover_popup_click` +
+    /// `render::apply_panel_hover_popup_route` — the same rung GTK's
+    /// `App::route_and_apply_panel_hover_popup` now calls too (previously a
+    /// complete no-op there). This is the first driver-tier coverage this
+    /// TUI-only feature ever had.
+    ///
+    /// Drives the real painted geometry (`driver.find_bounds`), not a
+    /// hardcoded cell, then asserts on two independently observable painted
+    /// effects: the popup's own body text disappearing (dismissed), and the
+    /// engine's message line showing the "Copied: <url>" text
+    /// `tui_copy_to_clipboard` writes — proving the click actually reached
+    /// the copy step, not just some unrelated dismissal.
+    ///
+    /// **RED against unfixed `develop`:** comment out the `render::
+    /// route_panel_hover_popup_click` call in `mouse.rs`'s panel-hover-popup
+    /// arm and the click below lands but nothing consumes it — the popup
+    /// stays open and no "Copied:" message appears.
+    #[test]
+    fn panel_hover_popup_link_click_copies_and_dismisses_via_shell_app() {
+        let mut app = app_with_sidebar_open();
+        app.engine.show_panel_hover(
+            "source_control",
+            "item0",
+            0,
+            "PANELHOVER1067TUI [commit1067tui](https://example.com/panelhover1067tui)",
+        );
+
+        let mut driver = driver_with_shell(app, config(), 100, 30);
+        assert!(
+            driver.screen_contains("PANELHOVER1067TUI"),
+            "precondition: the panel hover popup body must paint; screen:\n{}",
+            driver.screen()
+        );
+
+        let (lx, ly) = driver
+            .find("commit1067tui")
+            .expect("the popup's markdown link text must paint");
+
+        driver.dispatch(UiEvent::MouseDown {
+            widget: None,
+            button: quadraui::MouseButton::Left,
+            position: quadraui::Point::new(lx, ly),
+            modifiers: quadraui::Modifiers::default(),
+        });
+        driver.render();
+
+        assert!(
+            !driver.screen_contains("PANELHOVER1067TUI"),
+            "a click on the panel-hover popup's link must dismiss the popup; \
+             screen:\n{}",
+            driver.screen()
+        );
+        assert!(
+            driver.screen_contains("Copied: https://example.com/panelhover1067tui"),
+            "the click must copy the link's URL to the clipboard and surface \
+             that on the message line; screen:\n{}",
             driver.screen()
         );
     }
