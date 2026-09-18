@@ -9136,6 +9136,37 @@ pub fn panel_hover_to_quadraui_rich_text(
     }
 }
 
+/// On-screen content row (0-based, relative to the ext panel's own chrome)
+/// for an ext-panel hover's flat `item_index` — the inverse of
+/// `route_sidebar_hover`'s `SidebarOwner::ExtPanel` arm, which sets
+/// `flat_idx = engine.ext_panel_scroll_top + row` (`render.rs`, just above
+/// [`route_sidebar_hover`]). #1087: the anchor code used to skip this
+/// subtraction entirely and anchor to the flat index as if it were a screen
+/// row, so anything scrolled past the first screenful painted dozens of rows
+/// below the viewport.
+///
+/// Returns `None` when `item_index` is behind the current scroll offset,
+/// which can happen for one stale frame immediately after a scroll (the
+/// hover popup should simply not paint that frame — an `f32` cast of a
+/// wrapped `usize` subtraction would otherwise park it at infinity).
+pub(crate) fn ext_panel_hover_screen_row(panel: &ExtPanelData, item_index: usize) -> Option<usize> {
+    item_index.checked_sub(panel.scroll_top)
+}
+
+/// Chrome rows an ext panel paints above its first content row: the header,
+/// plus the search-input row when it's visible. Mirrors `render_ext_panel`'s
+/// own `chrome_h` (`tui_main/panels.rs`) — the same condition
+/// `mouse.rs`'s `SidebarOwner::ExtPanel` click arm uses for
+/// `SidebarBodyGeometry::header_rows` (#1086) — so hover and click can't
+/// drift on what counts as chrome.
+pub(crate) fn ext_panel_chrome_rows(panel: &ExtPanelData) -> usize {
+    if panel.input_active || !panel.input_text.is_empty() {
+        2
+    } else {
+        1
+    }
+}
+
 /// Vertical anchor (top of the hovered row, in the caller's line units) for
 /// [`panel_hover_popup_paint`]. Lifted from the now-dead
 /// `src/gtk/draw.rs::draw_panel_hover_popup`'s source-control section walk
@@ -9145,14 +9176,27 @@ pub fn panel_hover_to_quadraui_rich_text(
 /// true in the pre-#552 single-DA GTK architecture that dead code was
 /// written against, no longer true now that a title-bar row can sit above
 /// the sidebar.
+///
+/// Returns `None` when the anchor can't be computed this frame (#1087's
+/// scroll-underflow guard, or no `screen.ext_panel` yet) — callers should
+/// skip painting the popup for that frame rather than clamp to a garbage
+/// position.
 fn panel_hover_anchor_y(
     screen: &ScreenLayout,
     hover: &PanelHoverPopupData,
     sidebar_top_y: f32,
     unit_h: f32,
-) -> f32 {
+) -> Option<f32> {
     if hover.panel_name != "source_control" {
-        return sidebar_top_y + unit_h + hover.item_index as f32 * unit_h;
+        // #1087: `hover.item_index` is a flat index across the whole panel
+        // list, not a screen row — subtract the scroll offset back out, and
+        // use the chrome rows this panel actually painted (1 or 2,
+        // depending on whether the search input row is showing) instead of
+        // the literal `1` this used to hardcode.
+        let panel = screen.ext_panel.as_ref()?;
+        let screen_row = ext_panel_hover_screen_row(panel, hover.item_index)?;
+        let chrome_rows = ext_panel_chrome_rows(panel);
+        return Some(sidebar_top_y + chrome_rows as f32 * unit_h + screen_row as f32 * unit_h);
     }
     // SC layout: `section_top` is read from the cached `SidebarPanelLayout`
     // (`sc_sections_start_y`, already an absolute coordinate — see its own
@@ -9174,7 +9218,7 @@ fn panel_hover_anchor_y(
             unit_h + gap + commit_rows * unit_h + unit_h
         });
     let Some(ref sc) = screen.source_control else {
-        return section_top + hover.item_index as f32 * unit_h;
+        return Some(section_top + hover.item_index as f32 * unit_h);
     };
     // Walk sections to find the accumulated Y offset for the hovered flat
     // index. Headers occupy one row; expanded items occupy `item_height`
@@ -9220,7 +9264,7 @@ fn panel_hover_anchor_y(
             }
         }
     }
-    y_off
+    Some(y_off)
 }
 
 /// Paint the sidebar-item hover popup (source-control / extension-panel item
@@ -9276,7 +9320,12 @@ pub fn panel_hover_popup_paint(
     let content_w = ((max_len + 2.0) * unit_w)
         .max(10.0 * unit_w)
         .min((avail_w - 2.0 * unit_w).max(10.0 * unit_w));
-    let anchor_y = panel_hover_anchor_y(screen, hover, sidebar_top_y, unit_h);
+    // #1087: `None` means the anchor can't be trusted this frame (e.g. the
+    // scroll-underflow guard in `ext_panel_hover_screen_row`) — skip
+    // painting rather than fall back to a stale/garbage position.
+    let Some(anchor_y) = panel_hover_anchor_y(screen, hover, sidebar_top_y, unit_h) else {
+        return (vec![], None);
+    };
     let measure = quadraui::RichTextPopupMeasure::new(content_w, unit_h);
     // `Placement::Below` adds one row height to the anchor, so subtract it
     // here to land the box's top border exactly on `anchor_y` — same trick
