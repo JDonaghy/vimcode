@@ -229,10 +229,30 @@ proof, not just the diff looking smaller.
     below), not a line-count win.
 
 **Wave 3 — needs a product decision before converging:**
-13. Should GTK gain `PANEL_GIT`/`SEARCH`/`SETTINGS`/ext-panel wheel scroll to
-    match TUI? Mechanical shape already known (route through the same
-    `handle_*_sidebar_ui_event` calls when the pointer is over the sidebar
-    body).
+13. ✅ **Decided (#1065): yes** — every other GUI app scrolls a scrollable
+    panel under the wheel. Turned out **already wired for Git and Settings**:
+    GTK's generic `try_route_sidebar_mouse_event` has routed `UiEvent::Scroll`
+    to `handle_sc_sidebar_ui_event`/the Settings `FormController` since
+    #544/#754, well before this audit — the "GTK missing PANEL_GIT/SETTINGS
+    wheel scroll" line above was simply wrong, never empirically checked.
+    **Search was genuinely broken**: `paint_sidebar_panel_rung`'s
+    `PANEL_SEARCH` arm never called `search_sidebar_system.set_backend_info`
+    — the exact #971 gap (`SidebarSystem::handle_cached` returns `Ignored`
+    unconditionally until it's called once) already fixed for the git and
+    ext-sidebar systems but missed for search, so every wheel notch (and
+    every content-row click) over the results tree silently no-op'd. One-line
+    fix, RED-verified against unfixed `develop`, driver tests added for git
+    and search (`src/gtk/testing.rs::sidebar_panel_clicks`; settings already
+    had one). **Ext-panel (plugin `ext_panel_active` panels) is out of scope
+    here, genuinely blocked**: GTK's `id if id.starts_with("ext:")` paint arm
+    and `try_route_sidebar_mouse_event`'s `ExtPanel` click arm both operate on
+    `ext_sidebar_system` (the built-in Extensions *marketplace* tree) instead
+    of the plugin's own `build_ext_panel_data`/`ext_panel_scroll_top` state —
+    a pre-existing content-routing bug independent of scroll (already flagged
+    by `switching_to_a_plugin_panel_clears_stale_marketplace_focus`'s doc
+    comment as "not this issue's to fix"). Needs its own vimcode issue before
+    ext-panel wheel scroll can be tested/fixed for real; once that lands,
+    scroll comes for free through the same rung Git/Search/Settings use.
 14. Should TUI's editor wheel scroll the hovered (unfocused) pane the way
     GTK's `hovered_window_id` does? Mechanical shape known (`render::
     find_window_at` + a `_for_window` scroll call).

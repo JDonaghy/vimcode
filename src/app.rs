@@ -3282,6 +3282,23 @@ impl App {
                 engine.explorer_tree.borrow().render(backend, q_sb);
             }
             PANEL_SEARCH => {
+                // #1065: `search_sidebar_system` never had `set_backend_info`
+                // called on this backend — the exact #971 gap
+                // (`gui_sidebar_system_metrics`'s own doc) that left
+                // `SidebarSystem::handle_cached` returning
+                // `SidebarEvent::Ignored` unconditionally, fixed for
+                // `sc_sidebar_system` (this match's `PANEL_GIT` arm) and
+                // `ext_sidebar_system` (`refresh_ext_sidebar_metrics`) but
+                // missed here. Every content-row press *and* every wheel
+                // notch over the search results list silently no-op'd —
+                // `search_panel_click_focuses_the_query_field`'s click landed
+                // on the query text box, a separate hit-test that never goes
+                // through `handle_cached`, so it never caught this.
+                let search_lh = backend.line_height();
+                engine
+                    .search_sidebar_system
+                    .borrow_mut()
+                    .set_backend_info(search_lh, render::gui_sidebar_system_metrics(search_lh));
                 render::populate_search_sidebar_system(engine, &engine.cwd);
                 engine.search_sidebar_body_rect.set(q_sb);
                 engine.search_sidebar_system.borrow().render(backend, q_sb);
