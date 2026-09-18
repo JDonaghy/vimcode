@@ -11261,6 +11261,23 @@ pub fn build_minimap_data(
             ((fraction * max_start as f64).round() as usize).min(max_start)
         }
     };
+    // Downstream code (the viewport-highlight band `build_minimap_data`
+    // paints further below, and every consumer of `Minimap::visible_row_start`)
+    // relies on `scroll_top` always landing inside
+    // `[window_start_line, window_start_line + window_len)` once the window
+    // has slid. That holds here only because `target_lines` (hence
+    // `window_len`) is derived from `display_rows`/`gtk_row_capacity` —
+    // both sized off the same pane height `editor_visible_rows` comes from
+    // at the one production call site — so the window is always at least as
+    // tall as the editor's own viewport. It is **not** a general contract of
+    // this function: a future caller that decouples the strip's height from
+    // the editor's own visible-row count (passing a `rect`/`line_height`
+    // pair that yields a `target_lines` smaller than `editor_visible_rows`)
+    // could shrink the window below the viewport and violate it. Several of
+    // the unit tests below call `build_minimap_data` directly with
+    // deliberately mismatched `rect`/`editor_visible_rows` pairs to probe
+    // the windowing math in isolation — keep that mismatch out of the one
+    // real call site.
 
     // #1085: partition the *window* into `target_lines`-many blocks *before*
     // fetching any line text (same #728 discipline the old point-sampler

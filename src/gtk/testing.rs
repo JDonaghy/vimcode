@@ -7518,6 +7518,137 @@ mod minimap {
         );
     }
 
+    /// #1093 review follow-up: the two GTK minimap-click driver tests above
+    /// (`minimap_click_at_the_middle_scrolls_to_half_the_file`, 400 lines at
+    /// a 1400x900 harness) and below in `editor_mouse_rungs`
+    /// (`minimap_click_scrolls_the_editor_on_gtk`, 60 lines at 1050x600)
+    /// both use fixtures short enough that the whole file fits inside the
+    /// strip's own real row capacity (`gtk_row_capacity` in
+    /// `build_minimap_data`, `rect.height / ROW_PITCH_PX`) — so
+    /// `window_len == total_buffer_lines` and `window_start_line` stays `0`
+    /// on every frame in both of them. Neither test ever reaches the #1093
+    /// sliding-window math at all; both exercise byte-for-byte the
+    /// pre-#1093 "whole file already fits" path. This is the GTK
+    /// counterpart of the sliding-window acceptance already covered on TUI
+    /// (`minimap_window_slides_to_show_a_distinctive_line_once_scrolled_to_it`
+    /// / `minimap_click_at_the_middle_scrolls_to_the_middle_of_the_painted_window`
+    /// in `tui_main/shell_app.rs`): a file tall enough that GTK's own real,
+    /// pixel-denominated `gtk_row_capacity` is exceeded several times over.
+    ///
+    /// (a) With the cursor pinned to the top of the file, the strip's last
+    ///     painted row (`mm.minimap.lines.last()`) must stand in for a
+    ///     buffer line well short of the file's actual last line — proof
+    ///     the strip holds a *window* onto the buffer, not the whole file
+    ///     squeezed to fit (which would always pin the last painted row to
+    ///     `total_buffer_lines - 1`, regardless of scroll position).
+    /// (b) A click near the bottom of the strip must advance `scroll_top`
+    ///     by roughly the window's own span (a page-down), not jump to the
+    ///     file's last line — the EOF-jump bug this issue reports.
+    ///
+    /// RED-first: reverting `build_minimap_data`'s windowing (handing
+    /// `minimap_block_bounds` `total_buffer_lines` directly again, as
+    /// unfixed `develop` did) makes assertion (a) fail — the strip's last
+    /// painted row once again stands in for the file's actual last line —
+    /// and pushes the bottom-of-strip click's resulting `scroll_top` up
+    /// near `total_buffer_lines - 1` instead of inside roughly one
+    /// window's worth of the top, failing assertion (b). Confirmed by hand
+    /// before restoring the fix.
+    #[test]
+    fn minimap_click_near_the_bottom_pages_instead_of_jumping_to_eof_on_gtk() {
+        // Enough lines that the strip's real GTK row capacity (measured at
+        // ~378 rows for this harness's 1400x900 size by the #1052 test
+        // above) is exceeded well over an order of magnitude, so the
+        // sliding-window math is actually exercised rather than the
+        // "whole file already fits" branch every other GTK minimap test in
+        // this module happens to take.
+        let n_lines = 5_000usize;
+        let mut engine = Engine::new_for_test();
+        let text: String = (0..n_lines).map(|i| format!("line {i}\n")).collect();
+        engine.buffer_mut().insert(0, &text);
+
+        let mut h = harness(engine, 1400, 900);
+        let win = h.engine.borrow().active_window_id();
+        h.window_center(win).expect("editor pane must paint");
+        assert_eq!(
+            h.engine.borrow().scroll_top(),
+            0,
+            "fixture must start at the top of the file"
+        );
+
+        let (strip, window_len, last_painted_line, total) = {
+            let layout = h.screen_layout.borrow();
+            let mm = layout
+                .as_ref()
+                .unwrap()
+                .minimap
+                .iter()
+                .find(|m| m.window_id == win)
+                .expect("minimap must be present for the active pane");
+            (
+                mm.rect,
+                mm.minimap.lines.len(),
+                mm.minimap.lines.last().map(|l| l.line_idx).unwrap_or(0),
+                mm.minimap.total_buffer_lines,
+            )
+        };
+        assert!(
+            // Ropey counts a trailing `\n` as opening one further (empty)
+            // line, so a buffer built from `n_lines` newline-terminated
+            // lines reports `n_lines + 1` — this just guards against the
+            // fixture's line count going missing entirely on its way to the
+            // painted layout, not an exact match.
+            (n_lines..=n_lines + 1).contains(&total),
+            "sanity: the fixture's own line count ({n_lines}) must reach \
+             the painted layout (got total_buffer_lines={total})"
+        );
+        assert!(
+            window_len < total,
+            "test setup sanity: the strip's own row capacity ({window_len}) \
+             must be smaller than the fixture ({total} lines), or this \
+             fixture is too short to exercise the sliding window at all"
+        );
+
+        // (a) — the strip's window, not the whole buffer.
+        assert!(
+            last_painted_line + window_len < total - 1,
+            "with the cursor at the top of a {total}-line file, the \
+             strip's last painted row (buffer line {last_painted_line}, \
+             window of {window_len} rows) must be well short of the \
+             file's actual last line ({}) — a #1093 regression squeezes \
+             the whole buffer into the strip on every frame, pinning the \
+             last painted row to the file's end regardless of scroll \
+             position",
+            total - 1
+        );
+
+        // (b) — a bottom-of-strip click pages, it doesn't jump to EOF.
+        h.driver.click(
+            (strip.x + strip.width / 2.0) as f32,
+            (strip.y + strip.height * 0.95) as f32,
+        );
+        h.driver.render();
+
+        let scroll_top = h.engine.borrow().scroll_top();
+        assert!(
+            scroll_top > 0,
+            "a click near the bottom of the strip must still scroll \
+             forward from the top of the file — got scroll_top=0"
+        );
+        assert!(
+            scroll_top < window_len * 2,
+            "clicking near the bottom of the strip while the cursor is at \
+             the top of a {total}-line file must page roughly one \
+             strip-window's worth of file ({window_len} lines) forward, \
+             not jump to (or near) EOF — got scroll_top={scroll_top} of \
+             {total}"
+        );
+        assert!(
+            scroll_top < total - window_len,
+            "a bottom-of-strip click must not jump anywhere near EOF — \
+             got scroll_top={scroll_top} of {total} (window={window_len})"
+        );
+    }
+
     /// Acceptance (#35): pressing and holding on the minimap and dragging
     /// keeps seeking — not just the pixel under the initial mouse-down.
     ///
