@@ -1263,53 +1263,20 @@ pub(crate) fn assert_text_metrics_backend_applies_metrics<B: TextMetricsBackend>
 /// [`row_click_in_its_painted_band_hits_its_own_row`]'s doc for the
 /// measurements and for the (stronger) property those scenarios assert
 /// now that they are ungated.
-pub(crate) const KNOWN_BUGS: &[&str] = &[
-    // #1043: the first `tui_prod`-only divergence this harness found — the
-    // shared `App`'s `::gtk`/`::tui` arms have long since fixed #984 (a
-    // core `Engine::dispatch_explorer_tree_event` gap), but the shipped
-    // TUI's own, independently hand-written mouse routing has a *second*,
-    // TUI-only bug that reproduces the identical user-visible symptom by a
-    // completely different mechanism — confirmed by adding a temporary
-    // probe print at the call site and reading the captured state, not
-    // guessed:
-    //
-    // `TuiShellApp::handle_mouse_event`'s own `TreeController` intercept
-    // (`shell_app.rs` ~1476-1487) requires *three* things before it will
-    // even look at a `MouseDown` inside `explorer_tree_rect`:
-    // `!intercepts_blocked`, `self.engine.active_panel_is(PANEL_EXPLORER)`,
-    // and `self.engine.app_shell.sidebar_visible()`. The shared dispatch
-    // both `gtk` and the `tui` control arm go through instead —
-    // `App::explorer_ui_event` (`app.rs` ~5744-5750) — has no equivalent of
-    // that third condition: it claims the event whenever
-    // `explorer_tree_rect.width > 0.0`, i.e. whenever the tree was actually
-    // painted this frame. Reproduced here: this scenario's fixture sets
-    // `engine.session.explorer_visible = true` *after* the engine is built
-    // (the same "post-hoc `e.session = ...` assignment" pattern
-    // `Engine::new_for_test`'s own doc warns never retroactively updates
-    // `app_shell`'s already-baked-in visibility decision — see that
-    // constructor's doc, `src/core/engine/mod.rs` ~3770). The explorer tree
-    // (chevron included) paints correctly regardless — painting does not
-    // consult `app_shell.sidebar_visible()` — but a captured probe at the
-    // click site read `is_explorer_event=false, sidebar_visible=false`
-    // despite a non-zero, correctly-populated `explorer_tree_rect`, so
-    // `TuiShellApp`'s own intercept declines to claim a click the shared
-    // dispatch would have claimed. The `MouseDown` then falls through to
-    // `mouse::handle_mouse`'s legacy crossterm-shaped path, which gates the
-    // same sidebar body on the identical (also-false) flag and hands the
-    // click to whatever comes after — observed effect: the whole sidebar
-    // collapses instead of the chevron toggling.
-    //
-    // This is a genuine `tui_main`-only asymmetry (an extra, staler
-    // condition `TuiShellApp`'s intercept imposes that the shared dispatch
-    // does not), independent of whether a real interactive session can
-    // reach the exact same `session.explorer_visible`/`app_shell` desync
-    // this fixture forces — the fix (drop the redundant
-    // `sidebar_visible()` check, or resync it from the same ground truth
-    // `App` uses) lives entirely in `shell_app.rs`, outside this
-    // harness-wiring issue's file scope; a follow-up fix issue is required
-    // before this label can be removed.
-    "explorer_chevron_click_toggles_dir_with_same_arity_as_label_click::tui_prod", // #1043 — fix: needs a follow-up issue (filed by the coordinator from this PR)
-];
+// #1117 removed the last live entry here (`::tui_prod`'s chevron-click
+// scenario, filed by #1043 without a follow-up — see that issue and this
+// one for the full history). Root cause was a genuine `tui_main`-only
+// desync: `TuiShellApp::from_engine` never re-derived `engine.app_shell`'s
+// sidebar visibility from `engine.session.explorer_visible` after
+// construction, so a caller that set `session.explorer_visible` on an
+// already-built `Engine` (as `Engine::new_for_test`'s own doc warns
+// against, but which this harness's fixture did) left the shadow
+// `app_shell` stale — read by both `handle_mouse_event`'s `TreeController`
+// intercept and the runner-vs-shadow sidebar-visibility resync at the tail
+// of `TuiShellApp::handle`. `from_engine` now re-runs that derivation once
+// more before handing the engine off, so the shadow agrees with whatever
+// session state the engine actually carries regardless of when it was set.
+pub(crate) const KNOWN_BUGS: &[&str] = &[];
 
 /// A saved `std::panic::set_hook`/`take_hook` closure — named so
 /// `known_bug_gate_outcome`'s suppress/restore `RestoreHook` doesn't need
