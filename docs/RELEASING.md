@@ -58,21 +58,39 @@ scripts/platform-conformance.sh --print-plan   # resolve the matrix, run nothing
 scripts/platform-conformance.sh                # run every supported lane
 ```
 
-**Run it under a throwaway `HOME`.** As of [#976](https://github.com/JDonaghy/vimcode/issues/976)
-the `shell_app` driver tests read — and write — the real `~/.config/vimcode`, so
-a machine that has ever run the editor fails tests that are green in CI, whose
-`HOME` is always pristine. This is not a platform difference and not a
-regression; it is ambient state:
+**Run it under a throwaway `HOME` anyway — belt and suspenders.**
+[#976](https://github.com/JDonaghy/vimcode/issues/976) root-caused and fixed the
+`shell_app` driver tests that read the real `~/.config/vimcode`: ten fixtures
+(nine named in the issue, plus `ctrl_o_activates_original_tab_via_shell_app`,
+independently measured red on `dellserver` and attributed to the same cause)
+built their `TuiShellApp` with the production `TuiShellApp::new(None)`
+constructor, which runs `Engine::new()` (reads the developer's real
+`settings.json`/global `session.json`) *and* `restore_session_files()` (reopens
+whatever windows/tabs/scroll-positions the developer's real **per-workspace**
+session holds for this exact checkout path — keyed on `current_dir()`, so it is
+the same on every run from the same clone). All ten now build through
+[`TuiShellApp::new_for_test`], which substitutes in-memory defaults and skips
+the restore entirely, so their starting state no longer depends on what a real
+`vimcode` session left behind. See `src/tui_main/shell_app.rs`'s doc comments on
+`TuiShellApp::new_for_test`, `app_with_sidebar_open`, and each fixed test for
+the mechanism.
+
+The throwaway-`HOME` habit below is still worth keeping — the ordinary
+production constructor is still ambient by design (that is the whole point of
+`new(None)` vs `new_for_test`), so any *future* test that reaches for it
+inherits the same risk, and a manual smoke (§1.5) writes real config either
+way:
 
 ```bash
 env HOME=$(mktemp -d) RUSTUP_HOME=~/.rustup CARGO_HOME=~/.cargo PATH=~/.cargo/bin:$PATH \
   scripts/platform-conformance.sh
 ```
 
-Measured at d6e0ed3 on `dellserver`: with the real `HOME`, one failure
+Measured at d6e0ed3 on `dellserver`, pre-fix: with the real `HOME`, one failure
 (`ctrl_o_activates_original_tab_via_shell_app`); with a clean one, **tui 4129
-passed / gtk 4294 passed across 49 binaries, exit 0**. Drop the `HOME` override
-once #976 lands and the fixtures stop touching the user's config.
+passed / gtk 4294 passed across 49 binaries, exit 0**. Re-measure on a used
+`HOME` at the #976 fix commit to confirm it now matches the clean-`HOME` count
+before dropping this section's warning tone.
 
 **The contamination runs both ways — give the manual smoke (§1.5) its own
 throwaway `HOME` too.** The rule above is usually read as "tests can be poisoned
@@ -249,8 +267,15 @@ claims macOS GUI behaviour, smoke the menu bar by hand (§1.5).
 
 `macmini` carries gtk4 4.22.4, so `cargo test` runs there — but it is **not clean**.
 Measured at 648f2dd (2026-09-14): **2855 passed, 12 failed** — three GTK pixel
-probes plus nine `tui_main::shell_app` driver tests (#976, separate cause, red on
-the TUI lane too). The three GTK ones are:
+probes plus nine `tui_main::shell_app` driver tests. The nine were **not**
+GTK-specific or Darwin-specific — they were ambient-config leakage (#976, fixed;
+see §1.0) triggered by `macmini` being a machine that has actually run
+`vimcode` from this checkout, and were expected to reproduce on the TUI lane
+and on any other used machine too, independent of platform. #976 landed a fix
+switching the affected fixtures to `TuiShellApp::new_for_test`; this section's
+2855/12 count is stale as of that fix and needs a fresh `macmini` measurement
+at the fix commit — expect **2855 passed, 3 failed** (the GTK pixel probes
+below only) if the fix holds. The three GTK ones are:
 
 - `gtk::chrome_paint_tests::window_control_buttons_are_visible_against_their_background_in_every_theme`
 - `gtk::testing::minimap::minimap_click_at_the_middle_scrolls_to_half_the_file`
@@ -423,7 +448,7 @@ dated list rather than a habit.
 | Symptom | Lane | Status |
 |---|---|---|
 | 3 pixel/paint probes fail (§1.3b) | macOS GTK | Expected — #934, Core Text vs freetype rasterisation |
-| `shell_app` driver tests fail on a used machine | any host with a real `~/.config/vimcode` | Root-caused — #976; the fixtures read and write the real user config, so CI (pristine `HOME`) is green and developer machines are not. Run the gate under `HOME=$(mktemp -d)` (§1.0) until it lands. **Not** platform-specific and **not** the quadraui pin |
+| `shell_app` driver tests fail on a used machine | any host with a real `~/.config/vimcode` | Fixed — #976; ten fixtures built `TuiShellApp` through the ambient production constructor, which reopens the real per-workspace session; switched to `TuiShellApp::new_for_test` (see §1.0). Needs a fresh `macmini`/`dellserver` measurement at the fix commit to close out. Was **not** platform-specific and **not** the quadraui pin |
 | `install_menu_bar` main-thread panic, caught (§1.3) | macOS native | Expected — test-runner threading; vimcode#901 closed, native menu bar untested |
 | No Win-GUI test suite | Windows | Gap — `src/win/` has zero `#[test]`s |
 | Flatpak bundle unbuildable (§2.2) | Linux | Gap — #975; `cargo-sources.json` predates the #691 git dep; not shipping in v0.11.0 |
