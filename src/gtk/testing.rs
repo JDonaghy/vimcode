@@ -731,6 +731,24 @@ mod tests {
     /// The arm-without-apply case that `route_divider_grab` and
     /// `apply_divider_drag` are deliberately split across — a router that
     /// applied a ratio on press would nudge the divider here.
+    ///
+    /// #1094: this fixture (`engine_with_long_buffer`, so the left pane
+    /// overflows) now also exercises quadraui's `gtk::editor::draw_editor`
+    /// painting *that* window's own vertical scrollbar at `RenderedWindow.
+    /// rect`'s own right edge — which, post-#1094, is the pane's true edge,
+    /// i.e. exactly this `:vsplit` boundary (the scroll column now lands
+    /// past the minimap strip rather than before it, same as the TUI half
+    /// of this issue). The scrollbar's track colour and the window
+    /// divider's own line colour are both `theme.separator`-derived, so
+    /// they paint as one merged, several-pixel-wide band rather than the
+    /// divider's own single hairline — expected, not a regression (VS Code
+    /// shows the same scroll affordance flush against a pane boundary).
+    /// `line_colour`/`painted_divider_x` is measured *before* the click too
+    /// now, rather than assuming the raw `div.position` is the first
+    /// matching pixel the scan finds — the merged band's leading edge is
+    /// what "the painted line" means here, and this test only needs it to
+    /// hold still across the click, not to coincide with `div.position`
+    /// itself.
     #[test]
     fn window_split_divider_click_without_move_leaves_the_line_put() {
         let mut engine = engine_with_long_buffer();
@@ -751,6 +769,8 @@ mod tests {
             )
         };
         let line_colour = h.driver.pixel(start_x, mid_y);
+        let before = painted_divider_x(&mut h, start_x, mid_y, 8, line_colour)
+            .expect("the divider (or the window's own merged scrollbar band) must paint near its layout position before any click");
 
         h.driver.mouse_down(start_x as f32, mid_y as f32);
         h.driver.mouse_up(start_x as f32, mid_y as f32);
@@ -758,7 +778,7 @@ mod tests {
 
         assert_eq!(
             painted_divider_x(&mut h, start_x, mid_y, 8, line_colour),
-            Some(start_x),
+            Some(before),
             "a press-and-release on the divider with no drag must not move it"
         );
     }
@@ -7132,13 +7152,24 @@ mod minimap {
 
     /// Acceptance (#35): the minimap column is painted, and the width it
     /// takes is exactly what `quadraui::reserved_width` reserves — the
-    /// editor pane gives up precisely that many pixels and gets them all
-    /// back with `:set nominimap`.
+    /// editor pane gives up precisely that many *text columns* and gets
+    /// them all back with `:set nominimap`.
     ///
-    /// RED-first: reverting `build_screen_layout`'s rect narrowing makes the
-    /// `on_w + strip.width == off_w` assertion fail, and dropping the
-    /// `draw_minimap_strip` call in `render_content` collapses `painted` to
-    /// 0 — both confirmed by hand before restoring the fix.
+    /// #1094: `RenderedWindow.rect` is no longer narrowed by the strip's
+    /// width at all (it now reaches the pane's true right edge — the
+    /// scroll column paints past the strip, not before it — see
+    /// `render.rs`'s `build_screen_layout_with_breadcrumb_row` doc
+    /// comment), so `on_w`/`off_w` are trivially equal and no longer the
+    /// acceptance check. `text_viewport_cols` is: it's still narrowed by
+    /// the strip's width (plus the one-cell scroll gutter beside it —
+    /// `scroll_gutter_width`), exactly the formula `build_rendered_window`
+    /// itself applies, replicated here rather than approximated so this
+    /// stays exact instead of tolerance-fudged.
+    ///
+    /// RED-first: reverting `build_screen_layout`'s viewport-column
+    /// narrowing makes the column-delta assertion below fail, and dropping
+    /// the `draw_minimap_strip` call in `render_content` collapses
+    /// `painted` to 0 — both confirmed by hand before restoring the fix.
     #[test]
     fn minimap_paints_a_strip_whose_width_matches_reserved_width() {
         let mut h_on = harness(engine_with_shaped_buffer(), 1400, 900);
@@ -7151,7 +7182,7 @@ mod minimap {
         h_on.window_center(win_on)
             .expect("editor pane must paint with the default settings");
 
-        let (strip, on_w, on_cols) = {
+        let (strip, pane_w, on_cols) = {
             let layout = h_on.screen_layout.borrow();
             let l = layout.as_ref().unwrap();
             let mm = l
@@ -7163,7 +7194,7 @@ mod minimap {
             (mm.rect, rw.rect.width, rw.text_viewport_cols)
         };
 
-        // The editor must get every one of those pixels back when it's off.
+        // The editor must get every one of those columns back when it's off.
         let mut engine_off = engine_with_shaped_buffer();
         engine_off.settings.minimap = false;
         let h_off = harness(engine_off, 1400, 900);
@@ -7181,24 +7212,42 @@ mod minimap {
             let rw = l.windows.iter().find(|w| w.window_id == win_off).unwrap();
             (rw.rect.width, rw.text_viewport_cols)
         };
+        assert_eq!(
+            pane_w, off_w,
+            "the pane's own rect must be identical on/off now — only the \
+             text-column count should differ (#1094)"
+        );
 
         // #722: the reserved width is now a proportion of the pane's own
         // width rather than a fixed `MINIMAP_COLS` count, so the column
-        // delta isn't a pinned constant any more. The pixel-exact assertion
-        // right below is the real acceptance check (`build_screen_layout`
-        // narrows/widens the rect by exactly `strip.width`); this is just a
-        // column-domain sanity check that *some* text columns came back.
+        // delta isn't a pinned constant any more.
         assert!(
             off_cols > on_cols,
             "the editor must regain text columns when the minimap is off \
              (on={on_cols}, off={off_cols})"
         );
+
+        // The precise acceptance check: replicate `build_rendered_window`'s
+        // own `total_chars` formula (`render.rs`) at both the strip's raw
+        // width alone and with the #1094 scroll-gutter sliver folded in, and
+        // require the real column delta to match exactly.
+        let char_width = h_on.painted_char_width();
+        const SCROLLBAR_RESERVE_PX: f64 = 8.0; // mirrors `GtkBackend::scrollbar_reserve()`
+        let gutter = crate::render::scroll_gutter_width(SCROLLBAR_RESERVE_PX, char_width);
+        let minimap_w_for_build = strip.width + (gutter - SCROLLBAR_RESERVE_PX);
+        let total_chars_off = ((off_w - SCROLLBAR_RESERVE_PX) / char_width).floor();
+        let total_chars_on =
+            ((off_w - SCROLLBAR_RESERVE_PX - minimap_w_for_build) / char_width).floor();
+        let expected_col_delta = (total_chars_off - total_chars_on) as usize;
         assert_eq!(
-            on_w + strip.width,
-            off_w,
-            "the editor must reclaim exactly the reserved width when the \
-             minimap is off (on={on_w} + strip={} vs off={off_w})",
-            strip.width
+            off_cols - on_cols,
+            expected_col_delta,
+            "the editor must reclaim exactly the reserved width (strip \
+             {} px + gutter sliver {} px) when the minimap is off, in text \
+             columns (on={on_cols}, off={off_cols}, expected \
+             delta={expected_col_delta})",
+            strip.width,
+            gutter - SCROLLBAR_RESERVE_PX,
         );
 
         // …and something actually painted in that column band. Probe a grid
@@ -7267,7 +7316,12 @@ mod minimap {
                      past what makes it a *narrow*-pane test",
             );
             let rw = l.windows.iter().find(|w| w.window_id == win).unwrap();
-            (mm.rect.width, rw.rect.width + mm.rect.width)
+            // #1094: `rw.rect.width` is the pane's own, un-narrowed width
+            // directly now — `build_screen_layout` no longer shrinks
+            // `RenderedWindow.rect` by the strip's width (that used to make
+            // `rw.rect.width + mm.rect.width` the way to recover the pane's
+            // full width; doing that today double-counts the strip).
+            (mm.rect.width, rw.rect.width)
         };
         let char_width = h.painted_char_width();
         let expected = crate::render::minimap_reserved_width(
@@ -7319,7 +7373,9 @@ mod minimap {
                 .find(|m| m.window_id == win)
                 .expect("the layout must carry a minimap for the pane");
             let rw = l.windows.iter().find(|w| w.window_id == win).unwrap();
-            (mm.rect.width, rw.rect.width + mm.rect.width)
+            // #1094: see the sibling narrow-pane test's comment — `rw.rect.
+            // width` is the pane's own un-narrowed width directly now.
+            (mm.rect.width, rw.rect.width)
         };
         let char_width = h.painted_char_width();
         let expected = crate::render::minimap_reserved_width(

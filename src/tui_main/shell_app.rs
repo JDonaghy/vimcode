@@ -796,9 +796,13 @@ impl TuiShellApp {
                 // `Backend::draw_status_bar` — see its doc comment — so it no
                 // longer needs the raw `Frame` that `frame: None` used to
                 // skip it for).
-                render::EditorOp::Windows => {
-                    render_all_windows(backend, None, &screen.windows, theme)
-                }
+                render::EditorOp::Windows => render_all_windows(
+                    backend,
+                    None,
+                    &screen.windows,
+                    &screen.group_dividers,
+                    theme,
+                ),
                 // #35/#722: minimap strips on every window's right edge (one
                 // entry per `WindowId` in `screen.minimap`, not just the
                 // active window's) — one call, the braille rasteriser is
@@ -15696,27 +15700,30 @@ mod tests {
         app
     }
 
-    /// #723 acceptance (TUI half): with the minimap on and a file longer
-    /// than the viewport, the pane shows **exactly one** vertical scroll
-    /// affordance, and it sits *beside* the strip rather than on top of it —
-    /// one column of `'█'`/`'░'` (quadraui's `tui::draw_editor` scrollbar),
-    /// with the minimap's braille starting in the very next column.
+    /// #723 acceptance (TUI half), updated by #1094: with the minimap on and
+    /// a file longer than the viewport, the pane shows **exactly one**
+    /// vertical scroll affordance, and it sits *beside* the strip rather
+    /// than on top of it — one column of `'█'`/`'░'` (quadraui's
+    /// `tui::draw_editor` scrollbar). The strip's own scroll feedback is
+    /// quadraui's `viewport_highlight` band — a *background* accent across
+    /// the visible rows, painted by both rasterisers — not a second
+    /// foreground bar, so "beside, not doubled" is still the invariant this
+    /// guards (the defect `render_impl::tests::
+    /// test_tui_two_groups_single_boundary_scrollbar_481` independently
+    /// covers for the `:vsplit` case).
     ///
-    /// This is the invariant the first attempt at #723 broke: painting
-    /// `MinimapLayout.scrollbar` over the strip via `Backend::draw_scrollbar`
-    /// put a second solid bar in the strip's leftmost column, directly
-    /// against the editor's own — two bars jammed together, which is exactly
-    /// the operator-visible defect
-    /// `render_impl::tests::test_tui_two_groups_single_boundary_scrollbar_481`
-    /// exists to prevent (it went from 2 scrollbar columns to 4). The strip's
-    /// own scroll feedback is quadraui's `viewport_highlight` band — a
-    /// *background* accent across the visible rows, painted by both
-    /// rasterisers — not a second foreground bar.
+    /// #1094 changed *which* side: VS Code's `editor.minimap.side: right`
+    /// order is text, then the strip, then the scroll column outermost —
+    /// so the scrollbar column is now the pane's rightmost column (99 at
+    /// this driver's 100-col width), with the strip's braille ending in the
+    /// column immediately to its *left*, not starting to its right as
+    /// before this issue.
     ///
-    /// RED against the reverted state: with `draw_minimap_strip` calling
-    /// `draw_scrollbar`, the column right of the editor's scrollbar is a
-    /// second `'░'`/`'█'` instead of braille, and the "exactly one" count is
-    /// 2. Verified by hand by restoring that call.
+    /// RED against develop pre-#1094: the scrollbar painted at column 87
+    /// (immediately left of the strip, sandwiched between it and the text)
+    /// rather than at the pane's true right edge (99); this test's
+    /// `sb_cols[0] == line.len() - 1` assertion below fails against that
+    /// unfixed geometry. Verified by hand against the pre-fix `render.rs`.
     #[test]
     fn minimap_strip_does_not_double_the_scrollbar_via_shell_app() {
         let mut driver = driver_with_shell(app_with_shaped_buffer_no_sidebar(), config(), 100, 24);
@@ -15755,13 +15762,22 @@ mod tests {
             "a pane with the minimap on must show exactly one vertical \
              scrollbar column on row {row}, got {sb_cols:?}; screen:\n{screen}"
         );
+        assert_eq!(
+            sb_cols[0],
+            line.len() - 1,
+            "#1094: the scroll column must be the pane's outermost column \
+             (VS Code's order is text, strip, scrollbar) — got column \
+             {} of {}; screen:\n{screen}",
+            sb_cols[0],
+            line.len()
+        );
 
-        let next = line.get(sb_cols[0] + 1).copied();
+        let prev = sb_cols[0].checked_sub(1).and_then(|i| line.get(i).copied());
         assert!(
-            next.is_some_and(is_braille),
-            "the minimap strip must begin in the column immediately right of \
+            prev.is_some_and(is_braille),
+            "the minimap strip must end in the column immediately left of \
              the scrollbar ({}), painting braille rather than a second bar; \
-             got {next:?}; screen:\n{screen}",
+             got {prev:?}; screen:\n{screen}",
             sb_cols[0]
         );
     }
@@ -15811,15 +15827,33 @@ mod tests {
     /// confirmed by hand, reverted before landing this test.
     #[test]
     fn minimap_strip_width_matches_the_formula_at_narrow_and_wide_terminal_widths_via_shell_app() {
-        /// One row's real, painted strip width in columns: the distance from
-        /// [`braille_col`]'s hit to the row's own right edge (the strip
-        /// paints flush against it, with no sidebar/activity-bar chrome to
-        /// its right — `app_with_shaped_buffer_no_sidebar`).
+        /// One row's real, painted strip width in columns: the span from
+        /// [`braille_col`]'s hit to the last contiguous braille column.
+        ///
+        /// #1094: no longer `total_cols - start` — the strip used to paint
+        /// flush against the row's own right edge (no sidebar/activity-bar
+        /// chrome to its right — `app_with_shaped_buffer_no_sidebar`), but
+        /// now the pane's outermost column is the scroll affordance, one
+        /// column *beyond* the strip's own right edge, so the strip's own
+        /// width has to be measured directly rather than inferred from
+        /// `total_cols`.
         fn painted_strip_width(screen: &str, row: usize, total_cols: usize) -> usize {
-            let start = braille_col(screen, row).unwrap_or_else(|| {
+            let line: Vec<char> = screen
+                .lines()
+                .nth(row)
+                .unwrap_or_else(|| panic!("row {row} must exist; screen:\n{screen}"))
+                .chars()
+                .collect();
+            let is_braille = |c: char| ('\u{2800}'..='\u{28FF}').contains(&c);
+            let start = line.iter().position(|&c| is_braille(c)).unwrap_or_else(|| {
                 panic!("row {row} must paint minimap braille; screen:\n{screen}")
             });
-            total_cols - start
+            let end = line[start..]
+                .iter()
+                .position(|&c| !is_braille(c))
+                .map(|rel| start + rel)
+                .unwrap_or(total_cols.min(line.len()));
+            end - start
         }
 
         for total_cols in [40u16, 160u16] {

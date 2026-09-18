@@ -812,6 +812,7 @@ pub(super) fn render_all_windows(
     backend: &mut dyn quadraui::Backend,
     mut frame: Option<&mut ratatui::Frame>,
     windows: &[RenderedWindow],
+    group_dividers: &[GroupDivider],
     theme: &Theme,
 ) {
     // #1039: paint the active window *last*.
@@ -864,7 +865,7 @@ pub(super) fn render_all_windows(
         };
         render_window(backend, frame.as_deref_mut(), win_rect, window, theme);
     }
-    render_separators(backend, windows, theme);
+    render_separators(backend, windows, group_dividers, theme);
 }
 
 /// Render one editor window (pane) into `frame`.
@@ -1036,7 +1037,40 @@ fn window_right_edge_cell(rect: &WindowRect) -> u16 {
 /// `Buffer`/`Backend` access) so [`group_divider_cells`] (#609) can ask
 /// "would `render_separators` already put a divider-like glyph in this
 /// cell?" without needing to read back whatever was actually painted.
-fn vertical_separator_cells(windows: &[RenderedWindow]) -> std::collections::HashSet<(u16, u16)> {
+///
+/// `group_dividers` (#1094): the authoritative list of *editor-group*
+/// boundaries, consulted only to exclude them from the geometric adjacency
+/// test below. Before #1094, `RenderedWindow.rect` stopped short of a
+/// pane's true right edge by its own minimap strip's width whenever the
+/// strip was on — which, for two windows meeting at a *group* boundary
+/// (the ordinary case for side-by-side groups, each with one full-height
+/// window), coincidentally kept `a.rect`'s right edge more than a cell
+/// short of `b.rect.x`, so this adjacency test could only ever fire for a
+/// genuine `:vsplit` sibling *within* one group. #1094 widened
+/// `RenderedWindow.rect` back out to the pane's true edge (needed so the
+/// pane's own scroll column lands past the strip, not before it — see
+/// `render.rs`'s `build_screen_layout_with_breadcrumb_row` doc comment),
+/// which closed that gap and exposed a blind spot: nothing here previously
+/// distinguished "two windows that are `:vsplit` siblings" from "two
+/// windows that just happen to tile edge-to-edge because they're in
+/// adjacent groups" — without this exclusion, a plain two-group split with
+/// neither window scrolled painted its divider one column early (`sep_x -
+/// 1`, this pass's own cell) with `group_divider_cells` correctly (but
+/// now wrongly) yielding to it, and that painted column drifted out of
+/// sync with `GroupDivider::position` as soon as float rounding gave the
+/// two computations different answers (`separator_column_tracks_the_
+/// divider_after_a_fractional_drag` pins exactly that drift) — the #753
+/// group-divider-drag driver test caught the live version of this as the
+/// divider under-tracking the drag by more than a cell.
+///
+/// Compared in `f64`, against `b.rect.x` directly — not the `u16`-truncated
+/// `sep_x` computed below — because that comparison is `window_right_edge_
+/// cell`'s own f32-rounding-prone one; using it here would just move the
+/// drift into the exclusion test instead of removing it.
+fn vertical_separator_cells(
+    windows: &[RenderedWindow],
+    group_dividers: &[GroupDivider],
+) -> std::collections::HashSet<(u16, u16)> {
     let mut cells = std::collections::HashSet::new();
     for i in 0..windows.len() {
         for j in (i + 1)..windows.len() {
@@ -1050,6 +1084,15 @@ fn vertical_separator_cells(windows: &[RenderedWindow]) -> std::collections::Has
             let v_overlap =
                 a.rect.y.max(b.rect.y) < (a.rect.y + a.rect.height).min(b.rect.y + b.rect.height);
             if (a.rect.x + a.rect.width - b.rect.x).abs() < 1.0 && v_overlap {
+                // This boundary is an editor-group boundary, not a
+                // `:vsplit` one — leave it entirely to `group_divider_cells`
+                // (see this function's own doc comment).
+                let is_group_boundary = group_dividers.iter().any(|d| {
+                    d.direction == SplitDirection::Vertical && (d.position - b.rect.x).abs() < 1.0
+                });
+                if is_group_boundary {
+                    continue;
+                }
                 // #550: `a.rect`/`b.rect` are already absolute terminal-screen
                 // coordinates, so no `editor_area` offset addition needed.
                 // See [`window_right_edge_cell`] for why the boundary column
@@ -1206,6 +1249,7 @@ pub(super) fn draw_rule_row_q(
 pub(super) fn render_separators(
     backend: &mut dyn quadraui::Backend,
     windows: &[RenderedWindow],
+    group_dividers: &[GroupDivider],
     theme: &Theme,
 ) {
     if windows.len() <= 1 {
@@ -1218,7 +1262,7 @@ pub(super) fn render_separators(
     // `quadraui::Theme` dozens of times per frame.
     backend.set_theme(super::quadraui_tui::q_theme(theme));
 
-    for (x, y) in vertical_separator_cells(windows) {
+    for (x, y) in vertical_separator_cells(windows, group_dividers) {
         draw_rule_cell_themed(backend, x, y, '│', theme.separator, theme.background);
     }
 
@@ -1283,7 +1327,7 @@ pub(super) fn group_divider_cells(
     windows: &[RenderedWindow],
     editor_area: Rect,
 ) -> Vec<(u16, u16)> {
-    let already_separated = vertical_separator_cells(windows);
+    let already_separated = vertical_separator_cells(windows, dividers);
     let mut out = Vec::new();
     for div in dividers {
         if div.direction != SplitDirection::Vertical {
@@ -1453,9 +1497,13 @@ mod tests {
                         engine.terminal_maximized,
                     ) {
                         match op {
-                            render::EditorOp::Windows => {
-                                render_all_windows(backend, None, &screen.windows, &theme)
-                            }
+                            render::EditorOp::Windows => render_all_windows(
+                                backend,
+                                None,
+                                &screen.windows,
+                                &screen.group_dividers,
+                                &theme,
+                            ),
                             render::EditorOp::Minimap => {
                                 render::draw_minimap_strip(backend, &screen);
                             }
@@ -2639,10 +2687,24 @@ mod tests {
     /// that to a left pane exactly `13.999999046325684` cells wide — while
     /// the divider `position` it returns from the *same* `first_w`, summed
     /// in f32, is exactly `48.0`. Summing the pane's f64 `x + width` here
-    /// instead yields `47.999999046…`, truncating to 47, so the separator
-    /// landed at 46: one column left of the divider's own cell, the #481
-    /// "already separated" guard stopped matching, and both the separator
-    /// and the group divider painted with a blank column wedged between.
+    /// instead yields `47.999999046…`, truncating to 47 — `window_right_edge_
+    /// cell`'s own doc comment has the full #481 history of the phantom
+    /// double divider that rounding drift used to cause here.
+    ///
+    /// #1094 closed that gap a different way: [`vertical_separator_cells`]
+    /// no longer claims an *editor-group* boundary at all (it now excludes
+    /// any pair whose meeting point matches a `GroupDivider`, comparing the
+    /// same f64 `rect.x`/`position` units the group layout itself produced,
+    /// not the `u16`-truncated `sep_x` this fixture's rounding drift was
+    /// about) — group boundaries are [`group_divider_cells`]'s alone,
+    /// unconditionally, at the divider's own authoritative `position`. That
+    /// sidesteps the #481 rounding drift entirely for this case: nothing
+    /// downstream of `group_divider_cells` ever re-derives the boundary
+    /// column from `window_right_edge_cell`'s f32 sum. This fixture — a
+    /// two-group boundary whose panes carry exactly the #481 rounding drift
+    /// — now pins the *new* invariant: `vertical_separator_cells` produces
+    /// nothing for it, and `group_divider_cells` alone paints the divider,
+    /// consistently at its own `position`, drift or not.
     #[test]
     fn separator_column_tracks_the_divider_after_a_fractional_drag() {
         // `13.999999046325684` is not a typo — it is `(14f32 / 46f32 * 46f32)`
@@ -2661,20 +2723,6 @@ mod tests {
         );
         let right = fixture_window(WindowId(1), WindowRect::new(48.0, 2.0, 32.0, 21.0), 1, None);
         let windows = [left, right];
-
-        // The separator must sit in column 47 — the cell immediately left of
-        // the divider's own cell (48), exactly as it does before any drag.
-        let cells = vertical_separator_cells(&windows);
-        for y in 2..23u16 {
-            assert!(
-                cells.contains(&(47, y)),
-                "row {y}: the left pane's separator must track the divider's \
-                 cell (48) at column 47; got {cells:?}"
-            );
-        }
-
-        // ...and because it does, the group divider must not paint a *second*
-        // line at 48 across the panes' rows (#481).
         let divider = GroupDivider {
             split_index: 0,
             direction: SplitDirection::Vertical,
@@ -2684,6 +2732,22 @@ mod tests {
             cross_start: 0.0,
             cross_size: 24.0,
         };
+
+        // #1094: this boundary is a *group* boundary (`right.rect.x == 48.0
+        // == divider.position`, within the same f64 precision) — excluded
+        // from `vertical_separator_cells` regardless of the f32 rounding
+        // drift `window_right_edge_cell`'s own `sep_x` would otherwise carry.
+        let cells = vertical_separator_cells(&windows, std::slice::from_ref(&divider));
+        assert!(
+            cells.is_empty(),
+            "a pair of windows meeting exactly at a known group-divider \
+             position must be left entirely to `group_divider_cells` — got \
+             {cells:?}"
+        );
+
+        // ...so the group divider paints on every row, unconditionally, at
+        // its own `position` (48) — not a rect-derived, rounding-prone
+        // column beside it (#481's original failure mode).
         let editor_area = Rect {
             x: 34,
             y: 0,
@@ -2691,21 +2755,14 @@ mod tests {
             height: 24,
         };
         let div_cells = group_divider_cells(&[divider], &windows, editor_area);
-        for y in 2..23u16 {
+        for y in 1..23u16 {
             assert!(
-                !div_cells.contains(&(48, y)),
-                "row {y}: the left pane already separates the two groups, so \
-                 the group divider must not paint a second line beside it; \
-                 got {div_cells:?}"
+                div_cells.contains(&(48, y)),
+                "row {y}: with `vertical_separator_cells` no longer claiming \
+                 this boundary, the group divider must paint every row at \
+                 its own position (48); got {div_cells:?}"
             );
         }
-        // Above the panes (the tab-bar rows) nothing else separates them, so
-        // the divider itself is still what paints there.
-        assert!(
-            div_cells.contains(&(48, 1)),
-            "the divider must still paint on the tab-bar row, where no pane \
-             separator covers it; got {div_cells:?}"
-        );
     }
 
     // ── #1097: residual (minimap-off) click-cost profile ────────────────────

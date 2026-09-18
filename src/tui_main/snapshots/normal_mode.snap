@@ -1,10 +1,11 @@
 ---
 source: src/tui_main/render_impl.rs
+assertion_line: 2329
 expression: "lines.join(\"\\n\")"
 ---
      [No Name] ×                                   󰤲    ⋯
 
-    -fn main() {                                    ⠍⠈⠛⠛⠓⠓⠒⠒
+    -fn main() {                                   ⠍⠈⠛⠛⠓⠓⠒⠒
      │   println!("hello");
      }
 
@@ -12,4 +13,4 @@ expression: "lines.join(\"\\n\")"
 
 
 
-     NORMAL  [No Name]   LF Spaces: 4  Ln 1, Col 1
+     NORMAL  [No Name]    󰘖 utf-8 LF Spaces: 4  Ln 1, Col 1

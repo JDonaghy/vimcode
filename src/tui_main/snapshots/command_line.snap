@@ -1,10 +1,11 @@
 ---
 source: src/tui_main/render_impl.rs
+assertion_line: 2359
 expression: "lines.join(\"\\n\")"
 ---
      [No Name] ×                                   󰤲    ⋯
 
-     buffer content                                 ⠉⠉⠉⠈⠉⠉⠉⠀
+     buffer content                                ⠉⠉⠉⠈⠉⠉⠉⠀
 
 
 
@@ -12,5 +13,5 @@ expression: "lines.join(\"\\n\")"
 
 
 
-     COMMAND  [No Name]  LF Spaces: 4  Ln 1, Col 1
+     COMMAND  [No Name]   󰘖 utf-8 LF Spaces: 4  Ln 1, Col 1
     :set
