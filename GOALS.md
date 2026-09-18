@@ -173,7 +173,7 @@ materially smaller and more tractable backlog than #950's framing implied.
 | Tab-bar post-hit-test dispatch (duplicated 2× in `mouse.rs`, `click::dispatch_tab_bar_target` exists but unused by TUI) | convergeable | Clearest concrete mechanical win (wave 2, item 7). |
 | Editor v/h scrollbar click+drag geometry | convergeable | Both sides hand-roll the identical track/thumb math independently (wave 2, item 9). |
 | Wheel scroll: GTK missing `PANEL_GIT`/`SEARCH`/`SETTINGS`/ext-panel scroll; TUI missing hover-window (unfocused-pane) scroll | convergeable-pending-design | Mechanical shape known for both; needs a product nod, not a design question (wave 3, items 13/14). |
-| Hover-link click-to-copy (TUI-only) | convergeable-pending-design | Real, previously-unflagged asymmetry — GTK gap or intentional (native Pango hyperlinks)? (wave 3, item 15). |
+| Hover-link click-to-copy (TUI-only) | ✅ converged (#1067) | Was a real asymmetry, not intentional — GTK had painted/cached the link rects since the #540 migration but never wired a click reader. Now shared via `render::route_panel_hover_popup_click` (wave 3, item 15). |
 | Explorer drag-and-drop finalize | **feature gap, not irreducible-surface** | TUI-only capability, nothing on GTK to converge with — see `IRREDUCIBLE_SURFACE.md` §7's note on scope. |
 | Command-line selection (full rung) | quadraui-gap (same as above, cited once) | See `PENDING_QUADRAUI_ISSUES.md`. |
 | Tab-bar hit-test, right-click resolution, text-selection drag-origin encoding, chrome-band geometry caching | irreducible | Cell-vs-pixel geometry (`click.rs`'s own documented reason) — instances of the existing frame-metrics fact. |
@@ -236,8 +236,29 @@ proof, not just the diff looking smaller.
 14. Should TUI's editor wheel scroll the hovered (unfocused) pane the way
     GTK's `hovered_window_id` does? Mechanical shape known (`render::
     find_window_at` + a `_for_window` scroll call).
-15. Is TUI's hover-link click-to-copy a feature GTK should also get, or
-    intentionally TUI-only?
+15. ✅ **Decided (#1067): GTK should get it — converged, not TUI-only.**
+    TUI's panel-hover-popup (source-control / extension-panel item dwell
+    tooltip) link click was a hand-rolled inline hit test in `mouse.rs`; GTK
+    painted and cached the identical `panel_hover_link_rects` (`render::
+    panel_hover_popup_paint`) but never read them back on click at all — a
+    complete no-op, not an intentional design choice. `panel_hover_popup_
+    paint`'s own doc traces the gap to the #540 Relm4->ShellApp migration
+    retiring `Msg::PanelHoverClick` without a replacement — GTK *used to*
+    have this. There is no "terminal has no rich clipboard" case for
+    *painting a hit region and then ignoring the click on it*; that argument
+    only supports TUI's *action* differing (copy vs. open), which is exactly
+    the precedent the already-shipped editor-hover-popup rung
+    (`render::route_editor_hover_popup_click` /
+    `EditorHoverPopupEffect::open_url`, "opens (GTK) or copies (TUI) — the
+    one genuinely per-backend step") already established for the sibling
+    popup. #1067 extracted the identical shape —
+    `render::route_panel_hover_popup_click` /
+    `render::apply_panel_hover_popup_route` — wired both backends onto it
+    (`App::route_and_apply_panel_hover_popup` on GTK,
+    `mouse::handle_mouse` on TUI), and along the way aligned TUI's
+    previously-dropped `is_native` flag with GTK's so the two caches share
+    one element shape. Driver tests on both backends, RED-verified against
+    unfixed `develop`.
 
 **Wave 4 — the epic, last, gated on P0:**
 16. Retire `events::uievent_to_crossterm` + `mouse.rs`'s remaining

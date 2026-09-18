@@ -793,10 +793,11 @@ pub(super) fn render_ext_panel(
 ///
 /// The popup displays rendered markdown content and appears to the right of
 /// the sidebar at the vertical position of the hovered item.
-/// Returns `(link_rects, popup_rect)`, both `quadraui::Rect`-based (#831) —
-/// the same type GTK's `render::panel_hover_popup_paint` returns, so the
-/// mouse router (`render::route_sidebar_hover` and friends) never has to
-/// know which backend painted the popup.
+/// Returns `(link_rects, popup_rect)`. `link_rects` carries the trailing
+/// `is_native` flag (#1067) the same way GTK's `render::
+/// panel_hover_popup_paint` does — both caches are now the exact same
+/// element shape, so `render::route_panel_hover_popup_click` is callable
+/// from either backend without an adapter.
 #[allow(clippy::type_complexity, clippy::too_many_arguments)]
 pub(super) fn render_panel_hover_popup(
     backend: &mut dyn quadraui::Backend,
@@ -806,7 +807,7 @@ pub(super) fn render_panel_hover_popup(
     sidebar_y: u16,
     sidebar_height: u16,
     term_area: Rect,
-) -> (Vec<(quadraui::Rect, String)>, Option<quadraui::Rect>) {
+) -> (Vec<(quadraui::Rect, String, bool)>, Option<quadraui::Rect>) {
     let Some(ref ph) = screen.panel_hover else {
         return (vec![], None);
     };
@@ -888,7 +889,8 @@ pub(super) fn render_panel_hover_popup(
     backend.set_theme(super::quadraui_tui::q_theme(theme));
     backend.draw_rich_text_popup(&popup, &layout);
 
-    let link_rects: Vec<(quadraui::Rect, String)> = layout
+    let is_native = render::panel_hover_link_is_native(&ph.panel_name);
+    let link_rects: Vec<(quadraui::Rect, String, bool)> = layout
         .link_hit_regions
         .iter()
         .map(|(rect, idx)| {
@@ -897,7 +899,7 @@ pub(super) fn render_panel_hover_popup(
                 .get(*idx)
                 .map(|l| l.url.clone())
                 .unwrap_or_default();
-            (*rect, url)
+            (*rect, url, is_native)
         })
         .collect();
 

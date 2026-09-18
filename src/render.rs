@@ -5472,6 +5472,92 @@ pub fn apply_editor_hover_popup_route(
     effect
 }
 
+/// Is a panel-hover link "native" (source-control, trusted, open directly)
+/// or extension-provided? Mirrors `panel_hover_popup_paint`'s own
+/// `is_native` derivation so the paint step and any future confirm-before-
+/// open policy can't independently drift on what counts as trusted. Neither
+/// backend currently branches on this — see [`PanelHoverPopupRoute`]'s doc.
+pub fn panel_hover_link_is_native(panel_name: &str) -> bool {
+    panel_name == "source_control"
+}
+
+/// What a left-press on a painted panel-hover-popup link means (the
+/// sidebar-item dwell tooltip — source-control / extension-panel item
+/// hover, [`panel_hover_popup_paint`]).
+///
+/// #1067: TUI hand-rolled this hit test inline in `mouse.rs`; GTK never
+/// wired one at all after the #540 Relm4->ShellApp migration retired
+/// `Msg::PanelHoverClick` (see `panel_hover_popup_paint`'s doc for the two
+/// retired branches) — clicking a link in the panel-hover popup was a
+/// complete no-op on GTK. This is the shared rung both now call, the same
+/// shape as [`route_editor_hover_popup_click`] minus the scrollbar/focus/
+/// selection arms the panel-hover popup (a pure tooltip) never had.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PanelHoverPopupRoute {
+    /// A `command:` URI link — run it, then dismiss.
+    Command(String),
+    /// A plain URL link — the backend opens or copies it, then dismisses.
+    Link(String),
+    /// The press didn't land on a link.
+    None,
+}
+
+/// Arbitrate a left-press against the panel-hover popup's painted link
+/// rects. `links` carries the trailing `is_native` flag
+/// [`panel_hover_popup_paint`] produces; unused for now (see
+/// [`panel_hover_link_is_native`]'s doc) but kept so both backends' caches
+/// share one shape instead of TUI silently dropping the field.
+pub fn route_panel_hover_popup_click(
+    links: &[(quadraui::Rect, String, bool)],
+    x: f64,
+    y: f64,
+) -> PanelHoverPopupRoute {
+    let (cx, cy) = (x as f32, y as f32);
+    for (rect, uri, _is_native) in links {
+        if rect_contains(*rect, cx, cy) {
+            return if uri.starts_with("command:") {
+                PanelHoverPopupRoute::Command(uri.clone())
+            } else {
+                PanelHoverPopupRoute::Link(uri.clone())
+            };
+        }
+    }
+    PanelHoverPopupRoute::None
+}
+
+/// What the caller still has to do after [`apply_panel_hover_popup_route`]
+/// has mutated the engine.
+#[derive(Debug, Default)]
+pub struct PanelHoverPopupEffect {
+    /// `true` when the press landed on a link and was consumed here.
+    pub consumed: bool,
+    /// A plain URL to open (GTK) or copy (TUI) — the one genuinely
+    /// per-backend step, same split as [`EditorHoverPopupEffect::open_url`].
+    pub open_url: Option<String>,
+}
+
+/// Apply a [`PanelHoverPopupRoute`] to the engine.
+pub fn apply_panel_hover_popup_route(
+    engine: &mut Engine,
+    route: PanelHoverPopupRoute,
+) -> PanelHoverPopupEffect {
+    let mut effect = PanelHoverPopupEffect::default();
+    match route {
+        PanelHoverPopupRoute::None => {}
+        PanelHoverPopupRoute::Command(uri) => {
+            engine.execute_command_uri(&uri);
+            engine.dismiss_panel_hover_now();
+            effect.consumed = true;
+        }
+        PanelHoverPopupRoute::Link(url) => {
+            effect.open_url = Some(url);
+            engine.dismiss_panel_hover_now();
+            effect.consumed = true;
+        }
+    }
+    effect
+}
+
 /// The painted divider geometry for one frame, plus the caller's grab metrics.
 #[derive(Debug, Clone, Copy)]
 pub struct DividerState<'a> {
@@ -9178,7 +9264,7 @@ pub fn panel_hover_popup_paint(
     if hover.line_text.is_empty() {
         return (vec![], None);
     }
-    let is_native = hover.panel_name == "source_control";
+    let is_native = panel_hover_link_is_native(&hover.panel_name);
     let popup = panel_hover_to_quadraui_rich_text(hover, theme);
     let max_len = popup
         .line_text

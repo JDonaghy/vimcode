@@ -238,7 +238,7 @@ pub(super) fn handle_mouse(
     explorer_drag_src: &mut Option<usize>,
     explorer_drag_active: &mut Option<(usize, Option<usize>)>,
     tab_drag: &mut render::TabDragState,
-    hover_link_rects: &[(quadraui::Rect, String)],
+    hover_link_rects: &[(quadraui::Rect, String, bool)],
     hover_popup_rect: Option<quadraui::Rect>,
     editor_hover_popup_rect: Option<quadraui::Rect>,
     editor_hover_link_rects: &[(quadraui::Rect, String)],
@@ -580,22 +580,24 @@ pub(super) fn handle_mouse(
         }
     }
 
-    // ── Hover link click-to-copy ────────────────────────────────────────────────
+    // ── Panel-hover popup link click (#1067) ────────────────────────────────
+    //
+    // Shared with GTK's `App::route_and_apply_panel_hover_popup` via
+    // `render::route_panel_hover_popup_click` +
+    // `render::apply_panel_hover_popup_route` — GTK never wired a click
+    // handler for this popup at all before #1067 (see that function's doc).
+    // "Open vs copy" for a plain link stays the one per-backend step, same
+    // split the editor-hover-popup rung above already uses.
     if !hover_link_rects.is_empty() {
         if let MouseEventKind::Down(MouseButton::Left) = ev.kind {
-            for (rect, url) in hover_link_rects {
-                if (row as f32) == rect.y
-                    && (col as f32) >= rect.x
-                    && (col as f32) < rect.x + rect.width
-                {
-                    if url.starts_with("command:") {
-                        engine.execute_command_uri(url);
-                    } else {
-                        tui_copy_to_clipboard(url, engine);
-                    }
-                    engine.dismiss_panel_hover_now();
-                    return sidebar_width;
-                }
+            let route =
+                render::route_panel_hover_popup_click(hover_link_rects, col as f64, row as f64);
+            let effect = render::apply_panel_hover_popup_route(engine, route);
+            if let Some(url) = effect.open_url {
+                tui_copy_to_clipboard(&url, engine);
+            }
+            if effect.consumed {
+                return sidebar_width;
             }
         }
     }
