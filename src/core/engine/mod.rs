@@ -4376,14 +4376,13 @@ impl Engine {
             accelerators: Vec::new(),
             idle_last_file_check: std::time::Instant::now(),
         };
-        let show_sidebar = if engine.settings.autohide_panels {
-            false
-        } else {
-            engine.session.explorer_visible || engine.settings.explorer_visible_on_startup
-        };
-        if !show_sidebar {
-            engine.app_shell.hide_sidebar();
-        }
+        // A freshly-built `AppShell` (above) defaults `sidebar_visible: true`,
+        // so this only ever needs to *hide* it here — but it's expressed via
+        // the same bidirectional `Engine::sync_app_shell_sidebar_visibility`
+        // every other caller uses (`TuiShellApp::from_engine`, #1117) rather
+        // than a second copy of the `autohide_panels` / `explorer_visible`
+        // derivation, so the formula lives in exactly one place.
+        engine.sync_app_shell_sidebar_visibility();
         engine.init_file_watcher();
         // Register Phase B.2 accelerators (terminal maximize for now).
         engine.register_default_accelerators();
