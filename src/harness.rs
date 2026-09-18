@@ -1266,16 +1266,34 @@ pub(crate) fn assert_text_metrics_backend_applies_metrics<B: TextMetricsBackend>
 // #1117 removed the last live entry here (`::tui_prod`'s chevron-click
 // scenario, filed by #1043 without a follow-up — see that issue and this
 // one for the full history). Root cause was a genuine `tui_main`-only
-// desync: `TuiShellApp::from_engine` never re-derived `engine.app_shell`'s
-// sidebar visibility from `engine.session.explorer_visible` after
-// construction, so a caller that set `session.explorer_visible` on an
-// already-built `Engine` (as `Engine::new_for_test`'s own doc warns
-// against, but which this harness's fixture did) left the shadow
-// `app_shell` stale — read by both `handle_mouse_event`'s `TreeController`
-// intercept and the runner-vs-shadow sidebar-visibility resync at the tail
-// of `TuiShellApp::handle`. `from_engine` now re-runs that derivation once
-// more before handing the engine off, so the shadow agrees with whatever
-// session state the engine actually carries regardless of when it was set.
+// desync: `TuiShellApp::handle_mouse_event`'s `TreeController` intercept
+// required `engine.app_shell.sidebar_visible()` — a shadow copy of sidebar
+// visibility tracked independently of what the runner's own `AppShell`
+// actually painted — in addition to `explorer_tree_rect.width > 0.0`, the
+// one condition the shared dispatch `App::explorer_ui_event` (`app.rs`,
+// what GTK and the `::tui`/`::gtk` harness arms both go through) checks.
+// That shadow could go stale relative to what actually painted (e.g. a
+// caller mutating `engine.session` on an already-built `Engine`, as
+// `Engine::new_for_test`'s own doc warns against, which is exactly what
+// this scenario's fixture did) and decline a click the shared dispatch
+// would have claimed, dropping it through to the legacy `mouse::handle_mouse`
+// path, which collapsed the sidebar instead. The fix converges the
+// intercept onto the shared predicate — it no longer reads the shadow at
+// all — and makes that predicate accurate by having `render_content` reset
+// `explorer_tree_rect` to zero-width, once per frame, whenever the sidebar
+// body doesn't paint (`presence.sidebar_panel == false`) — checked
+// unconditionally, not from inside the `SidebarPanel` rung's own arm, since
+// that rung is entirely absent from a hidden-sidebar frame's composed op
+// list and so can never reset anything on exactly the frame that needs it.
+// So a hidden sidebar can no longer leave a stale, non-zero rect behind for
+// a later click to land in. Converging exposed one more gap the shadow
+// check had been accidentally masking: `handle_mouse_event`'s panel
+// intercepts (Explorer included) had no equivalent of GTK's
+// `try_route_sidebar_mouse_event` early-exit on `engine.picker_open` /
+// `handle_mouse_click_msg`'s on `self.folder_picker` — an outside click
+// meant to dismiss an open picker could be swallowed by a panel intercept
+// instead of ever reaching the picker's own dismiss routing. Folded into
+// the same `intercepts_blocked` gate every panel intercept already shares.
 pub(crate) const KNOWN_BUGS: &[&str] = &[];
 
 /// A saved `std::panic::set_hook`/`take_hook` closure — named so

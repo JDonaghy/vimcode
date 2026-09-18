@@ -1023,6 +1023,27 @@ impl TuiShellApp {
         }
         setup_tui_clipboard(&mut engine);
 
+        // #1117: re-run `Engine::sync_app_shell_sidebar_visibility` here,
+        // after `startup`/`startup_without_session_restore` — not because
+        // this click-routing fix reads `app_shell.sidebar_visible()`
+        // anymore (it doesn't: see the `TreeController` intercept's own
+        // comment), but because `TuiShellApp::handle`'s own runner-vs-shadow
+        // resync ("#634 smoke retry") pushes whatever `app_shell` says onto
+        // the *runner* every dispatch — so a shadow left stale here would
+        // go on to actively hide a sidebar the runner is correctly showing,
+        // the first time any event reaches `handle()`. Two ways it can be
+        // stale by this point: (a) a caller mutates `engine.session` on an
+        // already-built `Engine` before handing it to `from_engine` (as
+        // `Engine::new_for_test`'s own doc warns against — the `#1043`
+        // fixture pattern), or (b) `startup`'s `open_folder` applies a
+        // per-folder `.vimcode/settings.json` overlay that changes
+        // `autohide_panels`/`explorer_visible_on_startup` *after*
+        // `Engine::new_from_state` already baked in its own answer — this
+        // call running after `startup` (not before) is what picks that up.
+        // One call, no duplicated derivation: see
+        // `Engine::sync_app_shell_sidebar_visibility`'s own doc.
+        engine.sync_app_shell_sidebar_visibility();
+
         let pending_startup_msg = if nerd_fonts_undiscovered {
             Some(
                 "Using ASCII fallback icons. If your terminal has a Nerd Font, run \
@@ -1032,42 +1053,6 @@ impl TuiShellApp {
         } else {
             None
         };
-
-        // #1117: re-derive `engine.app_shell`'s sidebar visibility from
-        // `engine.session.explorer_visible` one more time here, rather than
-        // trusting whatever `app_shell` already baked in at `Engine::new`/
-        // `Engine::new_for_test` construction time. In the ordinary
-        // production path the two never drift — `Engine::new` reads the
-        // persisted session *before* constructing `app_shell`, so the two
-        // start in lockstep and every later toggle (Ctrl+B, panel
-        // accelerators, autohide) updates `app_shell` directly, keeping it
-        // authoritative from then on. But a caller is free to mutate
-        // `engine.session` on an already-built `Engine` before handing it
-        // here — `Engine::new_for_test`'s own doc warns this never
-        // retroactively updates `app_shell` — and when that happens
-        // downstream consumers of the shadow (this file's own
-        // `handle_mouse_event` `TreeController` intercept, and the
-        // runner-vs-shadow sidebar-visibility resync at the tail of
-        // `Self::handle`) read a stale `app_shell` and can force the
-        // *runner's* sidebar hidden even though the tree just painted and a
-        // click landed on it (#1117). Recomputing here — the same
-        // `autohide_panels` / `explorer_visible` derivation
-        // `Engine::new_from_state` runs at construction — makes `app_shell`
-        // agree with whatever `session` state `engine` actually carries by
-        // the time the shell app takes ownership of it, regardless of when
-        // or how that state was set.
-        let show_sidebar = if engine.settings.autohide_panels {
-            false
-        } else {
-            engine.session.explorer_visible || engine.settings.explorer_visible_on_startup
-        };
-        if show_sidebar != engine.app_shell.sidebar_visible() {
-            if show_sidebar {
-                engine.app_shell.toggle_sidebar();
-            } else {
-                engine.app_shell.hide_sidebar();
-            }
-        }
 
         let now = Instant::now();
         Self {
@@ -1388,7 +1373,29 @@ impl TuiShellApp {
         // the authoritative state, it costs nothing, and it stays correct
         // if/when #607 makes the modal-stack path work too.
         let ctx_menu_blocks_event = self.engine.context_menu.is_some();
-        let intercepts_blocked = modal_blocks_event || ctx_menu_blocks_event;
+        // #1117: an open picker (`engine.picker_open`) or folder picker
+        // (`self.folder_picker`) also has to block every panel intercept
+        // below, not just claims that land inside its own painted bounds —
+        // mirrors GTK's `try_route_sidebar_mouse_event`, which returns
+        // `false` unconditionally on `engine.picker_open` before it even
+        // looks at click position (`app.rs`, "Falling through is also what
+        // makes *dismissal* correct"), and `handle_mouse_click_msg`, which
+        // does the same for `self.folder_picker` ("checked before every
+        // other rung"). Without this, a press *outside* the popup that is
+        // meant to dismiss it — the picker floats centred over the whole
+        // window, so with the sidebar visible its left half sits on top of
+        // whichever panel is active — gets swallowed by that panel's own
+        // intercept instead of ever reaching the picker's own modal-stack
+        // dispatch (`mouse::handle_mouse`'s `route_modal_overlay_click`),
+        // which is what actually resolves an outside click as a dismissal.
+        // This was already latent before #1117 touched this function (every
+        // panel intercept below shares the same shape), just never exposed
+        // — the Explorer intercept's now-deleted `app_shell.sidebar_visible()`
+        // read happened to also decline in every scenario the existing test
+        // suite combined with an open picker, by accident of those
+        // scenarios' own setup rather than by design.
+        let picker_blocks_event = self.engine.picker_open || self.folder_picker.is_some();
+        let intercepts_blocked = modal_blocks_event || ctx_menu_blocks_event || picker_blocks_event;
 
         // ── SidebarSystem intercept: debug sidebar (mirrors `mod.rs`
         // ~1436-1471) ──
@@ -1544,33 +1551,42 @@ impl TuiShellApp {
             let is_explorer_event = match &event {
                 UiEvent::MouseDown { position, .. } | UiEvent::DoubleClick { position, .. } => {
                     let rect = self.engine.explorer_tree_rect.get();
-                    // #1117: `self.engine.app_shell.sidebar_visible()` here
-                    // is a live, accurate read of the same ground truth
-                    // `App::explorer_ui_event` (`app.rs`) effectively
-                    // consults on GTK — it's kept in lockstep with the
-                    // runner's own `AppShell` sidebar visibility (the
-                    // `ShellAdapter`-owned instance that actually decides
-                    // what painted this frame) by `Self::from_engine`'s
-                    // construction-time resync and by every subsequent
-                    // toggle path in this file, so it is not the "extra,
-                    // staler condition" it used to be. It is still needed
-                    // *in addition to* `rect.width > 0.0`: unlike GTK (whose
-                    // `explorer_ui_event` is gated by the freshly-computed
-                    // `ctx.layout.sidebar_content_bounds` one level up, in
-                    // `try_route_sidebar_mouse_event`), `explorer_tree_rect`
-                    // here is a plain `Cell` that only ever gets *set* when
-                    // the sidebar body actually paints — it is never reset
-                    // to zero on a frame where the sidebar is hidden, so
-                    // once hidden it keeps reporting the *last* rect it was
-                    // painted at. Dropping this check made a click that
-                    // landed in the editor, at the same screen position the
-                    // sidebar last occupied before being hidden, get
-                    // mis-claimed by this intercept instead of reaching the
-                    // editor (see this issue's regression on
-                    // `tui_editor_double_click_selects_the_word_via_shared_dispatch`
-                    // and its siblings).
+                    // #1117: converged onto the same predicate
+                    // `App::explorer_ui_event` (`app.rs`) uses on GTK —
+                    // `rect.width > 0.0` alone, no extra
+                    // `app_shell.sidebar_visible()` read. That extra
+                    // condition used to be needed only because
+                    // `explorer_tree_rect` was a plain `Cell` that got
+                    // *set* whenever the sidebar body painted but never
+                    // *reset* on a frame where it didn't — so once the
+                    // sidebar was hidden, this rect kept reporting the last
+                    // position it was painted at, and the sidebar-visible
+                    // shadow (`engine.app_shell`, tracked independently of
+                    // what the runner actually painted — see
+                    // `Self::handle`'s runner-vs-shadow resync) was the
+                    // only thing keeping a stale rect from mis-claiming an
+                    // editor click. That shadow can itself go stale
+                    // relative to what painted (the actual #1043 bug: a
+                    // caller that mutates `engine.session` on an
+                    // already-built `Engine`, as `Engine::new_for_test`'s
+                    // own doc warns against, leaves `app_shell` behind
+                    // without ever touching what the runner paints or what
+                    // this rect measures) — an extra, staler condition in a
+                    // backend file, exactly the per-backend drift the
+                    // Platform-Neutrality Rule says to delete rather than
+                    // maintain. `render_content` now resets
+                    // `explorer_tree_rect` to zero-width, once per frame,
+                    // unconditionally, whenever `presence.sidebar_panel` is
+                    // `false` (nothing painted the sidebar body this
+                    // frame) — ungated by which rungs end up composed, so
+                    // it still runs on a frame where the `SidebarPanel`
+                    // rung itself is entirely absent from `composed_frame`
+                    // (see that check's own comment). `rect.width > 0.0`
+                    // is on its own an accurate, self-correcting signal —
+                    // ground truth is "did the tree actually paint", not a
+                    // second copy of "is the sidebar visible" that can
+                    // drift from it.
                     !intercepts_blocked
-                        && self.engine.app_shell.sidebar_visible()
                         && self.engine.active_panel_is(PANEL_EXPLORER)
                         && rect.width > 0.0
                         && rect.contains(*position)
@@ -2228,6 +2244,29 @@ impl ShellApp for TuiShellApp {
             render::FramePresence::from_screen(&screen, layout, render::FrameMetrics::CELL);
         presence.toast_stack = toast_stack.is_some();
         presence.folder_picker = self.folder_picker.is_some();
+
+        // #1117: `presence.sidebar_panel` (derived above, straight from
+        // `layout.sidebar_content_bounds`) is the exact gate
+        // `render::compose_frame` uses to decide whether `FrameOp::SidebarPanel`
+        // is even in this frame's op list — when it's `false`, that rung's
+        // own arm below never runs, so it can never reset `explorer_tree_rect`
+        // itself (an `else` branch inside that arm is dead code for a
+        // *hidden* sidebar, precisely the frame that needs the reset; the
+        // in-arm branch only ever ran for panels other than Explorer, e.g.
+        // Search, which was already a no-op). This has to run here, once,
+        // unconditionally, ungated by which rungs end up composed. Without
+        // it `explorer_tree_rect` — a plain `Cell` only ever *set* when the
+        // tree actually paints — keeps reporting the last position it was
+        // painted at for as long as the sidebar stays hidden, which is
+        // exactly the staleness `handle_mouse_event`'s `TreeController`
+        // intercept relies on this being fixed to have converged onto the
+        // shared `rect.width > 0.0` predicate GTK's `explorer_ui_event`
+        // uses (see that intercept's own comment).
+        if !presence.sidebar_panel {
+            self.engine
+                .explorer_tree_rect
+                .set(quadraui::Rect::new(0.0, 0.0, 0.0, 0.0));
+        }
 
         let mut composed: Vec<render::FrameOp> = Vec::new();
         for op in render::compose_frame(&presence) {
