@@ -147,13 +147,29 @@ impl Engine {
     }
 
     /// Find the flat index of an item by its ID within a specific section.
-    /// Returns `None` if the panel, section, or item is not found.
+    ///
+    /// Match precedence:
+    ///   1. An exact `id` match (empty ids never match — a query is never empty
+    ///      either, so this alone rules out the empty-id separator/header rows
+    ///      that `git_log_panel.lua` emits).
+    ///   2. Failing that, a single unambiguous hash-prefix match against a
+    ///      top-level row (`parent_id` empty, not a separator) whose `id`
+    ///      starts with `item_id`. A `<hash>:<path>` child row never qualifies
+    ///      here even if its id happens to share the prefix, and if more than
+    ///      one top-level row matches the prefix the result is ambiguous and
+    ///      treated as no match — guessing would silently select the wrong
+    ///      commit.
+    ///
+    /// Returns `None` if the panel, section, or a unique match is not found.
     pub fn ext_panel_find_flat_index(
         &self,
         panel_name: &str,
         section_name: &str,
         item_id: &str,
     ) -> Option<usize> {
+        if item_id.is_empty() {
+            return None;
+        }
         let reg = self.ext_panels.get(panel_name)?;
         let expanded = self.ext_panel_sections_expanded.get(panel_name);
         let mut pos = 0;
@@ -165,12 +181,24 @@ impl Engine {
                 if let Some(items) = self.ext_panel_items.get(&key) {
                     let visible = self.ext_panel_visible_indices(panel_name, items);
                     if section == section_name {
-                        for &vi in &visible {
-                            if items[vi].id == item_id
-                                || items[vi].id.starts_with(item_id)
-                                || item_id.starts_with(&items[vi].id)
-                            {
-                                return Some(pos + visible.iter().position(|&x| x == vi).unwrap());
+                        // Pass 1: exact id match (any visible row).
+                        if let Some(offset) = visible
+                            .iter()
+                            .position(|&vi| !items[vi].id.is_empty() && items[vi].id == item_id)
+                        {
+                            return Some(pos + offset);
+                        }
+                        // Pass 2: unambiguous hash-prefix match against a
+                        // top-level (commit) row only.
+                        let mut prefix_matches = visible.iter().enumerate().filter(|&(_, &vi)| {
+                            !items[vi].id.is_empty()
+                                && !items[vi].is_separator
+                                && items[vi].parent_id.is_empty()
+                                && items[vi].id.starts_with(item_id)
+                        });
+                        if let Some((offset, _)) = prefix_matches.next() {
+                            if prefix_matches.next().is_none() {
+                                return Some(pos + offset);
                             }
                         }
                     }
@@ -200,10 +228,19 @@ impl Engine {
             }
         }
         // Find the flat index and set selection
-        if let Some(flat_idx) = self.ext_panel_find_flat_index(panel_name, section_name, item_id) {
-            self.ext_panel_selected = flat_idx;
-            // Center the item in the viewport
-            self.ext_panel_scroll_top = flat_idx.saturating_sub(5);
+        match self.ext_panel_find_flat_index(panel_name, section_name, item_id) {
+            Some(flat_idx) => {
+                self.ext_panel_selected = flat_idx;
+                // Center the item in the viewport
+                self.ext_panel_scroll_top = flat_idx.saturating_sub(5);
+            }
+            None => {
+                // A reveal that quietly lands on the wrong row is worse than one that
+                // reports it couldn't find a unique match — leave the selection as-is
+                // and say so instead of silently falling back to row 0.
+                self.message =
+                    format!("Could not find \"{item_id}\" in {section_name} — selection unchanged");
+            }
         }
     }
 
