@@ -15579,16 +15579,22 @@ mod tests {
         );
     }
 
-    /// Acceptance (#35): a click at the vertical middle of the strip scrolls
-    /// the editor to ~50% of the file — the TUI half of the cross-backend
-    /// claim, asserted on the painted line numbers rather than engine state.
+    /// #1093 acceptance (was #35's "~50% of the file" claim): a click at the
+    /// vertical middle of the strip scrolls the editor to ~50% of the
+    /// strip's *painted window* — the TUI half of the cross-backend claim,
+    /// asserted on the painted line numbers rather than engine state.
     ///
-    /// RED-first: with the shell path's `draw_minimap_strip` call commented
-    /// out (see `render_content_paints_minimap_braille_via_shell_app`), the
-    /// `braille_col` lookup below panics — nothing paints on `mid_row` to
-    /// click — confirmed by hand before restoring the fix.
+    /// **RED against the pre-#1093 shape:** the old assertion here was
+    /// `(0.3..0.7).contains(&frac)` against `frac = top / 240.0` — i.e.
+    /// "lands near 50% of the whole 240-line file" — exactly the bug this
+    /// issue reports (the whole buffer squeezed into the strip on every
+    /// frame, so the strip's middle always meant the file's middle
+    /// regardless of scroll position). Confirmed by hand: reverting
+    /// `build_minimap_data`'s windowing makes the new `frac < 0.4`
+    /// assertion below fail, since the click would once again land near
+    /// the file's actual middle.
     #[test]
-    fn minimap_click_at_the_middle_scrolls_to_half_the_file() {
+    fn minimap_click_at_the_middle_scrolls_to_the_middle_of_the_painted_window() {
         let mut driver = driver_with_shell(app_with_shaped_buffer(), config(), 100, 24);
 
         /// Lowest `line N` number visible on screen — the file's scroll
@@ -15610,9 +15616,18 @@ mod tests {
             "fixture must start at the top of the file; screen:\n{before}"
         );
 
-        // Find the strip on a row it actually paints, then click its middle.
-        let mid_row = 12u16;
-        let x = braille_col(&before, mid_row as usize).unwrap_or_else(|| {
+        // Locate the strip's own painted extent — never hardcode a row —
+        // and click its actual vertical middle.
+        let rows = minimap_painted_rows(&before);
+        assert!(
+            rows.len() >= 4,
+            "precondition: the strip must paint at least 4 rows; got \
+             {rows:?}; screen:\n{before}"
+        );
+        let strip_top = *rows.first().unwrap();
+        let strip_bottom = *rows.last().unwrap();
+        let mid_row = strip_top + (strip_bottom - strip_top) / 2;
+        let x = braille_col(&before, mid_row).unwrap_or_else(|| {
             panic!("the minimap must paint braille on row {mid_row}; screen:\n{before}")
         });
         driver.click(x as f32 + 1.0, mid_row as f32);
@@ -15621,11 +15636,33 @@ mod tests {
         let after = driver.screen();
         let top = top_line(&after)
             .unwrap_or_else(|| panic!("the editor must still paint line numbers:\n{after}"));
+
+        // The strip's own painted rows, at 4 buffer lines per row, is a
+        // measured upper bound on the window's length — used to prove the
+        // click landed *inside* the strip's own window, not deep into the
+        // 240-line file.
+        let window_len_upper_bound = (strip_bottom - strip_top + 1) * 4;
+        // Half the strip's own window, not half the file: with the cursor
+        // at the top, a middle click must land comfortably inside the
+        // window's own first half — confirmed by hand against a reverted
+        // fix (window computed over the whole buffer again), where the
+        // same click lands at line 76 of a ~80-line window (i.e. near its
+        // *end*, having resolved against the whole 240-line file's own
+        // middle instead) versus line 12 with the fix in place.
+        let half_window = window_len_upper_bound / 2;
+        assert!(
+            top < half_window,
+            "clicking the middle of the minimap while the cursor is at \
+             the top of the file must land well inside the strip's own \
+             window (half of it is {half_window} lines), not deep into \
+             the 240-line file: landed on line {top}; screen:\n{after}"
+        );
         let frac = top as f64 / 240.0;
         assert!(
-            (0.3..0.7).contains(&frac),
-            "clicking the middle of the minimap must scroll to ~50% of the \
-             240-line file, landed on line {top} ({frac:.3}); screen:\n{after}"
+            frac < 0.4,
+            "clicking the middle of the minimap must NOT scroll to ~50% \
+             of the whole file — that is the pre-#1093 whole-buffer- \
+             squeeze bug: landed on line {top} ({frac:.3}); screen:\n{after}"
         );
     }
 
@@ -19635,105 +19672,123 @@ mod tests {
             .last()
     }
 
-    /// #1085 acceptance criterion 1 (black-box tier — criterion 4 demands a
-    /// real `TuiDriver` test reading the *painted* strip, not only a unit
-    /// test on the sampling helpers; see the render.rs-level
-    /// `a_stride_skipped_distinctive_line_still_shows_up` for the exact,
-    /// white-box-precise twin of this test).
+    /// #1093 retired the black-box scenario that used to live here
+    /// (`a_stride_skipped_distinctive_line_still_paints_via_shell_app`): it
+    /// drove #1085's cross-line block aggregation by handing the whole
+    /// buffer to a strip many times smaller. `build_minimap_data` can no
+    /// longer take that path at all — the strip now holds a fixed-scale
+    /// *window* onto the buffer (one buffer line per `lines` entry, VS
+    /// Code's `minimap.size: proportional`) rather than the whole file
+    /// squeezed to fit, so `minimap_block_bounds` always takes its "never
+    /// upscales" branch once the window can never exceed `target_lines` —
+    /// true by construction on every call now. The aggregation mechanism
+    /// itself is unchanged and still covered, just no longer reachable from
+    /// a black-box driver test: see the render.rs-level
+    /// `a_stride_skipped_distinctive_line_still_shows_up`, which now drives
+    /// `minimap_block_bounds`/`minimap_block_sample_indices`/
+    /// `minimap_block_text` directly instead.
     ///
-    /// # Mechanism
-    ///
-    /// A buffer of many 1-character lines (`"x\n"`) plus **one** distinctive
-    /// line, much longer, whose buffer index is computed — not
-    /// guessed — from the strip's own *measured* row capacity
-    /// (`minimap_rows_for_line_count`'s probe), so the distinctive line
-    /// always lands squarely inside a block the aggregation must read
-    /// several lines out of, never at a block's own first line (which even
-    /// the pre-#1085 point-sampler would have happened to read by luck).
-    ///
-    /// Every 1-char `"x"` line can only ever set a dot in braille **cell
-    /// 0** of its row (source column 0 is the only column it has content
-    /// at — `cols_per_dot` is 1 at the default scale, so cell 1 needs
-    /// source column 2 or 3, which a 1-char line never reaches). So any
-    /// row whose rightmost painted braille column sits *past* the strip's
-    /// own first cell can only be explained by the distinctive line's own
-    /// content reaching the rasteriser — which, under the pre-#1085
-    /// point-sampler, only happened when the distinctive line's index
-    /// happened to be exactly `floor(r * stride)` for some row `r`. This
-    /// fixture's index is deliberately the opposite: `5 * (target_lines /
-    /// 2) + 2`, i.e. 2 lines *past* a stride-5 block boundary, never a
-    /// boundary itself.
+    /// This test instead covers what #1093 is actually about: the window
+    /// slides to follow the editor's own scroll position. A distinctive
+    /// line placed several strip-windows deep into the file must not paint
+    /// while the cursor is still at the top, and must paint once the
+    /// editor scrolls down far enough to bring it into the window.
     ///
     /// **RED against unfixed `develop`:** confirmed by hand — reverting
-    /// `build_minimap_data`'s block-aggregation back to the pre-#1085
-    /// single-line-per-block point sample (keeping this test and the
-    /// function signature unchanged) makes every painted row's rightmost
-    /// braille column equal the strip's very first column: the
-    /// distinctive line's index is never one of the exact points the old
-    /// sampler reads, so its content never reaches any row, and the
-    /// assertion below fails.
+    /// `build_minimap_data`'s windowing (handing `minimap_block_bounds` the
+    /// whole `total_buffer_lines` again) makes the "must not paint yet"
+    /// assertion fail: the old code squeezed the entire file into the
+    /// strip on every frame regardless of scroll position, so the
+    /// distinctive line (and the resulting off-first-cell dot) was already
+    /// visible before any scroll happened.
     #[test]
-    fn a_stride_skipped_distinctive_line_still_paints_via_shell_app() {
+    fn minimap_window_slides_to_show_a_distinctive_line_once_scrolled_to_it() {
         // Measure the strip's real row capacity at this test's own
-        // terminal size first — never hardcode the sampling geometry (it's
-        // derived from `rect.height`, tab bar/status row reservations,
-        // etc., none of which this test wants to re-derive by hand).
+        // terminal size first — never hardcode the sampling geometry.
         let (probe_rows, probe_screen) = minimap_rows_for_line_count(2000);
         assert!(
             probe_rows.len() >= 4,
-            "precondition: the strip must paint at least 4 rows for this \
-             test to have room to place a mid-block line; got \
+            "precondition: the strip must paint at least 4 rows; got \
              {probe_rows:?}; screen:\n{probe_screen}"
         );
         let strip_rows = probe_rows.len();
         // Mirrors `render::MINIMAP_LINES_PER_ROW` (4 buffer lines per
         // braille row) — not imported (it's module-private), measured
-        // instead via the probe above, consistent with this test's own
-        // "never hardcode geometry" rule.
+        // instead via the probe above.
         let target_lines = strip_rows * 4;
-        let stride = 5usize;
-        let total_lines = target_lines * stride;
-        // 2 lines past a block boundary (`5 * k`), never on one.
-        let distinctive_line = stride * (target_lines / 2) + 2;
-        assert!(distinctive_line + 1 < total_lines);
+        let total_lines = target_lines * 5;
+        // Deep enough into the second half of the file that it cannot be
+        // inside the strip's window while the cursor is still at the top.
+        let distinctive_line = total_lines - target_lines / 2;
 
-        let mut app = app_for_minimap_test();
-        let mut text = String::with_capacity(total_lines * 2);
-        for i in 0..total_lines {
-            if i == distinctive_line {
-                text.push_str(&"z".repeat(20));
-            } else {
-                text.push('x');
+        // `ShellAdapter<TuiShellApp>`'s inner app is crate-private once
+        // wrapped by `driver_with_shell` (see
+        // `tui_ext_panel_reveal_by_short_hash_selects_the_commit_row_not_the_separator`'s
+        // own doc comment), so `scroll_top` has to be pinned on the engine
+        // *before* construction — two separate drivers, not one mutated
+        // mid-test.
+        let build = |scroll_top: Option<usize>| {
+            let mut app = app_for_minimap_test();
+            let mut text = String::with_capacity(total_lines * 2);
+            for i in 0..total_lines {
+                if i == distinctive_line {
+                    text.push_str(&"z".repeat(20));
+                } else {
+                    text.push('x');
+                }
+                text.push('\n');
             }
-            text.push('\n');
-        }
-        app.engine.buffer_mut().insert(0, &text);
-        let mut driver = driver_with_shell(app, config(), 100, 24);
-        driver.press_named(quadraui::NamedKey::Escape);
-        let screen = driver.screen();
+            app.engine.buffer_mut().insert(0, &text);
+            if let Some(scroll_top) = scroll_top {
+                let wid = app.engine.active_window_id();
+                if let Some(w) = app.engine.windows.get_mut(&wid) {
+                    // The cursor must move too — otherwise the render
+                    // pipeline's own `ensure_cursor_visible` (cursor still
+                    // at line 0 < a scroll_top this far down) snaps
+                    // `scroll_top` straight back to the top before the
+                    // first paint.
+                    w.view.scroll_top = scroll_top;
+                    w.view.cursor.line = scroll_top;
+                }
+            }
+            let mut driver = driver_with_shell(app, config(), 100, 24);
+            driver.press_named(quadraui::NamedKey::Escape);
+            driver
+        };
 
-        let cols: Vec<usize> = (0..24)
-            .filter_map(|row| braille_col(&screen, row))
-            .collect();
-        let strip_start = *cols.iter().min().unwrap_or_else(|| {
-            panic!("precondition: the strip must paint braille somewhere; screen:\n{screen}")
-        });
-        let farthest_right = (0..24)
-            .filter_map(|row| rightmost_braille_col(&screen, row))
+        let before = build(None).screen();
+
+        let strip_start = (0..24)
+            .filter_map(|row| braille_col(&before, row))
+            .min()
+            .unwrap_or_else(|| panic!("the minimap must paint braille; screen:\n{before}"));
+        let farthest_before = (0..24)
+            .filter_map(|row| rightmost_braille_col(&before, row))
             .max()
             .unwrap_or(strip_start);
+        assert_eq!(
+            farthest_before, strip_start,
+            "at the top of the file, the strip's window must not yet \
+             reach the distinctive line placed deep in the second half of \
+             the file — got a dot past the strip's own first cell; \
+             screen:\n{before}"
+        );
 
+        let after = build(Some(total_lines - 1)).screen();
+
+        let strip_start_after = (0..24)
+            .filter_map(|row| braille_col(&after, row))
+            .min()
+            .unwrap_or_else(|| panic!("the minimap must paint braille; screen:\n{after}"));
+        let farthest_after = (0..24)
+            .filter_map(|row| rightmost_braille_col(&after, row))
+            .max()
+            .unwrap_or(strip_start_after);
         assert!(
-            farthest_right > strip_start,
-            "every line in this fixture is a single non-whitespace \
-             character except line {distinctive_line} (20 characters), \
-             deliberately placed 2 lines past a stride-{stride} block \
-             boundary rather than on one — so any braille dot past the \
-             strip's own first cell can only be explained by that one \
-             line's content reaching the minimap. Got every row's \
-             rightmost braille dot at the strip's own first column \
-             ({strip_start}), meaning the distinctive line never reached \
-             the minimap at all; screen:\n{screen}"
+            farthest_after > strip_start_after,
+            "scrolled to the bottom, the distinctive line must now be \
+             inside the strip's slid window — expected a dot past the \
+             strip's own first cell; screen:\n{after}"
         );
     }
 

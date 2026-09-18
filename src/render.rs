@@ -11215,7 +11215,54 @@ pub fn build_minimap_data(
         return None;
     }
 
-    // #1085: partition the buffer into `target_lines`-many blocks *before*
+    // #1093: the strip holds a *fixed vertical scale* — one `lines` entry
+    // is always worth exactly one buffer line — instead of the whole
+    // buffer being squeezed end-to-end into the strip on every frame. The
+    // old squeeze pinned the file's last line to the strip's bottom row at
+    // *every* scroll position (so a bottom-of-strip click always jumped to
+    // EOF); VS Code's `minimap.size: proportional` this issue asks for
+    // instead shows a `target_lines`-line *window* onto the buffer that
+    // slides as the editor scrolls, so both ends of the file are reachable
+    // and a bottom click pages roughly one strip's worth of file.
+    //
+    // quadraui's own `MinimapSizing::FixedPitch` already implements this
+    // slide (`slide_window_start_row`) — but only engages once it's handed
+    // more `lines` than the strip can hold. Handing it the *whole* buffer
+    // to get that engagement would cost O(file) per frame (the
+    // #728/#1085 regression this function exists to avoid), so the window
+    // is computed here, host-side, over a `lines` vector that never
+    // exceeds `target_lines` — `slide_window_start_row` then always takes
+    // its "already fits" branch and returns `0`, by construction.
+    let window_len = target_lines.min(total_buffer_lines);
+    let max_start = total_buffer_lines - window_len;
+    let window_start_line = if max_start == 0 {
+        // The whole file already fits in one window — top-aligned, no
+        // slide, byte-for-byte the pre-#1093 behaviour.
+        0
+    } else {
+        // Slide in lockstep with the editor's own scroll position: `0` at
+        // the top of the file, `max_start` (the window's own last
+        // reachable position) once the editor can't scroll down any
+        // further. Anchored to the editor's own scroll *ceiling*
+        // (`total_buffer_lines - editor_visible_rows`, the same arithmetic
+        // `View::ensure_cursor_visible` clamps `scroll_top` against)
+        // rather than `total_buffer_lines` itself, so the window reaches
+        // its own bottom exactly when the editor viewport reaches the real
+        // bottom of the file — not some fraction short of it (which a
+        // `scroll_top / total_buffer_lines` fraction would leave: the
+        // editor's own `scroll_top` never reaches `total_buffer_lines - 1`
+        // except in a one-row viewport).
+        let max_scroll_top = total_buffer_lines.saturating_sub(editor_visible_rows.max(1));
+        if max_scroll_top == 0 {
+            0
+        } else {
+            let scroll_top = window.view.scroll_top.min(max_scroll_top);
+            let fraction = scroll_top as f64 / max_scroll_top as f64;
+            ((fraction * max_start as f64).round() as usize).min(max_start)
+        }
+    };
+
+    // #1085: partition the *window* into `target_lines`-many blocks *before*
     // fetching any line text (same #728 discipline the old point-sampler
     // followed — decide what's worth reading before reading it), then
     // aggregate each block's lines (capped, see `MINIMAP_BLOCK_LINE_SAMPLE_CAP`)
@@ -11246,15 +11293,28 @@ pub fn build_minimap_data(
     // this file; this is that same trick applied per sampled line instead
     // of to one contiguous window, since the minimap's sampled lines are
     // scattered across the whole buffer rather than contiguous.
-    let bounds = minimap_block_bounds(total_buffer_lines, target_lines);
+    // `bounds` is *window*-relative (`0..window_len`), matching
+    // `minimap_block_sample_indices`'s own contract — remapped to real
+    // buffer line numbers below (`+ window_start_line`), both when reading
+    // from `rope` and when stamping `MinimapLine::line_idx`. At scale 1
+    // (`window_len <= target_lines`, always true by construction above)
+    // this takes the "never upscales" branch and every block is exactly
+    // one line wide — the aggregation this loop still runs stays the
+    // right path for a future compressed mode (a user-configurable
+    // `editor.minimap.scale`-style setting, deliberately out of this
+    // issue's scope), it just has nothing to aggregate today.
+    let bounds = minimap_block_bounds(window_len, target_lines);
     if bounds.len() < 2 {
         return None;
     }
     let mut owned: Vec<String> = Vec::with_capacity(bounds.len() - 1);
     let mut raw_spans: Vec<quadraui::SyntaxSpan> = Vec::new();
     for r in 0..bounds.len() - 1 {
-        let indices =
-            minimap_block_sample_indices(bounds[r], bounds[r + 1], MINIMAP_BLOCK_LINE_SAMPLE_CAP);
+        let indices: Vec<usize> =
+            minimap_block_sample_indices(bounds[r], bounds[r + 1], MINIMAP_BLOCK_LINE_SAMPLE_CAP)
+                .into_iter()
+                .map(|i| i + window_start_line)
+                .collect();
         owned.push(minimap_block_text(rope, &indices, r));
         for &i in &indices {
             let line_start = rope.line_to_byte(i);
@@ -11326,7 +11386,7 @@ pub fn build_minimap_data(
     // positions within the slice it was given, not buffer line numbers.
     let mut lines = quadraui::sample_lines(&borrowed, borrowed.len());
     for (i, line) in lines.iter_mut().enumerate() {
-        line.line_idx = bounds[i];
+        line.line_idx = bounds[i] + window_start_line;
     }
     if lines.is_empty() {
         return None;
@@ -11484,35 +11544,47 @@ pub fn minimap_strip_rect(mm: &RenderedMinimap) -> quadraui::Rect {
 /// Needs no backend instance: `MinimapLayout::hit_test` resolves purely from
 /// `bounds`, which is the same strip rect both rasterisers were handed —
 /// `lines_per_row` only shapes the *painted* rows, never the hit fraction. So
-/// "click the vertical middle → ~50% of the file" is one behaviour computed
-/// once, not two implementations that can drift.
+/// "click the vertical middle → ~50% of the *painted window*" is one
+/// behaviour computed once, not two implementations that can drift.
+///
+/// #1093: `sizing` used to be `MinimapSizing::Fill`, which (like every other
+/// sizing variant) never actually changed `hit_test`'s fraction — `hit_test`
+/// only ever reads `layout.bounds`, which is the `bounds` argument handed back
+/// verbatim, never reshaped by the sizing branch. What sizing *does* change is
+/// `layout.visible_lines`, which [`minimap_fraction_to_line`] now consults (the
+/// `start_line_idx` bridge its own doc describes) to resolve the fraction
+/// against the rows actually on screen rather than against
+/// `total_buffer_lines` — so this now has to agree with whichever pitch the
+/// real rasteriser painted with, or the two would resolve different windows.
+/// `FixedPitch(1.0)` is safe for *both* backends here: it never overestimates
+/// the strip's real row pitch (TUI's own pitch), so `rows_that_fit` can only
+/// come out larger than reality, never smaller — and since `mm.minimap.lines`
+/// is already host-windowed to fit the strip's real capacity
+/// (`build_minimap_data`), `rows_that_fit >= lines.len() / lines_per_row`
+/// holds regardless, so `layout_with_sizing` never re-slides on top of the
+/// host-side window already computed.
 pub fn minimap_click_line(screen: &ScreenLayout, x: f64, y: f64) -> Option<(WindowId, usize)> {
     for mm in &screen.minimap {
-        // quadraui#667 deprecated the 2-arg `Minimap::layout` shim in favor
-        // of `layout_with_sizing` with an explicit `MinimapSizing` — `Fill`
-        // here is byte-for-byte the old shim's (and this function's
-        // pre-#667) behaviour, so this is a warning fix, not a behaviour
-        // change.
         let layout = mm.minimap.layout_with_sizing(
             minimap_strip_rect(mm),
             MINIMAP_LINES_PER_ROW,
-            quadraui::MinimapSizing::Fill,
+            quadraui::MinimapSizing::FixedPitch(1.0),
         );
         if let quadraui::MinimapHit::Seek { fraction } = layout.hit_test(x as f32, y as f32) {
             return Some((
                 mm.window_id,
-                minimap_fraction_to_line(fraction, mm.minimap.total_buffer_lines),
+                minimap_fraction_to_line(fraction, &layout, &mm.minimap),
             ));
         }
     }
     None
 }
 
-/// Apply a minimap click/drag: focus the *hit* pane, scroll it to the
-/// clicked fraction of the file, and carry the cursor with it, so the next
-/// `ensure_cursor_visible` doesn't snap the view straight back. Works
-/// against whichever pane's strip the point landed on (#722), not just the
-/// active window.
+/// Apply a minimap click/drag: focus the *hit* pane, scroll it so the
+/// clicked line sits at the *centre* of the viewport (VS Code parity), and
+/// carry the cursor with it, so the next `ensure_cursor_visible` doesn't snap
+/// the view straight back. Works against whichever pane's strip the point
+/// landed on (#722), not just the active window.
 ///
 /// The focus switch (`focus_group_for_window` + `set_cursor_for_window`,
 /// the same pair `Engine::mouse_click` uses for a plain buffer click) is a
@@ -11523,9 +11595,18 @@ pub fn minimap_click_line(screen: &ScreenLayout, x: f64, y: f64) -> Option<(Wind
 /// read as broken — a click that visibly moves a pane's view but leaves
 /// focus (and keyboard input) somewhere else.
 ///
-/// Returns the window scrolled and the buffer line scrolled to, or `None`
-/// when the point missed every strip (in which case the caller must fall
-/// through to its normal editor click handling).
+/// #1093: centres rather than top-aligns — `set_scroll_top_for_window` used
+/// to be handed `line` directly, which put the clicked line at the very top
+/// of the viewport. Combined with the strip no longer spanning the whole
+/// file, top-aligning a bottom-of-strip click made the viewport's *bottom*
+/// land a further `viewport_lines` past the clicked point, reading as an
+/// overshoot/page-down rather than "scroll to roughly here" — VS Code
+/// centres the viewport on the clicked point instead.
+///
+/// Returns the window scrolled and the buffer line scrolled to (the raw
+/// clicked line — the cursor's own target — not the centred `scroll_top`),
+/// or `None` when the point missed every strip (in which case the caller
+/// must fall through to its normal editor click handling).
 pub fn apply_minimap_click(
     engine: &mut Engine,
     screen: &ScreenLayout,
@@ -11534,22 +11615,52 @@ pub fn apply_minimap_click(
 ) -> Option<(WindowId, usize)> {
     let (window_id, line) = minimap_click_line(screen, x, y)?;
     engine.focus_group_for_window(window_id);
-    engine.set_scroll_top_for_window(window_id, line);
+    let half_viewport = engine
+        .windows
+        .get(&window_id)
+        .map(|w| w.view.viewport_lines / 2)
+        .unwrap_or(0);
+    engine.set_scroll_top_for_window(window_id, line.saturating_sub(half_viewport));
     engine.set_cursor_for_window(window_id, line, 0);
     Some((window_id, line))
 }
 
-/// Buffer line a minimap click at `fraction` of the track should scroll to.
+/// Buffer line a minimap click at `fraction` of the track should scroll to,
+/// resolved against the strip's actual **painted window** — not against
+/// [`quadraui::Minimap::total_buffer_lines`] (#1093). Once the strip holds a
+/// fixed-scale window rather than the whole file, "50% down the track" means
+/// "the row halfway through what's currently painted", which for a file
+/// taller than the strip is a real buffer line far short of 50% of the file.
 ///
-/// `fraction` comes from `quadraui::MinimapLayout::hit_test`; both backends
-/// funnel through here so a click at the vertical middle of the strip lands on
-/// the same line in GTK and TUI.
-pub fn minimap_fraction_to_line(fraction: f32, total_buffer_lines: usize) -> usize {
-    if total_buffer_lines == 0 {
+/// `layout` must be the same backend/pitch-matched
+/// [`quadraui::MinimapLayout`] `fraction` itself came from (see
+/// [`minimap_click_line`]'s doc comment on why the sizing has to agree with
+/// paint). `layout.visible_lines[row].start_line_idx` bridges a resolved row
+/// back to its position in `minimap.lines`, whose own
+/// [`quadraui::MinimapLine::line_idx`] is the real buffer line
+/// `build_minimap_data` already stamped it with — so this never needs
+/// `total_buffer_lines` at all.
+pub fn minimap_fraction_to_line(
+    fraction: f32,
+    layout: &quadraui::MinimapLayout,
+    minimap: &quadraui::Minimap,
+) -> usize {
+    let last_line_idx = || minimap.lines.last().map(|l| l.line_idx).unwrap_or(0);
+    if minimap.lines.is_empty() {
         return 0;
     }
-    let f = fraction.clamp(0.0, 1.0) as f64;
-    ((f * total_buffer_lines as f64) as usize).min(total_buffer_lines - 1)
+    let row_count = layout.visible_lines.len();
+    if row_count == 0 {
+        return minimap.lines[0].line_idx;
+    }
+    let row = ((fraction.clamp(0.0, 1.0) as f64) * row_count as f64) as usize;
+    let row = row.min(row_count - 1);
+    let start_line_idx = layout.visible_lines[row].start_line_idx;
+    minimap
+        .lines
+        .get(start_line_idx)
+        .map(|l| l.line_idx)
+        .unwrap_or_else(last_line_idx)
 }
 
 /// Context menu data for TUI rendering.
@@ -25092,15 +25203,36 @@ mod tests {
         );
     }
 
-    /// Acceptance: clicking the vertical middle of the strip seeks to ~50%
-    /// of the file. Backend-independent — both backends call exactly this.
+    /// #1093 acceptance criteria 4 and 5: clicking the vertical middle of the
+    /// strip seeks to ~50% of the strip's *painted window*, not 50% of the
+    /// whole file, and the scroll it produces is centred on that line (VS
+    /// Code parity), not top-aligned. Backend-independent — both backends
+    /// call exactly this.
+    ///
+    /// **RED against the pre-#1093 shape:** the old assertion here was
+    /// `(line as f64 / total).abs() < 0.1` — i.e. "lands near 50% of the
+    /// whole file" — which is exactly the bug this issue reports (the whole
+    /// buffer squeezed into the strip on every frame, so 50% of the strip
+    /// always meant 50% of the file regardless of scroll position).
+    /// Confirmed by hand: reverting `build_minimap_data`'s windowing (handing
+    /// `minimap_block_bounds` the whole `total_buffer_lines` again) makes
+    /// `window_len < total` (this test's own setup-sanity check) fail
+    /// outright, since the window would once again cover the entire file.
     #[test]
-    fn minimap_click_at_the_middle_seeks_to_half_the_file() {
+    fn minimap_click_at_the_middle_seeks_to_the_middle_of_the_painted_window() {
         let mut e = minimap_engine();
         let screen = render_engine(&e, 120.0, 30.0);
         let win_id = screen.windows[0].window_id;
         let mm = screen.minimap.first().expect("minimap present");
-        let total = mm.minimap.total_buffer_lines as f64;
+        let total = mm.minimap.total_buffer_lines;
+        let window_len = mm.minimap.lines.len();
+        assert!(
+            window_len < total,
+            "test setup sanity: the file must be taller than the strip's \
+             own window, or this test cannot distinguish window-relative \
+             from whole-file semantics (window_len={window_len}, \
+             total={total})"
+        );
 
         let mid_x = mm.rect.x + mm.rect.width / 2.0;
         let mid_y = mm.rect.y + mm.rect.height / 2.0;
@@ -25110,39 +25242,89 @@ mod tests {
             hit_win, win_id,
             "the hit must resolve to the pane it was clicked in"
         );
-        let frac = line as f64 / total;
+
+        // The cursor starts at the top of the file, so the painted window
+        // itself starts at line 0 — a middle click must land near half of
+        // *that* window, not half of `total`.
+        let window_frac = line as f64 / window_len as f64;
         assert!(
-            (frac - 0.5).abs() < 0.1,
-            "a click at the vertical middle must land near 50% of the file, got \
-             line {line} of {total} ({frac:.3})"
+            (window_frac - 0.5).abs() < 0.15,
+            "a click at the vertical middle must land near 50% of the \
+             painted window ({window_len} lines starting at line 0), got \
+             line {line} ({window_frac:.3})"
+        );
+        let file_frac = line as f64 / total as f64;
+        assert!(
+            file_frac < 0.4,
+            "the click must NOT land near 50% of the whole file — that is \
+             the pre-#1093 whole-buffer-squeeze bug: got line {line} of \
+             {total} ({file_frac:.3})"
         );
 
-        // …and it actually scrolls the window there.
+        // …and it actually scrolls the window there, *centred* on the
+        // clicked line rather than top-aligned.
         let (scrolled_win, scrolled) =
             apply_minimap_click(&mut e, &screen, mid_x, mid_y).expect("click must be handled");
         assert_eq!(scrolled_win, win_id);
         assert_eq!(scrolled, line);
-        assert_eq!(e.scroll_top(), line, "the window must be scrolled to it");
+        let viewport_lines = e
+            .windows
+            .get(&win_id)
+            .map(|w| w.view.viewport_lines)
+            .unwrap_or(0);
+        assert_eq!(
+            e.scroll_top(),
+            line.saturating_sub(viewport_lines / 2),
+            "the click must centre the viewport on the clicked line \
+             (against the painted window's own line, not `total`), not \
+             pin it to the very top of the viewport"
+        );
     }
 
-    /// Top and bottom of the track bracket the file; a point outside the
-    /// strip must miss so the caller falls through to normal editor clicks.
+    /// #1093 acceptance criteria 1 and 4: at the top of the file, the
+    /// strip's bottom row must NOT jump to EOF — the exact repro in the
+    /// issue ("open a 647-line file at line 1, click the bottom of the
+    /// strip, the view jumps to EOF"). It must instead land near the end of
+    /// the painted window, i.e. advance by roughly one strip's worth of
+    /// file. A point outside the strip must still miss so the caller falls
+    /// through to normal editor clicks.
+    ///
+    /// **RED against the pre-#1093 shape:** confirmed by hand — the old
+    /// assertion (`bottom >= total - total / 10`, "lands in the last tenth
+    /// of the file") passed on unfixed `develop` and would fail against
+    /// this fix (`bottom` lands far short of `total`); the new assertions
+    /// below fail against unfixed `develop` instead, since there `bottom`
+    /// really is in the file's last tenth regardless of scroll position.
     #[test]
-    fn minimap_click_top_bottom_and_miss() {
+    fn minimap_click_at_the_bottom_does_not_jump_to_eof() {
         let e = minimap_engine();
         let screen = render_engine(&e, 120.0, 30.0);
         let win_id = screen.windows[0].window_id;
         let mm = screen.minimap.first().expect("minimap present");
         let total = mm.minimap.total_buffer_lines;
+        let window_len = mm.minimap.lines.len();
+        assert!(
+            window_len < total,
+            "test setup sanity: the file must be taller than the strip's \
+             own window (window_len={window_len}, total={total})"
+        );
         let x = mm.rect.x + 1.0;
 
         assert_eq!(minimap_click_line(&screen, x, mm.rect.y), Some((win_id, 0)));
         let (_, bottom) = minimap_click_line(&screen, x, mm.rect.y + mm.rect.height - 0.5)
             .expect("bottom of the track must hit");
         assert!(
-            bottom >= total - total / 10,
-            "the bottom of the track must land in the last tenth of the file, \
-             got {bottom} of {total}"
+            bottom < total - total / 10,
+            "the bottom of the track must NOT land in the last tenth of \
+             the file while the cursor is still at the top — that is the \
+             issue's own repro (bottom-of-strip click jumps to EOF): got \
+             {bottom} of {total}"
+        );
+        assert!(
+            bottom as f64 >= window_len as f64 * 0.7,
+            "the bottom of the track must land near the end of the \
+             painted window ({window_len} lines), not far short of it: \
+             got {bottom}"
         );
 
         // One cell to the left of the strip is editor text, not the minimap.
@@ -25167,8 +25349,16 @@ mod tests {
     /// The sampled lines and aggregated spans are quadraui's output, keyed
     /// back to real buffer lines — a transposed or empty sample would show up
     /// here before it reaches a snapshot.
+    ///
+    /// #1093: renamed from `minimap_samples_the_whole_buffer_in_order` — the
+    /// strip now holds a *window*, not the whole buffer, so the claim in the
+    /// old name is no longer true (the window merely happens to start at
+    /// line 0 here, since the cursor starts at the top of the file). The
+    /// in-order/strictly-increasing assertions below are unchanged; a
+    /// `window_len < total_buffer_lines` check is added so this stays
+    /// honest about no longer covering the whole file.
     #[test]
-    fn minimap_samples_the_whole_buffer_in_order() {
+    fn minimap_window_samples_in_order_starting_at_the_top() {
         let e = minimap_engine();
         let screen = render_engine(&e, 120.0, 30.0);
         let mm = &screen.minimap.first().expect("minimap present").minimap;
@@ -25177,6 +25367,14 @@ mod tests {
             "200 lines plus the trailing one"
         );
         assert!(!mm.lines.is_empty());
+        assert!(
+            mm.lines.len() < mm.total_buffer_lines,
+            "test setup sanity: the file must be taller than the strip's \
+             own window, or this test can't distinguish a window from the \
+             pre-#1093 whole-buffer sample (window={}, total={})",
+            mm.lines.len(),
+            mm.total_buffer_lines
+        );
         assert!(
             mm.lines.windows(2).all(|w| w[0].line_idx < w[1].line_idx),
             "sampled buffer line indices must be strictly increasing"
@@ -25192,25 +25390,165 @@ mod tests {
         );
     }
 
+    /// #1093 acceptance criterion 1: a file several times taller than the
+    /// strip, cursor at line 1 — the strip's last painted row's `line_idx`
+    /// must be well short of `total_buffer_lines`. This is the issue's own
+    /// repro (`src/app_support.rs`, 647 lines, TUI minimap, cursor at line
+    /// 1: "the strip's bottom row is line ~647").
+    ///
+    /// **RED against unfixed `develop`:** the pre-#1093 shape squeezed the
+    /// whole buffer into the strip on every frame, so the last painted row
+    /// was always `total_buffer_lines - 1` regardless of scroll position —
+    /// this exact assertion (`last_line_idx < total - total / 4`) fails
+    /// against that shape at any scroll position, including the top.
+    #[test]
+    fn minimap_window_stays_short_of_eof_when_scrolled_to_the_top() {
+        let e = large_minimap_engine(2_000);
+        let theme = Theme::onedark();
+        let wid = e.active_window_id();
+        let rect = WindowRect::new(0.0, 0.0, 100.0, 40.0);
+        let mm = build_minimap_data(&e, &theme, wid, rect, 1.0, 40)
+            .expect("minimap must build")
+            .minimap;
+
+        assert_eq!(mm.lines[0].line_idx, 0, "cursor starts at the top");
+        let last_line_idx = mm.lines.last().unwrap().line_idx;
+        assert!(
+            last_line_idx < mm.total_buffer_lines - mm.total_buffer_lines / 4,
+            "the strip's last painted row (line {last_line_idx} of \
+             {}) must be well short of the end of the file while the \
+             cursor is at the top — a full-length map would paint the \
+             file's last line here on every frame",
+            mm.total_buffer_lines
+        );
+    }
+
+    /// #1093 acceptance criterion 2: the same file scrolled to the bottom —
+    /// the strip's last painted row **is** the last line of the file, and
+    /// its first row is not line 0 (both ends of the file are reachable by
+    /// scrolling, VS Code's `minimap.size: proportional`).
+    #[test]
+    fn minimap_window_reaches_eof_when_scrolled_to_the_bottom() {
+        let mut e = large_minimap_engine(2_000);
+        let theme = Theme::onedark();
+        let wid = e.active_window_id();
+        let rect = WindowRect::new(0.0, 0.0, 100.0, 40.0);
+        const EDITOR_VISIBLE_ROWS: usize = 40;
+
+        let total_buffer_lines = {
+            let state = e.active_buffer_state_mut();
+            state.buffer.content.len_lines()
+        };
+        let max_scroll_top = total_buffer_lines - EDITOR_VISIBLE_ROWS;
+        if let Some(w) = e.windows.get_mut(&wid) {
+            w.view.scroll_top = max_scroll_top;
+        }
+
+        let mm = build_minimap_data(&e, &theme, wid, rect, 1.0, EDITOR_VISIBLE_ROWS)
+            .expect("minimap must build")
+            .minimap;
+
+        assert_eq!(
+            mm.lines.last().unwrap().line_idx,
+            total_buffer_lines - 1,
+            "scrolled to the bottom, the strip's last painted row must be \
+             the file's actual last line"
+        );
+        assert!(
+            mm.lines[0].line_idx > 0,
+            "scrolled to the bottom, the strip's first painted row must \
+             not still be line 0 — the window must have slid"
+        );
+    }
+
+    /// #1093 acceptance criterion 3: a 200-line file and a 2,000-line file
+    /// opened into the *same* strip must sample the same number of buffer
+    /// lines per painted row — the fixed vertical scale this issue asks
+    /// for, independent of file length.
+    ///
+    /// **RED against unfixed `develop`:** the pre-#1093 scale was
+    /// `total_buffer_lines / target_lines` — a number that moves with the
+    /// file — so a 10x-longer file at the same strip geometry sampled a 10x
+    /// coarser scale; this equality fails against that shape.
+    #[test]
+    fn minimap_scale_is_independent_of_file_length() {
+        let theme = Theme::onedark();
+        let rect = WindowRect::new(0.0, 0.0, 100.0, 40.0);
+
+        let short = large_minimap_engine(200);
+        let long = large_minimap_engine(2_000);
+        let wid_short = short.active_window_id();
+        let wid_long = long.active_window_id();
+
+        let mm_short = build_minimap_data(&short, &theme, wid_short, rect, 1.0, 40)
+            .expect("minimap must build for the short fixture")
+            .minimap;
+        let mm_long = build_minimap_data(&long, &theme, wid_long, rect, 1.0, 40)
+            .expect("minimap must build for the long fixture")
+            .minimap;
+
+        // At a fixed scale, `lines[i].line_idx` advances by exactly the same
+        // step regardless of `total_buffer_lines` — checked between any two
+        // consecutive sampled rows so this doesn't depend on either fixture
+        // actually needing a window (the short one may not).
+        let step = |mm: &quadraui::Minimap| mm.lines[1].line_idx - mm.lines[0].line_idx;
+        assert_eq!(
+            step(&mm_short),
+            step(&mm_long),
+            "the buffer-lines-per-painted-row must be identical for a \
+             200-line and a 2,000-line file at the same strip geometry"
+        );
+    }
+
+    /// #1093 acceptance criterion 6: a file that fits entirely within the
+    /// strip's own capacity must still paint top-to-bottom with no window —
+    /// no regression to the pre-#1093 behaviour for the common case where
+    /// the whole file already fits.
+    #[test]
+    fn minimap_window_is_the_whole_file_when_it_fits_the_strip() {
+        let e = large_minimap_engine(10);
+        let theme = Theme::onedark();
+        let wid = e.active_window_id();
+        let rect = WindowRect::new(0.0, 0.0, 100.0, 40.0);
+        let mm = build_minimap_data(&e, &theme, wid, rect, 1.0, 40)
+            .expect("minimap must build")
+            .minimap;
+
+        assert_eq!(
+            mm.lines.len(),
+            mm.total_buffer_lines,
+            "a file shorter than the strip's own capacity must show every \
+             line, not a partial window"
+        );
+        assert_eq!(mm.lines[0].line_idx, 0);
+        assert_eq!(mm.lines.last().unwrap().line_idx, mm.total_buffer_lines - 1);
+    }
+
     // ── #1085: point-sample → block-aggregation ────────────────────────
 
     /// #1085 acceptance criterion 1, white-box precise tier: a distinctive
     /// single line landing squarely *inside* a stride-5 block (not on its
-    /// boundary) must still reach the minimap it feeds. This is the exact
-    /// numeric twin of `tui_main::shell_app::tests::
-    /// a_stride_skipped_distinctive_line_still_paints_via_shell_app`,
-    /// which proves the same thing through real painted braille but has no
-    /// access to `render`'s private sampling internals and so can't pin an
-    /// exact stride the way this white-box test can.
+    /// boundary) must still reach the minimap it feeds.
     ///
-    /// At `rect = WindowRect::new(0.0, 0.0, 100.0, 40.0)`, `line_height =
-    /// 1.0`: `display_rows = 40`, `target_lines = (40 *
-    /// MINIMAP_LINES_PER_ROW).max(gtk_row_capacity) = 160`. `TOTAL =
-    /// target_lines * 5 = 800` makes the block stride exactly `5.0` — an
-    /// exact integer, so block boundaries land on exact multiples of 5
-    /// with no floating-point rounding ambiguity — block `r` covers `[5r,
-    /// 5r + 5)`. Line 133 sits 3 lines into block 26's `[130, 135)` range,
-    /// never on a boundary — the precondition assertions below prove that
+    /// #1093 moved this off `build_minimap_data`: that function now windows
+    /// the buffer to a `target_lines`-line span with one buffer line per
+    /// `lines` entry (VS Code's `minimap.size: proportional`), so
+    /// `minimap_block_bounds(window_len, target_lines)` always takes its
+    /// "never upscales" branch (`window_len <= target_lines` holds by
+    /// construction on every call) — there is no longer any call path
+    /// through the real app that hands the block-aggregation helpers a
+    /// `total_lines` bigger than `target_lines`. The helpers themselves stay
+    /// exactly as #1085 left them (kept for a possible future
+    /// `editor.minimap.scale`-style compressed mode — see
+    /// `minimap_block_bounds`'s doc comment), so this test now drives them
+    /// directly instead of through `build_minimap_data`, which can no
+    /// longer reach this path at all.
+    ///
+    /// `TOTAL = TARGET_LINES * 5` makes the block stride exactly `5.0` — an
+    /// exact integer, so block boundaries land on exact multiples of 5 with
+    /// no floating-point rounding ambiguity — block `r` covers `[5r, 5r +
+    /// 5)`. Line 133 sits 3 lines into block 26's `[130, 135)` range, never
+    /// on a boundary — the precondition assertions below prove that
     /// arithmetic rather than assuming it.
     ///
     /// **RED against unfixed `develop`:** confirmed by hand — temporarily
@@ -25223,7 +25561,9 @@ mod tests {
     /// Reverted before landing this test.
     #[test]
     fn a_stride_skipped_distinctive_line_still_shows_up() {
-        const TOTAL: usize = 800;
+        const TARGET_LINES: usize = 160;
+        const STRIDE: usize = 5;
+        const TOTAL: usize = TARGET_LINES * STRIDE;
         const DISTINCTIVE_LINE: usize = 133;
         let mut text = String::with_capacity(TOTAL * 2);
         for i in 0..TOTAL {
@@ -25235,41 +25575,40 @@ mod tests {
             text.push('\n');
         }
         let e = test_engine(&text);
-        let theme = Theme::onedark();
         let wid = e.active_window_id();
-        let rect = WindowRect::new(0.0, 0.0, 100.0, 40.0);
-        let mm = build_minimap_data(&e, &theme, wid, rect, 1.0, 40)
-            .expect("minimap must build")
-            .minimap;
+        let window = e.windows.get(&wid).expect("window must exist");
+        let buffer_state = e
+            .buffer_manager
+            .get(window.buffer_id)
+            .expect("buffer must exist");
+        let rope = &buffer_state.buffer.content;
 
-        assert!(
-            mm.lines.len() < TOTAL,
-            "precondition: fixture must be large enough to force \
-             downsampling, or this test proves nothing; sampled {} rows \
-             from {TOTAL} lines",
-            mm.lines.len()
+        let bounds = minimap_block_bounds(TOTAL, TARGET_LINES);
+        assert_eq!(
+            bounds.len(),
+            TARGET_LINES + 1,
+            "an exact stride-5 split must produce exactly TARGET_LINES blocks"
         );
         assert!(
-            !mm.lines.iter().any(|l| l.line_idx == DISTINCTIVE_LINE),
+            !bounds.contains(&DISTINCTIVE_LINE),
             "precondition: line {DISTINCTIVE_LINE} must not itself be a \
-             sampled block-start, or this test doesn't exercise the \
+             sampled block boundary, or this test doesn't exercise the \
              cross-line aggregation path at all"
         );
+        let r = (0..bounds.len() - 1)
+            .find(|&r| bounds[r] <= DISTINCTIVE_LINE && DISTINCTIVE_LINE < bounds[r + 1])
+            .expect("some block must cover the distinctive line");
 
-        let containing = mm
-            .lines
-            .iter()
-            .rev()
-            .find(|l| l.line_idx <= DISTINCTIVE_LINE)
-            .expect("some sampled block must start at or before the distinctive line");
+        let indices =
+            minimap_block_sample_indices(bounds[r], bounds[r + 1], MINIMAP_BLOCK_LINE_SAMPLE_CAP);
+        let block_text = minimap_block_text(rope, &indices, r);
         assert!(
-            containing.text.chars().skip(50).any(|c| !c.is_whitespace()),
+            block_text.chars().skip(50).any(|c| !c.is_whitespace()),
             "the block covering line {DISTINCTIVE_LINE} (a single \
              200-char line among otherwise 1-char lines) must show \
              content past column 50 — every other line in its block is \
              1 character wide, so nothing else could set a dot that far \
-             right; text={:?}",
-            containing.text
+             right; text={block_text:?}"
         );
     }
 
