@@ -1207,21 +1207,46 @@ pub(super) fn handle_mouse(
             // registers a `"tui:editor_viewport"` `ScrollSurface` or pushes that
             // id onto the `ModalStack`, so `dispatch_scroll` (which can only
             // emit an id it was handed one of those two ways) could never
-            // produce it. Deleted rather than wired up: making it real means
-            // registering per-window scroll surfaces so a wheel event scrolls
-            // whichever pane is under the pointer — like GTK's
-            // `hovered_window_id` does in `handle_mouse_scroll_msg` — and this
-            // fallback, unconditionally targeting the *active* window, is the
-            // only path editor-viewport wheel scroll has ever actually taken.
-            // That GTK/TUI behavior gap is real but is a feature gap, not a
-            // duplication one; out of scope here.
+            // produce it. Deleted rather than wired up as a `ScrollSurface`.
+            //
+            // #1066: product decision was to converge on GTK's
+            // `hovered_window_id` behaviour — scroll the pane *under the
+            // pointer*, not whichever pane holds focus, without moving focus
+            // (standard scroll-follows-pointer, and also `:split`'s own
+            // behaviour in real Vim). Resolved via the same shared primitives
+            // `handle_mouse_scroll_msg` (app.rs) already uses for GTK —
+            // `render::find_window_at` plus
+            // `Engine::scroll_viewport_with_cursor_for_window` — so this is
+            // TUI-side wiring onto existing engine/render infrastructure, not
+            // new per-backend logic.
             if col >= editor_left && row + 2 < term_height {
                 let dir = if matches!(ev.kind, MouseEventKind::ScrollUp) {
                     -1
                 } else {
                     1
                 };
-                engine.scroll_viewport_with_cursor(dir, 3);
+                let active_id = engine.active_window_id();
+                // #550: `rw.rect` is already absolute terminal-screen space.
+                // Query the *center* of the cell (`+ 0.5`), not its top-left
+                // corner: an odd number of rows available to a horizontal
+                // split divides unevenly (e.g. 37 rows -> two 18.5-row
+                // panes), so a pane boundary can land at a half-row
+                // (`rect.y == 20.5`). `find_window_at`'s `y < r.y + r.height`
+                // check is exclusive, so querying the integer row itself
+                // (`20.0`) falls just *outside* the pane that visually owns
+                // that row and matches the pane above it instead — the same
+                // cell-center convention `TuiDriver::find`/`find_bounds`
+                // already use for exactly this reason.
+                let hovered_id = last_layout.and_then(|layout| {
+                    render::find_window_at(layout, col as f64 + 0.5, row as f64 + 0.5)
+                        .map(|idx| layout.windows[idx].window_id)
+                });
+                let target = hovered_id.unwrap_or(active_id);
+                if target == active_id {
+                    engine.scroll_viewport_with_cursor(dir, 3);
+                } else {
+                    engine.scroll_viewport_with_cursor_for_window(target, dir, 3);
+                }
                 engine.sync_scroll_binds();
             }
             return sidebar_width;

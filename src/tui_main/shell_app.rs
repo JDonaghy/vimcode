@@ -14917,6 +14917,123 @@ mod tests {
         );
     }
 
+    /// #1066 product decision: converge TUI's editor-viewport wheel scroll
+    /// onto GTK's "scroll the pane under the pointer, not whichever pane
+    /// holds focus" behaviour (`hovered_window_id` in `App::
+    /// handle_mouse_scroll_msg`, `app.rs`). Weighed against keeping the
+    /// divergence: scroll-follows-pointer is the norm in GUI editors, but
+    /// more importantly it is *also* real Vim's own mouse behaviour
+    /// (`:split` panes each scroll independently under the pointer without
+    /// stealing focus) — the terminal-native precedent a "vim-like" editor
+    /// should match, not just GTK parity for its own sake. Routed through
+    /// the same shared primitives GTK already uses
+    /// (`render::find_window_at`, `Engine::
+    /// scroll_viewport_with_cursor_for_window`), so this is TUI-side wiring
+    /// onto existing engine/render infrastructure — no new per-backend
+    /// logic (Platform-Neutrality Rule).
+    ///
+    /// Drives two real files into a horizontal split. `Engine::
+    /// split_window` always makes the *new* window active and — since
+    /// `splitbelow` defaults to `false` — places it *first* on screen, so
+    /// the top pane (file B) ends up focused and the bottom pane (file A,
+    /// the window that was active before the split) ends up unfocused.
+    /// Wheel-scrolling over the bottom pane's own painted text must scroll
+    /// *that* pane's content off screen while leaving the top pane's first
+    /// line untouched.
+    ///
+    /// Asserted purely on the rendered screen: `driver_with_shell` hides
+    /// the concrete `TuiShellApp`/`Engine` behind an opaque `AppLogic` with
+    /// no accessor back out (this module's own doc comment above), so
+    /// there is no internal `scroll_top` for this test to peek at even if
+    /// it wanted to — `find`/`screen_contains` against painted text is the
+    /// only tier available, which is also the tier CLAUDE.md's "Testing"
+    /// section requires.
+    ///
+    /// RED against unfixed `develop`: before this fix, `mouse.rs`'s
+    /// editor-viewport wheel fallback unconditionally called
+    /// `engine.scroll_viewport_with_cursor` — the *active*-window scroll —
+    /// regardless of pointer position, so a wheel event dispatched over
+    /// the unfocused bottom pane's own text actually scrolled the focused
+    /// top pane instead: "AAA1066_000" (bottom pane) would have stayed on
+    /// screen and "BBB1066_000" (top, focused pane) would have scrolled off
+    /// — i.e. the two assertions below inverted. Confirmed by hand:
+    /// reverting the `find_window_at`/`_for_window` routing in `mouse.rs`
+    /// back to a bare `engine.scroll_viewport_with_cursor(dir, 3)` call
+    /// flips both assertions and fails this test.
+    #[test]
+    fn wheel_scrolls_the_hovered_pane_not_the_focused_one_via_shell_app() {
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_test_1066_hovered_pane_scroll_{:?}",
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_a = dir.join("a1066.txt"); // becomes the unfocused (bottom) pane
+        let file_b = dir.join("b1066.txt"); // becomes the focused (top) pane
+        let content_a: String = (0..80).map(|i| format!("AAA1066_{i:03}\n")).collect();
+        let content_b: String = (0..80).map(|i| format!("BBB1066_{i:03}\n")).collect();
+        std::fs::write(&file_a, &content_a).unwrap();
+        std::fs::write(&file_b, &content_b).unwrap();
+
+        let mut app = TuiShellApp::new(None);
+        app.engine.settings.autohide_panels = false;
+        app.engine.app_shell.hide_sidebar();
+        app.engine.session.explorer_visible = false;
+        app.engine
+            .open_file_with_mode(&file_a, crate::core::engine::OpenMode::Permanent)
+            .unwrap();
+        app.engine
+            .split_window(SplitDirection::Horizontal, Some(&file_b));
+
+        let mut driver = driver_with_shell(app, config(), 120, 40);
+        // Warm-up dispatch: the very first frame `driver_with_shell` paints
+        // reflects the *runner*'s own `AppShell` sidebar-visibility default,
+        // not yet the engine's (the "shadow"'s) state set above — that only
+        // reconciles at the tail of a dispatch (see this module's doc
+        // comment on the runner/shadow bridge). A no-op mouse move forces
+        // one reconcile pass so `last_layout`'s window rects and the
+        // painted screen agree before any coordinate is read off either.
+        driver.mouse_move(0.0, 0.0);
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("AAA1066_000") && screen.contains("BBB1066_000"),
+            "both panes must paint their own first line before any \
+             scroll; screen:\n{screen}"
+        );
+
+        let (ax, ay) = driver
+            .find("AAA1066_000")
+            .expect("the unfocused pane's first line must be painted somewhere");
+
+        // Wheel *down* — `delta.y < 0.0` is quadraui's convention for a
+        // downward notch (see `synth_mouseevent` in quadraui's
+        // `tui/events.rs`) — dispatched at the point the unfocused pane's
+        // own text painted at, several notches so the first line is well
+        // clear of the viewport rather than borderline.
+        for _ in 0..4 {
+            driver.dispatch(UiEvent::Scroll {
+                widget: None,
+                position: quadraui::Point::new(ax, ay),
+                delta: quadraui::ScrollDelta::new(0.0, -1.0),
+            });
+        }
+
+        let screen = driver.screen();
+        assert!(
+            !screen.contains("AAA1066_000"),
+            "wheel over the unfocused pane must scroll it — its first \
+             line should have scrolled off screen; screen:\n{screen}"
+        );
+        assert!(
+            screen.contains("BBB1066_000"),
+            "wheel over the unfocused pane must NOT scroll the focused \
+             pane — its first line should be untouched; screen:\n{screen}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// #722 acceptance, painted-output tier: switching focus between panes
     /// of a `:vsplit` must not move either pane's text — coverage for the
     /// "migrates on focus change, reflowing both panes" symptom the issue

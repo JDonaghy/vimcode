@@ -1,6 +1,35 @@
 # VimCode Project State
 
-**Last updated:** September 16, 2026 (#1031 — `:s///c` confirm loop built, #801 Phase 2 / #986 fix: `Engine::confirm_sub` + `handle_confirm_sub_key` in `execute.rs`). Prior revisions: September 14 (#951 — ACP-0: `src/core/acp.rs`, NDJSON JSON-RPC transport + session lifecycle, foundation of the ACP track, epic #531), September 14 (#522 — Track A foundation: generic external-tool JSON seam, `src/core/tool_client.rs`, no coordinator vocabulary in core), September 14 (#970 — confirmed the two "failing GTK click-geometry tests" are the already-known/already-documented Darwin font-rasteriser divergence from #926/#933, not a new bug; no code change), September 14 (#950 review fix round — driver-tier pixel test added for the SEARCH_COD→SEARCH glyph change, self-contradictory pure-refactor claim corrected), September 14 (#950 — ShellApp convergence decomposition + cheap wins), September 14 (#949 review fix round — driver-tier test added, macOS/Win-GUI claim corrected), September 14 (#949 — GTK-only settings-reload watcher deleted), September 11 (macOS native-menu audit — #901/#902 filed, milestone #7 reopened), September 10 (#862 — `src/app.rs` no longer needs the `gui` feature to compile), September 5 (#827 correction pass), September 4 (#801), September 3 (platform-neutrality chain drained). Milestone #7 is **2 open** (#901, #902 — 2026-09-11 macOS native-menu audit). **#47 is reopened, in milestone #5** — its blocker (quadraui#699/#704) closed 2026-09-03, and #811 already ported the TUI side onto the new API. See `GOALS.md` for the full correction history.
+**Last updated:** September 17, 2026 (#1066 — product decision: TUI's editor wheel now scrolls the hovered pane, converged onto GTK's `hovered_window_id` behaviour; `mouse.rs` rewired onto `render::find_window_at` + `Engine::scroll_viewport_with_cursor_for_window`, GOALS.md item 14 closed). Prior revisions: September 16 (#1031 — `:s///c` confirm loop built, #801 Phase 2 / #986 fix: `Engine::confirm_sub` + `handle_confirm_sub_key` in `execute.rs`), September 14 (#951 — ACP-0: `src/core/acp.rs`, NDJSON JSON-RPC transport + session lifecycle, foundation of the ACP track, epic #531), September 14 (#522 — Track A foundation: generic external-tool JSON seam, `src/core/tool_client.rs`, no coordinator vocabulary in core), September 14 (#970 — confirmed the two "failing GTK click-geometry tests" are the already-known/already-documented Darwin font-rasteriser divergence from #926/#933, not a new bug; no code change), September 14 (#950 review fix round — driver-tier pixel test added for the SEARCH_COD→SEARCH glyph change, self-contradictory pure-refactor claim corrected), September 14 (#950 — ShellApp convergence decomposition + cheap wins), September 14 (#949 review fix round — driver-tier test added, macOS/Win-GUI claim corrected), September 14 (#949 — GTK-only settings-reload watcher deleted), September 11 (macOS native-menu audit — #901/#902 filed, milestone #7 reopened), September 10 (#862 — `src/app.rs` no longer needs the `gui` feature to compile), September 5 (#827 correction pass), September 4 (#801), September 3 (platform-neutrality chain drained). Milestone #7 is **2 open** (#901, #902 — 2026-09-11 macOS native-menu audit). **#47 is reopened, in milestone #5** — its blocker (quadraui#699/#704) closed 2026-09-03, and #811 already ported the TUI side onto the new API. See `GOALS.md` for the full correction history.
+
+## #1066 — TUI editor wheel scroll converges onto GTK's hovered-pane behaviour
+
+Wave 3 product decision from the #1044 audit (GOALS.md item 14): should TUI's editor wheel
+scroll the pane under the pointer, like GTK's `hovered_window_id` does, instead of always the
+focused pane? **Decided: converge.** Scroll-follows-pointer is standard in GUI editors, but the
+decisive argument was terminal-native precedent — real Vim's own mouse handling already scrolls
+the `:split` pane under the pointer independent of focus, which is what a "vim-like" editor
+should match, not GTK parity for its own sake.
+
+`mouse.rs`'s editor-viewport wheel-scroll fallback (the block a `#825` comment had explicitly
+flagged as the one place this diverged) now resolves the hovered window via `render::
+find_window_at` and routes through `Engine::scroll_viewport_with_cursor_for_window` when it
+differs from the active window — the exact shared primitives GTK's `handle_mouse_scroll_msg`
+(`app.rs`) already uses. No new per-backend code.
+
+Building the driver test surfaced a real, previously-latent `find_window_at` call-site bug:
+TUI window rects can land on a half-row boundary (an odd number of available rows splits
+unevenly, e.g. 37 → two 18.5-row panes), and querying the integer row itself — rather than the
+cell's *center* (`+ 0.5`) — lands just outside the pane that visually owns that row. Fixed by
+querying `col + 0.5, row + 0.5`, matching the cell-center convention `TuiDriver::find`/
+`find_bounds` already use.
+
+New black-box test: `wheel_scrolls_the_hovered_pane_not_the_focused_one_via_shell_app`
+(`src/tui_main/shell_app.rs`) — drives a real horizontal `:split` with two files through
+`driver_with_shell`, wheel-scrolls at the unfocused pane's own painted text, and asserts purely
+on the rendered screen (the driver hides the concrete `Engine` behind an opaque `AppLogic`, so
+there is no internal `scroll_top` to assert on even if the test wanted to). RED-verified by hand
+against the pre-fix `engine.scroll_viewport_with_cursor(dir, 3)`-only fallback.
 
 ## #1031 — `:s///c` confirm loop built (#801 Phase 2, #986 fix)
 
