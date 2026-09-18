@@ -417,11 +417,6 @@ pub(crate) fn v_scrollbar_hit_test(
     None
 }
 
-/// Open a URL in the default browser (only https/http).
-pub(crate) fn open_url(url: &str) {
-    crate::core::engine::open_url_in_browser(url);
-}
-
 /// The bundled Nerd Font icon subset (Symbols Nerd Font 3.5.1), embedded in
 /// the binary. Shared by [`install_bundled_icon_font_into`] (the fontconfig
 /// filesystem-install route #920 used, still needed on Linux/BSD) and

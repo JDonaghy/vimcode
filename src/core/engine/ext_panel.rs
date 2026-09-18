@@ -1607,30 +1607,18 @@ impl Engine {
         false
     }
 
-    /// Open a URL in the default browser.
-    pub(crate) fn open_url(&self, url: &str) {
+    /// Open a URL in the default browser. Validates the URL scheme via
+    /// `is_safe_url` and, if safe, queues a
+    /// [`PendingPlatformAction::OpenUrl`] for the runner to carry out
+    /// through `PlatformServices` (#1134) — see
+    /// `Engine::pending_platform_actions`'s doc for why this can't shell
+    /// out directly from here.
+    pub(crate) fn open_url(&mut self, url: &str) {
         if !is_safe_url(url) {
             return;
         }
-        #[cfg(not(test))]
-        {
-            #[cfg(target_os = "macos")]
-            {
-                let _ = std::process::Command::new("open")
-                    .arg(url)
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .spawn();
-            }
-            #[cfg(not(target_os = "macos"))]
-            {
-                let _ = std::process::Command::new("xdg-open")
-                    .arg(url)
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .spawn();
-            }
-        }
+        self.pending_platform_actions
+            .push(PendingPlatformAction::OpenUrl(url.to_string()));
     }
 
     /// Get the file path of the active buffer (if it has one).

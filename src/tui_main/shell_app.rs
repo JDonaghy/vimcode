@@ -2019,6 +2019,38 @@ impl TuiShellApp {
     fn disarm_hamburger_stale_click_guard(&mut self) {
         self.engine.hamburger_stale_click_guard = false;
     }
+
+    /// Carry out a platform action queued by engine logic this frame — `gx`,
+    /// the "Reveal in File Manager" context-menu item, an extension-supplied
+    /// link, ... — using the runner-owned `backend`'s `PlatformServices`
+    /// (#1134). `core/engine/` has no `backend` handle of its own, hence the
+    /// queue-and-drain-in-`tick` shape (see `Engine::pending_platform_actions`'s
+    /// doc); mirrors `App::run_pending_platform_action` (`app.rs`), the GTK
+    /// twin of this method. On failure, reports it via `engine.message` (the
+    /// same status-line surface `gx`'s own "Opening:" message already uses)
+    /// rather than silently doing nothing. TUI's `PlatformServices::open_url_result`
+    /// (quadraui#969) falls back to an OSC 8 hyperlink when no platform
+    /// opener is reachable (a headless SSH session, say) before reporting
+    /// `Err`, so this only surfaces a message in the genuinely-unsupported
+    /// case.
+    fn run_pending_platform_action(
+        &mut self,
+        action: PendingPlatformAction,
+        backend: &mut dyn quadraui::Backend,
+    ) {
+        match action {
+            PendingPlatformAction::OpenUrl(url) => {
+                if let Err(e) = backend.services().open_url_result(&url) {
+                    self.engine.message = format!("Could not open URL: {e:?}");
+                }
+            }
+            PendingPlatformAction::Reveal(path) => {
+                if let Err(e) = backend.services().reveal_in_file_manager(&path) {
+                    self.engine.message = format!("Could not reveal in file manager: {e:?}");
+                }
+            }
+        }
+    }
 }
 
 impl ShellApp for TuiShellApp {
@@ -3651,6 +3683,18 @@ impl ShellApp for TuiShellApp {
                 self.engine.toggle_sidebar();
             }
             self.sidebar.has_focus = true;
+            needs_redraw = true;
+        }
+
+        // Drain platform actions (open URL / reveal in file manager) queued
+        // by engine logic this frame — needs the runner-owned `backend` for
+        // `PlatformServices`, which `core/engine/` has no handle to (#1134).
+        // See `Engine::pending_platform_actions`'s doc.
+        if !self.engine.pending_platform_actions.is_empty() {
+            let actions = std::mem::take(&mut self.engine.pending_platform_actions);
+            for action in actions {
+                self.run_pending_platform_action(action, backend);
+            }
             needs_redraw = true;
         }
 
@@ -6425,6 +6469,48 @@ mod tests {
         assert!(
             screen.contains("ZQXW_STAGE2_EDITOR_MARKER"),
             "editor content should paint via TuiShellApp::render_content; screen:\n{screen}"
+        );
+    }
+
+    /// #1134: `gx` used to shell out directly from `core/engine/keys.rs` via
+    /// a bare `Command::new("xdg-open")` with no `target_os` guard at all —
+    /// it ran the Linux opener even on macOS/Windows, and (being
+    /// `#[cfg(not(test))]`) was structurally unreachable from any test, so
+    /// nothing could have caught that. Now `gx` queues a
+    /// `PendingPlatformAction::OpenUrl` onto `Engine::pending_platform_actions`
+    /// (asserted directly in `core::engine::tests`) and sets `engine.message`
+    /// synchronously — this test drives that through the real
+    /// `TuiDriver → ShellAdapter → dispatch_event → Engine::handle_key` path
+    /// and asserts on the *painted* status line, not on engine state, per
+    /// this repo's black-box testing rule. It deliberately does **not**
+    /// call `driver.tick()`: that's a separate `ShellApp::tick` call the
+    /// runner makes between event batches, and it's what actually drains
+    /// the queue through `PlatformServices::open_url_result` — exercising
+    /// it here would really shell out to (or OSC-8-fallback through) the
+    /// test process's own stdout, which is exactly the side effect a
+    /// deterministic, headless `cargo test` run must not have.
+    ///
+    /// **RED-verified against unfixed `develop`:** `Engine` has no
+    /// `pending_platform_actions` field there at all, so
+    /// `core::engine::tests`' queue assertions fail to *compile* — as red as
+    /// a reproduction of a `#[cfg(not(test))]`-gated, test-invisible bug can
+    /// get. This driver test additionally pins the user-visible half (the
+    /// status message), which compiles fine against unfixed `develop` but
+    /// is exactly the line the old code's `#[cfg(not(test))]` `Command::new`
+    /// swap must not regress.
+    #[test]
+    fn gx_shows_opening_message_via_shell_app() {
+        let mut app = TuiShellApp::new(None);
+        app.engine.buffer_mut().insert(0, "ZQXW1134GXMARKER");
+        let mut driver = driver_with_shell(app, config(), 80, 24);
+        // Cursor starts at (0, 0), on the marker word inserted above.
+        driver.type_char('g');
+        driver.type_char('x');
+        driver.render();
+        let screen = driver.screen();
+        assert!(
+            screen.contains("Opening: ZQXW1134GXMARKER"),
+            "gx should paint an \"Opening: <word>\" status message; screen:\n{screen}"
         );
     }
 

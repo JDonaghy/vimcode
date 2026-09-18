@@ -674,35 +674,21 @@ impl Engine {
         bs.file_path.clone()
     }
 
-    /// Open the system file manager at the given path's parent directory.
-    pub fn reveal_in_file_manager(&self, path: &Path) {
-        #[cfg(target_os = "macos")]
-        {
-            let _ = std::process::Command::new("open")
-                .arg("-R")
-                .arg(path)
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn();
-        }
-        // `dir` is only consulted by the xdg-open leg — macOS's `open -R`
-        // takes the file itself and reveals it in its parent.  Binding it
-        // outside this block made it an unused variable on macOS, i.e. a
-        // `-D warnings` failure that only ever fired on the platform #896
-        // is about (Linux CI uses it, so CI stayed green).
-        #[cfg(not(target_os = "macos"))]
-        {
-            let dir = if path.is_dir() {
-                path
-            } else {
-                path.parent().unwrap_or(path)
-            };
-            let _ = std::process::Command::new("xdg-open")
-                .arg(dir)
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn();
-        }
+    /// Open the system file manager at the given path's parent directory,
+    /// with it selected. Queues a [`PendingPlatformAction::Reveal`] for the
+    /// runner to carry out through `PlatformServices::reveal_in_file_manager`
+    /// (#1134) — see `Engine::pending_platform_actions`'s doc for why this
+    /// can't shell out directly from here. That method takes the target
+    /// path itself (not its parent) on every backend that implements it for
+    /// real (GTK, macOS, Win-GUI all resolve the parent-and-select
+    /// themselves), so no `path.is_dir()`/`path.parent()` split is needed
+    /// here any more — that used to live in this function only because the
+    /// old macOS leg (`open -R`) and the old Linux fallback leg (the
+    /// freedesktop.org opener, given `<dir>`) disagreed about which one they
+    /// wanted.
+    pub fn reveal_in_file_manager(&mut self, path: &Path) {
+        self.pending_platform_actions
+            .push(PendingPlatformAction::Reveal(path.to_path_buf()));
     }
 
     /// Return the path relative to cwd.
