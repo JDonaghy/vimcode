@@ -4852,8 +4852,24 @@ mod tests {
     /// `AppShellEvent::SidebarHidden` is supposed to clear, so it is seeded
     /// too — otherwise a test asserting that it ends up `false` would pass
     /// vacuously.
+    ///
+    /// Built on [`TuiShellApp::new_for_test`], not `TuiShellApp::new(None)`
+    /// (#976): pinning sidebar visibility here fixed the #634 ambient-config
+    /// leak but left the *other* half `new_for_test`'s own doc warns about —
+    /// `TuiShellApp::new(None)` also runs `restore_session_files()`, which
+    /// restores whatever window/split/scroll-position state is saved in the
+    /// developer's real per-workspace session file for this exact checkout
+    /// path. On a box that has ever run vimcode from this repo, callers of
+    /// this fixture (`alt_letter_reveals_menu_bar_via_shell_app`,
+    /// `alt_right_widens_the_painted_sidebar_via_shell_app`) inserted their
+    /// buffer-offset-0 marker into whatever window/scroll state the restore
+    /// left behind rather than a fresh, empty one, so a restored non-zero
+    /// scroll offset could scroll the marker out of the viewport before the
+    /// test's own precondition assertion ever ran — green in CI (no config),
+    /// red on a dev box. `new_for_test` skips the restore entirely, so the
+    /// starting state is the same everywhere.
     fn app_with_sidebar_open() -> TuiShellApp {
-        let mut app = TuiShellApp::new(None);
+        let mut app = TuiShellApp::new_for_test();
         app.engine
             .app_shell
             .show_panel(&quadraui::WidgetId::new(PANEL_EXPLORER));
@@ -7944,6 +7960,15 @@ mod tests {
     /// second `Ctrl-O` would move the cursor inside tab B's own buffer
     /// instead of switching back to tab A — the painted screen would still
     /// show `BBB674`, not `AAA674`.
+    ///
+    /// Built on [`TuiShellApp::new_for_test`], not `TuiShellApp::new(None)`
+    /// (#976): the latter also runs `restore_session_files()` against this
+    /// exact checkout's real per-workspace session file, which can reopen
+    /// extra tabs before this test opens its own two — shifting
+    /// `active_group().active_tab` away from the `1` the assertions below
+    /// assume. Measured red on a dev box with a saved session for this repo
+    /// path (`docs/RELEASING.md` §1.0), green in CI where no such session
+    /// exists.
     #[test]
     fn ctrl_o_activates_original_tab_via_shell_app() {
         let dir = std::env::temp_dir().join(format!(
@@ -7959,7 +7984,7 @@ mod tests {
         std::fs::write(&file_a, &content_a).unwrap();
         std::fs::write(&file_b, &content_b).unwrap();
 
-        let mut app = TuiShellApp::new(None);
+        let mut app = TuiShellApp::new_for_test();
         app.engine
             .open_file_with_mode(&file_a, crate::core::engine::OpenMode::Permanent)
             .unwrap();
@@ -10251,9 +10276,16 @@ mod tests {
     /// `default_ctrl_f_action()` unconditionally returned `"find"`, so this
     /// same Ctrl+F press opened the find/replace overlay (the `"Aa"` toggle
     /// appears) instead of paging the viewport.
+    ///
+    /// Built on [`TuiShellApp::new_for_test`], not `TuiShellApp::new(None)`
+    /// (#976): the latter also runs `restore_session_files()` against this
+    /// exact checkout's real per-workspace session file, which can restore a
+    /// non-zero scroll offset before the "top of file visible" precondition
+    /// below ever runs — red on a dev box with a saved session for this repo
+    /// path, green in CI where no such session exists.
     #[test]
     fn ctrl_f_pages_down_the_viewport_in_default_vim_mode_via_shell_app() {
-        let mut app = TuiShellApp::new(None);
+        let mut app = TuiShellApp::new_for_test();
         assert_eq!(
             app.engine.settings.editor_mode,
             crate::core::settings::EditorMode::Vim,
@@ -10322,10 +10354,17 @@ mod tests {
     /// unconditionally, so `<Tab>` accepted the popup even in default Vim
     /// mode — the `after_tab` assertion below (expected count 1) observes 2
     /// instead against that code.
+    ///
+    /// Built on [`TuiShellApp::new_for_test`], not `TuiShellApp::new(None)`
+    /// (#976): the latter also runs `restore_session_files()` against this
+    /// exact checkout's real per-workspace session file, which can leave the
+    /// fixture with extra restored windows/scroll state before the typed
+    /// completion popup is built — red on a dev box with a saved session for
+    /// this repo path, green in CI where no such session exists.
     #[test]
     fn ctrl_y_accepts_tab_falls_through_for_completion_popup_in_default_vim_mode_via_shell_app() {
         let build = || {
-            let mut app = TuiShellApp::new(None);
+            let mut app = TuiShellApp::new_for_test();
             assert_eq!(
                 app.engine.settings.editor_mode,
                 crate::core::settings::EditorMode::Vim,
@@ -10391,11 +10430,18 @@ mod tests {
     /// `terminal_has_focus` and repeating the *identical* key must delete the
     /// character, so a fixture whose text simply could not change would fail
     /// the second half.
+    ///
+    /// Built on [`TuiShellApp::new_for_test`], not `TuiShellApp::new(None)`
+    /// (#976): the latter also runs `restore_session_files()` against this
+    /// exact checkout's real per-workspace session file, which can restore
+    /// extra windows/scroll state before the fixture's own marker insert
+    /// runs — red on a dev box with a saved session for this repo path,
+    /// green in CI where no such session exists.
     #[test]
     fn focused_terminal_swallows_editor_keys_via_shell_app() {
         // Same fixture twice, differing only in `terminal_has_focus`.
         let build = |focused: bool| {
-            let mut app = TuiShellApp::new(None);
+            let mut app = TuiShellApp::new_for_test();
             app.engine.buffer_mut().insert(0, "ZQXWTERM758\n");
             app.engine.terminal_new_tab(80, 6);
             app.engine.terminal_has_focus = focused;
@@ -14431,9 +14477,16 @@ mod tests {
     /// cursor, off the narrow visible editor column in this fixture's
     /// wide-sidebar layout, which is itself further evidence the paste went
     /// to the wrong place rather than nowhere at all).
+    ///
+    /// Built on [`TuiShellApp::new_for_test`], not `TuiShellApp::new(None)`
+    /// (#976): the latter also runs `restore_session_files()` against this
+    /// exact checkout's real per-workspace session file, which can restore
+    /// extra windows/scroll state before the fixture's own overlay setup
+    /// runs — red on a dev box with a saved session for this repo path,
+    /// green in CI where no such session exists.
     #[test]
     fn ctrl_v_paste_reaches_the_find_replace_overlay_via_clipboard_paste_event() {
-        let mut app = TuiShellApp::new(None);
+        let mut app = TuiShellApp::new_for_test();
         app.engine.buffer_mut().insert(0, "fn main() {}\n");
         app.engine.find_replace_open = true;
         app.engine.find_replace_focus = 0; // query field
@@ -14490,9 +14543,16 @@ mod tests {
     /// arm) to a no-op and re-running this test fails it — the rendered
     /// line still shows the marker with a literal 'h' appended instead of
     /// losing its trailing character.
+    ///
+    /// Built on [`TuiShellApp::new_for_test`], not `TuiShellApp::new(None)`
+    /// (#976): the latter also runs `restore_session_files()` against this
+    /// exact checkout's real per-workspace session file, which can restore
+    /// extra windows/scroll state before the fixture's own marker insert
+    /// runs — red on a dev box with a saved session for this repo path,
+    /// green in CI where no such session exists.
     #[test]
     fn ctrl_h_backspaces_in_insert_mode_via_shell_app() {
-        let mut app = TuiShellApp::new(None);
+        let mut app = TuiShellApp::new_for_test();
         let marker = "ZQXW804MARK";
         app.engine.buffer_mut().insert(0, marker);
         app.engine.mode = crate::core::Mode::Insert;
@@ -16355,8 +16415,19 @@ mod tests {
     /// `~/.config/vimcode`, so the sidebar boots visible on a box that has
     /// ever opened the explorer and hidden on a bare CI runner. Neither
     /// test here should depend on which.
+    ///
+    /// Built on [`TuiShellApp::new_for_test`], not `TuiShellApp::new(None)`
+    /// (#976): the sidebar pin above only covers the #634 leak.
+    /// `TuiShellApp::new(None)` also runs `restore_session_files()` against
+    /// this exact checkout's real per-workspace session file, which can
+    /// restore a non-zero scroll offset or extra windows before the fixture's
+    /// own `buffer_mut().insert(0, "teh end\n")` runs — scrolling that marker
+    /// out of the viewport on a dev box that has a saved session for this
+    /// repo path while staying green in CI, where no such session exists.
+    /// `new_for_test` skips the restore, so the starting state matches
+    /// everywhere.
     fn app_with_spell_suggestions_and_activity_bar_focus() -> TuiShellApp {
-        let mut app = TuiShellApp::new(None);
+        let mut app = TuiShellApp::new_for_test();
         app.engine.settings.autohide_panels = false;
         app.engine.app_shell.hide_sidebar();
         app.engine.session.explorer_visible = false;
@@ -17139,8 +17210,18 @@ mod tests {
     /// A `TuiShellApp` showing an editor hover popup whose body carries a
     /// `command:` link, plus a distinctive body word to assert the popup's
     /// presence on the painted grid with.
+    ///
+    /// Built on [`TuiShellApp::new_for_test`], not `TuiShellApp::new(None)`
+    /// (#976): the latter also runs `restore_session_files()` against this
+    /// exact checkout's real per-workspace session file, which can restore a
+    /// non-zero scroll offset or extra windows before the fixture's own
+    /// `buffer_mut().insert(0, "fn main() {}\n")` runs — scrolling the
+    /// `HOVERBODY755` marker out of the viewport on a dev box with a saved
+    /// session for this repo path while staying green in CI, where no such
+    /// session exists. `new_for_test` skips the restore, so the starting
+    /// state matches everywhere.
     fn app_with_editor_hover_link() -> TuiShellApp {
-        let mut app = TuiShellApp::new(None);
+        let mut app = TuiShellApp::new_for_test();
         app.engine.settings.use_nerd_fonts = Some(false);
         crate::icons::set_nerd_fonts(false);
         app.engine.session.explorer_visible = false;
