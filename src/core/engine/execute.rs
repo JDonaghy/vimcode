@@ -801,17 +801,30 @@ impl Engine {
                     let rhs = parts.next().unwrap_or("").trim();
                     match build_keymap_entries(lhs, rhs, modes, noremap) {
                         Some(entries) => {
-                            let mut added = false;
-                            for entry in entries {
-                                if !self.settings.keymaps.contains(&entry) {
-                                    self.settings.keymaps.push(entry);
-                                    added = true;
+                            // Redefining a mapping for the same (mode, lhs)
+                            // replaces the existing entry rather than
+                            // accumulating a stale/conflicting duplicate —
+                            // vim's `:nnoremap`/`:nmap`/etc. semantics.
+                            // Without this, `:nnoremap jk <Esc>` followed by
+                            // `:nnoremap jk <C-c>` left both entries in
+                            // `settings.keymaps` forever, with `:nmap`'s
+                            // lister showing the stale one alongside the
+                            // current one (#1151 review).
+                            let leader = self.settings.leader.to_string();
+                            let target_keys =
+                                expand_leader_tokens(parse_key_sequence(lhs), &leader);
+                            self.settings.keymaps.retain(|s| match parse_keymap_def(s) {
+                                Some(km) => {
+                                    let km_keys = expand_leader_tokens(km.keys, &leader);
+                                    !(modes.contains(&km.mode.as_str()) && km_keys == target_keys)
                                 }
+                                None => true,
+                            });
+                            for entry in entries {
+                                self.settings.keymaps.push(entry);
                             }
-                            if added {
-                                let _ = self.settings.save();
-                                self.rebuild_user_keymaps();
-                            }
+                            let _ = self.settings.save();
+                            self.rebuild_user_keymaps();
                             self.message = format!("Mapped: {lhs} -> {rhs}");
                         }
                         None => {

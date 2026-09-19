@@ -1837,8 +1837,22 @@ fn normalize_key_token(tok: &str) -> String {
     }
     let inner = &tok[1..tok.len() - 1];
     let lower = inner.to_ascii_lowercase();
+    // `encode_keypress` special-cases the two *named* keys that can follow
+    // Ctrl with a mixed-case canonical spelling (`<C-Space>`, `<C-Tab>` —
+    // capital S/T), rather than the plain lowercasing every other `<C-x>`
+    // combo gets. `<C-Space>` is also the literal default completion-trigger
+    // keybinding (`Settings::completion_trigger_key`, settings.rs). If this
+    // function lowercased those two like everything else, a keymap lhs/rhs
+    // written as `<C-Space>`/`<C-Tab>` (verbatim vim spelling, or matching
+    // that default) would normalize to `<C-space>`/`<C-tab>` and then never
+    // match a real keypress's `<C-Space>`/`<C-Tab>` encoding again (#1151
+    // review).
     if let Some(rest) = lower.strip_prefix("c-") {
-        return format!("<C-{rest}>");
+        return match rest {
+            "space" => "<C-Space>".to_string(),
+            "tab" => "<C-Tab>".to_string(),
+            _ => format!("<C-{rest}>"),
+        };
     }
     if let Some(rest) = lower
         .strip_prefix("a-")

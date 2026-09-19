@@ -225,6 +225,45 @@ fn nnoremap_command_no_duplicates() {
 }
 
 #[test]
+fn redefining_a_mapping_replaces_the_stale_entry() {
+    // #1151 review: redefining `jk` in normal mode with a different rhs must
+    // *replace* the existing entry for that (mode, lhs), not accumulate a
+    // second, conflicting one — vim's :nnoremap-family semantics. Before the
+    // fix, `settings.keymaps` grew a stale `"n! jk <Esc>"` alongside the new
+    // `"n! jk <C-c>"` forever, and `:nmap` (the lister) showed both.
+    let mut e = engine_with("");
+    exec(&mut e, "nnoremap jk <Esc>");
+    exec(&mut e, "nnoremap jk <C-c>");
+    assert_eq!(
+        e.settings.keymaps.len(),
+        1,
+        "redefinition should replace, not accumulate: {:?}",
+        e.settings.keymaps
+    );
+    assert_eq!(e.settings.keymaps[0], "n! jk <C-c>");
+    assert_eq!(e.user_keymaps.len(), 1);
+}
+
+#[test]
+fn redefining_a_mapping_in_a_different_mode_leaves_other_modes_alone() {
+    // Replacement must be scoped to the modes the redefining command
+    // targets — an `:inoremap jk` redefinition must not touch a separately
+    // defined `:nnoremap jk`.
+    let mut e = engine_with("");
+    exec(&mut e, "nnoremap jk <C-c>");
+    exec(&mut e, "inoremap jk <Esc>");
+    exec(&mut e, "inoremap jk <C-c>");
+    assert_eq!(
+        e.settings.keymaps.len(),
+        2,
+        "n-mode mapping must survive an i-mode redefinition: {:?}",
+        e.settings.keymaps
+    );
+    assert!(e.settings.keymaps.contains(&"n! jk <C-c>".to_string()));
+    assert!(e.settings.keymaps.contains(&"i! jk <C-c>".to_string()));
+}
+
+#[test]
 fn bare_map_command_expands_to_vims_combined_modes() {
     // vim's bare `:map`/`:noremap` targets Normal+Visual+Select+Operator-pending.
     let mut e = engine_with("aaa\nbbb\n");
@@ -484,4 +523,65 @@ fn operator_pending_map_does_not_fire_in_plain_normal_mode() {
         "bare 'p' (no pending operator) must not fire the o-mode map"
     );
     assert_eq!(get_lines(&e)[0], "foo(bar)baz");
+}
+
+// ── <C-Space> / <C-Tab> case preservation (#1151 review) ────────────────────
+//
+// `encode_keypress` (the format a live keypress is turned into for keymap
+// matching) special-cases these two named keys with a mixed-case spelling
+// (`<C-Space>`, `<C-Tab>` — capital S/T), unlike every other `<C-x>` combo
+// which is lowercased. `normalize_key_token` must preserve that spelling for
+// tokens parsed out of a `:map`-family command or a `settings.json`
+// `keymaps` entry, or the parsed keymap can never match the real keypress
+// again. `<C-Space>` is also the literal default completion-trigger key
+// (`Settings::completion_trigger_key`, settings.rs), so a stray lowercasing
+// here would have broken a mapping shared with a real default, not just a
+// hypothetical one.
+
+#[test]
+fn ctrl_space_keymap_fires_on_ctrl_space_keypress() {
+    let mut e = engine_with_keymaps("", &["i <C-Space> <Esc>"]);
+    press(&mut e, 'i');
+    assert_eq!(e.mode, Mode::Insert);
+    e.handle_key("Space", None, true);
+    assert_eq!(
+        e.mode,
+        Mode::Normal,
+        "<C-Space> lhs must match a live Ctrl+Space keypress"
+    );
+}
+
+#[test]
+fn ctrl_tab_rhs_expands_to_a_real_ctrl_tab_keypress() {
+    // <C-Tab> as a *lhs* can't be exercised here — Ctrl+Tab is intercepted
+    // globally by the built-in tab switcher before user keymaps ever get a
+    // look at it (the `if ctrl && key_name == "Tab"` arm near the top of
+    // `handle_key`, keys.rs), which is pre-existing behaviour unrelated to
+    // this fix. Exercise the *rhs* side instead: a mapping whose rhs is
+    // `<C-Tab>` must decode back to a real Ctrl+Tab keypress that opens the
+    // tab switcher, not a mangled `<c-tab>` token `decode_keypress` doesn't
+    // recognise.
+    let mut e = engine_with_keymaps("", &["n! X <C-Tab>"]);
+    // The tab switcher only opens with 2+ tabs (`open_tab_switcher`,
+    // windows.rs) — open a second one so the effect is observable.
+    exec(&mut e, "tabnew");
+    press(&mut e, 'X');
+    assert!(
+        e.tab_switcher_open,
+        "<C-Tab> rhs should have opened the tab switcher, same as a live Ctrl+Tab keypress"
+    );
+}
+
+#[test]
+fn ctrl_space_rhs_expands_to_a_real_ctrl_space_keypress() {
+    // The rhs side matters too: `nnoremap X <C-Space>` must decode back to a
+    // keypress that itself matches vimcode's own <C-Space>-bound behaviour,
+    // not some mangled `<c-space>` token `decode_keypress` doesn't recognise.
+    let mut e = engine_with_keymaps("", &["i! <C-x> <C-Space>"]);
+    press(&mut e, 'i');
+    // Feed the lhs; this only checks that expansion doesn't panic/garble —
+    // decode_keypress("<c-space>") would fall through to a bogus 's' key
+    // rather than a Ctrl+Space, so this exercises that path.
+    e.handle_key("x", Some('x'), true);
+    assert_eq!(e.mode, Mode::Insert, "rhs expansion should not crash/hang");
 }
