@@ -883,6 +883,76 @@ impl Engine {
             return EngineAction::None;
         }
 
+        // ── :abbreviate / :iabbrev / :cabbrev family (#1152) ──────────────────────
+        // A Vim abbreviation is a key-to-keys substitution like `:map`, but
+        // triggered by typing a non-keyword character (or leaving Insert /
+        // running the command line) right after the `lhs`, instead of typing
+        // the `lhs` itself as a command. `:noreabbrev`/`:inoreabbrev`/
+        // `:cnoreabbrev` behave identically to their `:abbreviate`/
+        // `:iabbrev`/`:cabbrev` counterparts here: the "nore" distinction
+        // only matters when the `rhs` could itself be re-expanded by another
+        // mapping as it's inserted, and this engine's abbreviation expansion
+        // inserts the replacement text directly — it is never re-fed through
+        // key-mapping lookup, recursive or otherwise.
+        if cmd == "abbreviate" || cmd == "noreabbrev" {
+            self.message = self.list_abbrevs(&["a", "i", "c"], "No abbreviations");
+            return EngineAction::None;
+        }
+        if let Some(rest) = cmd
+            .strip_prefix("abbreviate ")
+            .or_else(|| cmd.strip_prefix("noreabbrev "))
+        {
+            self.message = self.define_abbrev_from_args("a", rest.trim());
+            return EngineAction::None;
+        }
+        if cmd == "iabbrev" {
+            self.message = self.list_abbrevs(&["a", "i"], "No insert-mode abbreviations");
+            return EngineAction::None;
+        }
+        if let Some(rest) = cmd
+            .strip_prefix("iabbrev ")
+            .or_else(|| cmd.strip_prefix("inoreabbrev "))
+        {
+            self.message = self.define_abbrev_from_args("i", rest.trim());
+            return EngineAction::None;
+        }
+        if cmd == "cabbrev" {
+            self.message = self.list_abbrevs(&["a", "c"], "No command-line abbreviations");
+            return EngineAction::None;
+        }
+        if let Some(rest) = cmd
+            .strip_prefix("cabbrev ")
+            .or_else(|| cmd.strip_prefix("cnoreabbrev "))
+        {
+            self.message = self.define_abbrev_from_args("c", rest.trim());
+            return EngineAction::None;
+        }
+        if cmd == "abclear" {
+            let had_any = !self.settings.abbreviations.is_empty();
+            self.settings.abbreviations.clear();
+            if had_any {
+                let _ = self.settings.save();
+            }
+            self.rebuild_user_abbrevs();
+            self.message = "Abbreviations cleared".to_string();
+            return EngineAction::None;
+        }
+        if cmd == "unabbreviate" {
+            self.message = "Usage: :unabbreviate <lhs>  (e.g. :unabbreviate teh)".to_string();
+            return EngineAction::None;
+        }
+        if let Some(rest) = cmd.strip_prefix("unabbreviate ") {
+            let lhs = rest.trim();
+            if lhs.is_empty() {
+                self.message = "Usage: :unabbreviate <lhs>  (e.g. :unabbreviate teh)".to_string();
+            } else if self.remove_abbrev(lhs) {
+                self.message = format!("Removed abbreviation: {lhs}");
+            } else {
+                self.message = format!("No such abbreviation: {lhs}");
+            }
+            return EngineAction::None;
+        }
+
         // ── Extension commands (:ExtInstall / :ExtRemove / :ExtRefresh / :ExtList /
         //                        :ExtEnable / :ExtDisable) ──────────────────────────────
         if let Some(subcmd) = cmd.strip_prefix("Ext").map(|s| s.trim()) {
@@ -5318,6 +5388,77 @@ impl Engine {
         self.view_mut().cursor.line = line;
         self.view_mut().cursor.col = self.first_non_blank_col(line);
         self.clamp_cursor_col();
+    }
+
+    // ─── User abbreviations (#1152) ─────────────────────────────────────────
+
+    /// Parse `"{lhs} {rhs...}"` (the argument tail of `:abbreviate`/
+    /// `:iabbrev`/`:cabbrev` and their `nore` variants) and define or replace
+    /// the abbreviation. Returns the status message to show the user.
+    fn define_abbrev_from_args(&mut self, mode: &str, args: &str) -> String {
+        let mut parts = args.splitn(2, ' ');
+        match (parts.next(), parts.next()) {
+            (Some(lhs), Some(rhs)) if !lhs.is_empty() && !rhs.trim().is_empty() => {
+                let rhs = rhs.trim();
+                self.define_abbrev(mode, lhs, rhs);
+                format!("Abbreviation: {lhs} -> {rhs}")
+            }
+            _ => "Usage: :abbreviate <lhs> <rhs>  (e.g. :iabbrev teh the)".to_string(),
+        }
+    }
+
+    /// Add a user-defined abbreviation, replacing any earlier definition for
+    /// the same `(mode, lhs)` pair — matching Vim's own "redefining an
+    /// abbreviation replaces it" behaviour, and keeping
+    /// `find_abbrev_match`'s longest-match tie-break from seeing stale
+    /// duplicates.
+    fn define_abbrev(&mut self, mode: &str, lhs: &str, rhs: &str) {
+        self.settings.abbreviations.retain(|s| {
+            parse_abbrev_def(s)
+                .map(|a| a.mode != mode || a.lhs != lhs)
+                .unwrap_or(true)
+        });
+        self.settings
+            .abbreviations
+            .push(format!("{mode} {lhs} {rhs}"));
+        let _ = self.settings.save();
+        self.rebuild_user_abbrevs();
+    }
+
+    /// Remove every abbreviation (in any mode) whose `lhs` matches exactly.
+    /// Returns `true` if anything was removed. Vim distinguishes
+    /// `:unabbreviate`/`:iunabbreviate`/`:cunabbreviate` by mode; this engine
+    /// only exposes the mode-agnostic form (#1152's requested deliverable).
+    fn remove_abbrev(&mut self, lhs: &str) -> bool {
+        let before = self.settings.abbreviations.len();
+        self.settings
+            .abbreviations
+            .retain(|s| parse_abbrev_def(s).map(|a| a.lhs != lhs).unwrap_or(true));
+        let removed = self.settings.abbreviations.len() < before;
+        if removed {
+            let _ = self.settings.save();
+            self.rebuild_user_abbrevs();
+        }
+        removed
+    }
+
+    /// Format the `:abbreviate`/`:iabbrev`/`:cabbrev` no-argument lister:
+    /// every defined abbreviation whose mode is in `modes`, or `empty_msg` if
+    /// none match.
+    fn list_abbrevs(&self, modes: &[&str], empty_msg: &str) -> String {
+        let listed: Vec<String> = self
+            .settings
+            .abbreviations
+            .iter()
+            .filter_map(|s| parse_abbrev_def(s))
+            .filter(|a| modes.contains(&a.mode.as_str()))
+            .map(|a| format!("{} {} {}", a.mode, a.lhs, a.rhs))
+            .collect();
+        if listed.is_empty() {
+            empty_msg.to_string()
+        } else {
+            listed.join("  |  ")
+        }
     }
 }
 

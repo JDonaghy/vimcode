@@ -254,6 +254,14 @@ pub struct Settings {
     #[serde(default)]
     pub keymaps: Vec<String>,
 
+    /// User-defined Vim-style abbreviations (`:h abbreviations`), persisted
+    /// alongside `keymaps`. Each entry is `"mode lhs rhs"`: mode is `i`
+    /// (Insert-only, `:iabbrev`), `c` (Command-line-only, `:cabbrev`), or `a`
+    /// (both, `:abbreviate`/`:noreabbrev`). `rhs` may itself contain spaces.
+    /// Example: `["i teh the", "a @@ me@example.com"]`
+    #[serde(default)]
+    pub abbreviations: Vec<String>,
+
     /// Highlight all search matches (default true). Disable with `:set nohlsearch`.
     #[serde(default = "default_hlsearch")]
     pub hlsearch: bool,
@@ -1138,6 +1146,7 @@ impl Default for Settings {
             plugins_enabled: default_plugins_enabled(),
             disabled_plugins: Vec::new(),
             keymaps: Vec::new(),
+            abbreviations: Vec::new(),
             hlsearch: default_hlsearch(),
             ignorecase: false,
             smartcase: false,

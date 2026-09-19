@@ -4000,6 +4000,73 @@ const CASES_EX: &[Case] = &[
     ),
 ];
 
+// ─────────────────── H2. abbreviations (:abbreviate family, #1152) ───────────
+// Each case defines its abbreviation(s) with a real typed `:iabbrev`/
+// `:cabbrev`/`:abbreviate` command (both sides run the actual command, not a
+// stand-in), then exercises the documented trigger rules.
+const CASES_ABBREV: &[Case] = &[
+    c(
+        "abbrev:full-id expands on trigger char",
+        &[""],
+        1,
+        1,
+        ":iabbrev teh the<CR>iteh <Esc>",
+    ),
+    c(
+        "abbrev:end-id expands on trigger char",
+        &[""],
+        1,
+        1,
+        ":iabbrev #i #include<CR>i#i <Esc>",
+    ),
+    c(
+        "abbrev:C-v before trigger suppresses expansion",
+        &[""],
+        1,
+        1,
+        ":iabbrev teh the<CR>iteh<C-v> <Esc>",
+    ),
+    c(
+        "abbrev:does not fire mid-word",
+        &[""],
+        1,
+        1,
+        ":iabbrev teh the<CR>iateh <Esc>",
+    ),
+    c(
+        "abbrev:expands on Esc with nothing typed after",
+        &[""],
+        1,
+        1,
+        ":iabbrev teh the<CR>iteh<Esc>",
+    ),
+    c(
+        "abbrev:expands on CR",
+        &[""],
+        1,
+        1,
+        ":iabbrev teh the<CR>iteh<CR><Esc>",
+    ),
+    c(
+        "abbrev:cabbrev on the command line runs the expanded command",
+        &["foo"],
+        1,
+        1,
+        ":cabbrev X %s/foo/bar/<CR>:X<CR>",
+    ),
+    c(
+        "abbrev:iabbrev does not apply on the command line",
+        &["H"],
+        1,
+        1,
+        // `:iabbrev` is Insert-only — ":H<CR>" must NOT expand to ":help"
+        // (which would open a help window and leave the buffer untouched
+        // for a different reason). Instead ":H" is an unknown command on
+        // both sides, so the buffer and cursor stay exactly as they started.
+        ":iabbrev H help<CR>:H<CR>x",
+    ),
+];
+
 // ─────────────────────────── I. insert mode keys ───────────────────────────
 const CASES_INS: &[Case] = &[
     c("ins:C-w", &["ab"], 1, 1, "Afoo bar<C-w><Esc>"),
@@ -6177,6 +6244,10 @@ const CATEGORIES: &[(&str, &[Case])] = &[
     ("mark    marks & jumps", CASES_MARK),
     ("search  search", CASES_SEARCH),
     ("ex      :s / :g / ex", CASES_EX),
+    (
+        "abbrev  :abbreviate / :iabbrev / :cabbrev (#1152)",
+        CASES_ABBREV,
+    ),
     ("ins     insert-mode keys", CASES_INS),
     ("vis     visual", CASES_VIS),
     ("vb      visual block", CASES_VB),
