@@ -17,6 +17,79 @@ blockers"**, then delete its entry here and update the citing vimcode issue
 
 ---
 
+## TUI runner has no host-facing "force full repaint" hook (blocks vimcode#58)
+
+**Title:** `tui::run`/`run_with_shell` internalised the `Terminal`, silently
+dropping the only mitigation vimcode#58 (stale-character rendering artifacts)
+ever had — no `Reaction`/`Backend` hook replaces it
+
+**Body:**
+
+vimcode#58 tracks intermittent stale characters left on screen: ratatui's
+incremental diff can miss cells when the physical terminal's real state
+diverges from its internal `Buffer` tracking (typical triggers: PTY writes
+into the embedded terminal pane, certain resize sequences, popup
+dismissal). vimcode's Session-244 mitigation was to call
+`ratatui::Terminal::clear()` — which resets the diff cache so the *next*
+frame repaints every cell unconditionally — on resize events and on
+popup-dismiss transitions, from its own hand-rolled event loop
+(`src/tui_main/mod.rs`, pre-#634).
+
+That loop no longer exists. #634 moved vimcode's TUI onto
+`quadraui::tui::shell_runner::run_with_shell` (this crate's `tui::run`/
+`run_with` family, `quadraui/src/tui/run.rs`), which now owns the
+`ratatui::Terminal` internally and calls `terminal.clear()` exactly once,
+at startup (`run_with`, `quadraui/src/tui/run.rs:203`) — never again for
+the life of the process. Confirmed by reading the pinned rev
+(`7a77602`): `Reaction` (`quadraui/src/runner.rs`) has only
+`Continue`/`Redraw`/`RedrawAfter(Duration)`/`Exit` — no variant that maps
+to "clear before the next draw" — and neither `Backend` nor `AppLogic`
+exposes a `request_full_repaint`-shaped method the runner's frame loop
+would consult. So there is currently no way for a quadraui-hosted TUI app
+to ask for what `Terminal::clear()` gives a raw ratatui app.
+
+vimcode's own code already documents this as a known, currently-inert
+gap rather than working around it: `render::is_force_redraw_key`'s doc
+comment (Ctrl+L, `src/render.rs`) and `TuiShellApp::render_content`'s
+`had_popup_overlay` tracking (`src/tui_main/shell_app.rs`) both say so —
+Ctrl+L today only returns `Reaction::Redraw`, which re-runs the same
+incremental diff that missed the cells in the first place, so it does not
+actually fix anything a user hits it for. `had_popup_overlay` is computed
+and stored every frame but has no reader left — the call site it used to
+drive (`terminal.clear()`) was deleted along with the legacy loop.
+
+**Ask:** give a TUI-hosted `AppLogic` a way to force the next frame to
+paint as if the terminal were blank. Two shapes, either resolves this:
+
+1. A new `Reaction::FullRedraw` variant — `tui::run`'s frame loop calls
+   `terminal.borrow_mut().clear()?` before the next `render_frame` when an
+   event handler returns it, otherwise identical to `Reaction::Redraw`.
+2. A `Backend::request_full_repaint()` method (default no-op) that
+   `TuiBackend` implements by setting a flag the runner checks each loop
+   iteration before drawing — mirroring how `request_frame_in`/
+   `Reaction::RedrawAfter` already thread a scheduling request through the
+   same seam, so it needs no new event/dispatch plumbing.
+
+GTK does not need this: Cairo repaints its `DrawingArea` in full every
+frame (no incremental diff to desync), which the existing
+`gtk::backend` tests documenting "full repaint after a skipped frame /
+modal closed / theme change" already rely on. So this is a TUI-only gap
+today, but the hook itself should stay on the backend-neutral trait
+surface (`Backend`, not a TUI-only escape hatch) so a future diff-based
+renderer (a terminal-multiplexer-aware Win-GUI console mode, say) isn't
+left with the identical hole.
+
+**Consumers waiting on this, already commented in place:**
+`render::is_force_redraw_key` (Ctrl+L) and
+`TuiShellApp::render_content`'s `had_popup_overlay` field
+(`src/tui_main/shell_app.rs`) both name the exact call site that would
+call the new hook the moment it exists.
+
+**Blocks:** `JDonaghy/vimcode#58` — leave that issue open behind this one,
+per `GOALS.md`'s milestone-discipline rule.
+
+---
+
 ## Multi-band bottom chrome (blocks vimcode#820)
 
 **Title:** `ShellConfig`/`BottomPanelController` models one drawer; vimcode

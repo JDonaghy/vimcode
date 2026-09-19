@@ -1,6 +1,55 @@
 # VimCode Project State
 
-**Last updated:** September 18, 2026 (#934 — the three GTK pixel probes documented as Darwin-known-red since #926/#933/#970 are now robust to Core Text's rasterisation instead of skipped: `painted_divider_x` tolerance-matches colour, the minimap ink probe samples 3 rows instead of 1, and the window-control contrast floor drops 40.0→25.0. Verified green on Linux at this SHA — all 5 prior + 2 sibling driver tests pass — settling the "is this fleet-wide" question the #3298 config comment left open: **it is not**, confirming Darwin-rasteriser-artifact, not ordinary bug. RED-verified all three against reintroduced real regressions on Linux; could not verify on an actual Darwin host from this session (WSL2/Linux only) — flagged for macmini confirmation before the operator drops `coordinator.yml`'s `uname` guard). Prior revisions: September 17 (#1066 — product decision: TUI's editor wheel now scrolls the hovered pane, converged onto GTK's `hovered_window_id` behaviour; `mouse.rs` rewired onto `render::find_window_at` + `Engine::scroll_viewport_with_cursor_for_window`, GOALS.md item 14 closed), September 16 (#1031 — `:s///c` confirm loop built, #801 Phase 2 / #986 fix: `Engine::confirm_sub` + `handle_confirm_sub_key` in `execute.rs`), September 14 (#951 — ACP-0: `src/core/acp.rs`, NDJSON JSON-RPC transport + session lifecycle, foundation of the ACP track, epic #531), September 14 (#522 — Track A foundation: generic external-tool JSON seam, `src/core/tool_client.rs`, no coordinator vocabulary in core), September 14 (#970 — confirmed the two "failing GTK click-geometry tests" are the already-known/already-documented Darwin font-rasteriser divergence from #926/#933, not a new bug; no code change), September 14 (#950 review fix round — driver-tier pixel test added for the SEARCH_COD→SEARCH glyph change, self-contradictory pure-refactor claim corrected), September 14 (#950 — ShellApp convergence decomposition + cheap wins), September 14 (#949 review fix round — driver-tier test added, macOS/Win-GUI claim corrected), September 14 (#949 — GTK-only settings-reload watcher deleted), September 11 (macOS native-menu audit — #901/#902 filed, milestone #7 reopened), September 10 (#862 — `src/app.rs` no longer needs the `gui` feature to compile), September 5 (#827 correction pass), September 4 (#801), September 3 (platform-neutrality chain drained). Milestone #7 is **2 open** (#901, #902 — 2026-09-11 macOS native-menu audit). **#47 is reopened, in milestone #5** — its blocker (quadraui#699/#704) closed 2026-09-03, and #811 already ported the TUI side onto the new API. See `GOALS.md` for the full correction history.
+**Last updated:** September 18, 2026 (#58 — investigated the "intermittent stale TUI characters" issue and found its Session-244 mitigation, `Terminal::clear()` on resize/popup-dismiss, no longer exists: #634 moved TUI onto `quadraui::tui::run_with_shell`, which owns the `Terminal` internally and calls `clear()` once at startup only, with no `Reaction`/`Backend` hook an app can use to ask for it again. `render::is_force_redraw_key` (Ctrl+L) and `TuiShellApp::had_popup_overlay` already document this as a dead-in-practice gap in code comments; drafted the quadraui-side ask in `docs/PENDING_QUADRAUI_ISSUES.md` rather than adding per-backend code, per the Platform-Neutrality Rule — no fix is possible from `src/tui_main/` alone. **Keep #58 open** until that quadraui issue is filed. No code change this session (investigation + docs only).). Prior update: September 18, 2026 (#934 — the three GTK pixel probes documented as Darwin-known-red since #926/#933/#970 are now robust to Core Text's rasterisation instead of skipped: `painted_divider_x` tolerance-matches colour, the minimap ink probe samples 3 rows instead of 1, and the window-control contrast floor drops 40.0→25.0. Verified green on Linux at this SHA — all 5 prior + 2 sibling driver tests pass — settling the "is this fleet-wide" question the #3298 config comment left open: **it is not**, confirming Darwin-rasteriser-artifact, not ordinary bug. RED-verified all three against reintroduced real regressions on Linux; could not verify on an actual Darwin host from this session (WSL2/Linux only) — flagged for macmini confirmation before the operator drops `coordinator.yml`'s `uname` guard). Prior revisions: September 17 (#1066 — product decision: TUI's editor wheel now scrolls the hovered pane, converged onto GTK's `hovered_window_id` behaviour; `mouse.rs` rewired onto `render::find_window_at` + `Engine::scroll_viewport_with_cursor_for_window`, GOALS.md item 14 closed), September 16 (#1031 — `:s///c` confirm loop built, #801 Phase 2 / #986 fix: `Engine::confirm_sub` + `handle_confirm_sub_key` in `execute.rs`), September 14 (#951 — ACP-0: `src/core/acp.rs`, NDJSON JSON-RPC transport + session lifecycle, foundation of the ACP track, epic #531), September 14 (#522 — Track A foundation: generic external-tool JSON seam, `src/core/tool_client.rs`, no coordinator vocabulary in core), September 14 (#970 — confirmed the two "failing GTK click-geometry tests" are the already-known/already-documented Darwin font-rasteriser divergence from #926/#933, not a new bug; no code change), September 14 (#950 review fix round — driver-tier pixel test added for the SEARCH_COD→SEARCH glyph change, self-contradictory pure-refactor claim corrected), September 14 (#950 — ShellApp convergence decomposition + cheap wins), September 14 (#949 review fix round — driver-tier test added, macOS/Win-GUI claim corrected), September 14 (#949 — GTK-only settings-reload watcher deleted), September 11 (macOS native-menu audit — #901/#902 filed, milestone #7 reopened), September 10 (#862 — `src/app.rs` no longer needs the `gui` feature to compile), September 5 (#827 correction pass), September 4 (#801), September 3 (platform-neutrality chain drained). Milestone #7 is **2 open** (#901, #902 — 2026-09-11 macOS native-menu audit). **#47 is reopened, in milestone #5** — its blocker (quadraui#699/#704) closed 2026-09-03, and #811 already ported the TUI side onto the new API. See `GOALS.md` for the full correction history.
+
+## #58 — blocked on an unfiled quadraui gap (drafted, not yet submitted)
+
+Issue #58 (intermittent stale TUI characters) said it was "mitigated in
+Session 244" by calling `ratatui::Terminal::clear()` on resize events and on
+popup-dismiss transitions from the legacy `src/tui_main/mod.rs` event loop —
+`clear()` resets ratatui's incremental-diff cache so the *next* frame
+unconditionally repaints every cell, working around cases where ratatui's
+diff misses cells because the physical terminal's real state has diverged
+from what its `Buffer` thinks it painted.
+
+**That mitigation is gone, not just dormant.** #634 (closed well before this
+session, part of the TUI → `ShellApp`/`run_with_shell` wave) deleted the
+legacy event loop and moved vimcode's TUI onto
+`quadraui::tui::shell_runner::run_with_shell`, which now owns the
+`ratatui::Terminal` internally. Read the pinned rev (`7a77602`,
+`quadraui/src/tui/run.rs`): `terminal.clear()` is called exactly once, at
+startup, and never again — the runner's `Reaction` enum
+(`quadraui/src/runner.rs`) has only `Continue`/`Redraw`/`RedrawAfter`/`Exit`,
+none of which maps to "clear before the next draw," and neither `Backend`
+nor `AppLogic` exposes a `request_full_repaint`-shaped method. vimcode's own
+code already flags this as a known-but-inert gap rather than silently
+regressing: `render::is_force_redraw_key`'s doc comment (Ctrl+L) and
+`TuiShellApp::render_content`'s `had_popup_overlay` comment
+(`src/tui_main/shell_app.rs`) both say so in as many words — Ctrl+L today
+only returns an ordinary `Reaction::Redraw`, which re-runs the very diff
+that missed the cells, so pressing it does not actually fix what a user
+hits it for; `had_popup_overlay` is computed and stored every frame but has
+had no reader since the call site it used to drive was deleted.
+
+**Per the Platform-Neutrality Rule, this is not fixable from
+`src/tui_main/` alone** — there is no host-facing hook in quadraui's TUI
+runner to force the underlying `Terminal::clear()` a second time, and
+adding one by reaching into `quadraui`'s internals (or reintroducing a
+vimcode-owned `Terminal`, duplicating the runner) would be exactly the kind
+of per-backend workaround the rule exists to prevent. The upstream gap is
+fully drafted, ready to file on `JDonaghy/quadraui`, in
+[`docs/PENDING_QUADRAUI_ISSUES.md`](docs/PENDING_QUADRAUI_ISSUES.md) —
+filing it needs `gh` access this worker session doesn't have. **Keep #58
+open until that issue is filed**, then until its fix lands and vimcode
+wires `is_force_redraw_key`/`had_popup_overlay` onto the new hook (per
+`GOALS.md`'s milestone-discipline rule); once filed, delete the drafted
+entry and link the real issue number here.
+
+No code change this session — investigation + two docs updates
+(`docs/PENDING_QUADRAUI_ISSUES.md`, this file). GTK is unaffected (Cairo
+repaints its `DrawingArea` in full every frame, confirmed against
+`gtk::backend`'s existing "full repaint after a skipped frame / modal
+closed / theme change" tests), so no GTK-side investigation was needed.
 
 ## #934 — the three Darwin-known-red GTK pixel probes fixed to tolerate Core Text, not routed around
 
