@@ -20727,4 +20727,78 @@ mod tests {
             driver.screen()
         );
     }
+
+    /// #200: an extension-provided sidebar panel with more rows than fit in
+    /// the viewport must paint a scrollbar column, the same way the mouse
+    /// drag handling at `mouse.rs`'s `ext_panel:sb` arm already assumes one
+    /// exists. Black-box through `driver_with_shell`: asserts on the
+    /// *painted* `'█'`/`'░'` glyphs in `render_ext_panel`'s scrollbar block
+    /// (panels.rs, `ext_panel_scrollbar`), never on
+    /// `engine.ext_panel_scroll_top` or any other state field being
+    /// populated — see this file's CLAUDE.md "rendered output, not state"
+    /// rule; a state-only assertion would have passed throughout #587/#592.
+    ///
+    /// 30 items in a single "Log" section, rendered into a deliberately
+    /// short (15-row) terminal so the panel body (well under 30 visible
+    /// rows once chrome is subtracted) cannot show every item —
+    /// `render_ext_panel`'s `total > track_h` guard must trip.
+    ///
+    /// Verified RED by hand: commenting out the `ext_panel_scrollbar` block
+    /// in `render_ext_panel` (panels.rs) so only `draw_tree` paints (no
+    /// scrollbar column) makes this test's glyph-presence assertion fail —
+    /// confirming it actually exercises the scrollbar paint path and isn't
+    /// vacuously true.
+    #[test]
+    fn tui_ext_panel_scrollbar_paints_when_content_overflows_viewport() {
+        let mut app = TuiShellApp::new(None);
+        app.engine.settings.use_nerd_fonts = Some(false);
+        crate::icons::set_nerd_fonts(false);
+        app.engine.ext_panels.clear();
+        app.engine.ext_panels.insert(
+            "git-insights".to_string(),
+            crate::core::plugin::PanelRegistration {
+                name: "git-insights".to_string(),
+                title: "Git Insights".to_string(),
+                icon: '\u{f113}',
+                fallback_icon: Some(EXT_ICON),
+                sections: vec!["Log".to_string()],
+            },
+        );
+        let items: Vec<crate::core::plugin::ExtPanelItem> = (0..30)
+            .map(|i| crate::core::plugin::ExtPanelItem {
+                text: format!("sbitem200{i:02}"),
+                id: format!("item{i}"),
+                ..Default::default()
+            })
+            .collect();
+        app.engine
+            .ext_panel_items
+            .insert(("git-insights".to_string(), "Log".to_string()), items);
+        app.engine.ext_panel_active = Some("git-insights".to_string());
+        app.sidebar.ext_panel_name = Some("git-insights".to_string());
+
+        // 15 rows total leaves far fewer than the 31 body rows (1 section
+        // header + 30 items) needed to show everything — the panel content
+        // overflows its viewport.
+        let mut driver = driver_with_shell(app, config(), 100, 15);
+        driver.render();
+        let screen = driver.screen();
+
+        fn is_scrollbar_glyph(c: char) -> bool {
+            c == '\u{2588}' || c == '\u{2591}'
+        }
+
+        // Restrict to the sidebar's own columns (well left of `SIDEBAR_WIDTH
+        // == 30` plus the activity bar) so a coincidental editor/minimap
+        // scrollbar elsewhere on the row can't produce a false pass.
+        let has_sidebar_scrollbar = screen
+            .lines()
+            .any(|line| line.chars().take(35).any(is_scrollbar_glyph));
+        assert!(
+            has_sidebar_scrollbar,
+            "ext panel content overflows the viewport (30 items in a \
+             15-row window) but no scrollbar column painted in the \
+             sidebar; screen:\n{screen}"
+        );
+    }
 }
