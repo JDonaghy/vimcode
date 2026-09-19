@@ -716,58 +716,157 @@ impl Engine {
             return EngineAction::None;
         }
 
-        // ── :map / :unmap — user-defined key mappings ────────────────────────────
-        if cmd == "map" {
-            // :map — list all user keymaps
-            if self.settings.keymaps.is_empty() {
-                self.message = "No user keymaps defined".to_string();
-            } else {
-                self.message = self.settings.keymaps.join("  |  ");
-            }
-            return EngineAction::None;
-        }
-        if let Some(rest) = cmd.strip_prefix("map ") {
-            let rest = rest.trim();
-            // :map n <C-/> :Commentary → add keymap
-            if parse_keymap_def(rest).is_some() {
-                let entry = rest.to_string();
-                if !self.settings.keymaps.contains(&entry) {
-                    self.settings.keymaps.push(entry.clone());
-                    let _ = self.settings.save();
-                    self.rebuild_user_keymaps();
+        // ── :map family — vim's per-mode key mapping commands (#1151) ─────────────
+        // Before #1151, vimcode's only mapping command was its own invention,
+        // `:map <mode> <keys> :<excmd>` — mode as a positional argument, target
+        // always an ex command. Neither matches vim: vim selects the mode from
+        // the *command name* (`:nnoremap`, `:imap`, …) and `{rhs}` can be a raw
+        // key sequence, not just `:excmd`. This table drives that per-mode
+        // dispatch; `build_keymap_entries` materializes it into the same
+        // persisted-string format `settings.json` already used (so existing
+        // `keymaps` entries, and code that reads them, keep working unmigrated).
+        //
+        // "x"/"s" are vim's Visual-only / Select-only letters. vimcode has no
+        // separate Select mode, so `x` matches during `try_user_keymap`
+        // alongside `v` and `s` is accepted here (parses, lists, unmaps) but
+        // never active — see `Engine::active_keymap_modes`.
+        const MAP_DEFINE_CMDS: &[(&str, &[&str], bool)] = &[
+            ("nnoremap", &["n"], true),
+            ("nmap", &["n"], false),
+            ("vnoremap", &["v"], true),
+            ("vmap", &["v"], false),
+            ("xnoremap", &["x"], true),
+            ("xmap", &["x"], false),
+            ("onoremap", &["o"], true),
+            ("omap", &["o"], false),
+            ("inoremap", &["i"], true),
+            ("imap", &["i"], false),
+            ("cnoremap", &["c"], true),
+            ("cmap", &["c"], false),
+            ("snoremap", &["s"], true),
+            ("smap", &["s"], false),
+            // Bang forms target Insert+Command-line; bare forms target vim's
+            // combined Normal+Visual+Select+Operator-pending.
+            ("noremap!", &["i", "c"], true),
+            ("map!", &["i", "c"], false),
+            ("noremap", &["n", "v", "s", "o"], true),
+            ("map", &["n", "v", "s", "o"], false),
+        ];
+        const MAP_UNMAP_CMDS: &[(&str, &[&str])] = &[
+            ("nunmap", &["n"]),
+            ("vunmap", &["v"]),
+            ("xunmap", &["x"]),
+            ("ounmap", &["o"]),
+            ("iunmap", &["i"]),
+            ("cunmap", &["c"]),
+            ("sunmap", &["s"]),
+            ("unmap!", &["i", "c"]),
+            ("unmap", &["n", "v", "s", "o"]),
+        ];
+        const MAP_CLEAR_CMDS: &[(&str, &[&str])] = &[
+            ("nmapclear", &["n"]),
+            ("vmapclear", &["v"]),
+            ("xmapclear", &["x"]),
+            ("omapclear", &["o"]),
+            ("imapclear", &["i"]),
+            ("cmapclear", &["c"]),
+            ("smapclear", &["s"]),
+            // Bare `:mapclear` matches bare `:map`'s scope (n,v,s,o); `!`
+            // matches `:map!`'s (i,c) — it does not mean "clear everything".
+            ("mapclear!", &["i", "c"]),
+            ("mapclear", &["n", "v", "s", "o"]),
+        ];
+
+        let (map_word, map_rest) = match cmd.find(' ') {
+            Some(idx) => (&cmd[..idx], Some(cmd[idx + 1..].trim_start())),
+            None => (cmd, None),
+        };
+
+        if let Some(&(_, modes, noremap)) =
+            MAP_DEFINE_CMDS.iter().find(|(name, ..)| *name == map_word)
+        {
+            match map_rest {
+                None | Some("") => {
+                    // Bare command (any of the family) — list all user keymaps,
+                    // same as pre-#1151 bare `:map`.
+                    if self.settings.keymaps.is_empty() {
+                        self.message = "No user keymaps defined".to_string();
+                    } else {
+                        self.message = self.settings.keymaps.join("  |  ");
+                    }
                 }
-                self.message = format!("Mapped: {entry}");
-            } else {
-                self.message =
-                    "Usage: :map <mode> <keys> :<command>  (e.g. :map n <C-/> :Commentary)"
-                        .to_string();
-            }
-            return EngineAction::None;
-        }
-        if cmd == "unmap" {
-            self.message = "Usage: :unmap <mode> <keys>  (e.g. :unmap n <C-/>)".to_string();
-            return EngineAction::None;
-        }
-        if let Some(rest) = cmd.strip_prefix("unmap ") {
-            let rest = rest.trim();
-            // Parse "n <C-/>" → find and remove matching keymap
-            let parts: Vec<&str> = rest.splitn(2, ' ').collect();
-            if parts.len() == 2 {
-                let mode = parts[0];
-                let keys = parts[1];
-                let prefix = format!("{mode} {keys} ");
-                let before = self.settings.keymaps.len();
-                self.settings.keymaps.retain(|s| !s.starts_with(&prefix));
-                if self.settings.keymaps.len() < before {
-                    let _ = self.settings.save();
-                    self.rebuild_user_keymaps();
-                    self.message = format!("Unmapped: {mode} {keys}");
-                } else {
-                    self.message = format!("No mapping found for: {mode} {keys}");
+                Some(rest) => {
+                    let mut parts = rest.splitn(2, ' ');
+                    let lhs = parts.next().unwrap_or("");
+                    let rhs = parts.next().unwrap_or("").trim();
+                    match build_keymap_entries(lhs, rhs, modes, noremap) {
+                        Some(entries) => {
+                            let mut added = false;
+                            for entry in entries {
+                                if !self.settings.keymaps.contains(&entry) {
+                                    self.settings.keymaps.push(entry);
+                                    added = true;
+                                }
+                            }
+                            if added {
+                                let _ = self.settings.save();
+                                self.rebuild_user_keymaps();
+                            }
+                            self.message = format!("Mapped: {lhs} -> {rhs}");
+                        }
+                        None => {
+                            self.message = format!(
+                                "Usage: :{map_word} {{lhs}} {{rhs}}  (e.g. :{map_word} jk <Esc>)"
+                            );
+                        }
+                    }
                 }
-            } else {
-                self.message = "Usage: :unmap <mode> <keys>  (e.g. :unmap n <C-/>)".to_string();
             }
+            return EngineAction::None;
+        }
+
+        if let Some(&(_, modes)) = MAP_UNMAP_CMDS.iter().find(|(name, _)| *name == map_word) {
+            match map_rest {
+                None | Some("") => {
+                    self.message = format!("Usage: :{map_word} {{lhs}}  (e.g. :{map_word} jk)");
+                }
+                Some(lhs) => {
+                    let leader = self.settings.leader.to_string();
+                    let target_keys = expand_leader_tokens(parse_key_sequence(lhs), &leader);
+                    let before = self.settings.keymaps.len();
+                    self.settings.keymaps.retain(|s| match parse_keymap_def(s) {
+                        Some(km) => {
+                            let km_keys = expand_leader_tokens(km.keys, &leader);
+                            !(modes.contains(&km.mode.as_str()) && km_keys == target_keys)
+                        }
+                        None => true,
+                    });
+                    if self.settings.keymaps.len() < before {
+                        let _ = self.settings.save();
+                        self.rebuild_user_keymaps();
+                        self.message = format!("Unmapped: {lhs}");
+                    } else {
+                        self.message = format!("No mapping found for: {lhs}");
+                    }
+                }
+            }
+            return EngineAction::None;
+        }
+
+        if let Some(&(_, modes)) = MAP_CLEAR_CMDS.iter().find(|(name, _)| *name == map_word) {
+            // Buffer-local (`<buffer>`) mapclear is not modeled — vimcode has
+            // no buffer-local keymaps to distinguish from global ones.
+            let before = self.settings.keymaps.len();
+            self.settings.keymaps.retain(|s| match parse_keymap_def(s) {
+                Some(km) => !modes.contains(&km.mode.as_str()),
+                None => true,
+            });
+            let removed = before - self.settings.keymaps.len();
+            if removed > 0 {
+                let _ = self.settings.save();
+                self.rebuild_user_keymaps();
+            }
+            self.message = format!("Cleared {removed} mapping(s)");
             return EngineAction::None;
         }
 
@@ -5955,4 +6054,31 @@ fn reg_type_letter(ty: RegType) -> &'static str {
         RegType::Linewise => "l",
         RegType::Blockwise => "b",
     }
+}
+
+/// Validate and materialize the persisted-string keymap entries for a
+/// vim-style `:{cmd} {lhs} {rhs}` definition, one per targeted mode.
+///
+/// Returns `None` if `lhs`/`rhs` don't form a valid mapping (empty, or an
+/// `{rhs}` that fails key-notation parsing). Reuses [`parse_keymap_def`] as
+/// the single source of truth for validity, so a `:nnoremap` definition and a
+/// hand-edited `settings.json` line can never disagree about what's valid
+/// (#1151).
+fn build_keymap_entries(
+    lhs: &str,
+    rhs: &str,
+    modes: &[&str],
+    noremap: bool,
+) -> Option<Vec<String>> {
+    if lhs.is_empty() || rhs.is_empty() {
+        return None;
+    }
+    let bang = if noremap { "!" } else { "" };
+    let mut entries = Vec::with_capacity(modes.len());
+    for m in modes {
+        let entry = format!("{m}{bang} {lhs} {rhs}");
+        parse_keymap_def(&entry)?;
+        entries.push(entry);
+    }
+    Some(entries)
 }

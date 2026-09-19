@@ -928,6 +928,32 @@ fn apply_setup(settings: &mut Settings, setup: &str) -> Result<(), String> {
         if stmt.is_empty() {
             continue;
         }
+        // #1151: the `:map` family's oracle cases need two statement shapes
+        // `vim.o.<name>=<value>` can't express — a mapping definition, and
+        // (for `<leader>` cases) the leader itself. Both are real Lua Neovim
+        // needs no help with; only vimcode's side needs a translator, since
+        // it has no Lua interpreter.
+        if let Some(value) = stmt.strip_prefix("vim.g.mapleader") {
+            let value = value.trim().strip_prefix('=').ok_or_else(|| {
+                format!("unparseable setup statement {stmt:?} — expected `vim.g.mapleader = value`")
+            })?;
+            let value = unquote_lua(value.trim())
+                .ok_or_else(|| format!("unterminated string in setup statement {stmt:?}"))?;
+            let ch = value.chars().next().ok_or_else(|| {
+                format!(
+                    "'vim.g.mapleader' must be a single character, got {value:?} (from {stmt:?})"
+                )
+            })?;
+            settings.leader = ch;
+            continue;
+        }
+        if let Some(inner) = stmt
+            .strip_prefix("vim.keymap.set(")
+            .and_then(|s| s.strip_suffix(')'))
+        {
+            apply_keymap_set(settings, stmt, inner)?;
+            continue;
+        }
         let body = stmt.strip_prefix("vim.o.").ok_or_else(|| {
             format!("unsupported setup statement {stmt:?} — only `vim.o.<name>=<value>` is parsed")
         })?;
@@ -1002,6 +1028,38 @@ fn apply_setup(settings: &mut Settings, setup: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Parse and apply one `vim.keymap.set('mode', 'lhs', 'rhs' [, {remap = true}])`
+/// setup statement onto vimcode's [`Settings::keymaps`] (#1151).
+///
+/// Real Neovim's `vim.keymap.set` defaults to **non-recursive** — `opts.remap`
+/// defaults to `false`, the opposite of legacy `:map`'s default — so a call
+/// with no options table is stored `noremap`; only an explicit
+/// `remap = true` makes it recursive (vimcode's `noremap = false`). Getting
+/// this default backwards would make every case using the plain 3-argument
+/// form compare vimcode's `noremap` against Neovim's `map`, silently.
+fn apply_keymap_set(settings: &mut Settings, stmt: &str, inner: &str) -> Result<(), String> {
+    let remap = inner.contains("remap = true") || inner.contains("remap=true");
+    // "'i', 'jk', '<Esc>'".split('\'') → ["", "i", ", ", "jk", ", ", "<Esc>", ""],
+    // so the three string arguments sit at indices 1, 3, 5.
+    let quoted: Vec<&str> = inner.split('\'').collect();
+    if quoted.len() < 6 {
+        return Err(format!(
+            "unparseable vim.keymap.set(...) args in {stmt:?} — expected \
+             vim.keymap.set('mode', 'lhs', 'rhs') with single-quoted string args"
+        ));
+    }
+    let (mode, lhs, rhs) = (quoted[1], quoted[3], quoted[5]);
+    if mode.chars().count() != 1 {
+        return Err(format!(
+            "vim.keymap.set mode {mode:?} must be a single letter (from {stmt:?}) — \
+             a table of modes is not supported here"
+        ));
+    }
+    let bang = if remap { "" } else { "!" };
+    settings.keymaps.push(format!("{mode}{bang} {lhs} {rhs}"));
+    Ok(())
+}
+
 fn run_in_vimcode(
     label: &str,
     lines: &[&str],
@@ -1022,6 +1080,11 @@ fn run_in_vimcode(
     if let Err(why) = apply_setup(&mut engine.settings, setup) {
         panic!("conformance case {label:?}: bad `setup` — {why}");
     }
+    // `apply_setup` may have pushed onto `settings.keymaps` (a `vim.g.mapleader`
+    // or `vim.keymap.set` statement, #1151) or changed `settings.leader`, and
+    // `engine_with` only rebuilt `user_keymaps` from *its* defaults before any
+    // of that ran — cheap regardless, since most cases have neither.
+    engine.rebuild_user_keymaps();
     // Screen-relative motions (H/M/L, <C-d>, zt) are meaningless unless both
     // sides agree on the window height, so mirror nvim's.
     engine.set_viewport_lines(rows);
@@ -5845,6 +5908,110 @@ const CASES_FOLD: &[Case] = &[
     ),
 ];
 
+// ───────────────────────── G2. :map family (#1151) ─────────────────────────
+//
+// The oracle corpus's coverage of vim's `:map`/`:nmap`/`:nnoremap`/… family —
+// key-to-keys remapping, noremap-vs-map recursion, `<leader>` expansion, and
+// operator-pending maps. Mapping definitions with no `<Notation>` in the rhs
+// (`:nmap a b`, `:onoremap p i(`) are typed as literal ex-command keystrokes,
+// identically on both sides, via `c(..)`. A definition whose rhs needs
+// `<Notation>` that isn't `<CR>`/`<Esc>`/etc. already known to this suite's
+// own key tokenizer (`<Esc>` *would* tokenize fine, but sending it while
+// typing a `:` command line would send a real Escape keystroke and cancel
+// the command instead of typing the four literal characters "E","s","c" —
+// see `tokenize_keys`) instead defines the mapping via a `cs(..)` Lua
+// `vim.keymap.set(...)` / `vim.g.mapleader` setup statement, which
+// `apply_keymap_set` / `apply_setup` translate onto vimcode's
+// `Settings::keymaps` without going through any keystroke path at all.
+const CASES_MAP: &[Case] = &[
+    // `inoremap jk <Esc>` — the single most common line in any vimrc (#1151's
+    // motivating example). If the mapping fires, "jk" is consumed entirely
+    // by the mapping (buffered waiting for the "k" — same prefix contract as
+    // any other multi-key mapping) and nothing is inserted; escaping also
+    // steps the cursor back one column, same as a real `<Esc>` keypress.
+    cs(
+        "map:inoremap_jk_to_escape",
+        &["ab"],
+        1,
+        1,
+        "ijk",
+        "vim.keymap.set('i', 'jk', '<Esc>')",
+    ),
+    // A single 'j' not followed by 'k' must still just be typed — the
+    // prefix-buffering must not eat keys it doesn't end up needing.
+    cs(
+        "map:inoremap_jk_single_j_falls_through",
+        &["ab"],
+        1,
+        1,
+        "ijx",
+        "vim.keymap.set('i', 'jk', '<Esc>')",
+    ),
+    // `:nmap` (recursive): a -> b, b -> x (delete char under cursor). Chases
+    // through both hops, so pressing 'a' deletes a character.
+    c(
+        "map:nmap_chases_recursively",
+        &["abc"],
+        1,
+        1,
+        ":nmap a b<CR>:nmap b x<CR>a",
+    ),
+    // `:nnoremap` (non-recursive): a -> b, and b is *separately* mapped to x.
+    // The noremap rhs 'b' must be taken literally — the built-in word-back
+    // motion, which touches nothing at the start of the buffer — not chase
+    // into the a-priori-unrelated b -> x mapping (which would delete a char).
+    c(
+        "map:nnoremap_does_not_chase",
+        &["abc def"],
+        1,
+        1,
+        ":nnoremap a b<CR>:nmap b x<CR>a",
+    ),
+    // A cycle with no base case (`nmap a b` + `nmap b a`) must stop — vim's
+    // `maxmapdepth` — rather than hang. Neither side should have touched the
+    // buffer or cursor by the time the guard aborts it.
+    c(
+        "map:recursive_cycle_hits_depth_guard",
+        &["hello"],
+        1,
+        1,
+        ":nmap a b<CR>:nmap b a<CR>a",
+    ),
+    // `<leader>` expansion in the lhs. Using ',' rather than the real default
+    // ('\') sidesteps Lua/Rust string-escaping noise without weakening the
+    // case: what's under test is substitution of *whatever* `mapleader` is,
+    // not the specific default character.
+    cs(
+        "map:leader_expands_in_lhs",
+        &["abc"],
+        1,
+        1,
+        ",w",
+        "vim.g.mapleader = ','\nvim.keymap.set('n', '<leader>w', 'x')",
+    ),
+    // Operator-pending (`o`) maps: `onoremap p i(` makes 'p', while an
+    // operator awaits its motion, behave like the "inside parens" text
+    // object — so "dp" deletes inside the parens the cursor is in, same as
+    // "di(" would.
+    c(
+        "map:onoremap_extends_a_motion",
+        &["foo(bar)baz"],
+        1,
+        6,
+        ":onoremap p i(<CR>dp",
+    ),
+    // The same mapping must not fire outside operator-pending — bare 'p'
+    // (paste, nothing yanked) should stay a no-op, not enter Insert mode and
+    // type a literal '(' the way firing the rhs "i(" directly would.
+    c(
+        "map:onoremap_does_not_fire_without_pending_operator",
+        &["foo(bar)baz"],
+        1,
+        6,
+        ":onoremap p i(<CR>p",
+    ),
+];
+
 // ─────────────────── H. multi-file jumplist (#985) ───────────────────
 //
 // Cross-buffer/cross-tab/cross-split `<C-o>`/`<C-i>`, plus `:jumps` list
@@ -5992,6 +6159,7 @@ const CATEGORIES: &[(&str, &[Case])] = &[
     ("to      text objects", CASES_TO),
     ("misc    misc", CASES_MISC),
     ("fold    folds (#1006)", CASES_FOLD),
+    ("map     :map family (#1151)", CASES_MAP),
 ];
 
 // ---------------------------------------------------------------------------
@@ -7399,6 +7567,10 @@ const COMMAND_PROBES: &[CommandProbe] = &[
     p("ex::cc", Keys(":cc")),
     p("ex::cd {path}", Keys(":cd")),
     p("ex::colorscheme", Keys(":colorscheme")),
+    // #1151
+    p("ex::map", Label("map:nmap_chases_recursively")),
+    p("ex::nmap", Label("map:nmap_chases_recursively")),
+    p("ex::imap", Label("map:inoremap_jk_to_escape")),
     p("ex::make", Keys(":make")),
     p("ex::b {name}", Label("ex:b by name")),
     p("ex::Explore", Keys(":Explore")),

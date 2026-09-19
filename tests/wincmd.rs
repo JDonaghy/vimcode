@@ -539,8 +539,8 @@ fn vscode_keybindings_reference_shows_command_names() {
     assert!(content.contains(":debug"), "vscode ref should show :debug");
     assert!(content.contains(":fuzzy"), "vscode ref should show :fuzzy");
     assert!(
-        content.contains(":map n"),
-        "vscode ref should mention :map n for remapping"
+        content.contains(":nnoremap"),
+        "vscode ref should mention :nnoremap for remapping"
     );
 }
 

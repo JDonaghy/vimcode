@@ -516,7 +516,7 @@ impl Engine {
         for km in &self.user_keymaps {
             let keys_str = km.keys.join("");
             let display = format!(
-                "{:<24}:{} [mode: {}] (user remap)",
+                "{:<24}{} [mode: {}] (user remap)",
                 keys_str, km.action, km.mode
             );
             self.picker_all_items.push(PickerItem {

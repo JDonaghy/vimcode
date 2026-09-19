@@ -9213,14 +9213,55 @@ impl Engine {
     // ─── User keymaps ────────────────────────────────────────────────────────
 
     /// Rebuild the parsed user_keymaps cache from settings.keymaps.
-    /// Call after loading or changing settings.
+    /// Call after loading or changing settings. Expands the `<leader>`
+    /// notation marker against `Settings::leader` here (rather than in the
+    /// free-standing `parse_keymap_def`, which has no settings access), on
+    /// both the lhs and any key-to-keys rhs (#1151).
     pub fn rebuild_user_keymaps(&mut self) {
+        let leader = self.settings.leader.to_string();
         self.user_keymaps = self
             .settings
             .keymaps
             .iter()
             .filter_map(|s| parse_keymap_def(s))
+            .map(|mut km| {
+                km.keys = expand_leader_tokens(km.keys, &leader);
+                if let UserKeymapAction::Keys(rhs) = km.action {
+                    km.action = UserKeymapAction::Keys(expand_leader_tokens(rhs, &leader));
+                }
+                km
+            })
             .collect();
+    }
+
+    /// Modes active for user-keymap matching in the engine's current state.
+    /// Multiple letters can be simultaneously active — Visual mode matches
+    /// both `v` (vim's combined Visual+Select letter) and `x` (Visual-only),
+    /// since vimcode has no separate Select mode to tell them apart. `o`
+    /// (operator-pending) replaces `n` while an operator awaits its motion,
+    /// matching vim: only o-mode maps (and built-in motions) apply then, not
+    /// plain Normal-mode maps (#1151).
+    fn active_keymap_modes(&self) -> &'static [&'static str] {
+        if self.is_vscode_mode() {
+            // VSCode mode has no modal distinction; "n" keymaps apply.
+            return &["n"];
+        }
+        match self.mode {
+            Mode::Normal => {
+                if self.pending_operator.is_some()
+                    || self.pending_find_operator.is_some()
+                    || self.pending_text_object.is_some()
+                {
+                    &["o"]
+                } else {
+                    &["n"]
+                }
+            }
+            Mode::Visual | Mode::VisualLine | Mode::VisualBlock => &["v", "x"],
+            Mode::Insert => &["i"],
+            Mode::Command => &["c"],
+            _ => &[],
+        }
     }
 
     /// Check user keymaps for the current keypress. Returns `Some(action)` if
@@ -9237,31 +9278,23 @@ impl Engine {
             return None;
         }
 
-        let mode_str = if self.is_vscode_mode() {
-            // VSCode mode has no modal distinction; "n" keymaps apply.
-            "n"
-        } else {
-            match self.mode {
-                Mode::Normal => "n",
-                Mode::Visual | Mode::VisualLine | Mode::VisualBlock => "v",
-                Mode::Insert => "i",
-                Mode::Command => "c",
-                _ => return None,
-            }
-        };
+        let active_modes = self.active_keymap_modes();
+        if active_modes.is_empty() {
+            return None;
+        }
 
         let encoded = encode_keypress(key_name, unicode, ctrl);
         self.keymap_buf.push(encoded);
 
-        let mut exact_match_action = None;
+        let mut exact_match: Option<(UserKeymapAction, bool)> = None;
         let mut has_prefix = false;
 
         for km in &self.user_keymaps {
-            if km.mode != mode_str {
+            if !active_modes.contains(&km.mode.as_str()) {
                 continue;
             }
             if km.keys == self.keymap_buf {
-                exact_match_action = Some(km.action.clone());
+                exact_match = Some((km.action.clone(), km.noremap));
             } else if km.keys.len() > self.keymap_buf.len()
                 && km.keys[..self.keymap_buf.len()] == self.keymap_buf[..]
             {
@@ -9269,19 +9302,37 @@ impl Engine {
             }
         }
 
-        if let Some(action) = exact_match_action {
+        if let Some((action, noremap)) = exact_match {
             self.keymap_buf.clear();
+            let explicit_count = self.peek_count();
             let count = self.take_count();
-            // Substitute {count} in the action, or append count as argument
-            let cmd = if action.contains("{count}") {
-                action.replace("{count}", &count.to_string())
-            } else if count > 1 {
-                format!("{action} {count}")
-            } else {
-                action
-            };
             *changed = true;
-            return Some(self.execute_command(&cmd));
+            return Some(match action {
+                UserKeymapAction::Ex(cmd) => {
+                    // Substitute {count} in the action, or append count as argument
+                    let cmd = if cmd.contains("{count}") {
+                        cmd.replace("{count}", &count.to_string())
+                    } else if count > 1 {
+                        format!("{cmd} {count}")
+                    } else {
+                        cmd
+                    };
+                    self.execute_command(&cmd)
+                }
+                UserKeymapAction::Keys(rhs) => {
+                    // Vim: a count typed before a key-to-keys mapping is
+                    // inserted before the rhs's own keys, not used to repeat
+                    // the whole rhs — `nnoremap X dw` + `3X` types "3dw", so
+                    // the built-in count+operator handling (not this code)
+                    // consumes it.
+                    let mut feed: Vec<String> = Vec::new();
+                    if let Some(n) = explicit_count {
+                        feed.extend(n.to_string().chars().map(|c| c.to_string()));
+                    }
+                    feed.extend(rhs);
+                    self.feed_keymap_rhs(&feed, noremap)
+                }
+            });
         }
 
         if has_prefix {
@@ -9305,6 +9356,107 @@ impl Engine {
         }
         self.keymap_replaying = false;
         Some(last_action)
+    }
+
+    /// Feed a key-to-keys mapping's rhs back through `handle_key`.
+    ///
+    /// A `noremap` mapping's rhs is taken literally and never re-expanded —
+    /// that's what `noremap` means — so this just replays it.
+    ///
+    /// A `map`-family (recursive) mapping's rhs can itself contain lhs text
+    /// that matches *another* user keymap, which vim expands too (up to
+    /// `maxmapdepth`). A cycle (`nmap a b` + `nmap b a`) must eventually stop
+    /// with `E223: recursive mapping` rather than hang. Earlier versions of
+    /// this expanded recursively by calling `handle_key` → `try_user_keymap`
+    /// → `feed_keymap_rhs` again for each nested mapping — one Rust stack
+    /// frame per expansion level, which overflowed the thread's real stack on
+    /// a cyclic map (`handle_key` is a large function) *before* any depth
+    /// counter got a chance to fire. This instead resolves the whole chain
+    /// with an explicit work queue in a loop, so [`MAXMAPDEPTH`] expansions
+    /// cost one stack frame total, not 1000 (#1151 review).
+    fn feed_keymap_rhs(&mut self, rhs: &[String], top_noremap: bool) -> EngineAction {
+        if top_noremap {
+            return self.replay_keys_literal(rhs);
+        }
+
+        let mut queue: std::collections::VecDeque<String> = rhs.iter().cloned().collect();
+        let mut last = EngineAction::None;
+        let mut expansions = 0usize;
+
+        while let Some(first) = queue.front().cloned() {
+            let active_modes = self.active_keymap_modes();
+            let mut best: Option<(usize, UserKeymapAction, bool)> = None;
+            if !active_modes.is_empty() {
+                for km in &self.user_keymaps {
+                    if !active_modes.contains(&km.mode.as_str()) {
+                        continue;
+                    }
+                    if km.keys.is_empty() || km.keys.len() > queue.len() {
+                        continue; // not enough lookahead to ever match
+                    }
+                    if queue.iter().take(km.keys.len()).eq(km.keys.iter()) {
+                        let better = best.as_ref().is_none_or(|(len, _, _)| km.keys.len() > *len);
+                        if better {
+                            best = Some((km.keys.len(), km.action.clone(), km.noremap));
+                        }
+                    }
+                }
+            }
+
+            let Some((len, action, noremap)) = best else {
+                // No mapping matches at this position — dispatch exactly one
+                // token literally and move on.
+                queue.pop_front();
+                last = self.replay_keys_literal(std::slice::from_ref(&first));
+                continue;
+            };
+
+            for _ in 0..len {
+                queue.pop_front();
+            }
+            expansions += 1;
+            if expansions > MAXMAPDEPTH {
+                self.message = "E223: recursive mapping".to_string();
+                return EngineAction::None;
+            }
+            match action {
+                UserKeymapAction::Ex(cmd) => {
+                    last = self.execute_command(&cmd);
+                }
+                UserKeymapAction::Keys(sub_rhs) => {
+                    if noremap {
+                        last = self.replay_keys_literal(&sub_rhs);
+                    } else {
+                        // Push the expansion back onto the front of the queue
+                        // so it's resolved (and can itself be expanded
+                        // further) before anything already queued after it.
+                        for tok in sub_rhs.into_iter().rev() {
+                            queue.push_front(tok);
+                        }
+                    }
+                }
+            }
+        }
+        last
+    }
+
+    /// Replay a fixed list of already-resolved keys through `handle_key` with
+    /// user-keymap matching disabled, so none of them can be re-expanded —
+    /// used both for a `noremap` rhs (never expands, by definition) and for a
+    /// single token `feed_keymap_rhs` has already decided has no mapping
+    /// match (dispatching it through `handle_key` normally would run
+    /// `try_user_keymap`'s own prefix-buffering on it a second time, against
+    /// `self.keymap_buf` state that belongs to live typing, not this replay).
+    fn replay_keys_literal(&mut self, toks: &[String]) -> EngineAction {
+        let was_replaying = self.keymap_replaying;
+        self.keymap_replaying = true;
+        let mut last = EngineAction::None;
+        for tok in toks {
+            let (name, uni, ctrl) = decode_keypress(tok);
+            last = self.handle_key(&name, uni, ctrl);
+        }
+        self.keymap_replaying = was_replaying;
+        last
     }
 
     /// Try to run a named plugin command. Returns `true` if the command was found.
