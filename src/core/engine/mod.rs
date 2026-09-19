@@ -335,10 +335,28 @@ static EX_ABBREVS: &[(&str, usize)] = &[
 
 /// Split an ex-command string into (command_word, bang, rest).
 /// Example: `"q!"` → `("q", "!", "")`, `"sor foo"` → `("sor", "", " foo")`
+///
+/// `_` counts as part of the word, not a boundary (#1125): no real Vim
+/// ex-command name contains an underscore, but `execute_command` also
+/// doubles as the dispatch target for menu/palette action-id strings like
+/// `"save_workspace_as_dialog"` (`Engine::dispatch_menu_action`,
+/// `Engine::picker_confirm`'s `other => self.execute_command(other)`
+/// fallback — see #634). Splitting at `_` treated those as a short
+/// abbreviation-eligible word ("save") glued to an unrecognised
+/// "argument" ("_workspace_as_dialog"), so [`normalize_ex_command`]'s
+/// abbreviation table rewrote `cmd_word` (`"save"` → `"saveas"`, since
+/// `"saveas"` is in [`EX_ABBREVS`]) and reassembled a garbled command —
+/// `"saveas_workspace_as_dialog"` — that matches nothing, silently
+/// breaking the menu/palette entry instead of reaching
+/// `execute_command`'s own `cmd == "save_workspace_as_dialog"` equality
+/// check a few lines down. Keeping `_` in the word makes `cmd_word` the
+/// whole action-id string, which is always longer than every
+/// [`EX_ABBREVS`] canonical name, so the abbreviation loop never matches
+/// and the string reaches that equality check unmodified.
 fn split_ex_command(input: &str) -> (&str, &str, &str) {
-    // Find end of alphabetic command word
+    // Find end of alphabetic (+ underscore) command word
     let cmd_end = input
-        .find(|c: char| !c.is_ascii_alphabetic())
+        .find(|c: char| !(c.is_ascii_alphabetic() || c == '_'))
         .unwrap_or(input.len());
     let cmd_word = &input[..cmd_end];
     let rest = &input[cmd_end..];

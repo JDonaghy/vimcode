@@ -2868,8 +2868,19 @@ impl ShellApp for TuiShellApp {
                     quadraui::MenuEvent::Activated(id) => {
                         let action = id.as_str().to_string();
                         if action == "open_file_dialog" {
-                            self.engine
-                                .open_picker(crate::core::engine::PickerSource::Files);
+                            // #1125: was `open_picker(PickerSource::Files)`
+                            // (an in-canvas fuzzy finder, not a real "Open
+                            // File" dialog) — now the shared native-dialog
+                            // rung both backends use (`render.rs`). `backend`
+                            // is already in scope here, so TUI calls it
+                            // synchronously; no GTK-style `tick()` deferral
+                            // needed (see the rung's header comment).
+                            if render::run_open_file_dialog(&mut self.engine, backend).is_some() {
+                                self.engine.explorer_rebuild_rows();
+                                if let Some(path) = self.engine.file_path().cloned() {
+                                    self.engine.explorer_reveal_path(&path);
+                                }
+                            }
                         } else {
                             // #634: `dispatch_menu_action` returns an
                             // `EngineAction` the engine can't complete on its
@@ -2899,6 +2910,7 @@ impl ShellApp for TuiShellApp {
                                 viewport.width as u16,
                                 viewport.height as u16,
                                 self.sidebar_width,
+                                backend,
                             ) {
                                 break 'dispatch Reaction::Exit;
                             }
@@ -4503,6 +4515,7 @@ fn handle_key_pressed(
         screen_w,
         screen_h,
         *state.sidebar_width,
+        backend,
     ) {
         return Reaction::Exit;
     }
@@ -4548,6 +4561,12 @@ struct TuiEngineActionHost<'a> {
     screen_w: u16,
     screen_h: u16,
     sidebar_width: u16,
+    /// Live handle to the runner-owned backend, needed for
+    /// `save_workspace_as_dialog`'s native file dialog (#1125). Unlike
+    /// GTK's `GtkEngineActionHost`, TUI's callers always have `backend` in
+    /// scope already (see [`dispatch_post_key_action`]'s doc), so this
+    /// reaches the dialog synchronously instead of deferring to `tick()`.
+    backend: &'a mut dyn quadraui::Backend,
 }
 
 impl render::EngineActionHost for TuiEngineActionHost<'_> {
@@ -4581,8 +4600,7 @@ impl render::EngineActionHost for TuiEngineActionHost<'_> {
         engine.explorer_rebuild_rows();
     }
     fn save_workspace_as_dialog(&mut self, engine: &mut Engine) {
-        let ws_path = engine.cwd.join(".vimcode-workspace");
-        engine.save_workspace_as(&ws_path);
+        render::run_save_workspace_as_dialog(engine, self.backend);
     }
     fn open_recent_dialog(&mut self, engine: &mut Engine) {
         if engine.session.recent_workspaces.is_empty() {
@@ -4628,6 +4646,7 @@ fn dispatch_post_key_action(
     screen_w: u16,
     screen_h: u16,
     sidebar_width: u16,
+    backend: &mut dyn quadraui::Backend,
 ) -> bool {
     let mut host = TuiEngineActionHost {
         sidebar,
@@ -4635,6 +4654,7 @@ fn dispatch_post_key_action(
         screen_w,
         screen_h,
         sidebar_width,
+        backend,
     };
     render::apply_engine_action(action, engine, &mut host)
 }
@@ -10421,6 +10441,230 @@ mod tests {
             "Terminal \u{25b8} New Terminal must open a terminal pane (bottom-panel \
              tab bar showing \"Terminal\" outside the menu-bar row); screen:\n{screen}"
         );
+    }
+
+    // ── #1125: TUI file dialogs go through the real native picker ──────────
+    //
+    // Before this fix, `TuiEngineActionHost::save_workspace_as_dialog` wrote
+    // `engine.cwd.join(".vimcode-workspace")` unconditionally — no prompt,
+    // no way to cancel — and the `open_file_dialog` menu action fell back to
+    // the in-canvas fuzzy finder (`open_picker(PickerSource::Files)`)
+    // instead of a real "Open File" dialog. Both now call the shared
+    // `render::run_open_file_dialog`/`run_save_workspace_as_dialog` (#1125),
+    // backed by quadraui#965's `TuiPlatformServices::show_file_open_dialog`/
+    // `show_file_save_dialog` — a real nested draw-and-read loop over
+    // `FilePickerController`, resolved synchronously inside one
+    // `TuiDriver::dispatch`/`click` call.
+    //
+    // That synchronous, single-call design is also why these tests can't
+    // assert on `driver.screen()` for the dialog's *own* painted content the
+    // way most of this module's tests do: the dialog opens and resolves
+    // entirely inside one `dispatch`/`click`, and whatever it painted is
+    // overwritten by `TuiShellApp`'s own next full-frame render before
+    // `dispatch`/`click` ever returns control to the test — there is no
+    // point between "dialog painted" and "app repainted over it" a caller
+    // outside `TuiShellApp::handle` can observe. (`TuiPlatformServices::
+    // set_dialog_surface`/`queue_dialog_events` are `pub(crate)` in
+    // quadraui — reachable only through `TuiDriver`'s public
+    // `queue_dialog_events` wrapper, which schedules the dialog's *input*,
+    // not a way to peek at its output mid-call.) GTK's own precedent test
+    // for exactly this class of native/nested dialog,
+    // `native_dialog_presented_exactly_once_across_repeated_frames`
+    // (`gtk/testing.rs`), hits the identical wall for `show_message_dialog`
+    // and documents it the same way. What *is* observable, and is the
+    // stronger proof besides: the real filesystem side effect the dialog's
+    // resolution drives — exactly the thing the pre-#1125 bug got wrong.
+
+    /// Cancelling "Save Workspace As" must write nothing.
+    ///
+    /// No `queue_dialog_events` call is made, so the dialog's nested loop
+    /// paints one frame and then — its scripted-event queue empty —
+    /// synthesizes a single Escape (`TuiPlatformServices::
+    /// next_dialog_events`'s documented behaviour) and resolves `Cancelled`.
+    ///
+    /// RED-verified: reverting `TuiEngineActionHost::save_workspace_as_dialog`
+    /// to its pre-#1125 body (`engine.cwd.join(".vimcode-workspace");
+    /// engine.save_workspace_as(&ws_path);`) makes this fail — that body
+    /// writes the file unconditionally, with no dialog and so no way for a
+    /// "cancel" to exist at all.
+    #[test]
+    fn menu_save_workspace_as_cancelled_dialog_writes_nothing_via_shell_app() {
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_test_1125_save_workspace_as_cancel_{:?}",
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut app = TuiShellApp::new_for_test();
+        app.engine.cwd = dir.clone();
+        let mut driver = driver_with_shell(app, config(), 80, 24);
+
+        // Alt+F reveals the menu bar and opens the File dropdown in one
+        // dispatch — the #318 shim; mirrors
+        // `menu_terminal_activation_opens_terminal_pane_via_shell_app`'s
+        // identical use of Alt+<letter> for Terminal.
+        driver.dispatch(quadraui::UiEvent::KeyPressed {
+            key: quadraui::Key::Char('f'),
+            modifiers: quadraui::Modifiers {
+                alt: true,
+                ..quadraui::Modifiers::default()
+            },
+            repeat: false,
+        });
+        let (x, y) = driver.find("Save Workspace As").unwrap_or_else(|| {
+            panic!(
+                "File dropdown must list Save Workspace As\u{2026}; screen:\n{}",
+                driver.screen()
+            )
+        });
+        driver.click(x, y);
+
+        let ws_path = dir.join(".vimcode-workspace");
+        assert!(
+            !ws_path.exists(),
+            "an unscripted (cancelled) Save Workspace As dialog must not \
+             write cwd/.vimcode-workspace — the pre-#1125 code wrote it \
+             unconditionally with no dialog at all"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Confirming "Save Workspace As" with a *typed* name must save under
+    /// that name, not the hardcoded `.vimcode-workspace` the pre-#1125 code
+    /// always used — the distinguishing half of the #1125 fix the cancel
+    /// test above can't cover on its own (a bare, unscripted confirm of the
+    /// dialog's seeded `.vimcode-workspace` initial filename would land on
+    /// the very same path the old hardcoded write did, so it can't tell the
+    /// two implementations apart).
+    ///
+    /// Clears the picker's seeded `.vimcode-workspace` query (one Backspace
+    /// per character, matching `FilePickerController::pop_char`) before
+    /// typing a different name, then confirms with Enter —
+    /// `FilePickerController::confirm_selection` resolves a non-empty
+    /// Save-mode query to `root.join(query)` regardless of whether that name
+    /// already exists.
+    ///
+    /// RED-verified: reverting `TuiEngineActionHost::save_workspace_as_dialog`
+    /// to its pre-#1125 body makes this fail — `renamed-workspace` never
+    /// gets created (the hardcoded body only ever writes `.vimcode-workspace`,
+    /// ignoring the scripted dialog entirely).
+    #[test]
+    fn menu_save_workspace_as_confirmed_with_a_typed_name_saves_to_that_path_via_shell_app() {
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_test_1125_save_workspace_as_confirm_{:?}",
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut app = TuiShellApp::new_for_test();
+        app.engine.cwd = dir.clone();
+        let mut driver = driver_with_shell(app, config(), 80, 24);
+
+        let mut events: Vec<quadraui::UiEvent> = Vec::new();
+        for _ in ".vimcode-workspace".chars() {
+            events.push(quadraui::UiEvent::KeyPressed {
+                key: quadraui::Key::Named(quadraui::NamedKey::Backspace),
+                modifiers: quadraui::Modifiers::default(),
+                repeat: false,
+            });
+        }
+        for c in "renamed-workspace".chars() {
+            events.push(quadraui::UiEvent::KeyPressed {
+                key: quadraui::Key::Char(c),
+                modifiers: quadraui::Modifiers::default(),
+                repeat: false,
+            });
+        }
+        events.push(quadraui::UiEvent::KeyPressed {
+            key: quadraui::Key::Named(quadraui::NamedKey::Enter),
+            modifiers: quadraui::Modifiers::default(),
+            repeat: false,
+        });
+        driver.queue_dialog_events(events);
+
+        driver.dispatch(quadraui::UiEvent::KeyPressed {
+            key: quadraui::Key::Char('f'),
+            modifiers: quadraui::Modifiers {
+                alt: true,
+                ..quadraui::Modifiers::default()
+            },
+            repeat: false,
+        });
+        let (x, y) = driver.find("Save Workspace As").unwrap_or_else(|| {
+            panic!(
+                "File dropdown must list Save Workspace As\u{2026}; screen:\n{}",
+                driver.screen()
+            )
+        });
+        driver.click(x, y);
+
+        assert!(
+            dir.join("renamed-workspace").exists(),
+            "confirming the dialog with a typed name must save under that \
+             name — the real dialog's result must reach \
+             Engine::save_workspace_as, not a hardcoded path"
+        );
+        assert!(
+            !dir.join(".vimcode-workspace").exists(),
+            "the confirmed name was \"renamed-workspace\", not \
+             \".vimcode-workspace\" — a stray file at the old hardcoded \
+             name would mean the dialog's result was ignored"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// File ▸ Open File… must no longer fall back to the in-canvas fuzzy
+    /// finder (`open_picker(PickerSource::Files)`, painted with a "Find
+    /// Files" header) — it now goes through `render::run_open_file_dialog`,
+    /// the same native-dialog rung `Save Workspace As` uses above.
+    ///
+    /// RED-verified: reverting the `open_file_dialog` menu-id arm in
+    /// `TuiShellApp::handle` to
+    /// `self.engine.open_picker(crate::core::engine::PickerSource::Files)`
+    /// makes this fail — "Find Files" paints.
+    #[test]
+    fn menu_open_file_no_longer_falls_back_to_the_in_canvas_picker_via_shell_app() {
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_test_1125_open_file_dialog_{:?}",
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut app = TuiShellApp::new_for_test();
+        app.engine.cwd = dir.clone();
+        let mut driver = driver_with_shell(app, config(), 80, 24);
+
+        driver.dispatch(quadraui::UiEvent::KeyPressed {
+            key: quadraui::Key::Char('f'),
+            modifiers: quadraui::Modifiers {
+                alt: true,
+                ..quadraui::Modifiers::default()
+            },
+            repeat: false,
+        });
+        let (x, y) = driver.find("Open File").unwrap_or_else(|| {
+            panic!(
+                "File dropdown must list Open File\u{2026}; screen:\n{}",
+                driver.screen()
+            )
+        });
+        driver.click(x, y);
+
+        assert!(
+            !driver.screen_contains("Find Files"),
+            "File \u{25b8} Open File\u{2026} must no longer fall back to the \
+             in-canvas fuzzy finder (PickerSource::Files, \"Find Files\" \
+             header) — it should go through the real native dialog instead; \
+             screen:\n{}",
+            driver.screen()
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ── #758 / #734 slice 3: the shared terminal (PTY) keyboard rung ───────

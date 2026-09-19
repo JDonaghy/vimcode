@@ -4773,6 +4773,70 @@ pub fn apply_engine_action(
     }
 }
 
+// ─── Native file-dialog rung (#1125) ────────────────────────────────────────
+//
+// TUI's `save_workspace_as_dialog` used to hardcode `engine.cwd.join(
+// ".vimcode-workspace")` and write it unconditionally — no prompt, no way to
+// cancel, and silently ignoring whatever path the user actually wanted. GTK
+// already did this right (`App::run_pending_file_dialog`, driven by
+// `PendingFileDialog`/`tick()` because its `backend` handle is only reachable
+// there — see that type's doc comment for why). quadraui#965 shipped the TUI
+// half of the same primitive — `TuiPlatformServices::show_file_open_dialog` /
+// `show_file_save_dialog`, a nested draw-and-read loop over
+// `FilePickerController` — so TUI can call it too.
+//
+// TUI doesn't need GTK's `tick()` deferral: `TuiShellApp::handle` already has
+// `backend: &mut dyn quadraui::Backend` in scope at both call sites that can
+// open one of these dialogs (the `open_file_dialog` menu action, and
+// `EngineAction::SaveWorkspaceAsDialog` via `TuiEngineActionHost`, which now
+// carries a `backend` field for exactly this). [`run_open_file_dialog`] and
+// [`run_save_workspace_as_dialog`] are the one shared body both GTK's
+// deferred call site and TUI's synchronous ones call — the point of this rung
+// is one implementation, two thin call sites, not a parallel TUI-only copy.
+
+/// Show a native "Open File" dialog via `backend`'s `PlatformServices` and
+/// open the chosen file in `engine`. Returns the opened path (`None` if the
+/// user cancelled) so a caller can refresh backend-local UI — e.g. GTK's
+/// file-tree selection — only when something was actually opened.
+pub fn run_open_file_dialog(
+    engine: &mut Engine,
+    backend: &mut dyn quadraui::Backend,
+) -> Option<std::path::PathBuf> {
+    let path = backend
+        .services()
+        .show_file_open_dialog(quadraui::FileDialogOptions {
+            title: Some("Open File".to_string()),
+            // Browse from the current workspace root, not wherever the OS
+            // process happened to start (`FileDialogOptions::initial_dir`
+            // defaults to `std::env::current_dir()` when `None` — see
+            // `TuiPlatformServices::show_file_open_dialog`'s doc — which can
+            // diverge from `engine.cwd` after an in-app `Open Folder`/`:cd`
+            // that never actually `chdir`s the process).
+            initial_dir: Some(engine.cwd.clone()),
+            ..Default::default()
+        })?;
+    let _ = engine.open_file_with_mode(&path, crate::core::engine::OpenMode::Permanent);
+    Some(path)
+}
+
+/// Show a native "Save Workspace As" dialog via `backend`'s
+/// `PlatformServices` and save the workspace to the chosen path. Does
+/// nothing when the user cancels — the #1125 fix.
+pub fn run_save_workspace_as_dialog(engine: &mut Engine, backend: &mut dyn quadraui::Backend) {
+    if let Some(path) = backend
+        .services()
+        .show_file_save_dialog(quadraui::FileDialogOptions {
+            title: Some("Save Workspace As".to_string()),
+            initial_filename: Some(".vimcode-workspace".to_string()),
+            // See `run_open_file_dialog`'s identical `initial_dir` comment.
+            initial_dir: Some(engine.cwd.clone()),
+            ..Default::default()
+        })
+    {
+        engine.save_workspace_as(&path);
+    }
+}
+
 // ─── Shell-event shadow-sync rung (#1062) ────────────────────────────────────
 //
 // `AppShellEvent::PanelChanged`/`SidebarHidden`/`SidebarResized` all report a

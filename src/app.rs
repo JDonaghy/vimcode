@@ -1806,30 +1806,23 @@ impl App {
         req: PendingFileDialog,
         backend: &mut dyn quadraui::Backend,
     ) {
-        use quadraui::FileDialogOptions;
+        // Bodies shared with TUI's synchronous call sites — see
+        // `render::run_open_file_dialog`/`run_save_workspace_as_dialog`'s
+        // rung header comment (#1125) for why this stays one implementation
+        // with two thin call sites instead of a per-backend copy.
         match req {
             PendingFileDialog::OpenFile => {
-                let path = backend.services().show_file_open_dialog(FileDialogOptions {
-                    title: Some("Open File".to_string()),
-                    ..Default::default()
-                });
-                if let Some(path) = path {
-                    let _ = self
-                        .engine
-                        .borrow_mut()
-                        .open_file_with_mode(&path, crate::core::engine::OpenMode::Permanent);
+                let opened = {
+                    let mut engine = self.engine.borrow_mut();
+                    render::run_open_file_dialog(&mut engine, backend)
+                };
+                if opened.is_some() {
                     self.refresh_file_tree();
                 }
             }
             PendingFileDialog::SaveWorkspaceAs => {
-                let path = backend.services().show_file_save_dialog(FileDialogOptions {
-                    title: Some("Save Workspace As".to_string()),
-                    initial_filename: Some(".vimcode-workspace".to_string()),
-                    ..Default::default()
-                });
-                if let Some(path) = path {
-                    self.engine.borrow_mut().save_workspace_as(&path);
-                }
+                let mut engine = self.engine.borrow_mut();
+                render::run_save_workspace_as_dialog(&mut engine, backend);
             }
         }
         self.draw_needed.set(true);
