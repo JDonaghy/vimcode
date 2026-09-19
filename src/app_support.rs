@@ -57,39 +57,27 @@ pub(crate) fn is_ext_panel_id(id: &str) -> bool {
 /// the metric change from fixing the family, so nudging both at once
 /// would make it impossible to tell which change did what.
 ///
-/// #1069: the list above has no macOS entry at all — every name in it
-/// is Linux/Windows-shaped, so on a Mac it fell through to the same
-/// trailing `Sans` generic, which is not the system UI font (VS Code's
-/// macOS chrome renders in `-apple-system`/SF Pro). Fixed with
-/// `cfg!(target_os = "macos")` here, in shared code — not a branch in
-/// `src/gtk/` or `src/macos/` — matching the shape
-/// `core::settings::default_use_nerd_fonts` already established for a
-/// per-OS default. `SF Pro Text`, `Helvetica Neue` and `Lucida Grande`
-/// are real CoreText family names spanning current and older macOS UI
-/// font history, ahead of the existing Linux/Windows names and the
-/// trailing `Sans` catch-all.
+/// #1069 added a `cfg!` branch here, keyed on `target_os == "macos"`, to
+/// try real CoreText UI font names ahead of the Linux/Windows list — a
+/// *backend* fact (which family name resolves on which OS) leaking into
+/// otherwise shared code, and one that bought nothing:
+/// `MacBackend::parse_ui_font_desc`
+/// didn't split a comma list at the time, so the whole string always
+/// degraded to the CoreText system UI font regardless of which names led
+/// it (documented at length in the pre-#1129 revision of this comment).
 ///
-/// **Inert on macOS today, for two independent reasons — do not read a
-/// screenshot of this as "done":**
-/// 1. quadraui#1003: as of the pinned rev, `MacBackend` only reads
-///    `chrome_font` for 2 of GTK's 16 chrome paints (e.g. the status
-///    bar) — most non-dialog chrome still paints with the CoreText
-///    default UI font regardless of what `set_ui_font` was given.
-/// 2. A *new* gap this issue's review surfaced: `MacBackend::set_ui_font`
-///    -> `parse_ui_font_desc` does not split on commas the way Pango
-///    does — it treats everything before the trailing point-size token
-///    as ONE literal CoreText family name. So even where #1 above
-///    doesn't block it, the whole comma-joined string (macOS names
-///    included) is handed to `make_font_exact` as a single unresolvable
-///    name and always degrades to the CoreText system UI font. File a
-///    quadraui issue for this (distinct from #1003) before expecting
-///    this list to resolve anything real on macOS; don't work around it
-///    here (Platform-Neutrality Rule).
-const UI_FONT_FAMILY: &str = if cfg!(target_os = "macos") {
-    "SF Pro Text, Helvetica Neue, Lucida Grande, Cantarell, Ubuntu, Segoe UI, Droid Sans, Sans"
-} else {
-    "Cantarell, Ubuntu, Segoe UI, Droid Sans, Sans"
-};
+/// #1129: removed once quadraui#1023 landed comma-list parsing plus
+/// [`quadraui::GenericFamily`] resolution for `Backend::set_ui_font` on
+/// every pixel backend. GTK/fontconfig already resolves this exact list
+/// natively (`Cantarell`/`Ubuntu` first, matching real Linux desktop UI
+/// fonts, then the Windows/legacy names, `Sans` as the final catch-all —
+/// see #704's history above). On macOS, `MacBackend::set_ui_font` now
+/// tries each comma-separated candidate in order via `make_font_exact`
+/// and degrades to the CoreText system UI font only if none resolve —
+/// still inert for *this* list (none of these are real CoreText family
+/// names) but no longer needs a `cfg!` branch to say so: the fix is one
+/// shared string plus quadraui resolving it per-backend, not two lists.
+const UI_FONT_FAMILY: &str = "Cantarell, Ubuntu, Segoe UI, Droid Sans, Sans";
 
 thread_local! {
     /// Per-thread UI font size (points). Synced from

@@ -462,25 +462,33 @@ mod mac_driver_tests {
     }
 
     /// #1069: on macOS, `Settings::default().font_family` must resolve a
-    /// *real* CoreText family, not silently fail. Before this issue,
+    /// *real* CoreText font, not silently fail. Before that issue,
     /// `default_font_family()` (`src/core/settings.rs`) returned
-    /// `"Monospace"` on every platform — a fontconfig *generic alias* with
-    /// no CoreText equivalent. `App::render_content` pushes it onto the
-    /// paint backend every frame via `backend.set_editor_font(family,
-    /// size)` unconditionally (#947, no gate) — on macOS that reaches
-    /// `MacBackend::set_editor_font`, which no-ops unless `make_font_exact`
-    /// finds an *exact* installed family. `"Monospace"` never matched, so
-    /// `current_font` stayed `None` forever and `char_width`/`line_height`
-    /// stuck at quadraui's placeholder seed values (`MacBackend::new`'s
-    /// `current_char_width: 8.0`, `current_line_height: 16.0`) regardless
-    /// of `font_size` — the editor was laid out against numbers no
-    /// installed font actually has.
+    /// `"Monospace"` on every platform — a fontconfig *generic alias*
+    /// `MacBackend::set_editor_font` -> `make_font_exact` couldn't resolve
+    /// at the time. `App::render_content` pushes it onto the paint backend
+    /// every frame via `backend.set_editor_font(family, size)`
+    /// unconditionally (#947, no gate), so `current_font` stayed `None`
+    /// forever and `char_width`/`line_height` stuck at quadraui's
+    /// placeholder seed values (`MacBackend::new`'s `current_char_width:
+    /// 8.0`, `current_line_height: 16.0`) regardless of `font_size` — the
+    /// editor was laid out against numbers no installed font actually has.
+    ///
+    /// #1129: `default_font_family()` went back to the single shared
+    /// `"Monospace"` value once quadraui#1023 taught
+    /// `MacBackend::set_editor_font` to resolve that Pango alias directly
+    /// to `system_monospace_font` (CoreText's
+    /// `kCTFontUserFixedPitchFontType`) instead of routing it through
+    /// `make_font_exact`'s installed-family lookup — so the positive
+    /// control below now compares against `system_monospace_font`, not
+    /// `make_font_exact`.
     ///
     /// RED-verified against unfixed `develop`: temporarily reverting
-    /// `default_font_family()`'s macOS arm back to `"Monospace".to_string()`
-    /// and re-running this test with `cargo test --no-default-features
-    /// --features macos` fails — `char_width`/`line_height` land exactly on
-    /// the 8.0/16.0 placeholders instead of matching Menlo's real metrics.
+    /// `default_font_family()` to the pre-#1129 `cfg!(target_os =
+    /// "macos")` branch (`"Menlo"`) and re-running this test with `cargo
+    /// test --no-default-features --features macos` fails — the resolved
+    /// metrics no longer match `system_monospace_font`'s (they match
+    /// Menlo's instead).
     ///
     /// Goes straight through `Backend::set_editor_font` on a bare
     /// `MacBackend` — same shape as the sibling
@@ -506,7 +514,7 @@ mod mac_driver_tests {
             8.0,
             "current_char_width is still quadraui's placeholder seed value \
              — Settings::default().font_family ({:?}) never resolved a real \
-             font via make_font_exact",
+             font",
             settings.font_family
         );
         assert_ne!(
@@ -514,27 +522,26 @@ mod mac_driver_tests {
             16.0,
             "current_line_height is still quadraui's placeholder seed value \
              — Settings::default().font_family ({:?}) never resolved a real \
-             font via make_font_exact",
+             font",
             settings.font_family
         );
 
-        // Positive control: the resolved metrics must be Menlo's own, not
-        // some other font `make_font` silently substituted.
-        let menlo = quadraui::macos::text::make_font_exact(
-            &settings.font_family,
-            settings.font_size as f64,
-        )
-        .expect("Settings::default().font_family must be exactly resolvable on macOS (#1069)");
-        let expected = quadraui::macos::text::font_metrics(&menlo);
+        // Positive control: the resolved metrics must be
+        // `system_monospace_font`'s own — the CoreText face
+        // `quadraui::GenericFamily::Monospace` (the Pango alias
+        // `"Monospace"` parses to) resolves to on this backend — not some
+        // other font silently substituted.
+        let expected_font = quadraui::macos::text::system_monospace_font(settings.font_size as f64);
+        let expected = quadraui::macos::text::font_metrics(&expected_font);
         assert!(
             (backend.char_width() as f64 - expected.char_width).abs() < 0.01,
-            "char_width {} does not match Menlo's own metrics {}",
+            "char_width {} does not match system_monospace_font's metrics {}",
             backend.char_width(),
             expected.char_width
         );
         assert!(
             (backend.line_height() as f64 - expected.line_height).abs() < 0.01,
-            "line_height {} does not match Menlo's own metrics {}",
+            "line_height {} does not match system_monospace_font's metrics {}",
             backend.line_height(),
             expected.line_height
         );
