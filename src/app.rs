@@ -1413,6 +1413,36 @@ impl App {
         )
     }
 
+    /// Map a built-in activity-bar panel id to its glyph — the single table
+    /// every backend's `shell_config` builder resolves icons from (#1107).
+    ///
+    /// Before this, `tui_main::shell_app::TuiShellApp::shell_config` carried
+    /// its own icon literal (zipped positionally against
+    /// `sidebar::FIXED_ACTIVITY_PANEL_IDS`), entirely independent of this
+    /// match — which is exactly how the search panel ended up resolving to
+    /// two different glyphs across backends for months (`SEARCH_COD` on
+    /// GTK, `SEARCH` on TUI, converged by #950, but the *machinery* that let
+    /// them drift in the first place — two hand-maintained tables — stayed
+    /// in place until now). `shell_config_resolves_the_same_search_icon_on_
+    /// every_backend` below pins the fact directly.
+    ///
+    /// Returns `None` for any id this table doesn't know — extension panels
+    /// resolve their own icon before ever reaching a `shell_config` builder
+    /// (see `Engine::ext_activity_panels`), so a caller should leave an
+    /// unmatched panel's icon untouched rather than blank it out.
+    pub(crate) fn resolve_builtin_panel_icon(id: &str) -> Option<&'static str> {
+        Some(match id {
+            "panel:explorer" => crate::icons::EXPLORER.s(),
+            "panel:search" => crate::icons::SEARCH.s(),
+            "panel:debug" => crate::icons::DEBUG.s(),
+            "panel:git" => crate::icons::GIT_BRANCH.s(),
+            "panel:extensions" => crate::icons::EXTENSIONS.s(),
+            "panel:ai" => crate::icons::AI_CHAT.s(),
+            "bottom:settings" => crate::icons::SETTINGS.s(),
+            _ => return None,
+        })
+    }
+
     /// Derive the runner's [`quadraui::ShellConfig`] from this `App`'s engine
     /// state — the backend-neutral core of what every GUI entry point needs
     /// before it can call `run_with_shell` (#859).
@@ -1458,16 +1488,9 @@ impl App {
             .iter()
             .cloned()
             .map(|mut p| {
-                p.icon = match p.id.as_str() {
-                    "panel:explorer" => crate::icons::EXPLORER.s().to_string(),
-                    "panel:search" => crate::icons::SEARCH.s().to_string(),
-                    "panel:debug" => crate::icons::DEBUG.s().to_string(),
-                    "panel:git" => crate::icons::GIT_BRANCH.s().to_string(),
-                    "panel:extensions" => crate::icons::EXTENSIONS.s().to_string(),
-                    "panel:ai" => crate::icons::AI_CHAT.s().to_string(),
-                    "bottom:settings" => crate::icons::SETTINGS.s().to_string(),
-                    _ => p.icon,
-                };
+                if let Some(icon) = Self::resolve_builtin_panel_icon(p.id.as_str()) {
+                    p.icon = icon.to_string();
+                }
                 p
             })
             .collect();
@@ -8842,6 +8865,72 @@ mod portable_entry_point_tests {
         );
         assert_eq!(cfg.min_sidebar_width, render::ALT_SIDEBAR_WIDTH_MIN as f32);
         assert_eq!(cfg.max_sidebar_width, render::ALT_SIDEBAR_WIDTH_MAX as f32);
+    }
+
+    /// #1107: `App::shell_config` (this GTK/macOS/Win-GUI builder) and
+    /// `TuiShellApp::build_shell_config` used to carry two entirely
+    /// independent icon tables for the built-in activity-bar panels — which
+    /// is exactly how the search panel ended up resolving to `SEARCH_COD`
+    /// on GTK and `SEARCH` on TUI for months before #950 noticed by
+    /// inspection and hand-aligned the two literals. Hand-aligning the
+    /// *values* doesn't stop the *tables* from drifting again the next time
+    /// either one gains a panel; this test pins the fact that both
+    /// backends now resolve every shared built-in panel id — not just
+    /// search — through the one `App::resolve_builtin_panel_icon` table
+    /// (#1107), so a future edit to only one of them fails here instead of
+    /// shipping a silent per-backend icon fork again.
+    ///
+    /// Note for reviewers: this does **not** go red against unfixed
+    /// `develop` — #950 already made the two *values* agree by hand. #1107
+    /// is the refactor that deletes the machinery which let them diverge in
+    /// the first place (no user-visible behaviour change), and this test is
+    /// the structural regression guard for it, not a bug-fix repro.
+    #[cfg(feature = "gui")]
+    #[test]
+    fn shell_config_resolves_the_same_icon_on_every_backend_for_every_shared_panel() {
+        let engine = Rc::new(RefCell::new(Engine::new_for_test()));
+        let app = App::new_headless(engine);
+        let gtk_cfg = app.shell_config();
+        let tui_cfg = crate::tui_main::testing::TuiShellApp::build_shell_config(false);
+
+        let icon_for = |cfg: &quadraui::ShellConfig, id: &str| -> Option<String> {
+            cfg.panels
+                .iter()
+                .chain(cfg.bottom_items.iter())
+                .find(|p| p.id.as_str() == id)
+                .map(|p| p.icon.clone())
+        };
+
+        // Every built-in id both backends' `ShellConfig`s claim to carry —
+        // not just search, so a future panel doesn't get a free pass.
+        let shared_ids: Vec<&str> = gtk_cfg
+            .panels
+            .iter()
+            .chain(gtk_cfg.bottom_items.iter())
+            .map(|p| p.id.as_str())
+            .filter(|id| {
+                tui_cfg
+                    .panels
+                    .iter()
+                    .chain(tui_cfg.bottom_items.iter())
+                    .any(|p| p.id.as_str() == *id)
+            })
+            .collect();
+        assert!(
+            shared_ids.contains(&"panel:search"),
+            "precondition: both backends must claim the search panel for \
+             this test to mean anything"
+        );
+
+        for id in shared_ids {
+            let gtk_icon = icon_for(&gtk_cfg, id).unwrap();
+            let tui_icon = icon_for(&tui_cfg, id).unwrap();
+            assert_eq!(
+                gtk_icon, tui_icon,
+                "panel {id:?} resolved to different icons per backend \
+                 (GTK: {gtk_icon:?}, TUI: {tui_icon:?})"
+            );
+        }
     }
 
     /// #949 review: makes the "closes the macOS/Win-GUI settings hot-reload

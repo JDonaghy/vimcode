@@ -247,7 +247,7 @@ pub mod testing {
         // why that used to leave the scenario's real engine's sidebar
         // systems without `set_backend_info` and its clipboard unset.
         let app = TuiShellApp::from_engine(engine, None, false);
-        let config = TuiShellApp::shell_config(false);
+        let config = TuiShellApp::build_shell_config(false);
         let driver = driver_with_shell(app, config, width, height);
         let placeholder_engine = Rc::new(RefCell::new(Engine::new_for_test()));
         ConformanceHarness::new(driver, placeholder_engine, paint, cwd)
