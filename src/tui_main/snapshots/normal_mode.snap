@@ -1,11 +1,11 @@
 ---
 source: src/tui_main/render_impl.rs
-assertion_line: 2329
+assertion_line: 2363
 expression: "lines.join(\"\\n\")"
 ---
      [No Name] ×                                   󰤲    ⋯
 
-    -fn main() {                                   ⠍⠈⠛⠛⠓⠓⠒⠒
+    -fn main() {                                   ⠅⠛⠓⠒⠒⠂⠀⠀
      │   println!("hello");
      }
 
