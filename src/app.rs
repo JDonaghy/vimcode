@@ -474,20 +474,30 @@ impl TextMetricsBackend for win_backend::WinBackend {
     }
 }
 
-/// Narrow seam over the OS top-level window handle (#862), the same shape as
-/// [`TextMetricsBackend`] above and `Engine::clipboard_read`/`clipboard_write`
-/// (#417): `App::window` stores one of these type-erased, so the shared
-/// paint/title-sync/minimize methods can call it without naming a toolkit
-/// type. Method names are prefixed `win_*` to avoid colliding with the
-/// `gtk4::prelude` extension-trait methods of the same name on the one
-/// concrete impl below (both would otherwise be applicable to `&gtk4::Window`
-/// inside that impl, which is an ambiguous call, not a recursive one).
+/// Narrow seam over the OS top-level window handle (#862) for the window
+/// queries quadraui's `Backend::window()` (`WindowControl`, quadraui#950)
+/// still has no portable answer for: reading back the last-requested
+/// (non-maximized) size for session-restore, `is_maximized()`, and
+/// `set_decorated()` (#552 CSD — dropping the server-side titlebar in
+/// favour of the drawn one). Method names are prefixed `win_*` to avoid
+/// colliding with the `gtk4::prelude` extension-trait methods of the same
+/// name on the one concrete impl below (both would otherwise be applicable
+/// to `&gtk4::Window` inside that impl, which is an ambiguous call, not a
+/// recursive one).
+///
+/// #1124 dropped this trait's title-set/minimize methods: both now
+/// route through `backend.window()?.set_title(..)`/`.minimize()` instead
+/// (the same `WindowControl` surface `TuiBackend` implements too — its one
+/// genuine capability there is `set_title`, emitting the OSC 0/2 escape;
+/// see `src/tui_main/shell_app.rs`). `self.window` below is only ever
+/// populated on GTK (`capture_window_and_apply_csd`'s discovery has no
+/// macOS/Win-GUI equivalent), which made title-sync and minimize silent
+/// no-ops on both of those backends; `backend.window()` is backed on every
+/// windowed backend, so this now works everywhere `App` runs.
 pub(crate) trait PlatformWindowHandle {
     fn win_default_width(&self) -> i32;
     fn win_default_height(&self) -> i32;
-    fn win_set_title(&self, title: &str);
     fn win_is_maximized(&self) -> bool;
-    fn win_minimize(&self);
     // Only called from `capture_window_and_apply_csd`'s `gui`-gated inner
     // block today — window *discovery* has no portable equivalent yet (see
     // that method's doc comment), so nothing calls this outside `gui`.
@@ -503,14 +513,8 @@ impl PlatformWindowHandle for gtk4::Window {
     fn win_default_height(&self) -> i32 {
         gtk4::prelude::GtkWindowExt::default_height(self)
     }
-    fn win_set_title(&self, title: &str) {
-        gtk4::prelude::GtkWindowExt::set_title(self, Some(title));
-    }
     fn win_is_maximized(&self) -> bool {
         gtk4::prelude::GtkWindowExt::is_maximized(self)
-    }
-    fn win_minimize(&self) {
-        gtk4::prelude::GtkWindowExt::minimize(self);
     }
     fn win_set_decorated(&self, decorated: bool) {
         gtk4::prelude::GtkWindowExt::set_decorated(self, decorated);
@@ -2785,7 +2789,7 @@ impl App {
         }
     }
 
-    fn handle_poll_tick(&mut self) {
+    fn handle_poll_tick(&mut self, backend: &mut dyn quadraui::Backend) {
         // Reload CSS if the colorscheme changed (e.g. via :colorscheme command).
         {
             let current = self.engine.borrow().settings.colorscheme.clone();
@@ -2908,15 +2912,19 @@ impl App {
             }
             self.sync_sidebar_widgets();
         }
-        // Sync the OS window title with the active buffer name (taskbar/pager).
+        // Sync the OS window title with the active buffer name (taskbar/
+        // pager). Routed through `Backend::window()` (quadraui#950, #1124)
+        // rather than the old GTK-only `self.window`/`PlatformWindowHandle`
+        // title setter — see that trait's doc comment for why this is what
+        // fixed title-sync being a silent no-op on macOS/Win-GUI.
         let win_title = self
             .engine
             .borrow()
             .active_buffer_name()
             .map(|n| format!("VimCode \u{2014} {}", n))
             .unwrap_or_else(|| "VimCode".to_string());
-        if let Some(ref w) = self.window {
-            w.win_set_title(&win_title);
+        if let Some(w) = backend.window() {
+            let _ = w.set_title(&win_title);
         }
     }
 
@@ -6124,6 +6132,18 @@ impl App {
     /// portable "find the runner's window" surface yet — #862 module doc item
     /// 2), so unlike `window`'s other call sites this one has no non-GTK
     /// branch to fall back to; it stays behind the `gui` feature entirely.
+    ///
+    /// #1124 narrowed what this feeds: title-sync and minimize moved off
+    /// `self.window` onto `backend.window()` (quadraui#950), so this
+    /// discovery hack now backs only `PlatformWindowHandle`'s two remaining
+    /// queries (`win_is_maximized`/`win_set_decorated` for CSD) plus the
+    /// session-restore size read (`win_default_width`/`win_default_height`)
+    /// — none of which have a `WindowControl` equivalent yet. Unlike the
+    /// title/minimize seam this trait used to also carry, this discovery
+    /// hack is *not* deleted, because there is no other way to reach the
+    /// raw `gtk4::Window` for those: dropping it would silently regress
+    /// GTK's CSD (both the server-side titlebar never getting suppressed,
+    /// and the maximize button's checked state) rather than fix a bug.
     #[cfg(feature = "gui")]
     fn find_visible_window() -> Option<Box<dyn PlatformWindowHandle>> {
         // `list_toplevels` asserts GTK is initialized, which it never is under
@@ -6670,9 +6690,14 @@ impl App {
     }
 
     /// Minimize the application window (inline window-control button).
-    fn window_minimize(&mut self) {
-        if let Some(ref w) = self.window {
-            w.win_minimize();
+    ///
+    /// Routed through `Backend::window()` (quadraui#950, #1124) rather than
+    /// the old GTK-only `self.window`/`PlatformWindowHandle` seam — see
+    /// `PlatformWindowHandle`'s doc comment for why this is what fixed
+    /// minimize being a silent no-op on macOS/Win-GUI.
+    fn window_minimize(&mut self, backend: &mut dyn quadraui::Backend) {
+        if let Some(w) = backend.window() {
+            let _ = w.minimize();
         }
     }
 
@@ -7139,7 +7164,7 @@ impl App {
                 match action {
                     quadraui::StatusBarAction::Clicked(id) => {
                         match id.as_str() {
-                            render::WINDOW_MINIMIZE_ACTION => self.window_minimize(),
+                            render::WINDOW_MINIMIZE_ACTION => self.window_minimize(backend),
                             render::WINDOW_MAXIMIZE_ACTION => self.window_toggle_maximize(backend),
                             render::WINDOW_CLOSE_ACTION => self.window_close(),
                             _ => {}
@@ -7757,7 +7782,7 @@ impl App {
         }
 
         // Periodic background work: LSP, DAP, git, search, etc.
-        self.handle_poll_tick();
+        self.handle_poll_tick(backend);
 
         if self.draw_needed.get() {
             self.draw_needed.set(false);
@@ -9011,8 +9036,9 @@ mod portable_entry_point_tests {
              on-disk value, or a reload would be indistinguishable from a no-op"
         );
         let mut app = App::new_headless(Rc::clone(&engine));
+        let mut backend = quadraui::gtk::GtkBackend::new();
 
-        app.handle_poll_tick();
+        app.handle_poll_tick(&mut backend);
 
         assert_eq!(
             engine.borrow().settings.line_numbers,

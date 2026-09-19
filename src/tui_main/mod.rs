@@ -301,7 +301,7 @@ pub(crate) use debug_log;
 use ratatui::crossterm::cursor::SetCursorStyle;
 use ratatui::crossterm::event::{Event, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::crossterm::execute;
-use ratatui::crossterm::terminal::{supports_keyboard_enhancement, SetTitle};
+use ratatui::crossterm::terminal::supports_keyboard_enhancement;
 use ratatui::layout::{Constraint, Direction, Layout, Rect, Size};
 // `RColor`/`Modifier` are only referenced by the `#[cfg(test)]` legacy paint
 // helpers (`set_cell`, `rc`) now that `event_loop` is gone.
