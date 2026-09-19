@@ -13565,6 +13565,118 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// #231: a modal `Dialog` painted over the explorer tree must leave no
+    /// residue once it closes — every row it covered must repaint back to
+    /// its pre-dialog background, not retain a leftover tint.
+    ///
+    /// #231's own repro used the rename input prompt, but that was the
+    /// pre-#223 `Dialog`-based flow; rename today is inline row editing via
+    /// `TreeController` (`explorer_tree.is_editing()` /
+    /// `TreeControllerEvent::EditConfirmed`, `explorer_ops.rs`) and never
+    /// opens `engine.dialog` at all — `ExplorerRenameState` is
+    /// `#[allow(dead_code)]` on this backend (`buffers.rs`). This test
+    /// substitutes a `Dialog` that's still very much alive on this path —
+    /// `Engine::show_quit_confirm` — which `paint_dialog_rung` centers over
+    /// the *window* viewport (`win_q`, not the content area), so on an
+    /// 80×24 screen it does overlap the sidebar tree exactly like the old
+    /// rename prompt did.
+    ///
+    /// `TuiDriver` keeps its wrapped `ShellAdapter<TuiShellApp>` crate-
+    /// private (see the doc comment on `app_with_expanded_explorer` /
+    /// #1088's test above — no `driver.app_mut().engine` after
+    /// construction), so the dialog is opened on the `Engine` *before* the
+    /// app is handed to `driver_with_shell`, and closed the same way a
+    /// real user would: pressing Escape, which
+    /// `Engine::handle_dialog_key`'s "Escape" arm routes to (proven
+    /// generically by `handle_key_pressed_dialog_intercepts_all_keys`
+    /// above). A second, dialog-free driver on an identically seeded
+    /// fixture supplies the "clean" reference style for each row, since
+    /// nothing about dialog open/close touches tree selection or focus.
+    ///
+    /// Reads rendered `style_at`, not engine state, per CLAUDE.md's
+    /// "rendered output, not state" rule — `ScreenLayout` fields have
+    /// looked populated while nothing painted correctly before (#587/#592).
+    #[test]
+    fn explorer_tree_rows_repaint_clean_after_dialog_closes_231() {
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_test_231_shell_app_explorer_{:?}",
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Enough rows to span the vertical middle of a 24-row screen, where
+        // a centered quit-confirm dialog actually lands.
+        let files: Vec<String> = (0..18).map(|i| format!("zqxw231_{i:02}.txt")).collect();
+        for f in &files {
+            std::fs::write(dir.join(f), "marker").unwrap();
+        }
+
+        // ── Reference: same fixture, dialog never opened ─────────────────
+        let mut clean_driver =
+            driver_with_shell(app_with_expanded_explorer(&dir), config(), 80, 24);
+        clean_driver.render();
+        let baseline: Vec<((u16, u16), quadraui::tui::testing::CellStyle)> = files
+            .iter()
+            .map(|f| {
+                let (x, y) = clean_driver.find(f).unwrap_or_else(|| {
+                    panic!(
+                        "seeded row {f} must paint; screen:\n{}",
+                        clean_driver.screen()
+                    )
+                });
+                let xy = (x as u16, y as u16);
+                let style = clean_driver
+                    .style_at(xy.0, xy.1)
+                    .unwrap_or_else(|| panic!("row {f} must have a style"));
+                (xy, style)
+            })
+            .collect();
+
+        // ── Dialog opened before the driver ever renders a frame ─────────
+        let mut app = app_with_expanded_explorer(&dir);
+        app.engine.show_quit_confirm();
+        let mut driver = driver_with_shell(app, config(), 80, 24);
+        driver.render();
+
+        // Find at least one seeded row the open dialog painted over — the
+        // repro is meaningless if the dialog missed the tree entirely.
+        let covered_idx = baseline
+            .iter()
+            .position(|(xy, base)| driver.style_at(xy.0, xy.1) != Some(*base))
+            .unwrap_or_else(|| {
+                panic!(
+                    "precondition: the quit-confirm dialog must paint over \
+                     at least one explorer row on an 80x24 screen for this \
+                     repro to be meaningful; screen:\n{}",
+                    driver.screen()
+                )
+            });
+
+        // Close it the way a user would.
+        driver.press_named(quadraui::NamedKey::Escape);
+        driver.render();
+        assert!(
+            !driver.screen_contains("Unsaved Changes"),
+            "precondition: Escape must close the quit-confirm dialog; \
+             screen:\n{}",
+            driver.screen()
+        );
+
+        let (xy, expected) = baseline[covered_idx];
+        let after = driver.style_at(xy.0, xy.1);
+        assert_eq!(
+            after,
+            Some(expected),
+            "explorer row {:?} must repaint to its pre-dialog style once \
+             the dialog closes, not retain a leftover tint from the \
+             dialog's chrome (#231); screen:\n{}",
+            files[covered_idx],
+            driver.screen()
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// #1025 companion: the same invariant at a non-zero `scroll_offset`, so
     /// a fix that hardcodes `- 1` into the wrong place (rather than
     /// deleting the hand-rolled arithmetic in favour of the shared
