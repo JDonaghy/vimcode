@@ -2791,7 +2791,7 @@ checksum = "d55d956fa96f5ec02be2e13af0e20391a5aa83d6a074e3ad368959d0fab299ea"
 [[package]]
 name = "quadraui"
 version = "0.0.1"
-source = "git+https://github.com/JDonaghy/quadraui.git?rev=5211f8f5aaef874804a6c12881a7d6b2647541e6#5211f8f5aaef874804a6c12881a7d6b2647541e6"
+source = "git+https://github.com/JDonaghy/quadraui.git?rev=d907a06275701d00a6123f1fa24ca84de0b62869#d907a06275701d00a6123f1fa24ca84de0b62869"
 dependencies = [
  "arboard",
  "core-foundation 0.9.4",
@@ -2805,6 +2805,7 @@ dependencies = [
  "objc2-app-kit",
  "objc2-foundation",
  "pangocairo",
+ "pkg-config",
  "portable-pty",
  "ratatui",
  "serde",
@@ -2814,6 +2815,7 @@ dependencies = [
  "vt100",
  "windows",
  "windows-numerics",
+ "yeslogic-fontconfig-sys",
 ]
 
 [[package]]
@@ -4827,6 +4829,17 @@ name = "xml-rs"
 version = "0.8.29"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e450f9b2ed1dff33c94c12589a87338689467b9c4f5d8a5710bd09a847d2c8a7"
+
+[[package]]
+name = "yeslogic-fontconfig-sys"
+version = "6.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1d8b8abf912b9a29ff112e1671c97c33636903d13a69712037190e6805af4f76"
+dependencies = [
+ "dlib",
+ "once_cell",
+ "pkg-config",
+]
 
 [[package]]
 name = "zbus"
