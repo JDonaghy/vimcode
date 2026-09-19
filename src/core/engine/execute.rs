@@ -1163,9 +1163,16 @@ impl Engine {
                 // mirroring `apply_foldlevel`'s own doc ("processing
                 // deepest-first") rather than waiting for the next `z`
                 // command. Idempotent (a plain re-close/re-define pass), so
-                // unconditionally re-running it here is safe even when
-                // neither option actually changed on this `:set` line.
-                if self.settings.foldmethod == "indent" {
+                // it's safe to re-run whenever either option was actually
+                // touched on this `:set` line — gated on that (rather than
+                // unconditionally on every `:set`) so an unrelated option
+                // like `:set ic` doesn't pay to recompute fold state on
+                // large files (#1153 review).
+                if self.settings.foldmethod == "indent"
+                    && split_set_args(trimmed)
+                        .iter()
+                        .any(|a| set_arg_touches_folding(a))
+                {
                     self.apply_foldlevel(self.settings.foldlevel);
                 }
                 return match last_err {
@@ -1216,7 +1223,7 @@ impl Engine {
             }
             // See the matching comment in the multi-option branch above
             // (#1153).
-            if self.settings.foldmethod == "indent" {
+            if self.settings.foldmethod == "indent" && set_arg_touches_folding(trimmed) {
                 self.apply_foldlevel(self.settings.foldlevel);
             }
             return EngineAction::None;
@@ -4302,26 +4309,41 @@ impl Engine {
             let start_cursor = self.search_start_cursor.unwrap_or(self.view().cursor);
             let start_char = self.buffer().line_to_char(start_cursor.line) + start_cursor.col;
 
-            // Find the appropriate match based on search direction
+            // Find the appropriate match based on search direction. `:h
+            // 'wrapscan'`: off, and no match in the requested direction from
+            // the start position — the live preview stays put rather than
+            // previewing a wrapped-around match (#1153 review; mirrors
+            // `search_next`/`search_prev`).
             let idx = match self.search_direction {
                 SearchDirection::Forward => {
                     // Find first match at or after start position
                     self.search_matches
                         .iter()
                         .position(|(start, _)| *start >= start_char)
-                        .unwrap_or(0)
                 }
                 SearchDirection::Backward => {
                     // Find last match strictly before start position
                     self.search_matches
                         .iter()
                         .rposition(|(start, _)| *start < start_char)
-                        .unwrap_or(self.search_matches.len() - 1)
                 }
             };
 
-            self.search_index = Some(idx);
-            self.jump_to_search_match(idx);
+            let idx = match idx {
+                Some(i) => Some(i),
+                None if self.settings.wrapscan => Some(match self.search_direction {
+                    SearchDirection::Forward => 0,
+                    SearchDirection::Backward => self.search_matches.len() - 1,
+                }),
+                None => None,
+            };
+
+            if let Some(idx) = idx {
+                self.search_index = Some(idx);
+                self.jump_to_search_match(idx);
+            } else if let Some(start_cursor) = self.search_start_cursor {
+                self.view_mut().cursor = start_cursor;
+            }
         } else {
             // No matches, restore to start position
             if let Some(start_cursor) = self.search_start_cursor {
@@ -5624,6 +5646,21 @@ pub(crate) fn split_set_args(args: &str) -> Vec<String> {
         out.push(cur);
     }
     out
+}
+
+/// Does a single `:set` argument (one entry from [`split_set_args`], or a
+/// whole single-option `:set` line) name `'foldmethod'`/`'foldlevel'`
+/// (either full name or abbreviation)? Used to skip the
+/// `apply_foldlevel` recompute on `:set` lines that have nothing to do with
+/// folding — see the two call sites in `handle_ex_command` (#1153 review:
+/// re-running the indent-fold pass on every `:set ic` etc. was a needless
+/// cost on large files).
+fn set_arg_touches_folding(arg: &str) -> bool {
+    let arg = arg.trim();
+    let arg = arg.strip_suffix('?').unwrap_or(arg);
+    let arg = arg.strip_suffix('!').unwrap_or(arg);
+    let name = arg.split('=').next().unwrap_or(arg);
+    matches!(name, "foldmethod" | "fdm" | "foldlevel" | "fdl")
 }
 
 /// One parsed `/` or `?` command line.

@@ -3093,6 +3093,24 @@ const CASES_SEARCH: &[Case] = &[
     ),
     c("search:dgn", &["foo bar foo"], 1, 1, "/foo<CR>ggdgn"),
     c("search:gN", &["foo bar foo"], 1, 11, "/foo<CR>gNd"),
+    // #1153 review: `gn` is documented as "like the `n` command", so it
+    // should honour 'wrapscan' the same way `n`/`N` already do. Both cases
+    // leave the cursor past the last "alpha" (`*$j`), with no further match
+    // ahead of it — verified against `nvim --headless`.
+    c(
+        "search:gn respects nowrapscan",
+        &["alpha xxx alpha", "yyy"],
+        1,
+        1,
+        "*$j:set nowrapscan<CR>gn<Esc>",
+    ),
+    c(
+        "search:gn wraps when wrapscan on",
+        &["alpha xxx alpha", "yyy"],
+        1,
+        1,
+        "*$jgn<Esc>",
+    ),
 ];
 
 // ─────────────────────────── H. :s / :g / ex ───────────────────────────
@@ -3832,6 +3850,24 @@ const CASES_INS: &[Case] = &[
         1,
         1,
         ":set et ts=8 sts=3 nosmarttab<CR>i<Tab><Tab><BS><Esc>",
+    ),
+    // Unaligned-run regressions caught in review: BackSpace must round the
+    // *absolute column* down to the previous 'softtabstop' stop, not cap the
+    // contiguous blank-run length at 'sts'. Both diverge from the aligned
+    // cases above only when the run doesn't start on a multiple of 'sts'.
+    c(
+        "ins:BS over softtabstop unaligned leading indent",
+        &["     x"],
+        1,
+        6,
+        ":set et ts=8 sts=2 nosmarttab<CR>i<BS><Esc>",
+    ),
+    c(
+        "ins:BS over softtabstop unaligned mid-line run",
+        &["a  b"],
+        1,
+        4,
+        ":set et ts=8 sts=2 nosmarttab<CR>i<BS><Esc>",
     ),
     c("ins:C-t", &["a"], 1, 1, "i<C-t><Esc>"),
     c("ins:C-t mid line", &["ab"], 1, 2, "i<C-t><Esc>"),

@@ -4945,18 +4945,44 @@ impl Engine {
             .iter()
             .position(|&(start, end)| cursor_char >= start && cursor_char < end);
 
+        // `:h gn`: "like the `n` command" — so it honours `'wrapscan'` the
+        // same way `search_next`/`search_prev` do: off, and no match in the
+        // requested direction, stay put with the matching E384/E385 message
+        // instead of wrapping (#1153 review).
         let idx = if let Some(i) = on_match {
             i
         } else if backward {
-            self.search_matches
+            match self
+                .search_matches
                 .iter()
                 .rposition(|(start, _)| *start < cursor_char)
-                .unwrap_or(self.search_matches.len() - 1)
+            {
+                Some(i) => i,
+                None if self.settings.wrapscan => self.search_matches.len() - 1,
+                None => {
+                    self.message = format!(
+                        "E384: search hit TOP without match for: {}",
+                        self.search_query
+                    );
+                    return;
+                }
+            }
         } else {
-            self.search_matches
+            match self
+                .search_matches
                 .iter()
                 .position(|(start, _)| *start >= cursor_char)
-                .unwrap_or(0)
+            {
+                Some(i) => i,
+                None if self.settings.wrapscan => 0,
+                None => {
+                    self.message = format!(
+                        "E385: search hit BOTTOM without match for: {}",
+                        self.search_query
+                    );
+                    return;
+                }
+            }
         };
 
         let (match_start, match_end) = self.search_matches[idx];
@@ -6655,26 +6681,39 @@ impl Engine {
                         && (0..col).all(|i| self.buffer().content.char(line_start + i) == ' ');
                     // `:h 'softtabstop'`: with 'softtabstop' set (and
                     // 'expandtab' on), BackSpace over a run of spaces
-                    // "feels like" deleting a tab — remove
-                    // `min(sts, contiguous_blanks)` space characters
-                    // immediately before the cursor, wherever they are on
-                    // the line (not just at the front of it) — verified
-                    // against `nvim --headless` (#1153). Distinct from the
-                    // 'smarttab'-driven `leading_blanks` rule above: that
-                    // one always uses 'shiftwidth' and only fires when
-                    // *every* character before the cursor is blank; this one
-                    // is driven purely by 'softtabstop' and only requires
-                    // the character immediately before the cursor to be a
-                    // space.
+                    // "feels like" deleting a tab — the cursor's absolute
+                    // column is rounded down to the previous multiple of
+                    // 'softtabstop' (clamped to the start of the contiguous
+                    // blank run so it never eats non-blank text), wherever
+                    // the run is on the line (not just at the front of it)
+                    // — verified against `nvim --headless` (#1153). Distinct
+                    // from the 'smarttab'-driven `leading_blanks` rule
+                    // above: that one always uses 'shiftwidth' and only
+                    // fires when *every* character before the cursor is
+                    // blank; this one is driven purely by 'softtabstop' and
+                    // only requires the character immediately before the
+                    // cursor to be a space. Mirrors the same
+                    // round-down-to-a-stop arithmetic the Tab-insert side
+                    // uses, rather than capping the raw run length at `sts`
+                    // — capping diverges from real Vim whenever the run
+                    // doesn't start on a column that's itself a multiple of
+                    // `sts` (e.g. an indent of 5 spaces with sts=2 removes
+                    // only 1 space, not 2; a mid-line run of 2 spaces
+                    // starting at column 1 with sts=2 removes only 1 space,
+                    // not 2).
                     let sts = self.effective_softtabstop();
-                    let sts_run = if !leading_blanks && sts > 0 && self.settings.expand_tab {
+                    let sts_run_start = if !leading_blanks && sts > 0 && self.settings.expand_tab {
                         let mut n = 0usize;
                         while n < col && self.buffer().content.char(char_idx - 1 - n) == ' ' {
                             n += 1;
                         }
-                        n.min(sts)
+                        if n > 0 {
+                            Some(col - n)
+                        } else {
+                            None
+                        }
                     } else {
-                        0
+                        None
                     };
                     if leading_blanks {
                         // `:h smarttab`: with 'smarttab' on (checked above),
@@ -6688,9 +6727,9 @@ impl Engine {
                         self.delete_with_undo(line_start + new_col, char_idx);
                         self.view_mut().cursor.col = new_col;
                         *changed = true;
-                    } else if sts_run > 0 {
-                        let new_col = col - sts_run;
-                        self.delete_with_undo(char_idx - sts_run, char_idx);
+                    } else if let Some(run_start) = sts_run_start {
+                        let new_col = run_start.max(((col - 1) / sts) * sts);
+                        self.delete_with_undo(line_start + new_col, char_idx);
                         self.view_mut().cursor.col = new_col;
                         *changed = true;
                     } else if col > 0 {
