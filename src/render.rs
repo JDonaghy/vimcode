@@ -930,18 +930,20 @@ const NERD_FONT_FALLBACK_FAMILY: &str = "Symbols Nerd Font";
 ///
 /// `sync_nerd_fonts` above only ever toggles the glyph-vs-fallback *flag*
 /// (`Backend::set_nerd_fonts`) — it never tells a backend which font to
-/// resolve a glyph against. On GTK that's enough: fontconfig cascades to a
-/// system-installed Nerd Font automatically. It is not enough on macOS
-/// (Core Text) or Windows (DirectWrite): neither cascades to an arbitrary
-/// installed font for Private-Use-Area codepoints without an explicit
-/// per-font fallback list, which is exactly what
-/// `Backend::register_font_from_memory` +
-/// `Backend::set_nerd_font_fallback` install. Both are defaulted no-ops per
-/// quadraui's rule that the *app* must call them (quadraui#929) — GTK and
-/// TUI take the default harmlessly (GTK already has its own hardcoded
-/// fallback; TUI is a fixed-cell backend with no font concept), so this one
-/// call is platform-neutral: no `#[cfg(target_os)]` needed here or at either
-/// call site.
+/// resolve a glyph against. Core Text (macOS) and DirectWrite (Windows)
+/// never cascade to an arbitrary installed font for Private-Use-Area
+/// codepoints without an explicit per-font fallback list, which is exactly
+/// what `Backend::register_font_from_memory` + `Backend::
+/// set_nerd_font_fallback` install. GTK used to get this for free from a
+/// vimcode-side fontconfig filesystem install (`install_bundled_icon_font`,
+/// deleted in #1130); now that quadraui#1013 gives `GtkBackend` a real
+/// `register_font_from_memory` override (in-process, no filesystem write and
+/// no font-cache-refresh shell-out), this one call registers the font for
+/// GTK too — the same call
+/// that already covered macOS/Windows. TUI takes the trait's no-op default
+/// harmlessly (a fixed-cell backend has no font concept), so this call is
+/// platform-neutral: no `#[cfg(target_os)]` needed here or at either call
+/// site.
 ///
 /// Call once, from `setup()` — **not** the per-frame
 /// `sync_nerd_fonts`/`sync_per_frame_backend_state` path. Unlike the

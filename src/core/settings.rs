@@ -456,9 +456,8 @@ pub struct Settings {
     /// Backend-derived (issue #999): `None` means "inherit from the running
     /// backend" and is resolved live by the [`Settings::use_nerd_fonts`]
     /// accessor method — GTK and macOS bundle Symbols Nerd Font 3.5.1 and
-    /// install/register it at startup
-    /// (`app_support::install_bundled_icon_font`,
-    /// `render::register_nerd_font_fallback`), so the glyphs are guaranteed
+    /// register it in-process at startup (`render::register_nerd_font_
+    /// fallback`, #1130), so the glyphs are guaranteed
     /// available regardless of what the user has installed, on every OS —
     /// those two backends therefore inherit `true` unconditionally. Win-GUI
     /// shares the same bundled font in principle but has two open,
