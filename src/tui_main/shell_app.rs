@@ -9524,6 +9524,143 @@ mod tests {
         );
     }
 
+    /// #499's exact repro: a "git-insights" ext panel with **three** sections
+    /// (Branches / Log / Stash), each carrying one item. The issue reported
+    /// that after the initial #484 fix, clicking the *top* header
+    /// (Branches) toggled correctly but the other two (Log, Stash) did not —
+    /// i.e. the bug was two-thirds still broken, not fully fixed. #1086
+    /// later found the real root cause (a fixed one-row-low offset in the
+    /// click arm's row derivation, independent of which section is
+    /// clicked) and fixed it generically; this test pins #499's own
+    /// three-section repro directly, rather than relying only on #1086's
+    /// two-section coverage above, so a regression narrower than #1086's
+    /// fix (e.g. one that only rebreaks the *last* section) would still be
+    /// caught.
+    fn app_with_three_ext_panel_sections() -> TuiShellApp {
+        let mut app = TuiShellApp::new_for_test();
+        app.engine.settings.use_nerd_fonts = Some(false);
+        crate::icons::set_nerd_fonts(false);
+        app.engine.ext_panels.clear();
+        app.engine.ext_panels.insert(
+            "git-insights".to_string(),
+            crate::core::plugin::PanelRegistration {
+                name: "git-insights".to_string(),
+                title: "Git Insights".to_string(),
+                icon: '\u{f113}',
+                fallback_icon: Some(EXT_ICON),
+                sections: vec![
+                    "Branches".to_string(),
+                    "Log".to_string(),
+                    "Stash".to_string(),
+                ],
+            },
+        );
+        app.engine.ext_panel_items.insert(
+            ("git-insights".to_string(), "Branches".to_string()),
+            vec![crate::core::plugin::ExtPanelItem {
+                text: "mainZQXW499".to_string(),
+                id: "branch1".to_string(),
+                ..Default::default()
+            }],
+        );
+        app.engine.ext_panel_items.insert(
+            ("git-insights".to_string(), "Log".to_string()),
+            vec![crate::core::plugin::ExtPanelItem {
+                text: "commitZQXW499".to_string(),
+                id: "commit1".to_string(),
+                ..Default::default()
+            }],
+        );
+        app.engine.ext_panel_items.insert(
+            ("git-insights".to_string(), "Stash".to_string()),
+            vec![crate::core::plugin::ExtPanelItem {
+                text: "stashZQXW499".to_string(),
+                id: "stash1".to_string(),
+                ..Default::default()
+            }],
+        );
+        // See `tui_ext_panel_double_click_on_a_section_header_does_not_toggle_it`'s
+        // comment: start on a non-Explorer panel so frame 1 never paints (and
+        // leaves a stale claim from) the explorer tree.
+        app.engine
+            .app_shell
+            .show_panel(&quadraui::WidgetId::new(PANEL_SETTINGS));
+        app
+    }
+
+    /// #499: clicking the **Log** header (middle section) and the **Stash**
+    /// header (last section) must each toggle only that section — the
+    /// issue's report was that both stayed broken even after the top
+    /// (Branches) section was fixed by #484. Verified RED against unfixed
+    /// `develop` the same way `tui_ext_panel_click_on_a_section_header_toggles_it`
+    /// was: reverting #1086's `mouse.rs`/`panels.rs`/`core/engine/mod.rs`
+    /// changes reproduces the one-row-low click offset, so clicking "Log"
+    /// lands on "commitZQXW499" and clicking "Stash" lands one row past the
+    /// end of the list (a no-op) — both assertions below fail.
+    #[test]
+    fn tui_ext_panel_click_toggles_the_log_and_stash_headers_499() {
+        let app = app_with_three_ext_panel_sections();
+        let cfg = TuiShellApp::live_shell_config(&app.engine);
+        let mut driver = driver_with_shell(app, cfg, 80, 24);
+        driver.set_double_click_folding(false);
+        driver.dispatch(quadraui::UiEvent::WindowFocused(true));
+        driver.render();
+        driver.click(1.0, 7.0);
+
+        assert!(
+            driver.screen_contains("commitZQXW499") && driver.screen_contains("stashZQXW499"),
+            "precondition: all three sections default to expanded, so every \
+             item must already be painted; screen:\n{}",
+            driver.screen()
+        );
+
+        // ── Log (middle section) ────────────────────────────────────────
+        let log_header = driver
+            .find_bounds("Log")
+            .expect("the Log section header should be painted");
+        driver.click(log_header.x + 1.0, log_header.y + log_header.height / 2.0);
+        assert!(
+            !driver.screen_contains("commitZQXW499"),
+            "clicking the Log section header must collapse it, but its item \
+             is still painted — the click resolved to a different row; \
+             screen:\n{}",
+            driver.screen()
+        );
+        driver.click(log_header.x + 1.0, log_header.y + log_header.height / 2.0);
+        assert!(
+            driver.screen_contains("commitZQXW499"),
+            "clicking the (now collapsed) Log header a second time must \
+             re-expand it; screen:\n{}",
+            driver.screen()
+        );
+
+        // ── Stash (last section) ────────────────────────────────────────
+        let stash_header = driver
+            .find_bounds("Stash")
+            .expect("the Stash section header should be painted");
+        driver.click(
+            stash_header.x + 1.0,
+            stash_header.y + stash_header.height / 2.0,
+        );
+        assert!(
+            !driver.screen_contains("stashZQXW499"),
+            "clicking the Stash section header must collapse it, but its \
+             item is still painted — the click resolved to a different row; \
+             screen:\n{}",
+            driver.screen()
+        );
+        driver.click(
+            stash_header.x + 1.0,
+            stash_header.y + stash_header.height / 2.0,
+        );
+        assert!(
+            driver.screen_contains("stashZQXW499"),
+            "clicking the (now collapsed) Stash header a second time must \
+             re-expand it; screen:\n{}",
+            driver.screen()
+        );
+    }
+
     /// A "git-insights" ext panel with a single "Log" section shaped like
     /// `git_log_panel.lua`'s real output: a leading empty-id separator (the
     /// #1088 fuzzy-match trap — `item_id.starts_with(&items[vi].id)` used to
