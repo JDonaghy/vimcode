@@ -8133,6 +8133,69 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// #1158: opening a *different file* into the current pane — `:e`,
+    /// `EngineAction::OpenFile` → `open_file_with_mode` — is jump-worthy in
+    /// Neovim regardless of line, but `open_file_with_mode` never called
+    /// `push_jump_location`, so `Ctrl-O` right after `:e` was a complete
+    /// no-op: nothing had ever been recorded to jump back to. No `G`, no
+    /// search, no other jump command runs here — the single-window `:e`
+    /// switch is the *only* jump-worthy event in this test, isolating
+    /// exactly the gap `KNOWN_DEVIATIONS_MULTI` used to excuse under "jump:
+    /// multi C-o after :e returns to A".
+    ///
+    /// Drives real key input (`ctrl_char('o')`) through `TuiDriver` and
+    /// asserts on the painted editor body, per the black-box tier this
+    /// repo's testing rule requires for behaviour changes — not an
+    /// `Engine`-internal check that `jump_list` got populated.
+    ///
+    /// Measured red against unfixed `develop`: with no jump ever recorded,
+    /// `Ctrl-O` leaves the cursor exactly where `:e b1158.txt` left it, so
+    /// the screen keeps showing "BBB1158" instead of switching back to
+    /// "AAA1158".
+    #[test]
+    fn ctrl_o_after_e_returns_to_prior_file_via_shell_app() {
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_test_1158_shell_app_jumplist_{:?}",
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_a = dir.join("a1158.txt");
+        let file_b = dir.join("b1158.txt");
+        std::fs::write(&file_a, "AAA1158 first line\nAAA1158 second line\n").unwrap();
+        std::fs::write(&file_b, "BBB1158 first line\nBBB1158 second line\n").unwrap();
+
+        let mut app = TuiShellApp::new_for_test();
+        app.engine
+            .open_file_with_mode(&file_a, crate::core::engine::OpenMode::Permanent)
+            .unwrap();
+        // The one and only jump-worthy event: `:e file_b` in the same
+        // window, no other motion in between.
+        app.engine
+            .open_file_with_mode(&file_b, crate::core::engine::OpenMode::Permanent)
+            .unwrap();
+
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        let screen = driver.screen();
+        assert!(
+            screen.contains("BBB1158"),
+            "sanity: should be looking at file B before Ctrl-O; screen:\n{screen}"
+        );
+
+        driver.ctrl_char('o');
+        let screen = driver.screen();
+        assert!(
+            screen.contains("AAA1158"),
+            "Ctrl-O after :e should return to file A; screen:\n{screen}"
+        );
+        assert!(
+            !screen.contains("BBB1158"),
+            "pane should no longer show file B after Ctrl-O; screen:\n{screen}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// #551: the unsplit (single editor group) case must still paint exactly
     /// one full-width tab bar on the editor's top row, and no group divider.
     ///

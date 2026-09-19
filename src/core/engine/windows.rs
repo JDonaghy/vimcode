@@ -59,6 +59,15 @@ impl Engine {
             current_buffer_id
         };
 
+        // Opening a file into a split is jump-worthy in Neovim regardless
+        // of line (#1158) -- record the pre-switch position while `self`
+        // still points at the window being left. Skip when leaving a
+        // still-pristine scratch buffer, which real Neovim doesn't record
+        // either (`is_pristine_scratch_buffer`'s doc comment).
+        if file_path.is_some() && !self.is_pristine_scratch_buffer(current_buffer_id) {
+            self.push_jump_location();
+        }
+
         let new_window_id = self.new_window_id();
         let mut new_window = Window::new(new_window_id, new_buffer_id);
 
@@ -325,6 +334,15 @@ impl Engine {
         } else {
             self.buffer_manager.create()
         };
+
+        // Opening a file into a new tab is jump-worthy in Neovim regardless
+        // of line (#1158) -- record the pre-switch position while `self`
+        // still points at the tab/window being left. Skip when leaving a
+        // still-pristine scratch buffer, which real Neovim doesn't record
+        // either (`is_pristine_scratch_buffer`'s doc comment).
+        if file_path.is_some() && !self.is_pristine_scratch_buffer(self.active_buffer_id()) {
+            self.push_jump_location();
+        }
 
         let window_id = self.new_window_id();
         let window = Window::new(window_id, buffer_id);

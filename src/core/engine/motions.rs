@@ -6297,6 +6297,21 @@ impl Engine {
         self.append_jump_list_entry();
     }
 
+    /// True when `id` is a still-pristine "scratch" buffer — unnamed,
+    /// unmodified, and empty — the state a freshly-started editor's initial
+    /// buffer is in. Verified against real Neovim (#1158): leaving such a
+    /// buffer via `:edit`/`:tabnew`/`:split` does NOT record a jumplist
+    /// entry (`nvim --headless -u NONE -i NONE -c 'edit a.txt' -c 'edit
+    /// b.txt' -c jumps` shows only one entry, for a.txt — the unnamed
+    /// startup buffer never appears); once the buffer has a name, content,
+    /// or unsaved changes, leaving it becomes jump-worthy like any other
+    /// file switch.
+    pub(crate) fn is_pristine_scratch_buffer(&self, id: BufferId) -> bool {
+        self.buffer_manager
+            .get(id)
+            .is_some_and(|s| s.file_path.is_none() && !s.dirty && s.buffer.content.len_chars() == 0)
+    }
+
     /// The jumplist-only half of `push_jump_location` — appends the current
     /// cursor position, deduped against the top entry and truncating any
     /// forward (redo) history. Split out so `record_jump_from` can update
@@ -6462,7 +6477,7 @@ impl Engine {
             let current_file = self.active_buffer_state().file_path.clone();
             if entry.file != current_file {
                 if let Some(path) = &entry.file {
-                    let _ = self.open_file_with_mode(path, OpenMode::Permanent);
+                    let _ = self.open_file_for_jump_recovery(path);
                 }
             }
         }
