@@ -4866,95 +4866,22 @@ mod editor_popups {
         assert!(layout.bounds.width > 0.0 && layout.bounds.height > 0.0);
     }
 
-    /// #420: with two windows side by side (`:vnew`, which — per
-    /// `splitright`'s `false` default, same as real Vim — opens the new,
-    /// active window on the *left*), a completion popup's background/border
-    /// chrome must stay within the *active* window's own viewport, even for
-    /// a candidate label much longer than that window is wide.
-    /// `Completions::layout` only clamps the popup's *position* into the
-    /// viewport it's given, not its *width* — so `popup_w` itself has to be
-    /// capped to the active window's own viewport width before the call,
-    /// mirroring the fix in `render_impl.rs`'s TUI path.
-    ///
-    /// Asserts on the *cached* `CompletionsLayout.bounds` compared against
-    /// the active window's own rendered rect — both read from the same
-    /// `render_content` frame that painted them. This is **not** the
-    /// #587/#592 "state populated but nothing paints it" shape: unlike that
-    /// stale, disconnected field, `completion_layout`'s `bounds` is the
-    /// exact struct `draw_completions` (quadraui's GTK rasteriser) reads
-    /// its `cr.rectangle(popup_x, popup_y, popup_w, popup_h)` background
-    /// fill and border stroke from, in the very same call this test
-    /// exercises — so a wrong `bounds` here is a wrong background/border
-    /// rectangle on screen, not a disconnected flag. (What this test
-    /// deliberately does *not* claim: the candidate *label glyphs*
-    /// themselves are clipped to that rectangle — `draw_completions` calls
-    /// Pango's `show_layout` with no width/ellipsize constraint, so
-    /// long-enough text still overflows the correctly-sized box. That is a
-    /// quadraui GTK-rasteriser gap, not a vimcode wiring bug — fixing it
-    /// would mean editing `quadraui/src/gtk/completions.rs`, which the
-    /// Platform-Neutrality Rule forbids from this side; it needs its own
-    /// quadraui issue and fix before vimcode can close the "long items get
-    /// cut off" symptom completely.)
-    ///
-    /// **Verified RED against unfixed `develop`:** before capping `popup_w`
-    /// to `win_viewport.width` in `app.rs`, this fixture's 80-character
-    /// candidate produced a ~900px-wide `bounds` against a ~440px-wide
-    /// active window, so `bounds.x + bounds.width` landed ~460px past the
-    /// window's own right edge — deep inside the neighbouring window — and
-    /// the assertion below failed.
-    #[test]
-    fn completion_popup_bounds_stay_within_its_own_split() {
-        let mut engine = small_engine();
-        // `splitright` defaults to `false`, so `:vnew`'s fresh, active
-        // window opens on the left, leaving the original buffer's window as
-        // its (inactive) right-hand neighbour — a real window boundary for
-        // the popup to potentially cross, unlike a single lone window whose
-        // only "neighbour" is the canvas edge (which cairo would clip
-        // un-observably).
-        engine.execute_command("vnew");
-        engine.buffer_mut().insert(0, "fn main() {}\n");
-        // Far longer than any reasonable window this harness produces, so
-        // the popup's *naive* width (longest candidate + padding) is
-        // guaranteed to exceed the active window's own viewport width.
-        engine.completion_candidates = vec!["X".repeat(80)];
-        engine.completion_idx = Some(0);
-        engine.completion_start_col = 0;
-
-        let h = harness(engine, 1400, 900);
-        let active = h.engine.borrow().active_window_id();
-        let active_rect = {
-            let layout = h.screen_layout.borrow();
-            layout
-                .as_ref()
-                .expect("render_content must have painted a ScreenLayout")
-                .windows
-                .iter()
-                .find(|w| w.window_id == active)
-                .expect("the active window must have painted")
-                .rect
-        };
-        let layout_cell = h.completion_layout.borrow();
-        let layout = layout_cell
-            .as_ref()
-            .expect("completion popup must cache its CompletionsLayout");
-
-        assert!(
-            layout.bounds.x as f64 >= active_rect.x - 0.5,
-            "popup bounds.x={} must not start left of the active window's \
-             own edge (x={})",
-            layout.bounds.x,
-            active_rect.x,
-        );
-        assert!(
-            (layout.bounds.x + layout.bounds.width) as f64
-                <= active_rect.x + active_rect.width + 0.5,
-            "popup bounds right edge={} must not extend past the active \
-             window's own right edge ({}) — it must have leaked into a \
-             neighbouring window",
-            layout.bounds.x + layout.bounds.width,
-            active_rect.x + active_rect.width,
-        );
-    }
+    // #420 note: an earlier version of this fix capped `popup_w` in
+    // `app.rs` to the active window's own viewport width, with a
+    // corresponding `completion_popup_bounds_stay_within_its_own_split`
+    // test here. Review found that cap duplicated, verbatim, the same
+    // `.min(win_viewport.width)` workaround landed in
+    // `tui_main::render_impl.rs` — the real gap is in the shared
+    // `quadraui::Completions::layout()` primitive, which already clamps
+    // *height* to the viewport (`clipped_h`) but never does the symmetric
+    // clamp for `bounds.width`. Per the Platform-Neutrality Rule, that
+    // belongs in quadraui, not patched twice per-backend in vimcode — so
+    // both the GTK and TUI width caps were reverted, and the width-overflow
+    // symptom ("GTK clips right edge, long items get cut off") remains open
+    // pending a quadraui-side fix to `Completions::layout()`, tracked as a
+    // follow-up rather than duplicated here. GTK's *position* clamp (this
+    // window's `win_viewport`, used above `popup_w` in `app.rs`) predates
+    // this issue and is unaffected.
 
     #[test]
     fn hover_popup_paints() {

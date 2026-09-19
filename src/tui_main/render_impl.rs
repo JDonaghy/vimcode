@@ -414,20 +414,35 @@ pub(super) fn paint_editor_popups(
                 // against the sidebar boundary. GTK's `paint_editor_popups`
                 // equivalent in `app.rs` already scopes to `win_viewport`
                 // this way; this brings TUI in line with it.
-                let win_viewport = quadraui::Rect::new(
-                    active_win.rect.x as f32,
-                    active_win.rect.y as f32,
-                    active_win.rect.width as f32,
-                    active_win.rect.height as f32,
-                );
+                //
+                // Built from `tui_window_paint_rect(&active_win.rect)`
+                // rather than the raw (possibly fractional) `active_win.rect`
+                // directly: `RenderedWindow` rects come from continuous
+                // float split math and are not integer-valued in general
+                // (see the doc comment on `tui_window_paint_rect` in
+                // `render.rs`, #1040), and every TUI call site that resolves
+                // geometry against window bounds must snap to the same
+                // whole-cell grid the paint path already truncated to, or it
+                // silently clamps against geometry that was never painted.
+                let win_rect = render::tui_window_paint_rect(&active_win.rect);
+                let win_viewport = quadraui::Rect::from(win_rect);
                 // Per D6: build quadraui::Completions + layout + rasterise.
                 let completions = render::completion_menu_to_quadraui_completions(menu);
-                // #420: `Completions::layout` only clamps *position* into
-                // the viewport, not *width* — an over-wide popup (long
-                // candidate label in a narrow split) still overflows the
-                // right edge even once the position is correctly clamped
-                // above, so cap the width here too.
-                let popup_width = ((menu.max_width as f32 + 4.0).max(12.0)).min(win_viewport.width);
+                // #420: `Completions::layout` clamps the popup's *position*
+                // into the viewport (`x.max(viewport.x)`), which is what
+                // fixes the "bleeds into the sidebar/neighbouring split"
+                // symptom above — but it never clamps `popup_width` itself,
+                // so an over-wide popup (a long candidate label in a narrow
+                // split) can still render past the viewport's right edge
+                // even once correctly positioned as far left as it can go.
+                // That's a gap in the shared `quadraui::Completions::layout`
+                // primitive (it already does the symmetric clamp for
+                // height, `clipped_h` below `desired_height`), not something
+                // to patch around per-backend here — see the Platform-
+                // Neutrality Rule. Left as a tracked follow-up pending a
+                // quadraui-side fix; do not re-add a `.min(win_viewport...)`
+                // cap here without one.
+                let popup_width = (menu.max_width as f32 + 4.0).max(12.0);
                 let max_popup_height = 10.0;
                 let layout = completions.layout(
                     popup_x as f32,

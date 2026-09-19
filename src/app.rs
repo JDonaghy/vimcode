@@ -3625,13 +3625,20 @@ impl App {
                 let cursor_x = win_x + gutter_w + cursor_pos.col as f64 * cw - h_scroll;
                 let cursor_y = win_y + cursor_pos.view_line as f64 * lh;
                 // Longest candidate + 2 cells of padding/border, floored at
-                // 100px. #420: also capped to the window's own viewport
-                // width — `Completions::layout` only clamps the popup's
-                // *position* into the viewport, not its *width*, so a long
-                // candidate label still overflowed past the right edge of
-                // the window even once positioned as far left as it can go.
-                let popup_w =
-                    (((menu.max_width + 2) as f64 * cw).max(100.0)).min(win_viewport.width as f64);
+                // 100px.
+                //
+                // #420: `Completions::layout` clamps the popup's *position*
+                // into `win_viewport` (`x.max(viewport.x)`) but never
+                // clamps `popup_w` itself, so a long enough candidate label
+                // can still render past the window's own right edge even
+                // once positioned as far left as it can go. That's a gap in
+                // the shared `quadraui::Completions::layout` primitive
+                // (it already clips height the same way, via `clipped_h`),
+                // not something to patch around per-backend — see the
+                // Platform-Neutrality Rule. Tracked as a follow-up pending
+                // a quadraui-side fix rather than duplicating a `.min(...)`
+                // clamp here and in `tui_main::render_impl`.
+                let popup_w = ((menu.max_width + 2) as f64 * cw).max(100.0);
                 let max_popup_h = 10.0 * lh;
                 let completions = render::completion_menu_to_quadraui_completions(menu);
                 let q_layout = completions.layout(
