@@ -40,7 +40,7 @@ mod seam_657 {
     fn tui_backend_paints_a_full_frame_from_an_integration_test() {
         let mut driver = driver_with_shell(
             TuiShellApp::new(None),
-            TuiShellApp::shell_config(false),
+            TuiShellApp::build_shell_config(false),
             80,
             24,
         );
@@ -77,7 +77,7 @@ mod seam_657 {
             window.view.scroll_top = 0;
         }
 
-        let mut driver = driver_with_shell(app, TuiShellApp::shell_config(false), 120, 24);
+        let mut driver = driver_with_shell(app, TuiShellApp::build_shell_config(false), 120, 24);
         driver.render();
 
         assert!(

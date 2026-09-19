@@ -249,7 +249,7 @@
 //! [JDonaghy/quadraui#532](https://github.com/JDonaghy/quadraui/issues/532)
 //! landed `AppShell::set_title_bar_visible`, the runtime toggle this needed
 //! (unlike `AppShell::with_title_bar`, a construction-time-only commitment —
-//! see that method's own doc comment). [`TuiShellApp::shell_config`] seeds
+//! see that method's own doc comment). [`TuiShellApp::build_shell_config`] seeds
 //! the title-bar reservation from `engine.menu_bar_visible` at construction
 //! (so the very first frame, painted before any `handle()` dispatch, is
 //! already correct), and `handle()` keeps it synced via
@@ -324,7 +324,7 @@
 //! have dropped every one of those keys through to the general
 //! `Engine::handle_key` fallback.
 //!
-//! **E. `ShellConfig` build-out — done.** [`TuiShellApp::shell_config`]
+//! **E. `ShellConfig` build-out — done.** [`TuiShellApp::build_shell_config`]
 //! derives its panel list from the same `PANEL_*` ids
 //! `render::build_activity_bar`'s `fixed` array switches on (explorer,
 //! search, debug, source control, extensions, AI), plus the menu hamburger
@@ -1128,20 +1128,26 @@ impl TuiShellApp {
         self.live = true;
     }
 
-    /// The live `ShellConfig` for `TuiShellApp` (#635, Stage 6b item E).
+    /// The static base `ShellConfig` for `TuiShellApp` (#635, Stage 6b item
+    /// E; renamed from `shell_config` and rebuilt on top of a shared icon
+    /// table in #1107 — see that issue for why two independent copies of
+    /// this builder existed in the first place).
     ///
     /// The middle six panels (explorer, search, debug, source control,
-    /// extensions, AI) are built by zipping
+    /// extensions, AI) are built by iterating
     /// `sidebar::FIXED_ACTIVITY_PANEL_IDS` — the shared order constant
     /// `render::build_activity_bar`'s (`render.rs:8147`) own `fixed` array is
-    /// debug-asserted against — with this function's local icon/title/tooltip
-    /// metadata array, so the *order* can't drift from `build_activity_bar`
-    /// without both a compile error here (index/length mismatch) and a
-    /// debug-assertion failure there. (Icon/title/tooltip strings are still a
-    /// second hand-maintained copy — `PanelDefinition` and `ActivityItem` are
-    /// different shapes with no shared metadata table to draw from — so a
+    /// debug-asserted against — so the *order* can't drift from
+    /// `build_activity_bar` without a debug-assertion failure there. Each
+    /// id's icon resolves through `App::resolve_builtin_panel_icon`, the
+    /// same table `App::shell_config` (GTK/macOS/Win) uses, so the two
+    /// backends cannot independently drift onto different glyphs for the
+    /// same panel the way the search icon once did (#950). Title/tooltip
+    /// wording is still a second hand-maintained copy, looked up by id via
+    /// the local `title_tooltip` — `PanelDefinition` and `ActivityItem` are
+    /// different shapes with no shared metadata table to draw from, so a
     /// wording-only change to `build_activity_bar`'s tooltips still needs a
-    /// matching edit here; only the *ordering* is now structurally shared.)
+    /// matching edit here.
     /// Also registers the menu hamburger (top, matching its position in
     /// `build_activity_bar`'s `top` list) and settings (bottom, matching
     /// `build_activity_bar`'s `bottom` list) — the two items outside the
@@ -1180,7 +1186,7 @@ impl TuiShellApp {
     /// (`quadraui::tui::shell_runner`) reads to decide whether to call
     /// `AppShell::with_title_bar` at construction — setting them directly
     /// here is simpler than routing through that builder twice.
-    pub fn shell_config(menu_bar_visible: bool) -> quadraui::ShellConfig {
+    pub fn build_shell_config(menu_bar_visible: bool) -> quadraui::ShellConfig {
         fn panel(id: &str, icon: &str, title: &str, tooltip: &str) -> quadraui::PanelDefinition {
             quadraui::PanelDefinition {
                 id: quadraui::WidgetId::new(id),
@@ -1190,24 +1196,35 @@ impl TuiShellApp {
             }
         }
 
-        // Icon/title/tooltip metadata for the fixed middle panels, in the
-        // same order as `sidebar::FIXED_ACTIVITY_PANEL_IDS` — the shared
-        // constant `render::build_activity_bar`'s own `fixed` array is
-        // debug-asserted against, so both call sites are pinned to the same
-        // order (index-zipped below, not hand-matched by id). The array
-        // length is sized *from* `FIXED_ACTIVITY_PANEL_IDS::len()` itself
-        // (not a hand-copied literal `6`), so adding/removing a panel there
-        // is a compile error here until this array is resized to match —
-        // `zip` alone would otherwise silently truncate to the shorter side.
-        let mid_meta: [(&str, &str, &str);
-            crate::core::engine::sidebar::FIXED_ACTIVITY_PANEL_IDS.len()] = [
-            (icons::EXPLORER.s(), "Explorer", "Explorer (Ctrl+Shift+E)"),
-            (icons::SEARCH.s(), "Search", "Search (Ctrl+Shift+F)"),
-            (icons::DEBUG.s(), "Debug", "Debug"),
-            (icons::GIT_BRANCH.s(), "Source Control", "Source Control"),
-            (icons::EXTENSIONS.s(), "Extensions", "Extensions"),
-            (icons::AI_CHAT.s(), "AI Assistant", "AI Assistant"),
-        ];
+        // Title/tooltip wording for the fixed middle panels, looked up *by
+        // id* rather than zipped positionally against
+        // `sidebar::FIXED_ACTIVITY_PANEL_IDS` (#1107) — a typo'd/reordered
+        // id here now falls through to the `unreachable!` below instead of
+        // silently mis-pairing two adjacent panels the way a length/order
+        // mismatch in a positional `zip` could have. This is still a
+        // second hand-maintained copy of the *wording*
+        // `render::build_activity_bar`'s `fixed` array carries — see that
+        // function's own tooltip strings — because `PanelDefinition` and
+        // `ActivityItem` are different shapes with no shared metadata table
+        // to draw from, so a wording-only change there still needs a
+        // matching edit here. What is no longer duplicated is the *icon*:
+        // this function and `App::shell_config` both resolve it through
+        // the one shared `App::resolve_builtin_panel_icon` table (#1107) —
+        // the two independent copies that used to exist here are exactly
+        // how the search panel ended up on two different glyphs across
+        // backends for months (`SEARCH_COD` on GTK, `SEARCH` on TUI, #950).
+        fn title_tooltip(id: &str) -> (&'static str, &'static str) {
+            match id {
+                PANEL_EXPLORER => ("Explorer", "Explorer (Ctrl+Shift+E)"),
+                PANEL_SEARCH => ("Search", "Search (Ctrl+Shift+F)"),
+                PANEL_DEBUG => ("Debug", "Debug"),
+                PANEL_GIT => ("Source Control", "Source Control"),
+                PANEL_EXTENSIONS => ("Extensions", "Extensions"),
+                PANEL_AI => ("AI Assistant", "AI Assistant"),
+                _ => unreachable!("title_tooltip called with a non-fixed panel id: {id:?}"),
+            }
+        }
+
         let mut panels = vec![panel(
             HAMBURGER_PANEL_ID,
             icons::HAMBURGER.s(),
@@ -1217,13 +1234,16 @@ impl TuiShellApp {
         panels.extend(
             crate::core::engine::sidebar::FIXED_ACTIVITY_PANEL_IDS
                 .into_iter()
-                .zip(mid_meta)
-                .map(|(id, (icon, title, tooltip))| panel(id, icon, title, tooltip)),
+                .map(|id| {
+                    let (title, tooltip) = title_tooltip(id);
+                    let icon = crate::app::App::resolve_builtin_panel_icon(id).unwrap_or_default();
+                    panel(id, icon, title, tooltip)
+                }),
         );
 
         let mut cfg = quadraui::ShellConfig::new("VimCode", panels).with_bottom_items(vec![panel(
             PANEL_SETTINGS,
-            icons::SETTINGS.s(),
+            crate::app::App::resolve_builtin_panel_icon(PANEL_SETTINGS).unwrap_or_default(),
             "Settings",
             "Settings",
         )]);
@@ -1264,7 +1284,7 @@ impl TuiShellApp {
     /// only seeds frame zero — [`Self::sync_ext_activity_panels`] keeps the
     /// live `AppShell` converged from there.
     pub(super) fn live_shell_config(engine: &Engine) -> quadraui::ShellConfig {
-        let mut cfg = Self::shell_config(engine.menu_bar_visible);
+        let mut cfg = Self::build_shell_config(engine.menu_bar_visible);
         cfg.panels.extend(engine.ext_activity_panels());
         cfg
     }
@@ -4813,7 +4833,7 @@ mod tests {
                 tooltip: String::new(),
             }],
         );
-        // Match `TuiShellApp::shell_config`'s 1-row title bar rather than
+        // Match `TuiShellApp::build_shell_config`'s 1-row title bar rather than
         // `ShellConfig`'s own 1.5-line-height default, so tests that reveal
         // the menu bar at runtime through this minimal config measure the
         // same reservation the live config produces (quadraui#547).
@@ -4938,21 +4958,21 @@ mod tests {
         let _ = driver.screen();
     }
 
-    /// #635 (Stage 6b item E): [`TuiShellApp::shell_config`] must register
+    /// #635 (Stage 6b item E): [`TuiShellApp::build_shell_config`] must register
     /// exactly the panels `render::build_activity_bar`'s `fixed` array
     /// plus the hamburger (top) and settings (bottom) — the two items
     /// outside that array — in the same order, so the eventual live
     /// `AppShell` activity bar (#634) can't drift from what `draw_frame`
     /// paints today. The middle six ids are asserted against
     /// `sidebar::FIXED_ACTIVITY_PANEL_IDS` directly — the same array
-    /// `shell_config` zips its metadata against and `build_activity_bar`
-    /// debug-asserts its own `fixed` order against — rather than a
-    /// hand-transcribed literal, so a reordering of the shared constant
-    /// changes what this test expects automatically instead of needing a
-    /// matching hand-edit here.
+    /// `build_shell_config` iterates and `build_activity_bar` debug-asserts
+    /// its own `fixed` order against — rather than a hand-transcribed
+    /// literal, so a reordering of the shared constant changes what this
+    /// test expects automatically instead of needing a matching hand-edit
+    /// here.
     #[test]
     fn shell_config_registers_every_build_activity_bar_panel() {
-        let cfg = TuiShellApp::shell_config(false);
+        let cfg = TuiShellApp::build_shell_config(false);
         let ids: Vec<&str> = cfg.panels.iter().map(|p| p.id.as_str()).collect();
         let mut expected = vec![HAMBURGER_PANEL_ID];
         expected.extend(crate::core::engine::sidebar::FIXED_ACTIVITY_PANEL_IDS);
@@ -4970,7 +4990,7 @@ mod tests {
     fn shell_app_constructs_via_driver_with_shell_using_live_config() {
         let driver = driver_with_shell(
             TuiShellApp::new(None),
-            TuiShellApp::shell_config(false),
+            TuiShellApp::build_shell_config(false),
             80,
             24,
         );
@@ -5244,7 +5264,7 @@ mod tests {
     fn driver_click_on_search_icon_switches_and_toggles_sidebar() {
         let mut driver = driver_with_shell(
             TuiShellApp::new(None),
-            TuiShellApp::shell_config(false),
+            TuiShellApp::build_shell_config(false),
             80,
             24,
         );
@@ -5345,7 +5365,7 @@ mod tests {
     #[test]
     fn driver_paints_an_extension_panel_registered_after_the_first_frame() {
         let app = app_with_ext_panel();
-        let mut driver = driver_with_shell(app, TuiShellApp::shell_config(false), 80, 24);
+        let mut driver = driver_with_shell(app, TuiShellApp::build_shell_config(false), 80, 24);
         assert!(
             !driver.screen().contains(EXT_ICON),
             "precondition: the static config carries no extension panels"
@@ -5419,7 +5439,7 @@ mod tests {
     /// hides_menu_bar` documents why a stale coordinate can silently
     /// exercise a different code path). Built with
     /// `TuiShellApp::new_for_test` (`#868`) and the real production
-    /// `TuiShellApp::shell_config(false)` — not the single-panel test
+    /// `TuiShellApp::build_shell_config(false)` — not the single-panel test
     /// `config()` helper — so this is the actual activity bar a user
     /// clicks, not a stand-in.
     ///
@@ -5443,7 +5463,7 @@ mod tests {
         app.engine.cwd = dir.clone();
         app.engine.explorer_reveal_path(&marker_file);
 
-        let mut driver = driver_with_shell(app, TuiShellApp::shell_config(false), 80, 24);
+        let mut driver = driver_with_shell(app, TuiShellApp::build_shell_config(false), 80, 24);
         driver.set_double_click_folding(false);
         driver.dispatch(quadraui::UiEvent::WindowFocused(true));
         driver.render();
@@ -5657,7 +5677,7 @@ mod tests {
     #[test]
     fn live_shell_config_appends_extension_panels_after_the_builtins() {
         let app = app_with_ext_panel();
-        let base: Vec<String> = TuiShellApp::shell_config(false)
+        let base: Vec<String> = TuiShellApp::build_shell_config(false)
             .panels
             .iter()
             .map(|p| p.id.as_str().to_string())
@@ -5707,7 +5727,7 @@ mod tests {
     fn menu_reveal_then_search_icon_click_opens_search_not_explorer() {
         let mut driver = driver_with_shell(
             TuiShellApp::new(None),
-            TuiShellApp::shell_config(false),
+            TuiShellApp::build_shell_config(false),
             80,
             24,
         );
@@ -5788,7 +5808,7 @@ mod tests {
     /// `ActivityBarTarget::MenuToggle` arm mis-resolving a shifted row. That
     /// arm is **unreachable** for a genuine single click on the hamburger in
     /// production: the hamburger is a registered top-row `PanelDefinition`
-    /// (`TuiShellApp::shell_config`), so `quadraui`'s own
+    /// (`TuiShellApp::build_shell_config`), so `quadraui`'s own
     /// `ShellAdapter::handle` → `AppShell::handle_activity_click`
     /// (`compose/app_shell.rs`) hit-tests and consumes a plain `MouseDown`
     /// into a semantic `AppShellEvent` before it ever reaches
@@ -5864,7 +5884,7 @@ mod tests {
     fn hamburger_relocated_click_after_reveal_hides_menu_bar() {
         let mut driver = driver_with_shell(
             TuiShellApp::new_for_test(),
-            TuiShellApp::shell_config(false),
+            TuiShellApp::build_shell_config(false),
             80,
             24,
         );
@@ -6055,7 +6075,7 @@ mod tests {
     fn hamburger_stale_click_position_after_reveal_still_hides_menu_bar() {
         let mut driver = driver_with_shell(
             TuiShellApp::new(None),
-            TuiShellApp::shell_config(false),
+            TuiShellApp::build_shell_config(false),
             80,
             24,
         );
@@ -6189,7 +6209,7 @@ mod tests {
              ever clicked"
         );
 
-        let mut driver = driver_with_shell(app, TuiShellApp::shell_config(false), 80, 24);
+        let mut driver = driver_with_shell(app, TuiShellApp::build_shell_config(false), 80, 24);
         driver.dispatch(quadraui::UiEvent::WindowFocused(true));
         driver.render();
         assert!(
@@ -6246,7 +6266,7 @@ mod tests {
     fn hamburger_corner_guard_does_not_permanently_block_file_menu_clicks() {
         let mut driver = driver_with_shell(
             TuiShellApp::new(None),
-            TuiShellApp::shell_config(false),
+            TuiShellApp::build_shell_config(false),
             80,
             24,
         );
@@ -6345,7 +6365,7 @@ mod tests {
     fn hamburger_corner_guard_is_spent_by_a_real_activity_bar_panel_click() {
         let mut driver = driver_with_shell(
             TuiShellApp::new(None),
-            TuiShellApp::shell_config(false),
+            TuiShellApp::build_shell_config(false),
             80,
             24,
         );
@@ -6427,7 +6447,7 @@ mod tests {
     fn hamburger_corner_guard_is_spent_by_an_intervening_keystroke() {
         let mut driver = driver_with_shell(
             TuiShellApp::new(None),
-            TuiShellApp::shell_config(false),
+            TuiShellApp::build_shell_config(false),
             80,
             24,
         );
@@ -8931,7 +8951,7 @@ mod tests {
     /// 2. **The sidebar-width settle.** `driver_with_shell` paints frame 1
     ///    straight from the [`config`] helper, which leaves quadraui's generic
     ///    20-column `default_sidebar_width` in place rather than mirroring
-    ///    `TuiShellApp::shell_config`'s #634 clamp to `SIDEBAR_WIDTH`. The
+    ///    `TuiShellApp::build_shell_config`'s #634 clamp to `SIDEBAR_WIDTH`. The
     ///    end-of-dispatch `set_sidebar_width(self.sidebar_width)` sync in
     ///    `handle()` re-widens it on the first event of *any* kind, so a
     ///    column measured off frame 1 is stale from frame 2 onwards. The
@@ -10855,7 +10875,7 @@ mod tests {
         // `shell_config(true)`, not `config()`: `AppShell::set_title_bar_visible`
         // is what reserves `layout.title_bar_bounds`, and with no reserved row
         // the three title-bar rungs are not live at all.
-        let driver = driver_with_shell(app, TuiShellApp::shell_config(true), 80, 24);
+        let driver = driver_with_shell(app, TuiShellApp::build_shell_config(true), 80, 24);
         let screen = driver.screen();
 
         assert_eq!(
@@ -10911,7 +10931,7 @@ mod tests {
         // `shell_config(true)`, not `config()`: `AppShell::set_title_bar_visible`
         // is what reserves `layout.title_bar_bounds`, and with no reserved row
         // the menu-dropdown rung has nothing to paint into.
-        let driver = driver_with_shell(app, TuiShellApp::shell_config(true), 80, 24);
+        let driver = driver_with_shell(app, TuiShellApp::build_shell_config(true), 80, 24);
         let screen = driver.screen();
 
         assert_eq!(
@@ -11022,7 +11042,7 @@ mod tests {
         // `shell_config(true)`, not `config()`: `AppShell::set_title_bar_visible`
         // is what reserves `layout.title_bar_bounds`, and with no reserved row
         // the `MenuRow` rung is not live at all.
-        let driver = driver_with_shell(app, TuiShellApp::shell_config(true), 80, 24);
+        let driver = driver_with_shell(app, TuiShellApp::build_shell_config(true), 80, 24);
         let screen = driver.screen();
 
         assert_eq!(
@@ -11075,7 +11095,7 @@ mod tests {
         );
 
         let frame = app.composed_frame.clone();
-        let driver = driver_with_shell(app, TuiShellApp::shell_config(true), 80, 24);
+        let driver = driver_with_shell(app, TuiShellApp::build_shell_config(true), 80, 24);
         let screen = driver.screen();
         assert_eq!(
             chrome_half(&frame.borrow()),
@@ -11525,7 +11545,7 @@ mod tests {
         let mut app = TuiShellApp::new(None);
         app.engine.menu_bar_visible = true;
 
-        let driver = driver_with_shell(app, TuiShellApp::shell_config(true), 80, 24);
+        let driver = driver_with_shell(app, TuiShellApp::build_shell_config(true), 80, 24);
         let screen = driver.screen();
         assert!(
             screen.contains("File"),
@@ -11576,7 +11596,7 @@ mod tests {
     #[test]
     fn render_content_paints_command_center_after_menu_labels_via_shell_app() {
         let app = app_with_menu_bar_and_tab_history();
-        let driver = driver_with_shell(app, TuiShellApp::shell_config(true), 80, 24);
+        let driver = driver_with_shell(app, TuiShellApp::build_shell_config(true), 80, 24);
         let screen = driver.screen();
 
         let file = driver
@@ -11614,7 +11634,7 @@ mod tests {
     #[test]
     fn command_center_click_routes_nav_and_opens_picker_via_shell_app() {
         let app = app_with_menu_bar_and_tab_history();
-        let mut driver = driver_with_shell(app, TuiShellApp::shell_config(true), 80, 24);
+        let mut driver = driver_with_shell(app, TuiShellApp::build_shell_config(true), 80, 24);
 
         let back = driver.find_bounds("◀").expect("back arrow must paint");
         let fwd = driver.find_bounds("▶").expect("forward arrow must paint");
@@ -11705,7 +11725,7 @@ mod tests {
         let (search_x, search_y) = {
             let probe_driver = driver_with_shell(
                 app_with_menu_bar_and_tab_history(),
-                TuiShellApp::shell_config(true),
+                TuiShellApp::build_shell_config(true),
                 80,
                 24,
             );
@@ -11718,7 +11738,7 @@ mod tests {
         let mut app = app_with_menu_bar_and_tab_history();
 
         app.engine.menu_bar_visible = false;
-        let mut driver = driver_with_shell(app, TuiShellApp::shell_config(true), 80, 24);
+        let mut driver = driver_with_shell(app, TuiShellApp::build_shell_config(true), 80, 24);
         assert!(
             driver.find_bounds("🔍").is_none(),
             "the search-box icon must not paint once the menu bar is hidden"
@@ -11918,7 +11938,7 @@ mod tests {
         let app = TuiShellApp::new(None);
         assert!(!app.engine.menu_bar_visible);
 
-        let driver = driver_with_shell(app, TuiShellApp::shell_config(false), 80, 24);
+        let driver = driver_with_shell(app, TuiShellApp::build_shell_config(false), 80, 24);
         let screen = driver.screen();
         assert!(
             !screen.contains("File"),
@@ -11977,7 +11997,7 @@ mod tests {
         app.engine.buffer_mut().insert(0, "ZQXW547MARKER");
         assert!(!app.engine.menu_bar_visible);
 
-        let mut driver = driver_with_shell(app, TuiShellApp::shell_config(false), 80, 24);
+        let mut driver = driver_with_shell(app, TuiShellApp::build_shell_config(false), 80, 24);
 
         let before = driver.screen();
         let before_row = before
@@ -12531,7 +12551,7 @@ mod tests {
     fn driver_hamburger_click_sidebar_closed_does_not_panic() {
         let mut driver = driver_with_shell(
             TuiShellApp::new(None),
-            TuiShellApp::shell_config(false),
+            TuiShellApp::build_shell_config(false),
             80,
             24,
         );
@@ -12567,7 +12587,7 @@ mod tests {
     fn driver_hamburger_click_twice_does_not_panic() {
         let mut driver = driver_with_shell(
             TuiShellApp::new(None),
-            TuiShellApp::shell_config(false),
+            TuiShellApp::build_shell_config(false),
             80,
             24,
         );
@@ -12597,7 +12617,7 @@ mod tests {
     fn driver_hamburger_click_with_sidebar_open_does_not_panic() {
         let mut driver = driver_with_shell(
             TuiShellApp::new(None),
-            TuiShellApp::shell_config(false),
+            TuiShellApp::build_shell_config(false),
             80,
             24,
         );
@@ -12625,7 +12645,7 @@ mod tests {
     fn driver_hamburger_click_then_key_does_not_panic() {
         let mut driver = driver_with_shell(
             TuiShellApp::new(None),
-            TuiShellApp::shell_config(false),
+            TuiShellApp::build_shell_config(false),
             80,
             24,
         );
@@ -12657,7 +12677,7 @@ mod tests {
     fn driver_hamburger_click_then_key_with_sidebar_open_does_not_panic() {
         let mut driver = driver_with_shell(
             TuiShellApp::new(None),
-            TuiShellApp::shell_config(false),
+            TuiShellApp::build_shell_config(false),
             80,
             24,
         );
@@ -13842,7 +13862,7 @@ mod tests {
     fn hamburger_click_paints_menu_bar_immediately_via_shell_app() {
         let mut app = app_with_sidebar_open();
         app.engine.buffer_mut().insert(0, "ZQXW_HAMBURGER_MARKER");
-        let mut driver = driver_with_shell(app, TuiShellApp::shell_config(false), 80, 24);
+        let mut driver = driver_with_shell(app, TuiShellApp::build_shell_config(false), 80, 24);
 
         // Prime the runner off the hamburger's default-active slot
         // (`AppShell::new` activates panel index 0, the hamburger) so the
@@ -17161,7 +17181,7 @@ mod tests {
             "opening tab B makes it the active tab"
         );
 
-        // The live config (`TuiShellApp::shell_config`), not the bare
+        // The live config (`TuiShellApp::build_shell_config`), not the bare
         // single-panel `config()` test helper: it seeds
         // `default_sidebar_width` from the same `SIDEBAR_WIDTH` constant
         // `mouse.rs`'s own click math reads back via `self.sidebar_width`
@@ -17172,7 +17192,7 @@ mod tests {
         // disagree by the difference — a test-fixture-only trap, not a
         // production bug (the real runner's `ShellConfig` always goes
         // through `shell_config`).
-        let mut driver = driver_with_shell(app, TuiShellApp::shell_config(false), 100, 24);
+        let mut driver = driver_with_shell(app, TuiShellApp::build_shell_config(false), 100, 24);
         assert!(
             driver.screen().contains("BBB752"),
             "fixture must start out on tab B's content; screen:\n{}",
@@ -17258,7 +17278,7 @@ mod tests {
     fn driver_click_on_editor_hover_command_link_navigates_and_closes_the_popup() {
         let mut driver = driver_with_shell(
             app_with_editor_hover_link(),
-            TuiShellApp::shell_config(false),
+            TuiShellApp::build_shell_config(false),
             80,
             24,
         );
@@ -17292,7 +17312,7 @@ mod tests {
     fn driver_click_outside_editor_hover_popup_dismisses_it_and_falls_through() {
         let mut driver = driver_with_shell(
             app_with_editor_hover_link(),
-            TuiShellApp::shell_config(false),
+            TuiShellApp::build_shell_config(false),
             80,
             24,
         );
@@ -17381,7 +17401,7 @@ mod tests {
         // fixed-width, non-wrapping box (horizontal scroll instead), and this
         // test's line is long enough that a plain 80-col terminal clips the
         // trailing URL text before `find` can locate it.
-        let driver = driver_with_shell(app, TuiShellApp::shell_config(false), 160, 24);
+        let driver = driver_with_shell(app, TuiShellApp::build_shell_config(false), 160, 24);
 
         // Markdown syntax must be stripped — proves quadraui's parser ran
         // rather than the raw source being painted verbatim.
@@ -17486,7 +17506,7 @@ mod tests {
 
         let mut app = TuiShellApp::new(None);
         app.engine.activity_bar_focus_in_at(TOOLBAR_IDX_SETTINGS);
-        let mut driver = driver_with_shell(app, TuiShellApp::shell_config(false), 80, 24);
+        let mut driver = driver_with_shell(app, TuiShellApp::build_shell_config(false), 80, 24);
 
         let before = driver.screen();
         assert!(
@@ -17556,7 +17576,7 @@ mod tests {
             None,
             None,
         );
-        let mut driver = driver_with_shell(app, TuiShellApp::shell_config(false), 80, 24);
+        let mut driver = driver_with_shell(app, TuiShellApp::build_shell_config(false), 80, 24);
 
         let before = driver.screen();
         assert!(
@@ -17628,7 +17648,7 @@ mod tests {
         // Park the activity bar's keyboard cursor on the (only) plugin panel.
         app.engine.activity_bar_focus_in_at(TOOLBAR_IDX_EXT_BASE);
 
-        let mut driver = driver_with_shell(app, TuiShellApp::shell_config(false), 80, 24);
+        let mut driver = driver_with_shell(app, TuiShellApp::build_shell_config(false), 80, 24);
 
         let before = driver.screen();
         assert!(
@@ -17717,7 +17737,7 @@ mod tests {
         // untouched default) is still the explorer.
         app.engine.settings_has_focus = true;
 
-        let mut driver = driver_with_shell(app, TuiShellApp::shell_config(false), 80, 24);
+        let mut driver = driver_with_shell(app, TuiShellApp::build_shell_config(false), 80, 24);
 
         let before = driver.screen();
         assert!(
@@ -17785,7 +17805,7 @@ mod tests {
     fn alt_right_widens_the_painted_sidebar_via_shell_app() {
         let mut app = app_with_sidebar_open();
         app.engine.buffer_mut().insert(0, "ZQXW759W");
-        let mut driver = driver_with_shell(app, TuiShellApp::shell_config(false), 120, 24);
+        let mut driver = driver_with_shell(app, TuiShellApp::build_shell_config(false), 120, 24);
 
         let before = driver
             .find_bounds("ZQXW759W")
@@ -17851,7 +17871,8 @@ mod tests {
             } else {
                 crate::core::Mode::Normal
             };
-            let mut driver = driver_with_shell(app, TuiShellApp::shell_config(vscode), 100, 24);
+            let mut driver =
+                driver_with_shell(app, TuiShellApp::build_shell_config(vscode), 100, 24);
 
             alt_press(&mut driver, quadraui::Key::Char('z'), false);
 
@@ -17909,7 +17930,7 @@ mod tests {
         // paint over the command line this test reads. See
         // `TuiShellApp::new_for_test`'s doc comment.
         let app = TuiShellApp::new_for_test();
-        let mut driver = driver_with_shell(app, TuiShellApp::shell_config(false), 100, 24);
+        let mut driver = driver_with_shell(app, TuiShellApp::build_shell_config(false), 100, 24);
 
         press_with(
             &mut driver,
@@ -17963,7 +17984,7 @@ mod tests {
             render::FocusKeyRoute::Search,
             "precondition: the search panel must own the keyboard"
         );
-        let mut driver = driver_with_shell(app, TuiShellApp::shell_config(false), 100, 24);
+        let mut driver = driver_with_shell(app, TuiShellApp::build_shell_config(false), 100, 24);
 
         press_with(
             &mut driver,
@@ -18017,7 +18038,7 @@ mod tests {
     fn ctrl_l_is_consumed_and_never_edits_the_buffer_via_shell_app() {
         let mut app = TuiShellApp::new_for_test();
         app.engine.buffer_mut().insert(0, "ZQXW762CTRLL");
-        let mut driver = driver_with_shell(app, TuiShellApp::shell_config(false), 100, 24);
+        let mut driver = driver_with_shell(app, TuiShellApp::build_shell_config(false), 100, 24);
 
         // Settle the sidebar width, then enter Insert mode — in that order,
         // so nothing but the Ctrl+L under test can move the marker.
@@ -18108,7 +18129,7 @@ mod tests {
             render::FocusKeyRoute::Search,
             "precondition: the search panel must own the keyboard before the click"
         );
-        let mut driver = driver_with_shell(app, TuiShellApp::shell_config(false), 100, 24);
+        let mut driver = driver_with_shell(app, TuiShellApp::build_shell_config(false), 100, 24);
 
         let marker = driver
             .find_bounds("ZQXW823SEARCHFOCUS")
