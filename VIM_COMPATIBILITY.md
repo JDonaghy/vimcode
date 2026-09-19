@@ -539,19 +539,24 @@ Operators `d`, `c`, `y`, `>`, `<`, `=`, `g~`, `gu`, `gU` all accept these motion
 | `:e {file}` / `:edit` | Open file | ✅ | |
 | `:enew` | New empty buffer | ✅ | |
 | `:bn` / `:bp` | Buffer next/prev | ✅ | |
+| `:bfirst` / `:blast` | Buffer first/last | ✅ | |
 | `:b#` | Alternate buffer | ✅ | |
 | `:b {N}` | Go to buffer N | ⚠️ | By number only, not by name |
 | `:bd` / `:bdelete` | Delete buffer | ✅ | |
+| `:bw` / `:bwipeout` | Wipe out buffer | ✅ | Shares `:bdelete`'s implementation — vimcode has no separate unloaded-but-listed buffer state |
 | `:ls` / `:buffers` | List buffers | ✅ | |
 | `:split` / `:sp` | Horizontal split | ✅ | |
 | `:vsplit` / `:vs` | Vertical split | ✅ | |
 | `:close` | Close window | ✅ | |
 | `:only` | Close other windows | ✅ | |
+| `:hide` | Close window, keep buffer loaded | ✅ | Never checks the dirty flag |
 | `:new` | New buffer in h-split | ✅ | |
 | `:vnew` | New buffer in v-split | ✅ | |
 | `:tabnew` / `:tabe` | New tab | ✅ | |
 | `:tabclose` | Close tab | ✅ | |
+| `:tabonly` | Close all other tabs | ✅ | |
 | `:tabnext` / `:tabprevious` | Next/prev tab | ✅ | |
+| `:tabfirst` / `:tablast` | First/last tab | ✅ | |
 | `:tabmove` | Move tab | ✅ | |
 | `:[range]s/pat/rep/[flags] [count]` | Substitute | ✅ | Vim regex; `g c e i I n &` flags (`c` errors — not implemented); any delimiter (`:s#a#b#`); `:&`, `:&&`, `:~`; `\|` chaining |
 | `:%s/pat/rep/` | Substitute all lines | ✅ | Multi-line patterns (`\n`) supported |
@@ -566,6 +571,7 @@ Operators `d`, `c`, `y`, `>`, `<`, `=`, `g~`, `gu`, `gU` all accept these motion
 | `:sort` | Sort lines | ✅ | `n`/`r`/`u`/`i` flags |
 | `:norm` / `:normal` | Execute normal keys | ✅ | Range support, `!` variant |
 | `:noh` / `:nohlsearch` | Clear highlight | ✅ | |
+| `:startinsert` / `:stopinsert` | Enter/leave Insert mode | ✅ | `!` variant appends at end of line |
 | Ex ranges | `N`, `.`, `$`, `%`, `'m`, `'<,'>`, `/pat/`, `?pat?`, `+N`/`-N`, `a,b`, `a;b` | ✅ | Accepted by `:s`, `:g`, `:d`, `:y`, `:j`, `:>`, `:<`, `:t`, `:m`, `:normal` |
 | `:set {option}` | Set option | ✅ | Full `:set` syntax, several options per command (`:set ic scs`) |
 | `:r {file}` / `:read` | Read file into buffer | ✅ | |
@@ -582,6 +588,7 @@ Operators `d`, `c`, `y`, `>`, `<`, `=`, `g~`, `gu`, `gU` all accept these motion
 | `:=` | Display line number | ✅ | |
 | `:#` / `:number` / `:print` | Print line | ✅ | |
 | `:ma` / `:mark` | Set mark | ✅ | |
+| `:delmarks` / `:delm` | Delete marks | ✅ | Space-separated chars, `a-c` ranges, `!` clears all lowercase marks |
 | `:retab` | Convert tabs/spaces | ✅ | |
 | `:saveas {file}` | Save as | ✅ | |
 | `:update` | Save if modified | ✅ | |
