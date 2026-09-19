@@ -12153,6 +12153,165 @@ mod tests {
         );
     }
 
+    /// #234: mouse hover over the menu bar must (a) switch the open
+    /// dropdown to whichever top-level label the pointer is over, and (b)
+    /// move the highlighted row inside that dropdown to whichever item the
+    /// pointer is over — both driven by a bare `UiEvent::MouseMoved` with no
+    /// button held, exactly what a real terminal's SGR any-motion tracking
+    /// (crossterm's `EnableMouseCapture` enables mode 1003 unconditionally)
+    /// delivers on ordinary pointer movement.
+    ///
+    /// #234 reported both as broken on TUI ("hovering over a different
+    /// top-level menu doesn't switch the dropdown"; "hovering over an entry
+    /// doesn't highlight it"), by analogy with GTK's #373/#751 fix (GTK's
+    /// own `UiEvent::MouseMoved` arm did nothing unless a button was held).
+    /// TUI's menu bar goes through a different pipe than GTK's, though:
+    /// `TuiShellApp::handle`'s `MenuSystem` intercept (`menu_bar_visible ||
+    /// menu_system.borrow().is_open()`) forwards the raw event straight to
+    /// quadraui's `MenuSystem::handle`, whose `UiEvent::MouseMoved` arm
+    /// already implements both behaviours unconditionally (`compose/
+    /// menu_system.rs`) — there is no per-backend hover code for TUI to be
+    /// missing in the first place.
+    ///
+    /// **Could not reproduce.** This test asserts on rendered output (the
+    /// dropdown's own text disappearing/appearing, plus `style_at`'s two
+    /// rows swapping which one carries the selected-row colours) and passes
+    /// against unfixed `develop` — proven not vacuous by disabling the
+    /// `MenuSystem` intercept in `TuiShellApp::handle` above (temporarily
+    /// changing its `if` to `if false &&`) during this investigation, which
+    /// turns every assertion below red (the dropdown never even opens
+    /// without the intercept forwarding `MouseDown` to `MenuSystem` either,
+    /// let alone tracks hover) — restored before committing. Kept as a
+    /// permanent regression guard; see `menu_bar_click_then_hover_switches_
+    /// and_highlights_234` below for the same behaviour through the actual
+    /// user-facing entry point (a mouse click to open, sidebar visible).
+    #[test]
+    fn menu_bar_hover_switches_menu_and_highlight_234() {
+        let mut app = TuiShellApp::new(None);
+        app.engine.menu_bar_visible = true;
+        let mut driver = driver_with_shell(app, TuiShellApp::build_shell_config(true), 80, 24);
+
+        // Open File via Alt+F (`MENU_STRUCTURE`'s alt-letter shim).
+        driver.dispatch(quadraui::UiEvent::KeyPressed {
+            key: quadraui::Key::Char('f'),
+            modifiers: quadraui::Modifiers {
+                alt: true,
+                ..quadraui::Modifiers::default()
+            },
+            repeat: false,
+        });
+        let screen = driver.screen();
+        assert!(
+            screen.contains("New Tab"),
+            "File dropdown should be open; screen:\n{screen}"
+        );
+
+        // (a) Hovering a different top-level label must switch the dropdown.
+        let edit = driver
+            .find_bounds("Edit")
+            .expect("Edit label must paint on the menu bar");
+        driver.dispatch(quadraui::UiEvent::MouseMoved {
+            position: quadraui::Point::new(edit.x + edit.width / 2.0, edit.y + edit.height / 2.0),
+            buttons: quadraui::ButtonMask::default(),
+        });
+        let screen = driver.screen();
+        assert!(
+            screen.contains("Undo"),
+            "hovering Edit should open the Edit dropdown; screen:\n{screen}"
+        );
+        assert!(
+            !screen.contains("New Tab"),
+            "the File dropdown should have closed once Edit took over; screen:\n{screen}"
+        );
+
+        // (b) Hovering a sibling item inside the now-open Edit dropdown must
+        // move the highlight onto it.
+        let undo = driver.find_bounds("Undo").expect("Undo item must paint");
+        let redo = driver.find_bounds("Redo").expect("Redo item must paint");
+        let undo_style_before = driver.style_at(undo.x as u16 + 1, undo.y as u16);
+        let redo_style_before = driver.style_at(redo.x as u16 + 1, redo.y as u16);
+        assert_ne!(
+            undo_style_before, redo_style_before,
+            "sanity: the selected row must already paint differently from an \
+             unselected one, otherwise this test cannot see a highlight move"
+        );
+
+        driver.dispatch(quadraui::UiEvent::MouseMoved {
+            position: quadraui::Point::new(redo.x + 1.0, redo.y + 0.5),
+            buttons: quadraui::ButtonMask::default(),
+        });
+
+        assert_eq!(
+            driver.style_at(redo.x as u16 + 1, redo.y as u16),
+            undo_style_before,
+            "hovering Redo should move the selected-row style onto it"
+        );
+        assert_eq!(
+            driver.style_at(undo.x as u16 + 1, undo.y as u16),
+            redo_style_before,
+            "Undo should lose the highlight once Redo is hovered"
+        );
+    }
+
+    /// #234 companion: the same two behaviours as
+    /// `menu_bar_hover_switches_menu_and_highlight_234` above, but through
+    /// the path an actual user takes — a mouse click on "File" to open the
+    /// dropdown (not the Alt-letter shim), with the explorer sidebar
+    /// visible so the menu bar's column offsets are non-trivial (the
+    /// activity-bar + sidebar width shift every column the hit-tests below
+    /// read). Kept separate from the test above rather than folded in,
+    /// since a failure here that passes there would point specifically at
+    /// the click-open path or the sidebar-offset geometry rather than
+    /// `MenuSystem` itself.
+    #[test]
+    fn menu_bar_click_then_hover_switches_and_highlights_234() {
+        let mut app = app_with_sidebar_open();
+        app.engine.menu_bar_visible = true;
+        let mut driver = driver_with_shell(app, TuiShellApp::build_shell_config(true), 100, 30);
+
+        let file = driver.find_bounds("File").expect("File label must paint");
+        driver.click(file.x + file.width / 2.0, file.y + file.height / 2.0);
+        let screen = driver.screen();
+        assert!(
+            screen.contains("New Tab"),
+            "clicking File should open its dropdown; screen:\n{screen}"
+        );
+
+        let edit = driver.find_bounds("Edit").expect("Edit label must paint");
+        driver.dispatch(quadraui::UiEvent::MouseMoved {
+            position: quadraui::Point::new(edit.x + edit.width / 2.0, edit.y + edit.height / 2.0),
+            buttons: quadraui::ButtonMask::default(),
+        });
+        let screen = driver.screen();
+        assert!(
+            screen.contains("Undo"),
+            "hovering Edit after a click-open should switch dropdowns; screen:\n{screen}"
+        );
+        assert!(
+            !screen.contains("New Tab"),
+            "the File dropdown should have closed; screen:\n{screen}"
+        );
+
+        let undo = driver.find_bounds("Undo").expect("Undo item must paint");
+        let redo = driver.find_bounds("Redo").expect("Redo item must paint");
+        let undo_style_before = driver.style_at(undo.x as u16 + 1, undo.y as u16);
+        let redo_style_before = driver.style_at(redo.x as u16 + 1, redo.y as u16);
+        driver.dispatch(quadraui::UiEvent::MouseMoved {
+            position: quadraui::Point::new(redo.x + 1.0, redo.y + 0.5),
+            buttons: quadraui::ButtonMask::default(),
+        });
+        assert_eq!(
+            driver.style_at(redo.x as u16 + 1, redo.y as u16),
+            undo_style_before,
+            "hovering Redo should move the highlight onto it"
+        );
+        assert_eq!(
+            driver.style_at(undo.x as u16 + 1, undo.y as u16),
+            redo_style_before,
+            "Undo should lose the highlight once Redo is hovered"
+        );
+    }
+
     /// The title-bar row must NOT be reserved (and nothing painted into
     /// row 0) when the menu is hidden — `shell_config(false)` is the
     /// default `TuiShellApp::new` state, so this is the same driver setup
