@@ -21577,4 +21577,557 @@ mod tests {
              sidebar; screen:\n{screen}"
         );
     }
+
+    /// #1154 driver-tier coverage: `:startinsert` must actually flip the
+    /// mode a real `i` key press would, visible in the per-window status
+    /// line's `"INSERT"` badge (same signal
+    /// `ctrl_l_is_consumed_and_never_edits_the_buffer_via_shell_app` reads),
+    /// not just `Engine::mode` inspected directly. A real character typed
+    /// afterwards must land as literal insertion, not a Normal-mode
+    /// command, confirming Insert mode was genuinely entered rather than
+    /// just labelled.
+    ///
+    /// RED against unfixed `develop`: `:startinsert` fell through to the
+    /// unknown-ex-command fallback, so the mode never changed, the
+    /// `"INSERT"` badge never appeared, and the typed `Z` would have run as
+    /// a Normal-mode command instead of inserting text.
+    #[test]
+    fn ex_startinsert_enters_insert_mode_via_shell_app() {
+        let mut app = TuiShellApp::new_for_test();
+        app.engine.buffer_mut().insert(0, "hello");
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        driver.press_named(quadraui::NamedKey::Escape);
+        driver.render();
+        assert!(
+            !driver.screen().contains("INSERT"),
+            "sanity: must start in Normal mode; screen:\n{}",
+            driver.screen()
+        );
+
+        driver.type_char(':');
+        for c in "startinsert".chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
+        driver.render();
+        assert!(
+            driver.screen().contains("INSERT"),
+            ":startinsert must enter Insert mode; screen:\n{}",
+            driver.screen()
+        );
+
+        driver.type_char('Z');
+        driver.render();
+        assert!(
+            driver.screen().contains("Zhello"),
+            "a character typed right after :startinsert must land as \
+             literal insertion, proving Insert mode was really entered; \
+             screen:\n{}",
+            driver.screen()
+        );
+    }
+
+    /// #1154 driver-tier coverage: `:stopinsert` while already in Normal
+    /// mode is documented as a no-op, not an error — the only `:stopinsert`
+    /// scenario reachable by *typing* a colon command at all: real Vim
+    /// (confirmed by hand against `nvim --headless -u NONE`) does not let a
+    /// bare `:` open the command line from Insert mode either (it inserts a
+    /// literal `:` character there — reaching `:stopinsert` from genuine
+    /// Insert mode needs `i_CTRL-O`, or a mapping/script context, which
+    /// vimcode does not implement), so this is the one path this driver can
+    /// actually exercise. `src/core/engine/tests.rs`'s
+    /// `test_ex_stopinsert_returns_to_normal_mode_1154` covers the
+    /// from-Insert transition directly against `Engine::execute_command`.
+    ///
+    /// RED against unfixed `develop`: `:stopinsert` fell through to the
+    /// unknown-ex-command fallback (`"Not an editor command: stopinsert"`),
+    /// which painted an error message on the status/command row instead of
+    /// silently doing nothing.
+    #[test]
+    fn ex_stopinsert_is_a_noop_in_normal_mode_via_shell_app() {
+        let mut app = TuiShellApp::new_for_test();
+        app.engine.buffer_mut().insert(0, "hello");
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        driver.press_named(quadraui::NamedKey::Escape);
+        driver.render();
+
+        driver.type_char(':');
+        for c in "stopinsert".chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
+        driver.render();
+
+        let screen = driver.screen();
+        assert!(
+            !screen.contains("INSERT"),
+            ":stopinsert in Normal mode must stay in Normal mode; \
+             screen:\n{screen}"
+        );
+        assert!(
+            !screen.contains("Not an editor command"),
+            ":stopinsert must be a recognised no-op in Normal mode, not an \
+             unknown-command error; screen:\n{screen}"
+        );
+        assert!(
+            screen.contains("hello"),
+            "the buffer must be untouched; screen:\n{screen}"
+        );
+    }
+
+    /// #1154 driver-tier coverage: `:tabonly` must actually collapse the
+    /// painted tab bar to a single `"[No Name]"` label, mirroring the
+    /// `starts.len()` assertion `render_content_paints_single_group_tab_bar_via_shell_app`
+    /// makes for the unsplit case — not just `active_group().tabs.len()`
+    /// inspected on the `Engine` directly.
+    ///
+    /// RED against unfixed `develop`: `:tabonly` fell through to the
+    /// unknown-ex-command fallback, so all 3 tabs would still show in the
+    /// tab row.
+    #[test]
+    fn ex_tabonly_collapses_tab_bar_via_shell_app() {
+        let mut app = TuiShellApp::new_for_test();
+        app.engine.settings.hide_single_tab = false;
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        driver.press_named(quadraui::NamedKey::Escape);
+
+        driver.type_char(':');
+        for c in "tabnew".chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
+        driver.type_char(':');
+        for c in "tabnew".chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
+        driver.render();
+
+        let tab_row = driver
+            .screen()
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .to_string();
+        assert_eq!(
+            tab_row.matches("[No Name]").count(),
+            3,
+            "sanity: 3 tabs must be open before :tabonly; row:\n{tab_row}"
+        );
+
+        driver.type_char(':');
+        for c in "tabonly".chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
+        driver.render();
+
+        let tab_row = driver
+            .screen()
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .to_string();
+        assert_eq!(
+            tab_row.matches("[No Name]").count(),
+            1,
+            ":tabonly must close every tab but the active one; row:\n{tab_row}"
+        );
+    }
+
+    /// #1154 driver-tier coverage: `:tabfirst`/`:tablast` must switch which
+    /// tab's buffer is actually painted in the editor body, not just move
+    /// `active_group().active_tab` on the `Engine`.
+    ///
+    /// RED against unfixed `develop`: both commands fell through to the
+    /// unknown-ex-command fallback, so the screen would keep showing
+    /// `TABFL_C_1154` (the tab active when the driver was built) through
+    /// both assertions below.
+    #[test]
+    fn ex_tabfirst_tablast_switch_active_tab_via_shell_app() {
+        let mut app = TuiShellApp::new_for_test();
+        app.engine.settings.hide_single_tab = false;
+        app.engine.buffer_mut().insert(0, "TABFL_A_1154");
+        app.engine.new_tab(None);
+        app.engine.buffer_mut().insert(0, "TABFL_B_1154");
+        app.engine.new_tab(None);
+        app.engine.buffer_mut().insert(0, "TABFL_C_1154");
+        assert_eq!(app.engine.active_group().active_tab, 2);
+
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        driver.render();
+        assert!(
+            driver.screen().contains("TABFL_C_1154"),
+            "sanity: last-created tab must be active before any :tab* \
+             command; screen:\n{}",
+            driver.screen()
+        );
+
+        driver.type_char(':');
+        for c in "tabfirst".chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
+        driver.render();
+        let screen = driver.screen();
+        assert!(
+            screen.contains("TABFL_A_1154") && !screen.contains("TABFL_C_1154"),
+            ":tabfirst must switch to the first tab's buffer; screen:\n{screen}"
+        );
+
+        driver.type_char(':');
+        for c in "tablast".chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
+        driver.render();
+        let screen = driver.screen();
+        assert!(
+            screen.contains("TABFL_C_1154") && !screen.contains("TABFL_A_1154"),
+            ":tablast must switch to the last tab's buffer; screen:\n{screen}"
+        );
+    }
+
+    /// #1154 driver-tier coverage: `:hide` must close the active pane's
+    /// painted window without ever prompting about unsaved changes (unlike
+    /// `:quit`), leaving the other pane's own content as the only thing on
+    /// screen — the black-box twin of the engine-level
+    /// `test_ex_hide_closes_window_without_dirty_check_1154` /
+    /// `test_ex_hide_refuses_to_close_the_last_window_1154`.
+    ///
+    /// RED against unfixed `develop`: `:hide` fell through to the
+    /// unknown-ex-command fallback, so both panes (and the dirtied buffer's
+    /// text) would still be on screen after it ran.
+    #[test]
+    fn ex_hide_closes_active_pane_without_dirty_prompt_via_shell_app() {
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_test_1154_hide_shell_app_{:?}",
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_a = dir.join("a1154hide.txt");
+        let file_b = dir.join("b1154hide.txt");
+        std::fs::write(&file_a, "AAA1154HIDE\n").unwrap();
+        std::fs::write(&file_b, "BBB1154HIDE\n").unwrap();
+
+        let mut app = TuiShellApp::new_for_test();
+        app.engine.settings.autohide_panels = false;
+        app.engine.app_shell.hide_sidebar();
+        app.engine.session.explorer_visible = false;
+        app.engine
+            .open_file_with_mode(&file_a, crate::core::engine::OpenMode::Permanent)
+            .unwrap();
+        app.engine
+            .split_window(SplitDirection::Horizontal, Some(&file_b));
+        // Dirty the (about-to-be-hidden) active buffer B — :hide must never
+        // prompt about unsaved changes, unlike :quit.
+        app.engine.buffer_mut().insert(0, "DIRTY1154");
+
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        let screen = driver.screen();
+        assert!(
+            screen.contains("AAA1154HIDE") && screen.contains("BBB1154HIDE"),
+            "sanity: the split must paint both panes before :hide; \
+             screen:\n{screen}"
+        );
+
+        driver.type_char(':');
+        for c in "hide".chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
+        driver.render();
+
+        let screen = driver.screen();
+        assert!(
+            !screen.contains("Unsaved Changes"),
+            ":hide must never prompt about unsaved changes; screen:\n{screen}"
+        );
+        assert!(
+            !screen.contains("BBB1154HIDE") && !screen.contains("DIRTY1154"),
+            ":hide must close the active pane (buffer B); screen:\n{screen}"
+        );
+        assert!(
+            screen.contains("AAA1154HIDE"),
+            ":hide must leave the other pane's content on screen; \
+             screen:\n{screen}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1154 driver-tier coverage: `:bfirst`/`:blast` must switch which
+    /// buffer the single window actually paints, not just move
+    /// `Engine::goto_buffer`'s internal pointer.
+    ///
+    /// RED against unfixed `develop`: both commands fell through to the
+    /// unknown-ex-command fallback, so the screen would keep showing
+    /// `CCC1154BFL` (the most recently opened buffer) through both
+    /// assertions below.
+    #[test]
+    fn ex_bfirst_blast_switch_active_buffer_via_shell_app() {
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_test_1154_bfirst_blast_shell_app_{:?}",
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_a = dir.join("a1154bfl.txt");
+        let file_b = dir.join("b1154bfl.txt");
+        let file_c = dir.join("c1154bfl.txt");
+        std::fs::write(&file_a, "AAA1154BFL\n").unwrap();
+        std::fs::write(&file_b, "BBB1154BFL\n").unwrap();
+        std::fs::write(&file_c, "CCC1154BFL\n").unwrap();
+
+        let mut app = TuiShellApp::new_for_test();
+        // `TuiShellApp::new_for_test` already seeds one empty "[No Name]"
+        // buffer before any file is opened — it is still buffer #1
+        // afterwards (`open_file_with_mode` switches the window's buffer,
+        // it does not delete the one being switched away from), so it must
+        // be wiped out here or `:bfirst` would (correctly) land on it
+        // instead of `file_a`.
+        let initial_buffer_id = app.engine.active_buffer_id();
+        app.engine
+            .open_file_with_mode(&file_a, crate::core::engine::OpenMode::Permanent)
+            .unwrap();
+        app.engine
+            .open_file_with_mode(&file_b, crate::core::engine::OpenMode::Permanent)
+            .unwrap();
+        app.engine
+            .open_file_with_mode(&file_c, crate::core::engine::OpenMode::Permanent)
+            .unwrap();
+        app.engine.delete_buffer(initial_buffer_id, true).unwrap();
+        assert_eq!(app.engine.buffer_manager.len(), 3);
+
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        let screen = driver.screen();
+        assert!(
+            screen.contains("CCC1154BFL") && !screen.contains("AAA1154BFL"),
+            "sanity: the single window shows only the most recently \
+             opened buffer before any :b* command; screen:\n{screen}"
+        );
+
+        driver.type_char(':');
+        for c in "bfirst".chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
+        driver.render();
+        let screen = driver.screen();
+        assert!(
+            screen.contains("AAA1154BFL") && !screen.contains("CCC1154BFL"),
+            ":bfirst must switch the active window to the lowest-numbered \
+             buffer; screen:\n{screen}"
+        );
+
+        driver.type_char(':');
+        for c in "blast".chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
+        driver.render();
+        let screen = driver.screen();
+        assert!(
+            screen.contains("CCC1154BFL") && !screen.contains("AAA1154BFL"),
+            ":blast must switch the active window to the highest-numbered \
+             buffer; screen:\n{screen}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1154 driver-tier coverage: `:bwipeout`/`:bw` must actually remove
+    /// the buffer and repaint the window with whatever buffer
+    /// `delete_buffer` fell back to — the observable effect a user sees —
+    /// not just `buffer_manager.list()` inspected directly.
+    ///
+    /// RED against unfixed `develop`: `:bwipeout`/`:bw` fell through to the
+    /// unknown-ex-command fallback, so the screen would still show
+    /// `BBB1154BW` after the command ran.
+    #[test]
+    fn ex_bwipeout_removes_buffer_and_repaints_via_shell_app() {
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_test_1154_bwipeout_shell_app_{:?}",
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_a = dir.join("a1154bw.txt");
+        let file_b = dir.join("b1154bw.txt");
+        std::fs::write(&file_a, "AAA1154BW\n").unwrap();
+        std::fs::write(&file_b, "BBB1154BW\n").unwrap();
+
+        let mut app = TuiShellApp::new_for_test();
+        // See the sibling `:bfirst`/`:blast` test above: the seeded initial
+        // "[No Name]" buffer survives `open_file_with_mode` and must be
+        // wiped out so exactly the two files below are the only buffers.
+        let initial_buffer_id = app.engine.active_buffer_id();
+        app.engine
+            .open_file_with_mode(&file_a, crate::core::engine::OpenMode::Permanent)
+            .unwrap();
+        app.engine
+            .open_file_with_mode(&file_b, crate::core::engine::OpenMode::Permanent)
+            .unwrap();
+        app.engine.delete_buffer(initial_buffer_id, true).unwrap();
+        assert_eq!(app.engine.buffer_manager.len(), 2);
+
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        assert!(
+            driver.screen().contains("BBB1154BW"),
+            "sanity: buffer B must be active before :bw; screen:\n{}",
+            driver.screen()
+        );
+
+        driver.type_char(':');
+        for c in "bw".chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
+        driver.render();
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("AAA1154BW") && !screen.contains("BBB1154BW"),
+            ":bw must wipe out the active buffer and repaint the window \
+             with the remaining one; screen:\n{screen}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1154 driver-tier coverage: bare `:cc` must actually jump the
+    /// painted editor to the currently selected quickfix entry's file, not
+    /// just leave `quickfix_selected` untouched on the `Engine`.
+    ///
+    /// RED against unfixed `develop`: bare `:cc` fell through to the
+    /// unknown-ex-command fallback (only `:cc {N}` existed), so the screen
+    /// would never show `BBB1154CC` after the command ran.
+    #[test]
+    fn ex_bare_cc_jumps_to_current_quickfix_entry_via_shell_app() {
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_test_1154_cc_shell_app_{:?}",
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_a = dir.join("a1154cc.txt");
+        let file_b = dir.join("b1154cc.txt");
+        std::fs::write(&file_a, "AAA1154CC\n").unwrap();
+        std::fs::write(&file_b, "BBB1154CC\n").unwrap();
+
+        let mut app = TuiShellApp::new_for_test();
+        app.engine.quickfix_items = vec![
+            crate::core::project_search::ProjectMatch {
+                file: file_a.clone(),
+                line: 0,
+                col: 0,
+                line_text: String::new(),
+            },
+            crate::core::project_search::ProjectMatch {
+                file: file_b.clone(),
+                line: 0,
+                col: 0,
+                line_text: String::new(),
+            },
+        ];
+        app.engine.quickfix_selected = 1;
+        app.engine.quickfix_open = true;
+        app.engine.quickfix_has_focus = true;
+
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        assert!(
+            !driver.screen().contains("BBB1154CC"),
+            "sanity: must not already be looking at file B before :cc; \
+             screen:\n{}",
+            driver.screen()
+        );
+
+        driver.type_char(':');
+        for c in "cc".chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
+        driver.render();
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("BBB1154CC"),
+            ":cc must jump the editor to the currently selected quickfix \
+             entry; screen:\n{screen}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1154 driver-tier coverage: `:delmarks {marks}` must actually remove
+    /// the mark so a subsequent `` `{mark} `` jump reports "not set" and
+    /// leaves the cursor untouched — the observable behaviour a user sees —
+    /// not just `Engine::marks`'s map inspected directly (the engine-level
+    /// `test_ex_delmarks_removes_named_marks_1154` twin).
+    ///
+    /// Reads the status line's `"Ln {n}, Col {n}"` position readout (same
+    /// signal the pre-existing `right_text.contains("Ln 1")` render test
+    /// uses) to prove the cursor never moved, and the `"Mark `a` not set"`
+    /// message `keys.rs`'s backtick-jump handler emits when a mark is
+    /// absent.
+    ///
+    /// RED against unfixed `develop`: `:delmarks a` fell through to the
+    /// unknown-ex-command fallback, so mark `a` would still be set and
+    /// `` `a `` would silently jump to line 2 instead of reporting it
+    /// unset.
+    #[test]
+    fn ex_delmarks_removes_mark_so_backtick_jump_fails_via_shell_app() {
+        let mut app = TuiShellApp::new_for_test();
+        app.engine
+            .buffer_mut()
+            .insert(0, "L1154_1\nL1154_2\nL1154_3\n");
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        driver.press_named(quadraui::NamedKey::Escape);
+
+        // Move to line 2 and set mark 'a'.
+        driver.type_char('j');
+        driver.type_char('m');
+        driver.type_char('a');
+        driver.render();
+        assert!(
+            driver.screen().contains("Ln 2, Col 1"),
+            "sanity: mark 'a' must be set on line 2; screen:\n{}",
+            driver.screen()
+        );
+
+        // Back to line 1.
+        driver.type_char('k');
+        driver.render();
+        assert!(
+            driver.screen().contains("Ln 1, Col 1"),
+            "sanity: cursor must be back on line 1 before :delmarks; \
+             screen:\n{}",
+            driver.screen()
+        );
+
+        driver.type_char(':');
+        for c in "delmarks a".chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
+        driver.render();
+
+        // Attempt to jump to the now-deleted mark.
+        driver.type_char('`');
+        driver.type_char('a');
+        driver.render();
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("not set"),
+            ":delmarks a must remove mark 'a' so a backtick-jump reports \
+             it unset; screen:\n{screen}"
+        );
+        assert!(
+            screen.contains("Ln 1, Col 1"),
+            "cursor must not have moved, since the mark no longer exists; \
+             screen:\n{screen}"
+        );
+    }
 }

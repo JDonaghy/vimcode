@@ -154,6 +154,45 @@ fn test_ex_startinsert_bang_appends_at_end_of_line_1154() {
     assert_eq!(engine.buffer().to_string(), "abcZ");
 }
 
+/// #1154 review: `:startinsert` (no bang) must call `start_undo_group`
+/// *before* `clamp_cursor_col`, exactly like plain `i` does (`keys.rs`'s
+/// `#1003` comment) — not after, which is what the bang form (mirroring
+/// `A`, `#886`) correctly does. `start_undo_group` snapshots the pre-clamp
+/// cursor as `u`'s restore point, so getting the order backwards would only
+/// show up in the narrow edge case `clamp_cursor_col` exists for: the cursor
+/// sitting one column past end-of-line while nominally in Normal mode.
+/// Constructs that exact edge case by hand (`cursor.col = 2` on a 2-char
+/// line) and asserts `:startinsert` produces the identical post-`u` cursor
+/// and buffer as pressing `i` does from the same starting state.
+#[test]
+fn test_ex_startinsert_undo_restores_same_cursor_as_i_key_1154() {
+    fn make() -> Engine {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "ab");
+        engine.update_syntax();
+        engine.view_mut().cursor.col = 2; // one past 'b' — the #1003 edge case
+        engine
+    }
+
+    let mut via_i = make();
+    press_char(&mut via_i, 'i');
+    press_char(&mut via_i, 'X');
+    press_special(&mut via_i, "Escape");
+    press_char(&mut via_i, 'u');
+
+    let mut via_startinsert = make();
+    via_startinsert.execute_command("startinsert");
+    press_char(&mut via_startinsert, 'X');
+    press_special(&mut via_startinsert, "Escape");
+    press_char(&mut via_startinsert, 'u');
+
+    assert_eq!(
+        via_i.buffer().to_string(),
+        via_startinsert.buffer().to_string()
+    );
+    assert_eq!(via_i.view().cursor, via_startinsert.view().cursor);
+}
+
 #[test]
 fn test_ex_stopinsert_returns_to_normal_mode_1154() {
     let mut engine = Engine::new();
@@ -6623,6 +6662,58 @@ fn test_ex_delmarks_removes_named_marks_1154() {
     engine.execute_command("delmarks!");
     assert!(!engine.marks.get(&buf_id).unwrap().contains_key(&'a'));
     assert!(!engine.marks.get(&buf_id).unwrap().contains_key(&'b'));
+}
+
+#[test]
+fn test_ex_delmarks_range_deletes_every_mark_in_range_1154() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "a\nb\nc\nd\ne");
+    engine.update_syntax();
+
+    for (i, name) in ['a', 'b', 'c'].iter().enumerate() {
+        engine.view_mut().cursor.line = i;
+        press_char(&mut engine, 'm');
+        press_char(&mut engine, *name);
+    }
+    let buf_id = engine.active_buffer_id();
+    assert!(engine.marks.get(&buf_id).unwrap().contains_key(&'a'));
+    assert!(engine.marks.get(&buf_id).unwrap().contains_key(&'b'));
+    assert!(engine.marks.get(&buf_id).unwrap().contains_key(&'c'));
+
+    engine.execute_command("delmarks a-c");
+    let marks = engine.marks.get(&buf_id).unwrap();
+    assert!(!marks.contains_key(&'a'));
+    assert!(!marks.contains_key(&'b'));
+    assert!(!marks.contains_key(&'c'));
+}
+
+/// #1154 review nit: real Vim's `E475: Invalid argument` for a malformed
+/// `:delmarks` range — an inverted range (`c-a`) or a range spanning two
+/// different mark categories (`a-C`, lowercase to uppercase) — must be
+/// reported as an error, not silently reinterpreted as three individual
+/// one-character mark names (`c`, `-`, `a`). Neither range endpoint's mark
+/// may be touched when the command errors.
+#[test]
+fn test_ex_delmarks_invalid_range_errors_1154() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "a\nb\nc");
+    engine.update_syntax();
+    press_char(&mut engine, 'm');
+    press_char(&mut engine, 'a');
+    press_char(&mut engine, 'm');
+    press_char(&mut engine, 'c');
+    let buf_id = engine.active_buffer_id();
+
+    let action = engine.execute_command("delmarks c-a");
+    assert!(matches!(action, EngineAction::Error));
+    assert!(engine.message.contains("E475"));
+    assert!(engine.marks.get(&buf_id).unwrap().contains_key(&'a'));
+    assert!(engine.marks.get(&buf_id).unwrap().contains_key(&'c'));
+
+    let action = engine.execute_command("delmarks a-C");
+    assert!(matches!(action, EngineAction::Error));
+    assert!(engine.message.contains("E475"));
+    assert!(engine.marks.get(&buf_id).unwrap().contains_key(&'a'));
 }
 
 #[test]

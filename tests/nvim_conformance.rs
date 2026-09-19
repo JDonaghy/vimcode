@@ -3763,6 +3763,151 @@ const CASES_EX: &[Case] = &[
         1,
         ":%s/abc/def/g<CR>",
     ),
+    // #1154: bare `:cc` (no count) on an empty quickfix list. This is the
+    // one `:cc`-family behaviour this single-buffer harness can actually
+    // compare: `nvim_buf_set_lines` gives both sides an *unnamed* scratch
+    // buffer with no backing file, so there is no way to seed the two sides
+    // with an identical *populated* quickfix list (real Neovim needs
+    // `:vimgrep`-on-a-real-file or `:cexpr`, and vimcode's expression
+    // evaluator is explicitly out of scope for this milestone — see the
+    // module docs' "Coverage ratchet" section and #1154's own PR
+    // description). But the empty-list error path needs no quickfix state
+    // at all: confirmed by hand against `nvim --headless -u NONE` that a
+    // bare `:cc` with no quickfix list leaves the buffer and cursor
+    // completely untouched (it errors — `E42: No Errors` — before doing
+    // anything), which is exactly what vimcode's new bare-`:cc` handler
+    // does too (`execute.rs`'s `cmd == "cc"` arm, `self.quickfix_items.is_empty()`
+    // branch). Before #1154, bare `:cc` fell through to the unknown-ex-command
+    // fallback (`"Not an editor command: cc"`) instead of a real quickfix
+    // error, but that fallback is likewise a buffer/cursor no-op — so this
+    // case cannot regression-guard the historic bug by buffer/cursor
+    // comparison alone (`src/core/engine/tests.rs`'s
+    // `test_ex_cc_on_empty_quickfix_list_errors_1154` is what actually pins
+    // the message). What it *does* prove, and what retires `"ex::cc"` from
+    // `COVERAGE_EXEMPT`, is that the id now has a real, passing oracle case
+    // at all — required once a command stops being doc-exempt.
+    c(
+        "ex:cc on empty quickfix list",
+        &["a", "b", "c"],
+        2,
+        1,
+        ":cc<CR>",
+    ),
+    // #1154: the rest of this PR's backfilled ex commands. Each of these was
+    // confirmed by hand against `nvim --headless -u NONE` — a fresh
+    // single-tab/single-window/single-buffer session leaves every one of
+    // these a documented no-op or refusal, which is exactly what makes them
+    // usable here: this harness has no multi-tab/multi-window/multi-buffer
+    // real-file plumbing (see the multi-file harness section above, which
+    // needs real files on disk and its own `MultiFileCase`/`send_keys_multi`
+    // machinery), so a *populated* tab/buffer list identical on both sides
+    // isn't reachable from a bare `Case`. The no-op/refusal path is still a
+    // real, comparable behaviour, not a vacuous placeholder — a case that
+    // failed to recognise the command at all (the pre-#1154 unknown-ex-command
+    // fallback) also happens to leave the buffer/cursor untouched, so these
+    // do not regression-guard the historic "command didn't exist" bug (the
+    // engine-level `test_ex_*_1154` tests in `src/core/engine/tests.rs` do
+    // that, asserting on `Engine` state a bare buffer/cursor diff can't see);
+    // what they retire is the `COVERAGE_EXEMPT` entry itself, per this
+    // repo's "an id just needs one real passing case" bar (`ex:cc on empty
+    // quickfix list` above sets the same precedent).
+    c(
+        "ex:tabonly noop with one tab",
+        &["a", "b"],
+        1,
+        1,
+        ":tabonly<CR>",
+    ),
+    c(
+        "ex:tabfirst noop with one tab",
+        &["a", "b"],
+        1,
+        1,
+        ":tabfirst<CR>",
+    ),
+    c(
+        "ex:tablast noop with one tab",
+        &["a", "b"],
+        1,
+        1,
+        ":tablast<CR>",
+    ),
+    c(
+        "ex:bfirst noop with one buffer",
+        &["a", "b"],
+        1,
+        1,
+        ":bfirst<CR>",
+    ),
+    c(
+        "ex:blast noop with one buffer",
+        &["a", "b"],
+        1,
+        1,
+        ":blast<CR>",
+    ),
+    c(
+        "ex:hide refuses to close the last window",
+        &["a", "b"],
+        1,
+        1,
+        ":hide<CR>",
+    ),
+    // Leading `x` is a real edit (not just `engine_with`'s raw seed insert,
+    // which bypasses dirty-tracking on both sides — an *unmodified* sole
+    // buffer can genuinely be wiped out, and vimcode has no fallback empty
+    // buffer to swap the window onto afterwards, so exercising THAT path
+    // here would crash the harness rather than the oracle's Neovim). With a
+    // real dirty flag set identically on both sides, the un-forced wipe must
+    // refuse with "No write since last change" and leave buffer/cursor
+    // exactly where the `x` left them.
+    c(
+        "ex:bw refuses on a dirty buffer without a bang",
+        &["ab", "c"],
+        1,
+        1,
+        "x:bw<CR>",
+    ),
+    c(
+        "ex:bwipeout refuses on a dirty buffer without a bang",
+        &["ab", "c"],
+        1,
+        1,
+        "x:bwipeout<CR>",
+    ),
+    c("ex:delmarks a", &["a", "b", "c"], 2, 1, "ma:delmarks a<CR>"),
+    c(
+        "ex:delm a (abbreviation)",
+        &["a", "b", "c"],
+        2,
+        1,
+        "ma:delm a<CR>",
+    ),
+    // `:startinsert` differentially matters (unlike the no-ops above): typed
+    // text after it only lands as literal insertion if the command actually
+    // entered Insert mode. Before #1154 `:startinsert` fell through to the
+    // unknown-ex-command fallback, so `mode` stayed Normal and `XY` would
+    // have run as two Normal-mode commands instead.
+    c(
+        "ex:startinsert then type",
+        &["ab"],
+        1,
+        1,
+        ":startinsert<CR>XY<Esc>",
+    ),
+    // `:stopinsert` cannot be *typed* from Insert mode in real Vim (a bare
+    // `:` there just inserts a literal colon; reaching it needs `i_CTRL-O`
+    // or a script/mapping context this harness's single-keystroke-at-a-time
+    // `nvim_input` transport does not model). The comparable, safely-typeable
+    // case is the documented already-Normal no-op, which still exercises the
+    // real `cmd == "stopinsert"` dispatch arm added by this PR.
+    c(
+        "ex:stopinsert noop when already Normal",
+        &["ab"],
+        1,
+        1,
+        ":stopinsert<CR>x",
+    ),
 ];
 
 // ─────────────────────────── I. insert mode keys ───────────────────────────
@@ -7150,10 +7295,14 @@ const COMMAND_PROBES: &[CommandProbe] = &[
     p("ex::enew", Keys(":enew")),
     p("ex::bn", Keys(":bn")),
     p("ex::bp", Keys(":bp")),
+    p("ex::bfirst", Keys(":bfirst")),
+    p("ex::blast", Keys(":blast")),
     p("ex::b#", Keys(":b#")),
     p("ex::b {N}", Label("ex:b by number")),
     p("ex::bd", Keys(":bd")),
     p("ex::bdelete", Keys(":bdelete")),
+    p("ex::bw", Keys(":bw")),
+    p("ex::bwipeout", Keys(":bwipeout")),
     p("ex::ls", Keys(":ls")),
     p("ex::buffers", Keys(":buffers")),
     p("ex::split", Label("jump:multi C-o across split")),
@@ -7162,13 +7311,17 @@ const COMMAND_PROBES: &[CommandProbe] = &[
     p("ex::vs", Keys(":vs ")),
     p("ex::close", Keys(":close")),
     p("ex::only", Keys(":only")),
+    p("ex::hide", Keys(":hide")),
     p("ex::new", Keys(":new")),
     p("ex::vnew", Keys(":vnew")),
     p("ex::tabnew", Label("jump:multi C-o across tab")),
     p("ex::tabe", Keys(":tabe")),
     p("ex::tabclose", Keys(":tabclose")),
+    p("ex::tabonly", Keys(":tabonly")),
     p("ex::tabnext", Keys(":tabnext")),
     p("ex::tabprevious", Keys(":tabprevious")),
+    p("ex::tabfirst", Keys(":tabfirst")),
+    p("ex::tablast", Keys(":tablast")),
     p("ex::tabmove", Keys(":tabmove")),
     p("ex::[range]s/pat/rep/[flags] [count]", Label("sub:basic")),
     p("ex::%s/pat/rep/", Label("sub:%")),
@@ -7192,6 +7345,8 @@ const COMMAND_PROBES: &[CommandProbe] = &[
     p("ex::normal", Label("ex:normal Ax")),
     p("ex::noh", Label("ex:noh no effect")),
     p("ex::nohlsearch", Keys(":nohlsearch")),
+    p("ex::startinsert", Keys(":startinsert")),
+    p("ex::stopinsert", Keys(":stopinsert")),
     p("ex:Ex ranges", Label("ex:2;+1d")),
     p("ex::set {option}", Label("op:cc noautoindent")),
     p("ex::r {file}", Label("ex:r !echo")),
@@ -7214,13 +7369,21 @@ const COMMAND_PROBES: &[CommandProbe] = &[
     p("ex::print", Keys(":print")),
     p("ex::ma", Keys(":ma ")),
     p("ex::mark", Label("ex:2mark a")),
+    p("ex::delmarks", Keys(":delmarks")),
+    p("ex::delm", Keys(":delm ")),
     p("ex::retab", Label("ex:retab")),
     p("ex::saveas {file}", Keys(":saveas")),
     p("ex::update", Keys(":update")),
     p("ex::cquit", Keys(":cquit")),
     p("ex::version", Keys(":version")),
     p("ex::help", Keys(":help")),
-    p("ex::h", Keys(":h")),
+    // A bare `Keys(":h")` needle is exactly the over-crediting trap the
+    // module doc's "the probe is deliberately dumb" section warns about: it
+    // is a substring of `:help` (the id right above) and, since #1154, of
+    // `:hide` too — so it would silently "cover" `:h` off the back of an
+    // oracle case that never once typed the standalone `:h` help command.
+    // `<CR>` immediately after pins it to the bare, no-argument invocation.
+    p("ex::h", Keys(":h<CR>")),
     p("ex::windo {cmd}", Keys(":windo")),
     p("ex::bufdo {cmd}", Keys(":bufdo")),
     p("ex::tabdo {cmd}", Keys(":tabdo")),
@@ -7496,7 +7659,6 @@ const COVERAGE_EXEMPT: &[&str] = &[
     "ex::cclose",
     "ex::cn",
     "ex::cp",
-    "ex::cc",
     "ex::cd {path}",
     "ex::colorscheme",
     "ex::make",

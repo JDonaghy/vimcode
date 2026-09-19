@@ -1836,19 +1836,32 @@ impl Engine {
             for token in arg.split_whitespace() {
                 let bytes: Vec<char> = token.chars().collect();
                 if bytes.len() == 3 && bytes[1] == '-' {
-                    // Range, e.g. "a-c"
+                    // Range, e.g. "a-c" — real Vim only accepts a range
+                    // between two marks of the *same* category (both
+                    // lowercase, both uppercase, or both digits) with the
+                    // low end sorting before the high end; anything else
+                    // (an inverted range like "c-a", or a mixed-case range
+                    // like "a-C") is `E475: Invalid argument` and aborts the
+                    // whole command rather than being silently reinterpreted
+                    // as three individual one-character mark names (#1154
+                    // review nit).
                     let (lo, hi) = (bytes[0], bytes[2]);
-                    if lo <= hi {
-                        let mut c = lo;
-                        loop {
-                            chars_to_delete.push(c);
-                            if c == hi {
-                                break;
-                            }
-                            c = ((c as u8) + 1) as char;
-                        }
-                        continue;
+                    let same_category = (lo.is_ascii_lowercase() && hi.is_ascii_lowercase())
+                        || (lo.is_ascii_uppercase() && hi.is_ascii_uppercase())
+                        || (lo.is_ascii_digit() && hi.is_ascii_digit());
+                    if !same_category || lo > hi {
+                        self.message = format!("E475: Invalid argument: {}", token);
+                        return EngineAction::Error;
                     }
+                    let mut c = lo;
+                    loop {
+                        chars_to_delete.push(c);
+                        if c == hi {
+                            break;
+                        }
+                        c = ((c as u8) + 1) as char;
+                    }
+                    continue;
                 }
                 for c in token.chars() {
                     chars_to_delete.push(c);
@@ -1873,20 +1886,29 @@ impl Engine {
         // Handle :star[tinsert][!] — enter Insert mode as if `i` (or, with
         // `!`, `A`) had been pressed. Reuses the exact same field bookkeeping
         // those normal-mode keys use rather than reimplementing entry here
-        // (#1154).
+        // (#1154), including `start_undo_group`'s call order relative to the
+        // cursor adjustment: `A` starts its undo group *after* moving the
+        // cursor to end-of-line so `u` restores to the append position, not
+        // the pre-`A` cursor (#886), while plain `i` starts its undo group
+        // *before* `clamp_cursor_col` so `u` restores to the pre-clamp
+        // position exactly as pressing `i` would (#1003, keys.rs).
         if cmd == "startinsert" || cmd == "startinsert!" {
             if self.mode == Mode::Insert {
                 return EngineAction::None;
             }
             self.insert_repeat_count = 0;
-            self.insert_text_buffer.clear();
             if cmd == "startinsert!" {
+                self.insert_text_buffer.clear();
                 let line = self.view().cursor.line;
                 self.view_mut().cursor.col = self.get_line_len_for_insert(line);
-            } else if self.view().extra_cursors.is_empty() {
-                self.clamp_cursor_col();
+                self.start_undo_group();
+            } else {
+                self.start_undo_group();
+                self.insert_text_buffer.clear();
+                if self.view().extra_cursors.is_empty() {
+                    self.clamp_cursor_col();
+                }
             }
-            self.start_undo_group();
             self.set_mode(Mode::Insert);
             return EngineAction::None;
         }
