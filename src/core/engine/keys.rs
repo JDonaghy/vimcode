@@ -6523,6 +6523,13 @@ impl Engine {
 
         match key_name {
             "Escape" => {
+                // Vim abbreviation expansion (#1152): <Esc> is one of the
+                // trigger events, and must run before the autoindent-strip
+                // below — it operates on the same "text before cursor" that
+                // an abbreviation match consumes.
+                if self.try_expand_insert_abbrev(0) {
+                    *changed = true;
+                }
                 // `:h 'autoindent'` — leaving a line that's still nothing but
                 // the auto-inserted indent removes that indent (#804).
                 self.strip_blank_current_line_indent(changed);
@@ -6788,6 +6795,11 @@ impl Engine {
                     self.insert_text_buffer.push('\n');
                     *changed = true;
                 } else {
+                    // Vim abbreviation expansion (#1152): <CR> is a trigger
+                    // event, run before the newline split below so the split
+                    // sees the expanded text (matches Vim, and lines up with
+                    // the same ordering used for the <Esc> trigger above).
+                    self.try_expand_insert_abbrev(0);
                     let line = self.view().cursor.line;
                     // Compute the new line's indent from the *current* line's
                     // content before any stripping below touches it — the
@@ -7058,6 +7070,17 @@ impl Engine {
                         self.ensure_lsp_manager();
                         self.lsp_request_signature_help();
                     }
+                    // Vim abbreviation expansion (#1152): any typed
+                    // non-keyword character is a trigger — the character
+                    // itself was already inserted above and stays put
+                    // (`trailing = 1`), only the word/sequence before it may
+                    // be replaced. A char inserted via literal `<C-v>{c}`
+                    // (handled in its own early-return branch above, never
+                    // reaching this match arm) deliberately does not reach
+                    // here, which is what makes `<C-v>` suppress expansion.
+                    if !is_word_char(ch) && self.try_expand_insert_abbrev(1) {
+                        *changed = true;
+                    }
                 }
                 if *changed {
                     self.trigger_completion(false);
@@ -7228,6 +7251,12 @@ impl Engine {
                 EngineAction::None
             }
             "Return" => {
+                // Vim abbreviation expansion (#1152): <CR> is a trigger event
+                // for `:cabbrev`/`:abbreviate` on the command line, run
+                // before the buffer is captured so the expanded text is what
+                // actually executes (`:cabbrev W w` then typing `:W<CR>`
+                // must run `:w`).
+                self.try_expand_command_abbrev(0);
                 self.wildmenu_clear();
                 self.mode = Mode::Normal;
                 // If in history search, the matched command is already in command_buffer
@@ -7461,6 +7490,13 @@ impl Engine {
                                 cmd_char_to_byte(&self.command_buffer, self.command_cursor);
                             self.command_buffer.insert(byte_off, ch);
                             self.command_cursor += 1;
+                            // Vim abbreviation expansion (#1152): any typed
+                            // non-keyword character on the command line is a
+                            // trigger for `:cabbrev`/`:abbreviate`, same rule
+                            // as Insert mode.
+                            if !is_word_char(ch) {
+                                self.try_expand_command_abbrev(1);
+                            }
                         }
                     } else {
                         // Try plugin command-mode keymaps for unhandled special keys
@@ -9262,6 +9298,97 @@ impl Engine {
             Mode::Command => &["c"],
             _ => &[],
         }
+    }
+
+    // ─── User abbreviations (#1152) ─────────────────────────────────────────
+
+    /// Rebuild the parsed user_abbrevs cache from settings.abbreviations.
+    /// Call after loading or changing settings (mirrors `rebuild_user_keymaps`).
+    pub fn rebuild_user_abbrevs(&mut self) {
+        self.user_abbrevs = self
+            .settings
+            .abbreviations
+            .iter()
+            .filter_map(|s| parse_abbrev_def(s))
+            .collect();
+    }
+
+    /// Attempt Vim abbreviation expansion in Insert mode (`:h abbreviations`).
+    ///
+    /// `trailing` is how many characters already sitting at the cursor should
+    /// be left untouched and re-positioned after the replacement: `1` for a
+    /// just-typed non-keyword trigger character (which is inserted first, and
+    /// stays right after the expansion), `0` for `<Esc>`/`<CR>` — which
+    /// trigger on the word itself, with nothing typed after it yet.
+    ///
+    /// Abbreviations never span a line break, so only the current line's text
+    /// is considered (`:h abbreviations`). Multi-cursor inserts are not
+    /// expanded — `mc_insert` bulk-inserts identical text at every cursor
+    /// through a different path this hook does not see.
+    ///
+    /// Returns `true` if an expansion happened.
+    pub(crate) fn try_expand_insert_abbrev(&mut self, trailing: usize) -> bool {
+        if self.user_abbrevs.is_empty() || !self.view().extra_cursors.is_empty() {
+            return false;
+        }
+        let line = self.view().cursor.line;
+        let col = self.view().cursor.col;
+        if col < trailing {
+            return false;
+        }
+        let check_col = col - trailing;
+        let line_text: Vec<char> = self
+            .buffer()
+            .content
+            .line(line)
+            .chars()
+            .take(check_col)
+            .collect();
+        let Some((lhs_len, rhs)) = find_abbrev_match(&self.user_abbrevs, &line_text, "i")
+            .map(|(len, rhs)| (len, rhs.to_string()))
+        else {
+            return false;
+        };
+        let line_start = self.buffer().line_to_char(line);
+        let match_end = line_start + check_col;
+        let match_start = match_end - lhs_len;
+        self.delete_with_undo(match_start, match_end);
+        self.insert_with_undo(match_start, &rhs);
+        let new_check_col = check_col - lhs_len + rhs.chars().count();
+        self.view_mut().cursor.col = new_check_col + trailing;
+        true
+    }
+
+    /// Attempt Vim abbreviation expansion on the command line (`:h
+    /// abbreviations`, `c`-mode: `:cabbrev`/`:abbreviate`). Same `trailing`
+    /// convention as [`Engine::try_expand_insert_abbrev`] — `1` for a
+    /// just-typed non-keyword trigger character, `0` for `<CR>` (the command
+    /// about to run).
+    ///
+    /// Returns `true` if an expansion happened.
+    pub(crate) fn try_expand_command_abbrev(&mut self, trailing: usize) -> bool {
+        if self.user_abbrevs.is_empty() {
+            return false;
+        }
+        let full: Vec<char> = self.command_buffer.chars().collect();
+        if self.command_cursor < trailing || self.command_cursor > full.len() {
+            return false;
+        }
+        let check_col = self.command_cursor - trailing;
+        let prefix = &full[..check_col];
+        let Some((lhs_len, rhs)) = find_abbrev_match(&self.user_abbrevs, prefix, "c")
+            .map(|(len, rhs)| (len, rhs.to_string()))
+        else {
+            return false;
+        };
+        let match_start = check_col - lhs_len;
+        let mut new_full: Vec<char> = Vec::with_capacity(full.len() + rhs.chars().count());
+        new_full.extend_from_slice(&full[..match_start]);
+        new_full.extend(rhs.chars());
+        new_full.extend_from_slice(&full[check_col..]);
+        self.command_cursor = match_start + rhs.chars().count() + trailing;
+        self.command_buffer = new_full.into_iter().collect();
+        true
     }
 
     /// Check user keymaps for the current keypress. Returns `Some(action)` if

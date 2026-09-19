@@ -272,6 +272,8 @@ pub enum SettingsRow {
 // Each entry is (canonical_name, min_prefix_length).
 // `normalize_ex_command("sor foo")` → `"sort foo"`.
 static EX_ABBREVS: &[(&str, usize)] = &[
+    ("abbreviate", 2),
+    ("abclear", 3),
     ("bdelete", 2),
     ("bfirst", 2),
     ("blast", 2),
@@ -279,11 +281,13 @@ static EX_ABBREVS: &[(&str, usize)] = &[
     ("bprevious", 2),
     ("buffer", 1),
     ("bwipeout", 2),
+    ("cabbrev", 3),
     ("cclose", 3),
     ("cfirst", 4),
     ("clast", 3),
     ("close", 3),
     ("cnext", 2),
+    ("cnoreabbrev", 6),
     ("colorscheme", 4),
     ("copen", 4),
     ("copy", 2),
@@ -300,12 +304,15 @@ static EX_ABBREVS: &[(&str, usize)] = &[
     ("help", 1),
     ("hide", 3),
     ("history", 3),
+    ("iabbrev", 3),
+    ("inoreabbrev", 6),
     ("join", 1),
     ("jumps", 2),
     ("make", 3),
     ("mark", 2),
     ("move", 1),
     ("nohlsearch", 3),
+    ("noreabbrev", 5),
     ("number", 2),
     ("only", 2),
     ("print", 1),
@@ -331,6 +338,7 @@ static EX_ABBREVS: &[(&str, usize)] = &[
     ("tabonly", 4),
     ("tabprevious", 4),
     ("terminal", 2),
+    ("unabbreviate", 3),
     ("undo", 1),
     ("update", 2),
     ("version", 2),
@@ -1965,6 +1973,120 @@ fn parse_keymap_def(s: &str) -> Option<UserKeymap> {
     })
 }
 
+// ─── User abbreviations (#1152) ───────────────────────────────────────────────
+
+/// A parsed user-defined abbreviation from settings.json (`:h abbreviations`).
+///
+/// An abbreviation is a key-to-keys substitution like [`UserKeymap`], but
+/// triggered by typing a non-keyword character (or leaving Insert / running
+/// the command line) immediately after the `lhs`, rather than by typing the
+/// `lhs` as a command in its own right.
+#[derive(Debug, Clone)]
+pub struct UserAbbrev {
+    /// `"i"` (Insert-mode only, `:iabbrev`), `"c"` (Command-line only,
+    /// `:cabbrev`), or `"a"` (both, `:abbreviate`/`:noreabbrev`).
+    pub mode: String,
+    /// The abbreviation itself, e.g. `"teh"` or `"#i"`.
+    pub lhs: String,
+    /// The replacement text, e.g. `"the"`. May itself contain spaces.
+    pub rhs: String,
+}
+
+/// Parse one `settings.abbreviations` entry: `"mode lhs rhs..."` → `UserAbbrev`.
+/// Mirrors [`parse_keymap_def`]'s storage convention, but `rhs` may contain
+/// spaces (`"i @@ John Doe <jd@example.com>"`), so only the first two tokens
+/// are split off; everything after that is `rhs` verbatim.
+fn parse_abbrev_def(s: &str) -> Option<UserAbbrev> {
+    let s = s.trim();
+    let mut parts = s.splitn(3, ' ');
+    let mode = parts.next()?.to_string();
+    if !matches!(mode.as_str(), "i" | "c" | "a") {
+        return None;
+    }
+    let lhs = parts.next()?.to_string();
+    let rhs = parts.next()?.trim().to_string();
+    if lhs.is_empty() || rhs.is_empty() {
+        return None;
+    }
+    Some(UserAbbrev { mode, lhs, rhs })
+}
+
+/// An abbreviation's `lhs` falls into one of three classes (`:h
+/// abbreviations`), which determine what may precede a match for it to count
+/// as triggered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AbbrevClass {
+    /// full-id: every character is a keyword character (`'iskeyword'`):
+    /// `"foo"`.
+    Full,
+    /// end-id: ends in a keyword character, but has a non-keyword one
+    /// earlier: `"#i"`.
+    End,
+    /// non-id: does not end in a keyword character: `"def:"`.
+    Symbol,
+}
+
+fn classify_abbrev_lhs(lhs: &[char]) -> AbbrevClass {
+    match lhs.last() {
+        Some(&last) if is_word_char(last) => {
+            if lhs.iter().all(|&c| is_word_char(c)) {
+                AbbrevClass::Full
+            } else {
+                AbbrevClass::End
+            }
+        }
+        _ => AbbrevClass::Symbol,
+    }
+}
+
+/// Does `prefix` (the text immediately before the cursor / trigger, on one
+/// line) end with `lhs` in a position `:h abbreviations` counts as a match?
+///
+/// `full-id` abbreviations must be a whole word — preceded by a non-keyword
+/// character or the start of line — so `"teh"` matches in `"a teh"` but not
+/// in `"ateh"` (the "does not fire mid-word" rule, #1152). `end-id` and
+/// `non-id` abbreviations need no such boundary check: their own leading
+/// character is already non-keyword, so it can never be a continuation of a
+/// keyword run.
+fn abbrev_matches_at_end(prefix: &[char], lhs: &[char], class: AbbrevClass) -> bool {
+    if lhs.is_empty() || lhs.len() > prefix.len() {
+        return false;
+    }
+    let start = prefix.len() - lhs.len();
+    if prefix[start..] != *lhs {
+        return false;
+    }
+    match class {
+        AbbrevClass::Full => start == 0 || !is_word_char(prefix[start - 1]),
+        AbbrevClass::End | AbbrevClass::Symbol => true,
+    }
+}
+
+/// Find the best (longest) abbreviation match ending at `prefix`'s end,
+/// among `abbrevs` eligible for `mode` (`"i"` or `"c"`; entries stored as
+/// `"a"` match either). Longest-`lhs` wins when several could match, mirroring
+/// Vim's own preference for the longest word before the cursor.
+fn find_abbrev_match<'a>(
+    abbrevs: &'a [UserAbbrev],
+    prefix: &[char],
+    mode: &str,
+) -> Option<(usize, &'a str)> {
+    let mut best: Option<(usize, &str)> = None;
+    for ab in abbrevs {
+        if ab.mode != "a" && ab.mode != mode {
+            continue;
+        }
+        let lhs_chars: Vec<char> = ab.lhs.chars().collect();
+        let class = classify_abbrev_lhs(&lhs_chars);
+        if abbrev_matches_at_end(prefix, &lhs_chars, class)
+            && best.map(|(len, _)| lhs_chars.len() > len).unwrap_or(true)
+        {
+            best = Some((lhs_chars.len(), ab.rhs.as_str()));
+        }
+    }
+    best
+}
+
 // ── Keybinding reference generators ──────────────────────────────────────────
 
 pub(super) fn keybindings_reference_vim() -> String {
@@ -2543,6 +2665,8 @@ pub struct Engine {
     pub pending_key: Option<char>,
     /// Parsed user keymaps from settings (rebuilt on settings change).
     pub user_keymaps: Vec<UserKeymap>,
+    /// Parsed user abbreviations from settings (rebuilt on settings change).
+    pub user_abbrevs: Vec<UserAbbrev>,
     /// Accumulated keypress buffer for multi-key user keymap matching.
     pub keymap_buf: Vec<String>,
     /// Guard: true while replaying buffered keys through handle_key.
@@ -4030,6 +4154,7 @@ impl Engine {
             replace_flags: String::new(),
             pending_key: None,
             user_keymaps: Vec::new(),
+            user_abbrevs: Vec::new(),
             keymap_buf: Vec::new(),
             keymap_replaying: false,
             window_nav_overflow: None,
@@ -4561,6 +4686,7 @@ impl Engine {
             engine.menu_bar_visible = true;
         }
         engine.rebuild_user_keymaps();
+        engine.rebuild_user_abbrevs();
         engine.ensure_spell_checker();
         // Sync the syntax-highlighting line-count threshold before any file
         // is opened via restore_session_files / CLI args, so huge buffers

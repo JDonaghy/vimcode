@@ -1,6 +1,7 @@
 mod common;
 use common::*;
 use vimcode_core::EngineAction;
+use vimcode_core::Mode;
 use vimcode_core::RegType;
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -637,4 +638,199 @@ fn abbrev_h_help() {
     exec(&mut e, "h");
     // Help opens a split with help content
     assert!(!e.message.starts_with("Not an editor command"));
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  Group N: Vim abbreviations — :abbreviate / :iabbrev / :cabbrev (#1152)
+//
+//  Oracle cases named by the issue: full-id expansion, end-id expansion,
+//  <C-v> suppression, :cabbrev on the command line, and "does not fire
+//  mid-word" — each has a matching case here (fast, no `nvim` dependency)
+//  and in `tests/nvim_conformance.rs`'s `CASES_ABBREV` (the actual oracle).
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn vim_abbrev_iabbrev_full_id_expands_on_trigger_char() {
+    let mut e = engine_with("");
+    exec(&mut e, "iabbrev teh the");
+    press(&mut e, 'i');
+    type_chars(&mut e, "teh ");
+    assert_buf(&mut e, "the ");
+    assert_cursor(&e, 0, 4);
+}
+
+#[test]
+fn vim_abbrev_iabbrev_end_id_expands_on_trigger_char() {
+    let mut e = engine_with("");
+    exec(&mut e, "iabbrev #i #include");
+    press(&mut e, 'i');
+    type_chars(&mut e, "#i ");
+    assert_buf(&mut e, "#include ");
+}
+
+#[test]
+fn vim_abbrev_ctrl_v_suppresses_expansion() {
+    let mut e = engine_with("");
+    exec(&mut e, "iabbrev teh the");
+    press(&mut e, 'i');
+    type_chars(&mut e, "teh");
+    ctrl(&mut e, 'v');
+    press(&mut e, ' ');
+    // <C-v> before the trigger character inserts it literally and never
+    // reaches the abbreviation check — "teh" must stay unexpanded.
+    assert_buf(&mut e, "teh ");
+}
+
+#[test]
+fn vim_abbrev_does_not_fire_mid_word() {
+    let mut e = engine_with("");
+    exec(&mut e, "iabbrev teh the");
+    press(&mut e, 'i');
+    type_chars(&mut e, "ateh ");
+    // "teh" is preceded by the word character 'a', so it is not a whole
+    // word and must not expand (full-id abbreviations only fire on a
+    // complete word boundary).
+    assert_buf(&mut e, "ateh ");
+}
+
+#[test]
+fn vim_abbrev_expands_on_escape() {
+    let mut e = engine_with("");
+    exec(&mut e, "iabbrev teh the");
+    press(&mut e, 'i');
+    type_chars(&mut e, "teh");
+    press_key(&mut e, "Escape");
+    assert_buf(&mut e, "the");
+    assert_mode(&e, Mode::Normal);
+}
+
+#[test]
+fn vim_abbrev_expands_on_return() {
+    let mut e = engine_with("");
+    exec(&mut e, "iabbrev teh the");
+    press(&mut e, 'i');
+    type_chars(&mut e, "teh");
+    press_key(&mut e, "Return");
+    assert_eq!(get_lines(&e), vec!["the".to_string()]);
+}
+
+#[test]
+fn vim_abbrev_cabbrev_expands_on_trigger_char() {
+    let mut e = engine_with("");
+    exec(&mut e, "cabbrev H help");
+    press(&mut e, ':');
+    type_chars(&mut e, "H");
+    press(&mut e, ' ');
+    assert_eq!(e.command_buffer, "help ");
+}
+
+#[test]
+fn vim_abbrev_cabbrev_expands_and_runs_on_return() {
+    let mut e = engine_with("foo\n");
+    exec(&mut e, "cabbrev X %s/foo/bar/");
+    press(&mut e, ':');
+    type_chars(&mut e, "X");
+    press_key(&mut e, "Return");
+    assert_eq!(get_lines(&e), vec!["bar".to_string()]);
+}
+
+#[test]
+fn vim_abbrev_noreabbrev_variants_expand_like_their_plain_forms() {
+    let mut e = engine_with("");
+    exec(&mut e, "inoreabbrev teh the");
+    press(&mut e, 'i');
+    type_chars(&mut e, "teh ");
+    assert_buf(&mut e, "the ");
+
+    let mut e2 = engine_with("foo\n");
+    exec(&mut e2, "cnoreabbrev X %s/foo/bar/");
+    press(&mut e2, ':');
+    type_chars(&mut e2, "X");
+    press_key(&mut e2, "Return");
+    assert_eq!(get_lines(&e2), vec!["bar".to_string()]);
+}
+
+#[test]
+fn vim_abbrev_iabbrev_only_applies_in_insert_not_command() {
+    let mut e = engine_with("");
+    exec(&mut e, "iabbrev H help");
+    press(&mut e, ':');
+    type_chars(&mut e, "H");
+    press(&mut e, ' ');
+    // `:iabbrev` is Insert-mode only — the command line must not expand it.
+    assert_eq!(e.command_buffer, "H ");
+}
+
+#[test]
+fn vim_abbrev_lister_shows_defined_abbreviations() {
+    let mut e = engine_with("");
+    exec(&mut e, "iabbrev teh the");
+    exec(&mut e, "iabbrev");
+    assert_msg_contains(&e, "teh");
+    assert_msg_contains(&e, "the");
+}
+
+#[test]
+fn vim_abbrev_unabbreviate_removes_it() {
+    let mut e = engine_with("");
+    exec(&mut e, "iabbrev teh the");
+    exec(&mut e, "unabbreviate teh");
+    press(&mut e, 'i');
+    type_chars(&mut e, "teh ");
+    assert_buf(&mut e, "teh ");
+}
+
+#[test]
+fn vim_abbrev_abclear_removes_all() {
+    let mut e = engine_with("");
+    exec(&mut e, "iabbrev teh the");
+    exec(&mut e, "cabbrev H help");
+    exec(&mut e, "abclear");
+    assert!(e.settings.abbreviations.is_empty());
+    press(&mut e, 'i');
+    type_chars(&mut e, "teh ");
+    assert_buf(&mut e, "teh ");
+}
+
+#[test]
+fn vim_abbrev_abbreviate_applies_to_both_insert_and_command() {
+    let mut e = engine_with("foo\n");
+    exec(&mut e, "abbreviate X %s/foo/bar/");
+    press(&mut e, ':');
+    type_chars(&mut e, "X");
+    press_key(&mut e, "Return");
+    assert_eq!(get_lines(&e), vec!["bar".to_string()]);
+
+    let mut e2 = engine_with("");
+    exec(&mut e2, "abbreviate teh the");
+    press(&mut e2, 'i');
+    type_chars(&mut e2, "teh ");
+    assert_buf(&mut e2, "the ");
+}
+
+#[test]
+fn normalizer_ab_to_abbreviate() {
+    let mut e = engine_with("");
+    exec(&mut e, "ab teh the");
+    exec(&mut e, "iabbrev");
+    assert_msg_contains(&e, "teh");
+}
+
+#[test]
+fn normalizer_iab_to_iabbrev() {
+    let mut e = engine_with("");
+    exec(&mut e, "iab teh the");
+    press(&mut e, 'i');
+    type_chars(&mut e, "teh ");
+    assert_buf(&mut e, "the ");
+}
+
+#[test]
+fn normalizer_cab_to_cabbrev() {
+    let mut e = engine_with("");
+    exec(&mut e, "cab H help");
+    press(&mut e, ':');
+    type_chars(&mut e, "H");
+    press(&mut e, ' ');
+    assert_eq!(e.command_buffer, "help ");
 }
