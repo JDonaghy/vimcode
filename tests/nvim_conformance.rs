@@ -4065,6 +4065,27 @@ const CASES_ABBREV: &[Case] = &[
         // both sides, so the buffer and cursor stay exactly as they started.
         ":iabbrev H help<CR>:H<CR>x",
     ),
+    c(
+        // `:h :ia[bbrev]` — 2 chars (`:ia`) is real Vim/Neovim's minimal
+        // unambiguous prefix, confirmed against `nvim --headless -u NONE`.
+        "abbrev:2-char :ia prefix defines an iabbrev",
+        &[""],
+        1,
+        1,
+        ":ia teh the<CR>iteh <Esc>",
+    ),
+    c(
+        // `:h :ca[b]` — 2 chars (`:ca`) is real Vim/Neovim's minimal
+        // unambiguous prefix, confirmed against `nvim --headless -u NONE`.
+        // Expands into a safe substitution (not `:help`, which would open a
+        // real help window and make the two sides' final buffers
+        // environment-dependent to compare).
+        "abbrev:2-char :ca prefix defines a cabbrev",
+        &["foo"],
+        1,
+        1,
+        ":ca X %s/foo/bar/<CR>:X<CR>",
+    ),
 ];
 
 // ─────────────────────────── I. insert mode keys ───────────────────────────
