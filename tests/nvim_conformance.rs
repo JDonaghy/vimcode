@@ -1037,8 +1037,35 @@ fn apply_setup(settings: &mut Settings, setup: &str) -> Result<(), String> {
 /// `remap = true` makes it recursive (vimcode's `noremap = false`). Getting
 /// this default backwards would make every case using the plain 3-argument
 /// form compare vimcode's `noremap` against Neovim's `map`, silently.
+/// Scan a Lua options-table fragment (e.g. `{ remap = true }` or
+/// `{ noremap = true, silent = true }`) for an exact `key = true` /
+/// `key=true` assignment. A raw substring test (`inner.contains("remap =
+/// true")`) also matches inside `noremap = true` — `"noremap = true"[2..]`
+/// is literally `"remap = true"` — which would flip `remap` on for the
+/// opposite, and historically real, `nvim_set_keymap` option name (#1151
+/// review). Scanning comma-separated key=value segments and matching `key`
+/// as a whole token (not a substring) avoids that.
+fn has_true_opt(inner: &str, key: &str) -> bool {
+    inner.split(',').any(|part| {
+        let part = part
+            .trim()
+            .trim_start_matches('{')
+            .trim_end_matches('}')
+            .trim();
+        match part.strip_prefix(key) {
+            Some(rest) => {
+                let rest = rest.trim_start();
+                rest.strip_prefix('=')
+                    .map(|v| v.trim_start().starts_with("true"))
+                    .unwrap_or(false)
+            }
+            None => false,
+        }
+    })
+}
+
 fn apply_keymap_set(settings: &mut Settings, stmt: &str, inner: &str) -> Result<(), String> {
-    let remap = inner.contains("remap = true") || inner.contains("remap=true");
+    let remap = has_true_opt(inner, "remap");
     // "'i', 'jk', '<Esc>'".split('\'') → ["", "i", ", ", "jk", ", ", "<Esc>", ""],
     // so the three string arguments sit at indices 1, 3, 5.
     let quoted: Vec<&str> = inner.split('\'').collect();

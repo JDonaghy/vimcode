@@ -32159,3 +32159,51 @@ fn test_x_count_counts_cells_not_codepoints() {
         "2x must delete 2 cells (4 codepoints), not 2 codepoints"
     );
 }
+
+// ── normalize_key_token: <C-Space>/<C-Tab> case preservation (#1151 review) ──
+//
+// `encode_keypress` spells these two named keys with capital S/T
+// (`<C-Space>`, `<C-Tab>`) when it turns a live keypress into the string used
+// for keymap matching — unlike every other `<C-x>` combo, which it
+// lowercases. Before this fix, `normalize_key_token` lowercased everything
+// after `C-` unconditionally, so a keymap token written `<C-Space>` (vim's
+// own spelling, and vimcode's own default completion-trigger key,
+// `Settings::completion_trigger_key` in settings.rs) normalized to
+// `<C-space>` and could never match a real Ctrl+Space keypress again.
+
+#[test]
+fn normalize_key_token_preserves_ctrl_space_case() {
+    assert_eq!(normalize_key_token("<C-Space>"), "<C-Space>");
+    assert_eq!(normalize_key_token("<c-space>"), "<C-Space>");
+    assert_eq!(normalize_key_token("<C-SPACE>"), "<C-Space>");
+}
+
+#[test]
+fn normalize_key_token_preserves_ctrl_tab_case() {
+    assert_eq!(normalize_key_token("<C-Tab>"), "<C-Tab>");
+    assert_eq!(normalize_key_token("<c-tab>"), "<C-Tab>");
+    assert_eq!(normalize_key_token("<C-TAB>"), "<C-Tab>");
+}
+
+#[test]
+fn normalize_key_token_still_lowercases_ordinary_ctrl_combos() {
+    // Every other <C-x> combo is a single character and stays lowercased —
+    // only the two named keys above get the mixed-case treatment.
+    assert_eq!(normalize_key_token("<C-J>"), "<C-j>");
+    assert_eq!(normalize_key_token("<C-X>"), "<C-x>");
+}
+
+#[test]
+fn normalized_ctrl_space_round_trips_through_encode_keypress() {
+    // The whole point: a keymap token normalized from user input must equal
+    // what a live Ctrl+Space keypress encodes to, so `try_user_keymap`'s
+    // exact-match comparison actually fires.
+    assert_eq!(
+        normalize_key_token("<C-Space>"),
+        encode_keypress("Space", None, true)
+    );
+    assert_eq!(
+        normalize_key_token("<C-Tab>"),
+        encode_keypress("Tab", None, true)
+    );
+}
