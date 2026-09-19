@@ -1083,7 +1083,14 @@ pub struct WindowStatusLine {
 #[derive(Debug)]
 pub struct RenderedWindow {
     pub window_id: WindowId,
-    /// Pixel-space rectangle for the GTK backend (ignored by TUI).
+    /// Window rectangle. GTK reads it directly as sub-pixel float geometry
+    /// (Cairo paints exactly what's here). TUI reads it too — for popup
+    /// positioning (`tui_main::render_impl`'s completion/hover popup
+    /// clamping, #420) and, truncated to whole cells first via
+    /// [`tui_window_paint_rect`], for click/drag/hover column resolution
+    /// (#1040) — but is *not* the geometry TUI's own paint path draws
+    /// into; see [`tui_window_paint_rect`]'s doc for why TUI code must
+    /// truncate before using it.
     pub rect: WindowRect,
     /// Visible lines, one per row.
     pub lines: Vec<RenderedLine>,
