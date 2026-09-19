@@ -13938,14 +13938,22 @@ impl Theme {
 ///     window's status into a *separated* bar above the terminal instead,
 ///     freeing that window's own bottom row) but never checking
 ///     `terminal_maximized`.
-///   - GTK's `h_scrollbar_geometry` used `window_status_line &&
-///     !terminal_maximized` (to avoid offsetting the horizontal scrollbar
-///     for a status row that isn't painted while the terminal panel covers
-///     the editor windows entirely), but never checked `separate_status`.
+///   - GTK's old hand-rolled h-scrollbar geometry helper used
+///     `window_status_line && !terminal_maximized` (to avoid offsetting the
+///     horizontal scrollbar for a status row that isn't painted while the
+///     terminal panel covers the editor windows entirely), but never
+///     checked `separate_status`.
 ///
 /// Each covered an axis the other didn't, so either one alone could
-/// disagree with what actually gets painted. Both call sites now go through
-/// this one function instead.
+/// disagree with what actually gets painted.
+///
+/// #1128: GTK's own scrollbar geometry no longer consults this function at
+/// all — `quadraui::Editor::layout` (what paint actually uses, quadraui#968)
+/// lays scrollbars out against the window's raw, unshrunk rect regardless of
+/// a per-window status line, so `app_support::editor_scrollbar_layout`
+/// applying an offset here would just reintroduce a hover/paint disagreement
+/// in the opposite direction. `build_screen_layout_with_breadcrumb_row`
+/// remains this function's one live caller.
 pub fn window_status_row_reserved(engine: &Engine) -> bool {
     // While the terminal panel is maximized, editor windows are not the
     // visible surface at all (`breadcrumb_draw_targets` suppresses every
@@ -14051,7 +14059,8 @@ pub fn build_screen_layout_with_breadcrumb_row(
     let separate_status =
         per_window_status && !engine.settings.status_line_above_terminal && bottom_panel_open;
     // Single source of truth for "does this window paint its own bottom-row
-    // status line" (#728) — also consulted by GTK's `h_scrollbar_geometry`.
+    // status line" (#728). #1128: GTK's h-scrollbar geometry no longer
+    // consults this — see `window_status_row_reserved`'s doc for why.
     let own_status_row = window_status_row_reserved(engine);
 
     // Window-split dividers (#582) — independent of the `n >= 2` editor-group
@@ -24054,15 +24063,18 @@ mod tests {
 
     // ─── #728: single-predicate status-row reservation ──────────────────
 
-    /// `window_status_row_reserved` is now the only place either
-    /// `build_screen_layout` or GTK's `h_scrollbar_geometry` decide whether
-    /// a window paints its own bottom-row status line. Pin every axis it
-    /// depends on: the base setting, `terminal_maximized` (GTK's old
-    /// predicate accounted for this; `build_screen_layout`'s old one
-    /// didn't), and the `status_line_above_terminal`/bottom-panel
-    /// combination that produces a *separated* status bar instead
-    /// (`build_screen_layout`'s old predicate accounted for this; GTK's old
-    /// one didn't).
+    /// `window_status_row_reserved` is now the only place `build_screen_layout`
+    /// decides whether a window paints its own bottom-row status line — GTK's
+    /// old hand-rolled h-scrollbar geometry helper used to consult it too,
+    /// before #1128 found that GTK's real scrollbar paint (quadraui#968)
+    /// never shrinks its rect for the status row in the first place, so that
+    /// consultation was itself a source of hover/paint drift and was deleted
+    /// rather than fixed. Pin every axis this function depends on: the base
+    /// setting, `terminal_maximized` (GTK's old predicate accounted for
+    /// this; `build_screen_layout`'s old one didn't), and the
+    /// `status_line_above_terminal`/bottom-panel combination that produces a
+    /// *separated* status bar instead (`build_screen_layout`'s old predicate
+    /// accounted for this; GTK's old one didn't).
     #[test]
     fn window_status_row_reserved_covers_every_axis() {
         use crate::core::engine::Engine;

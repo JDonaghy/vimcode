@@ -8585,10 +8585,11 @@ mod scrollbar_paint {
     //! ShellApp, so #723's fix (`e02a824`, insetting that native widget
     //! past the minimap strip) was never visible on screen either — see
     //! the doc comment on the `Surface::Editor` push in
-    //! `App::render_content` for the full re-diagnosis and where the fix
-    //! actually needs to move (quadraui's `gtk::editor::draw_editor`,
-    //! which documents that it deliberately skips scrollbars on GTK today
-    //! and defers to the very host path this issue just deleted).
+    //! `App::render_content` for the full re-diagnosis. quadraui#968 has
+    //! since closed the gap this left: `gtk::editor::draw_editor` now paints
+    //! both scrollbars itself (see `scrollbar_pixels_paint_for_an_overflowing_editor_pane`
+    //! below and #1128, which corrected every other place in this codebase
+    //! that still assumed otherwise).
     //!
     //! `GtkDriver` paints into an in-memory Cairo `ImageSurface` and can
     //! only ever see Cairo-painted pixels, never native GTK overlay

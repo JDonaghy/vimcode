@@ -3896,36 +3896,28 @@ impl App {
         // across loop iterations, which is the borrow the two-phase shape here
         // exists to avoid.
         //
-        // #731: no vertical (or horizontal) scrollbar is painted for the
-        // editor on GTK today. quadraui's `gtk::editor::draw_editor` (the
-        // rasteriser `Surface::Editor` below calls into) documents that it
-        // deliberately skips scrollbars on GTK and defers to "the host" —
-        // meaning the Relm4-era native `gtk4::Scrollbar` overlay path this
-        // issue deleted (`sync_scrollbar`/`create_window_scrollbars`, plus
-        // the pixel-inset math in the now-deleted
-        // `native_scrollbar_margin_start`: `rect.x + rect.width -
-        // minimap_width - scrollbar_width - 2.0`, clamped to `rect.x`).
-        // That path never ran under the ShellApp runner (nothing assigns
-        // `self.overlay`/`self.drawing_area`), so it was already dead
-        // before this cleanup — this was not a working feature this PR
-        // broke.
+        // #1128 (was #731): both scrollbars ARE painted for the editor on
+        // GTK today. quadraui#968 taught `gtk::editor::draw_editor` (the
+        // rasteriser `Surface::Editor` below calls into) to paint both
+        // scrollbars itself, the way `tui::editor::draw_editor` already
+        // did — geometry comes from `Editor::layout`, the same call
+        // hit-testing uses, so paint and click agree by construction (see
+        // that rasteriser's module doc, "Scrollbars" section). This
+        // replaced the #731-era claim that GTK "deliberately skips
+        // scrollbars and defers to the host" — that sentence described the
+        // dead Relm4-era native `gtk4::Scrollbar` overlay path
+        // (`sync_scrollbar`/`create_window_scrollbars`) #731 deleted, which
+        // never ran under the ShellApp runner in the first place (nothing
+        // assigns `self.overlay`/`self.drawing_area`).
         //
-        // TUI's equivalent rasteriser (`quadraui::tui::editor`) paints an
-        // inline vertical + horizontal scrollbar column as part of the
-        // `Editor` primitive itself, narrowing the text viewport to make
-        // room — see `super::draw_scrollbar` calls in that module. GTK has
-        // no equivalent; closing this gap means teaching
-        // `quadraui::gtk::editor::draw_editor` to do the same (Cairo-paint
-        // a scrollbar inside `editor.rect`, mirroring TUI), which also
-        // makes the minimap inset automatic (the viewport is already
-        // narrowed by `minimap_reserved_width` before the rect reaches the
-        // rasteriser) — no separate margin-inset formula would be needed
-        // there. That is quadraui-side work per `CLAUDE.md`'s
-        // Platform-Neutrality Rule (file a quadraui issue; do not
-        // reintroduce GTK-specific scrollbar widget plumbing here). #723's
-        // fix (`e02a824`) targeted the dead native-widget path and cannot
-        // have been visible on screen; it needs re-verifying once this
-        // lands there.
+        // `app_support::editor_scrollbar_layout` builds the same
+        // `Editor`/`EditorLayout` pair (minus the rendered text, which
+        // scrollbar geometry never reads) so `h_scrollbar_thumb_geometry`/
+        // `v_scrollbar_thumb_geometry`/`h_scrollbar_hit_test`/
+        // `v_scrollbar_hit_test` below can never resolve a hover/drag rect
+        // paint didn't actually draw — #1128 deleted the pre-#968 h-scrollbar
+        // geometry helper that independently guessed its own track width and
+        // could disagree with what was actually painted.
         let mut window_editors: Vec<quadraui::Editor> = Vec::with_capacity(screen.windows.len());
         let mut hit_bars: Vec<(core::window::GroupId, quadraui::Rect, &quadraui::TabBar)> =
             Vec::new();
@@ -4958,8 +4950,9 @@ impl App {
                         h_scrollbar_hit_test(&engine, x, y, &rects, cw, lh)
                     {
                         let win_rect = rects.iter().find(|(id, _)| *id == win_id).map(|(_, r)| *r);
-                        let geom = win_rect
-                            .and_then(|rect| h_scrollbar_geometry(&engine, win_id, &rect, cw, lh));
+                        let geom = win_rect.and_then(|rect| {
+                            h_scrollbar_thumb_geometry(&engine, win_id, &rect, cw, lh)
+                        });
                         drop(engine);
                         if let Some((
                             track_x,
@@ -5053,8 +5046,9 @@ impl App {
                         v_scrollbar_hit_test(&engine, x, y, &rects, cw, lh)
                     {
                         let win_rect = rects.iter().find(|(id, _)| *id == win_id).map(|(_, r)| *r);
-                        let geom = win_rect
-                            .and_then(|rect| v_scrollbar_geometry(&engine, win_id, &rect, cw, lh));
+                        let geom = win_rect.and_then(|rect| {
+                            v_scrollbar_thumb_geometry(&engine, win_id, &rect, cw, lh)
+                        });
                         drop(engine);
                         if let Some((
                             _track_x,
