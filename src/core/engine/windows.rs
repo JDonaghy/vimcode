@@ -63,8 +63,15 @@ impl Engine {
         // of line (#1158) -- record the pre-switch position while `self`
         // still points at the window being left. Skip when leaving a
         // still-pristine scratch buffer, which real Neovim doesn't record
-        // either (`is_pristine_scratch_buffer`'s doc comment).
-        if file_path.is_some() && !self.is_pristine_scratch_buffer(current_buffer_id) {
+        // either (`is_pristine_scratch_buffer`'s doc comment), and skip
+        // when the "new" buffer is actually the same one already open
+        // (e.g. `:split <currently-open-path>`, which `buffer_manager`
+        // dedups by canonical path) -- a same-file reload is not "another
+        // file" in Neovim either (see `open_file_with_mode_impl`).
+        if file_path.is_some()
+            && new_buffer_id != current_buffer_id
+            && !self.is_pristine_scratch_buffer(current_buffer_id)
+        {
             self.push_jump_location();
         }
 
@@ -319,6 +326,7 @@ impl Engine {
 
     /// Create a new tab with an optional file.
     pub fn new_tab(&mut self, file_path: Option<&Path>) {
+        let current_buffer_id = self.active_buffer_id();
         let buffer_id = if let Some(path) = file_path {
             match self.buffer_manager.open_file(path) {
                 Ok(id) => {
@@ -339,8 +347,15 @@ impl Engine {
         // of line (#1158) -- record the pre-switch position while `self`
         // still points at the tab/window being left. Skip when leaving a
         // still-pristine scratch buffer, which real Neovim doesn't record
-        // either (`is_pristine_scratch_buffer`'s doc comment).
-        if file_path.is_some() && !self.is_pristine_scratch_buffer(self.active_buffer_id()) {
+        // either (`is_pristine_scratch_buffer`'s doc comment), and skip
+        // when the "new" buffer is actually the same one already open
+        // (e.g. `:tabnew <currently-open-path>`, which `buffer_manager`
+        // dedups by canonical path) -- a same-file reload is not "another
+        // file" in Neovim either (see `open_file_with_mode_impl`).
+        if file_path.is_some()
+            && buffer_id != current_buffer_id
+            && !self.is_pristine_scratch_buffer(current_buffer_id)
+        {
             self.push_jump_location();
         }
 
