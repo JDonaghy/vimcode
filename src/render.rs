@@ -10914,17 +10914,6 @@ pub fn gtk_minimap_sizing() -> quadraui::MinimapSizing {
 /// i.e. the ~2–6 px band #35 asks for.
 const MINIMAP_LINES_PER_ROW: usize = 4;
 
-/// Buffer columns folded into one aggregated colour cell — quadraui's TUI
-/// braille cell width, used for both backends for the same reason as
-/// [`MINIMAP_LINES_PER_ROW`].
-///
-/// `pub(crate)` since #1030 so the TUI black-box scenario
-/// (`tui_main::shell_app`'s `minimap_paints_syntax_colour_for_indented_code`)
-/// can derive "how many source columns does an N-cell braille strip cover"
-/// from the same constant production uses, instead of hardcoding the `22`
-/// that happens to fall out of an 11-cell strip at 100x24.
-pub(crate) const MINIMAP_COLS_PER_CELL: usize = 2;
-
 /// Ceiling on how many characters into a line `build_minimap_data`'s
 /// `to_col` closure ever looks when measuring a highlight's own column.
 /// Past this many characters, `aggregate_spans` would discard the column
@@ -11184,8 +11173,28 @@ pub struct RenderedMinimap {
     pub window_id: WindowId,
     /// The strip, in the caller's units (pixels for GTK, cells for TUI).
     pub rect: WindowRect,
-    /// The quadraui descriptor. Already sampled and colour-aggregated.
+    /// The quadraui descriptor. Already sampled — `lines` is final, but
+    /// `syntax_spans` starts **empty**. Colour aggregation can't happen
+    /// here: it needs `cols_per_cell`, and that scale is no longer a host
+    /// constant since quadraui#1032 made TUI's default resolve adaptively
+    /// from the buffer's own width (GTK's stays a fixed `1`). Only the
+    /// backend that is about to paint knows which one it'll use — asking
+    /// via `Backend::minimap_layout` requires a live backend, which this
+    /// struct (built at screen-layout time, before any backend-specific
+    /// call) does not have. `draw_minimap_strip` (`src/render.rs`) does
+    /// have one, reads `cols_per_cell` back from it, aggregates
+    /// `raw_syntax_spans` with a matching [`quadraui::MinimapGrid`], and
+    /// fills this field in immediately before painting — see that
+    /// function's doc comment (#1175).
     pub minimap: quadraui::Minimap,
+    /// Syntax highlight spans in raw, un-aggregated form (real character
+    /// columns, not cells) — [`draw_minimap_strip`] folds these into
+    /// `minimap.syntax_spans` once it knows the real `cols_per_cell` to
+    /// aggregate them at (#1175). Kept separate from `minimap` itself
+    /// (rather than one `RenderedMinimap::raw_spans` living beside an
+    /// eagerly-aggregated `syntax_spans`) so there is exactly one place
+    /// aggregation ever happens, not two that could silently drift.
+    pub raw_syntax_spans: Vec<quadraui::SyntaxSpan>,
 }
 
 /// Width the minimap reserves alongside the editor, in the caller's units.
@@ -11541,69 +11550,18 @@ pub fn build_minimap_data(
     if lines.is_empty() {
         return None;
     }
-    // #1030 (review round 2): the colour grid's raw-column budget comes
-    // from the strip this rasteriser actually paints, not a fixed
-    // constant — but `rect.width` alone cannot answer that for both
-    // backends, because it is in the *caller's own unit*
-    // (`RenderedMinimap::rect`'s doc comment: cells for TUI, pixels for
-    // GTK) and the two backends do not turn that unit into painted
-    // columns the same way:
-    //
-    // - TUI's braille cell packs `MINIMAP_COLS_PER_CELL` (2) raw columns
-    //   per painted cell, so `rect.width` cells of TUI strip consult
-    //   exactly `rect.width * 2` raw columns — `rect.width` really is a
-    //   column count here, and the formula is dimensionally exact.
-    // - GTK's rasteriser (`quadraui::gtk::minimap::draw_minimap`) does
-    //   *not* scale its per-row paint walk with `rect.width`'s pixel value
-    //   at all: every row is capped at a fixed
-    //   `quadraui::primitives::minimap::COLUMN_CAPACITY` (120) character
-    //   columns regardless of how wide the strip is in pixels (see that
-    //   constant's doc comment upstream). There is no formula that
-    //   converts GTK's `rect.width` (px) into "columns painted" — the two
-    //   are unrelated — so treating `rect.width` as a column count for GTK
-    //   the way the first version of this fix did was wrong: at
-    //   `MINIMAP_MIN_PX` (48) it produced a grid of only 96 raw columns,
-    //   under the 120 GTK's own paint walk can reach.
-    //
-    // Rather than branch on backend identity here (Platform-Neutrality
-    // Rule — this is shared code, not per-backend wiring), take the max of
-    // both backends' real requirements: TUI's exact
-    // `rect.width * COLS_PER_CELL` and GTK's fixed `COLUMN_CAPACITY`. An
-    // overestimate only ever costs unreachable aggregation work (bounded,
-    // and far smaller than the old flat 400 either backend ever hit); an
-    // underestimate silently drops colour data for columns a backend does
-    // paint (#990). GTK's real requirement (120) is a constant, so it is
-    // always included in the max — GTK is correct unconditionally,
-    // independent of `rect.width`'s pixel value — while TUI stays as tight
-    // as the strip it actually paints whenever that exceeds 120.
-    //
-    // Columns are **not** compressed to fit — quadraui#993 (landed in the
-    // pin this issue also bumps) made the TUI dot rasteriser stop
-    // per-line-normalising indentation for exactly this reason: a shared,
-    // literal column scale is what makes indentation on one line
-    // comparable to indentation on another, and content past
-    // `width_cells * COLS_PER_CELL` is meant to clip, not squeeze into
-    // view (VS Code parity). Colour aggregation already used literal
-    // columns before this fix and still does — only the grid's `cols` was
-    // wrong (too large to matter, never too small to drop anything in the
-    // visible range), so right-sizing it changes nothing about *which*
-    // columns are visible, only how much unreachable aggregation work the
-    // old 200-cell grid wasted on columns neither backend's paint loop was
-    // ever going to query.
-    //
-    // No trailing `.max(1)`: `COLUMN_CAPACITY` (120) is a non-zero constant
-    // and is always in the max, so the result is positive by construction
-    // (review nit, fix iteration 2 — the extra clamp was unreachable).
-    let visible_span_cols = ((rect.width.round().max(1.0)) as usize * MINIMAP_COLS_PER_CELL)
-        .max(quadraui::primitives::minimap::COLUMN_CAPACITY);
-
-    let grid = quadraui::MinimapGrid {
-        rows: lines.len().div_ceil(MINIMAP_LINES_PER_ROW).max(1),
-        cols: visible_span_cols.div_ceil(MINIMAP_COLS_PER_CELL).max(1),
-        lines_per_row: MINIMAP_LINES_PER_ROW,
-        cols_per_cell: MINIMAP_COLS_PER_CELL,
-    };
-    let syntax_spans = quadraui::aggregate_spans(&raw_spans, grid);
+    // #1175 (quadraui#1032): colour aggregation used to happen right here,
+    // against a `MinimapGrid` built from a hardcoded `MINIMAP_COLS_PER_CELL`.
+    // That stopped being safe the moment quadraui#1032 made TUI's default
+    // `cols_per_cell` adaptive to the buffer's own widest sampled line
+    // (GTK's stays a fixed `1`) — this function has no backend to ask, so
+    // it cannot know which scale will actually be painted. Aggregation is
+    // deferred to `draw_minimap_strip`, which *does* have a live
+    // `&dyn quadraui::Backend` and reads `cols_per_cell` back from
+    // `Backend::minimap_layout` immediately before painting (see that
+    // function's doc comment). `raw_spans` survives to that point
+    // unaggregated, in real (not cell) character columns.
+    let raw_syntax_spans = raw_spans;
 
     // Where the editor's viewport lands inside `lines`. Uses the editor
     // pane's own visible row count (`editor_visible_rows`), not
@@ -11626,11 +11584,14 @@ pub fn build_minimap_data(
         minimap: quadraui::Minimap {
             id: quadraui::WidgetId::new(format!("minimap:{}", window_id.0)),
             lines,
-            syntax_spans,
+            // Filled in by `draw_minimap_strip` once it knows the real,
+            // backend-resolved `cols_per_cell` to aggregate at (#1175).
+            syntax_spans: Vec::new(),
             visible_row_start,
             visible_row_count: visible_row_end.saturating_sub(visible_row_start).max(1),
             total_buffer_lines,
         },
+        raw_syntax_spans,
     })
 }
 
@@ -11641,8 +11602,32 @@ pub fn build_minimap_data(
 /// This is the *entire* backend-side contract for the minimap: GTK's font
 /// scaling and TUI's braille packing are quadraui's implementations of
 /// `Backend::draw_minimap`, so each backend's wiring is a single call to this
-/// function. Nothing about sampling, scaling, dot packing or colour
-/// aggregation exists on either side of it in vimcode.
+/// function. Nothing about sampling, dot packing or the *mechanics* of
+/// colour aggregation exists on either side of it in vimcode — only the
+/// *timing* of the one `quadraui::aggregate_spans` call does (#1175).
+///
+/// # Colour aggregation happens here, not in `build_minimap_data` (#1175)
+///
+/// quadraui#1032 made TUI's default `cols_per_cell` adapt to the buffer's
+/// own widest sampled line (GTK's stays a fixed `1`) instead of a constant
+/// either backend could hardcode. `build_minimap_data` runs at
+/// screen-layout time, before any backend-specific call, so it cannot know
+/// which scale is about to be painted — it hands `RenderedMinimap` an
+/// un-aggregated `raw_syntax_spans` (real character columns) alongside a
+/// `Minimap` whose `syntax_spans` starts empty. This function *does* have
+/// a live backend, so for each strip it:
+///
+/// 1. Asks `Backend::minimap_layout` for the `cols_per_cell` that backend
+///    will actually paint with — a no-paint call, since `syntax_spans` is
+///    still empty at this point and `minimap_layout` only reads `.lines`
+///    (mirrors `examples/common/minimap_app.rs`'s own read-back pattern
+///    upstream, which is what closed quadraui#1032's own colour/dot
+///    desync risk on quadraui's side of this fix).
+/// 2. Builds a [`quadraui::MinimapGrid`] from that *same* value — so the
+///    grid a cell's colour is aggregated at can never drift from the scale
+///    its dots are painted at, the exact desync #1000's review flagged and
+///    quadraui#1032 reopened by making the scale adaptive.
+/// 3. Aggregates `raw_syntax_spans` into that grid and paints.
 ///
 /// #723: the strip carries its own scroll affordance — `Minimap::layout`
 /// resolves a `viewport_highlight` band that *both* quadraui rasterisers
@@ -11665,11 +11650,72 @@ pub fn draw_minimap_strip(
         .minimap
         .iter()
         .map(|mm| {
-            backend
-                .draw_minimap(minimap_strip_rect(mm), &mm.minimap)
-                .layout
+            let rect = minimap_strip_rect(mm);
+            // No-paint probe: `mm.minimap.syntax_spans` is still empty
+            // here, which is fine — `minimap_layout` (both backends' own
+            // `Backend` impls) only ever reads `.lines` to resolve its
+            // scale.
+            let cols_per_cell = backend
+                .minimap_layout(rect, &mm.minimap)
+                .cols_per_cell
+                .max(1);
+            let grid = quadraui::MinimapGrid {
+                rows: mm
+                    .minimap
+                    .lines
+                    .len()
+                    .div_ceil(MINIMAP_LINES_PER_ROW)
+                    .max(1),
+                cols: minimap_grid_cols(mm.rect.width, cols_per_cell),
+                lines_per_row: MINIMAP_LINES_PER_ROW,
+                cols_per_cell,
+            };
+            let mut minimap = mm.minimap.clone();
+            minimap.syntax_spans = quadraui::aggregate_spans(&mm.raw_syntax_spans, grid);
+            backend.draw_minimap(rect, &minimap).layout
         })
         .collect()
+}
+
+/// Raw-column budget (`MinimapGrid::cols`) for a strip `cols_per_cell`
+/// columns wide per cell — see [`draw_minimap_strip`]'s doc comment for
+/// where `cols_per_cell` itself comes from (the backend's own resolved
+/// scale, never a host constant, as of #1175/quadraui#1032).
+///
+/// `rect_width` cannot alone answer "how many raw columns does this strip
+/// paint" for both backends, because it is in the *caller's own unit*
+/// (`RenderedMinimap::rect`'s doc comment: cells for TUI, pixels for GTK)
+/// and the two backends do not turn that unit into painted columns the
+/// same way:
+///
+/// - TUI's braille cell packs `cols_per_cell` raw columns per painted
+///   cell, so `rect_width` cells of TUI strip consult exactly
+///   `rect_width * cols_per_cell` raw columns — `rect_width` really is a
+///   column count here, and the formula is dimensionally exact.
+/// - GTK's rasteriser (`quadraui::gtk::minimap::draw_minimap`) does *not*
+///   scale its per-row paint walk with `rect_width`'s pixel value at all:
+///   every row is capped at a fixed
+///   `quadraui::primitives::minimap::COLUMN_CAPACITY` (120) character
+///   columns regardless of how wide the strip is in pixels (see that
+///   constant's doc comment upstream), and its own `cols_per_cell` is
+///   always `1` (`MinimapLayout`'s `Default`, and what
+///   `Minimap::layout_with_sizing` always sets), so `rect_width * 1` (a
+///   pixel count, at GTK's `MINIMAP_MIN_PX`..`MINIMAP_MAX_PX` range of
+///   48..240) is not dimensionally a column count at all.
+///
+/// Rather than branch on backend identity here (Platform-Neutrality Rule
+/// — this is shared code, not per-backend wiring), take the max of both
+/// backends' real requirements: TUI's exact `rect_width * cols_per_cell`
+/// and GTK's fixed `COLUMN_CAPACITY`. An overestimate only ever costs
+/// unreachable aggregation work; an underestimate silently drops colour
+/// data for columns a backend does paint (#990, and precisely the failure
+/// mode #1175 exists to close for TUI's now-adaptive scale — a fixed
+/// `COLUMN_CAPACITY` floor alone is not always enough once `cols_per_cell`
+/// itself can widen past what a hardcoded floor anticipated).
+fn minimap_grid_cols(rect_width: f64, cols_per_cell: usize) -> usize {
+    let visible_span_cols = ((rect_width.round().max(1.0)) as usize * cols_per_cell)
+        .max(quadraui::primitives::minimap::COLUMN_CAPACITY);
+    visible_span_cols.div_ceil(cols_per_cell).max(1)
 }
 
 /// The strip a `RenderedMinimap` occupies, in quadraui coordinates.

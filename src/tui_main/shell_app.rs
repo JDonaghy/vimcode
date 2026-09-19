@@ -20142,12 +20142,16 @@ mod tests {
     /// touched too) rather than recomputed from
     /// `render::minimap_reserved_width`'s formula.
     ///
-    /// Multiplied by `render::MINIMAP_COLS_PER_CELL` this is exactly the
-    /// range of *source character columns* the strip can represent, since
-    /// quadraui's TUI rasteriser maps one braille dot column to one source
-    /// column at a fixed scale (`braille_char_for_cell`'s
-    /// `cols_per_dot = (COLS_PER_CELL / 2).max(1)`, i.e. 1) — see
-    /// [`minimap_paints_syntax_colour_for_indented_code`]'s doc.
+    /// Before quadraui#1032, multiplying this by a fixed `COLS_PER_CELL`
+    /// gave exactly the range of *source character columns* the strip
+    /// could represent, since quadraui's TUI rasteriser mapped braille dot
+    /// columns to source columns at one constant scale. quadraui#1032 made
+    /// that scale adapt to the buffer's own widest sampled line instead, so
+    /// there is no longer a host-side constant to multiply by — a caller
+    /// that needs "how many source columns can this strip show" must read
+    /// the resolved scale back (`quadraui::MinimapLayout::cols_per_cell`,
+    /// which vimcode's own `render::draw_minimap_strip` reads back for
+    /// exactly this reason, #1175) rather than assume one.
     fn minimap_strip_width_cells(screen: &str) -> usize {
         screen
             .lines()
@@ -20273,7 +20277,19 @@ mod tests {
     /// painted frame.
     fn minimap_indent_runs(with_long_line: bool) -> (Vec<(usize, usize, usize, usize)>, String) {
         let mut app = app_for_minimap_test();
-        let mut text = String::from("x\n\n\n\n    x\n\n\n\n        x\n\n\n\n");
+        // #1175: each marker is 8 non-blank characters, not 1. Before
+        // quadraui#1032, TUI's dot scale was a fixed 1-column-per-dot, so a
+        // single character was always dense enough (100% coverage of its
+        // own 1-wide bucket) to survive the ordered-dither threshold
+        // (#1007). quadraui#1032 makes the scale a *per-file* property —
+        // driven by the buffer's own widest sampled line, `with_long_line`'s
+        // 300-character line included — so a lone character can now land
+        // in a much wider dot bucket (several source columns per dot) and
+        // fall below the dither threshold on its own, vanishing entirely
+        // regardless of indentation. An 8-character marker keeps enough
+        // density to survive that widening so this test can still probe
+        // indentation *position*, which is what it is actually about.
+        let mut text = String::from("xxxxxxxx\n\n\n\n    xxxxxxxx\n\n\n\n        xxxxxxxx\n\n\n\n");
         if with_long_line {
             text.push_str(&"y".repeat(300));
             text.push('\n');
@@ -20342,6 +20358,29 @@ mod tests {
     /// than the long line's — got 12 vs 12 cells`. Assertions (a) and (d)
     /// pass today, as this test's doc explains — they are post-fix
     /// properties, not the discriminators.
+    ///
+    /// # #1175 update: markers widened, assertion (d) dropped
+    ///
+    /// quadraui#1032 made `cols_per_cell` a *per-file* property, resolved
+    /// from the buffer's own widest sampled line rather than any one line
+    /// in isolation. Two consequences for this fixture, both intended
+    /// upstream behaviour rather than regressions:
+    ///
+    /// - A single marker character can now land in a dot bucket several
+    ///   source columns wide and fail the ordered-dither threshold (#1007)
+    ///   on its own — the marker widened from `"x"` to `"xxxxxxxx"` (8
+    ///   characters) so each indent level keeps enough density to survive
+    ///   whatever scale the file's widest line (`with_long_line`'s
+    ///   300-character line included) drives.
+    /// - Assertion (d) ("appending a long line must not move where the
+    ///   short lines' marks start") is no longer a valid invariant and was
+    ///   removed: since the scale is per-file, appending a much longer
+    ///   line elsewhere legitimately widens the scale every other line
+    ///   draws at, moving where their marks land. It was already
+    ///   documented above as a non-load-bearing nice-to-have, not the
+    ///   discriminator, so dropping it does not weaken this test's actual
+    ///   coverage — see the removed assertion's own comment for the
+    ///   measured before/after columns.
     #[test]
     fn minimap_indent_marks_track_the_files_own_indentation() {
         let (runs, screen) = minimap_indent_runs(false);
@@ -20357,60 +20396,64 @@ mod tests {
              minimap row; runs={long_runs:?}; screen:\n{long_screen}"
         );
 
-        crate::harness::known_bug_gate(
-            "minimap_indent_marks_track_the_files_own_indentation::tui",
-            || {
-                let [(first0, _, count0, strip_width), (first1, ..), (first2, ..)] = runs[..3]
-                else {
-                    unreachable!("length checked above")
-                };
+        // #1175: this used to run inside `crate::harness::known_bug_gate`,
+        // but its label was dropped from `KNOWN_BUGS` back when #990/
+        // quadraui#993 landed (the fix this test itself guards) — the gate
+        // had already become a pass-through, and an unlisted label just
+        // invites the next reader to think a bug is still parked here.
+        let [(first0, _, count0, strip_width), (first1, ..), (first2, ..)] = runs[..3] else {
+            unreachable!("length checked above")
+        };
 
-                // (a) Indentation ordering: deeper never starts left of
-                // shallower, and the deepest starts strictly right of the
-                // shallowest.
-                assert!(
-                    first0 <= first1 && first1 <= first2 && first0 < first2,
-                    "the three indent levels (0, 4, 8 spaces) must paint their \
-                 marks at non-decreasing columns with the deepest strictly \
-                 right of the shallowest; got first-dot columns \
-                 {first0}, {first1}, {first2}; screen:\n{screen}"
-                );
-
-                // (b) Extent, self-normalisation's direct symptom: one
-                // character cannot reasonably be the whole file's width.
-                assert!(
-                    count0 < strip_width,
-                    "a 1-character line must not paint a mark spanning the \
-                 entire {strip_width}-cell minimap strip — that is the \
-                 painted signature of per-line normalisation \
-                 (quadraui#993); screen:\n{screen}"
-                );
-
-                // (c) The discriminating comparison: in one file, a 1-char line
-                // and a 300-char line must not occupy the same width.
-                let (_, _, short_count, _) = long_runs[0];
-                let (_, _, long_count, _) = long_runs[3];
-                assert!(
-                    short_count < long_count,
-                    "in a file containing both a 1-character line and a \
-                 300-character line, the short line's minimap mark must be \
-                 narrower than the long line's — got {short_count} vs \
-                 {long_count} cells; screen:\n{long_screen}"
-                );
-
-                // (d) The issue's original proposal, kept as a post-fix
-                // property (see this test's doc for why it is not
-                // load-bearing): appending a long line must not shift where the
-                // short lines' marks start.
-                let before: Vec<usize> = runs[..3].iter().map(|r| r.0).collect();
-                let after: Vec<usize> = long_runs[..3].iter().map(|r| r.0).collect();
-                assert_eq!(
-                    before, after,
-                    "appending a long line must not move where the three short \
-                 lines' marks start; screen:\n{long_screen}"
-                );
-            },
+        // (a) Indentation ordering: deeper never starts left of
+        // shallower, and the deepest starts strictly right of the
+        // shallowest.
+        assert!(
+            first0 <= first1 && first1 <= first2 && first0 < first2,
+            "the three indent levels (0, 4, 8 spaces) must paint their \
+             marks at non-decreasing columns with the deepest strictly \
+             right of the shallowest; got first-dot columns \
+             {first0}, {first1}, {first2}; screen:\n{screen}"
         );
+
+        // (b) Extent, self-normalisation's direct symptom: one
+        // character cannot reasonably be the whole file's width.
+        assert!(
+            count0 < strip_width,
+            "a 1-character line must not paint a mark spanning the \
+             entire {strip_width}-cell minimap strip — that is the \
+             painted signature of per-line normalisation \
+             (quadraui#993); screen:\n{screen}"
+        );
+
+        // (c) The discriminating comparison: in one file, a short marker
+        // and a 300-character line must not occupy the same width.
+        let (_, _, short_count, _) = long_runs[0];
+        let (_, _, long_count, _) = long_runs[3];
+        assert!(
+            short_count < long_count,
+            "in a file containing both a short marker and a 300-character \
+             line, the short line's minimap mark must be narrower than the \
+             long line's — got {short_count} vs {long_count} cells; \
+             screen:\n{long_screen}"
+        );
+
+        // (d) [removed by #1175] The issue's original proposal was
+        // "appending a long line must not shift where the short lines'
+        // marks start" — already documented above as a nice-to-have, not
+        // load-bearing. quadraui#1032 makes `cols_per_cell` a *per-file*
+        // property (resolved from the buffer's own widest sampled line,
+        // not any one line in isolation), so appending a much longer line
+        // elsewhere in the same file legitimately widens the scale every
+        // other line is drawn at too — moving where their marks land is
+        // the documented, intended consequence of that design, not a
+        // regression. Measured directly: with the 8-character markers
+        // above, the three short marks start at columns `[87, 89, 91]`
+        // without the long line and `[87, 87, 88]` with it — order is
+        // preserved (assertion (a) still holds on `long_runs` implicitly,
+        // since indentation ordering is what actually matters), but the
+        // exact columns shift. Asserting position-invariance here would
+        // just be asserting quadraui#1032 away.
     }
 
     /// Open `n_lines` of `let value_N = 1;`, each indented by `indent`
@@ -20503,23 +20546,22 @@ mod tests {
         (colors, n_highlights, screen)
     }
 
-    /// #990 deliverable 3, fixed by **#1030**. Originally diagnosed as
-    /// vimcode's own (`render::build_minimap_data` handed
+    /// #990 deliverable 3, fixed by **#1030**; deliverable 2 (below) closed
+    /// on TUI by **quadraui#1032** / vimcode **#1175**. Originally diagnosed
+    /// as vimcode's own (`render::build_minimap_data` handed
     /// `quadraui::aggregate_spans` a `MinimapGrid` with a hardcoded
     /// `cols: MINIMAP_SPAN_COLS` (200) covering character columns 0..400,
     /// while the TUI strip is only ~11 cells wide) — but that diagnosis
     /// turned out to be a red herring: `cols: 200` never dropped anything
     /// the strip's own paint loop would have read anyway (200 cells ⊇ 11),
     /// so resizing it changes only how much unreachable aggregation work
-    /// happens, never what gets painted. `render::build_minimap_data` still
-    /// derives the grid from the painted strip's own width now (#1030) —
-    /// legitimate cleanup, not the fix.
+    /// happens, never what gets painted.
     ///
-    /// # What was actually entangled
+    /// # What was actually entangled (#990/#1030)
     ///
     /// Colour lookup (`quadraui::tui::minimap::cell_color`) was *always*
     /// literal: cell `col` reads real character columns
-    /// `col*COLS_PER_CELL..(col+1)*COLS_PER_CELL`, clipped to the strip's
+    /// `col*cols_per_cell..(col+1)*cols_per_cell`, clipped to the strip's
     /// own `width_cells` — unaffected by anything vimcode's grid contains.
     /// The actual bug was quadraui#993: dot rendering
     /// (`braille_char_for_cell`) normalised each line by its *own*
@@ -20528,125 +20570,45 @@ mod tests {
     /// every cell painted *some* dot. Colour's literal lookup found no
     /// aggregated span that far out and fell back to the theme default, so
     /// every one of those stretched-into-view dots painted in the same
-    /// fallback colour: `colors.len() == 1` for any indent past the
-    /// strip's real width (measured against unfixed `develop`, a 100-line
-    /// `.rs` buffer of `let value_N = 1;` indented by 0/8/20/40/80 spaces:
-    /// 5/3/2/1/1 distinct colours — the collapse tracked how much of each
-    /// line's *stretched* content still overlapped literal columns
-    /// 0..~22, not real indentation at all).
+    /// fallback colour. quadraui#993's fix made `braille_char_for_cell`
+    /// literal too — clipped, not stretched — so dots and colour agree: a
+    /// line indented past the strip's real (then-fixed) width painted no
+    /// dots at all, rather than stretched-but-wrongly-coloured ones.
     ///
-    /// quadraui#993's fix (landed in the `rev` #1030 also bumps) made
-    /// `braille_char_for_cell` literal too — clipped, not stretched, at
-    /// exactly the same `width_cells * COLS_PER_CELL` boundary colour
-    /// already used. Dots and colour now agree: a line indented past the
-    /// strip's real width paints **no** dots at all (nothing to colour),
-    /// rather than stretched-but-wrongly-coloured ones.
+    /// # #1030 deliverable 2, closed by quadraui#1032 / #1175
     ///
-    /// # What this scenario asserts, and where it stops
-    ///
-    /// Measured on the pinned rev at 100x24 (this test's own fixture: 100
-    /// lines of `let value_N = 1;` at a given indent, 400 highlights
-    /// throughout), the strip is **11 braille cells** wide and therefore
-    /// represents source columns `0..22` — one dot column per source
-    /// column, fixed scale. Distinct painted dot colours by indent:
-    ///
-    /// ```text
-    /// indent   0   4   8  12  16  18  20 | 22  24  28  40  80
-    /// colours  5   5   3   2   2   1   1 |  0   0   0   0   0
-    /// dot rows 20  20  20  20  20  20  20|  0   0   0   0   0
-    /// ```
-    ///
-    /// Two separate properties fall out of that, and this test asserts
-    /// both:
-    ///
-    /// 1. **Inside the strip's own column range, colour survives at every
-    ///    depth — not just near column 0.** The shrinking count is not a
-    ///    colour failure: it is the *visible window of the line* shrinking
-    ///    as indentation pushes content right (fewer tokens left in view,
-    ///    each still painted in its own colour). The assertion below is
-    ///    therefore not "N distinct colours" but the property that
-    ///    discriminates against #990's actual symptom: at every indent up
-    ///    to and including the deepest one the strip can show, at least one
-    ///    painted dot carries a real **syntax** colour rather than the
-    ///    theme fallback ([`minimap_fallback_dot_color`], measured, not
-    ///    hardcoded). #990's symptom was a strip painted *entirely* in that
-    ///    fallback.
-    /// 2. **The cut-off is exactly the strip's own width**, derived here as
-    ///    `minimap_strip_width_cells * render::MINIMAP_COLS_PER_CELL`, not
-    ///    a hardcoded 22/24. Indent `covered - 2` still paints; indent
-    ///    `covered` paints nothing at all. That pins the boundary from both
-    ///    sides, so neither a narrower strip nor a rasteriser that resumed
-    ///    stretching could slip through.
-    ///
-    /// # ⚠️ #1030 deliverable 2 is met on GTK, NOT on TUI, and is left open
-    ///
-    /// Issue #1030's written deliverable 2 says "colour must survive at
-    /// indent 40 and 80, not only near column 0". On **GTK that holds
-    /// literally and is asserted** —
+    /// Issue #1030's written deliverable 2 ("colour must survive at indent
+    /// 40 and 80, not only near column 0") used to hold on **GTK only** —
     /// `gtk::testing::minimap::minimap_paints_distinct_syntax_colors_at_indentation_via_gtk_driver`
-    /// measures 7 distinct painted colours at indents 0, 20, 40 *and* 80,
-    /// because GTK's strip is 120px wide and its rasteriser paints one 1px
-    /// block per character column out to `COLUMN_CAPACITY` (120).
+    /// — because TUI's rasteriser hardcoded a fixed `COLS_PER_CELL = 2`
+    /// (22 source columns for an 11-cell strip), and nothing vimcode passed
+    /// in could widen it. quadraui#1032 made that scale adapt to the
+    /// buffer's own widest sampled line instead (capped at
+    /// [`quadraui::primitives::minimap::COLUMN_CAPACITY`], VS Code's own
+    /// `minimap.maxColumn`), and vimcode#1175 wired the *colour* grid to
+    /// read the same resolved scale back (`render::draw_minimap_strip`,
+    /// via `Backend::minimap_layout`) instead of a stale hardcoded
+    /// constant — so indents 40 and 80 (well under a 100-line
+    /// `let value_N = 1;` fixture's ~120-column cap) now reach exactly like
+    /// GTK's already did.
     ///
-    /// On **TUI** property 1 above is as far as it is achievable, and the
-    /// gap is **not** a vimcode defect and **not** something this test is
-    /// entitled to redefine away: the TUI strip physically represents 22
-    /// source columns (11 cells x 2), because quadraui's TUI rasteriser
-    /// hardcodes
-    /// `COLS_PER_CELL = 2` with `cols_per_dot = (COLS_PER_CELL / 2).max(1)`
-    /// = **1 source column per dot column** in both
-    /// `braille_char_for_cell` and `cell_color`. Nothing vimcode passes in
-    /// — including the `MinimapGrid` this issue resized — can change that,
-    /// and the vimcode-side alternative (raise
-    /// `render::MINIMAP_TARGET_COLS_TUI` from 12 cells to the 60 needed to
-    /// cover GTK's/VS Code's 120 columns) would hand 60 of an 80-column
-    /// terminal to the minimap, which is not a real option.
+    /// # What this scenario asserts
     ///
-    /// The missing upstream API — an optional *shared* horizontal scale, so
-    /// a narrow braille strip can represent N source columns per dot
-    /// column without reintroducing quadraui#993's per-line normalisation —
-    /// is drafted in full in `docs/PENDING_QUADRAUI_ISSUES.md` ("TUI
-    /// minimap has no horizontal downsampling"). Per the Platform-Neutrality
-    /// Rule it is quadraui's to build, and per `GOALS.md`'s
-    /// milestone-discipline rule #1030's deliverable 2 stays **open behind
-    /// it** — the coordinator/human owns either filing that issue and
-    /// amending #1030's acceptance text to match the clip-not-stretch
-    /// behaviour verified here, or explicitly waiving the deliverable. This
-    /// test does not silently assert the deliverable away: the assertion
-    /// that a line past the boundary paints nothing carries that pointer,
-    /// so the unmet deliverable is findable by grep from the code that
-    /// depends on it.
-    ///
-    /// **RED against unfixed `develop`:** confirmed twice — by the original
-    /// fix round and again, on this exact test body, in fix iteration 2 — by
-    /// pointing `Cargo.toml`'s `rev` back at the unbumped pin
-    /// (`ed402b4ae0d9b753279bebe1bba4284dbe515d8a`, pre-quadraui#993) and
-    /// re-running `cargo test --no-default-features --lib
-    /// minimap_paints_syntax_colour_for_indented_code`. Property **2** is
-    /// the discriminator, and it fails at the very first past-boundary
-    /// indent:
-    ///
-    /// ```text
-    /// indent 22 is past the strip's own 22-column range (11 braille cells
-    /// x 2 columns), so it must paint NO dots at all — not dots stretched
-    /// into view (quadraui#993) and painted in a fallback colour that does
-    /// not belong to them. 400 highlights exist for this buffer. Got 1
-    /// distinct colour(s) on painted dots: {"Rgb(229, 229, 229)": 100}
-    /// ```
-    ///
-    /// — `Rgb(229, 229, 229)` is exactly the fallback colour
-    /// [`minimap_fallback_dot_color`] measures, and the painted strip in
-    /// that failure's screen dump reads `⠀⠀⠀⠀⠀⠀⣿⣿⣿⣿⣿` on all 20 rows:
-    /// 100 fully-set dot cells with nothing real behind them, stretched in
-    /// from a line whose content starts 22 columns off the right edge of an
-    /// 11-cell strip, against the `0` asserted now.
-    ///
-    /// Property **1** is *not* the discriminator and is not claimed to be:
-    /// it passes against the old pin too (stretching happened to leave real
-    /// tokens overlapping literal columns `0..22` at these indents). It is
-    /// there to stop the opposite regression — a future change that makes
-    /// the strip paint nothing, or paint only fallback dots, inside its own
-    /// column range — and to hold the achievable half of deliverable 2.
+    /// 1. **Colour survives at every depth up to and including 80** — not
+    ///    just near column 0 — and is the code's own syntax colour rather
+    ///    than the theme fallback ([`minimap_fallback_dot_color`], measured,
+    ///    not hardcoded). #990's symptom was a strip painted *entirely* in
+    ///    that fallback; #1030's unmet deliverable 2 was TUI clipping
+    ///    colour at indent 40/80 that GTK could already show.
+    /// 2. **Content genuinely past `COLUMN_CAPACITY` still clips** — VS
+    ///    Code parity, not unbounded widening. This is also the scenario
+    ///    that discriminates #1175's actual fix: if the colour grid is
+    ///    built with a stale `cols_per_cell` that undershoots what the
+    ///    rasteriser resolves, colour can vanish (or land on the wrong
+    ///    cell) well *before* this boundary too — property 1 at indent 80
+    ///    is that discriminator (see this test's sibling
+    ///    [`minimap_colour_grid_tracks_the_resolved_dot_scale`] for the
+    ///    RED-confirmed, more surgical version of that same failure mode).
     #[test]
     fn minimap_paints_syntax_colour_for_indented_code() {
         // Ungated (#1030 deleted this scenario's `KNOWN_BUGS` entry, and
@@ -20670,7 +20632,6 @@ mod tests {
         );
 
         let fallback = minimap_fallback_dot_color();
-        let cols_per_cell = crate::render::MINIMAP_COLS_PER_CELL;
         let strip_cells = minimap_strip_width_cells(&flat_screen);
         assert!(
             strip_cells >= 4,
@@ -20678,16 +20639,15 @@ mod tests {
              cells wide for the indent sweep below to have any depth to \
              sweep; got {strip_cells}; screen:\n{flat_screen}"
         );
-        let covered = strip_cells * cols_per_cell;
 
-        // Property 1 — colour survives at every depth the strip can show,
-        // right out to its last cell, and is the code's own syntax colour
-        // rather than the theme fallback (#990's symptom).
-        let deepest = covered - cols_per_cell;
-        let mut sweep = vec![0, 4, 8, deepest / 2, deepest];
-        sweep.sort_unstable();
-        sweep.dedup();
-        for indent in sweep {
+        // Property 1 — colour survives at every depth up to 80 (the #1030
+        // deliverable 2 depths), not just near column 0. Each of these
+        // buffers' widest line (`indent + len("let value_N = 1;")`, ~98 at
+        // most) sits comfortably under `COLUMN_CAPACITY`, so
+        // quadraui#1032's adaptive scale widens enough to keep the whole
+        // line in view — no `covered` arithmetic needed here, just the
+        // measured outcome.
+        for indent in [0, 4, 8, 40, 80] {
             let (colors, highlights, screen) = minimap_colors_for_indent(indent);
             // Candidate 1 of the issue's diagnosis ("highlights are empty
             // under the TUI") stays disproven at every depth, ungated.
@@ -20700,47 +20660,197 @@ mod tests {
             let syntax_coloured: Vec<&String> = colors.keys().filter(|c| **c != fallback).collect();
             assert!(
                 !syntax_coloured.is_empty(),
-                "indent {indent} is inside the strip's own {covered}-column \
-                 range ({strip_cells} braille cells x {cols_per_cell} \
-                 columns), so the code painted there must still carry its \
-                 own syntax colour — a strip painted *only* in the theme \
-                 fallback ({fallback}) is #990's symptom. Got {colors:?}; \
+                "indent {indent} is well under COLUMN_CAPACITY, so the code \
+                 painted there must still carry its own syntax colour — a \
+                 strip painted *only* in the theme fallback ({fallback}) is \
+                 #990's symptom, and colour vanishing specifically at 40/80 \
+                 is #1030 deliverable 2 regressing. Got {colors:?}; \
                  screen:\n{screen}"
             );
         }
 
-        // Property 2 — and nothing past the strip's own width, in either
-        // direction: clipped, never stretched into view under a fallback
-        // colour that doesn't belong to it.
-        //
-        // ⚠️ This is also where #1030's deliverable 2 ("colour must survive
-        // at indent 40 and 80") stands **unmet and open** — see this test's
-        // doc comment and the drafted upstream issue in
-        // `docs/PENDING_QUADRAUI_ISSUES.md` ("TUI minimap has no horizontal
-        // downsampling"). Do not read this assertion as the deliverable
-        // being satisfied or withdrawn; it is the measurement that shows
-        // the deliverable needs an upstream API vimcode does not have.
-        for indent in [covered, covered + 18, 80] {
-            let (colors, highlights, screen) = minimap_colors_for_indent(indent);
-            assert!(
-                highlights > 0,
-                "precondition: indenting the fixture by {indent} must not \
-                 stop tree-sitter highlighting it (candidate 1 of this \
-                 issue's diagnosis); got {highlights} highlights"
-            );
-            assert!(
-                colors.is_empty(),
-                "indent {indent} is past the strip's own {covered}-column \
-                 range ({strip_cells} braille cells x {cols_per_cell} \
-                 columns), so it must paint NO dots at all — not dots \
-                 stretched into view (quadraui#993) and painted in a \
-                 fallback colour that does not belong to them. \
-                 {highlights} highlights exist for this buffer. Got {} \
-                 distinct colour(s) on painted dots: {colors:?}; \
-                 screen:\n{screen}",
-                colors.len()
-            );
-        }
+        // Property 2 — content genuinely past COLUMN_CAPACITY still
+        // clips, VS Code parity rather than unbounded widening. The
+        // margin covers the adaptive scale's own rounding overshoot
+        // (`resolve_cols_per_cell` can cover a little past the cap; see
+        // that function's doc upstream), so this indent is unambiguously
+        // beyond anything the strip could ever be widened to reach.
+        let column_capacity = quadraui::primitives::minimap::COLUMN_CAPACITY;
+        let past_cap_indent = column_capacity + strip_cells * 2 + 20;
+        let (far_colors, far_highlights, far_screen) = minimap_colors_for_indent(past_cap_indent);
+        assert!(
+            far_highlights > 0,
+            "precondition: indenting the fixture by {past_cap_indent} must \
+             not stop tree-sitter highlighting it (candidate 1 of this \
+             issue's diagnosis); got {far_highlights} highlights"
+        );
+        assert!(
+            far_colors.is_empty(),
+            "indent {past_cap_indent} is well past COLUMN_CAPACITY \
+             ({column_capacity}), so it must paint NO dots at all — not \
+             dots stretched into view (quadraui#993) and painted in a \
+             fallback colour that does not belong to them. \
+             {far_highlights} highlights exist for this buffer. Got {} \
+             distinct colour(s) on painted dots: {far_colors:?}; \
+             screen:\n{far_screen}",
+            far_colors.len()
+        );
+    }
+
+    /// #1175 (quadraui#1032 host-side wiring): the minimap's colour grid
+    /// must track whichever `cols_per_cell` quadraui's TUI rasteriser
+    /// actually resolves for the buffer's own width, not a hardcoded
+    /// constant — otherwise a cell's *dots* and its *syntax colour*
+    /// describe different buffer columns, the exact desync
+    /// quadraui#993's own review flagged as a risk ("would quietly desync
+    /// the dot grid from `cell_color`'s colour grid again").
+    ///
+    /// # Mechanism
+    ///
+    /// `quadraui::aggregate_spans` weighs a histogram bucket by a span's
+    /// **full** length, not the length of its overlap with that bucket —
+    /// so a long span that merely *touches* a wide cell can still
+    /// out-weigh a short span that starts exactly at that cell's own
+    /// column 0. This fixture puts a short `keyword` token (`let`, weight
+    /// 3) at literal columns 0..3 and a long `comment` token (weight
+    /// ~150) that starts at column 9 — both inside cell 0's real column
+    /// range once the buffer's own width forces `cols_per_cell` to widen
+    /// past ~10 (quadraui#1032). Correctly aggregated (bucket width ==
+    /// the real resolved scale), cell 0's dominant colour is the
+    /// **comment's** (far more total weight). If the host aggregates with
+    /// a stale, narrower `cols_per_cell` instead, `aggregate_spans`
+    /// produces many narrow sub-buckets instead of one wide one, and
+    /// `cell_color`'s lookup (`.find()`, first match by ascending
+    /// `start_col`) returns whichever sub-bucket comes *first* — the
+    /// **keyword's**, since it starts at column 0 and the comment's own
+    /// sub-bucket doesn't begin until column 9. Same dots, wrong colour:
+    /// exactly the desync this issue closes.
+    ///
+    /// **RED against unfixed `render.rs`:** confirmed by reverting
+    /// `draw_minimap_strip`'s backend-resolved `cols_per_cell` read-back
+    /// (hardcoding the old fixed constant straight into the colour-grid
+    /// construction instead, with the pin still bumped to quadraui#1032's
+    /// rev) and re-running this test: cell 0 paints the `keyword` colour
+    /// instead of the `comment` colour that should dominate it.
+    #[test]
+    fn minimap_colour_grid_tracks_the_resolved_dot_scale() {
+        crate::core::buffer_manager::set_syntax_max_lines(20_000);
+
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_test_1175_minimap_colour_scale_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("wide1175.rs");
+        // `let x=1; // zzzz...` (a long trailing comment): "let" is a
+        // short `keyword` span at columns 0..3; the comment (`comment`
+        // scope) starts at column 9 and runs to the end of a ~160-column
+        // line, forcing quadraui#1032's adaptive scale to widen well past
+        // 10 for an ordinary ~11-cell TUI strip (see this test's doc for
+        // the exact mechanism this fixture is built to trigger).
+        let text = format!("let x=1; // {}\n", "z".repeat(150));
+        std::fs::write(&file, &text).unwrap();
+
+        let mut app = app_for_minimap_test();
+        app.engine
+            .open_file_with_mode(&file, crate::core::engine::OpenMode::Permanent)
+            .unwrap();
+        let win_id = app.engine.active_window_id();
+        let buf_id = app.engine.windows.get(&win_id).unwrap().buffer_id;
+        let highlights = app
+            .engine
+            .buffer_manager
+            .get(buf_id)
+            .unwrap()
+            .highlights
+            .clone();
+        let keyword_span = highlights
+            .iter()
+            .find(|(_, _, scope)| scope == "keyword")
+            .expect("precondition: 'let' must highlight as a keyword, or this fixture's own construction is broken");
+        let comment_span = highlights
+            .iter()
+            .find(|(_, _, scope)| scope == "comment")
+            .expect("precondition: the trailing '//' text must highlight as a comment, or this fixture's own construction is broken");
+        assert_eq!(
+            keyword_span.0, 0,
+            "precondition: 'let' must start at column 0, or cell 0's \
+             range no longer contains it; got {keyword_span:?}"
+        );
+        assert!(
+            comment_span.1 - comment_span.0 > (keyword_span.1 - keyword_span.0) * 10,
+            "precondition: the comment must far outweigh the keyword by \
+             total span length, or aggregate_spans's weighting cannot be \
+             expected to favour it; keyword={keyword_span:?} \
+             comment={comment_span:?}"
+        );
+
+        let driver = driver_with_shell(app, config(), 100, 24);
+        let screen = driver.screen();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let row = (0..screen.lines().count())
+            .find(|&r| minimap_dot_run(&screen, r).is_some())
+            .expect("the fixture line must paint at least one minimap row with a set dot");
+        let (_, _, _, strip_width) =
+            minimap_dot_run(&screen, row).expect("checked by find() above");
+        assert!(
+            strip_width >= 10,
+            "precondition: the minimap strip must be at least 10 cells \
+             wide for quadraui#1032's adaptive scale to plausibly widen \
+             cell 0 out to column 9 (the comment's start); got \
+             {strip_width}; screen:\n{screen}"
+        );
+
+        // Cell 0 is the leftmost braille glyph on the row — every cell in
+        // `draw_minimap`'s row loop gets a resolved `fg`, whether or not
+        // its own dot bits are set, so this is well-defined regardless of
+        // the dither threshold's outcome for cell 0 itself.
+        let cell0_col = screen
+            .lines()
+            .nth(row)
+            .expect("row exists, checked above")
+            .chars()
+            .enumerate()
+            .find(|(_, c)| ('\u{2800}'..='\u{28FF}').contains(c))
+            .map(|(i, _)| i)
+            .expect("precondition: the row must paint at least one braille cell");
+        let cell0_fg = driver
+            .style_at(cell0_col as u16, row as u16)
+            .expect("precondition: cell 0 must paint some style")
+            .fg;
+
+        // Onedark (the TUI's default theme) gives `keyword` and `comment`
+        // distinct RGB values — read directly off the theme rather than
+        // hardcoding a literal, so this stays correct if either preset
+        // colour is ever retuned.
+        let theme = crate::render::Theme::onedark();
+        let keyword_rgb =
+            ratatui::style::Color::Rgb(theme.keyword.r, theme.keyword.g, theme.keyword.b);
+        let comment_rgb =
+            ratatui::style::Color::Rgb(theme.comment.r, theme.comment.g, theme.comment.b);
+        assert_ne!(
+            keyword_rgb, comment_rgb,
+            "precondition: onedark's keyword and comment colours must \
+             differ, or this fixture cannot discriminate anything"
+        );
+
+        assert_eq!(
+            cell0_fg, comment_rgb,
+            "cell 0 covers real buffer columns [0, cols_per_cell) — wide \
+             enough, once quadraui#1032's scale resolves for this ~160-\
+             column line, to contain both the 3-column 'let' keyword and \
+             the ~150-column trailing comment that starts at column 9. \
+             quadraui::aggregate_spans weighs a cell by each span's full \
+             length, so the comment (far more total weight) must win the \
+             colour for that whole cell. Getting the keyword's colour \
+             ({keyword_rgb:?}) instead of the comment's ({comment_rgb:?}) \
+             means the colour grid was built at a different \
+             (narrower/stale) cols_per_cell than the dots were actually \
+             painted at; screen:\n{screen}"
+        );
     }
 
     // ── #1085: point-sample → block-aggregation ────────────────────────
