@@ -10439,6 +10439,94 @@ mod tests {
         );
     }
 
+    /// #420: the completion popup, anchored in the right-hand split of a
+    /// `:vnew`, must never render past that split's own left edge — not
+    /// even after the "shift left to avoid right-edge overflow" placement
+    /// kicks in for a long candidate label.
+    ///
+    /// Before the fix, `paint_editor_popups` clamped the popup's position
+    /// into the *shared* editor-band viewport (spanning every split), not
+    /// the *active window's own* rect, so the left-shift clamp let the
+    /// popup travel past the divider and render on top of the left split's
+    /// own content — which, with the left split narrow (or a sidebar open
+    /// next to it), looks exactly like the popup bleeding into the sidebar
+    /// region the bug report describes. GTK's equivalent code in `app.rs`
+    /// already scoped to the active window's own rect, so this was a
+    /// TUI-only divergence from the multi-backend rule.
+    ///
+    /// Asserts on rendered output: locates the right split's own left edge
+    /// via its per-window status line's leading `"INSERT"` mode badge
+    /// (`build_window_status_line` puts the mode text in
+    /// `left_segments[0]`, flush against the window's own rect — see that
+    /// function), then checks the popup's rendered left border+label never
+    /// starts left of it. Never asserts on `completion_layout` state
+    /// directly, which would stay populated (and pass) even if the popup
+    /// painted over the wrong split entirely (the #587/#592 failure shape).
+    ///
+    /// **Verified RED against unfixed `develop`:** before this fix, in this
+    /// exact fixture (90-col terminal, ~63-char candidate label), the
+    /// popup's rendered left edge landed at x=24 while the right split's
+    /// own status-line edge sat at x=47 — the popup painted 23 columns into
+    /// the left split. Reverting `render_impl.rs`'s `win_viewport` back to
+    /// the shared `viewport` reproduces this and fails the assertion below.
+    #[test]
+    fn completion_popup_stays_within_its_own_split_via_shell_app() {
+        let mut app = TuiShellApp::new_for_test();
+        // `:vnew` opens a *fresh empty buffer* in a new vertical split and
+        // moves focus there — unlike `:vsplit` (same buffer in both
+        // windows, same starting scroll position), this gives the two
+        // splits independent content with zero setup, so the long
+        // completion candidate only needs to exist in the split under
+        // test. Force the new (active) split onto the right, so that
+        // shifting the popup left to dodge a right-edge overflow is the
+        // exact case that could cross into the *other* split (`splitright`
+        // defaults to `false` — new window first/left — same as real Vim).
+        app.engine.settings.splitright = true;
+        app.engine.execute_command("vnew");
+        app.engine.buffer_mut().insert(
+            0,
+            "ZQXWFOOBARLONGCANDIDATEWORDXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX\n",
+        );
+
+        let mut driver = driver_with_shell(app, config(), 90, 24);
+        driver.render();
+        // Jump to the last line (the fresh buffer's only line, the long
+        // candidate above), open a new line below it, and type a prefix
+        // matching it — triggers the real word-completion auto-popup, in
+        // the right split only.
+        driver.type_char('G');
+        driver.type_char('o');
+        for c in "ZQXWFOO".chars() {
+            driver.type_char(c);
+        }
+        driver.render();
+
+        let screen = driver.screen();
+        let insert_bounds = driver
+            .find_bounds("INSERT")
+            .expect("right split must be in Insert mode and show its mode badge");
+
+        let popup_bounds = driver
+            // The candidate text also appears verbatim as plain buffer
+            // content (the line we inserted above); prefixing with the
+            // popup's own left border + label padding picks out the
+            // popup's rendering specifically, not that buffer line.
+            .find_bounds("│ ZQXWFOOBARLONGCANDIDATEWORD")
+            .expect("completion popup must be visible on screen");
+
+        // Small tolerance for the mode badge's own left padding inside the
+        // status bar — the real bug shifted the popup by ~12 columns, far
+        // outside this margin.
+        assert!(
+            popup_bounds.x + 3.0 >= insert_bounds.x,
+            "completion popup (x={}) must not render left of the right \
+             split's own edge (status line at x={}) — it bled into the \
+             neighbouring split; screen:\n{screen}",
+            popup_bounds.x,
+            insert_bounds.x,
+        );
+    }
+
     /// A focused terminal must swallow ordinary keys so they never reach the
     /// editor buffer — the divergence that made GTK unusable (there, `x` ran
     /// vim's delete-char on the file while the user thought they were typing
