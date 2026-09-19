@@ -1379,6 +1379,11 @@ impl Engine {
                 let max_line = self.buffer().len_lines().saturating_sub(1);
                 let line = (self.view().cursor.line + count - 1).min(max_line);
                 self.view_mut().cursor.line = line;
+                // `$` itself still lands on the last character even under
+                // `'virtualedit'` "all"/"onemore" (verified against `nvim
+                // --headless`: `$` alone stays put, only a *subsequent*
+                // motion like `l` goes past it) — the bonus column belongs
+                // to `move_right`, not here (#1153).
                 self.view_mut().cursor.col = self.get_max_cursor_col(line);
                 self.curswant = Some(CURSWANT_EOL);
             }
@@ -6648,6 +6653,29 @@ impl Engine {
                         && self.settings.expand_tab
                         && self.settings.smarttab
                         && (0..col).all(|i| self.buffer().content.char(line_start + i) == ' ');
+                    // `:h 'softtabstop'`: with 'softtabstop' set (and
+                    // 'expandtab' on), BackSpace over a run of spaces
+                    // "feels like" deleting a tab — remove
+                    // `min(sts, contiguous_blanks)` space characters
+                    // immediately before the cursor, wherever they are on
+                    // the line (not just at the front of it) — verified
+                    // against `nvim --headless` (#1153). Distinct from the
+                    // 'smarttab'-driven `leading_blanks` rule above: that
+                    // one always uses 'shiftwidth' and only fires when
+                    // *every* character before the cursor is blank; this one
+                    // is driven purely by 'softtabstop' and only requires
+                    // the character immediately before the cursor to be a
+                    // space.
+                    let sts = self.effective_softtabstop();
+                    let sts_run = if !leading_blanks && sts > 0 && self.settings.expand_tab {
+                        let mut n = 0usize;
+                        while n < col && self.buffer().content.char(char_idx - 1 - n) == ' ' {
+                            n += 1;
+                        }
+                        n.min(sts)
+                    } else {
+                        0
+                    };
                     if leading_blanks {
                         // `:h smarttab`: with 'smarttab' on (checked above),
                         // backspacing within leading indentation removes a
@@ -6658,6 +6686,11 @@ impl Engine {
                         let sw = self.effective_shift_width().max(1);
                         let new_col = ((col - 1) / sw) * sw;
                         self.delete_with_undo(line_start + new_col, char_idx);
+                        self.view_mut().cursor.col = new_col;
+                        *changed = true;
+                    } else if sts_run > 0 {
+                        let new_col = col - sts_run;
+                        self.delete_with_undo(char_idx - sts_run, char_idx);
                         self.view_mut().cursor.col = new_col;
                         *changed = true;
                     } else if col > 0 {
@@ -6806,8 +6839,15 @@ impl Engine {
                             && (0..col).all(|i| {
                                 matches!(self.buffer().content.char(line_start + i), ' ' | '\t')
                             });
+                        // `:h 'softtabstop'`: when set (and not overridden by
+                        // 'smarttab' at the front of the line, which always
+                        // uses 'shiftwidth'), Tab advances to the next
+                        // 'softtabstop' stop instead of 'tabstop' (#1153).
+                        let sts = self.effective_softtabstop();
                         let stop = if front_of_line {
                             self.effective_shift_width().max(1)
+                        } else if sts > 0 {
+                            sts
                         } else {
                             (self.settings.tabstop as usize).max(1)
                         };

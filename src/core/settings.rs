@@ -317,6 +317,48 @@ pub struct Settings {
     #[serde(default)]
     pub foldlevel: usize,
 
+    /// Whether `/` and `?` search wrap around the end/start of the buffer
+    /// when no more matches are found in the current direction. Corresponds
+    /// to Vim's `'wrapscan'` / `'ws'`. Default **true**, matching Vim
+    /// (`:h 'wrapscan'`).
+    #[serde(default = "default_true")]
+    pub wrapscan: bool,
+
+    /// When true, `>>`/`<<` (and their operator/count forms) round the
+    /// resulting indent to a multiple of `'shiftwidth'` instead of adding or
+    /// removing exactly one `'shiftwidth'`. Corresponds to Vim's
+    /// `'shiftround'` / `'sr'`. Default **false**, matching Vim (`:h
+    /// 'shiftround'`).
+    #[serde(default)]
+    pub shiftround: bool,
+
+    /// When true, inverts the meaning of the `:substitute` command's `g`
+    /// flag: every match on a line is replaced by default, and a `g` flag
+    /// toggles that off (replace only the first match per line). Corresponds
+    /// to Vim's `'gdefault'` / `'gd'`. Default **false**, matching Vim (`:h
+    /// 'gdefault'`).
+    #[serde(default)]
+    pub gdefault: bool,
+
+    /// Number of columns a `<Tab>`/`<BS>` "feels like" in Insert mode,
+    /// independent of `'tabstop'`. `0` (the default) disables this — Tab/BS
+    /// use `'tabstop'` as usual. A negative value is a documented Vim idiom
+    /// meaning "use `'shiftwidth'` instead" (`:h 'softtabstop'`). Only takes
+    /// effect when `'expandtab'` is on; mixed tab/space soft-tabs
+    /// (`noexpandtab` + `softtabstop`) are not modeled. Corresponds to Vim's
+    /// `'softtabstop'` / `'sts'`.
+    #[serde(default)]
+    pub softtabstop: i32,
+
+    /// Where the cursor may go past the end of a line, in Normal/Visual
+    /// mode. Corresponds to Vim's `'virtualedit'` / `'ve'`. Only the
+    /// documented "one column past the last character" effect of `"all"` /
+    /// `"onemore"` is implemented (applied to `l`/`<Right>`/`$`) — full
+    /// virtual-column placement anywhere in blank space (`"all"`'s complete
+    /// behavior) is not modeled. Default `""` (off), matching Vim.
+    #[serde(default)]
+    pub virtualedit: String,
+
     /// Highlight the line the cursor is on (default true).
     #[serde(default = "default_cursorline")]
     pub cursorline: bool,
@@ -1094,6 +1136,11 @@ impl Default for Settings {
             nrformats: default_nrformats(),
             foldmethod: default_foldmethod(),
             foldlevel: 0,
+            wrapscan: default_true(),
+            shiftround: false,
+            gdefault: false,
+            softtabstop: 0,
+            virtualedit: String::new(),
             cursorline: default_cursorline(),
             window_status_line: default_window_status_line(),
             status_line_above_terminal: default_status_line_above_terminal(),
@@ -1127,6 +1174,48 @@ impl Default for Settings {
             syntax_max_lines: default_syntax_max_lines(),
         }
     }
+}
+
+/// Real vim **boolean** options `:set` recognises by name (so a vimrc line
+/// naming one doesn't read as an unrecognised typo) but does not yet wire to
+/// any behaviour. `(long_name, short_name)`. #1153 — extend this table (and
+/// implement) as each is picked up; see the issue for the full missing-option
+/// audit and rough priority order.
+const UNIMPLEMENTED_BOOL_OPTIONS: &[(&str, &str)] = &[
+    ("hidden", "hid"),
+    ("list", "list"),
+    ("magic", "magic"),
+    ("showmatch", "sm"),
+    ("linebreak", "lbr"),
+    ("smartindent", "si"),
+    ("cindent", "cin"),
+    ("wildmenu", "wmnu"),
+    ("showcmd", "sc"),
+    ("ruler", "ru"),
+];
+
+/// Real vim **value** options `:set` recognises by name but does not yet
+/// wire to any behaviour. See [`UNIMPLEMENTED_BOOL_OPTIONS`]'s doc — same
+/// rationale, same table shape.
+const UNIMPLEMENTED_VALUE_OPTIONS: &[(&str, &str)] = &[
+    ("listchars", "lcs"),
+    ("whichwrap", "ww"),
+    ("backspace", "bs"),
+    ("clipboard", "cb"),
+    ("timeoutlen", "tm"),
+    ("wildmode", "wim"),
+    ("laststatus", "ls"),
+    ("sidescrolloff", "siso"),
+    ("scrolljump", "sj"),
+    ("iskeyword", "isk"),
+];
+
+/// Shared "recognised, not implemented" message for both option tables
+/// (#1153) — deliberately distinct wording from `"Unknown option: {opt}"` so
+/// a user (or a vimrc author) can tell "this is a typo" from "this is a real
+/// vim option vimcode hasn't wired up yet" at a glance.
+fn not_implemented_message(opt: &str) -> String {
+    format!("Option '{opt}' is recognised but not implemented yet")
 }
 
 impl Settings {
@@ -1179,6 +1268,16 @@ impl Settings {
     pub fn use_nerd_fonts(&self) -> bool {
         self.use_nerd_fonts
             .unwrap_or_else(|| default_use_nerd_fonts(crate::icons::is_gui_backend()))
+    }
+
+    /// Does `'virtualedit'` include the "one column past the last character"
+    /// effect (`"all"` or `"onemore"`)? The only subset of `'virtualedit'`
+    /// vimcode implements — see the field doc comment on
+    /// [`Settings::virtualedit`] (#1153).
+    pub(crate) fn virtualedit_allows_onemore(&self) -> bool {
+        self.virtualedit
+            .split(',')
+            .any(|t| t == "all" || t == "onemore")
     }
 
     /// Load settings from ~/.config/vimcode/settings.json
@@ -1469,6 +1568,9 @@ impl Settings {
             "showhiddenfiles" | "shf" => self.show_hidden_files = enable,
             "explorersortcaseinsensitive" | "esci" => self.explorer_sort_case_insensitive = enable,
             "swapfile" => self.swap_file = enable,
+            "wrapscan" | "ws" => self.wrapscan = enable,
+            "shiftround" | "sr" => self.shiftround = enable,
+            "gdefault" | "gd" => self.gdefault = enable,
             "breadcrumbs" => self.breadcrumbs = enable,
             "hidesingletab" | "hst" => self.hide_single_tab = enable,
             "autohidepanels" => self.autohide_panels = enable,
@@ -1483,6 +1585,19 @@ impl Settings {
             "nerdfonts" => {
                 self.use_nerd_fonts = Some(enable);
                 crate::icons::set_nerd_fonts(enable);
+            }
+            // #1153: real vim boolean options vimcode recognises but does not
+            // yet implement. Accepted (never "Unknown option") so a pasted
+            // vimrc line doesn't read as a typo, but rejected rather than
+            // silently no-op'd, per the issue's "reject with a 'recognised
+            // but not implemented' message" deliverable — a silent accept
+            // would be a worse lie than a loud one (the user would believe
+            // the behavior changed).
+            _ if UNIMPLEMENTED_BOOL_OPTIONS
+                .iter()
+                .any(|(n, a)| *n == opt || *a == opt) =>
+            {
+                return Err(not_implemented_message(opt));
             }
             _ => {
                 // Settings panel shows snake_case keys (e.g. `window_status_line`)
@@ -1586,6 +1701,54 @@ impl Settings {
                     .map_err(|_| format!("Invalid value for {name}: '{value}'"))?;
                 self.syntax_max_lines = n;
                 crate::core::buffer_manager::set_syntax_max_lines(n);
+            }
+            "softtabstop" | "sts" => {
+                let n: i32 = value
+                    .parse()
+                    .map_err(|_| format!("Invalid value for {name}: '{value}'"))?;
+                self.softtabstop = n;
+            }
+            "virtualedit" | "ve" => {
+                // `:h 'virtualedit'`: a comma-separated list of `all`,
+                // `block`, `insert`, `onemore`, or the empty string (off).
+                // Only `all`/`onemore`'s "one column past end of line"
+                // effect is implemented — see the field doc comment — but
+                // every real token is still accepted so `:set ve=all`
+                // doesn't read as invalid input.
+                if !value.is_empty() {
+                    for tok in value.split(',') {
+                        if !matches!(tok, "all" | "block" | "insert" | "onemore") {
+                            return Err(format!(
+                                "Invalid value for {name}: '{value}' (expected a comma-separated \
+                                 list of all/block/insert/onemore, or empty)"
+                            ));
+                        }
+                    }
+                }
+                self.virtualedit = value.to_string();
+            }
+            "foldmethod" | "fdm" => {
+                if value != "manual" && value != "indent" {
+                    return Err(format!(
+                        "Invalid value for {name}: '{value}' (only 'manual'/'indent' are \
+                         implemented)"
+                    ));
+                }
+                self.foldmethod = value.to_string();
+            }
+            "foldlevel" | "fdl" => {
+                let n: usize = value
+                    .parse()
+                    .map_err(|_| format!("Invalid value for {name}: '{value}'"))?;
+                self.foldlevel = n;
+            }
+            // #1153: see `UNIMPLEMENTED_BOOL_OPTIONS`'s doc comment — same
+            // rationale, value-option side.
+            _ if UNIMPLEMENTED_VALUE_OPTIONS
+                .iter()
+                .any(|(n, a)| *n == name || *a == name) =>
+            {
+                return Err(not_implemented_message(name));
             }
             _ => {
                 // Snake_case → packed-name fallback (see `set_bool_option`).
@@ -1792,6 +1955,34 @@ impl Settings {
             }),
             "syntax_max_lines" | "syntaxmaxlines" => {
                 Ok(format!("syntax_max_lines={}", self.syntax_max_lines))
+            }
+            "wrapscan" | "ws" => Ok(if self.wrapscan {
+                "wrapscan".to_string()
+            } else {
+                "nowrapscan".to_string()
+            }),
+            "shiftround" | "sr" => Ok(if self.shiftround {
+                "shiftround".to_string()
+            } else {
+                "noshiftround".to_string()
+            }),
+            "gdefault" | "gd" => Ok(if self.gdefault {
+                "gdefault".to_string()
+            } else {
+                "nogdefault".to_string()
+            }),
+            "softtabstop" | "sts" => Ok(format!("softtabstop={}", self.softtabstop)),
+            "virtualedit" | "ve" => Ok(format!("virtualedit={}", self.virtualedit)),
+            "foldmethod" | "fdm" => Ok(format!("foldmethod={}", self.foldmethod)),
+            "foldlevel" | "fdl" => Ok(format!("foldlevel={}", self.foldlevel)),
+            _ if UNIMPLEMENTED_BOOL_OPTIONS
+                .iter()
+                .any(|(n, a)| *n == opt || *a == opt)
+                || UNIMPLEMENTED_VALUE_OPTIONS
+                    .iter()
+                    .any(|(n, a)| *n == opt || *a == opt) =>
+            {
+                Err(not_implemented_message(opt))
             }
             _ => {
                 // Snake_case → packed-name fallback (see `set_bool_option`).

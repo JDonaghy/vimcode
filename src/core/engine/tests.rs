@@ -28407,6 +28407,220 @@ fn test_nvim_search_backward_question() {
     assert_eq!(engine.view().cursor.col, 8);
 }
 
+// -- #1153: 'wrapscan' --
+
+#[test]
+fn test_1153_wrapscan_off_does_not_wrap_forward_search() {
+    // `:h 'wrapscan'`: off, `/` past the last match stays put instead of
+    // wrapping to the top (verified against `nvim --headless`).
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "alpha\nbeta\ngamma\n");
+    engine.update_syntax();
+    engine.feed_keys(":set nowrapscan<CR>");
+    engine.view_mut().cursor.line = 2;
+    engine.view_mut().cursor.col = 0;
+    engine.feed_keys("/alpha<CR>");
+    // Stayed on line 2 (gamma) — did not wrap to line 0 (alpha).
+    assert_eq!(engine.view().cursor.line, 2);
+}
+
+#[test]
+fn test_1153_wrapscan_on_still_wraps_forward_search() {
+    // Default (wrapscan on) — unchanged from `test_nvim_search_wraps_around`,
+    // pinned again here so a regression in the new `nowrapscan` branch is
+    // caught by the same option's own test group.
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "alpha\nbeta\ngamma\n");
+    engine.update_syntax();
+    engine.view_mut().cursor.line = 2;
+    engine.feed_keys("/alpha<CR>");
+    assert_eq!(engine.view().cursor.line, 0);
+    assert_eq!(engine.view().cursor.col, 0);
+}
+
+// -- #1153: 'gdefault' --
+
+#[test]
+fn test_1153_gdefault_makes_plain_sub_replace_every_match_on_the_line() {
+    // `:h 'gdefault'`: on, plain `:s/a/x/` (no `g` flag) behaves like
+    // `:s/a/x/g` — verified against `nvim --headless`.
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "aaa\n");
+    engine.update_syntax();
+    engine.feed_keys(":set gdefault<CR>");
+    engine.feed_keys(":s/a/x/<CR>");
+    assert_eq!(engine.buffer().to_string(), "xxx\n");
+}
+
+#[test]
+fn test_1153_gdefault_g_flag_toggles_back_to_first_match_only() {
+    // `:h 'gdefault'`: on, a `g` flag on the command toggles the meaning
+    // back off — replaces only the first match per line.
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "aaa\n");
+    engine.update_syntax();
+    engine.feed_keys(":set gdefault<CR>");
+    engine.feed_keys(":s/a/x/g<CR>");
+    assert_eq!(engine.buffer().to_string(), "xaa\n");
+}
+
+// -- #1153: 'shiftround' --
+
+#[test]
+fn test_1153_shiftround_rounds_indent_up_to_shiftwidth_multiple() {
+    // `:h 'shiftround'`: `>>` lands on the next multiple of 'shiftwidth'
+    // instead of always adding exactly one — verified against
+    // `nvim --headless` (cols=5, sw=4 → 8, not 5+4=9).
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "     x\n"); // 5-space indent
+    engine.update_syntax();
+    engine.feed_keys(":set shiftround sw=4 expandtab<CR>");
+    engine.feed_keys(">>");
+    let line = engine.buffer().content.line(0).to_string();
+    assert_eq!(line.chars().take_while(|&c| c == ' ').count(), 8);
+}
+
+#[test]
+fn test_1153_noshiftround_indent_adds_exactly_one_shiftwidth() {
+    // Default (shiftround off) — `>>` always adds exactly 'shiftwidth',
+    // regardless of the existing indent's alignment.
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "     x\n"); // 5-space indent
+    engine.update_syntax();
+    engine.feed_keys(":set noshiftround sw=4 expandtab<CR>");
+    engine.feed_keys(">>");
+    let line = engine.buffer().content.line(0).to_string();
+    assert_eq!(line.chars().take_while(|&c| c == ' ').count(), 9);
+}
+
+#[test]
+fn test_1153_shiftround_rounds_dedent_down_to_shiftwidth_multiple() {
+    // `:h 'shiftround'`: `<<` lands on the *previous* multiple of
+    // 'shiftwidth', computed from the line's own indent directly — verified
+    // against `nvim --headless` (cols=5, sw=4 → 4, not 5-4=1 rounded again).
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "     x\n"); // 5-space indent
+    engine.update_syntax();
+    engine.feed_keys(":set shiftround sw=4 expandtab<CR>");
+    engine.feed_keys("<<");
+    let line = engine.buffer().content.line(0).to_string();
+    assert_eq!(line.chars().take_while(|&c| c == ' ').count(), 4);
+}
+
+// -- #1153: 'softtabstop' --
+
+#[test]
+fn test_1153_softtabstop_tab_advances_to_sts_stop_not_tabstop() {
+    // `:h 'softtabstop'`: with 'expandtab' on and 'smarttab' off, <Tab>
+    // advances to the next 'softtabstop' stop instead of 'tabstop' —
+    // verified against `nvim --headless` (ts=8, sts=2 → 1 space from col 1).
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "ab\n");
+    engine.update_syntax();
+    engine.feed_keys(":set expandtab ts=8 sts=2 nosmarttab<CR>");
+    engine.feed_keys("li"); // cursor onto 'b', insert before it — between a/b
+    engine.feed_keys("<Tab><Esc>");
+    assert_eq!(engine.buffer().to_string(), "a b\n");
+}
+
+#[test]
+fn test_1153_softtabstop_backspace_removes_a_whole_soft_tab() {
+    // `:h 'softtabstop'`: BackSpace over a run of spaces removes up to
+    // 'softtabstop' of them at once, "feeling like" a tab was deleted —
+    // verified against `nvim --headless` (empty line, sts=3, nosmarttab:
+    // two <Tab>s give 6 spaces, one <BS> removes 3, not 1).
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "\n");
+    engine.update_syntax();
+    engine.feed_keys(":set expandtab ts=8 sts=3 nosmarttab<CR>");
+    engine.feed_keys("i<Tab><Tab>");
+    assert_eq!(engine.buffer().to_string(), "      \n"); // 6 spaces
+    engine.feed_keys("<BS>");
+    // Removed one whole soft-tab (3 spaces), not just one space.
+    assert_eq!(engine.buffer().to_string(), "   \n"); // 3 spaces
+    engine.feed_keys("<Esc>");
+}
+
+// -- #1153: 'virtualedit' --
+
+#[test]
+fn test_1153_virtualedit_all_lets_l_move_past_dollar() {
+    // `:h 'virtualedit'`: with "all", `$` still lands on the last
+    // character, but a following `l` moves one column further, into
+    // virtual space past the end of the line — verified against
+    // `nvim --headless`.
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "abc\n");
+    engine.update_syntax();
+    engine.feed_keys(":set virtualedit=all<CR>");
+    engine.feed_keys("$");
+    assert_eq!(engine.view().cursor.col, 2); // on 'c', matches ve=off too
+    engine.feed_keys("l");
+    assert_eq!(engine.view().cursor.col, 3); // one past 'c'
+}
+
+#[test]
+fn test_1153_virtualedit_off_blocks_l_past_dollar() {
+    // Default (virtualedit off) — `l` at the last character is a no-op.
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "abc\n");
+    engine.update_syntax();
+    engine.feed_keys("$");
+    assert_eq!(engine.view().cursor.col, 2);
+    engine.feed_keys("l");
+    assert_eq!(engine.view().cursor.col, 2);
+}
+
+// -- #1153: 'foldmethod'/'foldlevel' settable via :set --
+
+#[test]
+fn test_1153_set_foldmethod_indent_folds_take_effect_immediately() {
+    // #1153: foldmethod/foldlevel existed as Settings fields but were
+    // unreachable from `:set` before this issue. `:set fdm=indent` should
+    // immediately compute + close the indent-fold hierarchy, the same way
+    // the nvim-conformance harness's `apply_setup` already does when a case
+    // sets it via Lua.
+    let mut engine = Engine::new();
+    engine
+        .buffer_mut()
+        .insert(0, "if x:\n    a\n    b\nelse:\n    c\n");
+    engine.update_syntax();
+    engine.feed_keys(":set fdm=indent<CR>");
+    // Cursor still on line 0; `j` from a closed fold at line 1 should skip
+    // straight to line 3 ("else:") since lines 1-2 are folded away.
+    engine.view_mut().cursor.line = 0;
+    engine.feed_keys("j");
+    assert_eq!(engine.view().cursor.line, 1);
+    engine.feed_keys("j");
+    assert_eq!(engine.view().cursor.line, 3);
+}
+
+// -- #1153: option table extended, not hard-erroring --
+
+#[test]
+fn test_1153_unimplemented_recognised_option_is_not_unknown_option() {
+    // A real vim option vimcode doesn't implement yet must not read as an
+    // unrecognised typo (`Unknown option`) — it gets a distinct
+    // "recognised but not implemented" rejection instead.
+    let mut engine = Engine::new();
+    let result = engine.settings.parse_set_option("hidden");
+    let err = result.expect_err("hidden is not yet implemented");
+    assert!(
+        err.contains("recognised but not implemented"),
+        "unexpected message: {err}"
+    );
+    assert!(!err.contains("Unknown option"), "unexpected message: {err}");
+}
+
+#[test]
+fn test_1153_still_unknown_option_is_unknown_option() {
+    // A genuine typo still gets the original "Unknown option" message.
+    let mut engine = Engine::new();
+    let result = engine.settings.parse_set_option("totallybogusoption");
+    let err = result.expect_err("bogus option name");
+    assert!(err.contains("Unknown option"), "unexpected message: {err}");
+}
+
 #[test]
 fn test_nvim_search_no_match_noop() {
     // Search for non-existent pattern leaves cursor in place

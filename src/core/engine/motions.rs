@@ -3708,6 +3708,19 @@ impl Engine {
             .unwrap_or(self.settings.shift_width as usize)
     }
 
+    /// Return the effective `'softtabstop'` — the Insert-mode Tab/BS "feels
+    /// like this width" setting, independent of `'tabstop'`. `0` means
+    /// "disabled, use 'tabstop'"; a negative `'softtabstop'` is Vim's
+    /// documented idiom for "use 'shiftwidth' instead" (`:h 'softtabstop'`,
+    /// #1153).
+    pub(crate) fn effective_softtabstop(&self) -> usize {
+        match self.settings.softtabstop {
+            0 => 0,
+            n if n < 0 => self.effective_shift_width().max(1),
+            n => n as usize,
+        }
+    }
+
     /// True for word characters: [a-zA-Z0-9_].
     pub(crate) fn is_word_char(c: char) -> bool {
         c.is_alphanumeric() || c == '_'
@@ -4576,7 +4589,11 @@ impl Engine {
 
     pub(crate) fn move_right(&mut self) {
         let line = self.view().cursor.line;
-        let max_valid_col = self.get_max_cursor_col(line);
+        // `:h 'virtualedit'`: `"all"`/`"onemore"` let the cursor sit one
+        // column past the last character — only this narrow subset is
+        // modeled, see the `virtualedit` field doc (#1153).
+        let max_valid_col =
+            self.get_max_cursor_col(line) + usize::from(self.settings.virtualedit_allows_onemore());
         if self.view().cursor.col < max_valid_col {
             self.view_mut().cursor.col += 1;
         }
@@ -6626,7 +6643,15 @@ impl Engine {
                 }
             }
 
-            let new_cols = cols + sw;
+            // `:h 'shiftround'`: land on the next multiple of 'shiftwidth'
+            // (verified against `nvim --headless`: `(cols/sw + 1) * sw`,
+            // e.g. cols=5,sw=4 → 8, not the plain 5+4=9) instead of always
+            // adding exactly one shiftwidth (#1153).
+            let new_cols = if self.settings.shiftround && sw > 0 {
+                (cols / sw + 1) * sw
+            } else {
+                cols + sw
+            };
             // `noet` only uses a tab where a *whole* tabstop fits, so with
             // ts=8 / sw=4 Vim indents with four spaces, not a tab.
             let new_indent = if expand {
@@ -6765,7 +6790,21 @@ impl Engine {
             // converted to spaces under 'expandtab' instead of surviving
             // untouched just because it wasn't the character actually
             // removed (#883).
-            let new_cols = cols.saturating_sub(remove_cols);
+            // `:h 'shiftround'`: round down to the previous multiple of
+            // 'shiftwidth', computed from this line's own current indent
+            // (#1153) — verified against `nvim --headless`: cols=5,sw=4 →
+            // 4 — NOT this function's own group-capped `remove_cols`
+            // rounded further, which would over-remove (5 → 1 → round to 0
+            // instead of the real-Vim answer, 4).
+            let new_cols = if self.settings.shiftround && sw > 0 {
+                if cols == 0 {
+                    0
+                } else {
+                    ((cols - 1) / sw) * sw
+                }
+            } else {
+                cols.saturating_sub(remove_cols)
+            };
             let new_indent = if expand {
                 " ".repeat(new_cols)
             } else {
