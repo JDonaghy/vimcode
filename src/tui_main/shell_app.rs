@@ -4936,6 +4936,58 @@ mod tests {
         assert!(app.live);
     }
 
+    /// #1124 routed `tick()`'s terminal-title write through
+    /// `backend.window()?.set_title(..)` (`WindowControl`, quadraui#950)
+    /// instead of hand-rolling crossterm's `SetTitle` directly — see the
+    /// doc comment on that call, right above the `if self.live` block it
+    /// lives in. Unlike GTK's `Backend::window()` (see `src/app.rs`'s
+    /// `gtk_backend_window_is_none_without_a_live_window_...` test), TUI's
+    /// limitation is the opposite shape: `TuiBackend::window()` is
+    /// unconditionally `Some` (asserted below) — the call is real and
+    /// always reachable — but it is gated behind `self.live`, which
+    /// `prepare_for_live_run_only_sets_the_flag` right above already pins
+    /// as `false` for every `driver_with_shell`/direct-construction test,
+    /// and `TuiBackend::set_title` (quadraui `tui/backend.rs`'s `impl
+    /// WindowControl for TuiBackend`) writes straight to the real process
+    /// `std::io::stdout()` with no injectable writer.
+    ///
+    /// Forcing `live = true` here to exercise the call would inject a raw
+    /// OSC 0/2 escape sequence into this test binary's actual stdout —
+    /// bypassing `cargo test`'s output capture entirely, since that only
+    /// intercepts the `print!`/`println!` macros, not direct `Write`
+    /// calls on `Stdout` — exactly the "corrupt the harness' own output"
+    /// scenario `tick()`'s own comment warns about for the cursor-style
+    /// write right next to it. So there is no way to assert the title
+    /// actually reached the terminal from inside this crate's test suite;
+    /// manual verification (does the emulator tab/window retitle when
+    /// switching buffers) is a `SMOKE_TESTS` item on #1124's PR instead.
+    ///
+    /// RED-verification note: nothing to make RED here — this pins two
+    /// structural facts (the flag defaults false, `TuiBackend::window()`
+    /// is always `Some`) that together explain why the write is
+    /// unreachable in this harness, not a vimcode behaviour that could
+    /// regress on its own.
+    #[test]
+    fn tick_title_sync_is_reachable_but_gated_on_live_so_black_box_untestable() {
+        use quadraui::Backend;
+
+        let app = TuiShellApp::new(None);
+        let mut backend = backend_at(80.0, 24.0);
+        assert!(
+            backend.window().is_some(),
+            "TuiBackend::window() should always be Some (it backs set_title \
+             unconditionally) -- if this fires, quadraui has changed and \
+             #1124's title-sync path may need to be revisited"
+        );
+        assert!(
+            !app.live,
+            "a driver/direct-constructed TuiShellApp must default to \
+             live=false, or tick() would attempt the real stdout OSC write \
+             during ordinary test runs -- see \
+             prepare_for_live_run_only_sets_the_flag"
+        );
+    }
+
     /// `setup()` must register the panel-key accelerators and populate the
     /// menu system — the two pieces of state `handle()` depends on.
     #[test]

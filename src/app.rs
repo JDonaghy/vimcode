@@ -9048,4 +9048,77 @@ mod portable_entry_point_tests {
 
         let _ = std::fs::remove_file(&tmp);
     }
+
+    /// #1124 routed title-sync (`handle_poll_tick`) and [`App::
+    /// window_minimize`] through `Backend::window()` (quadraui#950)
+    /// instead of the GTK-only `self.window`/`PlatformWindowHandle` seam
+    /// — that seam was `None` on macOS and Win-GUI, so both were silent
+    /// no-ops there before this fix. What that PR could not add is
+    /// black-box coverage of the *positive* path (a title that actually
+    /// reaches the OS window, a minimize that actually iconifies it) —
+    /// here is why that gap is real, not an oversight, and what would
+    /// close it:
+    ///
+    /// 1. `GtkBackend::window()` (quadraui `gtk/backend.rs:2012-2015`)
+    ///    returns `Some` only once `self.window` has been set via
+    ///    `GtkBackend::set_window`, which takes a real `gtk4::
+    ///    ApplicationWindow` — constructing one needs GTK initialized
+    ///    against a live display. This repo's whole headless-testing
+    ///    strategy (`src/gtk/testing.rs`'s `GtkDriver` wrapper)
+    ///    deliberately never calls `gtk::init()` (see that module's own
+    ///    "Known gaps" doc), so there is no headless path to a non-`None`
+    ///    `GtkBackend::window()`.
+    /// 2. Routing through `GtkDriver` instead of a bare `GtkBackend`
+    ///    doesn't work around (1) either: `GtkDriver::backend()`
+    ///    (quadraui `gtk/testing.rs:341`, and the sibling
+    ///    `handle_poll_tick_reloads_settings_changed_on_disk` test right
+    ///    above already established this for the poll-tick pump) returns
+    ///    `&GtkBackend`, not `&mut GtkBackend` — there is no
+    ///    `backend_mut()` — but `Backend::window()` needs `&mut self`, so
+    ///    even a driver that *had* a window attached couldn't reach it
+    ///    from this crate's tests.
+    /// 3. A hand-rolled fake `Backend` to test the wiring in isolation is
+    ///    not an option either: `quadraui::Backend` is a sealed trait
+    ///    (`pub(crate) sealed::Sealed` supertrait, `backend.rs:488-614`),
+    ///    and the one publicly constructible non-live impl,
+    ///    `quadraui::testing::RecordingBackend`, does not override
+    ///    `window()` either, so it inherits the trait's default `None`
+    ///    too (checked directly against the pinned rev: no `fn window(`
+    ///    in `quadraui/src/testing/mod.rs`).
+    ///
+    /// This is the same shape of gap `src/macos/mod.rs`'s
+    /// `control_inset_is_default_because_mac_driver_never_sets_a_window`
+    /// test documents for `titlebar_control_inset` (#940) — a live
+    /// windowed run is the only thing that exercises the `Some` branch,
+    /// which is why manual title-sync/minimize verification is a
+    /// `SMOKE_TESTS` item on #1124's PR rather than an automated test
+    /// here. Closing this properly needs a quadraui-side testing hook
+    /// (e.g. a `GtkDriver::backend_mut()`, or a way to attach a window
+    /// without a live display) — a quadraui issue to file, not a
+    /// vimcode workaround (`CLAUDE.md`'s Platform-Neutrality Rule: file
+    /// upstream, wait, then implement).
+    ///
+    /// RED-verification note: nothing to make RED here, symmetric with
+    /// the macOS test's own note — this pins what the pinned quadraui rev
+    /// provably always returns for a `GtkBackend` nobody has called
+    /// `set_window` on, not a vimcode behaviour that could regress. Its
+    /// job is the opposite: it goes RED the day quadraui adds a headless
+    /// way to attach a window (or a version bump otherwise changes this),
+    /// which is exactly the signal that real black-box coverage of
+    /// title-sync/minimize finally becomes possible.
+    #[cfg(feature = "gui")]
+    #[test]
+    fn gtk_backend_window_is_none_without_a_live_window_so_title_sync_and_minimize_stay_black_box_untestable(
+    ) {
+        use quadraui::Backend;
+
+        let mut backend = quadraui::gtk::GtkBackend::new();
+        assert!(
+            backend.window().is_none(),
+            "GtkBackend reported a window without ever calling set_window -- \
+             if this fires, quadraui has changed and #1124's title-sync/\
+             minimize path can likely now get real black-box coverage; see \
+             this test's doc comment"
+        );
+    }
 }
