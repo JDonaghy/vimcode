@@ -1158,6 +1158,16 @@ impl Engine {
                     self.ensure_spell_checker();
                 }
                 self.update_syntax();
+                // `foldmethod=indent`/`foldlevel=N` (#1153) — recompute the
+                // indent-fold hierarchy against the new level immediately,
+                // mirroring `apply_foldlevel`'s own doc ("processing
+                // deepest-first") rather than waiting for the next `z`
+                // command. Idempotent (a plain re-close/re-define pass), so
+                // unconditionally re-running it here is safe even when
+                // neither option actually changed on this `:set` line.
+                if self.settings.foldmethod == "indent" {
+                    self.apply_foldlevel(self.settings.foldlevel);
+                }
                 return match last_err {
                     Some(e) => {
                         self.message = e;
@@ -1203,6 +1213,11 @@ impl Engine {
             // buffer.)
             if self.settings.syntax_max_lines != prev_syntax_max_lines {
                 self.update_syntax();
+            }
+            // See the matching comment in the multi-option branch above
+            // (#1153).
+            if self.settings.foldmethod == "indent" {
+                self.apply_foldlevel(self.settings.foldlevel);
             }
             return EngineAction::None;
         }
@@ -3356,7 +3371,10 @@ impl Engine {
         // once the pattern/replacement/range are all resolved — see
         // `confirm && !report_only` below.
         let confirm = flags.contains('c');
-        let global = flags.contains('g');
+        // `:h 'gdefault'`: when set, the meaning of the `g` flag is
+        // inverted — every match on a line is replaced by default, and a
+        // `g` flag toggles that off (first match per line only).
+        let global = flags.contains('g') ^ self.settings.gdefault;
         let report_only = flags.contains('n');
         let quiet = flags.contains('e');
 
@@ -4049,7 +4067,22 @@ impl Engine {
             .search_matches
             .iter()
             .position(|(start, _)| *start > cursor_char);
-        let idx = next.unwrap_or(0);
+        let idx = match next {
+            Some(i) => i,
+            None if self.settings.wrapscan => {
+                self.message = "search hit BOTTOM, continuing at TOP".to_string();
+                0
+            }
+            None => {
+                // `:h 'wrapscan'`: off, and no match after the cursor —
+                // stay put rather than wrapping (#1153).
+                self.message = format!(
+                    "E385: search hit BOTTOM without match for: {}",
+                    self.search_query
+                );
+                return;
+            }
+        };
 
         self.search_index = Some(idx);
         self.jump_to_search_match(idx);
@@ -4077,7 +4110,21 @@ impl Engine {
             .search_matches
             .iter()
             .rposition(|(start, _)| *start < cursor_char);
-        let idx = prev.unwrap_or(self.search_matches.len() - 1);
+        let idx = match prev {
+            Some(i) => i,
+            None if self.settings.wrapscan => {
+                self.message = "search hit TOP, continuing at BOTTOM".to_string();
+                self.search_matches.len() - 1
+            }
+            None => {
+                // See `search_next`'s matching `'wrapscan'` comment (#1153).
+                self.message = format!(
+                    "E384: search hit TOP without match for: {}",
+                    self.search_query
+                );
+                return;
+            }
+        };
 
         self.search_index = Some(idx);
         self.jump_to_search_match(idx);

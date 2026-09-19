@@ -979,6 +979,18 @@ fn apply_setup(settings: &mut Settings, setup: &str) -> Result<(), String> {
                     format!("'foldlevel' expects a non-negative integer, got {raw_value:?}")
                 })?;
             }
+            // #1153
+            "wrapscan" | "ws" => settings.wrapscan = parse_lua_bool(name, value)?,
+            "shiftround" | "sr" => settings.shiftround = parse_lua_bool(name, value)?,
+            "gdefault" | "gd" => settings.gdefault = parse_lua_bool(name, value)?,
+            "softtabstop" | "sts" => {
+                settings.softtabstop = value
+                    .parse::<i32>()
+                    .map_err(|_| format!("'softtabstop' expects an integer, got {raw_value:?}"))?;
+            }
+            "virtualedit" | "ve" => {
+                settings.virtualedit = value.to_string();
+            }
             other => {
                 return Err(format!(
                     "no vimcode Settings mapping for option '{other}' (from {stmt:?}) — add one \
@@ -2018,6 +2030,21 @@ const CASES_OP: &[Case] = &[
         1,
         ":set ts=4 noet<CR><<",
     ),
+    // #1153 'shiftround' — verified against `nvim --headless`.
+    c(
+        "op:>> shiftround rounds up",
+        &["     x"], // 5-space indent
+        1,
+        1,
+        ":set sw=4 et sr<CR>>>",
+    ),
+    c(
+        "op:<< shiftround rounds down",
+        &["     x"], // 5-space indent
+        1,
+        1,
+        ":set sw=4 et sr<CR><<",
+    ),
     c(
         "op:=G braces",
         &["int f() {", "int x;", "if (x) {", "y();", "}", "}"],
@@ -2937,6 +2964,22 @@ const CASES_SEARCH: &[Case] = &[
     ),
     c("search:wrap forward", &["foo", "x"], 1, 1, "/foo<CR>"),
     c("search:wrap backward", &["x", "foo"], 1, 1, "?foo<CR>"),
+    // #1153 'wrapscan' off — no match ahead of the cursor, stay put instead
+    // of wrapping. Verified against `nvim --headless`.
+    c(
+        "search:nowrapscan forward stays put",
+        &["foo", "x"],
+        1,
+        1,
+        ":set nowrapscan<CR>/foo<CR>",
+    ),
+    c(
+        "search:nowrapscan backward stays put",
+        &["x", "foo"],
+        2,
+        1,
+        ":set nowrapscan<CR>?foo<CR>",
+    ),
     c("search:no match", &["abc"], 1, 2, "/zzz<CR>"),
     c("search:n after *", &["foo x foo x foo"], 1, 1, "*n"),
     c("search:3/pat", &["a foo foo foo"], 1, 1, "3/foo<CR>"),
@@ -3056,6 +3099,22 @@ const CASES_SEARCH: &[Case] = &[
 const CASES_EX: &[Case] = &[
     c("sub:basic", &["a a"], 1, 1, ":s/a/b/<CR>"),
     c("sub:g", &["a a"], 1, 1, ":s/a/b/g<CR>"),
+    // #1153 'gdefault' — inverts the meaning of the `g` flag. Verified
+    // against `nvim --headless`.
+    c(
+        "sub:gdefault makes plain sub global",
+        &["a a a"],
+        1,
+        1,
+        ":set gdefault<CR>:s/a/x/<CR>",
+    ),
+    c(
+        "sub:gdefault g flag toggles back to first-only",
+        &["a a a"],
+        1,
+        1,
+        ":set gdefault<CR>:s/a/x/g<CR>",
+    ),
     c("sub:%", &["a", "a", "a"], 1, 1, ":%s/a/b/<CR>"),
     c("sub:%g cursor", &["a a", "b", "a a"], 2, 1, ":%s/a/x/g<CR>"),
     c("sub:2,3", &["a", "a", "a", "a"], 1, 1, ":2,3s/a/b/<CR>"),
@@ -3759,6 +3818,21 @@ const CASES_INS: &[Case] = &[
         ":set ts=8<CR>A<Tab>x<Esc>",
     ),
     c("ins:Tab after 2 chars ts4", &["ab"], 1, 1, "A<Tab>x<Esc>"),
+    // #1153 'softtabstop' — verified against `nvim --headless`.
+    c(
+        "ins:Tab uses softtabstop not tabstop",
+        &["ab"],
+        1,
+        2,
+        ":set et ts=8 sts=2 nosmarttab<CR>i<Tab><Esc>",
+    ),
+    c(
+        "ins:BS over softtabstop removes a whole soft-tab",
+        &[""],
+        1,
+        1,
+        ":set et ts=8 sts=3 nosmarttab<CR>i<Tab><Tab><BS><Esc>",
+    ),
     c("ins:C-t", &["a"], 1, 1, "i<C-t><Esc>"),
     c("ins:C-t mid line", &["ab"], 1, 2, "i<C-t><Esc>"),
     c("ins:C-d", &["    a"], 1, 5, "i<C-d><Esc>"),
@@ -4758,6 +4832,17 @@ const CASES_WORD: &[Case] = &[
     ),
     c("word:i esc then j", &["abcdef", "abcdef"], 1, 4, "i<Esc>j"),
     c("word:$ then h then j", &["abcdef", "abcdef"], 1, 1, "$hj"),
+    // #1153 'virtualedit' — `$` still lands on the last character, but a
+    // following `l` moves one column past it. Verified against
+    // `nvim --headless`.
+    c(
+        "word:virtualedit=all lets l pass $",
+        &["abc"],
+        1,
+        1,
+        ":set ve=all<CR>$l",
+    ),
+    c("word:virtualedit off blocks l at $", &["abc"], 1, 1, "$l"),
     c("word:w then j col", &["ab cd", "abcdef"], 1, 1, "wj"),
     c("word:e then j", &["abc def", "abcdef"], 1, 1, "ej"),
     c("word:yy then j col", &["abcdef", "abcdef"], 1, 3, "yyj"),
@@ -5500,6 +5585,19 @@ const CASES_FOLD: &[Case] = &[
         "10Gzf10j30GzzH",
     ),
     // ── foldmethod=indent / foldlevel ────────────────────────────────────
+    // #1153: foldmethod/foldlevel are now reachable from the real `:set`
+    // command (previously only `apply_setup`'s Lua-setup bypass could set
+    // them for this suite — see the issue: "exist in settings.json but are
+    // not reachable from :set"). This case drives the actual `:set fdm=
+    // indent<CR>` ex command through both sides, unlike the `cs(..)` cases
+    // below it which pin the option before the key sequence starts.
+    c(
+        "fold:indent:set fdm=indent via :set",
+        FOLDNEST,
+        1,
+        1,
+        ":set fdm=indent<CR>j",
+    ),
     cs(
         "fold:indent:foldlevel0 j crosses the whole outer fold",
         FOLDNEST,
@@ -8330,8 +8428,11 @@ fn every_setup_option_the_corpus_uses_changes_vimcode_behaviour() {
 #[test]
 fn unrecognised_setup_is_a_hard_failure_naming_the_statement() {
     let mut s = Settings::default();
-    let err = apply_setup(&mut s, "vim.o.virtualedit='all'").expect_err("must not be accepted");
-    assert!(err.contains("virtualedit"), "must name the option: {err}");
+    // #1153 added `virtualedit` to `apply_setup` — swapped this example for
+    // `listchars`, still unmapped (it's in vimcode's own "recognised but not
+    // implemented" `:set` table, not wired to any behaviour).
+    let err = apply_setup(&mut s, "vim.o.listchars='eol:$'").expect_err("must not be accepted");
+    assert!(err.contains("listchars"), "must name the option: {err}");
 
     // Not the `vim.o.` statement form at all.
     let err = apply_setup(&mut s, "vim.cmd('set sol')").expect_err("must not be accepted");
