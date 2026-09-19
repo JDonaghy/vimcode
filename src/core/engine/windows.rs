@@ -2033,7 +2033,6 @@ impl Engine {
     }
 
     /// Switch to a specific tab (0-indexed).
-    #[allow(dead_code)]
     pub fn goto_tab(&mut self, index: usize) {
         if index < self.active_group().tabs.len() {
             self.active_group_mut().active_tab = index;

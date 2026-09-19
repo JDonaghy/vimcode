@@ -123,6 +123,56 @@ fn test_insert_tab() {
 }
 
 #[test]
+fn test_ex_startinsert_enters_insert_mode_at_cursor_1154() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "abc");
+    engine.update_syntax();
+    engine.view_mut().cursor.col = 1;
+
+    engine.execute_command("startinsert");
+
+    assert_eq!(engine.mode, Mode::Insert);
+    assert_eq!(engine.view().cursor.col, 1);
+    for ch in "XY".chars() {
+        press_char(&mut engine, ch);
+    }
+    assert_eq!(engine.buffer().to_string(), "aXYbc");
+}
+
+#[test]
+fn test_ex_startinsert_bang_appends_at_end_of_line_1154() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "abc");
+    engine.update_syntax();
+    engine.view_mut().cursor.col = 0;
+
+    engine.execute_command("startinsert!");
+
+    assert_eq!(engine.mode, Mode::Insert);
+    assert_eq!(engine.view().cursor.col, 3);
+    press_char(&mut engine, 'Z');
+    assert_eq!(engine.buffer().to_string(), "abcZ");
+}
+
+#[test]
+fn test_ex_stopinsert_returns_to_normal_mode_1154() {
+    let mut engine = Engine::new();
+    press_char(&mut engine, 'i');
+    for ch in "hi".chars() {
+        press_char(&mut engine, ch);
+    }
+    assert_eq!(engine.mode, Mode::Insert);
+
+    engine.execute_command("stopinsert");
+
+    assert_eq!(engine.mode, Mode::Normal);
+    assert_eq!(engine.buffer().to_string(), "hi");
+    // ':stopinsert' on an already-Normal-mode engine is a no-op, not an error.
+    engine.execute_command("stopinsert");
+    assert_eq!(engine.mode, Mode::Normal);
+}
+
+#[test]
 fn test_backspace_joins_lines() {
     let mut engine = Engine::new();
     engine.buffer_mut().insert(0, "AB\nCD");
@@ -1719,6 +1769,35 @@ fn test_tab_navigation() {
 }
 
 #[test]
+fn test_ex_tabonly_closes_every_other_tab_1154() {
+    let mut engine = Engine::new();
+    engine.new_tab(None);
+    engine.new_tab(None);
+    assert_eq!(engine.active_group().tabs.len(), 3);
+    // Middle tab (index 1) is active; :tabonly should keep only it.
+    engine.goto_tab(1);
+
+    engine.execute_command("tabonly");
+
+    assert_eq!(engine.active_group().tabs.len(), 1);
+}
+
+#[test]
+fn test_ex_tabfirst_tablast_jump_to_ends_1154() {
+    let mut engine = Engine::new();
+    engine.new_tab(None);
+    engine.new_tab(None);
+    assert_eq!(engine.active_group().tabs.len(), 3);
+    assert_eq!(engine.active_group().active_tab, 2);
+
+    engine.execute_command("tabfirst");
+    assert_eq!(engine.active_group().active_tab, 0);
+
+    engine.execute_command("tablast");
+    assert_eq!(engine.active_group().active_tab, 2);
+}
+
+#[test]
 fn test_buffer_navigation() {
     let mut engine = Engine::new();
     engine.buffer_mut().insert(0, "buffer 1");
@@ -1749,6 +1828,78 @@ fn test_list_buffers() {
 }
 
 #[test]
+fn test_ex_bfirst_blast_jump_to_ends_1154() {
+    let mut engine = Engine::new();
+    let path2 = std::env::temp_dir().join("vimcode_test_bfirst_blast_2.txt");
+    let path3 = std::env::temp_dir().join("vimcode_test_bfirst_blast_3.txt");
+    std::fs::write(&path2, "two").unwrap();
+    std::fs::write(&path3, "three").unwrap();
+
+    let buf1_id = engine.active_buffer_id();
+    engine.split_window(SplitDirection::Vertical, Some(&path2));
+    engine.split_window(SplitDirection::Vertical, Some(&path3));
+    let buf3_id = engine.active_buffer_id();
+    assert_ne!(buf1_id, buf3_id);
+
+    engine.execute_command("bfirst");
+    assert_eq!(engine.active_buffer_id(), buf1_id);
+
+    engine.execute_command("blast");
+    assert_eq!(engine.active_buffer_id(), buf3_id);
+
+    let _ = std::fs::remove_file(&path2);
+    let _ = std::fs::remove_file(&path3);
+}
+
+#[test]
+fn test_ex_bwipeout_deletes_buffer_like_bdelete_1154() {
+    let mut engine = Engine::new();
+    let path = std::env::temp_dir().join("vimcode_test_bwipeout.txt");
+    std::fs::write(&path, "wipe me").unwrap();
+
+    let buf1_id = engine.active_buffer_id();
+    engine.split_window(SplitDirection::Vertical, Some(&path));
+    let target_id = engine.active_buffer_id();
+    assert_ne!(buf1_id, target_id);
+    let num = engine
+        .buffer_manager
+        .list()
+        .iter()
+        .position(|&id| id == target_id)
+        .unwrap()
+        + 1;
+
+    engine.execute_command(&format!("bwipeout {}", num));
+
+    assert!(engine.message.contains("wiped out"));
+    assert!(!engine.buffer_manager.list().contains(&target_id));
+
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn test_ex_bw_abbreviation_wipes_active_buffer_1154() {
+    // ':bw' is the documented minimal abbreviation for ':bwipeout' (EX_ABBREVS
+    // entry) — exercise the abbreviation wiring, not just the canonical
+    // spelling, against the *active* buffer (no explicit N argument).
+    let mut engine = Engine::new();
+    let path = std::env::temp_dir().join("vimcode_test_bw_abbrev.txt");
+    std::fs::write(&path, "wipe me too").unwrap();
+
+    let buf1_id = engine.active_buffer_id();
+    engine.split_window(SplitDirection::Vertical, Some(&path));
+    let target_id = engine.active_buffer_id();
+    assert_ne!(buf1_id, target_id);
+
+    engine.execute_command("bw");
+
+    assert!(engine.message.contains("wiped out"));
+    assert!(!engine.buffer_manager.list().contains(&target_id));
+
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
 fn test_ctrl_w_commands() {
     let mut engine = Engine::new();
 
@@ -1772,6 +1923,32 @@ fn test_ctrl_w_commands() {
     press_ctrl(&mut engine, 'w');
     press_char(&mut engine, 'c');
     assert_eq!(engine.windows.len(), 2);
+}
+
+#[test]
+fn test_ex_hide_closes_window_without_dirty_check_1154() {
+    let mut engine = Engine::new();
+    engine.split_window(SplitDirection::Horizontal, None);
+    assert_eq!(engine.windows.len(), 2);
+    // Dirty the buffer in the (about-to-be-hidden) active window — unlike
+    // :quit, :hide must never complain about unsaved changes because the
+    // buffer stays loaded, just no longer shown here.
+    engine.buffer_mut().insert(0, "unsaved");
+
+    engine.execute_command("hide");
+
+    assert_eq!(engine.windows.len(), 1);
+}
+
+#[test]
+fn test_ex_hide_refuses_to_close_the_last_window_1154() {
+    let mut engine = Engine::new();
+    assert_eq!(engine.windows.len(), 1);
+
+    engine.execute_command("hide");
+
+    assert_eq!(engine.windows.len(), 1);
+    assert!(engine.message.contains("Cannot close last window"));
 }
 
 #[test]
@@ -6415,6 +6592,37 @@ fn test_mark_multiple_marks() {
     press_char(&mut engine, '\'');
     press_char(&mut engine, 'b');
     assert_eq!(engine.view().cursor.line, 3);
+}
+
+#[test]
+fn test_ex_delmarks_removes_named_marks_1154() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "a\nb\nc\nd\ne");
+    engine.update_syntax();
+
+    press_char(&mut engine, 'j');
+    press_char(&mut engine, 'm');
+    press_char(&mut engine, 'a');
+    press_char(&mut engine, 'j');
+    press_char(&mut engine, 'm');
+    press_char(&mut engine, 'b');
+
+    let buf_id = engine.active_buffer_id();
+    assert!(engine.marks.get(&buf_id).unwrap().contains_key(&'a'));
+    assert!(engine.marks.get(&buf_id).unwrap().contains_key(&'b'));
+
+    engine.execute_command("delmarks a");
+    assert!(!engine.marks.get(&buf_id).unwrap().contains_key(&'a'));
+    assert!(engine.marks.get(&buf_id).unwrap().contains_key(&'b'));
+
+    // ':delmarks b' clears the last one; bare ':delmarks!' below has
+    // nothing left to prove beyond "doesn't error" at that point, so
+    // re-set 'a' to exercise the bang form meaningfully.
+    press_char(&mut engine, 'm');
+    press_char(&mut engine, 'a');
+    engine.execute_command("delmarks!");
+    assert!(!engine.marks.get(&buf_id).unwrap().contains_key(&'a'));
+    assert!(!engine.marks.get(&buf_id).unwrap().contains_key(&'b'));
 }
 
 #[test]
@@ -12613,6 +12821,49 @@ fn test_cc_jump() {
         engine.quickfix_selected, 1,
         ":cc 2 should select index 1 (1-based)"
     );
+}
+
+#[test]
+fn test_ex_bare_cc_jumps_to_current_entry_1154() {
+    // #1154: bare `:cc` (no count) was entirely unimplemented — only
+    // `:cc {N}` existed — despite VIM_COMPATIBILITY.md marking `:cc` ✅.
+    let mut engine = Engine::new();
+    engine.quickfix_items = vec![make_qf_item("a.rs"), make_qf_item("b.rs")];
+    engine.quickfix_selected = 1;
+    engine.quickfix_open = true;
+    engine.quickfix_has_focus = true;
+
+    engine.execute_command("cc");
+
+    // Bare :cc re-jumps to whatever is currently selected, without moving
+    // the selection, and returns focus to the editor.
+    assert_eq!(engine.quickfix_selected, 1);
+    assert!(!engine.quickfix_has_focus);
+}
+
+#[test]
+fn test_ex_cc_on_empty_quickfix_list_errors_1154() {
+    let mut engine = Engine::new();
+    engine.execute_command("cc");
+    assert!(engine.message.contains("No errors"));
+}
+
+#[test]
+fn test_ex_cfirst_clast_jump_to_ends_1154() {
+    let mut engine = Engine::new();
+    engine.quickfix_items = vec![
+        make_qf_item("a.rs"),
+        make_qf_item("b.rs"),
+        make_qf_item("c.rs"),
+    ];
+    engine.quickfix_selected = 1;
+    engine.quickfix_open = true;
+
+    engine.execute_command("clast");
+    assert_eq!(engine.quickfix_selected, 2);
+
+    engine.execute_command("cfirst");
+    assert_eq!(engine.quickfix_selected, 0);
 }
 
 #[test]

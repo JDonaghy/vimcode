@@ -958,15 +958,25 @@ impl Engine {
             return EngineAction::None;
         }
 
-        // Handle :bd[elete][!] [N]
+        // Handle :bd[elete][!] [N] and :bw[ipeout][!] [N] — vimcode has no
+        // separate "unloaded but still listed" buffer state (`delete_buffer`
+        // always fully removes the buffer), so `:bwipeout` shares `:bdelete`'s
+        // implementation; only the reported message differs, matching Vim's
+        // own wording for each command (#1154).
         if cmd == "bdelete"
             || cmd.starts_with("bdelete ")
             || cmd == "bdelete!"
             || cmd.starts_with("bdelete! ")
+            || cmd == "bwipeout"
+            || cmd.starts_with("bwipeout ")
+            || cmd == "bwipeout!"
+            || cmd.starts_with("bwipeout! ")
         {
+            let wipeout = cmd.starts_with("bwipeout");
             let force = cmd.contains('!');
+            let cmd_word = if wipeout { "bwipeout" } else { "bdelete" };
             let arg = cmd
-                .trim_start_matches("bdelete")
+                .trim_start_matches(cmd_word)
                 .trim_start_matches('!')
                 .trim();
 
@@ -986,7 +996,11 @@ impl Engine {
 
             match self.delete_buffer(id, force) {
                 Ok(()) => {
-                    self.message = "Buffer deleted".to_string();
+                    self.message = if wipeout {
+                        "Buffer wiped out".to_string()
+                    } else {
+                        "Buffer deleted".to_string()
+                    };
                 }
                 Err(e) => {
                     self.message = e;
@@ -1018,6 +1032,19 @@ impl Engine {
 
         // Handle :clo[se]
         if cmd == "close" {
+            self.close_window();
+            return EngineAction::None;
+        }
+
+        // Handle :hid[e] — close the current window without touching the
+        // buffer (it stays loaded, just no longer shown here). `close_window`
+        // already never checks the dirty flag itself — that guard lives in
+        // the `:quit` handler above, which calls it after its own dirty
+        // check — so plain `close_window` already has exactly `:hide`'s
+        // "never complain about unsaved changes" semantics, including its
+        // refusal (with the same message Vim-adjacent "Cannot close last
+        // window" case) to close the very last window (#1154).
+        if cmd == "hide" {
             self.close_window();
             return EngineAction::None;
         }
@@ -1085,6 +1112,27 @@ impl Engine {
         // Handle :tabp[revious]
         if cmd == "tabprevious" {
             self.prev_tab();
+            return EngineAction::None;
+        }
+
+        // Handle :tabo[nly] — close every tab except the active one.
+        // Identical to Vim's `:tabonly`; `close_other_tabs` already implements
+        // exactly this (#1154).
+        if cmd == "tabonly" {
+            self.close_other_tabs();
+            return EngineAction::None;
+        }
+
+        // Handle :tabfir[st] — jump to the first tab.
+        if cmd == "tabfirst" {
+            self.goto_tab(0);
+            return EngineAction::None;
+        }
+
+        // Handle :tabl[ast] — jump to the last tab.
+        if cmd == "tablast" {
+            let last = self.active_group().tabs.len().saturating_sub(1);
+            self.goto_tab(last);
             return EngineAction::None;
         }
 
@@ -1351,6 +1399,18 @@ impl Engine {
             return EngineAction::None;
         }
 
+        // Handle :bf[irst] — jump to the lowest-numbered buffer.
+        if cmd == "bfirst" {
+            self.goto_buffer(1);
+            return EngineAction::None;
+        }
+
+        // Handle :bl[ast] — jump to the highest-numbered buffer.
+        if cmd == "blast" {
+            self.goto_buffer(self.buffer_manager.len());
+            return EngineAction::None;
+        }
+
         // Handle :buffer# (alternate buffer) — normalizer turns b# → buffer#
         if cmd == "buffer#" {
             self.alternate_buffer();
@@ -1374,6 +1434,30 @@ impl Engine {
             if let Some(n) = n_str.trim().parse::<usize>().ok().filter(|&n| n > 0) {
                 return self.quickfix_go(n - 1);
             }
+        }
+        // Handle bare :cc — (re-)jump to the current quickfix entry.
+        if cmd == "cc" {
+            if self.quickfix_items.is_empty() {
+                self.message = "E42: No errors".to_string();
+                return EngineAction::None;
+            }
+            return self.quickfix_jump();
+        }
+        // Handle :cfirst — jump to the first quickfix entry.
+        if cmd == "cfirst" {
+            if self.quickfix_items.is_empty() {
+                self.message = "E42: No errors".to_string();
+                return EngineAction::None;
+            }
+            return self.quickfix_go(0);
+        }
+        // Handle :clast — jump to the last quickfix entry.
+        if cmd == "clast" {
+            if self.quickfix_items.is_empty() {
+                self.message = "E42: No errors".to_string();
+                return EngineAction::None;
+            }
+            return self.quickfix_go(self.quickfix_items.len() - 1);
         }
         if let Some(pat) = cmd
             .strip_prefix("grep ")
@@ -1728,6 +1812,94 @@ impl Engine {
             self.view_mut().cursor.col = 0;
             self.clamp_cursor_col();
             self.ensure_cursor_visible();
+            return EngineAction::None;
+        }
+
+        // Handle :delm[arks] {marks} / :delmarks! — delete the named marks
+        // (space-separated chars and `a-c` ranges), or with `!` clear every
+        // lowercase mark in the current buffer (Vim never lets `!` touch
+        // uppercase/numbered marks — those are global, not per-buffer) (#1154).
+        if cmd == "delmarks" {
+            self.message = "E471: Argument required".to_string();
+            return EngineAction::Error;
+        }
+        if cmd == "delmarks!" {
+            let buf_id = self.active_buffer_id();
+            if let Some(marks) = self.marks.get_mut(&buf_id) {
+                marks.retain(|c, _| !c.is_ascii_lowercase());
+            }
+            return EngineAction::None;
+        }
+        if let Some(arg) = cmd.strip_prefix("delmarks ") {
+            let buf_id = self.active_buffer_id();
+            let mut chars_to_delete: Vec<char> = Vec::new();
+            for token in arg.split_whitespace() {
+                let bytes: Vec<char> = token.chars().collect();
+                if bytes.len() == 3 && bytes[1] == '-' {
+                    // Range, e.g. "a-c"
+                    let (lo, hi) = (bytes[0], bytes[2]);
+                    if lo <= hi {
+                        let mut c = lo;
+                        loop {
+                            chars_to_delete.push(c);
+                            if c == hi {
+                                break;
+                            }
+                            c = ((c as u8) + 1) as char;
+                        }
+                        continue;
+                    }
+                }
+                for c in token.chars() {
+                    chars_to_delete.push(c);
+                }
+            }
+            if chars_to_delete.is_empty() {
+                self.message = "E471: Argument required".to_string();
+                return EngineAction::Error;
+            }
+            for c in chars_to_delete {
+                if c.is_ascii_lowercase() {
+                    if let Some(marks) = self.marks.get_mut(&buf_id) {
+                        marks.remove(&c);
+                    }
+                } else {
+                    self.global_marks.remove(&c);
+                }
+            }
+            return EngineAction::None;
+        }
+
+        // Handle :star[tinsert][!] — enter Insert mode as if `i` (or, with
+        // `!`, `A`) had been pressed. Reuses the exact same field bookkeeping
+        // those normal-mode keys use rather than reimplementing entry here
+        // (#1154).
+        if cmd == "startinsert" || cmd == "startinsert!" {
+            if self.mode == Mode::Insert {
+                return EngineAction::None;
+            }
+            self.insert_repeat_count = 0;
+            self.insert_text_buffer.clear();
+            if cmd == "startinsert!" {
+                let line = self.view().cursor.line;
+                self.view_mut().cursor.col = self.get_line_len_for_insert(line);
+            } else if self.view().extra_cursors.is_empty() {
+                self.clamp_cursor_col();
+            }
+            self.start_undo_group();
+            self.set_mode(Mode::Insert);
+            return EngineAction::None;
+        }
+
+        // Handle :stopi[nsert] — leave Insert mode as if <Esc> had been
+        // pressed. Delegates to the real Escape handler so undo-group
+        // closing, dot-register recording, and cursor-left-on-exit all match
+        // pressing <Esc> exactly (#1154).
+        if cmd == "stopinsert" {
+            if self.mode == Mode::Insert {
+                let mut changed = false;
+                self.handle_insert_key("Escape", None, false, &mut changed);
+            }
             return EngineAction::None;
         }
 
