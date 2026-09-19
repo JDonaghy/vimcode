@@ -1189,7 +1189,6 @@ const UNIMPLEMENTED_BOOL_OPTIONS: &[(&str, &str)] = &[
     ("linebreak", "lbr"),
     ("smartindent", "si"),
     ("cindent", "cin"),
-    ("wildmenu", "wmnu"),
     ("showcmd", "sc"),
     ("ruler", "ru"),
 ];
@@ -1586,6 +1585,15 @@ impl Settings {
                 self.use_nerd_fonts = Some(enable);
                 crate::icons::set_nerd_fonts(enable);
             }
+            // `:h 'wildmenu'` describes an enhanced command-line completion
+            // menu — vimcode already has one, unconditionally, for every
+            // `:` command line (`wildmenu_items`/`wildmenu_selected` in
+            // `src/core/engine/keys.rs`, painted by both backends). It isn't
+            // gated by any setting, so unlike the genuinely-missing options
+            // below, rejecting `set wildmenu` as "not implemented" would be
+            // the wrong lie: the requested behavior is already there. Accept
+            // both spellings as a no-op (#1153 review).
+            "wildmenu" | "wmnu" => {}
             // #1153: real vim boolean options vimcode recognises but does not
             // yet implement. Accepted (never "Unknown option") so a pasted
             // vimrc line doesn't read as a typo, but rejected rather than
@@ -1975,6 +1983,8 @@ impl Settings {
             "virtualedit" | "ve" => Ok(format!("virtualedit={}", self.virtualedit)),
             "foldmethod" | "fdm" => Ok(format!("foldmethod={}", self.foldmethod)),
             "foldlevel" | "fdl" => Ok(format!("foldlevel={}", self.foldlevel)),
+            // Always on — see the `set_bool_option` "wildmenu" | "wmnu" arm.
+            "wildmenu" | "wmnu" => Ok("wildmenu".to_string()),
             _ if UNIMPLEMENTED_BOOL_OPTIONS
                 .iter()
                 .any(|(n, a)| *n == opt || *a == opt)

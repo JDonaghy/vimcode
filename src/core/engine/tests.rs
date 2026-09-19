@@ -28425,6 +28425,33 @@ fn test_1153_wrapscan_off_does_not_wrap_forward_search() {
 }
 
 #[test]
+fn test_1153_wrapscan_off_incremental_preview_does_not_wrap() {
+    // `:h 'wrapscan'`: the live preview-while-typing path
+    // (`perform_incremental_search`) must respect 'wrapscan' the same way
+    // the final `<CR>`-confirmed search already does — with no match ahead
+    // of the cursor, typing the pattern must not preview a wrapped-around
+    // match (review follow-up on #1153; this path is invisible to the
+    // nvim_conformance harness, which only diffs post-`<CR>` state, so it's
+    // covered here at the engine level instead).
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "foo xxx\nyyy\n");
+    engine.update_syntax();
+    engine.feed_keys(":set nowrapscan<CR>");
+    engine.view_mut().cursor.line = 1;
+    engine.view_mut().cursor.col = 1;
+
+    press_char(&mut engine, '/');
+    assert_eq!(engine.mode, Mode::Search);
+    press_char(&mut engine, 'f');
+    press_char(&mut engine, 'o');
+    press_char(&mut engine, 'o');
+    // Still parked at the pre-search cursor — did not preview a wrap to the
+    // "foo" on line 0.
+    assert_eq!(engine.view().cursor.line, 1);
+    assert_eq!(engine.view().cursor.col, 1);
+}
+
+#[test]
 fn test_1153_wrapscan_on_still_wraps_forward_search() {
     // Default (wrapscan on) — unchanged from `test_nvim_search_wraps_around`,
     // pinned again here so a regression in the new `nowrapscan` branch is
@@ -28436,6 +28463,43 @@ fn test_1153_wrapscan_on_still_wraps_forward_search() {
     engine.feed_keys("/alpha<CR>");
     assert_eq!(engine.view().cursor.line, 0);
     assert_eq!(engine.view().cursor.col, 0);
+}
+
+#[test]
+fn test_1153_gn_respects_wrapscan_off_no_match_forward() {
+    // `:h gn`: "like the `n` command" — so with 'wrapscan' off and no match
+    // after the cursor, `gn` stays put in Normal mode (no wrap, no visual
+    // selection) instead of wrapping to the first match — verified against
+    // `nvim --headless` v0.12.5 (review follow-up on #1153).
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "alpha beta alpha\nxxx\n");
+    engine.update_syntax();
+    engine.feed_keys("/alpha<CR>"); // establishes search_query + matches
+    engine.feed_keys(":set nowrapscan<CR>");
+    engine.view_mut().cursor.line = 1;
+    engine.view_mut().cursor.col = 1;
+    engine.feed_keys("gn");
+    assert_eq!(engine.mode, Mode::Normal);
+    assert_eq!(engine.view().cursor.line, 1);
+    assert_eq!(engine.view().cursor.col, 1);
+}
+
+#[test]
+fn test_1153_gn_wraps_when_wrapscan_on() {
+    // Default (wrapscan on) — `gn` past the last match wraps to the first
+    // one and enters Visual mode selecting it, unchanged from before this
+    // fix (pinned here so a regression in the new `nowrapscan` branch is
+    // caught by the same option's own test group).
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "alpha beta alpha\nxxx\n");
+    engine.update_syntax();
+    engine.feed_keys("/alpha<CR>");
+    engine.view_mut().cursor.line = 1;
+    engine.view_mut().cursor.col = 1;
+    engine.feed_keys("gn");
+    assert_eq!(engine.mode, Mode::Visual);
+    assert_eq!(engine.view().cursor.line, 0);
+    assert_eq!(engine.view().cursor.col, 4); // end of the wrapped-to first "alpha"
 }
 
 // -- #1153: 'gdefault' --
@@ -28541,6 +28605,44 @@ fn test_1153_softtabstop_backspace_removes_a_whole_soft_tab() {
     engine.feed_keys("<Esc>");
 }
 
+#[test]
+fn test_1153_softtabstop_backspace_rounds_column_not_run_length() {
+    // `:h 'softtabstop'`: BackSpace rounds the *absolute column* down to the
+    // previous multiple of 'softtabstop' — it does NOT simply cap the
+    // contiguous blank run length at 'softtabstop'. Those two formulas only
+    // coincide when the run starts on a column that's already a multiple of
+    // sts; this case (5-space indent, sts=2, run starts at col 0 which is a
+    // multiple, but the run length 5 is not) exercises the divergence —
+    // verified against `nvim --headless` v0.12.5 (set et ts=8 sts=2
+    // nosmarttab, "     x", <BS> before 'x' removes only 1 space, leaving 4).
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "     x\n"); // 5-space indent
+    engine.update_syntax();
+    engine.feed_keys(":set expandtab ts=8 sts=2 nosmarttab<CR>");
+    engine.feed_keys("li"); // cursor onto 'x', insert before it
+    engine.feed_keys("<BS>");
+    let line = engine.buffer().content.line(0).to_string();
+    assert_eq!(line.chars().take_while(|&c| c == ' ').count(), 4);
+    engine.feed_keys("<Esc>");
+}
+
+#[test]
+fn test_1153_softtabstop_backspace_mid_line_run_rounds_column() {
+    // Same divergence as above, but for a non-leading run of blanks (not
+    // preceded only by spaces, so 'smarttab' leading-blanks handling never
+    // applies) — verified against `nvim --headless` v0.12.5 (set et ts=8
+    // sts=2 nosmarttab, "a  b", <BS> before 'b' removes only 1 space,
+    // leaving "a b").
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "a  b\n");
+    engine.update_syntax();
+    engine.feed_keys(":set expandtab ts=8 sts=2 nosmarttab<CR>");
+    engine.feed_keys("$i"); // cursor onto 'b', insert before it
+    engine.feed_keys("<BS>");
+    assert_eq!(engine.buffer().to_string(), "a b\n");
+    engine.feed_keys("<Esc>");
+}
+
 // -- #1153: 'virtualedit' --
 
 #[test]
@@ -28619,6 +28721,28 @@ fn test_1153_still_unknown_option_is_unknown_option() {
     let result = engine.settings.parse_set_option("totallybogusoption");
     let err = result.expect_err("bogus option name");
     assert!(err.contains("Unknown option"), "unexpected message: {err}");
+}
+
+#[test]
+fn test_1153_wildmenu_accepted_as_noop_not_rejected() {
+    // Unlike the genuinely-missing options above, vimcode already has an
+    // unconditional command-line completion menu (`wildmenu_items` in
+    // keys.rs), so `set wildmenu` must be accepted (as a no-op), not
+    // rejected with "recognised but not implemented" — review follow-up on
+    // #1153.
+    let mut engine = Engine::new();
+    assert_eq!(
+        engine.settings.parse_set_option("wildmenu"),
+        Ok("wildmenu".to_string())
+    );
+    assert_eq!(
+        engine.settings.parse_set_option("wmnu"),
+        Ok("wmnu".to_string())
+    );
+    assert_eq!(
+        engine.settings.parse_set_option("wildmenu?"),
+        Ok("wildmenu".to_string())
+    );
 }
 
 #[test]
