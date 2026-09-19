@@ -52,8 +52,8 @@
 //!    were deleted rather than kept behind the gate.
 //! 3. **`crate::gtk::{click, css, util}`.** The portable majority of these —
 //!    `pixel_to_click_target` and the rest of the click-resolution/tab-bar
-//!    pixel-geometry functions, `make_theme_css`/`STATIC_CSS`, `open_url`/
-//!    `install_bundled_icon_font` — moved to the backend-neutral
+//!    pixel-geometry functions, `make_theme_css`/`STATIC_CSS`, `open_url` —
+//!    moved to the backend-neutral
 //!    `crate::click`/`crate::css`/`crate::app_support`, which `src/gtk/{click,
 //!    css,mod,util}.rs` now re-export so nothing else in `crate::gtk` had to
 //!    change. The genuinely GTK-only remainder —
@@ -1263,8 +1263,6 @@ impl App {
                 icon_theme.add_search_path(&icon_dir);
             }
         }
-        install_bundled_icon_font();
-
         let mut engine = {
             let mut e = Engine::new();
             // #999: record this as a GUI backend *before* resolving
@@ -1348,15 +1346,15 @@ impl App {
     /// repo yet, so this is not a live regression today, only a caveat
     /// for that future work.
     ///
-    /// **`install_bundled_icon_font()` is *not* in that skipped list (#920).**
-    /// It used to be — `App::new` called it and this constructor didn't, so
-    /// every non-GTK backend (macOS first, per #920's repro) silently shipped
-    /// no icon font at all. The function itself now picks its destination and
-    /// cache-refresh step per platform (`~/.local/share/fonts` + `fc-cache`
-    /// off macOS, `~/Library/Fonts` and no cache step on macOS — see
-    /// `app_support::icon_font_dest_dir`), so calling it here is correct for
-    /// every backend this constructor serves, the same way it already was for
-    /// GTK.
+    /// A fifth row used to live in this table: `install_bundled_icon_font()`
+    /// (#920's fontconfig filesystem install + font-cache-refresh shell-out).
+    /// #1130
+    /// deleted that function outright now that quadraui#1013 gives
+    /// `GtkBackend` a real `register_font_from_memory` override — every
+    /// backend, GTK included, now registers the bundled Nerd Font subset
+    /// in-process via `ShellApp::setup`'s `render::register_nerd_font_
+    /// fallback(backend)` call instead, so there is nothing left for either
+    /// constructor to call here.
     ///
     /// Everything else — engine construction and startup, nerd-font
     /// selection, the clipboard provider (`setup_gtk_clipboard` names no
@@ -1383,12 +1381,6 @@ impl App {
         file_path: Option<PathBuf>,
         backend: Rc<RefCell<Box<dyn TextMetricsBackend>>>,
     ) -> Self {
-        // #920: `App::new` calls this too (for GTK/Pango); it has to happen
-        // here as well or every non-GTK backend — macOS first — ships a
-        // bundled icon font that never reaches disk. The function itself
-        // picks the right destination and cache-refresh step per platform.
-        install_bundled_icon_font();
-
         let mut engine = {
             let mut e = Engine::new();
             // #999: same GUI-backend-then-resolve ordering as `App::new`
@@ -1724,9 +1716,7 @@ impl App {
     ///
     /// Deliberately skips, relative to [`App::new`]:
     ///
-    /// - `gdk::Display::default()` icon-theme search paths and
-    ///   `install_bundled_icon_font` (writes to `~/.local/share/fonts` and
-    ///   shells out to `fc-cache` — a test must not touch the user's system).
+    /// - `gdk::Display::default()` icon-theme search paths.
     /// - `load_css`, which `unwrap()`s `gdk::Display::default()` and therefore
     ///   panics with no `DISPLAY`. `css_provider` is left `None` — even
     ///   `gtk4::CssProvider::new()` asserts `gtk::init` has run, and a provider
