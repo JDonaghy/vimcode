@@ -10088,7 +10088,14 @@ fn test_jump_list_ctrl_o_reopens_file_when_buffer_swapped_in_place() {
         engine.active_buffer_state().file_path.as_deref(),
         Some(file_a.as_path())
     );
-    assert_eq!(engine.view().cursor.line, 0);
+    // Not line 0: `:e file_b` is itself jump-worthy (#1158), so it records
+    // A's position at the time of the switch -- line 29, where `G` had left
+    // the cursor -- as a *second* entry, on top of the one `G` itself
+    // pushed for line 0. A single Ctrl-O from the live end lands on the
+    // more recent of the two. Verified against real Neovim: `nvim a30.txt
+    // -c 'normal! G' -c 'edit b1.txt'` then `<C-o>` reports `line('.')` ==
+    // 30 (1-indexed), i.e. this engine's 0-indexed line 29.
+    assert_eq!(engine.view().cursor.line, 29);
 }
 
 /// Closing a tab that appears in the jumplist must not resurrect it: the

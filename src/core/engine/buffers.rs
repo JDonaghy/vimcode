@@ -3287,7 +3287,31 @@ impl Engine {
     /// - `Permanent`: Opens the file as a normal, persistent buffer.
     ///
     /// If the file is already open as a permanent buffer, just switches to it regardless of mode.
+    ///
+    /// Neovim treats landing on a different buffer this way as jump-worthy
+    /// regardless of line (#1158) — records a jumplist entry for the
+    /// pre-switch position. See [`Engine::open_file_for_jump_recovery`] for
+    /// the one caller (jumplist navigation's own recovery fallback) that
+    /// must NOT record another jump while replaying one.
     pub fn open_file_with_mode(&mut self, path: &Path, mode: OpenMode) -> Result<(), String> {
+        self.open_file_with_mode_impl(path, mode, true)
+    }
+
+    /// [`Engine::apply_jump_list_entry`]'s fallback when the recorded pane no
+    /// longer exists: opens `path` into the current window without pushing a
+    /// new jumplist entry (#1158). This call *is* jumplist navigation, not a
+    /// jump-worthy event in its own right — recording here would corrupt the
+    /// list a `<C-o>`/`<C-i>` walk is trying to replay.
+    pub(crate) fn open_file_for_jump_recovery(&mut self, path: &Path) -> Result<(), String> {
+        self.open_file_with_mode_impl(path, OpenMode::Permanent, false)
+    }
+
+    fn open_file_with_mode_impl(
+        &mut self,
+        path: &Path,
+        mode: OpenMode,
+        record_jump: bool,
+    ) -> Result<(), String> {
         // Check which buffers exist before opening (to detect reuse vs creation)
         let existing_ids: Vec<_> = self.buffer_manager.list();
 
@@ -3305,9 +3329,21 @@ impl Engine {
                 .get(buffer_id)
                 .is_some_and(|s| !s.preview);
 
+        // Record the pre-switch position before anything below moves the
+        // active buffer out from under it — only when this call actually
+        // lands on a different buffer, since a same-file `:e` reload is not
+        // "another file" (and would otherwise dedupe away via
+        // `append_jump_list_entry`'s top-entry check anyway, but not before
+        // stamping a possibly-stale `''` mark). Also skip when leaving a
+        // still-pristine scratch buffer -- real Neovim doesn't record that
+        // either (`is_pristine_scratch_buffer`'s doc comment).
+        let current = self.active_buffer_id();
+        if record_jump && current != buffer_id && !self.is_pristine_scratch_buffer(current) {
+            self.push_jump_location();
+        }
+
         // If buffer already exists as permanent, just switch to it
         if is_already_permanent && !self.preview_tab.is_preview(&buffer_id.to_string()) {
-            let current = self.active_buffer_id();
             if current != buffer_id {
                 self.buffer_manager.alternate_buffer = Some(current);
             }
@@ -3351,7 +3387,6 @@ impl Engine {
             }
         }
 
-        let current = self.active_buffer_id();
         if current != buffer_id {
             self.buffer_manager.alternate_buffer = Some(current);
         }

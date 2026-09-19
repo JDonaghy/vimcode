@@ -8074,38 +8074,15 @@ fn nvim_conformance() {
 // starts passing must have its entry deleted. May only ever SHRINK.
 // ---------------------------------------------------------------------------
 
-const KNOWN_DEVIATIONS_MULTI: &[&str] = &[
-    // #985: opening a file into a pane -- `:e`/`:edit` (`EngineAction::
-    // OpenFile` -> `open_file_with_mode`), `:tabnew`/`:tabe` (`new_tab`),
-    // `:split`/`:vsplit` (`split_window`) -- never calls
-    // `push_jump_location`/`record_jump_from` at all: verified by reading
-    // every call site in `src/core/engine/buffers.rs`, `windows.rs`'s
-    // `new_tab`/`split_window_with_new_first`, and `execute.rs`'s `:e`/
-    // `:tabnew`/`:split`/`:vsplit` handlers, and confirmed against the real
-    // oracle: opening a different file this way is jump-worthy in Neovim
-    // regardless of line (`getjumplist()` gains an entry), but vimcode's
-    // jumplist is untouched, so every `<C-o>`/`<C-i>` case whose only
-    // jump-worthy event is one of these finds nothing to jump to. This is
-    // the fix issue's spec, not something to paper over here -- see the PR
-    // description for the full divergence list.
-    "jump:multi C-o after :e returns to A",
-    "jump:multi C-o across tab",
-    "jump:multi C-o across split",
-    "jump:multi C-o across vsplit",
-    "jump:multi C-o after buffer swap in place",
-    "jump:multi C-o twice across three files",
-    "jump:multi C-o same line different file",
-    "jumps:multi list after two :e",
-    "jumps:multi list after C-o marker",
-    // NOT listed: "jump:multi C-i forward to B" / "jump:multi C-i across
-    // tab" currently PASS, but vacuously -- with the bug above, `<C-o>` is a
-    // complete no-op (nothing recorded to jump to), so the immediately-
-    // following `<C-i>` is *also* a no-op, and the two cancel out to the
-    // exact position `:e`/`:tabnew` already left the cursor at, matching the
-    // oracle's genuine round trip by coincidence. Real forward-jump coverage
-    // for the fix issue comes from re-running "jump:multi C-o ..." (which
-    // DOES fail today) once a fix lands, not from these two.
-];
+// #985 added the multi-file cases; #1158 fixed the underlying bug --
+// `open_file_with_mode` (`:e`/`:edit`), `new_tab` (`:tabnew`/`:tabe`), and
+// `split_window_with_new_first` (`:split`/`:vsplit`) now call
+// `push_jump_location` before switching the active buffer/window/tab away,
+// matching Neovim's rule that opening a different file this way is
+// jump-worthy regardless of line. All 9 entries this array used to carry
+// now PASS against the real oracle, so the array — which may only ever
+// SHRINK — is empty.
+const KNOWN_DEVIATIONS_MULTI: &[&str] = &[];
 
 #[test]
 fn nvim_conformance_jumplist_multi_file() {
