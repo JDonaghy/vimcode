@@ -2356,6 +2356,21 @@ mod tests {
         s
     }
 
+    /// #1175 updated the golden file: the minimap strip's braille changed
+    /// from `⠍⠈⠛⠛⠓⠓⠒⠒` to `⠅⠛⠓⠒⠒⠂⠀⠀`. That is quadraui#1032 (in the pin
+    /// this issue bumps to) making the TUI dot scale adapt to the buffer's
+    /// own widest sampled line — here the 22-column `println!` line — where
+    /// it was previously a fixed 2-source-columns-per-cell. The same three
+    /// lines are therefore drawn across a wider per-cell bucket, so the
+    /// marks compress leftwards and the strip's last two cells fall empty.
+    ///
+    /// Verified to be an upstream-only change, not a side effect of this
+    /// issue's own aggregation refactor: checking out `develop`'s
+    /// `src/render.rs` and `src/tui_main/shell_app.rs` on top of the new
+    /// pin reproduces byte-identical new output for both this snapshot and
+    /// [`snapshot_split_panes`]. The colour-aggregation move (#1175) cannot
+    /// affect these goldens at all — they capture `lines.join("\n")`, i.e.
+    /// glyphs, and `syntax_spans` only carries colour.
     #[test]
     fn snapshot_normal_mode() {
         let e = test_engine("fn main() {\n    println!(\"hello\");\n}\n");
@@ -2393,6 +2408,12 @@ mod tests {
         snap_settings().bind(|| insta::assert_snapshot!("command_line", lines.join("\n")));
     }
 
+    /// #1175 updated the golden file, for the same reason as
+    /// [`snapshot_normal_mode`] — quadraui#1032's adaptive TUI dot scale.
+    /// Both panes show the same buffer, so both strips move identically
+    /// (`⠉⠉⠈⠉⠁⠉` → `⠉⠉⠉⠉⠁⠀`): the 17-column `left pane content` now drives
+    /// a wider per-cell bucket than the old fixed scale, filling the first
+    /// four cells solid and emptying the last.
     #[test]
     fn snapshot_split_panes() {
         let mut e = test_engine("left pane content\n");
