@@ -44,9 +44,12 @@
 //!    default size / minimize / maximized-check, CSD capture) now go through
 //!    those same traits and compile for every feature set; only window
 //!    *discovery* (`find_visible_window` — quadraui has no portable "find the
-//!    runner's window" surface yet) and the handful of literal
-//!    `gtk4::Settings`/`gtk4::IconTheme` calls inside `App::new`/
-//!    `handle_poll_tick` stay behind inline `#[cfg(feature = "gui")]`.
+//!    runner's window" surface yet) and the `gdk::Display`/`gtk4::IconTheme`
+//!    icon-search-path setup inside `App::new` stay behind inline
+//!    `#[cfg(feature = "gui")]`. A `gtk4::Settings` dark/light-variant push
+//!    used to live here too (`App::new` and `handle_poll_tick` both);
+//!    quadraui#1016 moved it into `Backend::set_theme`, so both call sites
+//!    were deleted rather than kept behind the gate.
 //! 3. **`crate::gtk::{click, css, util}`.** The portable majority of these —
 //!    `pixel_to_click_target` and the rest of the click-resolution/tab-bar
 //!    pixel-geometry functions, `make_theme_css`/`STATIC_CSS`, `open_url`/
@@ -1274,9 +1277,6 @@ impl App {
         let css_provider: Option<Box<dyn PlatformCssProvider>> =
             Some(Box::new(crate::gtk::css::load_css(&initial_theme)));
         let last_colorscheme = engine.settings.colorscheme.clone();
-        if let Some(gtk_settings) = gtk4::Settings::default() {
-            gtk_settings.set_gtk_application_prefer_dark_theme(!initial_theme.is_light());
-        }
 
         let engine = Rc::new(RefCell::new(engine));
         unsafe {
@@ -1299,7 +1299,7 @@ impl App {
     /// non-GTK quadraui backend calls to get the *same* `App`, and therefore
     /// the same `impl ShellApp`, the GTK entry point runs.
     ///
-    /// This is [`App::new`] minus exactly three steps in its prologue that
+    /// This is [`App::new`] minus exactly two steps in its prologue that
     /// need a live GTK display, each of which is a platform *resource*
     /// rather than a decision:
     ///
@@ -1307,7 +1307,14 @@ impl App {
     /// |---|---|---|
     /// | `gdk::Display` icon-theme search path | GDK-only; no portable icon-theme concept exists off GTK | nothing — no other backend has an icon theme to seed |
     /// | `crate::gtk::css::load_css` | `unwrap()`s `gdk::Display::default()` | `css_provider: None` — a GTK stylesheet styles nothing on another toolkit |
-    /// | `gtk4::Settings::set_gtk_application_prefer_dark_theme` | GTK-only | the backend's own light/dark handling |
+    ///
+    /// A third row used to live in this table: the GTK-only
+    /// `gtk4::Settings` dark/light-variant push, run once from `App::new`'s
+    /// prologue and again from `handle_poll_tick` on every colorscheme
+    /// change. quadraui#1016 moved that push into
+    /// `Backend::set_theme` itself, which `sync_per_frame_backend_state`
+    /// already calls every frame on both constructors' `App`s — so both
+    /// call sites were deleted outright rather than needing a row here.
     ///
     /// A fourth row used to live in this table: the GTK-only
     /// `gio::FileMonitor` on `settings.json`, replaced here by
@@ -1720,7 +1727,6 @@ impl App {
     ///   panics with no `DISPLAY`. `css_provider` is left `None` — even
     ///   `gtk4::CssProvider::new()` asserts `gtk::init` has run, and a provider
     ///   attached to no display styles nothing.
-    /// - `gtk4::Settings::default()` (needs a display).
     /// - `setup_gtk_clipboard`, which probes X11 / spawns `xclip`.
     /// - `Engine::startup`, which would restore *the developer's real last
     ///   session*. Tests pass the exact buffers/groups they mean to assert on.
@@ -2789,11 +2795,12 @@ impl App {
                 if let Some(p) = &self.css_provider {
                     p.load_css_data(&combined);
                 }
-                // Update GTK dark/light preference for native widgets & menus.
-                #[cfg(feature = "gui")]
-                if let Some(gtk_settings) = gtk4::Settings::default() {
-                    gtk_settings.set_gtk_application_prefer_dark_theme(!theme.is_light());
-                }
+                // GTK dark/light preference for native widgets & menus
+                // (the file dialog) is no longer pushed here: quadraui#1016
+                // made `Backend::set_theme` do it, and
+                // `sync_per_frame_backend_state` calls that every frame —
+                // this block's `draw_needed.set(true)` below is what
+                // schedules the next one.
                 self.last_colorscheme = current;
                 self.draw_needed.set(true);
             }

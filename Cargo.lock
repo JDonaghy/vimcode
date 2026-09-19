@@ -2791,7 +2791,7 @@ checksum = "d55d956fa96f5ec02be2e13af0e20391a5aa83d6a074e3ad368959d0fab299ea"
 [[package]]
 name = "quadraui"
 version = "0.0.1"
-source = "git+https://github.com/JDonaghy/quadraui.git?rev=7a77602d78fbabc2a5c8a237db668e51a6fcdba1#7a77602d78fbabc2a5c8a237db668e51a6fcdba1"
+source = "git+https://github.com/JDonaghy/quadraui.git?rev=5211f8f5aaef874804a6c12881a7d6b2647541e6#5211f8f5aaef874804a6c12881a7d6b2647541e6"
 dependencies = [
  "arboard",
  "core-foundation 0.9.4",

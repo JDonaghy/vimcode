@@ -188,7 +188,7 @@ win = ["quadraui/win"]
 # that file and CLAUDE.md's "Wrong quadraui checkout" section) — this
 # replaces the old `VIMCODE_QUADRAUI_UNPINNED=1` escape hatch, which could
 # not build backwards drift (a checkout older than a rev vimcode requires).
-quadraui = { git = "https://github.com/JDonaghy/quadraui.git", rev = "7a77602d78fbabc2a5c8a237db668e51a6fcdba1", features = ["tui", "terminal"] }
+quadraui = { git = "https://github.com/JDonaghy/quadraui.git", rev = "5211f8f5aaef874804a6c12881a7d6b2647541e6", features = ["tui", "terminal"] }
 # #896: gtk4/pangocairo/gio are ONE version family with quadraui's own
 # gtk4-rs dependency, not three independent bumps. `gtk4-sys` carries
 # `links = "gtk-4"`, so Cargo permits exactly one `gtk4-sys` in the whole
