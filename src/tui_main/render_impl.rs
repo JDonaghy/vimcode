@@ -403,15 +403,37 @@ pub(super) fn paint_editor_popups(
                     .saturating_sub(active_win.scroll_left) as u16;
                 let popup_x = win_x + gutter_w + vis_col;
                 let popup_y = win_y + cursor_pos.view_line as u16 + 1;
+                // #420: clamp the popup into the *active window's own*
+                // rect, not the shared `viewport` above (which spans every
+                // split in the editor band, plus the gap the sidebar
+                // already leaves for the first split). Feeding the wider
+                // shared viewport into `Completions::layout` let its
+                // "shift left on right-overflow" clamp push the popup past
+                // the active window's own left edge — into a neighbouring
+                // split, or, with the leftmost split narrow, visibly
+                // against the sidebar boundary. GTK's `paint_editor_popups`
+                // equivalent in `app.rs` already scopes to `win_viewport`
+                // this way; this brings TUI in line with it.
+                let win_viewport = quadraui::Rect::new(
+                    active_win.rect.x as f32,
+                    active_win.rect.y as f32,
+                    active_win.rect.width as f32,
+                    active_win.rect.height as f32,
+                );
                 // Per D6: build quadraui::Completions + layout + rasterise.
                 let completions = render::completion_menu_to_quadraui_completions(menu);
-                let popup_width = (menu.max_width as f32 + 4.0).max(12.0);
+                // #420: `Completions::layout` only clamps *position* into
+                // the viewport, not *width* — an over-wide popup (long
+                // candidate label in a narrow split) still overflows the
+                // right edge even once the position is correctly clamped
+                // above, so cap the width here too.
+                let popup_width = ((menu.max_width as f32 + 4.0).max(12.0)).min(win_viewport.width);
                 let max_popup_height = 10.0;
                 let layout = completions.layout(
                     popup_x as f32,
                     popup_y as f32 - 1.0, // cursor y; layout adds line_height below
                     1.0,
-                    viewport,
+                    win_viewport,
                     popup_width,
                     max_popup_height,
                     |_| quadraui::CompletionItemMeasure::new(1.0),
