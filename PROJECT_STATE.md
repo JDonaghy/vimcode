@@ -1,6 +1,63 @@
 # VimCode Project State
 
-**Last updated:** September 17, 2026 (#1066 — product decision: TUI's editor wheel now scrolls the hovered pane, converged onto GTK's `hovered_window_id` behaviour; `mouse.rs` rewired onto `render::find_window_at` + `Engine::scroll_viewport_with_cursor_for_window`, GOALS.md item 14 closed). Prior revisions: September 16 (#1031 — `:s///c` confirm loop built, #801 Phase 2 / #986 fix: `Engine::confirm_sub` + `handle_confirm_sub_key` in `execute.rs`), September 14 (#951 — ACP-0: `src/core/acp.rs`, NDJSON JSON-RPC transport + session lifecycle, foundation of the ACP track, epic #531), September 14 (#522 — Track A foundation: generic external-tool JSON seam, `src/core/tool_client.rs`, no coordinator vocabulary in core), September 14 (#970 — confirmed the two "failing GTK click-geometry tests" are the already-known/already-documented Darwin font-rasteriser divergence from #926/#933, not a new bug; no code change), September 14 (#950 review fix round — driver-tier pixel test added for the SEARCH_COD→SEARCH glyph change, self-contradictory pure-refactor claim corrected), September 14 (#950 — ShellApp convergence decomposition + cheap wins), September 14 (#949 review fix round — driver-tier test added, macOS/Win-GUI claim corrected), September 14 (#949 — GTK-only settings-reload watcher deleted), September 11 (macOS native-menu audit — #901/#902 filed, milestone #7 reopened), September 10 (#862 — `src/app.rs` no longer needs the `gui` feature to compile), September 5 (#827 correction pass), September 4 (#801), September 3 (platform-neutrality chain drained). Milestone #7 is **2 open** (#901, #902 — 2026-09-11 macOS native-menu audit). **#47 is reopened, in milestone #5** — its blocker (quadraui#699/#704) closed 2026-09-03, and #811 already ported the TUI side onto the new API. See `GOALS.md` for the full correction history.
+**Last updated:** September 18, 2026 (#934 — the three GTK pixel probes documented as Darwin-known-red since #926/#933/#970 are now robust to Core Text's rasterisation instead of skipped: `painted_divider_x` tolerance-matches colour, the minimap ink probe samples 3 rows instead of 1, and the window-control contrast floor drops 40.0→25.0. Verified green on Linux at this SHA — all 5 prior + 2 sibling driver tests pass — settling the "is this fleet-wide" question the #3298 config comment left open: **it is not**, confirming Darwin-rasteriser-artifact, not ordinary bug. RED-verified all three against reintroduced real regressions on Linux; could not verify on an actual Darwin host from this session (WSL2/Linux only) — flagged for macmini confirmation before the operator drops `coordinator.yml`'s `uname` guard). Prior revisions: September 17 (#1066 — product decision: TUI's editor wheel now scrolls the hovered pane, converged onto GTK's `hovered_window_id` behaviour; `mouse.rs` rewired onto `render::find_window_at` + `Engine::scroll_viewport_with_cursor_for_window`, GOALS.md item 14 closed), September 16 (#1031 — `:s///c` confirm loop built, #801 Phase 2 / #986 fix: `Engine::confirm_sub` + `handle_confirm_sub_key` in `execute.rs`), September 14 (#951 — ACP-0: `src/core/acp.rs`, NDJSON JSON-RPC transport + session lifecycle, foundation of the ACP track, epic #531), September 14 (#522 — Track A foundation: generic external-tool JSON seam, `src/core/tool_client.rs`, no coordinator vocabulary in core), September 14 (#970 — confirmed the two "failing GTK click-geometry tests" are the already-known/already-documented Darwin font-rasteriser divergence from #926/#933, not a new bug; no code change), September 14 (#950 review fix round — driver-tier pixel test added for the SEARCH_COD→SEARCH glyph change, self-contradictory pure-refactor claim corrected), September 14 (#950 — ShellApp convergence decomposition + cheap wins), September 14 (#949 review fix round — driver-tier test added, macOS/Win-GUI claim corrected), September 14 (#949 — GTK-only settings-reload watcher deleted), September 11 (macOS native-menu audit — #901/#902 filed, milestone #7 reopened), September 10 (#862 — `src/app.rs` no longer needs the `gui` feature to compile), September 5 (#827 correction pass), September 4 (#801), September 3 (platform-neutrality chain drained). Milestone #7 is **2 open** (#901, #902 — 2026-09-11 macOS native-menu audit). **#47 is reopened, in milestone #5** — its blocker (quadraui#699/#704) closed 2026-09-03, and #811 already ported the TUI side onto the new API. See `GOALS.md` for the full correction history.
+
+## #934 — the three Darwin-known-red GTK pixel probes fixed to tolerate Core Text, not routed around
+
+Follow-up to the claude-coordinator#3298 config unblock. The `uname` guard in
+`coordinator.yml`'s vimcode `test_command` exists only because of these three probes
+(`gtk::chrome_paint_tests::window_control_buttons_are_visible_against_their_background_in_every_theme`,
+`gtk::testing::minimap::minimap_click_at_the_middle_scrolls_to_half_the_file`,
+`gtk::testing::tests::window_split_divider_drag_repaints_the_line_at_the_new_position`)
+failing on Darwin's Quartz/Core Text pangocairo backend while green on Linux/freetype
+— documented since #926/#933/#970 but never actually fixed, only routed around. This
+issue is the fix.
+
+**Step 1 — settle the "is this fleet-wide" question, per the issue's own instruction:**
+ran all three at this session's SHA on a Linux (WSL2, headless, no DISPLAY) host — **all
+green**, alongside their two shared-layout/TUI twins (`render::tests::
+minimap_click_at_the_middle_seeks_to_the_middle_of_the_painted_window` and
+`tui_main::shell_app::tests::minimap_click_at_the_middle_scrolls_to_the_middle_of_the_
+painted_window`, also green). Confirms the reported Darwin failures are rasteriser
+artifacts, not ordinary bugs — the fleet-wide-bug branch of the issue's decision tree
+does not apply.
+
+**Step 2 — fix each probe, not the behaviour it guards, per CLAUDE.md's "assert on
+rendered output" rule:**
+
+- `painted_divider_x` (`src/gtk/testing.rs`) now colour-matches within a TOL=10
+  per-channel tolerance (`colour_near`, mirroring `vscode_dimming::near`'s existing
+  idiom for the identical AA-rounding class) instead of `==`. The divider is a plain
+  filled line, not text, so its *geometry* can't shift with the font, but a 1px hairline
+  at a fractional x still gets antialiased across two columns, and Core Text's
+  compositing spreads that differently than freetype's — neither column may land on the
+  exact full-intensity byte value even though the line plainly painted.
+- The minimap ink sanity probe (`minimap_click_at_the_middle_scrolls_to_half_the_file`)
+  now sums colorful-pixel ink across the top **3** painted rows instead of 1, both
+  before and after the click. Every line in the fixture repeats the same token shape, so
+  this multiplies sampled ink without changing what's proven; the `frac`-tolerance keeps
+  `scroll_top` inside roughly (160,240) of 400 lines, so the widened "after" band tops
+  out around line 242 — comfortably inside the fixture's indented (100..300) range with
+  margin to spare.
+- The window-control contrast floor (`src/gtk/mod.rs`) drops from `40.0` to `25.0`. The
+  reported Darwin measurement was 36.1 (solarized-dark, minimize) — this is a single
+  data point, not a full Darwin run across every theme/button, so the new floor is a
+  reasoned floor-with-margin (≈5x above the #552 near-zero true-invisible-bug shape),
+  not a tuned-exact value.
+
+**RED-verified all three on Linux** by temporarily reintroducing the real bug each probe
+exists to catch (`apply_divider_drag` forced to `false`; `build_rendered_window`'s
+`scroll_top` hardcoded to `0`; `window_controls_status_bar`'s `fg` set equal to `bg`) —
+all three failed loudly with the expected message, confirming the widened tolerances
+did not weaken the checks. Reverted before committing; `git diff` touches only
+`src/gtk/testing.rs` and `src/gtk/mod.rs`.
+
+**Not verified on an actual Darwin host** — this session runs on WSL2/Linux, and no
+macOS machine was reachable. The fix is code-inspection-and-Linux-RED-verification
+based, not confirmed against the real Core Text failure. **Before the operator drops
+`coordinator.yml`'s `uname` guard per this issue's "follow-up once green" note, run
+`cargo test` on macmini and confirm all three (plus their #976 TUI-lane siblings, a
+separate and already-tracked issue) are actually green now.**
 
 ## #1066 — TUI editor wheel scroll converges onto GTK's hovered-pane behaviour
 

@@ -650,13 +650,36 @@ mod tests {
     // `group_divider_drag_moves_the_painted_divider_via_shell_app` and
     // `group_divider_click_without_move_leaves_the_divider_put_via_shell_app`.
 
+    /// Per-channel closeness, loose enough to absorb the divider hairline's
+    /// antialiasing rounding without weakening the position check it backs.
+    ///
+    /// #934: a Darwin/Quartz run of `window_split_divider_drag_repaints_the_
+    /// line_at_the_new_position` reported "no divider line found near the
+    /// drag column" against an exact `==` match. The divider is a plain
+    /// filled line (not text), so its geometry can't shift with the font —
+    /// but a 1px-wide line at a fractional x still gets antialiased across
+    /// two columns by Cairo, and Core Text's compositing spreads that blend
+    /// differently than freetype's, so neither column can land on the exact
+    /// full-intensity `colour` byte value even though the line plainly
+    /// painted. Tolerance-matching (mirroring `vscode_dimming::near`'s
+    /// TOL=10 for the identical class of rasteriser rounding) still requires
+    /// the pixel to be close to the divider's own colour, not merely
+    /// "different from background", so a divider that fails to move (or
+    /// stops rendering) still leaves no match within tolerance.
+    fn colour_near(a: (u8, u8, u8), b: (u8, u8, u8)) -> bool {
+        const TOL: i32 = 10;
+        (a.0 as i32 - b.0 as i32).abs() <= TOL
+            && (a.1 as i32 - b.1 as i32).abs() <= TOL
+            && (a.2 as i32 - b.2 as i32).abs() <= TOL
+    }
+
     /// Scan one painted row for the x of the window-split divider line.
     ///
     /// `draw_split` paints no text, so `find`/`find_bounds` cannot see it —
     /// this is the #555 "probe pixels when the content is not a label" route.
-    /// Searches for `colour` within `+/- span` of `near`, which keeps the test
-    /// honest about *where* the line ended up without hardcoding either end of
-    /// the drag.
+    /// Searches for `colour` (within `colour_near`'s AA tolerance) within
+    /// `+/- span` of `near`, which keeps the test honest about *where* the
+    /// line ended up without hardcoding either end of the drag.
     fn painted_divider_x<A: AppLogic>(
         h: &mut Harness<A>,
         near: i32,
@@ -664,7 +687,7 @@ mod tests {
         span: i32,
         colour: (u8, u8, u8),
     ) -> Option<i32> {
-        (near - span..=near + span).find(|x| h.driver.pixel(*x, y) == colour)
+        (near - span..=near + span).find(|x| colour_near(h.driver.pixel(*x, y), colour))
     }
 
     /// #753, GTK half: dragging a `:vsplit` window divider must repaint the
@@ -7500,8 +7523,8 @@ mod minimap {
             "fixture must start at the top of the file"
         );
 
-        // The 12-column band right after the gutter, on the top visible
-        // row: unindented content ("fn item_0() ...") paints syntax-colored
+        // The 12-column band right after the gutter, on the top 3 visible
+        // rows: unindented content ("fn item_0() ...") paints syntax-colored
         // glyph ink *somewhere* in this band before the click, while a row
         // from the indented band (100..300) paints nothing there but blank
         // indentation (background plus, at most, an indent-guide line —
@@ -7512,10 +7535,25 @@ mod minimap {
         // *brightest* color in the band rather than the ink, and indent
         // guides paint real (if faint) grayscale pixels in the same band
         // even on a correctly-repainted frame.
+        //
+        // #934: 3 rows, not 1. A Darwin/Quartz run reported the single-row
+        // version's "before" sanity check failing outright (0 colorful
+        // pixels found) — Core Text's gamma-correct glyph compositing can
+        // blend a thin syntax-colored stroke so far towards the background
+        // that one row's worth of ink dips under `is_colorful`'s TOL, even
+        // though the line plainly painted. Every unindented/indented line in
+        // the fixture repeats the identical token shape
+        // (`fn item_N() { let x = N; }`), so summing ink across 3 rows
+        // multiplies the sampled ink without changing what's being proven.
+        // It stays safe for the "after" (must-be-zero) band too: `frac`'s
+        // `< 0.1` tolerance keeps `scroll_top` inside roughly (160, 240) of
+        // the fixture's 400 lines, so the widened band (`scroll_top` ..
+        // `scroll_top + 2`) tops out around line 242 — comfortably inside
+        // the indented (100..300) range with margin to spare.
         let band_x0 = (rect.x + gutter_px) as i32;
         let band_x1 = (rect.x + gutter_px + 12.0 * char_w) as i32;
         let row_y0 = (rect.y).ceil() as i32;
-        let row_y1 = (rect.y + lh).floor() as i32;
+        let row_y1 = (rect.y + 3.0 * lh).floor() as i32;
         let is_colorful = |(r, g, b): (u8, u8, u8)| {
             let (r, g, b) = (r as i32, g as i32, b as i32);
             const TOL: i32 = 12; // AA-rounding tolerance, matching `near()` above
