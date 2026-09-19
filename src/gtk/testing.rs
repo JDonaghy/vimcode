@@ -8733,6 +8733,168 @@ mod scrollbar_paint {
         );
     }
 
+    /// #1128 black-box regression: dragging the GTK v-scrollbar thumb
+    /// through the real `App::handle_mouse_click_msg` ->
+    /// `handle_mouse_drag_msg` dispatch must land the window's scroll
+    /// position exactly where `quadraui::fit_thumb` (the one canonical
+    /// thumb-sizing formula `editor_scrollbar_layout`'s `Editor::layout`
+    /// call uses, and the same public function this test calls directly —
+    /// never this issue's own `editor_scrollbar_layout`/
+    /// `v_scrollbar_thumb_geometry` wrappers) predicts from real painted
+    /// geometry (`rect`, `line_height`) and the buffer's real line count.
+    /// This is the driver-tier proof that the fix is wired up end to end
+    /// through a real mouse interaction, not only through the pure-function
+    /// `editor_scrollbar_geometry_tests` in `gtk/mod.rs`.
+    ///
+    /// **Why the v-scrollbar, when this issue's title names the h-scrollbar:**
+    /// both bars' hit-testing now resolve through the identical
+    /// `editor_scrollbar_layout` call this issue's diff introduced
+    /// (`h_scrollbar_thumb_geometry`/`v_scrollbar_thumb_geometry` are thin
+    /// wrappers reading `h_scrollbar_bounds`/`v_scrollbar_bounds` off the
+    /// same `(Editor, EditorLayout)` pair), and this test targets the exact
+    /// axis (never shrinking the track for a per-window status line) both
+    /// wrappers now share — so a real drag through either rung exercises
+    /// the same fix. The h-scrollbar's own *click* rung (`app.rs`'s "H
+    /// scrollbar hit-test" block) additionally rebuilds window rects via
+    /// `compute_editor_window_rects` at a hardcoded `(0, 0)` origin, rather
+    /// than `App::painted_editor_bounds`'s real, activity-bar/sidebar-offset
+    /// one the v-scrollbar rung uses (see that rung's own "Window rects
+    /// come from `self.painted_editor_bounds()`" comment) — a separate,
+    /// pre-existing bug this issue's review flagged as a non-blocking
+    /// follow-up, not introduced or fixed here. With the default 48px-wide
+    /// activity bar alone (confirmed empirically: a single un-split
+    /// window's painted rect starts at `x: 48.0` with the sidebar closed),
+    /// a real click at the h-scrollbar's actual on-screen position —
+    /// anywhere past local column 1352 in a 1400px-wide harness — falls
+    /// outside that hardcoded-origin rect and never reaches
+    /// `h_scrollbar_hit_test` at all. Driving the real *h*-scrollbar click
+    /// end to end would therefore be red for that unrelated reason, not for
+    /// anything this issue changed, so this test exercises the shared fix
+    /// through the rung whose click-dispatch is already correct.
+    ///
+    /// **What actually distinguishes old from new** (and so what this test
+    /// pins): the pre-#1128 `v_scrollbar_geometry` helper (`git show
+    /// 9e83068^:src/app_support.rs`) shrank the track's height by one
+    /// `line_height` whenever `window_status_line` was on (this fixture's
+    /// default) before computing the thumb — so its `fit_thumb` call used a
+    /// track roughly one row shorter than what `editor_scrollbar_layout`
+    /// (via `quadraui::Editor::layout`, which never applies that shrink —
+    /// pinned directly by `status_line_settings_never_move_the_track` in
+    /// `gtk/mod.rs`) now uses. A one-row-shorter track changes both the
+    /// thumb's own length and the scrollbar's `max_scroll` (derived from
+    /// `visible_lines`, itself derived from the track height), so dragging
+    /// the thumb by a fixed pixel distance lands on a measurably different
+    /// row under the two formulas — a plain click can't observe this (any
+    /// click research row this test could reach is swallowed by the
+    /// per-window status line's own chrome-rung click handling before the
+    /// scrollbar rungs ever run — verified while writing this test), but a
+    /// drag's *continuation* (`handle_mouse_drag_msg`'s `ArmedTarget`
+    /// route) bypasses that arbitration entirely once begun, so it is
+    /// reachable this way.
+    ///
+    /// **Verified RED against the pre-#1128 code**: built a scratch
+    /// worktree at this issue's parent commit (`09d9de9`), copied this test
+    /// in unmodified, and ran it — the old, shrunk `v_scrollbar_geometry`
+    /// produced a different `max_scroll`/thumb length at drag-begin time,
+    /// so the same drag distance landed on a different `scroll_top` than
+    /// this test's `fit_thumb`-based prediction (which matches what
+    /// `editor_scrollbar_layout` now actually computes), failing the final
+    /// assertion. It passes unmodified on this issue's fix.
+    #[test]
+    fn dragging_the_v_scrollbar_thumb_lands_on_the_fit_thumb_predicted_row_on_gtk() {
+        let mut h = harness(engine_with_long_buffer(), 1400, 900);
+        let win = h.engine.borrow().active_window_id();
+        assert!(
+            h.engine.borrow().settings.window_status_line,
+            "fixture sanity: this test's whole point is the axis the old \
+             per-issue helper got wrong — a per-window status line on by \
+             default"
+        );
+
+        let rect = {
+            let layout = h.screen_layout.borrow();
+            layout
+                .as_ref()
+                .expect("render_content must have painted a ScreenLayout")
+                .windows
+                .iter()
+                .find(|w| w.window_id == win)
+                .expect("the active window must have painted")
+                .rect
+        };
+        let line_height =
+            h.painted_line_height()
+                .expect("render_content must publish the painted line height") as f32;
+
+        let total_lines = {
+            let engine = h.engine.borrow();
+            let window = engine.windows.get(&win).unwrap();
+            let buffer_state = engine.buffer_manager.get(window.buffer_id).unwrap();
+            buffer_state.buffer.len_lines()
+        };
+
+        // Independently predict, from real painted geometry
+        // (`rect`/`line_height`) plus the buffer's real line count and
+        // quadraui's own public `fit_thumb` — never this issue's own
+        // `editor_scrollbar_layout`/`v_scrollbar_thumb_geometry` — the
+        // scroll_top a real drag must land on. Mirrors exactly what
+        // `v_scrollbar_thumb_geometry` (this issue's fix) and
+        // `quadraui::dispatch_mouse_drag` (the generic drag-continuation
+        // math both scrollbars share) each compute, since there's no
+        // h-scrollbar in this fixture (short lines) to shrink the track
+        // further.
+        let track_h = rect.height as f32;
+        let visible_lines = (track_h / line_height).floor();
+        let max_scroll = ((total_lines as f64) - (visible_lines as f64))
+            .max(1.0)
+            .round() as usize;
+        let (thumb_start0, thumb_len) =
+            quadraui::fit_thumb(0.0, total_lines as f32, visible_lines, track_h, line_height);
+        assert!(
+            thumb_len > 8.0,
+            "fixture sanity: the thumb must be comfortably grabbable a few \
+             pixels from its own top edge (thumb_len={thumb_len})"
+        );
+
+        let x = (rect.x + rect.width - 3.0) as f32;
+        // Grab 2px into the thumb from its own top edge (thumb_start0 is 0
+        // here — the thumb starts at the track's top with scroll_top at 0).
+        const GRAB_OFFSET: f32 = 2.0;
+        let grab_y = rect.y as f32 + thumb_start0 + GRAB_OFFSET;
+        // Drag to the track's own midpoint — comfortably short of either
+        // formula's track end, so neither the real (new) nor the pre-#1128
+        // (shrunk-by-one-`line_height`) track clamps the result to the same
+        // saturated max, which would erase the very difference this test
+        // exists to catch.
+        let target_y = rect.y as f32 + 0.5 * track_h;
+
+        let effective_track = (track_h - thumb_len).max(1.0);
+        let rel = ((target_y - rect.y as f32) - GRAB_OFFSET) / effective_track;
+        let expected = (rel.clamp(0.0, 1.0) * max_scroll as f32).round() as i64;
+
+        let before = h.engine.borrow().windows.get(&win).unwrap().view.scroll_top;
+        assert_eq!(before, 0, "fixture sanity: must start unscrolled");
+
+        // A real `MouseDown` (routed through `App::handle_mouse_click_msg`)
+        // grabs the thumb at its real position, then a real `MouseMoved`
+        // with the button held (routed through `App::handle_mouse_drag_msg`)
+        // drags it — exactly as a user's drag would dispatch.
+        h.driver.mouse_down(x, grab_y);
+        h.driver.mouse_move(x, target_y);
+        h.driver.mouse_up(x, target_y);
+        h.driver.render();
+
+        let after = h.engine.borrow().windows.get(&win).unwrap().view.scroll_top as i64;
+        assert!(
+            (after - expected).abs() <= 1,
+            "dragging the v-scrollbar thumb to the track's midpoint must \
+             land scroll_top within 1 of this test's independent \
+             `fit_thumb`-based prediction ({expected}); got {after} \
+             instead (max_scroll={max_scroll}, visible_lines={visible_lines}, \
+             thumb_len={thumb_len})"
+        );
+    }
+
     /// #828 acceptance (driver tier): "editor viewport width with the
     /// scrollbar present". GTK does not clip painted *text* glyphs to
     /// `text_viewport_cols` at the pixel level — a long line's characters
