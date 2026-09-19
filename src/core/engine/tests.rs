@@ -10098,6 +10098,89 @@ fn test_jump_list_ctrl_o_reopens_file_when_buffer_swapped_in_place() {
     assert_eq!(engine.view().cursor.line, 29);
 }
 
+/// `:split <currently-open-path>` must NOT push a jump entry: real Neovim
+/// records nothing when the file opened into the split is the same file
+/// already active (verified against Neovim v0.12.5: `nvim a.txt -c 'split
+/// a.txt' -c jumps` prints an empty jumplist, vs. `split b.txt` which
+/// records one entry for a.txt). `buffer_manager.open_file` dedups by
+/// canonical path, so `split_window_with_new_first` must gate its
+/// `push_jump_location` call on the resulting buffer actually differing
+/// from the one being left -- not just on `file_path.is_some()`. Fails
+/// against the unfixed code (jump entry pushed for a same-file split): the
+/// jump_list length assertion sees 1 instead of 0.
+#[test]
+fn test_split_same_file_does_not_push_jump_entry() {
+    let dir = std::env::temp_dir().join("vimcode_jumplist_split_same_file");
+    std::fs::create_dir_all(&dir).unwrap();
+    let file_a = dir.join("file_a_split_same.txt");
+    let content_a: String = (0..30).map(|i| format!("AAA line {}\n", i)).collect();
+    std::fs::write(&file_a, &content_a).unwrap();
+
+    let mut engine = Engine::new();
+    engine
+        .open_file_with_mode(&file_a, OpenMode::Permanent)
+        .unwrap();
+    assert!(engine.jump_list.is_empty());
+
+    // Splitting into the *same already-open file* is not jump-worthy.
+    engine.split_window(SplitDirection::Vertical, Some(&file_a));
+    assert!(
+        engine.jump_list.is_empty(),
+        "split into the currently-open file must not record a jump entry, got {:?}",
+        engine.jump_list
+    );
+
+    // Contrast: splitting into a genuinely different file IS jump-worthy.
+    let file_b = dir.join("file_b_split_same.txt");
+    std::fs::write(&file_b, "BBB only line\n").unwrap();
+    engine.split_window(SplitDirection::Vertical, Some(&file_b));
+    assert_eq!(
+        engine.jump_list.len(),
+        1,
+        "split into a different file must record exactly one jump entry"
+    );
+}
+
+/// Same as `test_split_same_file_does_not_push_jump_entry`, but for
+/// `:tabnew <currently-open-path>` / `new_tab`. Verified against real
+/// Neovim v0.12.5: `nvim a.txt -c 'tabnew a.txt' -c jumps` prints an empty
+/// jumplist. Fails against the unfixed code, which pushed a jump entry
+/// whenever `file_path.is_some()` regardless of whether the new tab's
+/// buffer was actually different from the one being left.
+#[test]
+fn test_new_tab_same_file_does_not_push_jump_entry() {
+    let dir = std::env::temp_dir().join("vimcode_jumplist_tab_same_file");
+    std::fs::create_dir_all(&dir).unwrap();
+    let file_a = dir.join("file_a_tab_same.txt");
+    let content_a: String = (0..30).map(|i| format!("AAA line {}\n", i)).collect();
+    std::fs::write(&file_a, &content_a).unwrap();
+
+    let mut engine = Engine::new();
+    engine
+        .open_file_with_mode(&file_a, OpenMode::Permanent)
+        .unwrap();
+    assert!(engine.jump_list.is_empty());
+
+    // Opening a new tab on the *same already-open file* is not jump-worthy.
+    engine.new_tab(Some(&file_a));
+    assert!(
+        engine.jump_list.is_empty(),
+        "tabnew into the currently-open file must not record a jump entry, got {:?}",
+        engine.jump_list
+    );
+
+    // Contrast: opening a new tab on a genuinely different file IS
+    // jump-worthy.
+    let file_b = dir.join("file_b_tab_same.txt");
+    std::fs::write(&file_b, "BBB only line\n").unwrap();
+    engine.new_tab(Some(&file_b));
+    assert_eq!(
+        engine.jump_list.len(),
+        1,
+        "tabnew into a different file must record exactly one jump entry"
+    );
+}
+
 /// Closing a tab that appears in the jumplist must not resurrect it: the
 /// dead entry is pruned, and `Ctrl-O` keeps working by skipping straight
 /// over it rather than reopening the closed file or panicking.
