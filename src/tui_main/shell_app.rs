@@ -22130,4 +22130,218 @@ mod tests {
              screen:\n{screen}"
         );
     }
+
+    /// #1152 driver-tier coverage: `:iabbrev` must actually expand the typed
+    /// word into the *painted* buffer content the moment the trigger
+    /// character lands, not just `Engine::buffer()` inspected directly —
+    /// the black-box twin of `tests/ex_commands.rs`'s
+    /// `vim_abbrev_iabbrev_full_id_expands_on_trigger_char`.
+    ///
+    /// RED against unfixed `develop`: `:iabbrev` fell through to the
+    /// unknown-ex-command fallback (no abbreviation was ever defined), so
+    /// typing `teh ` would leave the literal text `"teh "` on screen
+    /// instead of expanding it to `"the "`.
+    #[test]
+    fn abbrev_iabbrev_expands_full_id_on_trigger_char_via_shell_app() {
+        let app = TuiShellApp::new_for_test();
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        driver.press_named(quadraui::NamedKey::Escape);
+
+        driver.type_char(':');
+        for c in "iabbrev teh the".chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
+        driver.render();
+
+        driver.type_char('i');
+        for c in "teh ".chars() {
+            driver.type_char(c);
+        }
+        driver.render();
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("the "),
+            ":iabbrev teh the must expand \"teh \" to \"the \" as it is \
+             typed; screen:\n{screen}"
+        );
+        assert!(
+            !screen.contains("teh "),
+            "the unexpanded abbreviation must not remain on screen; \
+             screen:\n{screen}"
+        );
+    }
+
+    /// #1152 driver-tier coverage: a full-id abbreviation must NOT expand
+    /// when it is not preceded by a word boundary — the black-box twin of
+    /// `tests/ex_commands.rs`'s `vim_abbrev_does_not_fire_mid_word`.
+    ///
+    /// RED against unfixed `develop`: with no abbreviation-expansion hook at
+    /// all, this assertion would spuriously pass (nothing ever expands), so
+    /// this test alone doesn't prove the fix — it's paired with
+    /// `abbrev_iabbrev_expands_full_id_on_trigger_char_via_shell_app` above,
+    /// which fails outright against `develop`, to pin the "whole word only"
+    /// boundary rule specifically.
+    #[test]
+    fn abbrev_iabbrev_does_not_fire_mid_word_via_shell_app() {
+        let app = TuiShellApp::new_for_test();
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        driver.press_named(quadraui::NamedKey::Escape);
+
+        driver.type_char(':');
+        for c in "iabbrev teh the".chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
+        driver.render();
+
+        driver.type_char('i');
+        for c in "ateh ".chars() {
+            driver.type_char(c);
+        }
+        driver.render();
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("ateh "),
+            "\"teh\" preceded by the word character 'a' is not a whole \
+             word and must not expand; screen:\n{screen}"
+        );
+    }
+
+    /// #1152 driver-tier coverage: an end-id abbreviation (`"#i"` — ends in
+    /// a keyword character but has a non-keyword one earlier) must expand
+    /// the same as a full-id one, with no word-boundary check required —
+    /// the black-box twin of `tests/ex_commands.rs`'s
+    /// `vim_abbrev_iabbrev_end_id_expands_on_trigger_char`.
+    ///
+    /// RED against unfixed `develop`: `:iabbrev` was unrecognised, so
+    /// typing `#i ` would leave the literal text on screen instead of
+    /// expanding to `"#include "`.
+    #[test]
+    fn abbrev_iabbrev_expands_end_id_on_trigger_char_via_shell_app() {
+        let app = TuiShellApp::new_for_test();
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        driver.press_named(quadraui::NamedKey::Escape);
+
+        driver.type_char(':');
+        for c in "iabbrev #i #include".chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
+        driver.render();
+
+        driver.type_char('i');
+        for c in "#i ".chars() {
+            driver.type_char(c);
+        }
+        driver.render();
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("#include "),
+            ":iabbrev #i #include must expand \"#i \" to \"#include \"; \
+             screen:\n{screen}"
+        );
+    }
+
+    /// #1152 driver-tier coverage: `<C-v>` (Vim's literal-insert /
+    /// abbreviation-suppression trigger, `:h i_CTRL-V`) is what a *paste*
+    /// looks like in this app's real input path — a `<C-v>` keypress never
+    /// reaches `Engine::handle_key`'s dedicated Ctrl-V branch at all.
+    /// `quadraui::runtime::preprocess_event` (quadraui#813) intercepts every
+    /// Ctrl+V ahead of `AppLogic::handle` on every backend and redelivers it
+    /// as `UiEvent::ClipboardPaste`, exactly as
+    /// `ctrl_v_paste_reaches_the_search_panel_via_clipboard_paste_event`
+    /// above documents empirically (a raw `KeyPressed(Char('v'), ctrl)`
+    /// dispatched through the driver reads the machine's *actual* system
+    /// clipboard instead, which is what a first attempt at this test hit).
+    /// `Engine::route_paste`'s `Mode::Insert` arm (`paste_in_insert_mode`)
+    /// bulk-inserts the pasted text directly and never calls
+    /// `try_expand_insert_abbrev` — so the black-box, driver-reachable
+    /// proof of "`<C-v>` suppresses expansion" is that a `ClipboardPaste`
+    /// ending in a matching abbreviation does not expand. The Engine-level
+    /// `tests/ex_commands.rs::vim_abbrev_ctrl_v_suppresses_expansion` covers
+    /// the literal `insert_ctrl_v_pending` mechanism directly via
+    /// `Engine::handle_key`, which the real app also *has*, but which no
+    /// live keypress can reach given the interception above.
+    ///
+    /// RED against unfixed `develop`: N/A for the paste path specifically
+    /// (paste never called the abbreviation hook even before this PR); this
+    /// is a regression guard pinning that pasted text keeps bypassing
+    /// expansion now that the hook exists elsewhere in the Insert-mode key
+    /// path, paired with the trigger-char tests above which do fail RED.
+    #[test]
+    fn abbrev_pasted_text_does_not_expand_via_shell_app() {
+        let app = TuiShellApp::new_for_test();
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        driver.press_named(quadraui::NamedKey::Escape);
+
+        driver.type_char(':');
+        for c in "iabbrev teh the".chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
+        driver.render();
+
+        driver.type_char('i');
+        driver.dispatch(UiEvent::ClipboardPaste("teh ".to_string()));
+        driver.render();
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("teh "),
+            "pasted text ending in a defined abbreviation must not expand \
+             (the real-app equivalent of <C-v> suppression); \
+             screen:\n{screen}"
+        );
+    }
+
+    /// #1152 driver-tier coverage: `:cabbrev` must expand on the real
+    /// command line and the *expanded* command must be the one that runs on
+    /// `<CR>`, visibly changing the buffer content — the black-box twin of
+    /// `tests/ex_commands.rs`'s `vim_abbrev_cabbrev_expands_and_runs_on_return`.
+    ///
+    /// RED against unfixed `develop`: `:cabbrev` was unrecognised, so typing
+    /// `:X<CR>` would report "Not an editor command: X" and leave the
+    /// buffer's `"foo"` untouched instead of substituting it to `"bar"`.
+    #[test]
+    fn abbrev_cabbrev_expands_and_runs_on_return_via_shell_app() {
+        let mut app = TuiShellApp::new_for_test();
+        app.engine.buffer_mut().insert(0, "foo\n");
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        driver.press_named(quadraui::NamedKey::Escape);
+        driver.render();
+        assert!(
+            driver.screen().contains("foo"),
+            "sanity: fixture buffer must show \"foo\" before the abbreviated \
+             substitution; screen:\n{}",
+            driver.screen()
+        );
+
+        driver.type_char(':');
+        for c in "cabbrev X %s/foo/bar/".chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
+        driver.render();
+
+        driver.type_char(':');
+        driver.type_char('X');
+        driver.press_named(quadraui::NamedKey::Enter);
+        driver.render();
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("bar"),
+            ":cabbrev X %s/foo/bar/ then :X<CR> must expand and run the \
+             substitution, replacing \"foo\" with \"bar\"; screen:\n{screen}"
+        );
+        assert!(
+            !screen.contains("foo"),
+            "the original \"foo\" text must be gone after the substitution; \
+             screen:\n{screen}"
+        );
+    }
 }
