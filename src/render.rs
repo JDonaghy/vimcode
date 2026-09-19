@@ -13382,7 +13382,8 @@ impl Theme {
             "vscode-dark".into(),
             "vscode-light".into(),
         ];
-        // Append custom VSCode themes from ~/.config/vimcode/themes/
+        // Append custom VSCode themes from the platform config dir's themes/
+        // subdirectory (see `core::paths::vimcode_config_dir`).
         if let Some(dir) = Self::themes_dir() {
             if let Ok(entries) = std::fs::read_dir(&dir) {
                 for entry in entries.flatten() {
@@ -13400,11 +13401,13 @@ impl Theme {
 
     /// The directory where custom VSCode theme JSON files are stored.
     fn themes_dir() -> Option<std::path::PathBuf> {
-        std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config/vimcode/themes"))
+        Some(crate::core::paths::vimcode_config_dir().join("themes"))
     }
 
     /// Try to load a VSCode-format `.json` theme file by name.
-    /// Looks in `~/.config/vimcode/themes/<name>.json`.
+    /// Looks in `<vimcode_config_dir>/themes/<name>.json`
+    /// (`~/.config/vimcode/themes/` on Linux/macOS, `%APPDATA%\vimcode\themes\`
+    /// on Windows).
     pub fn load_vscode_theme(name: &str) -> Option<Self> {
         let dir = Self::themes_dir()?;
         let path = dir.join(format!("{name}.json"));
@@ -23622,6 +23625,21 @@ mod tests {
         assert_eq!(theme.status_bg, try_from_hex("#181825").unwrap());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1127: `themes_dir()` must derive from the cross-platform
+    /// `core::paths::vimcode_config_dir()` (which handles `APPDATA` on
+    /// Windows), not read `$HOME` directly — reading `$HOME` raw would put
+    /// custom VS Code theme JSON files in the wrong directory on Windows.
+    #[test]
+    fn themes_dir_sits_under_vimcode_config_dir() {
+        let themes_dir = Theme::themes_dir().expect("themes_dir should resolve");
+        let config_dir = crate::core::paths::vimcode_config_dir();
+        assert_eq!(themes_dir, config_dir.join("themes"));
+        assert!(
+            themes_dir.starts_with(&config_dir),
+            "themes_dir {themes_dir:?} should be nested under config_dir {config_dir:?}"
+        );
     }
 
     #[test]
