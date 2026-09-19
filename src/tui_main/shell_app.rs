@@ -3611,13 +3611,20 @@ impl ShellApp for TuiShellApp {
         // line-number citation it used to carry (the GTK loop it named is
         // gone, and this has no GTK counterpart — GTK4 owns cursor shape
         // and window title).
-        // Cursor shape per mode and the emulator window title. Both are plain
-        // escape sequences rather than anything ratatui buffers, so writing
-        // them to the shared process stdout between frames is exactly what
-        // `event_loop` did through `terminal.backend_mut()`. Live runs only:
-        // under `driver_with_shell` there is no real terminal, and emitting
-        // control sequences from a test binary would corrupt the harness'
-        // own output.
+        // Cursor shape per mode is a plain escape sequence rather than
+        // anything ratatui buffers, so writing it to the shared process
+        // stdout between frames is exactly what `event_loop` did through
+        // `terminal.backend_mut()`. Live runs only: under `driver_with_shell`
+        // there is no real terminal, and emitting control sequences from a
+        // test binary would corrupt the harness' own output.
+        //
+        // The emulator window title used to be hand-rolled the same way
+        // (crossterm's `SetTitle` directly), but #1124 routed it through
+        // `backend.window()?.set_title(..)` instead — the `WindowControl`
+        // surface (quadraui#950) `TuiBackend` backs with the exact same OSC
+        // 0/2 escape underneath, so this stays gated on `self.live` for the
+        // same reason as the cursor style, it just no longer names the
+        // escape sequence itself.
         if self.live {
             let cursor_style = if !self.sidebar.has_focus && self.engine.pending_key == Some('r') {
                 SetCursorStyle::SteadyUnderScore
@@ -3633,7 +3640,9 @@ impl ShellApp for TuiShellApp {
                 .active_buffer_name()
                 .map(|n| format!("VimCode \u{2014} {}", n))
                 .unwrap_or_else(|| "VimCode".to_string());
-            let _ = execute!(out, SetTitle(tui_title.as_str()));
+            if let Some(w) = backend.window() {
+                let _ = w.set_title(&tui_title);
+            }
         }
 
         // ── Idle background work (mirrors `mod.rs:1157`-`:1247`) ───────────
