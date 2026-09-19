@@ -234,11 +234,23 @@ pub struct Settings {
     #[serde(default)]
     pub disabled_plugins: Vec<String>,
 
-    /// User-defined key mappings. Each entry is `"mode keys :command"`.
-    /// Mode: `n` (normal), `v` (visual), `i` (insert), `c` (command).
-    /// Keys: single char (`x`), modifier (`<C-/>`, `<A-c>`), or sequence (`gcc`, `gc`).
-    /// Action: ex command prefixed with `:`.
-    /// Example: `["n <C-/> :Commentary", "v <C-/> :Commentary"]`
+    /// User-defined key mappings, persisted in vimcode's internal storage
+    /// format: `"mode[!] keys rhs"`.
+    /// Mode: `n v x o i c s` (vim's `:map-modes` letters); a trailing `!`
+    /// on the mode marks the entry `noremap` (no recursive expansion).
+    /// Keys (lhs): single char (`x`), modifier (`<C-/>`, `<A-c>`), or
+    /// sequence (`gcc`, `gc`), in vim key notation.
+    /// Rhs: either an ex command prefixed with `:` (`":Commentary"`), or a
+    /// raw key sequence fed back through the normal key path (`"<Esc>"`,
+    /// `"<C-w>h"`) — vim's key-to-keys remapping (#1151).
+    ///
+    /// This array is populated by the `:map` family of ex commands
+    /// (`:nnoremap`, `:imap`, `:vnoremap`, …), which parse vim's own
+    /// `:{cmd} {lhs} {rhs}` syntax and translate it into this storage
+    /// format — the format itself, and pre-#1151 entries written in it
+    /// (`"n keys :command"`, always non-`noremap`, always an ex-command
+    /// rhs), keep parsing and working unmigrated.
+    /// Example: `["i! jk <Esc>", "n <C-/> :Commentary"]`
     #[serde(default)]
     pub keymaps: Vec<String>,
 

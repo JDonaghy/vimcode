@@ -2563,19 +2563,30 @@ impl Engine {
         // Build content: header comment + one keymap per line
         let mut content = String::from(
             "# User keymaps — one per line.  :w to save.\n\
-             # Format: mode keys :command\n\
-             # Modes: n (normal), v (visual), i (insert), c (command)\n\
-             # Keys:  single char (x), modifier (<C-x>, <A-x>), sequence (gcc)\n\
+             # Format: mode[!] keys rhs\n\
+             # Modes: n (normal) v (visual) x (visual-only) o (operator-pending)\n\
+             #        i (insert) c (command) s (select, unused)\n\
+             # A trailing '!' on mode is noremap (rhs is not re-expanded).\n\
+             # Keys:  single char (x), modifier (<C-x>), sequence (gcc), vim\n\
+             #        notation (<Esc> <CR> <Tab> <leader> <Plug>...)\n\
+             # Rhs:   an ex command prefixed with ':' (:Commentary), or a raw\n\
+             #        key sequence fed back through the normal key path (<Esc>)\n\
+             #\n\
+             # This buffer is edited directly in vimcode's storage format; day\n\
+             # to day, prefer the vim ex commands instead — :nnoremap, :imap,\n\
+             # :vnoremap, :onoremap, :unmap, :mapclear, etc. — which write to\n\
+             # this same list.\n\
              #\n\
              # In VSCode mode, \"n\" keymaps apply (use modifiers like <C-x>, <A-x>).\n\
              # Run :Keybindings to see all built-in keybindings and command names.\n\
              #\n\
              # Examples:\n\
-             # n <C-/> :Commentary\n\
-             # v <C-/> :Commentary\n\
-             # n gcc   :Commentary\n\
-             # n <A-j> :move +1\n\
-             # n <A-k> :move -1\n\
+             # n <C-/>  :Commentary\n\
+             # v <C-/>  :Commentary\n\
+             # n gcc    :Commentary\n\
+             # n <A-j>  :move +1\n\
+             # n <A-k>  :move -1\n\
+             # i! jk    <Esc>\n\
              #\n",
         );
         for km in &self.settings.keymaps {
@@ -2599,7 +2610,7 @@ impl Engine {
         self.active_group_mut().active_tab = self.active_group().tabs.len() - 1;
 
         self.settings_has_focus = false;
-        self.message = "Edit keymaps (one per line: mode keys :command). :w to save.".to_string();
+        self.message = "Edit keymaps (one per line: mode[!] keys rhs). :w to save.".to_string();
     }
 
     /// Save keymaps buffer content back to settings.
@@ -2616,7 +2627,7 @@ impl Engine {
             // Validate the keymap definition
             if parse_keymap_def(trimmed).is_none() {
                 return Err(format!(
-                    "Invalid keymap on line {}: \"{}\" (expected: mode keys :command)",
+                    "Invalid keymap on line {}: \"{}\" (expected: mode[!] keys rhs)",
                     line_idx + 1,
                     trimmed
                 ));

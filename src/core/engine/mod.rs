@@ -1762,19 +1762,111 @@ impl EditorGroup {
 
 // ─── User keymaps ────────────────────────────────────────────────────────────
 
+/// Vim's `maxmapdepth` default — the recursion ceiling for `:map`-style
+/// (non-`noremap`) key-to-keys expansion. Vim errors with `E223: recursive
+/// mapping` past this depth rather than hanging on a cycle like `nmap a b` +
+/// `nmap b a`; vimcode does the same (#1151).
+pub(crate) const MAXMAPDEPTH: usize = 1000;
+
+/// What a [`UserKeymap`] does when its `keys` (lhs) match: run an ex command,
+/// or feed a raw key sequence (rhs) back through the normal key path.
+///
+/// The `:`-prefix on the persisted string distinguishes them: `":join"`
+/// parses as `Ex("join")`, anything else (`"<Esc>"`, `"<C-w>h"`, …) parses as
+/// `Keys([...])`. This is what makes vim's single most common mapping line,
+/// `inoremap jk <Esc>`, expressible — before #1151 every `UserKeymap` target
+/// was an ex command, so key-to-keys remapping did not exist.
+#[derive(Debug, Clone, PartialEq)]
+pub enum UserKeymapAction {
+    /// Ex command to run (without leading `:`), e.g. `"Commentary"`.
+    Ex(String),
+    /// Key sequence to feed back through `Engine::handle_key`, in the same
+    /// encoded-token form as `UserKeymap::keys` (e.g. `["<Esc>"]`).
+    Keys(Vec<String>),
+}
+
+impl std::fmt::Display for UserKeymapAction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            UserKeymapAction::Ex(cmd) => write!(f, ":{cmd}"),
+            UserKeymapAction::Keys(keys) => write!(f, "{}", keys.join("")),
+        }
+    }
+}
+
 /// A parsed user-defined key mapping from settings.json.
 #[derive(Debug, Clone)]
 pub struct UserKeymap {
-    /// Mode: "n", "v", "i", "c".
+    /// Mode: "n", "v", "x", "o", "i", "c", "s" (vim's `:map-modes` letters;
+    /// "s" — Select mode — is accepted for parsing/listing but never active,
+    /// since vimcode has no separate Select mode from Visual).
     pub mode: String,
+    /// `true` for a `noremap`-family definition: the rhs is fed through
+    /// `handle_key` with user-keymap matching disabled, so it cannot recurse
+    /// into another mapping. `false` (`map`-family) allows recursion, guarded
+    /// by [`MAXMAPDEPTH`].
+    pub noremap: bool,
     /// Parsed key sequence, e.g. `["g", "c", "c"]` or `["<C-/>"]`.
     pub keys: Vec<String>,
-    /// The ex command to run (without leading `:`), e.g. `"Commentary"`.
-    pub action: String,
+    /// What firing this mapping does.
+    pub action: UserKeymapAction,
+}
+
+/// Normalize one `<...>` key-notation token to vimcode's canonical encoded
+/// form (the format `encode_keypress`/`decode_keypress` use), accepting
+/// vim's common spellings case-insensitively. `<leader>` is left as a literal
+/// marker — it is expanded against `Settings::leader` in
+/// `Engine::rebuild_user_keymaps`, since this free function has no settings
+/// access. Unrecognised tokens (`<F1>`, `<Up>`, `<Plug>foo`, …) pass through
+/// unchanged, since those are also vimcode's own storage format.
+fn normalize_key_token(tok: &str) -> String {
+    if tok.len() < 3 || !tok.starts_with('<') || !tok.ends_with('>') {
+        return tok.to_string();
+    }
+    let inner = &tok[1..tok.len() - 1];
+    let lower = inner.to_ascii_lowercase();
+    if let Some(rest) = lower.strip_prefix("c-") {
+        return format!("<C-{rest}>");
+    }
+    if let Some(rest) = lower
+        .strip_prefix("a-")
+        .or_else(|| lower.strip_prefix("m-"))
+    {
+        return format!("<A-{rest}>");
+    }
+    match lower.as_str() {
+        "esc" | "escape" => "<Escape>".to_string(),
+        "cr" | "return" | "enter" => "<Return>".to_string(),
+        "tab" => "<Tab>".to_string(),
+        "bs" | "backspace" => "<BS>".to_string(),
+        "space" => "<Space>".to_string(),
+        "leader" => "<leader>".to_string(),
+        "plug" => "<Plug>".to_string(),
+        _ => tok.to_string(),
+    }
+}
+
+/// Substitute the literal `<leader>` marker `parse_key_sequence` leaves in
+/// place (see [`normalize_key_token`]) with the configured leader key.
+/// Shared by `Engine::rebuild_user_keymaps` and the `:map`-family ex-command
+/// handlers in `execute.rs`, both of which need it applied to freshly parsed
+/// key tokens before they're matched or stored (#1151).
+pub(crate) fn expand_leader_tokens(toks: Vec<String>, leader: &str) -> Vec<String> {
+    toks.into_iter()
+        .map(|t| {
+            if t == "<leader>" {
+                leader.to_string()
+            } else {
+                t
+            }
+        })
+        .collect()
 }
 
 /// Parse a key notation string into individual key specs.
 /// `"gcc"` → `["g", "c", "c"]`; `"<C-/>x"` → `["<C-/>", "x"]`.
+/// Recognises vim's `<Esc> <CR> <Tab> <C-x> <A-x> <leader> <Plug>` notation
+/// (case-insensitively) via [`normalize_key_token`] (#1151).
 fn parse_key_sequence(s: &str) -> Vec<String> {
     let mut keys = Vec::new();
     let chars: Vec<char> = s.chars().collect();
@@ -1784,7 +1876,7 @@ fn parse_key_sequence(s: &str) -> Vec<String> {
             // Find matching '>'
             if let Some(end) = chars[i..].iter().position(|&c| c == '>') {
                 let token: String = chars[i..=i + end].iter().collect();
-                keys.push(token);
+                keys.push(normalize_key_token(&token));
                 i += end + 1;
             } else {
                 keys.push(chars[i].to_string());
@@ -1798,29 +1890,53 @@ fn parse_key_sequence(s: &str) -> Vec<String> {
     keys
 }
 
-/// Parse a keymap definition string: `"n gcc :Commentary"` → `UserKeymap`.
+/// Parse a keymap definition string, vimcode's persisted `settings.json`
+/// `keymaps` entry format: `"{mode}[!] {lhs} {rhs}"`.
+///
+/// `{mode}` is one of `n v x o i c s`; a trailing `!` marks the entry
+/// `noremap` (e.g. `"i! jk <Esc>"` is `inoremap jk <Esc>`, `"i jk <Esc>"` is
+/// `imap jk <Esc>`). `{rhs}` is `Ex` when `:`-prefixed (`"n gcc :Commentary"`,
+/// the pre-#1151 form — still parses identically, so existing `settings.json`
+/// keeps working unmigrated) and `Keys` otherwise (`"i! jk <Esc>"`).
 fn parse_keymap_def(s: &str) -> Option<UserKeymap> {
     let s = s.trim();
-    // Split: mode (first char or token), keys, :action
+    // Split: mode[!] (first token), keys, rhs
     let mut parts = s.splitn(3, ' ');
-    let mode = parts.next()?.to_string();
-    if !matches!(mode.as_str(), "n" | "v" | "i" | "c") {
+    let mode_tok = parts.next()?;
+    let (mode, noremap) = match mode_tok.strip_suffix('!') {
+        Some(base) => (base.to_string(), true),
+        None => (mode_tok.to_string(), false),
+    };
+    if !matches!(mode.as_str(), "n" | "v" | "x" | "o" | "i" | "c" | "s") {
         return None;
     }
     let keys_str = parts.next()?;
     let action_str = parts.next()?.trim();
-    if !action_str.starts_with(':') {
-        return None;
-    }
-    let action = action_str[1..].to_string();
-    if action.is_empty() {
+    if action_str.is_empty() {
         return None;
     }
     let keys = parse_key_sequence(keys_str);
     if keys.is_empty() {
         return None;
     }
-    Some(UserKeymap { mode, keys, action })
+    let action = if let Some(cmd) = action_str.strip_prefix(':') {
+        if cmd.is_empty() {
+            return None;
+        }
+        UserKeymapAction::Ex(cmd.to_string())
+    } else {
+        let rhs_keys = parse_key_sequence(action_str);
+        if rhs_keys.is_empty() {
+            return None;
+        }
+        UserKeymapAction::Keys(rhs_keys)
+    };
+    Some(UserKeymap {
+        mode,
+        noremap,
+        keys,
+        action,
+    })
 }
 
 // ── Keybinding reference generators ──────────────────────────────────────────
@@ -1830,7 +1946,7 @@ pub(super) fn keybindings_reference_vim() -> String {
 VimCode — Vim Mode Keybinding Reference
 ========================================
 Use / to search.  :Keymaps to add custom overrides.
-Commands shown on the right (e.g. :def) can be remapped via :map n <key> :command
+Commands shown on the right (e.g. :def) can be remapped via :nnoremap <key> :command
 
 ── Movement ────────────────────────────────────────────
 h j k l             Left / down / up / right
@@ -2089,7 +2205,7 @@ pub(super) fn keybindings_reference_vscode() -> String {
 VimCode — VSCode Mode Keybinding Reference
 ===========================================
 Use Ctrl+F or / to search.
-Remap keys: F1 → \"Open Keyboard Shortcuts\", or :map n <key> :command
+Remap keys: F1 → \"Open Keyboard Shortcuts\", or :nnoremap <key> :command
 
 ── Editing ─────────────────────────────────────────────
 Ctrl+Z              Undo

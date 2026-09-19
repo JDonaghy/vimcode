@@ -597,7 +597,7 @@ Operators `d`, `c`, `y`, `>`, `<`, `=`, `g~`, `gu`, `gU` all accept these motion
 | `:cn` / `:cp` / `:cc` | Quickfix navigation | ✅ | |
 | `:cd {path}` | Change directory | ✅ | |
 | `:colorscheme` | Change theme | ✅ | 4 built-in themes |
-| `:map` / `:nmap` / `:imap` | Key mappings | N/A | Lua `vimcode.keymap()` instead |
+| `:map` / `:nmap` / `:imap` | Key mappings — vim per-mode syntax, key-to-keys remap | ✅ | Also `:vmap` `:xmap` `:omap` `:cmap` `:smap`, the `:noremap` family (with a `maxmapdepth` recursion guard), `:unmap`/`:mapclear` (#1151) |
 | `:make` | Run build | ✅ | Delegates to `!make` |
 | `:b {name}` | Buffer by name | ✅ | Partial name match |
 | `:ab` / `:abbreviate` | Abbreviations | N/A | No abbreviation support |

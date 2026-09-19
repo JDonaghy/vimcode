@@ -96,8 +96,11 @@ fn save_keymaps_buffer_rejects_invalid_lines() {
     let mut e = engine_with("hello\n");
     exec(&mut e, "Keymaps");
 
-    // Invalid keymap (no colon prefix on command)
-    e.active_buffer_state_mut().buffer.content = ropey::Rope::from_str("n K join\n");
+    // Invalid keymap: unrecognised mode letter. (Since #1151, a bare
+    // (non-`:`-prefixed) rhs like "join" is now a *valid* key-to-keys
+    // mapping — "n K join" means "map K to the keys j,o,i,n" — so that no
+    // longer exercises the invalid-line path; an unknown mode does.)
+    e.active_buffer_state_mut().buffer.content = ropey::Rope::from_str("z K :join\n");
     e.active_buffer_state_mut().dirty = true;
 
     let result = e.save();
@@ -131,7 +134,10 @@ fn save_keymaps_buffer_rebuilds_user_keymaps() {
 
     // User keymaps should be rebuilt
     assert_eq!(e.user_keymaps.len(), 1);
-    assert_eq!(e.user_keymaps[0].action, "join");
+    assert_eq!(
+        e.user_keymaps[0].action,
+        vimcode_core::UserKeymapAction::Ex("join".to_string())
+    );
 }
 
 #[test]
