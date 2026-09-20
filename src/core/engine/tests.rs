@@ -29496,7 +29496,9 @@ fn test_1159_set_foldmethod_marker_folds_take_effect_immediately() {
 fn test_1159_foldmarker_rejects_malformed_values() {
     let mut engine = Engine::new();
     for bad in ["", "noComma", ",", "open,", ",close", "a,b,c"] {
-        let result = engine.settings.parse_set_option(&format!("foldmarker={bad}"));
+        let result = engine
+            .settings
+            .parse_set_option(&format!("foldmarker={bad}"));
         assert!(result.is_err(), "expected {bad:?} to be rejected");
     }
     // A well-formed pair is accepted and round-trips through the query form.
