@@ -3141,6 +3141,26 @@ const CASES_SEARCH: &[Case] = &[
         1,
         "/\\(foo\\)\\1<CR>",
     ),
+    // #1157: `\@=` look-ahead — only the "foo" immediately followed by
+    // "bar" qualifies; the lookahead is zero-width, so the cursor lands on
+    // that "foo"'s own 'f', not inside/after "bar".
+    c(
+        "search:/\\@= lookahead",
+        &["xx foobar foobaz"],
+        1,
+        1,
+        "/foo\\(bar\\)\\@=<CR>",
+    ),
+    // #1157: `\_s` — a whitespace class that also accepts end-of-line, so
+    // the pattern spans the newline between the two lines. Cursor starts on
+    // line 2 so the search has to wrap around to land on line 1.
+    c(
+        "search:/\\_s spans lines",
+        &["foo", "bar"],
+        2,
+        1,
+        "/foo\\_sbar<CR>",
+    ),
     c(
         "search:/\\w\\+ from col1",
         &["foo bar"],
@@ -3305,6 +3325,24 @@ const CASES_EX: &[Case] = &[
     c("sub:alternation", &["a b c"], 1, 1, ":s/a\\|c/x/g<CR>"),
     c("sub:\\zs", &["foobar"], 1, 1, ":s/foo\\zsbar/X/<CR>"),
     c("sub:\\ze", &["foobar"], 1, 1, ":s/foo\\zebar/X/<CR>"),
+    // #1157: `\@=` in a `:s` pattern — the lookahead is zero-width, so only
+    // "foo" is replaced and "bar" survives untouched.
+    c(
+        "sub:\\@= lookahead",
+        &["foobar foobaz"],
+        1,
+        1,
+        ":s/foo\\(bar\\)\\@=/X/<CR>",
+    ),
+    // #1157: `\_s` in a `:s` pattern — matches the newline between the two
+    // lines, so the substitution merges them into one.
+    c(
+        "sub:\\_s spans lines",
+        &["foo", "bar"],
+        1,
+        1,
+        ":s/foo\\_sbar/X/<CR>",
+    ),
     c(
         "sub:~ prev replacement",
         &["a b"],
