@@ -4498,13 +4498,15 @@ impl Engine {
         pattern: &str,
         smartcase_applies: bool,
     ) -> Result<vim_regex::Compiled, String> {
-        vim_regex::compile(
+        let (keyword_class, keyword_class_no_digits) = self.settings.iskeyword_regex_class_bodies();
+        vim_regex::compile_with_keyword_class(
             pattern,
             self.settings.ignorecase,
             self.settings.smartcase,
             smartcase_applies,
             &self.last_sub_replacement,
             self.last_visual_byte_range(),
+            (&keyword_class, &keyword_class_no_digits),
         )
     }
 

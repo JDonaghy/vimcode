@@ -207,6 +207,10 @@ fn class_for(c: char) -> Option<&'static str> {
         'H' => "[^A-Za-z_]",
         'i' => "[0-9A-Za-z_]",
         'I' => "[A-Za-z_]",
+        // `k`/`K` are handled dynamically by `Translator::class_for_dynamic`
+        // (#1191, `'iskeyword'`-driven) — not reachable via this table, kept
+        // here only as the defensive fallback `keyword_class_fallback` uses
+        // if `'iskeyword'` is somehow unparsable.
         'k' => "[0-9A-Za-z_]",
         'K' => "[A-Za-z_]",
         'f' => "[^ \\t]",
@@ -246,6 +250,23 @@ struct Translator<'a> {
     last_atom_start: Option<usize>,
     /// Position assertions collected from `\%23l` / `\%23c` / `\%V`.
     pos_constraints: Vec<PosConstraint>,
+    /// `[...]`-body fragments for `\k` / `\K` (`:h /\k`), derived from the
+    /// current `'iskeyword'` — see
+    /// [`crate::core::settings::Settings::iskeyword_regex_class_bodies`].
+    keyword_class: (String, String),
+}
+
+impl<'a> Translator<'a> {
+    /// Like [`class_for`], but resolves `\k`/`\K` dynamically against
+    /// `'iskeyword'` instead of the fixed ASCII fallback (#1191) — every
+    /// other letter is unaffected.
+    fn class_for_dynamic(&self, c: char) -> Option<String> {
+        match c {
+            'k' => Some(format!("[{}]", self.keyword_class.0)),
+            'K' => Some(format!("[{}]", self.keyword_class.1)),
+            _ => class_for(c).map(str::to_string),
+        }
+    }
 }
 
 /// Placeholder marker for a not-yet-resolved backreference: NUL followed by
@@ -713,10 +734,10 @@ impl<'a> Translator<'a> {
                             self.out.push_str(&cls);
                             self.out.push_str("|\\n)");
                         }
-                        Some(x) if class_for(x).is_some() => {
-                            let cls = class_for(x).expect("checked Some above");
+                        Some(x) if self.class_for_dynamic(x).is_some() => {
+                            let cls = self.class_for_dynamic(x).expect("checked Some above");
                             self.out.push_str("(?:");
-                            self.out.push_str(cls);
+                            self.out.push_str(&cls);
                             self.out.push_str("|\\n)");
                         }
                         Some(other) => {
@@ -727,8 +748,8 @@ impl<'a> Translator<'a> {
                         None => return Err("E682: Invalid search pattern".to_string()),
                     },
                     _ => {
-                        if let Some(cls) = class_for(n) {
-                            self.out.push_str(cls);
+                        if let Some(cls) = self.class_for_dynamic(n) {
+                            self.out.push_str(&cls);
                         } else if self.magic == Magic::VeryMagic {
                             // In very-magic a backslash always makes the next
                             // character literal.
@@ -814,10 +835,34 @@ impl<'a> Translator<'a> {
     }
 }
 
+/// Translate a Vim pattern into Rust `regex` source, using the historical
+/// ASCII-only `\k`/`\K` classes (`:h /\k`) — this module's own unit tests
+/// use this and don't exercise `'iskeyword'`. The real, `'iskeyword'`-aware
+/// caller path is [`compile_with_keyword_class`] (via
+/// [`translate_with_keyword_class`], #1191); [`compile`] is the same ASCII
+/// default as this fn, for callers (currently none outside tests) that
+/// don't have a `Settings` to hand.
+///
+/// `last_sub` is the previous `:s` replacement text, which `~` expands to.
+#[cfg(test)]
+fn translate(pattern: &str, magic: Magic, last_sub: &str) -> Result<Translation, String> {
+    translate_with_keyword_class(pattern, magic, last_sub, "0-9A-Za-z_", "A-Za-z_")
+}
+
 /// Translate a Vim pattern into Rust `regex` source.
 ///
 /// `last_sub` is the previous `:s` replacement text, which `~` expands to.
-pub fn translate(pattern: &str, magic: Magic, last_sub: &str) -> Result<Translation, String> {
+/// `keyword_class`/`keyword_class_no_digits` are the `[...]`-body fragments
+/// `\k`/`\K` expand to — see
+/// [`crate::core::settings::Settings::iskeyword_regex_class_bodies`], the
+/// only intended source for these two (#1191).
+pub fn translate_with_keyword_class(
+    pattern: &str,
+    magic: Magic,
+    last_sub: &str,
+    keyword_class: &str,
+    keyword_class_no_digits: &str,
+) -> Result<Translation, String> {
     let mut t = Translator {
         chars: pattern.chars().collect(),
         i: 0,
@@ -834,6 +879,10 @@ pub fn translate(pattern: &str, magic: Magic, last_sub: &str) -> Result<Translat
         bracket_stack: Vec::new(),
         last_atom_start: None,
         pos_constraints: Vec::new(),
+        keyword_class: (
+            keyword_class.to_string(),
+            keyword_class_no_digits.to_string(),
+        ),
     };
     t.run()?;
 
@@ -1166,6 +1215,11 @@ impl Compiled {
     }
 }
 
+/// Compile a Vim pattern using the historical ASCII-only `\k`/`\K` classes.
+/// Real production callers should use [`compile_with_keyword_class`]
+/// instead, threading the current `'iskeyword'` setting through — this is
+/// kept only for this module's own unit tests (#1191).
+#[cfg(test)]
 pub fn compile(
     pattern: &str,
     ignorecase: bool,
@@ -1174,10 +1228,43 @@ pub fn compile(
     last_sub: &str,
     visual_range: Option<(usize, usize)>,
 ) -> Result<Compiled, String> {
+    compile_with_keyword_class(
+        pattern,
+        ignorecase,
+        smartcase,
+        smartcase_applies,
+        last_sub,
+        visual_range,
+        ("0-9A-Za-z_", "A-Za-z_"),
+    )
+}
+
+/// Compile a Vim pattern against the current `'ignorecase'` / `'smartcase'`
+/// settings. `keyword_classes` is `(keyword_class, keyword_class_no_digits)`
+/// — the `'iskeyword'`-derived `[...]`-body fragments `\k`/`\K` expand to,
+/// bundled into one param to stay under clippy's argument-count limit. See
+/// [`crate::core::settings::Settings::iskeyword_regex_class_bodies`], the
+/// only intended source for these two (#1191).
+pub fn compile_with_keyword_class(
+    pattern: &str,
+    ignorecase: bool,
+    smartcase: bool,
+    smartcase_applies: bool,
+    last_sub: &str,
+    visual_range: Option<(usize, usize)>,
+    keyword_classes: (&str, &str),
+) -> Result<Compiled, String> {
+    let (keyword_class, keyword_class_no_digits) = keyword_classes;
     if pattern.is_empty() {
         return Err("E35: No previous regular expression".to_string());
     }
-    let t = translate(pattern, Magic::Magic, last_sub)?;
+    let t = translate_with_keyword_class(
+        pattern,
+        Magic::Magic,
+        last_sub,
+        keyword_class,
+        keyword_class_no_digits,
+    )?;
     let case_insensitive = match t.case_override {
         Some(CaseOverride::Ignore) => true,
         Some(CaseOverride::Match) => false,
@@ -1294,9 +1381,42 @@ mod tests {
     #[test]
     fn character_classes() {
         assert_eq!(tr("\\d\\+"), "[0-9]+");
+        // `\w` is fixed ASCII per real Vim (`:h /\w` — unlike `\k`, it does
+        // *not* depend on `'iskeyword'`), and stays that way here too.
         assert_eq!(tr("\\w"), "[0-9A-Za-z_]");
         assert_eq!(tr("\\s"), "[ \\t]");
         assert_eq!(tr("\\S"), "[^ \\t]");
+        // The bare `translate`/`tr` helper (used by every other test in
+        // this file) fixes `\k`/`\K` at the historical ASCII class,
+        // deliberately: those two are the ones this module can't get right
+        // on its own, since real Vim ties them to `'iskeyword'` — see
+        // `keyword_class_is_unicode_aware_with_the_default_iskeyword` below
+        // for the actual `'iskeyword'`-driven behavior (#1191).
+        assert_eq!(tr("\\k"), "[0-9A-Za-z_]");
+        assert_eq!(tr("\\K"), "[A-Za-z_]");
+    }
+
+    #[test]
+    fn keyword_class_is_unicode_aware_with_the_default_iskeyword() {
+        // #1191: before this fix, `\k`'s regex class was unconditionally
+        // the hardcoded ASCII `"[0-9A-Za-z_]"` (see `character_classes`
+        // above) — no non-ASCII letter could ever match `\k`, even though
+        // real Vim's default `'iskeyword'` (`@,48-57,_,192-255`) makes
+        // every Unicode alphabetic character a keyword char. This test
+        // would have failed against that hardcoded class.
+        let settings = crate::core::settings::Settings::default();
+        let (k, big_k) = settings.iskeyword_regex_class_bodies();
+        let c = compile_with_keyword_class("\\k\\+", false, false, true, "", None, (&k, &big_k))
+            .unwrap();
+        assert!(c.is_match("café"));
+        assert!(c.is_match("Ñandú"));
+        assert!(c.is_match("北京"));
+        // `\K` still excludes digits, same as the ASCII default.
+        let c_big =
+            compile_with_keyword_class("\\K\\+", false, false, true, "", None, (&k, &big_k))
+                .unwrap();
+        assert!(c_big.is_match("café"));
+        assert!(!c_big.is_match("42"));
     }
 
     #[test]

@@ -1017,6 +1017,10 @@ fn apply_setup(settings: &mut Settings, setup: &str) -> Result<(), String> {
             "virtualedit" | "ve" => {
                 settings.virtualedit = value.to_string();
             }
+            // #1191
+            "iskeyword" | "isk" => {
+                settings.iskeyword = value.to_string();
+            }
             other => {
                 return Err(format!(
                     "no vimcode Settings mapping for option '{other}' (from {stmt:?}) — add one \
@@ -3221,6 +3225,18 @@ const CASES_SEARCH: &[Case] = &[
         1,
         "*$jgn<Esc>",
     ),
+    // #1191: `*`/`#` (`word_under_cursor`/`star_word_under_cursor`) are the
+    // other documented consumer of 'iskeyword' — with `-` added to the
+    // keyword class, "foo-bar" is the whole word `*` searches for, so it
+    // finds the *next* "foo-bar" run rather than stopping mid-token.
+    cs(
+        "search:* with iskeyword+=- includes hyphen in the searched word",
+        &["foo-bar foo-bar"],
+        1,
+        1,
+        "*",
+        "vim.o.iskeyword='@,48-57,_,192-255,-'",
+    ),
 ];
 
 // ─────────────────────────── H. :s / :g / ex ───────────────────────────
@@ -5369,6 +5385,38 @@ const CASES_WORD: &[Case] = &[
         1,
         "wge",
     ),
+    // #1191: 'iskeyword' is a real input to word motions — `a-b` is two
+    // words under the default `'iskeyword'` (see "word:w a-b" above), but
+    // one word once `-` is added to the keyword class, exactly like real
+    // Vim. Before #1191, `vim.o.iskeyword=...` in a case's `setup` could
+    // only ever configure the oracle: `apply_setup` had no arm for it, so
+    // this case would have errored out of `every_corpus_setup_is_understood`
+    // (a hard failure, not a silent default) rather than compare a
+    // configured vimcode against a configured oracle.
+    cs(
+        "word:w with iskeyword+=- treats hyphen as a word char",
+        &["foo-bar baz"],
+        1,
+        1,
+        "w",
+        "vim.o.iskeyword='@,48-57,_,192-255,-'",
+    ),
+    cs(
+        "word:e with iskeyword+=- treats hyphen as a word char",
+        &["foo-bar baz"],
+        1,
+        1,
+        "e",
+        "vim.o.iskeyword='@,48-57,_,192-255,-'",
+    ),
+    cs(
+        "word:b with iskeyword+=- treats hyphen as a word char",
+        &["foo-bar baz"],
+        1,
+        9,
+        "b",
+        "vim.o.iskeyword='@,48-57,_,192-255,-'",
+    ),
 ];
 
 // ─────────────────────────── O. text objects ───────────────────────────
@@ -5600,6 +5648,18 @@ const CASES_TO: &[Case] = &[
         1,
         4,
         "daw",
+    ),
+    // #1191: `iw`/`aw` (`find_word_object`) are the third documented
+    // 'iskeyword' consumer — with `-` added to the keyword class, the whole
+    // hyphenated run is one word, so `diw` from inside "bar" deletes all of
+    // "foo-bar", not just "bar".
+    cs(
+        "to:diw with iskeyword+=- deletes the whole hyphenated word",
+        &["foo-bar baz"],
+        1,
+        5,
+        "diw",
+        "vim.o.iskeyword='@,48-57,_,192-255,-'",
     ),
 ];
 

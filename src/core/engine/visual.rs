@@ -799,10 +799,9 @@ impl Engine {
             if !word_bounded {
                 return true;
             }
-            let before_ok =
-                sb == 0 || !Self::is_word_char(text[..sb].chars().last().unwrap_or(' '));
+            let before_ok = sb == 0 || !self.is_word_char(text[..sb].chars().last().unwrap_or(' '));
             let after_ok =
-                eb >= text.len() || !Self::is_word_char(text[eb..].chars().next().unwrap_or(' '));
+                eb >= text.len() || !self.is_word_char(text[eb..].chars().next().unwrap_or(' '));
             before_ok && after_ok
         };
 
@@ -861,10 +860,10 @@ impl Engine {
                     let sb = byte_pos + found;
                     let eb = sb + pattern.len();
                     let ok = if word_bounded {
-                        let before_ok = sb == 0
-                            || !Self::is_word_char(text[..sb].chars().last().unwrap_or(' '));
+                        let before_ok =
+                            sb == 0 || !self.is_word_char(text[..sb].chars().last().unwrap_or(' '));
                         let after_ok = eb >= text.len()
-                            || !Self::is_word_char(text[eb..].chars().next().unwrap_or(' '));
+                            || !self.is_word_char(text[eb..].chars().next().unwrap_or(' '));
                         before_ok && after_ok
                     } else {
                         true

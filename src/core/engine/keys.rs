@@ -2582,11 +2582,13 @@ impl Engine {
                     // No `is_safe_url` gate here, deliberately, unlike
                     // `Engine::open_url`'s markdown-link callers: this was
                     // never gated before (any word went straight to the
-                    // opener) and `word_under_cursor` only ever returns
-                    // `[a-zA-Z0-9_]+` (`Engine::is_word_char`) — a scheme
-                    // like `https://…` can never survive that tokenizer
-                    // intact, so an `is_safe_url` check here would reject
-                    // every input and make `gx` permanently inert. Queuing
+                    // opener) and `word_under_cursor` only ever returns a
+                    // run of `'iskeyword'` characters (`Engine::is_word_char`,
+                    // #1191) — with the default `'iskeyword'`, `:` and `/`
+                    // are never keyword characters, so a scheme like
+                    // `https://…` can never survive that tokenizer intact,
+                    // and an `is_safe_url` check here would reject every
+                    // input and make `gx` permanently inert. Queuing
                     // unconditionally preserves the exact pre-#1134
                     // behavior; only the opener mechanism changed, from a
                     // raw per-OS `Command::new` to
@@ -5293,15 +5295,15 @@ impl Engine {
                 while end < total && !self.buffer().content.char(end).is_whitespace() {
                     end += 1;
                 }
-            } else if is_word_char(self.buffer().content.char(end)) {
-                while end < total && is_word_char(self.buffer().content.char(end)) {
+            } else if self.is_word_char(self.buffer().content.char(end)) {
+                while end < total && self.is_word_char(self.buffer().content.char(end)) {
                     end += 1;
                 }
             } else {
                 // Punctuation run: scan to its end (stop at a word char or whitespace).
                 while end < total {
                     let c = self.buffer().content.char(end);
-                    if is_word_char(c) || c.is_whitespace() {
+                    if self.is_word_char(c) || c.is_whitespace() {
                         break;
                     }
                     end += 1;
@@ -6133,7 +6135,7 @@ impl Engine {
         // extension) or clear (new word) after the char is inserted. Any
         // non-word key (space, punctuation, navigation) means the user
         // has left the current word, so the popup should dismiss.
-        let extends_word = unicode.is_some_and(Self::is_word_char) && !ctrl;
+        let extends_word = unicode.is_some_and(|c| self.is_word_char(c)) && !ctrl;
         if self.completion_idx.is_some() && !extends_word {
             self.dismiss_completion();
         }
@@ -6304,11 +6306,11 @@ impl Engine {
                 }
                 // Skip one run of same-class (keyword vs. punctuation) chars.
                 if i > 0 {
-                    let is_word = Self::is_word_char(chars[i - 1]);
+                    let is_word = self.is_word_char(chars[i - 1]);
                     while i > 0
                         && chars[i - 1] != ' '
                         && chars[i - 1] != '\t'
-                        && Self::is_word_char(chars[i - 1]) == is_word
+                        && self.is_word_char(chars[i - 1]) == is_word
                     {
                         i -= 1;
                     }
@@ -9735,8 +9737,8 @@ impl Engine {
                 if drag_before_origin {
                     // Dragging before the original word — anchor at word end, cursor at word start
                     let mut word_start = clamped_col.min(line_text.len().saturating_sub(1));
-                    if word_start < line_text.len() && Self::is_word_char(line_text[word_start]) {
-                        while word_start > 0 && Self::is_word_char(line_text[word_start - 1]) {
+                    if word_start < line_text.len() && self.is_word_char(line_text[word_start]) {
+                        while word_start > 0 && self.is_word_char(line_text[word_start - 1]) {
                             word_start -= 1;
                         }
                     }
@@ -9750,9 +9752,9 @@ impl Engine {
                 } else {
                     // Dragging after the original word — anchor at word start, cursor at word end
                     let mut word_end = clamped_col.min(line_text.len().saturating_sub(1));
-                    if word_end < line_text.len() && Self::is_word_char(line_text[word_end]) {
+                    if word_end < line_text.len() && self.is_word_char(line_text[word_end]) {
                         while word_end + 1 < line_text.len()
-                            && Self::is_word_char(line_text[word_end + 1])
+                            && self.is_word_char(line_text[word_end + 1])
                         {
                             word_end += 1;
                         }
@@ -9792,20 +9794,20 @@ impl Engine {
         let cursor_col = self.view().cursor.col;
         let line_text: Vec<char> = self.buffer().content.line(cursor_line).chars().collect();
 
-        if cursor_col >= line_text.len() || !Self::is_word_char(line_text[cursor_col]) {
+        if cursor_col >= line_text.len() || !self.is_word_char(line_text[cursor_col]) {
             // Clicked on non-word character — don't select
             return;
         }
 
         // Find word start
         let mut word_start = cursor_col;
-        while word_start > 0 && Self::is_word_char(line_text[word_start - 1]) {
+        while word_start > 0 && self.is_word_char(line_text[word_start - 1]) {
             word_start -= 1;
         }
 
         // Find word end (inclusive)
         let mut word_end = cursor_col;
-        while word_end + 1 < line_text.len() && Self::is_word_char(line_text[word_end + 1]) {
+        while word_end + 1 < line_text.len() && self.is_word_char(line_text[word_end + 1]) {
             word_end += 1;
         }
         // Exclude trailing newline from word end
