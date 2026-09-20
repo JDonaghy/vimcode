@@ -6,15 +6,18 @@
 > line. The `Platform-Neutrality Rule` at the top of `CLAUDE.md` is the *operational
 > rule*; **this file is the source of truth for *intent* and *sequencing*.**
 >
-> _Last updated: 2026-09-16 (#1044 — the `TuiShellApp`/`mouse.rs` rung-decomposition
-> audit: 98 rungs enumerated, 26 convergeable and sequenced into 16 child issues
-> below, one new `IRREDUCIBLE_SURFACE.md` fact, one quadraui gap drafted. No
-> production code changed — see "2026-09-16 audit" section below. Prior entry
-> (2026-09-11, macOS native-menu audit — milestone #7 reopened with #901/#902) kept
-> for its own history).
-> Milestone #7 is **3 open** (#901, #902, #1044 — #1044 itself closes once its
-> 16 drafted child issues are filed; they are not yet filed and are not counted
-> here)._
+> _Last updated: 2026-09-19 (#1168 — drift pass. #901, #902 and #1044 are all
+> **closed**; #1044's 16 drafted children were filed and #1043/#1053–#1067 landed
+> 2026-09-16→18, leaving wave 4 (#1068). The sizing table below is regenerated at
+> `30c0077`. The one "quadraui-gap" rung is **shipped and pinned**. Prior entries
+> (2026-09-16 #1044 rung decomposition; 2026-09-11 macOS native-menu audit) are kept
+> below for their own history — read them as history, not as current state)._
+>
+> Milestone #7 is **15 open**, and the remaining work is now almost entirely the
+> TUI: #1068, #1089, #1098, #1100, #1102, #1104, #1108, #1109, #1164, #1165, #1166,
+> #1167, #1168, #1169 (the standing TUI tracker), #1175. The GUI side is down to
+> three consume-side items (#1100, #1102, #1104), each against a quadraui issue that
+> has already shipped and is already pinned — **no open upstream blocker**._
 
 ## 🎯 North star
 
@@ -67,18 +70,30 @@ irreducible / quadraui-gap, and produce a sequenced work order. **No production
 code changed in this pass** — see `PROJECT_STATE.md` if that ever needs
 re-confirming.
 
-### Current sizing (regenerated 2026-09-16, `scripts/prod_lines.py`)
+### Current sizing (regenerated 2026-09-19 at `30c0077`, `scripts/prod_lines.py`)
 
-| File | Production lines |
-|---|---:|
-| `src/gtk/` | **1,020** |
-| `src/tui_main/` (all files) | **10,471** |
-| — of which `src/tui_main/shell_app.rs` | 4,459 (18,442 incl. tests — the issue's "17,947" cited the whole-file count on an older commit) |
-| — of which `src/tui_main/mouse.rs` | 2,881 (3,878 incl. tests) |
-| `src/app.rs` | 8,313 |
-| `src/render.rs` | 20,997 |
-| `src/macos/` | 138 |
-| `src/win/` | 178 |
+| File | Production lines | Δ vs 2026-09-16 |
+|---|---:|---:|
+| `src/gtk/` | **1,149** | +129 |
+| — of which `src/gtk/testing.rs` (the #646 harness) | 615 | — |
+| — so `src/gtk/` excluding the harness | **534** | — |
+| `src/tui_main/` (all files) | **11,037** | **+566** |
+| — of which `src/tui_main/shell_app.rs` | 4,773 (22,347 incl. tests) | +314 |
+| — of which `src/tui_main/mouse.rs` | 2,882 (4,038 incl. tests) | +1 |
+| `src/app.rs` | 8,798 | +485 |
+| `src/render.rs` | 22,134 | +1,137 |
+| `src/macos/` | 150 | +12 |
+| `src/win/` | 178 | 0 |
+
+**Read the Δ column before planning anything.** Fifteen convergence issues landed
+between these two measurements, projected to remove 400–900 production lines from
+`src/tui_main/`. It **grew by 566**. The #751–#766 chain missed in the same
+direction, and this is now the second consecutive audit window in which the
+outcome measure moved opposite to the plan. Whatever else is true, "issues closed"
+is not tracking "TUI shrunk", so **every PR under #1169 reports its
+`scripts/prod_lines.py` delta for `src/tui_main/` and the epic is judged on the
+cumulative number** — some issues legitimately will not shrink it (correctness
+audits, doc passes), and those say so in the PR rather than leaving it assumed.
 
 Two things worth stating plainly before the inventory: **GTK is not "1,020 lines
 of shell logic"** — it's 1,020 lines of thin wiring calling into `src/app.rs`
@@ -126,7 +141,7 @@ gap, counted once):
 | Already-shared | 40 |
 | Convergeable (incl. 5 pending a product decision) | 26 |
 | Irreducible | 31 — reduces to 3 facts, see `docs/IRREDUCIBLE_SURFACE.md` §1/§7 |
-| quadraui-gap | 1 — `CommandLine::selection` paint field, drafted in `docs/PENDING_QUADRAUI_ISSUES.md` |
+| quadraui-gap | 0 — was 1 (the command-line selection-highlight paint). **Shipped upstream as `Backend::draw_command_line_selection` + `CommandLineLayout::selection_bounds` (quadraui#1001) and live at the current pin `d907a06`.** vimcode consumes `selection_bounds` in `render.rs`; the *paint* call is not adopted yet — a consume-side task, not an upstream gap |
 | **Total rungs** | **98** |
 
 **The headline finding: the mouse-router "epic" #950 flagged is smaller than
@@ -148,7 +163,7 @@ materially smaller and more tractable backlog than #950's framing implied.
 | `render_content`: 12 of 14 `FrameOp` arms | already-shared | #824. |
 | `FrameOp::CommandLine` base paint | irreducible | px/cell paint substrate. |
 | `FrameOp::CommandLine` click→offset hit-test | already-shared | `render::command_line_click_char_idx`, quadraui#705 — corrects `IRREDUCIBLE_SURFACE.md` §2a, see §2c. |
-| `FrameOp::CommandLine` selection-highlight paint | **quadraui-gap** | `CommandLine::selection` field missing upstream; drafted in `PENDING_QUADRAUI_ISSUES.md`. |
+| `FrameOp::CommandLine` selection-highlight paint | ~~**quadraui-gap**~~ → **convergeable** | quadraui#1001 shipped `Backend::draw_command_line_selection`; pinned at `d907a06`. `render::command_line_selection_rect`'s doc comment still says no such API exists — stale, and the host-side rect helper is now deletable in favour of the upstream call. |
 | `FrameOp::TabSwitcher` | convergeable | `max_visible` vs `visible_rows` field mixup — looks like a live bug, not intentional (wave 1, item 4 below). |
 | Menu system / Command Center click / sidebar hover / panel-key accelerators / `ClipboardPaste` | already-shared | Each already calls one `render::` router (#752/#754/#755). |
 | Window-control buttons, CSD drag/resize, outer-edge resize cursor, native menu/context menu, `CharTyped` IME, `WindowClose`, native-menu `setup`, initial CSS load | irreducible | All one fact — "TUI has no OS window," new row in `IRREDUCIBLE_SURFACE.md` §1. |
@@ -511,6 +526,13 @@ moved logic without shrinking anything.
 
 ### What the chain *did* buy
 
+> **Numbers in this subsection are 2026-09-05 measurements — stale, kept for the
+> argument (#1168, 2026-09-19).** `src/gtk/mod.rs` no longer makes 424 `render::`
+> calls or holds 7,684 lines; production is **140 lines, zero `render::` calls**,
+> because #785/#862 moved `struct App` to `src/app.rs` (which makes 484). The
+> *reasoning* below still holds and is why it holds; the figures do not. Current
+> ones are in "Current sizing" above and `docs/IRREDUCIBLE_SURFACE.md` §3.
+
 Every *decision* — which surface was hit, which handler owns a key, what order a
 frame is composed in — is now stated once, in `render.rs`, and both backends walk
 it. Delegation density is high: `src/gtk/mod.rs` makes 424 `render::` calls. That
@@ -537,13 +559,17 @@ The headline, because it changes how the rest of this goal should be planned:
   counterpart — wrong: `quadraui::compose::FolderPickerController` has existed since
   2026-05-25 and its module doc explicitly tells vimcode to delete the local copy and
   rewire both backends through it. That verdict is struck, not counted.
-- **Only 1.3% of the two backends names a native toolkit type** — 246 production lines
-  out of 19,429 (`scripts/native_lines.py`; ~25% undercount on the GTK side for stored
-  widget handles, so call it under 4% even pessimistically).
-- **So platform-specificity is not what is keeping 19,995 lines in the backends.**
-  `src/gtk/mod.rs` (7,684) and `src/tui_main/shell_app.rs` (3,989) are two
-  implementations of the same four `ShellApp` entry points. The chain converged the
-  *decisions* those implementations make; it did not converge the implementations.
+- **Only ~1.8% of the two backends names a native toolkit type** — 207 production
+  lines out of 11,489, regenerated 2026-09-19 at `30c0077` (`scripts/native_lines.py`;
+  ~25% undercount on the GTK side for stored widget handles, so call it under 4% even
+  pessimistically). *The 2026-09-05 revision of this bullet read 246/19,429 = 1.3%;
+  the denominator shrank because GTK converged, not because files went missing.*
+- **So platform-specificity is not what is keeping the backends large — and it is
+  now a one-sided problem.** GTK's half was converged: `src/gtk/mod.rs` is **140**
+  production lines. `src/tui_main/` still carries its own `impl ShellApp`
+  (**11,037** lines, `shell_app.rs` alone 4,773) implementing the same four entry
+  points as `src/app.rs`. The chain converged the *decisions*; it never converged
+  the second implementation, and that residue is entirely the TUI's — #1169.
 
 **Plan accordingly: this is ordinary duplication, not a platform-porting problem.** A
 plan that sizes it as the latter will keep missing its projection the way #751–#766 did.
@@ -634,9 +660,9 @@ count.
 |---|---|---|
 | **quadraui#465** | macOS `ShellApp` + `run_with_shell` composition | ✅ Closed 2026-08-31. The supply-side gate is cleared. |
 | **#657** | Put vimcode on the oracle loop | ✅ Closed. `[lib] vimcode_core` + sealed `tests/acceptance/`. |
-| **#47** | Native macOS GUI, as a thin wrapper | 🔓 **Reopened 2026-09-03, OPEN in milestone #5.** Blocker resolved (quadraui#699/#704); #811 already ported the TUI side. Stage 1 (GTK side) is the actual next work — see `PLAN.md`. |
+| **#47** | Native macOS GUI, as a thin wrapper | 🔓 **OPEN in milestone #5, now scoped to Stage 2** — `src/macos/mod.rs` wrapper + the `macos` feature. **Stage 1's extraction is merged** (the issue title records this), so "Stage 1 (GTK side) is the next work" is retired. `src/macos/` is 150 production lines and `src/app.rs` is the shell both it and GTK drive. |
 | **quadraui#481 / #482** | Duplication one level down — largely refuted, see §2 above | 🔓 Open, un-milestoned. Don't plan against their headline numbers. |
-| **#1044** | TuiShellApp/mouse.rs rung-decomposition audit | 🔓 **Open, milestone #7.** Audit complete (98 rungs, this file's 2026-09-16 section); 16 sequenced child issues drafted, not yet filed — coordinator/human action. Closes once filed. |
+| **#1044** | TuiShellApp/mouse.rs rung-decomposition audit | ✅ **Closed.** All 16 children were filed; #1043 and #1053–#1067 landed 2026-09-16→18. Wave 4 (#1068) remains open. The standing tracker for finishing the job is now **#1169**, which also carries the drift #1044's rung tables did not cover (chore loops, pre-paint sizing, config assembly). |
 
 ### The two decisions this file was holding open — both now moot
 
@@ -651,22 +677,39 @@ every fix ahead of #657 was verified by tests its own author wrote. It is now
 follow-up is to decide whether any of #751–#766 warrants a retro-fitted
 oracle-authored test, rather than re-litigating the sequencing.
 
-## Status (2026-09-16, #1044 rung-decomposition audit)
+## Status (2026-09-19, #1168 drift pass)
 
-- 🔬 **Milestone #7 is 3 open** (#901, #902, #1044). #1044 enumerated all 98
-  rungs of `TuiShellApp`/`mouse.rs` against `App`: 40 already-shared, 26
-  convergeable (sequenced into 16 child issues, see the 2026-09-16 section
-  above), 31 irreducible (all instances of 3 facts, one of them new —
-  `docs/IRREDUCIBLE_SURFACE.md` §1/§7), 1 quadraui-gap (drafted in
-  `docs/PENDING_QUADRAUI_ISSUES.md`). **No production code changed** — this was
-  the audit, not the convergence. Target: `src/tui_main/` lands near
-  9,600–10,000 production lines once the 16 child issues land, not lower —
-  see that section's "Target end state" for why it can't reach `src/macos/`'s
-  138.
-- ⚠️ **#901/#902 still open** (the 09-01 critical path plus 16 slices all
-  landed, but the 2026-09-11 audit reopened the milestone: quadraui shipped
-  `install_menu_bar` / `show_context_menu` and vimcode adopted neither).
-  See the milestone section above for the additive-vs-substitutive rule.
+- 📐 **The GUI backends have reached the goal; the TUI has not, and it is now the
+  whole remaining gap.** At `30c0077`: `src/macos/` 150 lines, `src/win/` 178,
+  `src/gtk/` 534 excluding its 615-line test harness — and **`src/tui_main/`
+  11,037**. Production `src/gtk/mod.rs` is 138 lines that build a `ShellConfig`
+  and hand off to `quadraui::gtk::shell_runner::run_with_shell`; it makes **zero**
+  `render::` calls outside `#[cfg(test)]`, while `src/app.rs` makes 484. Three of
+  four backends are the shape the north star describes.
+- 🧮 **Almost none of the TUI's bulk is actually terminal-specific.** Measured at
+  `30c0077` with `python3 scripts/native_lines.py tui src/tui_main/*.rs` over all
+  five files: **10,984 production lines, 183 of them native-touching — 1.7%.**
+  (Omit `mod.rs` and you get 174/10,215 — same ratio, and the reason two
+  different "1.7%" line counts are both in circulation.) The rest is a
+  second `impl quadraui::ShellApp`: a parallel
+  `setup`/`handle`/`tick`/`render_content`, plus `mouse::handle_mouse` at
+  **2,513 lines and 29 parameters** (`mouse.rs:214–2726`), fed by converting
+  quadraui `UiEvent`s *back into crossterm events*. **The remaining work is not
+  porting platform code to quadraui; it is deleting a second copy of neutral
+  code.** Use `native_lines.py` for this figure, not a grep for `ratatui`/
+  `crossterm` — the script also counts `Buffer`/`Frame`/`Rect`, and a bare grep
+  undercounts it by roughly half.
+- ✅ **#901, #902 and #1044 are all closed.** #1044's 16 children were filed and
+  #1043/#1053–#1067 landed 2026-09-16→18. Wave 4 (#1068) is the largest single
+  item left. **#1169** is the standing tracker for finishing the TUI.
+- 📉 **The measurement went the wrong way again.** The 15 convergence issues that
+  landed in the 09-16→09-19 window were projected to take 400–900 lines off
+  `src/tui_main/`; it **grew 566** (10,471 → 11,037). See the Δ column in the
+  sizing table. Plan #1169 by cumulative line delta, not by issues closed.
+- ✅ **The last quadraui-gap rung is closed upstream and pinned.** quadraui#1001's
+  `draw_command_line_selection` is live at `d907a06` (#1133). vimcode's consume
+  side is adopted for `selection_bounds` only — the paint call is a convergeable
+  host-side task now, not a supply blocker.
 - ✅ **The oracle loop is live here** (#657) and `draw_frame` is gone (#766).
 - 📉 **The audit is run and the chain missed by ~12×.** Measured over its own range
   (`6875315`→`eedebf8`), convergence took **−728** off the backends against a
@@ -678,9 +721,10 @@ oracle-authored test, rather than re-litigating the sequencing.
   roughly **2,000 ± 500** are genuinely the same logic written twice. Converging all
   of it nets **−300 to −1,000** across the three files. **Do not plan a convergence
   campaign here; the returns are not there.**
-- 🔓 **#47 is open again, in milestone #5.** Its blocker (quadraui#699/#704) closed
-  2026-09-03; #811 already ported the TUI side onto the new API. Stage 1 (GTK side)
-  is the actual next actionable item — not a re-filing task.
+- 🔓 **#47 is open in milestone #5, now scoped to Stage 2** (`src/macos/mod.rs`
+  wrapper + the `macos` feature). Stage 1's extraction is merged; the "Stage 1 is
+  the next work" line this section used to carry predates #862 and the macOS CI
+  job (#1042).
 - 🔓 **quadraui#481 / #482 remain open and un-milestoned**, but most of their
   headline duplication claims were refuted 2026-09-05 (see §2) — the one confirmed
   live gap is macOS's undebounced `WindowResized`.
@@ -698,8 +742,9 @@ oracle-authored test, rather than re-litigating the sequencing.
   `python3 scripts/prod_lines.py src/gtk src/tui_main src/render.rs src/app.rs`**
   rather than trusting the table.
 - **Agents:** treat this as the standing objective behind all planning and triage.
-  Item 3's blocker is cleared — the next move is **vimcode#47 Stage 1** (see
-  `PLAN.md`), then items 1, 2 and 4 above. Never write new per-backend code
+  The next move is **#1169's TUI convergence** — start with #1109, then #1165
+  (a correctness audit that can reprioritise the rest), per that epic's suggested
+  order. **#47 is Stage 2**, not Stage 1. Never write new per-backend code
   (`CLAUDE.md` Platform-Neutrality Rule). When you adopt a quadraui API,
   **delete** the old backend code in the same PR.
 - **Humans:** edit freely as priorities shift; keep it short, re-date Status.
