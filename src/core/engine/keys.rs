@@ -5962,6 +5962,14 @@ impl Engine {
         ctrl: bool,
         changed: &mut bool,
     ) {
+        // `'showmatch'` (#1207): the flash from a previous key (if any) ends
+        // as soon as another key arrives — matching real Vim, where the
+        // momentary jump to the matching bracket lasts only until the next
+        // key or `'matchtime'` elapses (`'matchtime'` itself is out of
+        // scope; "ends on next key" is this fn's stand-in). Set again below
+        // if *this* key is a closing bracket with a match.
+        self.showmatch_flash = None;
+
         // ── Terminal ctrl-key aliases (#804) ──────────────────────────────────
         // In a real terminal, crossterm delivers `<C-h>` as ctrl+'h' (byte
         // 0x08), `<C-j>`/`<C-m>` as ctrl+'j'/'m' (bytes 0x0A/0x0D), and
@@ -7132,6 +7140,55 @@ impl Engine {
                                 let diff = old_len - new_indent.chars().count();
                                 self.view_mut().cursor.col =
                                     self.view().cursor.col.saturating_sub(diff);
+                            }
+                        }
+                    }
+                    // `'smartindent'`/`'cindent'` (#1207): typing '#' as the
+                    // first non-blank character on a line moves it to
+                    // column 0.
+                    if ch == '#' {
+                        let line = self.view().cursor.line;
+                        if let Some(new_indent) = self.auto_outdent_for_hash(line) {
+                            let old_indent = self.get_line_indent_str(line);
+                            if new_indent != old_indent {
+                                let line_start = self.buffer().line_to_char(line);
+                                let old_len = old_indent.chars().count();
+                                self.delete_with_undo(line_start, line_start + old_len);
+                                if !new_indent.is_empty() {
+                                    self.insert_with_undo(line_start, &new_indent);
+                                }
+                                let diff = old_len - new_indent.chars().count();
+                                self.view_mut().cursor.col =
+                                    self.view().cursor.col.saturating_sub(diff);
+                            }
+                        }
+                    }
+                    // `'showmatch'` (#1207): briefly flag the matching
+                    // opening bracket after typing a closer, reusing `%`'s
+                    // own `find_matching_bracket` rather than reimplementing
+                    // bracket search. This deliberately does not move
+                    // `view.cursor` — only `showmatch_flash` — so it can
+                    // never perturb where the *next* typed character lands;
+                    // see that field's doc comment for the full rationale.
+                    if self.settings.showmatch {
+                        if let Some(open_char) = match ch {
+                            ')' => Some('('),
+                            ']' => Some('['),
+                            '}' => Some('{'),
+                            _ => None,
+                        } {
+                            let line = self.view().cursor.line;
+                            let col = self.view().cursor.col;
+                            if col > 0 {
+                                let closer_pos = self.buffer().line_to_char(line) + col - 1;
+                                if let Some(match_pos) =
+                                    self.find_matching_bracket(closer_pos, open_char, ch, false)
+                                {
+                                    let match_line = self.buffer().content.char_to_line(match_pos);
+                                    let match_col =
+                                        match_pos - self.buffer().line_to_char(match_line);
+                                    self.showmatch_flash = Some((match_line, match_col));
+                                }
                             }
                         }
                     }

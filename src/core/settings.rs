@@ -146,6 +146,34 @@ pub struct Settings {
     #[serde(default = "default_auto_indent")]
     pub auto_indent: bool,
 
+    /// C-ish auto-indent on newline, layered on top of `'autoindent'`:
+    /// indent one `'shiftwidth'` further after a line ending in `{`, dedent
+    /// a line whose first non-blank character is `}`, and put a `#`
+    /// preprocessor line at column 0 unconditionally. Corresponds to Vim's
+    /// `'smartindent'` / `'si'`. Superseded by `'cindent'` when both are set
+    /// (`:h 'cindent'`: "'cindent' ... overrules 'smartindent'"). Default
+    /// off, matching Vim. #1207.
+    #[serde(default)]
+    pub smartindent: bool,
+
+    /// Stricter C-aware indenting; when set, takes precedence over
+    /// `'smartindent'` (both may be on at once — `'cindent'` wins). This
+    /// implementation is a simplified subset: indent after `{`, dedent a
+    /// line whose first non-blank character is `}`, `#` to column 0,
+    /// otherwise copy the previous non-blank line's indent. Corresponds to
+    /// Vim's `'cindent'` / `'cin'`. Default off, matching Vim. #1207.
+    #[serde(default)]
+    pub cindent: bool,
+
+    /// In Insert mode, briefly move the cursor to the matching opening
+    /// bracket when a closing `)`, `]` or `}` is typed, then move it back.
+    /// Corresponds to Vim's `'showmatch'` / `'sm'`. `'matchtime'` (how long
+    /// the cursor stays on the match) is a value option and out of scope —
+    /// see [`crate::core::engine::Engine::showmatch_flash`]. Default off,
+    /// matching Vim. #1207.
+    #[serde(default)]
+    pub showmatch: bool,
+
     /// Insert spaces instead of a literal tab character on Tab key press
     #[serde(default = "default_expand_tab")]
     pub expand_tab: bool,
@@ -217,6 +245,15 @@ pub struct Settings {
     #[serde(default)]
     pub wrap: bool,
 
+    /// When `'wrap'` is also on, break a soft-wrapped line at a word
+    /// boundary (whitespace) at or before the wrap column instead of
+    /// splitting mid-word. Purely a display-time choice of wrap point —
+    /// never touches what's stored in the buffer. No-op when `'wrap'` is
+    /// off. Corresponds to Vim's `'linebreak'` / `'lbr'`. Default off,
+    /// matching Vim. #1207.
+    #[serde(default)]
+    pub linebreak: bool,
+
     /// When true, highlights misspelled words with underlines.
     /// Corresponds to Vim's `:set spell` / `:set nospell`.
     #[serde(default)]
@@ -274,6 +311,19 @@ pub struct Settings {
     /// Only has effect when `ignorecase` is also set.
     #[serde(default)]
     pub smartcase: bool,
+
+    /// Which regex metacharacters need backslash-escaping to be special vs.
+    /// literal, in search patterns / `:s` / `*`/`#`. Corresponds to Vim's
+    /// `'magic'` (`:h 'magic'`). Default **on**, matching Vim: `.`, `*`,
+    /// `[`, `~`, `^`, `$` are special unescaped ([`crate::core::vim_regex::Magic::Magic`]).
+    /// With `nomagic`, only `^`/`$` stay special unescaped — `.`, `*`, `[`,
+    /// `~` become literal unless backslash-escaped, at which point they
+    /// regain their special meaning ([`crate::core::vim_regex::Magic::NoMagic`]).
+    /// A pattern's own inline `\v`/`\V`/`\m`/`\M` override always wins over
+    /// this setting, exactly as it wins over a literal `:h /magic` line in
+    /// real Vim. #1207.
+    #[serde(default = "default_true")]
+    pub magic: bool,
 
     /// Number of lines to keep visible above/below the cursor (default 0).
     #[serde(default)]
@@ -1346,6 +1396,9 @@ impl Default for Settings {
             explorer_visible_on_startup: default_explorer_visible(),
             incremental_search: default_incremental_search(),
             auto_indent: default_auto_indent(),
+            smartindent: false,
+            cindent: false,
+            showmatch: false,
             expand_tab: default_expand_tab(),
             tabstop: default_tabstop(),
             shift_width: default_shift_width(),
@@ -1361,6 +1414,7 @@ impl Default for Settings {
             menu_style: MenuStyle::Inherit,
             leader: default_leader(),
             wrap: false,
+            linebreak: false,
             spell: false,
             spelllang: default_spelllang(),
             plugins_enabled: default_plugins_enabled(),
@@ -1370,6 +1424,7 @@ impl Default for Settings {
             hlsearch: default_hlsearch(),
             ignorecase: false,
             smartcase: false,
+            magic: default_true(),
             scrolloff: 0,
             startofline: false,
             joinspaces: false,
@@ -1437,13 +1492,14 @@ impl Default for Settings {
 /// any behaviour. `(long_name, short_name)`. #1153 — extend this table (and
 /// implement) as each is picked up; see the issue for the full missing-option
 /// audit and rough priority order.
-const UNIMPLEMENTED_BOOL_OPTIONS: &[(&str, &str)] = &[
-    ("magic", "magic"),
-    ("showmatch", "sm"),
-    ("linebreak", "lbr"),
-    ("smartindent", "si"),
-    ("cindent", "cin"),
-];
+///
+/// Empty as of #1207, which implemented the last five entries (`magic`,
+/// `showmatch`, `linebreak`, `smartindent`, `cindent` — #1190's tranche
+/// before it cleared `hidden`, `list`, `showcmd`, `ruler`). Kept as `&[]`
+/// rather than removed, per #1207's own note: the "recognised but not
+/// implemented" mechanism (#1153) is meant to be reused by the next Vim
+/// option that lands here recognised-but-unwired.
+const UNIMPLEMENTED_BOOL_OPTIONS: &[(&str, &str)] = &[];
 
 /// Real vim **value** options `:set` recognises by name but does not yet
 /// wire to any behaviour. See [`UNIMPLEMENTED_BOOL_OPTIONS`]'s doc — same
@@ -2428,6 +2484,11 @@ impl Settings {
             "showcmd" | "sc" => self.showcmd = enable,
             "ruler" | "ru" => self.ruler = enable,
             "list" => self.list = enable,
+            "magic" => self.magic = enable,
+            "showmatch" | "sm" => self.showmatch = enable,
+            "linebreak" | "lbr" => self.linebreak = enable,
+            "smartindent" | "si" => self.smartindent = enable,
+            "cindent" | "cin" => self.cindent = enable,
             // `"nf"` is Vim's real abbreviation for `'nrformats'` (a
             // value-option, handled in `set_value_option` below) — nerdfonts
             // (a vimcode-only setting with no real-Vim counterpart) keeps
@@ -3000,6 +3061,31 @@ impl Settings {
                 "list".to_string()
             } else {
                 "nolist".to_string()
+            }),
+            "magic" => Ok(if self.magic {
+                "magic".to_string()
+            } else {
+                "nomagic".to_string()
+            }),
+            "showmatch" | "sm" => Ok(if self.showmatch {
+                "showmatch".to_string()
+            } else {
+                "noshowmatch".to_string()
+            }),
+            "linebreak" | "lbr" => Ok(if self.linebreak {
+                "linebreak".to_string()
+            } else {
+                "nolinebreak".to_string()
+            }),
+            "smartindent" | "si" => Ok(if self.smartindent {
+                "smartindent".to_string()
+            } else {
+                "nosmartindent".to_string()
+            }),
+            "cindent" | "cin" => Ok(if self.cindent {
+                "cindent".to_string()
+            } else {
+                "nocindent".to_string()
             }),
             "extension_registries" => Ok(format!(
                 "extension_registries={}",

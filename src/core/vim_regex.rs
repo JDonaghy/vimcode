@@ -170,13 +170,25 @@ pub fn escape_literal(s: &str) -> String {
     out
 }
 
-/// Escape a string so it matches literally when re-parsed as a **Vim** pattern
-/// in `magic` mode. Used by `*` / `#`, which wrap the word under the cursor in
-/// `\<` … `\>`.
-pub fn escape_vim_literal(s: &str) -> String {
+/// Escape a string so it matches literally when re-parsed as a **Vim**
+/// pattern under the current `'magic'` setting (#1207). Used by `*` / `#`,
+/// which wrap the word under the cursor in `\<` … `\>` and then run it back
+/// through [`compile_with_keyword_class`] at that same `magic` level.
+///
+/// Which characters need a backslash to stay literal depends on `magic`,
+/// mirroring real Vim (`vim_strsave_escaped(ptr, magic_isset() ? "/.*$^~["
+/// : "/^$")`): under `magic`, `.`, `*`, `~` and `[` are special unless
+/// escaped, so all of them (plus the anchors and the `/` delimiter) need
+/// escaping; under `nomagic`, those four are already literal — only the
+/// anchors `^`/`$` and the `/` delimiter need it. Escaping a char that is
+/// *not* special in the current mode would be wrong in the other direction:
+/// a bare backslash in `nomagic` mode makes the next character special, so
+/// escaping e.g. `.` there would turn a literal dot into "match any char".
+pub fn escape_vim_literal(s: &str, magic: bool) -> String {
+    let needs_escape = if magic { "\\/.*$^~[]" } else { "\\/^$" };
     let mut out = String::new();
     for c in s.chars() {
-        if "\\/.*$^~[]".contains(c) {
+        if needs_escape.contains(c) {
             out.push('\\');
         }
         out.push(c);
@@ -747,6 +759,25 @@ impl<'a> Translator<'a> {
                         }
                         None => return Err("E682: Invalid search pattern".to_string()),
                     },
+                    // `. * ^ $ ~ [ ]` (#1207): whether *bare* is special
+                    // depends on the magic level (`bare_special`), but a
+                    // backslash always **toggles** it — under `magic` that
+                    // means "make literal" (the common case, already the
+                    // `push_literal` fallback below), but under `nomagic`/
+                    // `\V`, where these are literal bare, the escaped form
+                    // must toggle back *to* special (`:h magic`'s "\."/"\*"
+                    // rows under those columns) — e.g. `\.` under `nomagic`
+                    // must still mean "matches any character", not a
+                    // literal dot.
+                    c @ ('.' | '*' | '^' | '$' | '~' | '[' | ']')
+                        if self.magic != Magic::VeryMagic =>
+                    {
+                        if self.bare_special(c) {
+                            push_literal(&mut self.out, c);
+                        } else {
+                            self.push_toggled_special(c, was_start)?;
+                        }
+                    }
                     _ => {
                         if let Some(cls) = self.class_for_dynamic(n) {
                             self.out.push_str(&cls);
@@ -832,6 +863,50 @@ impl<'a> Translator<'a> {
             Some('|') | Some(')') => self.magic == Magic::VeryMagic,
             _ => false,
         }
+    }
+
+    /// Emit the special (as opposed to literal) form of `c`, one of
+    /// `. * ^ $ ~ [ ]` — i.e. exactly what `run()`'s own bare-character
+    /// match would emit for `c` if it appeared unescaped. Used from the
+    /// escaped-atom branch (#1207) when the current magic level makes `c`
+    /// literal bare (`nomagic`/`\V`), so a backslash in front of it must
+    /// toggle it *to* special rather than *away from* it. `was_start` is
+    /// the caller's `self.at_start` snapshot from before the backslash was
+    /// consumed — `^` and `*` need it exactly the way the bare-char match
+    /// does, for the same reason.
+    fn push_toggled_special(&mut self, c: char, was_start: bool) -> Result<(), String> {
+        match c {
+            '^' => {
+                if was_start {
+                    self.out.push('^');
+                } else {
+                    self.out.push_str("\\^");
+                }
+            }
+            '$' => {
+                if self.at_dollar_end() {
+                    self.out.push('$');
+                } else {
+                    self.out.push_str("\\$");
+                }
+            }
+            '.' => self.out.push('.'),
+            '*' => {
+                if self.out.is_empty() || was_start {
+                    self.out.push_str("\\*");
+                } else {
+                    self.out.push('*');
+                }
+            }
+            '[' => self.collection()?,
+            ']' => self.out.push_str("\\]"),
+            '~' => {
+                let sub = self.last_sub.to_string();
+                self.out.push_str(&escape_literal(&sub));
+            }
+            _ => unreachable!("push_toggled_special is only called for . * ^ $ ~ [ ]"),
+        }
+        Ok(())
     }
 }
 
@@ -1236,6 +1311,7 @@ pub fn compile(
         last_sub,
         visual_range,
         ("0-9A-Za-z_", "A-Za-z_"),
+        true,
     )
 }
 
@@ -1245,6 +1321,14 @@ pub fn compile(
 /// bundled into one param to stay under clippy's argument-count limit. See
 /// [`crate::core::settings::Settings::iskeyword_regex_class_bodies`], the
 /// only intended source for these two (#1191).
+///
+/// `magic` is the current `'magic'` setting (#1207) — the *starting* magic
+/// level for the pattern before any inline `\v`/`\V`/`\m`/`\M` override.
+/// `true` → [`Magic::Magic`] (Vim's own default), `false` → [`Magic::NoMagic`]
+/// (`:h 'nomagic'`: only `^`/`$` stay special unescaped; `.`, `*`, `[`, `~`
+/// become literal unless backslash-escaped, which is exactly what
+/// [`Magic::NoMagic`]'s `bare_special` arm already encodes).
+#[allow(clippy::too_many_arguments)]
 pub fn compile_with_keyword_class(
     pattern: &str,
     ignorecase: bool,
@@ -1253,14 +1337,16 @@ pub fn compile_with_keyword_class(
     last_sub: &str,
     visual_range: Option<(usize, usize)>,
     keyword_classes: (&str, &str),
+    magic: bool,
 ) -> Result<Compiled, String> {
     let (keyword_class, keyword_class_no_digits) = keyword_classes;
     if pattern.is_empty() {
         return Err("E35: No previous regular expression".to_string());
     }
+    let initial_magic = if magic { Magic::Magic } else { Magic::NoMagic };
     let t = translate_with_keyword_class(
         pattern,
-        Magic::Magic,
+        initial_magic,
         last_sub,
         keyword_class,
         keyword_class_no_digits,
@@ -1378,6 +1464,27 @@ mod tests {
         assert_eq!(tr("\\M^a$"), "^a$");
     }
 
+    /// RED against unfixed `develop` (#1207): before the `push_toggled_special`
+    /// fix, an escaped `.`/`*`/`^`/`$` under `nomagic`/`\V` fell through to
+    /// the generic `push_literal` fallback regardless of magic level, so
+    /// `\.` under `nomagic` produced a *literal* dot instead of "matches any
+    /// character" (`:h magic`'s "\." row under the 'nomagic' column) — the
+    /// opposite of `:h 'magic'`'s documented escape-toggle rule.
+    #[test]
+    fn nomagic_escaped_dot_and_star_toggle_back_to_special() {
+        assert_eq!(tr("\\Ma\\.c"), "a.c");
+        assert_eq!(tr("\\Mab\\*c"), "ab*c");
+    }
+
+    #[test]
+    fn very_nomagic_escaped_dollar_toggles_back_to_anchor() {
+        // `:h magic`'s table: under `\V`, bare `$` is literal but `\$` is
+        // the end-of-line anchor (unlike `\M`, where bare `$` is already
+        // the anchor).
+        assert_eq!(tr("\\Vab$"), "ab\\$");
+        assert_eq!(tr("\\Vab\\$"), "ab$");
+    }
+
     #[test]
     fn character_classes() {
         assert_eq!(tr("\\d\\+"), "[0-9]+");
@@ -1406,15 +1513,24 @@ mod tests {
         // would have failed against that hardcoded class.
         let settings = crate::core::settings::Settings::default();
         let (k, big_k) = settings.iskeyword_regex_class_bodies();
-        let c = compile_with_keyword_class("\\k\\+", false, false, true, "", None, (&k, &big_k))
-            .unwrap();
+        let c =
+            compile_with_keyword_class("\\k\\+", false, false, true, "", None, (&k, &big_k), true)
+                .unwrap();
         assert!(c.is_match("café"));
         assert!(c.is_match("Ñandú"));
         assert!(c.is_match("北京"));
         // `\K` still excludes digits, same as the ASCII default.
-        let c_big =
-            compile_with_keyword_class("\\K\\+", false, false, true, "", None, (&k, &big_k))
-                .unwrap();
+        let c_big = compile_with_keyword_class(
+            "\\K\\+",
+            false,
+            false,
+            true,
+            "",
+            None,
+            (&k, &big_k),
+            true,
+        )
+        .unwrap();
         assert!(c_big.is_match("café"));
         assert!(!c_big.is_match("42"));
     }
@@ -1850,5 +1966,71 @@ mod tests {
     fn multiline_flag_is_on_so_anchors_are_per_line() {
         let c = compile("^b", false, false, true, "", None).unwrap();
         assert!(c.is_match("a\nb"));
+    }
+
+    // ── `'magic'` (#1207) ────────────────────────────────────────────────
+    //
+    // These exercise `compile_with_keyword_class`'s new `magic: bool` param
+    // directly (not the inline `\v`/`\V`/`\m`/`\M` overrides, which already
+    // had coverage via `tr()` before #1207) — i.e. the *setting*, with no
+    // per-pattern override in the pattern text itself. RED against unfixed
+    // `develop`: before #1207, `compile_with_keyword_class` hardcoded
+    // `Magic::Magic` as the starting level with no way to reach
+    // `Magic::NoMagic` short of an inline `\M`, so `magic_setting_off_makes_dot_and_star_literal`
+    // would have failed — a bare `.` would have matched any char instead of
+    // a literal dot.
+
+    #[test]
+    fn magic_setting_off_makes_dot_and_star_literal() {
+        let k = "0-9A-Za-z_";
+        let c = compile_with_keyword_class("a.c", false, false, true, "", None, (k, k), false)
+            .unwrap();
+        assert!(c.is_match("a.c"));
+        assert!(!c.is_match("abc"), "bare '.' must be literal under nomagic");
+        let c = compile_with_keyword_class("ab*c", false, false, true, "", None, (k, k), false)
+            .unwrap();
+        assert!(c.is_match("ab*c"));
+        assert!(!c.is_match("ac"), "bare '*' must be literal under nomagic");
+    }
+
+    #[test]
+    fn magic_setting_off_still_special_when_escaped() {
+        // `\.`/`\*` toggle *back* to special even under nomagic (`:h
+        // 'magic'`): the backslash always toggles, regardless of the
+        // current level.
+        let k = "0-9A-Za-z_";
+        let c = compile_with_keyword_class("a\\.c", false, false, true, "", None, (k, k), false)
+            .unwrap();
+        assert!(c.is_match("abc"), "escaped '.' must be special under nomagic");
+    }
+
+    #[test]
+    fn magic_setting_off_keeps_anchors_special() {
+        // `^`/`$` stay bare-special regardless of `'magic'`.
+        let k = "0-9A-Za-z_";
+        let c =
+            compile_with_keyword_class("^ab$", false, false, true, "", None, (k, k), false)
+                .unwrap();
+        assert!(c.is_match("ab"));
+        assert!(!c.is_match("xab"));
+    }
+
+    #[test]
+    fn magic_setting_on_is_the_existing_default_behaviour() {
+        let k = "0-9A-Za-z_";
+        let c =
+            compile_with_keyword_class("a.c", false, false, true, "", None, (k, k), true).unwrap();
+        assert!(c.is_match("abc"), "bare '.' must be special under magic");
+    }
+
+    #[test]
+    fn escape_vim_literal_is_magic_aware() {
+        // Under `magic`, `.`/`*`/`~`/`[` need escaping to stay literal.
+        assert_eq!(escape_vim_literal("a.b*c", true), "a\\.b\\*c");
+        // Under `nomagic`, those four are already literal — escaping them
+        // would wrongly toggle them special, so they must NOT be escaped;
+        // only the anchors/delimiter are.
+        assert_eq!(escape_vim_literal("a.b*c", false), "a.b*c");
+        assert_eq!(escape_vim_literal("a^b$c", false), "a\\^b\\$c");
     }
 }
