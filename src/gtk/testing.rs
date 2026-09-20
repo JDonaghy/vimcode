@@ -2481,15 +2481,13 @@ mod tests {
     }
 
     /// #700 items 2/3: the tab-bar row and the breadcrumb row are fixed-pixel
-    /// chrome, not `ceil(line_height * 1.6)` / `+ line_height`. This harness
-    /// cannot vary `settings.font_size` and observe a painted difference —
-    /// vimcode's GTK runner paints the editor at a hardcoded "Monospace 11"
-    /// regardless of `settings.font_size`/`font_family` (see the
-    /// `build_editor_click_context` call site's doc comment in
-    /// `App::render_content`), so `render::tests::
+    /// chrome, not `ceil(line_height * 1.6)` / `+ line_height`. This test
+    /// does not itself vary `settings.font_size` to prove that (a driver
+    /// harness that does exists: `set_font_family_size_and_zoomin_zoomout_
+    /// commands_reach_paint` above); `render::tests::
     /// test_tab_bar_height_px_independent_of_font_size` (varying the
-    /// `line_height` parameter those helpers actually take) is the real
-    /// font-size-independence proof; this test instead pins that the fixed
+    /// `line_height` parameter those helpers actually take) is the direct
+    /// font-size-independence proof. This test instead pins that the fixed
     /// pixel constants actually reach the live paint pipeline, and that
     /// breadcrumbs add exactly [`crate::render::BREADCRUMB_ROW_HEIGHT_PX`] —
     /// not a whole `line_height`-tall row — above the window content.
@@ -11318,6 +11316,142 @@ mod editor_mouse_rungs {
             "clicking the vertical middle of the painted minimap strip must \
              seek the pane to ~50% of the file (#35); screen was {:?}",
             h.driver.painted_texts()
+        );
+    }
+
+    /// #1104 acceptance: click→column resolution must track the editor
+    /// font *as painted this frame*, driven end to end through
+    /// `App::handle` (via `h.driver.click`) rather than by calling
+    /// `pixel_to_click_target`/`GtkBackend::editor_col_at_x` directly the
+    /// way `gtk::click`'s unit tests do.
+    ///
+    /// Before #1104, mouse clicks resolved columns against a SECOND,
+    /// separately-constructed `GtkBackend` (`App::backend`) that
+    /// `App::render_content` re-synced by hand every frame
+    /// (`set_editor_font` + a throwaway `set_pango_context`) to *mimic*
+    /// the real paint backend's font — two backends kept in lockstep by
+    /// bookkeeping instead of one backend being asked twice. #1104 threads
+    /// the runner's own live backend through the click dispatch chain
+    /// instead, so there is only ever one backend's font state to ask.
+    ///
+    /// Clicks at a computed column (never a hardcoded pixel — see
+    /// `click_at` below) both before and after a runtime `:set font_size=40`
+    /// grows the editor font substantially, and asserts the SAME resolution
+    /// still holds each time.
+    ///
+    /// **RED-verified:** reverting the `handle_mouse_click` call site in
+    /// `App::handle_mouse_click_msg` to resolve against `self.backend`
+    /// (the pre-#1104 second backend, whose editor font is never set now
+    /// that #1104 deleted the per-frame sync that used to keep it current)
+    /// fails even the FIRST assertion below — `self.backend`'s Pango layout
+    /// stays fonted at whatever it happened to have (nothing sets it now),
+    /// so it resolves the default-font-size click at the wrong column.
+    #[test]
+    fn click_column_tracks_a_runtime_font_size_change_on_gtk() {
+        let mut engine = Engine::new_for_test();
+        engine
+            .buffer_mut()
+            .insert(0, "0123456789".repeat(4).as_str());
+        // Hide the sidebar: it's visible by default and its width, in this
+        // pinned quadraui rev, is folded into the same VS-Code-parity
+        // column/pixel policy the minimap uses — orthogonal to what this
+        // test pins (click→column tracking a *font* change) and not worth
+        // coupling to here.
+        engine.app_shell.hide_sidebar();
+        let mut h = harness(engine, 2000, 700);
+        h.driver.set_double_click_folding(false);
+        // `AppShell`'s `hide_sidebar()` flip takes a frame to reach the
+        // painted layout, same as the font-size settle frame below.
+        h.driver.render();
+        h.driver.render();
+
+        // Resolve a pixel for `target_col` from what THIS frame actually
+        // painted (`editor_text_layout`, the same text_bounds/char metrics
+        // `pixel_to_click_target -> editor_col_at_x` resolves against) —
+        // never a hardcoded coordinate.
+        let click_at = |h: &Harness<_>, target_col: usize| -> (f32, f32) {
+            let layout = h.screen_layout.borrow();
+            let rw = &layout.as_ref().expect("frame must paint a window").windows[0];
+            let cw = h.painted_char_width();
+            let lh = h
+                .painted_line_height()
+                .expect("frame must paint a line height");
+            let (_editor, editor_layout) = crate::render::editor_text_layout(rw, cw, lh);
+            let x = editor_layout.text_bounds.x as f64 + (target_col as f64 + 0.5) * cw;
+            let y = rw.rect.y + lh / 2.0;
+            (x as f32, y as f32)
+        };
+
+        let target_col0 = 15usize;
+        let (x0, y0) = click_at(&h, target_col0);
+        h.driver.click(x0, y0);
+        h.driver.render();
+        assert_eq!(
+            h.engine.borrow().view().cursor.col,
+            target_col0,
+            "clicking at the computed pixel must resolve to column \
+             {target_col0} at the default font size"
+        );
+
+        let char_width_before = h.painted_char_width();
+
+        // Runtime font-size bump — the exact ex-command path a real
+        // `:set font_size=N` keystroke uses. One settle frame is required
+        // before the new metrics show up (matches
+        // `set_font_family_size_and_zoomin_zoomout_commands_reach_paint`'s
+        // documented reasoning: quadraui measures BEFORE handing control to
+        // `App::render_content`'s `set_editor_font` call).
+        h.engine.borrow_mut().execute_command("set font_size=40");
+        h.driver.render();
+        h.driver.render();
+        // `App::cached_char_width`/`cached_line_height` — what
+        // `pixel_to_click_target` actually resolves clicks against — are
+        // refreshed from `Backend::char_width()`/`line_height()` only on
+        // `UiEvent::WindowResized` (real GTK apps get one from the OS on
+        // basically every settle; a headless `GtkDriver` test never fires
+        // one on its own; see `Harness`'s own "no main loop" doc). Dispatch
+        // one so the click below resolves against the SAME metrics this
+        // frame painted with, exactly as a resize (or the runner's own
+        // periodic re-measurement) would refresh them in a real session.
+        let viewport = {
+            use quadraui::Backend as _;
+            h.driver.backend().viewport()
+        };
+        h.driver
+            .dispatch(quadraui::UiEvent::WindowResized { viewport });
+
+        assert!(
+            h.painted_char_width() > char_width_before * 1.3,
+            "precondition: `:set font_size=40` must grow the painted \
+             char_width substantially: before={char_width_before} \
+             after={}",
+            h.painted_char_width()
+        );
+
+        // Move the cursor away from `target_col0` first, so the assertion
+        // below can only pass if THIS click actually moved it there — not
+        // because it was a leftover from the click above. A render is
+        // required before computing the next `click_at`: `col_at_x`/
+        // `click_at` both assume `scroll_left == 0` (column N sits N cells
+        // right of `text_bounds.x`), which only holds once a frame has
+        // painted with the cursor back at column 0 — otherwise the window
+        // may still carry whatever `scroll_left` the old cursor position at
+        // the OLD (narrower, pre-font-bump) viewport needed.
+        h.engine.borrow_mut().view_mut().cursor = crate::core::Cursor { line: 0, col: 0 };
+        h.driver.render();
+
+        let target_col1 = 5usize;
+        let (x1, y1) = click_at(&h, target_col1);
+        h.driver.click(x1, y1);
+        h.driver.render();
+        assert_eq!(
+            h.engine.borrow().view().cursor.col,
+            target_col1,
+            "clicking at the pixel `editor_text_layout` reports for column \
+             {target_col1} must still resolve to that column after a live \
+             `:set font_size=40` — proving the click path (#1104: routed \
+             through the runner's own live backend, not a second, \
+             separately-constructed one) reads THIS frame's font metrics"
         );
     }
 

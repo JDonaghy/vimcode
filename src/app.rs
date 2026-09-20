@@ -18,12 +18,11 @@
 //! extension this whole file — to depend on it. It is now typed against
 //! [`TextMetricsBackend`], a narrow local trait for the text-measurement
 //! hooks that still have no portable `quadraui::Backend` equivalent; see
-//! that trait's doc comment. #861 closed the trait's remaining GTK leak:
-//! its context-setter used to take a `pango::Context` by name, which meant
-//! the trait — and so `App::backend`'s field type — could never be
-//! implemented by a non-GTK backend no matter what that backend could
-//! measure. It now takes the context type-erased, so the trait itself names
-//! no toolkit type.
+//! that trait's doc comment for why it survives #1104's click/drag/
+//! modal-stack refactor (which did delete the trait's third method,
+//! `set_text_measurement_context` — a GTK/Pango-context setter #861 had
+//! already type-erased to keep the trait itself toolkit-neutral) and what
+//! quadraui-side work would let the remaining two go too.
 //!
 //! #862 closed the three items the previous revision of this doc comment
 //! listed as the remaining blockers to dropping the `gui` gate:
@@ -56,12 +55,13 @@
 //!    moved to the backend-neutral
 //!    `crate::click`/`crate::css`/`crate::app_support`, which `src/gtk/{click,
 //!    css,mod,util}.rs` now re-export so nothing else in `crate::gtk` had to
-//!    change. The genuinely GTK-only remainder —
-//!    `click::build_editor_click_context` (the Pango/Cairo text-measurement
-//!    context, see [`TextMetricsBackend`]), `css::load_css` and `util`'s
-//!    icon-install/log helpers — stayed in `crate::gtk` and is reached from
-//!    here through explicit `#[cfg(feature = "gui")]` call sites (`App::new`,
-//!    the `TextMetricsBackend` impl). `app_icon_image_for_paint` used to be a
+//!    change. The genuinely GTK-only remainder — `css::load_css` and
+//!    `util`'s icon-install/log helpers — stayed in `crate::gtk` and is
+//!    reached from here through explicit `#[cfg(feature = "gui")]` call
+//!    sites in `App::new`. (`click::build_editor_click_context`, the
+//!    Pango/Cairo text-measurement context builder this list used to name
+//!    here too, is `#[cfg(test)]`-only since #1104 — see its doc comment.)
+//!    `app_icon_image_for_paint` used to be a
 //!    third such site — GTK got a pre-rasterised PNG, every other backend the
 //!    raw SVG — until quadraui#1014 added a decode cache to
 //!    `Backend::draw_image` itself (#1102), so it now hands every backend the
@@ -83,8 +83,6 @@
 
 #[cfg(feature = "gui")]
 use gtk4::gdk;
-#[cfg(feature = "gui")]
-use gtk4::pango;
 #[cfg(feature = "gui")]
 use gtk4::prelude::*;
 use std::cell::{Cell, RefCell};
@@ -385,58 +383,51 @@ impl DeferredQueue {
 /// `Backend` supertrait bound) *and* these narrow ones, without naming a
 /// concrete backend type anywhere outside its `impl` below.
 ///
-/// #861: `set_text_measurement_context` used to be `set_pango_context(ctx:
-/// pango::Context)`, which meant *no non-GTK backend could implement this
-/// trait at all* — the signature named a GTK/Pango type, so `App` could
-/// never hold a macOS or Win backend regardless of what that backend could
-/// actually measure. The context is now passed type-erased
-/// (`Box<dyn Any>`): the only caller that produces one
-/// (`click::build_editor_click_context`, GTK-only) and the only
-/// implementation that consumes one (`GtkBackend` below, via `downcast`)
-/// agree on the concrete type out of band, so the trait itself never names
-/// it. A backend with no persistent-context concept — TUI's fixed-width
-/// grid needs none; quadraui's macOS text measurement
-/// (`quadraui::macos::text::measure_text(&CTFont, &str)`) takes the font
-/// per call instead of storing one — can implement this as a no-op.
+/// #861: this trait used to expose `set_pango_context(ctx: pango::Context)`
+/// (a GTK/Pango-typed context setter for the editor-click Pango layout), which
+/// meant *no non-GTK backend could implement this trait at all*. #1104
+/// deleted that method along with its one caller (`App::render_content`'s
+/// per-frame sync onto a second, separately-constructed `GtkBackend` used
+/// only for click-time hit-testing — see the doc comment where that call used
+/// to live) once threading the runner's own live backend through the click/
+/// drag/modal-stack call chain made the second backend, and so the context it
+/// needed, unnecessary. What is left, `set_current_line_height`/
+/// `set_current_char_width`, has no GTK/Pango type in its signature and so
+/// was never the compilation blocker.
 ///
-/// #969: `set_text_measurement_context` has a default (empty) body —
-/// genuinely optional, per its own doc above, for any backend with no
-/// persistent-context concept. `set_current_line_height`/
-/// `set_current_char_width` deliberately have **no default**: both are
-/// load-bearing for click correctness (`App::explorer_ui_event` /
-/// `App::route_ai_chat_event` re-apply them, immediately before hit-testing,
-/// to undo the #540/#819 drift guard's namesake drift), so every impl must
-/// write *something* for them rather than silently inheriting a no-op. That
-/// alone does not stop an impl from writing an empty body anyway — #967 did
-/// exactly that on `MacBackend` — which is what
+/// #969: `set_current_line_height`/`set_current_char_width` deliberately have
+/// **no default**: both are load-bearing for click correctness
+/// (`App::explorer_ui_event` / `App::route_ai_chat_event` re-apply them,
+/// immediately before hit-testing, to undo the #540/#819 drift guard's
+/// namesake drift), so every impl must write *something* for them rather
+/// than silently inheriting a no-op. That alone does not stop an impl from
+/// writing an empty body anyway — #967 did exactly that on `MacBackend` —
+/// which is what
 /// [`crate::harness::assert_text_metrics_backend_applies_metrics`] is for:
 /// it round-trips a value through the trait object and the
 /// `quadraui::Backend` getter these setters are supposed to feed, so a stub
 /// fails a test instead of shipping silently.
+///
+/// #1104 could not delete this trait outright: `App::explorer_ui_event`,
+/// `App::route_ai_sidebar_event` and the DAP-sidebar key route all call these
+/// setters from deep inside the keyboard/mouse dispatch tree, at call sites
+/// with no live `backend: &mut dyn quadraui::Backend` reference threaded in
+/// (unlike the click/drag chain #1104 *did* convert) — and even if one were
+/// threaded in, `quadraui::Backend` has no `Any`/downcast escape hatch and no
+/// portable equivalent of these two setters, so there is no way to reach a
+/// concrete backend's inherent methods through the trait object without this
+/// local supertrait (or an equivalent) naming the concrete type somewhere.
+/// Closing that gap is quadraui-side work (a portable
+/// `text_metrics_handle()`-style accessor, mirroring `modal_stack_handle()`/
+/// `drag_state_handle()`), tracked as the follow-up this issue's report
+/// files against `JDonaghy/quadraui`.
 pub(crate) trait TextMetricsBackend: quadraui::Backend {
-    // Only called from the `gui`-gated editor-click-context block in
-    // `render_content` today (its one producer,
-    // `click::build_editor_click_context`, is GTK-only). Default body: a
-    // backend with no persistent-context concept (TUI, macOS, Win-GUI —
-    // see the trait doc above) can simply not override this.
-    #[cfg_attr(not(feature = "gui"), allow(dead_code))]
-    fn set_text_measurement_context(&mut self, _ctx: Box<dyn std::any::Any>) {}
     fn set_current_line_height(&mut self, line_height: f64);
     fn set_current_char_width(&mut self, char_width: f64);
 }
 
 #[cfg(feature = "gui")]
 impl TextMetricsBackend for backend::GtkBackend {
-    fn set_text_measurement_context(&mut self, ctx: Box<dyn std::any::Any>) {
-        // The only producer (`click::build_editor_click_context`) hands us
-        // a `pango::Context`; anything else is a caller bug, not something
-        // this backend can act on, so it's silently dropped rather than
-        // panicking.
-        if let Ok(pango_ctx) = ctx.downcast::<pango::Context>() {
-            backend::GtkBackend::set_pango_context(self, *pango_ctx);
-        }
-    }
-
     fn set_current_line_height(&mut self, line_height: f64) {
         backend::GtkBackend::set_current_line_height(self, line_height);
     }
@@ -449,24 +440,13 @@ impl TextMetricsBackend for backend::GtkBackend {
 /// [`TextMetricsBackend`] for quadraui's `WinBackend` (#866, the Win-GUI
 /// twin of #859's `MacBackend` impl in `src/macos/mod.rs`).
 ///
-/// - `set_text_measurement_context` is a no-op, same reasoning as the
-///   `MacBackend` impl: DirectWrite measurement
-///   (`WinBackend::measure_text`/`draw_text`) takes the string per call
-///   rather than storing a context, and the trait's one context producer
-///   (`click::build_editor_click_context`) is GTK-only and its call site in
-///   `render_content` is `#[cfg(feature = "gui")]`, so nothing ever calls
-///   this here.
-/// - The two metric setters forward to `WinBackend`'s own public
-///   `set_current_line_height`/`set_current_char_width` (`f32`, matching
-///   DirectWrite's unit — GTK's are `f64` Pango units), the Win-GUI
-///   counterparts of `GtkBackend`'s methods of the same name at the pinned
-///   rev `9eede7fd`.
+/// The two metric setters forward to `WinBackend`'s own public
+/// `set_current_line_height`/`set_current_char_width` (`f32`, matching
+/// DirectWrite's unit — GTK's are `f64` Pango units), the Win-GUI
+/// counterparts of `GtkBackend`'s methods of the same name at the pinned
+/// rev `9eede7fd`.
 #[cfg(feature = "win")]
 impl TextMetricsBackend for win_backend::WinBackend {
-    // `set_text_measurement_context` is deliberately not overridden here —
-    // the trait's default (empty) body is exactly this backend's no-op, per
-    // the reasoning above (#969).
-
     fn set_current_line_height(&mut self, line_height: f64) {
         win_backend::WinBackend::set_current_line_height(self, line_height as f32);
     }
@@ -966,15 +946,36 @@ pub(crate) struct App {
     pub(crate) last_colorscheme: String,
     /// A second, standalone `quadraui::Backend`-impl handle, distinct from
     /// the `&mut dyn quadraui::Backend` the `ShellApp` runner hands
-    /// `setup`/`handle`/`tick` — this one is owned outright by `App` for
-    /// click hit-testing and the two `TextMetricsBackend` calls that need a
-    /// long-lived handle across borrow-drop points (see the #560 comment in
-    /// `render_content`). Owns the canonical accelerators / event-queue /
-    /// viewport / services / modal-stack / drag-state. Call sites reach
-    /// modal-stack and drag-state via `self.backend.borrow().modal_stack_handle()`
-    /// and `drag_state_handle()` (B.5b Stage 11 dropped the alias `Rc` clones
-    /// that previously lived at `App.modal_stack` / `App.drag_state`). The
-    /// `init` drain timer holds a clone and pumps `poll_events()` every 16 ms.
+    /// `setup`/`handle`/`tick` — owned outright by `App` for the callers that
+    /// have no live runner backend reference of their own to reach instead:
+    ///
+    /// - **Clipboard/dialog services** (`setup_gtk_clipboard`,
+    ///   `PendingFileDialog` handling): `engine.clipboard_read`/
+    ///   `clipboard_write` are plain `Fn` callbacks invoked from deep inside
+    ///   `core::engine` code with no `Backend` parameter of their own at all,
+    ///   long after any `handle`/`render` call that held the runner's live
+    ///   backend has returned — this handle is what they close over.
+    /// - **`TextMetricsBackend`'s two metric setters** (`explorer_ui_event`,
+    ///   `route_ai_sidebar_event`, the DAP-sidebar key route):
+    ///   `set_current_line_height`/`set_current_char_width` are inherent
+    ///   `GtkBackend` methods with no portable `quadraui::Backend` trait
+    ///   equivalent, called from dispatch-tree call sites that #1104 could
+    ///   not thread a live `backend: &dyn quadraui::Backend` reference into
+    ///   without quadraui growing new portable surface — see
+    ///   [`TextMetricsBackend`]'s own doc comment.
+    ///
+    /// #1104 removed the third historical reason this field existed: click/
+    /// drag/modal-stack hit-testing (`pixel_to_click_target` and friends)
+    /// used to resolve against `self.backend`'s own, separately-synced
+    /// `modal_stack_handle()`/`drag_state_handle()`/Pango state, entirely
+    /// distinct from the runner's own — see `render_content`'s doc comment
+    /// at the old sync call site. That whole call chain is threaded the
+    /// runner's live backend now, so `self.backend`'s modal stack and drag
+    /// state are dead weight for it (nothing clicks against them anymore) —
+    /// only the two uses above still read this field.
+    ///
+    /// The `init` drain timer holds a clone and pumps `poll_events()` every
+    /// 16 ms.
     ///
     /// Typed against [`TextMetricsBackend`] rather than the concrete
     /// `backend::GtkBackend` (#813) — see that trait's doc comment for why
@@ -1950,11 +1951,11 @@ impl App {
 
     /// Open the editor (buffer text) context menu at the click's pixel
     /// position, unless a focused modal wants to swallow the click.
-    fn handle_editor_right_click(&mut self, x: f64, y: f64) {
+    fn handle_editor_right_click(&mut self, backend: &dyn quadraui::Backend, x: f64, y: f64) {
         // Swallow if the click landed on a focused modal that
         // wants to consume it (#216 — editor hover popup).
-        self.reconcile_editor_hover_modal();
-        let stack_rc = self.backend.borrow().modal_stack_handle();
+        self.reconcile_editor_hover_modal(backend);
+        let stack_rc = backend.modal_stack_handle();
         let in_modal = stack_rc
             .borrow()
             .hit_test(quadraui::Point {
@@ -1992,16 +1993,16 @@ impl App {
     /// The retired `Msg::CtrlMouseClick` also carried `width`/`height`, but
     /// the arm bound both to `_`, so they are dropped from the signature
     /// rather than threaded through unused.
-    fn handle_ctrl_mouse_click(&mut self, x: f64, y: f64) {
+    fn handle_ctrl_mouse_click(&mut self, backend: &dyn quadraui::Backend, x: f64, y: f64) {
         let layout_ref = self.cached_screen_layout.borrow();
         if let Some(ref layout) = *layout_ref {
             let mut engine = self.engine.borrow_mut();
             if !engine.picker_open {
-                let drag_rc = self.backend.borrow().drag_state_handle();
+                let drag_rc = backend.drag_state_handle();
                 let mut drag = drag_rc.borrow_mut();
                 if let ClickTarget::BufferPos(_, line, col) = pixel_to_click_target(
                     &mut engine,
-                    &**self.backend.borrow(),
+                    backend,
                     x,
                     y,
                     self.cached_line_height,
@@ -2025,12 +2026,12 @@ impl App {
     /// As with [`App::handle_ctrl_mouse_click`], the `width`/`height` the
     /// retired `Msg::MouseDoubleClick` carried were bound to `_` and are
     /// dropped from the signature.
-    fn handle_mouse_double_click_msg(&mut self, x: f64, y: f64) {
+    fn handle_mouse_double_click_msg(&mut self, backend: &dyn quadraui::Backend, x: f64, y: f64) {
         // #490: a double-click landing on the editor hover popup used to fall
         // straight through to the editor's word-select underneath, because
         // this handler never consulted the popup at all. It runs the same
         // shared rung the single-click path does, first.
-        if self.route_and_apply_editor_hover_popup(x, y) {
+        if self.route_and_apply_editor_hover_popup(backend, x, y) {
             return;
         }
         let mut engine = self.engine.borrow_mut();
@@ -2075,10 +2076,10 @@ impl App {
             if !bc_handled {
                 let layout_ref = self.cached_screen_layout.borrow();
                 if let Some(ref layout) = *layout_ref {
-                    let drag_rc = self.backend.borrow().drag_state_handle();
+                    let drag_rc = backend.drag_state_handle();
                     handle_mouse_double_click(
                         &mut engine,
-                        &**self.backend.borrow(),
+                        backend,
                         x,
                         y,
                         self.cached_line_height,
@@ -2100,7 +2101,12 @@ impl App {
     /// `delta_y` arrives in **GTK's raw polarity** (positive = wheel down) —
     /// see the negation comment at the `UiEvent::Scroll` call site in
     /// `ShellApp::handle`.
-    fn handle_mouse_scroll_msg(&mut self, delta_x: f64, delta_y: f64) {
+    fn handle_mouse_scroll_msg(
+        &mut self,
+        backend: &dyn quadraui::Backend,
+        delta_x: f64,
+        delta_y: f64,
+    ) {
         let mut engine = self.engine.borrow_mut();
         // Picker open: scroll the picker results.
         //
@@ -2122,7 +2128,7 @@ impl App {
         if let Some((px, py)) = self.last_editor_pointer.get() {
             let surfaces = engine.scroll_surfaces.borrow();
             let scroll_events = quadraui::dispatch_scroll(
-                &self.backend.borrow().modal_stack_handle().borrow(),
+                &backend.modal_stack_handle().borrow(),
                 &surfaces,
                 quadraui::Point {
                     x: px as f32,
@@ -2982,7 +2988,12 @@ impl App {
     /// (#229/#486) — and from `handle_mouse_double_click_msg`, which never
     /// consulted the popup at all, so a double-click on it fell through to
     /// the editor's word-select (#490).
-    fn route_and_apply_editor_hover_popup(&self, x: f64, y: f64) -> bool {
+    fn route_and_apply_editor_hover_popup(
+        &self,
+        backend: &dyn quadraui::Backend,
+        x: f64,
+        y: f64,
+    ) -> bool {
         let (visible, has_focus) = {
             let engine = self.engine.borrow();
             (engine.editor_hover.is_some(), engine.editor_hover_has_focus)
@@ -3016,7 +3027,7 @@ impl App {
             self.engine.borrow_mut().open_url(&url);
         }
         if let Some(target) = effect.begin_drag {
-            let drag_rc = self.backend.borrow().drag_state_handle();
+            let drag_rc = backend.drag_state_handle();
             drag_rc.borrow_mut().begin(target);
             // Seek immediately, with the same thumb-aware math the drag
             // frames will use. This backend used to run a *second*,
@@ -3092,13 +3103,13 @@ impl App {
     /// stop falling through to the editor's context menu. Picker-
     /// style reconcile: `push` dedupes on id, so calling this every
     /// click is safe.
-    fn reconcile_editor_hover_modal(&self) {
+    fn reconcile_editor_hover_modal(&self, backend: &dyn quadraui::Backend) {
         let editor_hover_id = quadraui::WidgetId::new("editor_hover");
         let engine = self.engine.borrow();
         let visible = engine.editor_hover.is_some();
         let rect = self.editor_hover_popup_rect.get();
         drop(engine);
-        let stack_rc = self.backend.borrow().modal_stack_handle();
+        let stack_rc = backend.modal_stack_handle();
         let mut stack = stack_rc.borrow_mut();
         match (visible, rect) {
             (true, Some(rect)) => {
@@ -3131,16 +3142,17 @@ impl App {
     /// without giving it priority there too, clicks on it fell straight
     /// through to `TreeController`'s row hit-test underneath instead of
     /// firing the menu action or dismissing it).
-    fn dispatch_context_menu_click(&mut self, x: f64, y: f64) -> bool {
+    fn dispatch_context_menu_click(
+        &mut self,
+        backend: &dyn quadraui::Backend,
+        x: f64,
+        y: f64,
+    ) -> bool {
         let cm_id = quadraui::WidgetId::new("context_menu");
         if self.engine.borrow().context_menu.is_none() {
             // Defensive cleanup: the menu may have closed via Esc/Enter while
             // no click was seen by us. Pop any stale entry.
-            self.backend
-                .borrow()
-                .modal_stack_handle()
-                .borrow_mut()
-                .pop(&cm_id);
+            backend.modal_stack_handle().borrow_mut().pop(&cm_id);
             return false;
         }
 
@@ -3148,8 +3160,7 @@ impl App {
         // that might be open (picker, dialog) is arbitrated against it by the
         // *drag* guard, which still consults the stack.
         if let Some(bounds) = self.context_menu_layout.borrow().as_ref().map(|l| l.bounds) {
-            self.backend
-                .borrow()
+            backend
                 .modal_stack_handle()
                 .borrow_mut()
                 .push(cm_id, bounds);
@@ -3157,7 +3168,7 @@ impl App {
 
         match self.route_modal_overlay(x, y, render::ModalMouseAction::LeftPress) {
             render::ModalOverlayRoute::ContextMenu(route) => {
-                self.apply_context_menu_route(route);
+                self.apply_context_menu_route(backend, route);
             }
             // A dialog or a toast outranks the menu; the shared router already
             // said so, and re-deciding that here is what let the two backends
@@ -3866,9 +3877,7 @@ impl App {
         // (explorer), `draw_tab_bar_icons`, and `draw_menu_bar` now all
         // honour for both paint and their no-paint measurement twins
         // (quadraui#624). Before this call `ui_font` on the paint backend
-        // (a *separate* `GtkBackend` instance from `self.backend`, which
-        // `sync_nerd_fonts` above already keeps synced for click-time
-        // hit-testing) was never touched, so it
+        // was never touched, so it
         // sat at quadraui's own "Sans 11" default forever: chrome text
         // didn't track `settings.ui_font_size`, and — per #700's item 3 —
         // status-bar-painted breadcrumb text had no font of its own to
@@ -4471,14 +4480,19 @@ impl App {
     /// proportional-font pixel bounds, resolved by `pixel_to_click_target`, not
     /// the exact cell hit TUI gets for free), so the confirmation that
     /// `render::TabDragMove::Crossed` asks for is a real second hit-test here.
-    fn tab_drag_source_at(&self, x: f64, y: f64) -> Option<(core::window::GroupId, usize)> {
+    fn tab_drag_source_at(
+        &self,
+        backend: &dyn quadraui::Backend,
+        x: f64,
+        y: f64,
+    ) -> Option<(core::window::GroupId, usize)> {
         let layout_ref = self.cached_screen_layout.borrow();
         let layout = layout_ref.as_ref()?;
         let mut engine = self.engine.borrow_mut();
-        let drag_rc = self.backend.borrow().drag_state_handle();
+        let drag_rc = backend.drag_state_handle();
         let target = pixel_to_click_target(
             &mut engine,
-            &**self.backend.borrow(),
+            backend,
             x,
             y,
             self.cached_line_height,
@@ -4590,7 +4604,7 @@ impl App {
     /// thumb at zero, TUI paged the track and grabbed with an offset, and
     /// clicking an already-selected row confirmed it on TUI but did nothing on
     /// GTK.
-    fn apply_picker_route(&mut self, route: render::PickerRoute) {
+    fn apply_picker_route(&mut self, backend: &dyn quadraui::Backend, route: render::PickerRoute) {
         let picker_id = quadraui::WidgetId::new("picker");
         let Some(rect) = self.picker_popup_rect.get() else {
             return;
@@ -4609,8 +4623,7 @@ impl App {
         // Keep the stack in step: the drag guard in `handle_mouse_drag_msg`
         // consults it to stop a gesture leaking to the editor behind the modal
         // (#192).
-        self.backend
-            .borrow()
+        backend
             .modal_stack_handle()
             .borrow_mut()
             .push(picker_id.clone(), geo.bounds);
@@ -4620,8 +4633,7 @@ impl App {
                 render::apply_picker_row_click(&mut self.engine.borrow_mut(), idx);
             }
             render::PickerRoute::ScrollbarThumb { grab_offset } => {
-                self.backend
-                    .borrow()
+                backend
                     .drag_state_handle()
                     .borrow_mut()
                     .begin(geo.drag_target(picker_id, grab_offset));
@@ -4636,11 +4648,7 @@ impl App {
             render::PickerRoute::Consume => {}
             render::PickerRoute::Dismiss => {
                 self.engine.borrow_mut().close_picker();
-                self.backend
-                    .borrow()
-                    .modal_stack_handle()
-                    .borrow_mut()
-                    .pop(&picker_id);
+                backend.modal_stack_handle().borrow_mut().pop(&picker_id);
             }
         }
     }
@@ -4651,14 +4659,14 @@ impl App {
     /// item, hover vs. click, dismiss vs. keep-open — is decided once in
     /// `render.rs` and shared with TUI's `handle_mouse`; what stays here is
     /// GTK's own plumbing (modal-stack bookkeeping, file-tree refresh).
-    fn apply_context_menu_route(&mut self, route: render::ContextMenuRoute) -> bool {
+    fn apply_context_menu_route(
+        &mut self,
+        backend: &dyn quadraui::Backend,
+        route: render::ContextMenuRoute,
+    ) -> bool {
         let cm_id = quadraui::WidgetId::new("context_menu");
-        let pop_stack = |app: &Self| {
-            app.backend
-                .borrow()
-                .modal_stack_handle()
-                .borrow_mut()
-                .pop(&cm_id);
+        let pop_stack = || {
+            backend.modal_stack_handle().borrow_mut().pop(&cm_id);
         };
         match route {
             render::ContextMenuRoute::Item(idx) => {
@@ -4672,7 +4680,7 @@ impl App {
                     engine.explorer_needs_refresh = false;
                 }
                 drop(engine);
-                pop_stack(self);
+                pop_stack();
                 if needs_tree_refresh {
                     self.refresh_file_tree();
                 }
@@ -4689,7 +4697,7 @@ impl App {
             render::ContextMenuRoute::Consume => {}
             render::ContextMenuRoute::Dismiss => {
                 self.engine.borrow_mut().close_context_menu();
-                pop_stack(self);
+                pop_stack();
             }
             render::ContextMenuRoute::Fallthrough => return false,
         }
@@ -4698,7 +4706,15 @@ impl App {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn handle_mouse_click_msg(&mut self, x: f64, y: f64, width: f64, height: f64, alt: bool) {
+    fn handle_mouse_click_msg(
+        &mut self,
+        backend: &dyn quadraui::Backend,
+        x: f64,
+        y: f64,
+        width: f64,
+        height: f64,
+        alt: bool,
+    ) {
         // ── Folder picker mouse handling (#815) ─────────────────────────
         // Checked before every other rung: like a modal dialog, the picker
         // swallows every click while open rather than competing for z-order
@@ -4710,7 +4726,7 @@ impl App {
             return;
         }
 
-        self.reconcile_editor_hover_modal();
+        self.reconcile_editor_hover_modal(backend);
 
         // ── Modal-overlay rung (#733) ─────────────────────────────────────
         //
@@ -4747,7 +4763,7 @@ impl App {
                 return;
             }
             render::ModalOverlayRoute::ContextMenu(route) => {
-                if self.apply_context_menu_route(route) {
+                if self.apply_context_menu_route(backend, route) {
                     return;
                 }
             }
@@ -4768,7 +4784,7 @@ impl App {
                 }
             }
             render::ModalOverlayRoute::UnifiedPicker(hit) => {
-                self.apply_picker_route(hit);
+                self.apply_picker_route(backend, hit);
                 self.draw_needed.set(true);
                 return;
             }
@@ -4795,7 +4811,7 @@ impl App {
         // at the popup's own scrollbar was consumed by the surface painted
         // behind it (#229/#486). It runs above that dispatch now — where TUI
         // always had it — because the popup paints on top of the editor.
-        if self.route_and_apply_editor_hover_popup(x, y) {
+        if self.route_and_apply_editor_hover_popup(backend, x, y) {
             return;
         }
 
@@ -4814,8 +4830,8 @@ impl App {
         // ── Scroll-surface click dispatch (scrollbar thumb-drag + track-page). ──
         {
             let surfaces = self.engine.borrow().scroll_surfaces.borrow().clone();
-            let modal = self.backend.borrow().modal_stack_handle().borrow().clone();
-            let mut drag = self.backend.borrow().drag_state_handle().borrow().clone();
+            let modal = backend.modal_stack_handle().borrow().clone();
+            let mut drag = backend.drag_state_handle().borrow().clone();
             let click_events = quadraui::dispatch_click(
                 &modal,
                 &surfaces,
@@ -4828,7 +4844,7 @@ impl App {
                 quadraui::MouseButton::Left,
                 Default::default(),
             );
-            *self.backend.borrow().drag_state_handle().borrow_mut() = drag;
+            *backend.drag_state_handle().borrow_mut() = drag;
             for cev in &click_events {
                 match cev {
                     quadraui::UiEvent::ScrollOffsetChanged { widget, new_offset } => {
@@ -5069,7 +5085,7 @@ impl App {
                                     return;
                                 }
                                 render::EditorScrollbarClick::BeginDrag { grab_offset } => {
-                                    let drag_rc = self.backend.borrow().drag_state_handle();
+                                    let drag_rc = backend.drag_state_handle();
                                     drag_rc
                                         .borrow_mut()
                                         .begin(quadraui::DragTarget::ScrollbarX {
@@ -5166,7 +5182,7 @@ impl App {
                                     return;
                                 }
                                 render::EditorScrollbarClick::BeginDrag { grab_offset } => {
-                                    let drag_rc = self.backend.borrow().drag_state_handle();
+                                    let drag_rc = backend.drag_state_handle();
                                     drag_rc
                                         .borrow_mut()
                                         .begin(quadraui::DragTarget::ScrollbarY {
@@ -5223,11 +5239,11 @@ impl App {
                     let (click_result, engine_action) = {
                         let layout_ref = self.cached_screen_layout.borrow();
                         if let Some(ref layout) = *layout_ref {
-                            let drag_rc = self.backend.borrow().drag_state_handle();
+                            let drag_rc = backend.drag_state_handle();
                             let mut drag = drag_rc.borrow_mut();
                             handle_mouse_click(
                                 &mut engine,
-                                &**self.backend.borrow(),
+                                backend,
                                 x,
                                 y,
                                 alt,
@@ -5501,14 +5517,21 @@ impl App {
     // resize → terminal → editor — while TUI stated a different one, and each
     // knew scrollbar widget ids the other did not. See the rung's banner in
     // `render.rs`.
-    fn handle_mouse_drag_msg(&mut self, x: f64, y: f64, width: f64, height: f64) {
+    fn handle_mouse_drag_msg(
+        &mut self,
+        backend: &dyn quadraui::Backend,
+        x: f64,
+        y: f64,
+        width: f64,
+        height: f64,
+    ) {
         // Keep the picker's modal-stack entry fresh before anything hit-tests
         // the stack: the popup's size depends on `has_preview`, which can change
         // mid-picker.
         let picker_open = self.engine.borrow().picker_open;
         {
             let picker_id = quadraui::WidgetId::new("picker");
-            let stack_rc = self.backend.borrow().modal_stack_handle();
+            let stack_rc = backend.modal_stack_handle();
             let mut stack = stack_rc.borrow_mut();
             if picker_open {
                 let rect = self.compute_picker_popup_bounds(width, height);
@@ -5522,8 +5545,8 @@ impl App {
             panel_left: self.painted_bottom_panel_left(),
             col_width: self.cached_char_width.max(1.0),
         };
-        let drag_rc = self.backend.borrow().drag_state_handle();
-        let stack_rc = self.backend.borrow().modal_stack_handle();
+        let drag_rc = backend.drag_state_handle();
+        let stack_rc = backend.modal_stack_handle();
         let route = {
             let engine = self.engine.borrow();
             let layout_ref = self.cached_screen_layout.borrow();
@@ -5671,12 +5694,12 @@ impl App {
                         // confirm it was on a tab. If it was not, disarm and
                         // re-route the same event with the machine idle — the
                         // one rung that can decline after being asked.
-                        if let Some(source) = self.tab_drag_source_at(press_x, press_y) {
+                        if let Some(source) = self.tab_drag_source_at(backend, press_x, press_y) {
                             self.tab_drag.begin(source, x, y);
                         } else {
                             self.tab_drag.disarm();
                             self.draw_needed.set(true);
-                            self.handle_mouse_drag_msg(x, y, width, height);
+                            self.handle_mouse_drag_msg(backend, x, y, width, height);
                             return;
                         }
                     }
@@ -5754,10 +5777,10 @@ impl App {
                 let layout_ref = self.cached_screen_layout.borrow();
                 if let Some(ref layout) = *layout_ref {
                     let mut engine = self.engine.borrow_mut();
-                    let drag_rc = self.backend.borrow().drag_state_handle();
+                    let drag_rc = backend.drag_state_handle();
                     handle_mouse_drag(
                         &mut engine,
-                        &**self.backend.borrow(),
+                        backend,
                         x,
                         y,
                         // #947/#555: was `self.cached_line_height`/
@@ -5819,7 +5842,7 @@ impl App {
     /// threads into `handle_mouse_drag_msg` — needed to finalize a
     /// terminal-split divider drag with the real pixel→cell conversion
     /// instead of a fixed guess (#1058).
-    fn handle_mouse_up_msg(&mut self, width: f64) {
+    fn handle_mouse_up_msg(&mut self, backend: &dyn quadraui::Backend, width: f64) {
         // Clear debug toolbar pressed state (#510).
         if self.engine.borrow().debug_button_pressed.is_some() {
             self.engine.borrow_mut().debug_button_pressed = None;
@@ -5831,10 +5854,10 @@ impl App {
         // engine later, but today no consumer cares about mouse-up
         // beyond clearing drag state.
         {
-            let drag_rc = self.backend.borrow().drag_state_handle();
+            let drag_rc = backend.drag_state_handle();
             let mut drag = drag_rc.borrow_mut();
             if drag.is_active() {
-                let stack_rc = self.backend.borrow().modal_stack_handle();
+                let stack_rc = backend.modal_stack_handle();
                 let stack = stack_rc.borrow();
                 let _events = quadraui::dispatch_mouse_up(
                     &stack,
@@ -6283,6 +6306,7 @@ impl App {
     /// the editor's own mouse-up path.
     fn try_route_sidebar_mouse_event(
         &mut self,
+        backend: &dyn quadraui::Backend,
         event: &quadraui::UiEvent,
         ctx: &quadraui::ShellContext<'_>,
     ) -> bool {
@@ -6366,7 +6390,7 @@ impl App {
                     ..
                 }
             ) {
-                self.dispatch_context_menu_click(pos.x as f64, pos.y as f64);
+                self.dispatch_context_menu_click(backend, pos.x as f64, pos.y as f64);
             }
             self.draw_needed.set(true);
             return true;
@@ -7432,7 +7456,7 @@ impl App {
         // panel's controller before the editor click path sees them. In ShellApp
         // mode there is no per-panel DrawingArea, so without this the file explorer
         // never receives clicks. (#540 ShellApp port)
-        if self.try_route_sidebar_mouse_event(&event, ctx) {
+        if self.try_route_sidebar_mouse_event(&*backend, &event, ctx) {
             return if self.draw_needed.get() {
                 self.draw_needed.set(false);
                 quadraui::Reaction::Redraw
@@ -7616,7 +7640,7 @@ impl App {
                     Some(idx) => render::ContextMenuRoute::Item(idx),
                     None => render::ContextMenuRoute::Dismiss,
                 };
-                self.apply_context_menu_route(route);
+                self.apply_context_menu_route(&*backend, route);
                 self.draw_needed.set(true);
                 return quadraui::Reaction::Redraw;
             }
@@ -7624,7 +7648,7 @@ impl App {
                 // #902: the native popup was dismissed without a selection
                 // (Escape, click-away). Same close path a `ContextMenuRoute
                 // ::Dismiss` from the in-window hit-test already takes.
-                self.apply_context_menu_route(render::ContextMenuRoute::Dismiss);
+                self.apply_context_menu_route(&*backend, render::ContextMenuRoute::Dismiss);
                 self.draw_needed.set(true);
                 return quadraui::Reaction::Redraw;
             }
@@ -7638,10 +7662,15 @@ impl App {
                 let (w, h) = (main.width as f64, main.height as f64);
                 match button {
                     MouseButton::Left if modifiers.ctrl => {
-                        self.handle_ctrl_mouse_click(position.x as f64, position.y as f64);
+                        self.handle_ctrl_mouse_click(
+                            &*backend,
+                            position.x as f64,
+                            position.y as f64,
+                        );
                     }
                     MouseButton::Left => {
                         self.handle_mouse_click_msg(
+                            &*backend,
                             position.x as f64,
                             position.y as f64,
                             w,
@@ -7701,7 +7730,7 @@ impl App {
                             if let Some((group_id, tab_idx)) = tab_target {
                                 self.handle_tab_right_click(group_id, tab_idx, rx, ry);
                             } else {
-                                self.handle_editor_right_click(rx, ry);
+                                self.handle_editor_right_click(&*backend, rx, ry);
                             }
                         }
                     }
@@ -7714,7 +7743,7 @@ impl App {
                 self.draw_needed.set(true);
             }
             UiEvent::DoubleClick { position, .. } => {
-                self.handle_mouse_double_click_msg(position.x as f64, position.y as f64);
+                self.handle_mouse_double_click_msg(&*backend, position.x as f64, position.y as f64);
                 self.draw_needed.set(true);
             }
             UiEvent::MouseMoved { position, buttons } => {
@@ -7733,12 +7762,13 @@ impl App {
                         position.y as f64,
                         render::ModalMouseAction::Move,
                     ) {
-                        self.apply_context_menu_route(route);
+                        self.apply_context_menu_route(&*backend, route);
                     }
                 }
                 if buttons.left {
                     let main = ctx.layout.main_content_bounds;
                     self.handle_mouse_drag_msg(
+                        &*backend,
                         position.x as f64,
                         position.y as f64,
                         main.width as f64,
@@ -7748,7 +7778,7 @@ impl App {
             }
             UiEvent::MouseUp { .. } => {
                 let main = ctx.layout.main_content_bounds;
-                self.handle_mouse_up_msg(main.width as f64);
+                self.handle_mouse_up_msg(&*backend, main.width as f64);
             }
             UiEvent::Scroll {
                 delta, position, ..
@@ -7794,7 +7824,7 @@ impl App {
                 //
                 // Only y is negated: `gdk_scroll_to_uievent` passes `dx`
                 // through unchanged, so `delta.x` is already GTK-raw.
-                self.handle_mouse_scroll_msg(delta.x as f64, -(delta.y as f64));
+                self.handle_mouse_scroll_msg(&*backend, delta.x as f64, -(delta.y as f64));
             }
             UiEvent::WindowResized { .. } => {
                 // Runner sets new line_height/char_width after resize.
@@ -8096,51 +8126,33 @@ impl quadraui::ShellApp for App {
         let screen_ref = self.cached_screen_layout.borrow();
         let screen = screen_ref.as_ref().unwrap();
 
-        // #560 / #947: give the *click* backend a correctly-fonted editor
-        // Pango context so mouse clicks resolve columns via the per-glyph
-        // Pango inverse rather than a naive uniform-cell division.
+        // #560 / #947 / #1104: mouse clicks resolve editor columns via the
+        // per-glyph Pango inverse (`Backend::editor_col_at_x`), not a naive
+        // uniform-cell division — see `pixel_to_click_target`'s call site for
+        // the emoji/CJK drift #560 reported.
         //
-        // vimcode keeps a SEPARATE `GtkBackend` (`self.backend`) for click-time
-        // hit-testing than the one quadraui's ShellApp runner creates and
-        // paints with (`quadraui::gtk::run` owns the single DrawingArea and its
-        // backend; see the `self.drawing_area` note in `tick`). The runner's
-        // backend is the one that stashes `last_editor_pango_layout` during the
-        // `frame.draw(backend)` calls below and is handed to `render_content`
-        // as `backend` — but it is NOT `self.backend`, and the trait exposes no
-        // way to copy its Pango context across. So `self.backend`, used by
-        // `pixel_to_click_target -> editor_col_at_x`, had neither a stashed
-        // editor layout nor a Pango context of its own and fell through to
-        // `EditorLayout::col_at_x`'s uniform per-cell division: exact for
-        // monospace glyphs, but drifting +1 column for every preceding wide
-        // glyph (emoji ✅/🟡/❌/⏭, CJK) — the reported #560 symptom.
+        // Before #1104, click-time hit-testing ran against `self.backend`, a
+        // SECOND `GtkBackend` vimcode constructed purely to mimic the real
+        // one's font (`build_editor_click_context` + a `set_editor_font` echo
+        // right here, every frame) — because the mouse-click handlers
+        // (`handle_mouse_click_msg` and friends) never received the runner's
+        // own live backend at all. #1104 threaded that live `backend`
+        // (the exact instance `quadraui::gtk::run` paints every frame, already
+        // carrying the stable `pango_ctx` its own `activate()` sets at widget
+        // realize, and already up to date on `editor_font_*` via
+        // `sync_per_frame_backend_state`'s `set_editor_font` call above)
+        // through the whole click/drag/modal-stack call chain instead, so
+        // there is no second backend left to keep in sync here — this frame's
+        // `backend` *is* the click backend now.
         //
-        // quadraui#971 added `GtkBackend::editor_pango_layout()`, a last-resort
-        // fallback inside `editor_col_at_x` that builds a layout from the
-        // backend's *own* `pango_ctx` fonted with its own `editor_font_*`
-        // state (set via `Backend::set_editor_font`) — so a `GtkBackend` that
-        // has never painted a frame still resolves per-glyph, as long as (a)
-        // it has a `pango_ctx` at all, which only `set_text_measurement_context`
-        // below gives it, and (b) its `editor_font_*` matches what got painted.
-        // Before #971 this seam had to hand-fake (b) by measuring a probe glyph
-        // against the *painted* `char_width` and hardcoding the `"Monospace"`
-        // family to match `quadraui::gtk::run`'s old default — see the #947
-        // issue's "the trap" for why the two had to be kept in lockstep by hand.
-        // Now that `sync_per_frame_backend_state` above pushes the *live*
-        // `settings.font_family`/`font_size` onto the paint backend via
-        // `set_editor_font`, we push the exact same values onto the click
-        // backend here — both track the setting, so there is nothing left to
-        // reproduce by probing. Re-set every frame so a runtime `:set guifont`
-        // takes effect immediately.
-        self.backend.borrow_mut().set_editor_font(
-            &engine.settings.font_family,
-            engine.settings.font_size as f32,
-        );
-        #[cfg(feature = "gui")]
-        if let Some(click_ctx) = crate::gtk::click::build_editor_click_context() {
-            self.backend
-                .borrow_mut()
-                .set_text_measurement_context(Box::new(click_ctx));
-        }
+        // `self.backend` still exists for the handful of callers this refactor
+        // could not reach without quadraui growing new portable surface (see
+        // `TextMetricsBackend`'s doc comment): `explorer_ui_event`,
+        // `route_ai_sidebar_event` and the DAP-sidebar key route all need
+        // `set_current_line_height`/`set_current_char_width`, which are
+        // inherent `GtkBackend` methods with no `quadraui::Backend`-trait
+        // equivalent, called from deep inside the keyboard/mouse dispatch tree
+        // where only `&mut self` (no live `backend` reference) is available.
 
         // ══ Editor band (#764, #735 slice 3) ═════════════════════════════════
         // Composed from `render::compose_editor_band`, then the `FrameHitMap`
