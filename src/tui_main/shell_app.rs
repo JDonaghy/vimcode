@@ -4493,7 +4493,12 @@ fn handle_key_pressed(
     };
 
     // ── Shared Ctrl+L force-redraw rung (#762 / #734 slice 7) ───────────
-    if render::is_force_redraw_key(&key_name, unicode, ctrl) {
+    if render::is_force_redraw_key(
+        &key_name,
+        unicode,
+        ctrl,
+        engine.mode == crate::core::Mode::Insert && engine.insert_ctrl_x_pending,
+    ) {
         return Reaction::Redraw;
     }
 
@@ -7699,6 +7704,94 @@ mod tests {
             !on_screen.contains("ZQXWNRFMT_008"),
             "with 'octal' in nrformats, 007 must not be read as decimal; \
              screen:\n{on_screen}"
+        );
+    }
+
+    /// #1160: `<C-k>{c1}{c2}` in Insert mode enters digraph mode and inserts
+    /// the mapped glyph — `a:` gives `ä` (`:h digraph-table`). The
+    /// engine-level `test_1160_ctrl_k_inserts_digraph` pokes
+    /// `engine.buffer()` directly; this drives the real key sequence through
+    /// `TuiDriver` and asserts on the *rendered* screen, closing the
+    /// driver-tier gap the repo's Testing rule requires for a new
+    /// user-visible key binding.
+    ///
+    /// **Verified RED against unfixed `develop`:** with the `<C-k>` block
+    /// removed from `handle_insert_key` (pre-#1160 `keys.rs`), `<C-k>a:`
+    /// falls through to plain self-insert of `a` and `:`, so the screen
+    /// shows `ZQXWDIGRAPH_a:` and never `ZQXWDIGRAPH_ä`.
+    #[test]
+    fn ctrl_k_digraph_inserts_glyph_via_shell_app() {
+        let mut app = TuiShellApp::new_for_test();
+        app.engine.buffer_mut().insert(0, "ZQXWDIGRAPH_");
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        driver.press_named(quadraui::NamedKey::Escape);
+        driver.render();
+
+        driver.type_char('A');
+        driver.ctrl_char('k');
+        driver.type_char('a');
+        driver.type_char(':');
+        driver.press_named(quadraui::NamedKey::Escape);
+        driver.render();
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("ZQXWDIGRAPH_ä"),
+            "<C-k>a: should insert the ä digraph; screen:\n{screen}"
+        );
+        assert!(
+            !screen.contains("ZQXWDIGRAPH_a:"),
+            "the digraph must replace the two typed chars, not leave them \
+             as plain self-insert; screen:\n{screen}"
+        );
+    }
+
+    /// #1160: `<C-x><C-l>` in Insert mode completes the current line against
+    /// another line in the buffer sharing its prefix (`:h i_CTRL-X_CTRL-L`).
+    /// Mirrors the engine-level `test_1160_ctrl_x_ctrl_l_completes_whole_line`
+    /// but drives the real `<C-x><C-x>` submode dispatch through `TuiDriver`
+    /// and asserts on the *rendered* screen — closing the same driver-tier
+    /// gap for the `<C-x>` completion family.
+    ///
+    /// **Verified RED against unfixed `develop`:** with the
+    /// `insert_ctrl_x_pending` dispatch removed from `handle_insert_key`,
+    /// `<C-x><C-l>` has no effect on Insert-mode text entry, so the second
+    /// line stays `ZQXWCXL_hel` and the screen never shows the completed
+    /// `ZQXWCXL_hello world`.
+    #[test]
+    fn ctrl_x_ctrl_l_completes_whole_line_via_shell_app() {
+        let mut app = TuiShellApp::new_for_test();
+        app.engine
+            .buffer_mut()
+            .insert(0, "ZQXWCXL_hello world\nZQXWCXL_hel");
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        driver.press_named(quadraui::NamedKey::Escape);
+        driver.render();
+
+        driver.type_char('G');
+        driver.type_char('A');
+        driver.ctrl_char('x');
+        driver.ctrl_char('l');
+        driver.press_named(quadraui::NamedKey::Escape);
+        driver.render();
+
+        let screen = driver.screen();
+        // The fixture's first line already reads "ZQXWCXL_hello world"
+        // before any key is pressed, so a bare `contains` would pass
+        // trivially even if `<C-x><C-l>` did nothing. Require the full text
+        // to appear *twice* — once from the untouched first line, once from
+        // the second line the completion should now have filled in — so the
+        // assertion actually exercises the completion, not the fixture.
+        assert_eq!(
+            screen.matches("ZQXWCXL_hello world").count(),
+            2,
+            "<C-x><C-l> should complete the second line to the first \
+             line's full text, appearing once per line; screen:\n{screen}"
+        );
+        assert!(
+            !screen.contains("ZQXWCXL_hel\n"),
+            "the second line must have been replaced by the completion, \
+             not left as the original unfinished prefix; screen:\n{screen}"
         );
     }
 

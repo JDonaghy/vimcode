@@ -11778,15 +11778,92 @@ mod slice7_closing_rungs {
         );
     }
 
-    // No GTK black-box test for the Ctrl+L rung: with the rung removed the
-    // GtkDriver renders byte-identically, because GTK's spelling of the chord
-    // (`key_name = "l"`, `ctrl = true`) is not a cursor motion in
-    // `Engine::handle_key` either. A test here could not fail, and
+    // No GTK black-box test for the *bare* Ctrl+L rung: with the rung
+    // removed the GtkDriver renders byte-identically, because GTK's spelling
+    // of the chord (`key_name = "l"`, `ctrl = true`) is not a cursor motion
+    // in `Engine::handle_key` either. A test here could not fail, and
     // `CLAUDE.md` rule 2 says a test that cannot fail is not coverage. The
     // rung is covered by TUI's RED-verified
     // `ctrl_l_is_consumed_and_never_edits_the_buffer_via_shell_app` and, for
     // GTK's own key spelling, by
     // `render::slice7_router_tests::ctrl_l_is_a_force_redraw_from_either_backends_spelling`.
+    //
+    // The `<C-x>`-pending case *is* distinguishable on GTK (below): once
+    // `<C-x><C-l>` is a real completion sub-mode (#1160), swallowing it as a
+    // repaint instead of forwarding it to `Engine::handle_key` is an
+    // observable difference in painted text, not a no-op.
+
+    /// #1160 (review fix): `<C-x><C-l>` must reach the whole-line completion
+    /// sub-mode on GTK, not be swallowed by the Ctrl+L force-redraw rung
+    /// directly above in `handle_key_press` — the same shape of bug
+    /// `<C-x><C-f>` already had against the find/replace binding, just one
+    /// layer further out (`render::is_force_redraw_key`'s `insert_ctrl_x_pending`
+    /// parameter). Mirrors TUI's
+    /// `ctrl_x_ctrl_l_completes_whole_line_via_shell_app` (`shell_app.rs`).
+    ///
+    /// **Verified RED against unfixed `develop`:** reverting `handle_key_press`
+    /// to call `render::is_force_redraw_key(&key_name, unicode, ctrl)` (the
+    /// pre-fix 3-arg signature, ignoring `insert_ctrl_x_pending`) makes
+    /// `<C-x><C-l>` a pure repaint request; the second line never picks up
+    /// the first line's text, so the final assertion fires.
+    #[test]
+    fn ctrl_x_ctrl_l_completes_whole_line_on_gtk() {
+        let mut engine = Engine::new_for_test();
+        engine
+            .buffer_mut()
+            .insert(0, "ZQXWGTKCXL_hello world\nZQXWGTKCXL_hel");
+
+        let mut h = harness(engine, 1200, 800);
+        h.driver.render();
+
+        // `G` to the last line, `A` to append at its end and enter Insert.
+        press(&mut h.driver, Key::Char('G'), Modifiers::default());
+        press(&mut h.driver, Key::Char('A'), Modifiers::default());
+        press(
+            &mut h.driver,
+            Key::Char('x'),
+            Modifiers {
+                ctrl: true,
+                ..Default::default()
+            },
+        );
+        press(
+            &mut h.driver,
+            Key::Char('l'),
+            Modifiers {
+                ctrl: true,
+                ..Default::default()
+            },
+        );
+        h.driver.render();
+
+        // The fixture's first line already reads "ZQXWGTKCXL_hello world"
+        // before any key is pressed, so a bare `screen_contains` would pass
+        // trivially even if `<C-x><C-l>` did nothing (same trap the TUI
+        // mirror's doc comment calls out). Require it painted at least
+        // *twice* — once from the untouched first line, once from the
+        // second line the completion should now have filled in (GTK also
+        // repeats it a third time in a status-bar segment, hence `>= 2`
+        // rather than TUI's exact `== 2`).
+        let hits = h
+            .driver
+            .painted_texts()
+            .iter()
+            .filter(|t| t.contains("ZQXWGTKCXL_hello world"))
+            .count();
+        assert!(
+            hits >= 2,
+            "<C-x><C-l> should complete the second line to the first \
+             line's full text, appearing at least once per line; painted: {:?}",
+            h.driver.painted_texts()
+        );
+        assert!(
+            !h.driver.screen_contains("ZQXWGTKCXL_hel\n"),
+            "the second line must have been replaced by the completion, \
+             not left as the original unfinished prefix; painted: {:?}",
+            h.driver.painted_texts()
+        );
+    }
 
     /// #762: `render::post_key_epilogue`'s sidebar-autohide behaviour, wired
     /// into GTK for the first time by `run_post_key_epilogue`. Before this

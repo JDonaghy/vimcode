@@ -2404,7 +2404,13 @@ impl App {
         // ── Shared Ctrl+L force-redraw rung (#762 / #734 slice 7) ──────
         // New on GTK: there was no Ctrl+L tier here at all, so the chord fell
         // through to whichever tier came next instead of being consumed.
-        if render::is_force_redraw_key(&key_name, unicode, ctrl) {
+        // `insert_ctrl_x_pending` carves out `<C-x><C-l>` (whole-line
+        // completion, #1160) — see `render::is_force_redraw_key`'s doc.
+        let insert_ctrl_x_pending = {
+            let engine = self.engine.borrow();
+            engine.mode == crate::core::Mode::Insert && engine.insert_ctrl_x_pending
+        };
+        if render::is_force_redraw_key(&key_name, unicode, ctrl, insert_ctrl_x_pending) {
             self.draw_needed.set(true);
             return;
         }
