@@ -10442,3 +10442,1555 @@ fn oracle_available_for_unit_test() -> Option<()> {
         Preflight::Refuse { reason } => panic!("\n\n{reason}\n"),
     }
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Phase 5 audit slice — `:set` options (#1225)
+//
+// `:help option-list` (Vim 9.1's `quickref.txt`) is a flat inventory of every
+// option Vim has: **421 of them**. [`OPTION_AUDIT`] below tags every one
+// Implemented / Partial / NotImplemented / Skipped against the `SettingDef`
+// registry in `src/core/settings.rs`, in `:help` order, so the tagging is
+// machine-checked rather than prose in a markdown file that nothing runs.
+//
+// The measurement, as of this slice:
+//
+//     ✅ Implemented       44
+//     🟡 Partial           10
+//     ❌ Not implemented  185
+//     ⏭️  Intentionally skipped  182   (each with a reason from SKIP_REASONS)
+//                        ────
+//                         421
+//
+// ## Why an options slice goes first, measured rather than assumed
+//
+// #26 deprioritised this audit on the grounds that "bugs found here tend to be
+// 'missing feature' not 'wrong behavior'". That held for the `g`-prefix slice;
+// it does not hold here. The oracle corpus probes seven options through its
+// `cs(..)` Lua `setup`, and three of them — `'joinspaces'`, `'smarttab'`,
+// `'nrformats'` — did not exist in `Settings` at all. They were found the
+// expensive way, as unexplained conformance deviations blamed on a harness
+// bug (#1000, #1001). The three *new* findings below are the same shape,
+// found in an afternoon by tagging instead of by debugging.
+//
+// ## Gate 1 — the recorded surface must match the live registry
+//
+// Every row records the `:set` **surface** vimcode actually exposes for that
+// option name, and [`option_audit_matches_the_live_settings_registry`]
+// recomputes it by driving `Settings::parse_set_option` and diffs the two.
+// That is the bidirectional half: tagging an option `NotImplemented` and then
+// implementing it fails the gate until the row is re-tagged, and a row
+// claiming `Implemented` for a name `:set` rejects fails immediately.
+//
+// The surface is finer-grained than a bool on purpose. Three of this slice's
+// findings are *asymmetries* — a name the mutation path knows and the query
+// path does not, or the reverse — which a yes/no "is it implemented" check
+// cannot see and which is exactly what a user hits when `:set autoread` works
+// and `:set autoread?` answers "Unknown option".
+//
+// ## Gate 2 — oracle coverage, same shrink-only shape as #1007
+//
+// Every Implemented/Partial row also carries a probe naming the oracle case
+// that exercises it; [`OPTION_COVERAGE_EXEMPT`] lists the ones no case
+// reaches today. Both directions fail, exactly as in `COVERAGE_EXEMPT`: an
+// unexempt row whose probe matches nothing, and an exempt row whose probe
+// starts matching. Writing the missing cases is #1162's job, not this
+// slice's — the exempt list is the measurement it starts from.
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// The audit verdict for one `:help option-list` entry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OptStatus {
+    /// ✅ — `:set` accepts the option and it drives real behaviour.
+    Implemented,
+    /// 🟡 — recognised, but incomplete: a missing value, a missing
+    /// abbreviation, or one of `:set x` / `:set x?` missing.
+    Partial,
+    /// ❌ — not in the registry (or recognised only to be rejected).
+    NotImplemented,
+    /// ⏭️ — deliberately out of scope. Carries the **reason**, per the bar
+    /// the insert-mode slice set ("requires VimScript eval", "no digraph
+    /// support planned") — a bare ⏭️ is not a tag, it is a shrug.
+    Skipped(&'static str),
+}
+
+// The skip-reason vocabulary. A fixed set, asserted by
+// [`option_audit_is_internally_consistent`], so a future slice cannot invent
+// a one-off excuse per row.
+const VIMSCRIPT: &str = "requires VimScript eval";
+const SCRIPTRT: &str = "no VimScript runtime (no :source, .vimrc or plugin scripts)";
+const BIDI: &str = "no right-to-left / input-method support planned";
+const ENCODING: &str = "vimcode is UTF-8 only; no encoding-conversion layer";
+const TERMCAP: &str = "terminal control belongs to quadraui; vimcode reads no termcap";
+const VIMGUI: &str = "Vim GUI-toolkit option with no GTK4/quadraui counterpart";
+const OBSOLETE: &str = "obsolete in Vim itself";
+const INTERP: &str = "language-binding dynamic library";
+const PRINTING: &str = "no :hardcopy printing planned";
+const CSCOPE: &str = "no cscope integration planned";
+const MAKE: &str = "no :make/:grep compiler integration (vimcode uses LSP diagnostics)";
+const SELECT: &str = "Select mode not supported (see the g-prefix slice: gH/gV/g CTRL-H)";
+const VICOMPAT: &str = "Vi-compatibility switch; vimcode targets nocompatible behaviour only";
+const EXMODE: &str = "Ex mode / legacy pager is out of scope (see gQ in the g-prefix slice)";
+const SESSION: &str = "no :mksession/:mkview support planned";
+const ARCH: &str = "no counterpart in vimcode's architecture (Ropey buffers, no line cache)";
+const PLATFORM: &str = "option of a Vim build for a platform vimcode does not target";
+
+const SKIP_REASONS: &[&str] = &[
+    VIMSCRIPT, SCRIPTRT, BIDI, ENCODING, TERMCAP, VIMGUI, OBSOLETE, INTERP, PRINTING, CSCOPE, MAKE,
+    SELECT, VICOMPAT, EXMODE, SESSION, ARCH, PLATFORM,
+];
+
+/// What `:set` actually does with an option name today — measured, never
+/// asserted by hand. See [`measured_surface`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Surface {
+    /// Both `:set x` / `:set x=v` and `:set x?` are accepted.
+    Full,
+    /// Mutation works; `:set x?` answers "Unknown option".
+    SetOnly,
+    /// `:set x?` works; mutation answers "Unknown option".
+    QueryOnly,
+    /// Recognised by name, rejected with settings.rs's
+    /// "recognised but not implemented yet" message (`UNIMPLEMENTED_*`).
+    Stub,
+    /// Every form answers "Unknown option" — not in the registry.
+    Absent,
+}
+
+/// How an audited option is proven to be exercised by the oracle corpus.
+/// Separate from #1007's [`Probe`] because an option is pinned by a case's
+/// Lua `setup`, which `Probe` cannot see.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OptProbe {
+    /// At least one case whose `setup`, with **all whitespace removed**,
+    /// contains this substring. The corpus writes both `vim.o.magic = false`
+    /// and `vim.o.smarttab=false`, so a needle like `"vim.o.magic="` must
+    /// match either spelling; stripping whitespace is what makes the `=`
+    /// usable, and the `=` is what stops `"vim.o.list="` from crediting
+    /// `vim.o.listchars=...`.
+    OptSetup(&'static str),
+    /// At least one case whose **keys** contain this substring — for options
+    /// the corpus pins with a literal `:set …<CR>` prefix instead of `setup`.
+    OptKeys(&'static str),
+}
+
+struct OptionAudit {
+    /// Full option name, as `:help option-list` spells it (without quotes).
+    name: &'static str,
+    /// Vim's abbreviation, or `""` when the option has none.
+    short: &'static str,
+    status: OptStatus,
+    /// The `:set` surface vimcode exposes **today**, re-measured by gate 1.
+    surface: Surface,
+    /// Oracle probe — `Some` exactly for Implemented/Partial rows.
+    probe: Option<OptProbe>,
+    /// For ❌ rows: Vim's one-line description plus this slice's assessment of
+    /// whether it is worth implementing. For 🟡: what specifically is missing.
+    note: &'static str,
+}
+
+#[allow(clippy::too_many_arguments)]
+const fn o(
+    name: &'static str,
+    short: &'static str,
+    status: OptStatus,
+    surface: Surface,
+    probe: Option<OptProbe>,
+    note: &'static str,
+) -> OptionAudit {
+    OptionAudit {
+        name,
+        short,
+        status,
+        surface,
+        probe,
+        note,
+    }
+}
+
+use crate::OptProbe::{OptKeys, OptSetup};
+use crate::OptStatus::{Implemented, NotImplemented, Partial, Skipped};
+use crate::Surface::{Absent, Full, QueryOnly, SetOnly, Stub};
+
+/// Every option in Vim 9.1's `:help option-list`, in `:help` order.
+///
+/// 421 rows, no "TODO" and no unreviewed row: adding a row, deleting one, or
+/// leaving one out of order fails [`option_audit_is_internally_consistent`].
+const OPTION_AUDIT: &[OptionAudit] = &[
+    o("aleph", "al", Skipped(BIDI), Absent, None,
+      "ASCII code of the letter Aleph (Hebrew)"),
+    o("allowrevins", "ari", Skipped(BIDI), Absent, None,
+      "allow CTRL-_ in Insert and Command-line mode"),
+    o("altkeymap", "akm", Skipped(OBSOLETE), Absent, None,
+      "obsolete option for Farsi"),
+    o("ambiwidth", "ambw", Skipped(ENCODING), Absent, None,
+      "what to do with Unicode chars of ambiguous width"),
+    o("antialias", "anti", Skipped(VIMGUI), Absent, None,
+      "Mac OS X: use smooth, antialiased fonts"),
+    o("arabic", "arab", Skipped(BIDI), Absent, None,
+      "for Arabic as a default second language"),
+    o("arabicshape", "arshape", Skipped(BIDI), Absent, None,
+      "do shaping for Arabic characters"),
+    o("autochdir", "acd", NotImplemented, Absent, None,
+      "change directory to the file in the current window — nice to have"),
+    o("autoindent", "ai", Implemented, Full, Some(OptSetup("vim.o.autoindent=")),
+      "take indent for new line from previous line"),
+    o("autoread", "ar", Partial, SetOnly, Some(OptSetup("vim.o.autoread=")),
+      "settable (:set autoread / :set noautoread) but NOT queryable — :set autoread? answers \"Unknown option\""),
+    o("autoshelldir", "asd", Skipped(PLATFORM), Absent, None,
+      "change directory to the shell's current directory"),
+    o("autowrite", "aw", NotImplemented, Absent, None,
+      "automatically write file if changed — nice to have"),
+    o("autowriteall", "awa", NotImplemented, Absent, None,
+      "as 'autowrite', but works with more commands — nice to have"),
+    o("background", "bg", NotImplemented, Absent, None,
+      "\"dark\" or \"light\", used for highlight colors — nice to have"),
+    o("backspace", "bs", Partial, Full, Some(OptSetup("vim.o.backspace=")),
+      "indent/eol/start honoured; Vim's numeric shorthand (0/1/2/3) is accepted as a list but not translated"),
+    o("backup", "bk", NotImplemented, Absent, None,
+      "keep backup file after overwriting a file — nice to have"),
+    o("backupcopy", "bkc", NotImplemented, Absent, None,
+      "make backup as a copy, don't rename the file — nice to have"),
+    o("backupdir", "bdir", NotImplemented, Absent, None,
+      "list of directories for the backup file — nice to have"),
+    o("backupext", "bex", NotImplemented, Absent, None,
+      "extension used for the backup file — nice to have"),
+    o("backupskip", "bsk", NotImplemented, Absent, None,
+      "no backup for files that match these patterns — nice to have"),
+    o("balloondelay", "bdlay", Skipped(VIMGUI), Absent, None,
+      "delay in mS before a balloon may pop up"),
+    o("ballooneval", "beval", Skipped(VIMGUI), Absent, None,
+      "switch on balloon evaluation in the GUI"),
+    o("balloonevalterm", "bevalterm", Skipped(VIMGUI), Absent, None,
+      "switch on balloon evaluation in the terminal"),
+    o("balloonexpr", "bexpr", Skipped(VIMSCRIPT), Absent, None,
+      "expression to show in balloon"),
+    o("belloff", "bo", NotImplemented, Absent, None,
+      "do not ring the bell for these reasons — nice to have"),
+    o("binary", "bin", NotImplemented, Absent, None,
+      "read/write/edit file in binary mode — nice to have"),
+    o("bioskey", "biosk", Skipped(TERMCAP), Absent, None,
+      "MS-DOS: use bios calls for input characters"),
+    o("bomb", "", Skipped(ENCODING), Absent, None,
+      "prepend a Byte Order Mark to the file"),
+    o("breakat", "brk", NotImplemented, Absent, None,
+      "characters that may cause a line break — nice to have"),
+    o("breakindent", "bri", NotImplemented, Absent, None,
+      "wrapped line repeats indent — nice to have"),
+    o("breakindentopt", "briopt", NotImplemented, Absent, None,
+      "settings for 'breakindent' — nice to have"),
+    o("browsedir", "bsdir", Skipped(VIMGUI), Absent, None,
+      "which directory to start browsing in"),
+    o("bufhidden", "bh", NotImplemented, Absent, None,
+      "what to do when buffer is no longer in window — nice to have"),
+    o("buflisted", "bl", NotImplemented, Absent, None,
+      "whether the buffer shows up in the buffer list — nice to have"),
+    o("buftype", "bt", NotImplemented, Absent, None,
+      "special type of buffer — nice to have"),
+    o("casemap", "cmp", Skipped(ENCODING), Absent, None,
+      "specifies how case of letters is changed"),
+    o("cdhome", "cdh", NotImplemented, Absent, None,
+      "change directory to the home directory by \":cd\" — low value"),
+    o("cdpath", "cd", NotImplemented, Absent, None,
+      "list of directories searched with \":cd\" — low value"),
+    o("cedit", "", NotImplemented, Absent, None,
+      "key used to open the command-line window — nice to have"),
+    o("charconvert", "ccv", Skipped(ENCODING), Absent, None,
+      "expression for character encoding conversion"),
+    o("cindent", "cin", Implemented, Full, Some(OptSetup("vim.o.cindent=")),
+      "do C program indenting"),
+    o("cinkeys", "cink", NotImplemented, Absent, None,
+      "keys that trigger indent when 'cindent' is set — nice to have"),
+    o("cinoptions", "cino", NotImplemented, Absent, None,
+      "how to do indenting when 'cindent' is set — nice to have"),
+    o("cinscopedecls", "cinsd", NotImplemented, Absent, None,
+      "words that are recognized by 'cino-g' — nice to have"),
+    o("cinwords", "cinw", NotImplemented, Absent, None,
+      "words where 'si' and 'cin' add an indent — nice to have"),
+    o("clipboard", "cb", NotImplemented, Stub, None,
+      "recognised but rejected (\"not implemented yet\"); #1100 landed backend.services().clipboard(), so the blocker is gone — worth implementing"),
+    o("cmdheight", "ch", NotImplemented, Absent, None,
+      "number of lines to use for the command-line — nice to have"),
+    o("cmdwinheight", "cwh", NotImplemented, Absent, None,
+      "height of the command-line window — nice to have"),
+    o("colorcolumn", "cc", Implemented, Full, Some(OptSetup("vim.o.colorcolumn=")),
+      "columns to highlight"),
+    o("columns", "co", NotImplemented, Absent, None,
+      "number of columns in the display — low value"),
+    o("comments", "com", NotImplemented, Absent, None,
+      "affects gq and auto-indent of comment leaders; worth implementing"),
+    o("commentstring", "cms", NotImplemented, Absent, None,
+      "commentary.vim support exists with a built-in filetype table; worth implementing"),
+    o("compatible", "cp", Skipped(VICOMPAT), Absent, None,
+      "behave Vi-compatible as much as possible"),
+    o("complete", "cpt", NotImplemented, Absent, None,
+      "specify how Insert mode completion works — worth implementing"),
+    o("completefunc", "cfu", Skipped(VIMSCRIPT), Absent, None,
+      "function to be used for Insert mode completion"),
+    o("completeopt", "cot", NotImplemented, Absent, None,
+      "options for Insert mode completion — low value"),
+    o("completepopup", "cpp", Skipped(VIMGUI), Absent, None,
+      "options for the Insert mode completion info popup"),
+    o("completeslash", "csl", Skipped(PLATFORM), Absent, None,
+      "like 'shellslash' for completion"),
+    o("concealcursor", "cocu", NotImplemented, Absent, None,
+      "whether concealable text is hidden in cursor line — nice to have"),
+    o("conceallevel", "cole", NotImplemented, Absent, None,
+      "whether concealable text is shown or hidden — nice to have"),
+    o("confirm", "cf", NotImplemented, Absent, None,
+      "ask what to do about unsaved/read-only files — nice to have"),
+    o("conskey", "consk", Skipped(TERMCAP), Absent, None,
+      "get keys directly from console (MS-DOS only)"),
+    o("copyindent", "ci", NotImplemented, Absent, None,
+      "make 'autoindent' use existing indent structure — worth implementing"),
+    o("cpoptions", "cpo", Skipped(VICOMPAT), Absent, None,
+      "flags for Vi-compatible behavior"),
+    o("cryptmethod", "cm", NotImplemented, Absent, None,
+      "type of encryption to use for file writing — nice to have"),
+    o("cscopepathcomp", "cspc", Skipped(CSCOPE), Absent, None,
+      "how many components of the path to show"),
+    o("cscopeprg", "csprg", Skipped(CSCOPE), Absent, None,
+      "command to execute cscope"),
+    o("cscopequickfix", "csqf", Skipped(CSCOPE), Absent, None,
+      "use quickfix window for cscope results"),
+    o("cscoperelative", "csre", Skipped(CSCOPE), Absent, None,
+      "Use cscope.out path basename as prefix"),
+    o("cscopetag", "cst", Skipped(CSCOPE), Absent, None,
+      "use cscope for tag commands"),
+    o("cscopetagorder", "csto", Skipped(CSCOPE), Absent, None,
+      "determines \":cstag\" search order"),
+    o("cscopeverbose", "csverb", Skipped(CSCOPE), Absent, None,
+      "give messages when adding a cscope database"),
+    o("cursorbind", "crb", NotImplemented, Absent, None,
+      "move cursor in window as it moves in other windows — nice to have"),
+    o("cursorcolumn", "cuc", NotImplemented, Absent, None,
+      "highlight the screen column of the cursor — worth implementing"),
+    o("cursorline", "cul", Implemented, Full, Some(OptSetup("vim.o.cursorline=")),
+      "highlight the screen line of the cursor"),
+    o("cursorlineopt", "culopt", NotImplemented, Absent, None,
+      "settings for 'cursorline' — nice to have"),
+    o("debug", "", Skipped(ARCH), Absent, None,
+      "set to \"msg\" to see all error messages"),
+    o("define", "def", NotImplemented, Absent, None,
+      "pattern to be used to find a macro definition — nice to have"),
+    o("delcombine", "deco", Skipped(ENCODING), Absent, None,
+      "delete combining characters on their own"),
+    o("dictionary", "dict", NotImplemented, Absent, None,
+      "list of file names used for keyword completion — worth implementing"),
+    o("diff", "", NotImplemented, Absent, None,
+      "use diff mode for the current window — nice to have"),
+    o("diffexpr", "dex", Skipped(VIMSCRIPT), Absent, None,
+      "expression used to obtain a diff file"),
+    o("diffopt", "dip", NotImplemented, Absent, None,
+      "options for using diff mode — nice to have"),
+    o("digraph", "dg", NotImplemented, Absent, None,
+      "#1160 shipped <C-k> digraphs, so the table exists; this option only adds the char-<BS>-char entry form; worth implementing"),
+    o("directory", "dir", NotImplemented, Absent, None,
+      "list of directory names for the swap file — nice to have"),
+    o("display", "dy", NotImplemented, Absent, None,
+      "list of flags for how to display text — worth implementing"),
+    o("eadirection", "ead", NotImplemented, Absent, None,
+      "in which direction 'equalalways' works — low value"),
+    o("edcompatible", "ed", Skipped(VICOMPAT), Absent, None,
+      "toggle flags of \":substitute\" command"),
+    o("emoji", "emo", Skipped(ENCODING), Absent, None,
+      "emoji characters are considered full width"),
+    o("encoding", "enc", Skipped(ENCODING), Absent, None,
+      "encoding used internally"),
+    o("endoffile", "eof", NotImplemented, Absent, None,
+      "write CTRL-Z at end of the file — low value"),
+    o("endofline", "eol", NotImplemented, Absent, None,
+      "write <EOL> for last line in file — worth implementing"),
+    o("equalalways", "ea", NotImplemented, Absent, None,
+      "windows are automatically made the same size — nice to have"),
+    o("equalprg", "ep", NotImplemented, Absent, None,
+      "external program to use for \"=\" command — nice to have"),
+    o("errorbells", "eb", NotImplemented, Absent, None,
+      "ring the bell for error messages — nice to have"),
+    o("errorfile", "ef", Skipped(MAKE), Absent, None,
+      "name of the errorfile for the QuickFix mode"),
+    o("errorformat", "efm", Skipped(MAKE), Absent, None,
+      "description of the lines in the error file"),
+    o("esckeys", "ek", Skipped(TERMCAP), Absent, None,
+      "recognize function keys in Insert mode"),
+    o("eventignore", "ei", NotImplemented, Absent, None,
+      "autocommand events that are ignored — nice to have"),
+    o("expandtab", "et", Implemented, Full, Some(OptKeys(":set noet")),
+      "use spaces when <Tab> is inserted"),
+    o("exrc", "ex", Skipped(SCRIPTRT), Absent, None,
+      "read .vimrc and .exrc in the current directory"),
+    o("fileencoding", "fenc", Skipped(ENCODING), Absent, None,
+      "file encoding for multibyte text"),
+    o("fileencodings", "fencs", Skipped(ENCODING), Absent, None,
+      "automatically detected character encodings"),
+    o("fileformat", "ff", NotImplemented, Absent, None,
+      "file format used for file I/O — worth implementing"),
+    o("fileformats", "ffs", NotImplemented, Absent, None,
+      "automatically detected values for 'fileformat' — worth implementing"),
+    o("fileignorecase", "fic", NotImplemented, Absent, None,
+      "ignore case when using file names — nice to have"),
+    o("filetype", "ft", NotImplemented, Absent, None,
+      "type of file, used for autocommands — nice to have"),
+    o("fillchars", "fcs", NotImplemented, Absent, None,
+      "characters to use for displaying special items — nice to have"),
+    o("fixendofline", "fixeol", NotImplemented, Absent, None,
+      "make sure last line in file has <EOL> — worth implementing"),
+    o("fkmap", "fk", Skipped(OBSOLETE), Absent, None,
+      "obsolete option for Farsi"),
+    o("foldclose", "fcl", NotImplemented, Absent, None,
+      "close a fold when the cursor leaves it — worth implementing"),
+    o("foldcolumn", "fdc", NotImplemented, Absent, None,
+      "width of the column used to indicate folds — worth implementing"),
+    o("foldenable", "fen", NotImplemented, Absent, None,
+      "folds exist (foldmethod/foldlevel/foldmarker/foldnestmax); the remaining fold options are cheap follow-ons; worth implementing"),
+    o("foldexpr", "fde", Skipped(VIMSCRIPT), Absent, None,
+      "expression used when 'foldmethod' is \"expr\""),
+    o("foldignore", "fdi", NotImplemented, Absent, None,
+      "ignore lines when 'foldmethod' is \"indent\" — worth implementing"),
+    o("foldlevel", "fdl", Implemented, Full, Some(OptSetup("vim.o.foldlevel=")),
+      "close folds with a level higher than this"),
+    o("foldlevelstart", "fdls", NotImplemented, Absent, None,
+      "'foldlevel' when starting to edit a file — worth implementing"),
+    o("foldmarker", "fmr", Implemented, Full, Some(OptSetup("vim.o.foldmarker=")),
+      "markers used when 'foldmethod' is \"marker\""),
+    o("foldmethod", "fdm", Partial, Full, Some(OptSetup("vim.o.foldmethod=")),
+      "only manual/indent/marker; expr/syntax/diff are rejected"),
+    o("foldminlines", "fml", NotImplemented, Absent, None,
+      "minimum number of lines for a fold to be closed — worth implementing"),
+    o("foldnestmax", "fdn", Implemented, Full, Some(OptSetup("vim.o.foldnestmax=")),
+      "maximum fold depth"),
+    o("foldopen", "fdo", NotImplemented, Absent, None,
+      "for which commands a fold will be opened — worth implementing"),
+    o("foldtext", "fdt", Skipped(VIMSCRIPT), Absent, None,
+      "expression used to display for a closed fold"),
+    o("formatexpr", "fex", Skipped(VIMSCRIPT), Absent, None,
+      "expression used with \"gq\" command"),
+    o("formatlistpat", "flp", NotImplemented, Absent, None,
+      "pattern used to recognize a list header — nice to have"),
+    o("formatoptions", "fo", NotImplemented, Absent, None,
+      "gq/gw and auto-wrap are implemented but not configurable; worth implementing"),
+    o("formatprg", "fp", NotImplemented, Absent, None,
+      "name of external program used with \"gq\" command — nice to have"),
+    o("fsync", "fs", NotImplemented, Absent, None,
+      "whether to invoke fsync() after file write — nice to have"),
+    o("gdefault", "gd", Implemented, Full, Some(OptKeys(":set gdefault")),
+      "the \":substitute\" flag 'g' is default on"),
+    o("grepformat", "gfm", Skipped(MAKE), Absent, None,
+      "format of 'grepprg' output"),
+    o("grepprg", "gp", Skipped(MAKE), Absent, None,
+      "program to use for \":grep\""),
+    o("guicursor", "gcr", Skipped(VIMGUI), Absent, None,
+      "GUI: settings for cursor shape and blinking"),
+    o("guifont", "gfn", Skipped(VIMGUI), Absent, None,
+      "superseded by vimcode's own font_family/font_size settings"),
+    o("guifontset", "gfs", Skipped(VIMGUI), Absent, None,
+      "GUI: Names of multibyte fonts to be used"),
+    o("guifontwide", "gfw", Skipped(VIMGUI), Absent, None,
+      "list of font names for double-wide characters"),
+    o("guiheadroom", "ghr", Skipped(VIMGUI), Absent, None,
+      "GUI: pixels room for window decorations"),
+    o("guiligatures", "gli", Skipped(VIMGUI), Absent, None,
+      "GTK GUI: ASCII characters that can form shapes"),
+    o("guioptions", "go", Skipped(VIMGUI), Absent, None,
+      "GUI: Which components and options are used"),
+    o("guipty", "", Skipped(VIMGUI), Absent, None,
+      "GUI: try to use a pseudo-tty for \":!\" commands"),
+    o("guitablabel", "gtl", Skipped(VIMGUI), Absent, None,
+      "GUI: custom label for a tab page"),
+    o("guitabtooltip", "gtt", Skipped(VIMGUI), Absent, None,
+      "GUI: custom tooltip for a tab page"),
+    o("helpfile", "hf", Skipped(SCRIPTRT), Absent, None,
+      "full path name of the main help file"),
+    o("helpheight", "hh", Skipped(SCRIPTRT), Absent, None,
+      "minimum height of a new help window"),
+    o("helplang", "hlg", Skipped(SCRIPTRT), Absent, None,
+      "preferred help languages"),
+    o("hidden", "hid", Implemented, Full, Some(OptSetup("vim.o.hidden=")),
+      "don't unload buffer when it is |abandon|ed"),
+    o("highlight", "hl", Skipped(VIMGUI), Absent, None,
+      "vimcode themes highlight groups through colorscheme JSON, not a flag string"),
+    o("history", "hi", NotImplemented, Absent, None,
+      "number of command-lines that are remembered — worth implementing"),
+    o("hkmap", "hk", Skipped(BIDI), Absent, None,
+      "Hebrew keyboard mapping"),
+    o("hkmapp", "hkp", Skipped(BIDI), Absent, None,
+      "phonetic Hebrew keyboard mapping"),
+    o("hlsearch", "hls", Implemented, Full, Some(OptSetup("vim.o.hlsearch=")),
+      "highlight matches with last search pattern"),
+    o("icon", "", NotImplemented, Absent, None,
+      "let Vim set the text of the window icon — low value"),
+    o("iconstring", "", Skipped(VIMSCRIPT), Absent, None,
+      "string to use for the Vim icon text"),
+    o("ignorecase", "ic", Implemented, Full, Some(OptKeys(":set ic")),
+      "ignore case in search patterns"),
+    o("imactivatefunc", "imaf", Skipped(BIDI), Absent, None,
+      "function to enable/disable the X input method"),
+    o("imactivatekey", "imak", Skipped(BIDI), Absent, None,
+      "key that activates the X input method"),
+    o("imcmdline", "imc", Skipped(BIDI), Absent, None,
+      "use IM when starting to edit a command line"),
+    o("imdisable", "imd", Skipped(BIDI), Absent, None,
+      "do not use the IM in any mode"),
+    o("iminsert", "imi", Skipped(BIDI), Absent, None,
+      "use :lmap or IM in Insert mode"),
+    o("imsearch", "ims", Skipped(BIDI), Absent, None,
+      "use :lmap or IM when typing a search pattern"),
+    o("imstatusfunc", "imsf", Skipped(BIDI), Absent, None,
+      "function to obtain X input method status"),
+    o("imstyle", "imst", Skipped(BIDI), Absent, None,
+      "specifies the input style of the input method"),
+    o("include", "inc", NotImplemented, Absent, None,
+      "pattern to be used to find an include file — nice to have"),
+    o("includeexpr", "inex", Skipped(VIMSCRIPT), Absent, None,
+      "expression used to process an include line"),
+    o("incsearch", "is", Implemented, Full, Some(OptSetup("vim.o.incsearch=")),
+      "highlight match while typing search pattern"),
+    o("indentexpr", "inde", Skipped(VIMSCRIPT), Absent, None,
+      "expression used to obtain the indent of a line"),
+    o("indentkeys", "indk", NotImplemented, Absent, None,
+      "keys that trigger indenting with 'indentexpr' — nice to have"),
+    o("infercase", "inf", NotImplemented, Absent, None,
+      "adjust case of match for keyword completion — worth implementing"),
+    o("insertmode", "im", Skipped(VICOMPAT), Absent, None,
+      "start the edit of a file in Insert mode"),
+    o("isfname", "isf", NotImplemented, Absent, None,
+      "affects gf and file-name completion; worth implementing"),
+    o("isident", "isi", NotImplemented, Absent, None,
+      "companion to the implemented 'iskeyword'; worth implementing"),
+    o("iskeyword", "isk", Implemented, Full, Some(OptSetup("vim.o.iskeyword=")),
+      "characters included in keywords"),
+    o("isprint", "isp", NotImplemented, Absent, None,
+      "affects how unprintable chars render in both backends; worth implementing"),
+    o("joinspaces", "js", Implemented, Full, Some(OptSetup("vim.o.joinspaces=")),
+      "two spaces after a period with a join command"),
+    o("jumpoptions", "jop", NotImplemented, Absent, None,
+      "specifies how jumping is done — nice to have"),
+    o("key", "", NotImplemented, Absent, None,
+      "encryption key — nice to have"),
+    o("keymap", "kmp", Skipped(BIDI), Absent, None,
+      "name of a keyboard mapping"),
+    o("keymodel", "km", Skipped(SELECT), Absent, None,
+      "enable starting/stopping selection with keys"),
+    o("keyprotocol", "kpc", Skipped(TERMCAP), Absent, None,
+      "what keyboard protocol to use for what terminal"),
+    o("keywordprg", "kp", NotImplemented, Absent, None,
+      "program to use for the \"K\" command — nice to have"),
+    o("langmap", "lmap", Skipped(BIDI), Absent, None,
+      "alphabetic characters for other language mode"),
+    o("langmenu", "lm", Skipped(BIDI), Absent, None,
+      "language to be used for the menus"),
+    o("langnoremap", "lnr", Skipped(BIDI), Absent, None,
+      "do not apply 'langmap' to mapped characters"),
+    o("langremap", "lrm", Skipped(BIDI), Absent, None,
+      "do apply 'langmap' to mapped characters"),
+    o("laststatus", "ls", Partial, Full, Some(OptSetup("vim.o.laststatus=")),
+      "0/1/2 honoured; 3 (global statusline) falls back to per-window"),
+    o("lazyredraw", "lz", Skipped(ARCH), Absent, None,
+      "both backends redraw from a single frame-driven paint; nothing to defer"),
+    o("linebreak", "lbr", Implemented, Full, Some(OptSetup("vim.o.linebreak=")),
+      "wrap long lines at a blank"),
+    o("lines", "", NotImplemented, Absent, None,
+      "number of lines in the display — low value"),
+    o("linespace", "lsp", Skipped(VIMGUI), Absent, None,
+      "superseded by vimcode's own font_size/ui_font_size; note its Vim abbreviation 'lsp' is taken by vimcode's own :set lsp"),
+    o("lisp", "", NotImplemented, Absent, None,
+      "automatic indenting for Lisp — nice to have"),
+    o("lispoptions", "lop", NotImplemented, Absent, None,
+      "changes how Lisp indenting is done — nice to have"),
+    o("lispwords", "lw", NotImplemented, Absent, None,
+      "words that change how lisp indenting works — nice to have"),
+    o("list", "", Implemented, Full, Some(OptSetup("vim.o.list=")),
+      "show <Tab> and <EOL>"),
+    o("listchars", "lcs", Partial, Full, Some(OptSetup("vim.o.listchars=")),
+      "tab/trail/eol/space rendered; extends/precedes/nbsp/conceal are not"),
+    o("loadplugins", "lpl", Skipped(SCRIPTRT), Absent, None,
+      "load plugin scripts when starting up"),
+    o("luadll", "", Skipped(INTERP), Absent, None,
+      "name of the Lua dynamic library"),
+    o("macatsui", "", Skipped(VIMGUI), Absent, None,
+      "Mac GUI: use ATSUI text drawing"),
+    o("magic", "", Implemented, Full, Some(OptSetup("vim.o.magic=")),
+      "changes special characters in search patterns"),
+    o("makeef", "mef", Skipped(MAKE), Absent, None,
+      "name of the errorfile for \":make\""),
+    o("makeencoding", "menc", Skipped(ENCODING), Absent, None,
+      "encoding of external make/grep commands"),
+    o("makeprg", "mp", Skipped(MAKE), Absent, None,
+      "program to use for the \":make\" command"),
+    o("matchpairs", "mps", NotImplemented, Absent, None,
+      "`%` matching is hardcoded to ()[]{}; worth implementing"),
+    o("matchtime", "mat", NotImplemented, Absent, None,
+      "#1207 shipped 'showmatch' with a fixed flash duration; worth implementing"),
+    o("maxcombine", "mco", Skipped(ENCODING), Absent, None,
+      "maximum nr of combining characters displayed"),
+    o("maxfuncdepth", "mfd", Skipped(SCRIPTRT), Absent, None,
+      "maximum recursive depth for user functions"),
+    o("maxmapdepth", "mmd", NotImplemented, Absent, None,
+      "maximum recursive depth for mapping — nice to have"),
+    o("maxmem", "mm", Skipped(ARCH), Absent, None,
+      "maximum memory (in Kbyte) used for one buffer"),
+    o("maxmempattern", "mmp", Skipped(ARCH), Absent, None,
+      "maximum memory (in Kbyte) used for pattern search"),
+    o("maxmemtot", "mmt", Skipped(ARCH), Absent, None,
+      "maximum memory (in Kbyte) used for all buffers"),
+    o("menuitems", "mis", Skipped(VIMGUI), Absent, None,
+      "maximum number of items in a menu"),
+    o("mkspellmem", "msm", NotImplemented, Absent, None,
+      "memory used before |:mkspell| compresses the tree — nice to have"),
+    o("modeline", "ml", NotImplemented, Absent, None,
+      "recognize modelines at start or end of file — nice to have"),
+    o("modelineexpr", "mle", Skipped(VIMSCRIPT), Absent, None,
+      "allow setting expression options from a modeline"),
+    o("modelines", "mls", NotImplemented, Absent, None,
+      "number of lines checked for modelines — nice to have"),
+    o("modifiable", "ma", NotImplemented, Absent, None,
+      "changes to the text are not possible — worth implementing"),
+    o("modified", "mod", NotImplemented, Absent, None,
+      "buffer has been modified — worth implementing"),
+    o("more", "", Skipped(EXMODE), Absent, None,
+      "pause listings when the whole screen is filled"),
+    o("mouse", "", NotImplemented, Absent, None,
+      "enable the use of mouse clicks — nice to have"),
+    o("mousefocus", "mousef", NotImplemented, Absent, None,
+      "keyboard focus follows the mouse — nice to have"),
+    o("mousehide", "mh", Skipped(VIMGUI), Absent, None,
+      "hide mouse pointer while typing"),
+    o("mousemodel", "mousem", NotImplemented, Absent, None,
+      "changes meaning of mouse buttons — nice to have"),
+    o("mousemoveevent", "mousemev", NotImplemented, Absent, None,
+      "report mouse moves with <MouseMove> — nice to have"),
+    o("mouseshape", "mouses", Skipped(VIMGUI), Absent, None,
+      "shape of the mouse pointer in different modes"),
+    o("mousetime", "mouset", NotImplemented, Absent, None,
+      "max time between mouse double-click — nice to have"),
+    o("mzquantum", "mzq", Skipped(INTERP), Absent, None,
+      "the interval between polls for MzScheme threads"),
+    o("mzschemedll", "", Skipped(INTERP), Absent, None,
+      "name of the MzScheme dynamic library"),
+    o("mzschemegcdll", "", Skipped(INTERP), Absent, None,
+      "name of the MzScheme dynamic library for GC"),
+    o("nrformats", "nf", Partial, Full, Some(OptSetup("vim.o.nrformats=")),
+      "alpha/octal/hex/bin parsed; 'unsigned' is not honoured"),
+    o("number", "nu", Implemented, Full, Some(OptSetup("vim.o.number=")),
+      "print the line number in front of each line"),
+    o("numberwidth", "nuw", NotImplemented, Absent, None,
+      "number of columns used for the line number — worth implementing"),
+    o("omnifunc", "ofu", Skipped(VIMSCRIPT), Absent, None,
+      "function for filetype-specific completion"),
+    o("opendevice", "odev", Skipped(PLATFORM), Absent, None,
+      "allow reading/writing devices on MS-Windows"),
+    o("operatorfunc", "opfunc", Skipped(VIMSCRIPT), Absent, None,
+      "g@ is implemented; the function is registered from Lua (vimcode.set_operatorfunc), not from :set"),
+    o("osfiletype", "oft", Skipped(OBSOLETE), Absent, None,
+      "no longer supported"),
+    o("packpath", "pp", Skipped(SCRIPTRT), Absent, None,
+      "list of directories used for packages"),
+    o("paragraphs", "para", NotImplemented, Absent, None,
+      "affects the { } paragraph motions; worth implementing"),
+    o("paste", "", Skipped(VICOMPAT), Absent, None,
+      "bracketed paste is handled by the backend; Vim itself deprecates this option"),
+    o("pastetoggle", "pt", Skipped(VICOMPAT), Absent, None,
+      "key code that causes 'paste' to toggle"),
+    o("patchexpr", "pex", Skipped(VIMSCRIPT), Absent, None,
+      "expression used to patch a file"),
+    o("patchmode", "pm", NotImplemented, Absent, None,
+      "keep the oldest version of a file — nice to have"),
+    o("path", "pa", NotImplemented, Absent, None,
+      "list of directories searched with \"gf\" et.al. — nice to have"),
+    o("perldll", "", Skipped(INTERP), Absent, None,
+      "name of the Perl dynamic library"),
+    o("preserveindent", "pi", NotImplemented, Absent, None,
+      "preserve the indent structure when reindenting — worth implementing"),
+    o("previewheight", "pvh", NotImplemented, Absent, None,
+      "height of the preview window — nice to have"),
+    o("previewpopup", "pvp", Skipped(VIMGUI), Absent, None,
+      "use popup window for preview"),
+    o("previewwindow", "pvw", NotImplemented, Absent, None,
+      "identifies the preview window — nice to have"),
+    o("printdevice", "pdev", Skipped(PRINTING), Absent, None,
+      "name of the printer to be used for :hardcopy"),
+    o("printencoding", "penc", Skipped(PRINTING), Absent, None,
+      "encoding to be used for printing"),
+    o("printexpr", "pexpr", Skipped(PRINTING), Absent, None,
+      "expression used to print PostScript for :hardcopy"),
+    o("printfont", "pfn", Skipped(PRINTING), Absent, None,
+      "name of the font to be used for :hardcopy"),
+    o("printheader", "pheader", Skipped(PRINTING), Absent, None,
+      "format of the header used for :hardcopy"),
+    o("printmbcharset", "pmbcs", Skipped(PRINTING), Absent, None,
+      "CJK character set to be used for :hardcopy"),
+    o("printmbfont", "pmbfn", Skipped(PRINTING), Absent, None,
+      "font names to be used for CJK output of :hardcopy"),
+    o("printoptions", "popt", Skipped(PRINTING), Absent, None,
+      "controls the format of :hardcopy output"),
+    o("prompt", "prompt", Skipped(EXMODE), Absent, None,
+      "enable prompt in Ex mode"),
+    o("pumheight", "ph", NotImplemented, Absent, None,
+      "maximum height of the popup menu — nice to have"),
+    o("pumwidth", "pw", NotImplemented, Absent, None,
+      "minimum width of the popup menu — nice to have"),
+    o("pythondll", "", Skipped(INTERP), Absent, None,
+      "name of the Python 2 dynamic library"),
+    o("pythonhome", "", Skipped(INTERP), Absent, None,
+      "name of the Python 2 home directory"),
+    o("pythonthreedll", "", Skipped(INTERP), Absent, None,
+      "name of the Python 3 dynamic library"),
+    o("pythonthreehome", "", Skipped(INTERP), Absent, None,
+      "name of the Python 3 home directory"),
+    o("pyxversion", "pyx", Skipped(INTERP), Absent, None,
+      "Python version used for pyx* commands"),
+    o("quickfixtextfunc", "qftf", Skipped(VIMSCRIPT), Absent, None,
+      "function for the text in the quickfix window"),
+    o("quoteescape", "qe", NotImplemented, Absent, None,
+      "affects the i\"/a\" text objects; worth implementing"),
+    o("readonly", "ro", NotImplemented, Absent, None,
+      "disallow writing the buffer — worth implementing"),
+    o("redrawtime", "rdt", NotImplemented, Absent, None,
+      "timeout for 'hlsearch' and |:match| highlighting — nice to have"),
+    o("regexpengine", "re", NotImplemented, Absent, None,
+      "default regexp engine to use — nice to have"),
+    o("relativenumber", "rnu", Implemented, Full, Some(OptSetup("vim.o.relativenumber=")),
+      "show relative line number in front of each line"),
+    o("remap", "", NotImplemented, Absent, None,
+      "allow mappings to work recursively — nice to have"),
+    o("renderoptions", "rop", Skipped(VIMGUI), Absent, None,
+      "options for text rendering on Windows"),
+    o("report", "", NotImplemented, Absent, None,
+      "threshold for reporting nr. of lines changed — worth implementing"),
+    o("restorescreen", "rs", Skipped(TERMCAP), Absent, None,
+      "Win32: restore screen when exiting"),
+    o("revins", "ri", Skipped(BIDI), Absent, None,
+      "inserting characters will work backwards"),
+    o("rightleft", "rl", Skipped(BIDI), Absent, None,
+      "window is right-to-left oriented"),
+    o("rightleftcmd", "rlc", Skipped(BIDI), Absent, None,
+      "commands for which editing works right-to-left"),
+    o("rubydll", "", Skipped(INTERP), Absent, None,
+      "name of the Ruby dynamic library"),
+    o("ruler", "ru", Implemented, Full, Some(OptSetup("vim.o.ruler=")),
+      "show cursor line and column in the status line"),
+    o("rulerformat", "ruf", Skipped(VIMSCRIPT), Absent, None,
+      "custom format for the ruler"),
+    o("runtimepath", "rtp", Skipped(SCRIPTRT), Absent, None,
+      "list of directories used for runtime files"),
+    o("scroll", "scr", NotImplemented, Absent, None,
+      "lines to scroll with CTRL-U and CTRL-D — worth implementing"),
+    o("scrollbind", "scb", NotImplemented, Absent, None,
+      "scroll in window as other windows scroll — nice to have"),
+    o("scrollfocus", "scf", NotImplemented, Absent, None,
+      "scroll wheel applies to window under pointer — low value"),
+    o("scrolljump", "sj", Implemented, Full, Some(OptSetup("vim.o.scrolljump=")),
+      "minimum number of lines to scroll"),
+    o("scrolloff", "so", Implemented, Full, Some(OptKeys(":set so=")),
+      "minimum nr. of lines above and below cursor"),
+    o("scrollopt", "sbo", NotImplemented, Absent, None,
+      "how 'scrollbind' should behave — nice to have"),
+    o("sections", "sect", NotImplemented, Absent, None,
+      "affects the [[ ]] section motions; worth implementing"),
+    o("secure", "", Skipped(SCRIPTRT), Absent, None,
+      "secure mode for reading .vimrc in current dir"),
+    o("selection", "sel", NotImplemented, Absent, None,
+      "inclusive/exclusive changes every Visual-mode operator's end column; worth implementing"),
+    o("selectmode", "slm", Skipped(SELECT), Absent, None,
+      "when to use Select mode instead of Visual mode"),
+    o("sessionoptions", "ssop", Skipped(SESSION), Absent, None,
+      "options for |:mksession|"),
+    o("shell", "sh", NotImplemented, Absent, None,
+      "`:!cmd` and range filters already shell out via a hardcoded shell — honouring :set shell would finish the feature; worth implementing"),
+    o("shellcmdflag", "shcf", NotImplemented, Absent, None,
+      "companion to 'shell' for `:!` and range filters; worth implementing"),
+    o("shellpipe", "sp", NotImplemented, Absent, None,
+      "string to put output of \":make\" in error file — nice to have"),
+    o("shellquote", "shq", NotImplemented, Absent, None,
+      "quote character(s) for around shell command — nice to have"),
+    o("shellredir", "srr", NotImplemented, Absent, None,
+      "string to put output of filter in a temp file — nice to have"),
+    o("shellslash", "ssl", Skipped(PLATFORM), Absent, None,
+      "use forward slash for shell file names"),
+    o("shelltemp", "stmp", NotImplemented, Absent, None,
+      "whether to use a temp file for shell commands — nice to have"),
+    o("shelltype", "st", Skipped(OBSOLETE), Absent, None,
+      "Amiga: influences how to use a shell"),
+    o("shellxescape", "sxe", Skipped(PLATFORM), Absent, None,
+      "characters to escape when 'shellxquote' is ("),
+    o("shellxquote", "sxq", Skipped(PLATFORM), Absent, None,
+      "like 'shellquote', but include redirection"),
+    o("shiftround", "sr", Implemented, Full, Some(OptKeys("et sr")),
+      "round indent to multiple of shiftwidth"),
+    o("shiftwidth", "sw", Implemented, Full, Some(OptKeys(":set sw=")),
+      "number of spaces to use for (auto)indent step"),
+    o("shortmess", "shm", NotImplemented, Absent, None,
+      "list of flags, reduce length of messages — nice to have"),
+    o("shortname", "sn", Skipped(OBSOLETE), Absent, None,
+      "Filenames assumed to be 8.3 chars"),
+    o("showbreak", "sbr", NotImplemented, Absent, None,
+      "string to use at the start of wrapped lines — nice to have"),
+    o("showcmd", "sc", Implemented, Full, Some(OptSetup("vim.o.showcmd=")),
+      "show (partial) command somewhere"),
+    o("showcmdloc", "sloc", NotImplemented, Absent, None,
+      "where to show (partial) command — nice to have"),
+    o("showfulltag", "sft", NotImplemented, Absent, None,
+      "show full tag pattern when completing tag — nice to have"),
+    o("showmatch", "sm", Implemented, Full, Some(OptSetup("vim.o.showmatch=")),
+      "briefly jump to matching bracket if insert one"),
+    o("showmode", "smd", NotImplemented, Absent, None,
+      "message on status line to show current mode — worth implementing"),
+    o("showtabline", "stal", NotImplemented, Absent, None,
+      "tells when the tab pages line is displayed — worth implementing"),
+    o("sidescroll", "ss", NotImplemented, Absent, None,
+      "minimum number of columns to scroll horizontal — worth implementing"),
+    o("sidescrolloff", "siso", Implemented, Full, Some(OptSetup("vim.o.sidescrolloff=")),
+      "min. nr. of columns to left and right of cursor"),
+    o("signcolumn", "scl", NotImplemented, Absent, None,
+      "when to display the sign column — nice to have"),
+    o("smartcase", "scs", Implemented, Full, Some(OptKeys(":set ic scs")),
+      "no ignore case when pattern has uppercase"),
+    o("smartindent", "si", Implemented, Full, Some(OptSetup("vim.o.smartindent=")),
+      "smart autoindenting for C programs"),
+    o("smarttab", "sta", Implemented, Full, Some(OptSetup("vim.o.smarttab=")),
+      "use 'shiftwidth' when inserting <Tab>"),
+    o("smoothscroll", "sms", NotImplemented, Absent, None,
+      "scroll by screen lines when 'wrap' is set — nice to have"),
+    o("softtabstop", "sts", Implemented, Full, Some(OptKeys("sts=2")),
+      "number of spaces that <Tab> uses while editing"),
+    o("spell", "", Implemented, Full, Some(OptSetup("vim.o.spell=")),
+      "enable spell checking"),
+    o("spellcapcheck", "spc", NotImplemented, Absent, None,
+      "pattern to locate end of a sentence — nice to have"),
+    o("spellfile", "spf", NotImplemented, Absent, None,
+      "files where |zg| and |zw| store words — nice to have"),
+    o("spelllang", "spl", Partial, QueryOnly, Some(OptSetup("vim.o.spelllang=")),
+      "queryable (:set spelllang?) but NOT settable — :set spelllang=de answers \"Unknown option\"; the 'spl' abbreviation is unknown in both directions"),
+    o("spelloptions", "spo", NotImplemented, Absent, None,
+      "options for spell checking — nice to have"),
+    o("spellsuggest", "sps", NotImplemented, Absent, None,
+      "method(s) used to suggest spelling corrections — nice to have"),
+    o("splitbelow", "sb", Implemented, Full, Some(OptSetup("vim.o.splitbelow=")),
+      "new window from split is below the current one"),
+    o("splitkeep", "spk", NotImplemented, Absent, None,
+      "determines scroll behavior for split windows — nice to have"),
+    o("splitright", "spr", Implemented, Full, Some(OptSetup("vim.o.splitright=")),
+      "new window is put right of the current one"),
+    o("startofline", "sol", Implemented, Full, Some(OptSetup("vim.o.startofline=")),
+      "commands move cursor to first non-blank in line"),
+    o("statusline", "stl", Skipped(VIMSCRIPT), Absent, None,
+      "custom format for the status line"),
+    o("suffixes", "su", NotImplemented, Absent, None,
+      "suffixes that are ignored with multiple match — nice to have"),
+    o("suffixesadd", "sua", NotImplemented, Absent, None,
+      "suffixes added when searching for a file — nice to have"),
+    o("swapfile", "swf", Partial, Full, Some(OptSetup("vim.o.swapfile=")),
+      "full name works; Vim's 'swf' abbreviation is not accepted"),
+    o("swapsync", "sws", Skipped(OBSOLETE), Absent, None,
+      "how to sync the swap file"),
+    o("switchbuf", "swb", NotImplemented, Absent, None,
+      "sets behavior when switching to another buffer — nice to have"),
+    o("synmaxcol", "smc", NotImplemented, Absent, None,
+      "maximum column to find syntax items — worth implementing"),
+    o("syntax", "syn", NotImplemented, Absent, None,
+      "syntax to be loaded for current buffer — nice to have"),
+    o("tabline", "tal", Skipped(VIMSCRIPT), Absent, None,
+      "custom format for the console tab pages line"),
+    o("tabpagemax", "tpm", NotImplemented, Absent, None,
+      "maximum number of tab pages for |-p| and \"tab all\" — nice to have"),
+    o("tabstop", "ts", Implemented, Full, Some(OptKeys(":set ts=")),
+      "number of spaces that <Tab> in file uses"),
+    o("tagbsearch", "tbs", NotImplemented, Absent, None,
+      "use binary searching in tags files — nice to have"),
+    o("tagcase", "tc", NotImplemented, Absent, None,
+      "how to handle case when searching in tags files — nice to have"),
+    o("tagfunc", "tfu", Skipped(VIMSCRIPT), Absent, None,
+      "function to get list of tag matches"),
+    o("taglength", "tl", NotImplemented, Absent, None,
+      "number of significant characters for a tag — nice to have"),
+    o("tagrelative", "tr", NotImplemented, Absent, None,
+      "file names in tag file are relative — nice to have"),
+    o("tags", "tag", NotImplemented, Absent, None,
+      "list of file names used by the tag command — nice to have"),
+    o("tagstack", "tgst", NotImplemented, Absent, None,
+      "push tags onto the tag stack — nice to have"),
+    o("tcldll", "", Skipped(INTERP), Absent, None,
+      "name of the Tcl dynamic library"),
+    o("term", "", Skipped(TERMCAP), Absent, None,
+      "name of the terminal"),
+    o("termbidi", "tbidi", Skipped(BIDI), Absent, None,
+      "terminal takes care of bi-directionality"),
+    o("termencoding", "tenc", Skipped(ENCODING), Absent, None,
+      "character encoding used by the terminal"),
+    o("termguicolors", "tgc", NotImplemented, Absent, None,
+      "use GUI colors for the terminal — nice to have"),
+    o("termwinkey", "twk", Skipped(TERMCAP), Absent, None,
+      "key that precedes a Vim command in a terminal"),
+    o("termwinscroll", "twsl", Skipped(TERMCAP), Absent, None,
+      "max number of scrollback lines in a terminal window"),
+    o("termwinsize", "tws", Skipped(TERMCAP), Absent, None,
+      "size of a terminal window"),
+    o("termwintype", "twt", Skipped(TERMCAP), Absent, None,
+      "MS-Windows: type of pty to use for terminal window"),
+    o("terse", "", Skipped(VICOMPAT), Absent, None,
+      "shorten some messages"),
+    o("textauto", "ta", Skipped(OBSOLETE), Absent, None,
+      "obsolete, use 'fileformats'"),
+    o("textmode", "tx", Skipped(OBSOLETE), Absent, None,
+      "obsolete, use 'fileformat'"),
+    o("textwidth", "tw", Implemented, Full, Some(OptKeys(":set tw=")),
+      "maximum width of text that is being inserted"),
+    o("thesaurus", "tsr", NotImplemented, Absent, None,
+      "list of thesaurus files for keyword completion — nice to have"),
+    o("thesaurusfunc", "tsrfu", Skipped(VIMSCRIPT), Absent, None,
+      "function to be used for thesaurus completion"),
+    o("tildeop", "top", NotImplemented, Absent, None,
+      "makes `~` an operator; small, self-contained and conformance-visible; worth implementing"),
+    o("timeout", "to", NotImplemented, Absent, None,
+      "time out on mappings and key codes — nice to have"),
+    o("timeoutlen", "tm", Implemented, Full, Some(OptSetup("vim.o.timeoutlen=")),
+      "time out time in milliseconds"),
+    o("title", "", NotImplemented, Absent, None,
+      "let Vim set the title of the window — nice to have"),
+    o("titlelen", "", NotImplemented, Absent, None,
+      "percentage of 'columns' used for window title — nice to have"),
+    o("titleold", "", NotImplemented, Absent, None,
+      "old title, restored when exiting — nice to have"),
+    o("titlestring", "", Skipped(VIMSCRIPT), Absent, None,
+      "string to use for the Vim window title"),
+    o("toolbar", "tb", Skipped(VIMGUI), Absent, None,
+      "GUI: which items to show in the toolbar"),
+    o("toolbariconsize", "tbis", Skipped(VIMGUI), Absent, None,
+      "size of the toolbar icons (for GTK 2 only)"),
+    o("ttimeout", "", Skipped(ARCH), Absent, None,
+      "vimcode never reads termcap, so there are no key codes to time out on"),
+    o("ttimeoutlen", "ttm", Skipped(ARCH), Absent, None,
+      "vimcode never reads termcap, so there are no key codes to time out on"),
+    o("ttybuiltin", "tbi", Skipped(TERMCAP), Absent, None,
+      "use built-in termcap before external termcap"),
+    o("ttyfast", "tf", Skipped(TERMCAP), Absent, None,
+      "indicates a fast terminal connection"),
+    o("ttymouse", "ttym", Skipped(TERMCAP), Absent, None,
+      "type of mouse codes generated"),
+    o("ttyscroll", "tsl", Skipped(TERMCAP), Absent, None,
+      "maximum number of lines for a scroll"),
+    o("ttytype", "tty", Skipped(TERMCAP), Absent, None,
+      "alias for 'term'"),
+    o("undodir", "udir", NotImplemented, Absent, None,
+      "where to store undo files — nice to have"),
+    o("undofile", "udf", NotImplemented, Absent, None,
+      "save undo information in a file — nice to have"),
+    o("undolevels", "ul", NotImplemented, Absent, None,
+      "vimcode's undo stack is unbounded; worth implementing"),
+    o("undoreload", "ur", NotImplemented, Absent, None,
+      "max nr of lines to save for undo on a buffer reload — nice to have"),
+    o("updatecount", "uc", NotImplemented, Absent, None,
+      "after this many characters flush swap file — nice to have"),
+    o("updatetime", "ut", Implemented, Full, Some(OptSetup("vim.o.updatetime=")),
+      "after this many milliseconds flush swap file"),
+    o("varsofttabstop", "vsts", NotImplemented, Absent, None,
+      "a list of number of spaces when typing <Tab> — worth implementing"),
+    o("vartabstop", "vts", NotImplemented, Absent, None,
+      "a list of number of spaces for <Tab>s — worth implementing"),
+    o("verbose", "vbs", Skipped(ARCH), Absent, None,
+      "give informative messages"),
+    o("verbosefile", "vfile", Skipped(ARCH), Absent, None,
+      "file to write messages in"),
+    o("viewdir", "vdir", Skipped(SESSION), Absent, None,
+      "directory where to store files with :mkview"),
+    o("viewoptions", "vop", Skipped(SESSION), Absent, None,
+      "specifies what to save for :mkview"),
+    o("viminfo", "vi", NotImplemented, Absent, None,
+      "use .viminfo file upon startup and exiting — nice to have"),
+    o("viminfofile", "vif", NotImplemented, Absent, None,
+      "file name used for the viminfo file — nice to have"),
+    o("virtualedit", "ve", Partial, Full, Some(OptKeys(":set ve=all")),
+      "block/insert/all/onemore parsed; 'none' clearing and per-mode semantics are only partly wired"),
+    o("visualbell", "vb", NotImplemented, Absent, None,
+      "use visual bell instead of beeping — nice to have"),
+    o("warn", "", Skipped(VICOMPAT), Absent, None,
+      "warn for shell command when buffer was changed"),
+    o("weirdinvert", "wiv", Skipped(TERMCAP), Absent, None,
+      "for terminals that have weird inversion method"),
+    o("whichwrap", "ww", Implemented, Full, Some(OptSetup("vim.o.whichwrap=")),
+      "allow specified keys to cross line boundaries"),
+    o("wildchar", "wc", NotImplemented, Absent, None,
+      "command-line character for wildcard expansion — nice to have"),
+    o("wildcharm", "wcm", NotImplemented, Absent, None,
+      "like 'wildchar' but also works when mapped — nice to have"),
+    o("wildignore", "wig", NotImplemented, Absent, None,
+      "files matching these patterns are not completed — nice to have"),
+    o("wildignorecase", "wic", NotImplemented, Absent, None,
+      "ignore case when completing file names — nice to have"),
+    o("wildmenu", "wmnu", Partial, Full, Some(OptSetup("vim.o.wildmenu=")),
+      "accepted as a no-op — vimcode's wildmenu is unconditional, so :set nowildmenu does not turn it off"),
+    o("wildmode", "wim", Implemented, Full, Some(OptSetup("vim.o.wildmode=")),
+      "mode for 'wildchar' command-line expansion"),
+    o("wildoptions", "wop", NotImplemented, Absent, None,
+      "specifies how command line completion is done — nice to have"),
+    o("winaltkeys", "wak", Skipped(VIMGUI), Absent, None,
+      "when the windows system handles ALT keys"),
+    o("wincolor", "wcr", Skipped(VIMGUI), Absent, None,
+      "window-local highlighting"),
+    o("window", "wi", NotImplemented, Absent, None,
+      "nr of lines to scroll for CTRL-F and CTRL-B — nice to have"),
+    o("winfixheight", "wfh", NotImplemented, Absent, None,
+      "keep window height when opening/closing windows — nice to have"),
+    o("winfixwidth", "wfw", NotImplemented, Absent, None,
+      "keep window width when opening/closing windows — nice to have"),
+    o("winheight", "wh", NotImplemented, Absent, None,
+      "minimum number of lines for the current window — nice to have"),
+    o("winminheight", "wmh", NotImplemented, Absent, None,
+      "minimum number of lines for any window — nice to have"),
+    o("winminwidth", "wmw", NotImplemented, Absent, None,
+      "minimal number of columns for any window — nice to have"),
+    o("winptydll", "", Skipped(INTERP), Absent, None,
+      "name of the winpty dynamic library"),
+    o("winwidth", "wiw", NotImplemented, Absent, None,
+      "minimal number of columns for current window — nice to have"),
+    o("wrap", "", Implemented, Full, Some(OptSetup("vim.o.wrap=")),
+      "long lines wrap and continue on the next line"),
+    o("wrapmargin", "wm", NotImplemented, Absent, None,
+      "chars from the right where wrapping starts — worth implementing"),
+    o("wrapscan", "ws", Implemented, Full, Some(OptKeys(":set nowrapscan")),
+      "searches wrap around the end of the file"),
+    o("write", "", NotImplemented, Absent, None,
+      "writing to a file is allowed — nice to have"),
+    o("writeany", "wa", NotImplemented, Absent, None,
+      "write to file with no need for \"!\" override — nice to have"),
+    o("writebackup", "wb", NotImplemented, Absent, None,
+      "make a backup before overwriting a file — nice to have"),
+    o("writedelay", "wd", Skipped(ARCH), Absent, None,
+      "delay this many msec for each char (for debug)"),
+    o("xtermcodes", "", Skipped(TERMCAP), Absent, None,
+      "request terminal codes from an xterm"),
+];
+
+// ---------------------------------------------------------------------------
+// OPTION_COVERAGE_EXEMPT — this list may only ever SHRINK.
+//
+// The Implemented/Partial options the oracle corpus never pins. Seeded from a
+// measured run (`CONFORMANCE_DUMP_OPTION_COVERAGE=…`), not by hand, so the
+// number is the real one rather than an impression:
+//
+//     **25 of the 54 options vimcode implements have no oracle case**
+//     (29 are pinned, 54%).
+//
+// Writing the cases that delete these entries is #1162's job; the entry is
+// deleted by the case, never by an editor's judgement, because gate 2 fails
+// the moment a listed option's probe starts matching.
+// ---------------------------------------------------------------------------
+const OPTION_COVERAGE_EXEMPT: &[&str] = &[
+    // Display/gutter options: nothing in the corpus renders a screen, so no
+    // case can pin one until #1162 adds render-comparing cases.
+    "colorcolumn",
+    "cursorline",
+    "laststatus",
+    "linebreak",
+    "list",
+    "listchars",
+    "number",
+    "relativenumber",
+    "ruler",
+    "showcmd",
+    "wrap",
+    // Search-highlight and incremental-search state: the corpus compares
+    // buffer text and cursor position, never highlight extents.
+    "hlsearch",
+    "incsearch",
+    // Scroll geometry beyond 'scrolloff' — the window-tracking cases pin
+    // 'scrolloff' only.
+    "scrolljump",
+    "sidescrolloff",
+    // Window/buffer and session-level behaviour, with no single-buffer
+    // keystroke that exposes it.
+    "autoread",
+    "splitbelow",
+    "splitright",
+    "swapfile",
+    "timeoutlen",
+    "updatetime",
+    // Command-line completion: no case types <Tab> on a `:` line.
+    "wildmenu",
+    "wildmode",
+    // Spelling: `src/core/spell.rs` is implemented but the corpus has no
+    // spell case at all — the same hole COVERAGE_EXEMPT records for z=/zg/zw.
+    "spell",
+    "spelllang",
+];
+
+/// Options whose **abbreviation** does not have the same surface as their full
+/// name. Every entry is a finding, not a convenience: gate 1 otherwise
+/// requires `:set sw=4` and `:set shiftwidth=4` to behave identically, which
+/// is what Vim guarantees and what every other row satisfies.
+const ABBREV_SURFACE_EXCEPTIONS: &[(&str, Surface, &str)] = &[
+    (
+        "spelllang",
+        Absent,
+        "'spl' is unknown in both directions, while the full name answers \
+         `:set spelllang?`",
+    ),
+    (
+        "swapfile",
+        Absent,
+        "'swf' is unknown, while `:set swapfile` / `:set noswapfile` work",
+    ),
+    (
+        "linespace",
+        Full,
+        "vimcode's own `:set lsp` (its LSP toggle) has taken Vim's abbreviation for \
+         'linespace' — the same collision the registry deliberately avoided for \
+         'nrformats'/'nf' vs nerdfonts",
+    ),
+];
+
+// ---------------------------------------------------------------------------
+// The audit's gates
+// ---------------------------------------------------------------------------
+
+/// Drive `Settings::parse_set_option` and report what surface `name` has.
+/// Deliberately behavioural: it asks the same public entry point `:set` asks,
+/// so nothing here can drift from what a user types.
+fn measured_surface(name: &str) -> Surface {
+    let try_set = |arg: String| Settings::default().parse_set_option(&arg);
+    const NOT_IMPL: &str = "recognised but not implemented";
+
+    let mut queryable = false;
+    let mut settable = false;
+    let mut stub = false;
+    let mut current: Option<String> = None;
+
+    match try_set(format!("{name}?")) {
+        Ok(v) => {
+            queryable = true;
+            if let Some((_, val)) = v.split_once('=') {
+                current = Some(val.to_string());
+            }
+        }
+        Err(e) if e.contains(NOT_IMPL) => stub = true,
+        Err(_) => {}
+    }
+
+    // Boolean and numeric forms both, plus a round-trip of the queried value
+    // so a value option is probed with something it actually accepts.
+    let mut probes = vec![name.to_string(), format!("no{name}"), format!("{name}=1")];
+    if let Some(c) = &current {
+        probes.push(format!("{name}={c}"));
+    }
+    for p in probes {
+        match try_set(p) {
+            Ok(_) => settable = true,
+            Err(e) if e.contains(NOT_IMPL) => stub = true,
+            Err(e) if e.starts_with("Unknown option") => {}
+            // Any other rejection ("Invalid value for …") means the *name* is
+            // in the registry — only the probe value was wrong.
+            Err(_) => settable = true,
+        }
+    }
+
+    match (stub, queryable, settable) {
+        (true, _, _) => Surface::Stub,
+        (_, true, true) => Surface::Full,
+        (_, false, true) => Surface::SetOnly,
+        (_, true, false) => Surface::QueryOnly,
+        (_, false, false) => Surface::Absent,
+    }
+}
+
+/// Every row whose recorded `surface` disagrees with what `:set` does now.
+/// Split out of the test so [`option_audit_gates_are_bidirectional`] can feed
+/// it a deliberately mis-tagged table and observe the gate go red — a gate
+/// nobody has seen fail is not a gate (#553).
+fn surface_drift(audit: &[OptionAudit], exceptions: &[(&str, Surface, &str)]) -> Vec<String> {
+    let mut drift: Vec<String> = Vec::new();
+    for e in audit {
+        let measured = measured_surface(e.name);
+        if measured != e.surface {
+            drift.push(format!(
+                "  '{}': table says {:?}, `:set` actually gives {:?}",
+                e.name, e.surface, measured
+            ));
+        }
+        if e.short.is_empty() {
+            continue;
+        }
+        let expected_short = exceptions
+            .iter()
+            .find(|(n, _, _)| *n == e.name)
+            .map(|(_, s, _)| *s)
+            .unwrap_or(e.surface);
+        let measured_short = measured_surface(e.short);
+        if measured_short != expected_short {
+            drift.push(format!(
+                "  '{}' abbreviation '{}': expected {:?}, `:set` gives {:?}",
+                e.name, e.short, expected_short, measured_short
+            ));
+        }
+    }
+    drift
+}
+
+/// Gate 1 (#1225) — the table's `surface` column is a claim about live code,
+/// and this re-measures every one of the 421 rows against it. Pure: no `nvim`,
+/// no subprocess, so it runs on every lane.
+#[test]
+fn option_audit_matches_the_live_settings_registry() {
+    let drift = surface_drift(OPTION_AUDIT, ABBREV_SURFACE_EXCEPTIONS);
+    assert!(
+        drift.is_empty(),
+        "\n\n== :set option audit drifted from src/core/settings.rs (#1225) ==\n\
+         The audit table records the surface `:set` exposed when the slice ran. \n\
+         Implementing (or breaking) an option changes that surface, so re-tag the\n\
+         row — that is how the audit stays true instead of rotting like a\n\
+         markdown checklist.\n\n{}\n\n\
+         An option that gained an implementation also needs its status changed\n\
+         from NotImplemented, a probe naming the case that covers it, and an\n\
+         OPTION_COVERAGE_EXEMPT entry if no case does yet.\n",
+        drift.join("\n")
+    );
+}
+
+/// Gate 1b (#1225) — the table describes itself correctly: complete, ordered,
+/// unique, no unreviewed row, every ⏭️ carrying a reason from the fixed
+/// vocabulary, and a probe on exactly the rows that can have one.
+#[test]
+fn option_audit_is_internally_consistent() {
+    use std::collections::HashSet;
+    let mut problems: Vec<String> = Vec::new();
+
+    assert_eq!(
+        OPTION_AUDIT.len(),
+        421,
+        "Vim 9.1's `:help option-list` has 421 entries; the audit must tag all of them"
+    );
+
+    let mut seen: HashSet<&str> = HashSet::new();
+    let mut prev = "";
+    for e in OPTION_AUDIT {
+        if !seen.insert(e.name) {
+            problems.push(format!("  '{}': listed twice", e.name));
+        }
+        if e.name <= prev {
+            problems.push(format!(
+                "  '{}': out of order (follows '{prev}'); the table is in `:help` order",
+                e.name
+            ));
+        }
+        prev = e.name;
+
+        if e.note.trim().is_empty() {
+            problems.push(format!(
+                "  '{}': empty note — every row is reviewed",
+                e.name
+            ));
+        }
+
+        match e.status {
+            OptStatus::Skipped(reason) => {
+                if !SKIP_REASONS.contains(&reason) {
+                    problems.push(format!(
+                        "  '{}': skip reason {reason:?} is not in SKIP_REASONS",
+                        e.name
+                    ));
+                }
+                if !matches!(e.surface, Surface::Absent) {
+                    problems.push(format!(
+                        "  '{}': skipped, but `:set` recognises it ({:?}) — it is at least \
+                         Partial",
+                        e.name, e.surface
+                    ));
+                }
+            }
+            OptStatus::Implemented => {
+                if !matches!(e.surface, Surface::Full) {
+                    problems.push(format!(
+                        "  '{}': Implemented, but its surface is {:?} — that is Partial",
+                        e.name, e.surface
+                    ));
+                }
+            }
+            OptStatus::Partial => {
+                if matches!(e.surface, Surface::Absent | Surface::Stub) {
+                    problems.push(format!(
+                        "  '{}': Partial, but `:set` does not implement it ({:?})",
+                        e.name, e.surface
+                    ));
+                }
+            }
+            OptStatus::NotImplemented => {
+                if !matches!(e.surface, Surface::Absent | Surface::Stub) {
+                    problems.push(format!(
+                        "  '{}': NotImplemented, but `:set` implements it ({:?})",
+                        e.name, e.surface
+                    ));
+                }
+            }
+        }
+
+        let wants_probe = matches!(e.status, OptStatus::Implemented | OptStatus::Partial);
+        if wants_probe && e.probe.is_none() {
+            problems.push(format!(
+                "  '{}': in scope for the oracle gate but has no probe",
+                e.name
+            ));
+        }
+        if !wants_probe && e.probe.is_some() {
+            problems.push(format!(
+                "  '{}': not in scope for the oracle gate, so its probe can never fire",
+                e.name
+            ));
+        }
+    }
+
+    for (name, _, _) in ABBREV_SURFACE_EXCEPTIONS {
+        if !OPTION_AUDIT.iter().any(|e| e.name == *name) {
+            problems.push(format!(
+                "  ABBREV_SURFACE_EXCEPTIONS names '{name}', which is not an audited option"
+            ));
+        }
+    }
+
+    assert!(
+        problems.is_empty(),
+        "\n\n== :set option audit table is inconsistent (#1225) ==\n{}\n",
+        problems.join("\n")
+    );
+}
+
+/// Every corpus case as `(label, keys, setup)`. [`all_corpus_cases`] drops the
+/// `setup`, which is precisely where an option case pins its option.
+fn all_corpus_cases_with_setup() -> Vec<(&'static str, &'static str, &'static str)> {
+    let mut out: Vec<(&str, &str, &str)> = CATEGORIES
+        .iter()
+        .flat_map(|(_, g)| g.iter())
+        .map(|c| (c.label, c.keys, c.setup))
+        .collect();
+    // The multi-file cases carry no `setup` (they pin files, not options), so
+    // they contribute an empty one rather than being dropped: a `Keys` probe
+    // must still be able to see their key sequences.
+    out.extend(CASES_MULTI_JUMP.iter().map(|c| (c.label, c.keys, "")));
+    out.extend(CASES_MULTI_JUMPS_LIST.iter().map(|c| (c.label, c.keys, "")));
+    out
+}
+
+impl OptProbe {
+    fn matches(&self, keys: &str, setup_no_ws: &str) -> bool {
+        match self {
+            OptProbe::OptSetup(n) => setup_no_ws.contains(n),
+            OptProbe::OptKeys(n) => keys.contains(n),
+        }
+    }
+}
+
+/// The option gate's verdict, in the two directions [`COVERAGE_EXEMPT`]
+/// established: coverage lost, and coverage gained but not yet claimed.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct OptionCoverage {
+    /// In scope, not exempt, probe matches nothing — coverage went backwards.
+    uncovered: Vec<&'static str>,
+    /// Exempt, but a case now pins it — delete the entry.
+    newly_covered: Vec<&'static str>,
+    /// Exempt but not an in-scope audited option — stale.
+    stale: Vec<&'static str>,
+    /// In-scope rows considered (Implemented/Partial).
+    in_scope: usize,
+}
+
+/// `cases` is `(keys, setup-with-whitespace-stripped)` for the whole corpus.
+fn classify_option_coverage(
+    audit: &'static [OptionAudit],
+    exempt: &[&'static str],
+    cases: &[(&str, String)],
+) -> OptionCoverage {
+    use std::collections::HashSet;
+    let exempt_set: HashSet<&str> = exempt.iter().copied().collect();
+    let mut v = OptionCoverage::default();
+    for e in audit {
+        let Some(probe) = e.probe else { continue };
+        v.in_scope += 1;
+        let covered = cases.iter().any(|(keys, setup)| probe.matches(keys, setup));
+        match (covered, exempt_set.contains(e.name)) {
+            (false, false) => v.uncovered.push(e.name),
+            (true, true) => v.newly_covered.push(e.name),
+            _ => {}
+        }
+    }
+    v.stale = exempt
+        .iter()
+        .copied()
+        .filter(|n| !audit.iter().any(|e| e.name == *n && e.probe.is_some()))
+        .collect();
+    v
+}
+
+/// The corpus as [`classify_option_coverage`] wants it: keys verbatim, and the
+/// `setup` with **all whitespace removed** so one needle matches both
+/// `vim.o.magic = false` and `vim.o.smarttab=false`.
+fn option_probe_corpus() -> Vec<(&'static str, String)> {
+    all_corpus_cases_with_setup()
+        .into_iter()
+        .map(|(_, keys, setup)| (keys, setup.chars().filter(|c| !c.is_whitespace()).collect()))
+        .collect()
+}
+
+/// Gate 2 (#1225) — the #1007 ratchet's shape, applied to the audited options:
+/// an in-scope option whose probe matches nothing must be exempt, and an
+/// exempt option whose probe now matches must lose its entry. Pure.
+#[test]
+fn option_audit_oracle_coverage_is_shrink_only() {
+    use std::collections::HashSet;
+    let corpus = option_probe_corpus();
+    let exempt: HashSet<&str> = OPTION_COVERAGE_EXEMPT.iter().copied().collect();
+    assert_eq!(
+        exempt.len(),
+        OPTION_COVERAGE_EXEMPT.len(),
+        "OPTION_COVERAGE_EXEMPT lists an option twice"
+    );
+
+    let v = classify_option_coverage(OPTION_AUDIT, OPTION_COVERAGE_EXEMPT, &corpus);
+
+    if let Ok(path) = std::env::var("CONFORMANCE_DUMP_OPTION_COVERAGE") {
+        let mut s = String::new();
+        for n in &v.uncovered {
+            s.push_str(&format!("UNCOVERED\t{n}\n"));
+        }
+        for n in &v.newly_covered {
+            s.push_str(&format!("NEWLY_COVERED\t{n}\n"));
+        }
+        for n in &v.stale {
+            s.push_str(&format!("STALE\t{n}\n"));
+        }
+        std::fs::write(&path, s).unwrap_or_else(|e| panic!("dump to {path}: {e}"));
+        return;
+    }
+
+    let covered = v.in_scope - OPTION_COVERAGE_EXEMPT.len();
+    println!(
+        "\n== :set option oracle coverage (#1225) ==\n\
+         {covered}/{} implemented options are pinned by an oracle case; {} exempt.\n",
+        v.in_scope,
+        OPTION_COVERAGE_EXEMPT.len()
+    );
+
+    assert!(
+        v.uncovered.is_empty() && v.newly_covered.is_empty() && v.stale.is_empty(),
+        "\n\n== :set option oracle coverage moved (#1225) ==\n\
+         UNCOVERED (probe matches no case — add the case, or exempt it only when \
+         seeding a newly-tagged option):\n  {:?}\n\
+         NEWLY COVERED (a case now pins it — delete the OPTION_COVERAGE_EXEMPT \
+         entry; that is how the list shrinks):\n  {:?}\n\
+         STALE (exempt but not an in-scope audited option):\n  {:?}\n",
+        v.uncovered,
+        v.newly_covered,
+        v.stale
+    );
+}
+
+/// Both gates, observed **failing** — on synthetic input for the shapes a
+/// human would otherwise have to take on trust, and on the **real** table and
+/// corpus for the two that matter most. #553 shipped black-box tests that
+/// stayed green with the bug reinstated; an audit whose gate cannot go red is
+/// the same mistake in table form.
+#[test]
+fn option_audit_gates_are_bidirectional() {
+    // ── Gate 1, direction A: a row that under-claims. 'tabstop' is fully
+    // implemented, so tagging it Absent must be caught.
+    static MIS_ABSENT: &[OptionAudit] = &[o(
+        "tabstop",
+        "ts",
+        NotImplemented,
+        Absent,
+        None,
+        "deliberately mis-tagged fixture",
+    )];
+    let drift = surface_drift(MIS_ABSENT, &[]);
+    assert_eq!(
+        drift.len(),
+        2,
+        "mis-tagging an implemented option must be caught for both the name and \
+         the abbreviation: {drift:?}"
+    );
+
+    // ── Gate 1, direction B: a row that over-claims. 'mouse' is not in the
+    // registry at all, so tagging it Full must be caught. This is the
+    // direction that fires when a NotImplemented row gains an implementation.
+    static MIS_FULL: &[OptionAudit] = &[o(
+        "mouse",
+        "",
+        Implemented,
+        Full,
+        Some(OptKeys(":set mouse=")),
+        "deliberately mis-tagged fixture",
+    )];
+    assert_eq!(
+        surface_drift(MIS_FULL, &[]).len(),
+        1,
+        "claiming an absent option is implemented must be caught"
+    );
+
+    // ── Gate 1, direction C: the abbreviation half. Dropping the recorded
+    // exception for 'swapfile' (whose 'swf' abbreviation is missing) must
+    // fail, which is what stops the three asymmetry findings from being
+    // quietly "fixed" by deleting their exception rows.
+    let without_exceptions = surface_drift(OPTION_AUDIT, &[]);
+    assert_eq!(
+        without_exceptions.len(),
+        ABBREV_SURFACE_EXCEPTIONS.len(),
+        "each ABBREV_SURFACE_EXCEPTIONS row must be load-bearing: {without_exceptions:?}"
+    );
+
+    // ── Gate 2, direction A (synthetic): an in-scope option nothing pins,
+    // and nothing exempts.
+    static UNPINNED: &[OptionAudit] = &[o(
+        "tabstop",
+        "ts",
+        Implemented,
+        Full,
+        Some(OptSetup("vim.o.tabstop=")),
+        "fixture",
+    )];
+    let empty: Vec<(&str, String)> = Vec::new();
+    assert_eq!(
+        classify_option_coverage(UNPINNED, &[], &empty).uncovered,
+        vec!["tabstop"]
+    );
+    // …and exempting it makes the same table clean.
+    assert!(classify_option_coverage(UNPINNED, &["tabstop"], &empty)
+        .uncovered
+        .is_empty());
+
+    // ── Gate 2, direction B (synthetic): an exempt option a case now pins.
+    let pinned = vec![("", "vim.o.tabstop=4".to_string())];
+    assert_eq!(
+        classify_option_coverage(UNPINNED, &["tabstop"], &pinned).newly_covered,
+        vec!["tabstop"]
+    );
+
+    // ── Gate 2, direction C (synthetic): a stale exemption.
+    assert_eq!(
+        classify_option_coverage(UNPINNED, &["tabstop", "wrapmargin"], &pinned).stale,
+        vec!["wrapmargin"]
+    );
+
+    // ── Gate 2 against the REAL table and corpus, the check #1007 makes for
+    // COVERAGE_EXEMPT: deleting an exempt entry must fail, and adding a case
+    // that pins an exempt option must fail. Anything less and the list could
+    // grow silently.
+    let corpus = option_probe_corpus();
+    let victim = "listchars";
+    assert!(
+        OPTION_COVERAGE_EXEMPT.contains(&victim),
+        "fixture drifted — {victim} is no longer exempt"
+    );
+    let without: Vec<&str> = OPTION_COVERAGE_EXEMPT
+        .iter()
+        .copied()
+        .filter(|n| *n != victim)
+        .collect();
+    assert_eq!(
+        classify_option_coverage(OPTION_AUDIT, &without, &corpus).uncovered,
+        vec![victim],
+        "deleting {victim:?} from OPTION_COVERAGE_EXEMPT must fail the gate"
+    );
+    let mut plus = corpus.clone();
+    plus.push(("", "vim.o.listchars='eol:$'".to_string()));
+    assert_eq!(
+        classify_option_coverage(OPTION_AUDIT, OPTION_COVERAGE_EXEMPT, &plus).newly_covered,
+        vec![victim],
+        "a case pinning {victim:?} must force its exemption to be deleted"
+    );
+}
