@@ -903,6 +903,18 @@ pub(crate) struct App {
     /// where it could neither paint nor *clear its own click-routing cache*
     /// once the sidebar collapsed.
     pub(crate) composed_bottom_band: Rc<RefCell<Vec<render::BottomOp>>>,
+    /// Per-group tab-bar `available_cols`, as this frame's `TabBars` rung
+    /// actually painted them — the GTK twin of `TuiShellApp::tab_visible_counts`
+    /// (#1165). `paint_tab_bars`'s doc used to say "TUI reads
+    /// `hits.available_cols` for `set_tab_visible_count`; GTK reads the full
+    /// `hits` for its pixel hit maps" as if that were a deliberate
+    /// backend-specific split — it wasn't: GTK simply never called
+    /// `Engine::post_draw_apply_widths` at all, so a tab scrolled out of view
+    /// by a resize/sidebar-toggle/new-tab could stay off-screen forever on
+    /// this backend, while TUI self-corrected within two frames. Populated by
+    /// `paint_tab_bars_rung`, drained by `handle_poll_tick`, mirroring TUI's
+    /// clear-at-paint/read-at-tick cadence exactly.
+    pub(crate) tab_visible_counts: Rc<RefCell<Vec<(core::window::GroupId, usize)>>>,
     /// Picker/command-palette popup rect **as the last frame
     /// actually painted it** — see [`App::compute_picker_popup_bounds`] for
     /// why the click path must not re-derive it (#555).
@@ -1685,6 +1697,7 @@ impl App {
             composed_frame: Rc::new(RefCell::new(Vec::new())),
             composed_editor_band: Rc::new(RefCell::new(Vec::new())),
             composed_bottom_band: Rc::new(RefCell::new(Vec::new())),
+            tab_visible_counts: Rc::new(RefCell::new(Vec::new())),
             picker_popup_rect: Rc::new(Cell::new(None)),
             folder_picker_popup_rect: Rc::new(Cell::new(None)),
             painted_sidebar_bounds: Rc::new(Cell::new(None)),
@@ -2842,6 +2855,22 @@ impl App {
             }
         }
 
+        // Re-check every group's active tab is on-screen against the widths
+        // this frame's `TabBars` rung actually painted (#1165) — mirrors
+        // `TuiShellApp::tick`'s identical drain of `tab_visible_counts`
+        // right after its own per-frame viewport sync. See
+        // `Self::tab_visible_counts`'s doc for why this was never wired on
+        // GTK: a tab scrolled out of view by a resize, sidebar toggle, or a
+        // new tab opening past the bar's width could stay off-screen forever
+        // on this backend, with nothing to bring it back until some other
+        // change happened to touch `tab_scroll_offset`.
+        {
+            let counts = self.tab_visible_counts.borrow().clone();
+            if !counts.is_empty() && self.engine.borrow_mut().post_draw_apply_widths(&counts) {
+                self.draw_needed.set(true);
+            }
+        }
+
         // Run all periodic background work (LSP, DAP, terminal, search, etc.)
         // poll_idle() consumes dap_wants_sidebar internally.
         let idle_dirty = self.engine.borrow_mut().poll_idle();
@@ -3919,6 +3948,11 @@ impl App {
         self.cached_tab_pixel_hits.borrow_mut().clear();
         self.cached_tab_close_abs.borrow_mut().clear();
         self.cached_tab_slots_abs.borrow_mut().clear();
+        // #1165: reset alongside the hit caches above — this frame's
+        // `TabBars` rung (if any) repopulates it, and `handle_poll_tick`
+        // wants this frame's measurements, not an accumulation across
+        // frames (mirrors TUI's `tab_visible_counts.borrow_mut().clear()`).
+        self.tab_visible_counts.borrow_mut().clear();
 
         let mut composed_editor: Vec<render::EditorOp> = Vec::new();
         for op in render::compose_editor_band(
@@ -4309,7 +4343,11 @@ impl App {
         let mut pixel_hits = self.cached_tab_pixel_hits.borrow_mut();
         let mut close_abs = self.cached_tab_close_abs.borrow_mut();
         let mut slots_abs = self.cached_tab_slots_abs.borrow_mut();
+        let mut visible_counts = self.tab_visible_counts.borrow_mut();
         for bar in painted {
+            // #1165: same `hits.available_cols` TUI reads for
+            // `set_tab_visible_count` — see `Self::tab_visible_counts`'s doc.
+            visible_counts.push((bar.group_id, bar.hits.available_cols));
             // Recover the exact pixel geometry the rasteriser just drew and
             // cache it (relative to the bar's left edge) for hit-testing.
             //
@@ -9096,6 +9134,76 @@ mod portable_entry_point_tests {
              if this fires, quadraui has changed and #1124's title-sync/\
              minimize path can likely now get real black-box coverage; see \
              this test's doc comment"
+        );
+    }
+
+    /// #1165: `App::handle_poll_tick` never drained `App::tab_visible_counts`
+    /// before this fix, so `Engine::post_draw_apply_widths` — the "single
+    /// contract every UI backend must call after each completed paint" per
+    /// its own doc comment — was never called on GTK at all. A tab scrolled
+    /// out of the visible tab bar by a resize, a sidebar toggle, or simply
+    /// opening enough tabs could stay off-screen forever on this backend,
+    /// with nothing left to bring it back until some unrelated change
+    /// happened to touch `tab_scroll_offset` (`goto_tab`/`close_tab`/etc.).
+    /// TUI already self-corrected within two frames via the identical
+    /// `tab_visible_counts` → `post_draw_apply_widths` drain in
+    /// `TuiShellApp::tick`.
+    ///
+    /// Follows `handle_poll_tick_reloads_settings_changed_on_disk`'s
+    /// established pattern of driving `App::handle_poll_tick` directly
+    /// against a real `App` + `Engine` (see that test's doc for why: as of
+    /// the pinned quadraui rev `GtkDriver` has no way to pump `tick()`
+    /// headlessly, so a genuine painted-pixel assertion needs quadraui-side
+    /// test infrastructure this repo doesn't have yet — a quadraui issue to
+    /// file, not a vimcode workaround, per `CLAUDE.md`'s Platform-Neutrality
+    /// Rule). What this test stands in for a real paint: `tab_visible_counts`
+    /// is normally populated by `paint_tab_bars_rung` from
+    /// `bar.hits.available_cols`, the exact geometry
+    /// `render::paint_tab_bars` (shared with TUI, already covered by its own
+    /// driver-tier tests) just painted — here it's pushed by hand to isolate
+    /// the wiring bug this issue is about from that already-tested paint
+    /// step.
+    ///
+    /// RED-verification: reverting this fix's `handle_poll_tick` block
+    /// (the `tab_visible_counts` drain calling `post_draw_apply_widths`)
+    /// while leaving the `tab_visible_counts` field itself in place turns
+    /// this red — `tab_scroll_offset` stays `0` and the assertion below
+    /// fails. Confirmed by hand before committing.
+    #[cfg(feature = "gui")]
+    #[test]
+    fn handle_poll_tick_scrolls_the_active_tab_back_into_view_on_gtk() {
+        let engine = Rc::new(RefCell::new(Engine::new()));
+        // Ten tabs, active tab is the last one opened (`new_tab` always
+        // activates the tab it just created).
+        for _ in 0..9 {
+            engine.borrow_mut().new_tab(None);
+        }
+        let group_id = engine.borrow().active_group;
+        assert_eq!(engine.borrow().active_group().active_tab, 9);
+        assert_eq!(
+            engine.borrow().active_group().tab_scroll_offset,
+            0,
+            "precondition: nothing has ever narrowed the bar, so the engine's \
+             own default offset must start at 0 or this test wouldn't show \
+             `handle_poll_tick` moving it"
+        );
+
+        let mut app = App::new_headless(Rc::clone(&engine));
+        let mut backend = quadraui::gtk::GtkBackend::new();
+
+        // Stand in for this frame's `TabBars` rung reporting a tab bar too
+        // narrow to fit all ten tabs starting from offset 0 — exactly what
+        // `paint_tab_bars_rung` would have pushed had a real frame painted
+        // first.
+        app.tab_visible_counts.borrow_mut().push((group_id, 20));
+
+        app.handle_poll_tick(&mut backend);
+
+        assert!(
+            engine.borrow().active_group().tab_scroll_offset > 0,
+            "handle_poll_tick did not apply this frame's painted tab-bar \
+             width -- the active tab (index 9) can stay scrolled out of \
+             view forever on GTK (#1165)"
         );
     }
 }

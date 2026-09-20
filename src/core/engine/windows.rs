@@ -2163,15 +2163,21 @@ impl Engine {
     /// after layout changes (window resize, sidebar toggle, new file open)
     /// and stay there until something else triggers a draw.
     ///
-    /// Where each backend calls it:
-    /// - **TUI** (`tui_main/mod.rs`): inline after `terminal.draw(...)`.
-    /// - **Win-GUI** (`win_gui/mod.rs`): inline after `EndDraw`.
-    /// - **GTK** (`gtk/mod.rs`): inside the `set_draw_func` closure after
-    ///   the immutable engine borrow is dropped. If the call returns true,
-    ///   schedule one more draw via `glib::idle_add_local_once(|| da.queue_draw())`
-    ///   — that's the GTK equivalent of TUI/Win-GUI re-running the paint
-    ///   loop, deferred by one idle tick because GTK's borrow rules don't
-    ///   allow a synchronous re-render from inside a draw callback.
+    /// Where each backend calls it (both post-#540 ShellApp migration —
+    /// `tui_main/mod.rs`'s pre-migration `event_loop`/`win_gui/mod.rs` this
+    /// doc used to cite are both gone):
+    /// - **TUI** (`TuiShellApp::tick`, `tui_main/shell_app.rs`): drains
+    ///   `tab_visible_counts`, populated by the same frame's `TabBars` rung
+    ///   in `render_content`. Setting `Reaction::Redraw` is the async
+    ///   twin of the "schedule one more draw" GTK does below — quadraui's
+    ///   TUI runner is a synchronous per-frame loop, so there is no separate
+    ///   idle handle to defer through.
+    /// - **GTK** (`App::handle_poll_tick`, `src/app.rs`): drains the GTK
+    ///   twin, `App::tab_visible_counts`, same cadence (#1165 — this call
+    ///   was missing entirely before, the exact gap this doc's own
+    ///   "skipping it after a draw is a bug" warns about). If the call
+    ///   returns true, `self.draw_needed.set(true)` schedules the next
+    ///   `tick_dispatch` to return `Reaction::Redraw`.
     ///
     /// The width/scroll change-tracking lets backends avoid an unconditional
     /// extra paint per frame; the feedback loop converges in ≤2 frames

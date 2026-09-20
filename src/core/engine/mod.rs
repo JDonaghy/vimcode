@@ -4787,6 +4787,17 @@ impl Engine {
     /// - `explorer_needs_refresh` — GTK calls `App::refresh_file_tree`
     /// - SC/explorer periodic auto-refresh — gated on sidebar visibility
     /// - Settings file auto-reload (#376)
+    /// - `post_draw_apply_widths` — paint-time, not idle-time; both backends
+    ///   call it once per tick anyway (see that method's own doc for exactly
+    ///   where — #1165 added the GTK call, which had been missing entirely)
+    /// - `tab_switcher_confirm`'s hold-to-cycle auto-confirm timer — both
+    ///   backends *call* it from `tick` (TUI has since #595, GTK does not —
+    ///   #1165 audit), but neither backend ever arms the deadline it checks
+    ///   (`tab_switcher_cycle`, the only writer, is `#[allow(dead_code)]` and
+    ///   unreachable from either key-dispatch path — #448-C follow-on). Not
+    ///   a tick asymmetry to converge: it is equally dead on both backends
+    ///   today, and wiring the real hold-to-cycle gesture is separate,
+    ///   pre-existing feature work, not part of this method's contract.
     pub fn poll_idle(&mut self) -> bool {
         let mut redraw = false;
         redraw |= self.process_pending_sidebar();
