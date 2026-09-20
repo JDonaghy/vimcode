@@ -1032,6 +1032,11 @@ fn apply_setup(settings: &mut Settings, setup: &str) -> Result<(), String> {
             }
             // #1190
             "hidden" | "hid" => settings.hidden = parse_lua_bool(name, value)?,
+            // #1207
+            "magic" => settings.magic = parse_lua_bool(name, value)?,
+            "smartindent" | "si" => settings.smartindent = parse_lua_bool(name, value)?,
+            "cindent" | "cin" => settings.cindent = parse_lua_bool(name, value)?,
+            "showmatch" | "sm" => settings.showmatch = parse_lua_bool(name, value)?,
             // #1206
             "whichwrap" | "ww" => settings.whichwrap = value.to_string(),
             "backspace" | "bs" => settings.backspace = value.to_string(),
@@ -6545,6 +6550,146 @@ const CASES_OPT: &[Case] = &[
     ),
 ];
 
+// ───────────────── G4. boolean options, tranche 2 (#1207) ─────────────────
+//
+// Oracle coverage for the buffer/cursor-observable half of #1207's tranche:
+// 'magic' (search/`:s` pattern semantics), 'smartindent' and 'cindent'
+// (newline/brace/hash indent behaviour). `-u NONE` (see `NvimRpc::spawn`)
+// means no filetype/indent plugins are loaded, so only 'smartindent'/
+// 'cindent' behaviour that is built into Vim core itself (brace-based
+// indent/outdent, '#' to column 0) is exercised here — not vimcode's own
+// `line_triggers_indent` language-aware extras (Python `:`, Lua/Ruby/Shell
+// `do`/`then`, ...), which are a vimcode-only enhancement layered on top of
+// real Vim's 'smartindent'/'autoindent' and have no oracle to check against.
+// ('showmatch' doesn't belong here — see `bool_opt:showmatch does not
+// disturb the buffer or final cursor position` below for why its own
+// resulting-state is not, in fact, oracle-observable.)
+const CASES_BOOLOPT: &[Case] = &[
+    // ── 'magic' ──────────────────────────────────────────────────────────
+    cs(
+        "bool_opt:magic search treats '.' as any-char wildcard",
+        &["xxx", "acb", "a.b"],
+        1,
+        1,
+        "/a.b<CR>",
+        "vim.o.magic = true",
+    ),
+    cs(
+        "bool_opt:nomagic search treats '.' as a literal dot",
+        &["xxx", "acb", "a.b"],
+        1,
+        1,
+        "/a.b<CR>",
+        "vim.o.magic = false",
+    ),
+    cs(
+        "bool_opt:magic :s treats '.' as any-char wildcard",
+        &["aXc"],
+        1,
+        1,
+        ":s/a.c/REPL/<CR>",
+        "vim.o.magic = true",
+    ),
+    cs(
+        "bool_opt:nomagic :s treats '.' as a literal dot, no match",
+        &["aXc"],
+        1,
+        1,
+        ":s/a.c/REPL/<CR>",
+        "vim.o.magic = false",
+    ),
+    cs(
+        "bool_opt:nomagic :s still substitutes an escaped \\.",
+        &["aXc"],
+        1,
+        1,
+        ":s/a\\.c/REPL/<CR>",
+        "vim.o.magic = false",
+    ),
+    // ── 'smartindent' (brace-after-newline only — see note below) ───────
+    //
+    // Real Vim's own `:h 'smartindent'` documents the "'}'/'#' as first
+    // char outdents/resets" behaviour too, but empirically (verified by
+    // hand against this exact oracle while writing these cases) it only
+    // fires when the current line's *entire* existing indent was itself
+    // produced by auto-indenting earlier in the very same Insert session
+    // (Vim's internal `did_ai` flag) — not when the leading whitespace was
+    // already sitting in the buffer before Insert was entered, which is
+    // what every case in this corpus's shared harness starts from (a fixed
+    // starting buffer, cursor placed by `nvim_win_set_cursor`, not typed).
+    // A same-session repro (`A<CR>}<Esc>` starting from a bare `{`-ending
+    // line, so the auto-indent and the `}` land in one Insert session) confirms
+    // this is a real Vim quirk, not a harness artifact: it produced the
+    // outdent nvim's side, and does not with a pre-existing indent. This
+    // repo's `smartindent` deliberately implements the *simpler*,
+    // unconditional form the issue (#1207) scoped — outdent/`#`-reset
+    // whenever the typed character is the first non-blank on the line,
+    // regardless of how the existing indent got there — so it does not
+    // chase Vim's `did_ai` gating. That divergence is covered by this
+    // repo's own engine-level tests (`src/core/engine/tests.rs`), not the
+    // oracle corpus here: `did_ai` isn't observable through this harness's
+    // `Case` shape without adding session-provenance tracking neither this
+    // issue nor a real user-facing gap calls for. `'cindent'`'s outdent/`#`
+    // rule has no such gating (see below — it fires unconditionally in
+    // both Vim and this repo), so only `'cindent'` gets oracle cases for
+    // those two rules.
+    cs(
+        "bool_opt:smartindent alone (no autoindent) indents after '{'",
+        &["if (x) {"],
+        1,
+        1,
+        "A<CR>y<Esc>",
+        "vim.o.autoindent = false\nvim.o.smartindent = true",
+    ),
+    // ── 'cindent' ─────────────────────────────────────────────────────────
+    cs(
+        "bool_opt:cindent alone (no autoindent) indents after '{'",
+        &["if (x) {"],
+        1,
+        1,
+        "A<CR>y<Esc>",
+        "vim.o.autoindent = false\nvim.o.cindent = true",
+    ),
+    cs(
+        "bool_opt:cindent alone outdents a lone closing brace",
+        &["if (x) {", "    "],
+        2,
+        5,
+        "A}<Esc>",
+        "vim.o.autoindent = false\nvim.o.cindent = true",
+    ),
+    cs(
+        "bool_opt:cindent alone moves a typed '#' to column 0",
+        &["    "],
+        1,
+        5,
+        "A#<Esc>",
+        "vim.o.autoindent = false\nvim.o.cindent = true",
+    ),
+    // ── 'showmatch' ───────────────────────────────────────────────────────
+    //
+    // 'showmatch' is a momentary *display* effect (`:h 'showmatch'`): Vim
+    // really does move the cursor to the matching bracket and back before
+    // the next redraw, gated on 'matchtime' — out of scope for #1207 (see
+    // the issue). Both here and in real Vim, once the dust settles the
+    // buffer and the *final* cursor position are unaffected by whether
+    // 'showmatch' was on at all — this repo's own `showmatch_flash` state
+    // (asserted directly in `src/core/engine/tests.rs`, not observable
+    // through this harness's `Case` shape) is what actually proves the
+    // flash happened; this case is a regression guard that turning
+    // 'showmatch' on doesn't accidentally leave the *real* cursor stuck at
+    // the match, which would show up here as a genuine buffer/cursor
+    // mismatch against Neovim.
+    cs(
+        "bool_opt:showmatch does not disturb the buffer or final cursor position",
+        &["(foo"],
+        1,
+        5,
+        "A)<Esc>",
+        "vim.o.showmatch = true",
+    ),
+];
+
 // ─────────────────── H. multi-file jumplist (#985) ───────────────────
 //
 // Cross-buffer/cross-tab/cross-split `<C-o>`/`<C-i>`, plus `:jumps` list
@@ -6698,6 +6843,7 @@ const CATEGORIES: &[(&str, &[Case])] = &[
     ("fold    folds (#1006)", CASES_FOLD),
     ("map     :map family (#1151)", CASES_MAP),
     ("opt     value options (#1206)", CASES_OPT),
+    ("bool_opt boolean options tranche 2 (#1207)", CASES_BOOLOPT),
 ];
 
 // ---------------------------------------------------------------------------
