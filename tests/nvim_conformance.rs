@@ -3904,7 +3904,7 @@ const CASES_EX: &[Case] = &[
     // bare `:cc` with no quickfix list leaves the buffer and cursor
     // completely untouched (it errors — `E42: No Errors` — before doing
     // anything), which is exactly what vimcode's new bare-`:cc` handler
-    // does too (`execute.rs`'s `cmd == "cc"` arm, `self.quickfix_items.is_empty()`
+    // does too (`execute.rs`'s `cmd == "cc"` arm, `self.quickfix.items.is_empty()`
     // branch). Before #1154, bare `:cc` fell through to the unknown-ex-command
     // fallback (`"Not an editor command: cc"`) instead of a real quickfix
     // error, but that fallback is likewise a buffer/cursor no-op — so this
@@ -7745,6 +7745,28 @@ const COMMAND_PROBES: &[CommandProbe] = &[
     p("ex::cn", Keys(":cn")),
     p("ex::cp", Keys(":cp")),
     p("ex::cc", Keys(":cc")),
+    // --- #1155: quickfix completion + the location-list family ---
+    p("ex::cfirst", Keys(":cfirst")),
+    p("ex::clast", Keys(":clast")),
+    p("ex::cwindow", Keys(":cwindow")),
+    p("ex::clist", Keys(":clist")),
+    p("ex::colder", Keys(":colder")),
+    p("ex::cnewer", Keys(":cnewer")),
+    p("ex::cdo", Keys(":cdo")),
+    p("ex::cfdo", Keys(":cfdo")),
+    p("ex::lopen", Keys(":lopen")),
+    p("ex::lclose", Keys(":lclose")),
+    p("ex::lwindow", Keys(":lwindow")),
+    p("ex::lnext", Keys(":lnext")),
+    p("ex::lprevious", Keys(":lprevious")),
+    p("ex::lfirst", Keys(":lfirst")),
+    p("ex::llast", Keys(":llast")),
+    p("ex::ll", Keys(":ll")),
+    p("ex::llist", Keys(":llist")),
+    p("ex::ldo", Keys(":ldo")),
+    p("ex::lfdo", Keys(":lfdo")),
+    p("ex::lgrep", Keys(":lgrep")),
+    p("ex::lvimgrep", Keys(":lvimgrep")),
     p("ex::cd {path}", Keys(":cd")),
     p("ex::colorscheme", Keys(":colorscheme")),
     // #1151
@@ -8023,6 +8045,30 @@ const COVERAGE_EXEMPT: &[&str] = &[
     "ex::cclose",
     "ex::cn",
     "ex::cp",
+    // --- #1155: quickfix completion + the location-list family — no oracle
+    // case exercises any of these yet, same gap as the rest of "Core Vim ex
+    // commands" above.
+    "ex::cfirst",
+    "ex::clast",
+    "ex::cwindow",
+    "ex::clist",
+    "ex::colder",
+    "ex::cnewer",
+    "ex::cdo",
+    "ex::cfdo",
+    "ex::lopen",
+    "ex::lclose",
+    "ex::lwindow",
+    "ex::lnext",
+    "ex::lprevious",
+    "ex::lfirst",
+    "ex::llast",
+    "ex::ll",
+    "ex::llist",
+    "ex::ldo",
+    "ex::lfdo",
+    "ex::lgrep",
+    "ex::lvimgrep",
     "ex::cd {path}",
     "ex::colorscheme",
     "ex::make",

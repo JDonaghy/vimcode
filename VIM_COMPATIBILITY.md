@@ -642,7 +642,14 @@ Operators `d`, `c`, `y`, `>`, `<`, `=`, `g~`, `gu`, `gU` all accept these motion
 | `:diffsplit` / `:diffthis` / `:diffoff` | Diff commands | ✅ | |
 | `:grep` / `:vimgrep` | Project search | ✅ | Quickfix integration |
 | `:copen` / `:cclose` | Quickfix open/close | ✅ | |
-| `:cn` / `:cp` / `:cc` | Quickfix navigation | ✅ | |
+| `:cn` / `:cp` / `:cc` / `:cfirst` / `:clast` | Quickfix navigation | ✅ | `:cc {N}` and bare `:cc` (#1154) |
+| `:cwindow` / `:clist` | Quickfix window-if-errors, and list entries | ✅ | `:cwindow` opens only when the list is non-empty, closes it otherwise (#1155) |
+| `:colder` / `:cnewer` | Walk the quickfix stack | ✅ | 10-deep history, matching Vim's default (#1155) |
+| `:cdo` / `:cfdo` | Run a command over every quickfix entry/file | ✅ | `:cdo` once per entry, `:cfdo` once per distinct file (#1155) |
+| `:lopen` / `:lclose` / `:lwindow` | Open/close the location-list window | ✅ | Per-window, mirrors `:copen`/`:cclose`/`:cwindow` (#1155) |
+| `:lnext` / `:lprevious` / `:lfirst` / `:llast` / `:ll` | Navigate the location list | ✅ | Mirrors `:cn`/`:cp`/`:cfirst`/`:clast`/`:cc` over the active window's list (#1155) |
+| `:llist` / `:ldo` / `:lfdo` | List / run a command over the location list | ✅ | Mirrors `:clist`/`:cdo`/`:cfdo` (#1155) |
+| `:lgrep` / `:lvimgrep` | Project search into the location list | ✅ | Mirrors `:grep`/`:vimgrep`, targets the active window's list instead of the global one (#1155) |
 | `:cd {path}` | Change directory | ✅ | |
 | `:colorscheme` | Change theme | ✅ | 4 built-in themes |
 | `:map` / `:nmap` / `:imap` | Key mappings — vim per-mode syntax, key-to-keys remap | ✅ | Also `:vmap` `:xmap` `:omap` `:cmap` `:smap`, the `:noremap` family (with a `maxmapdepth` recursion guard), `:unmap`/`:mapclear` (#1151) |
@@ -661,7 +668,9 @@ Operators `d`, `c`, `y`, `>`, `<`, `=`, `g~`, `gu`, `gU` all accept these motion
 | `:Sexplore` / `:Sex` | Horizontal split + netrw | ✅ | |
 | `:Vexplore` / `:Vex` | Vertical split + netrw | ✅ | |
 
-**Ex commands: 70/70 (100%)** (excluding N/A)
+**Ex commands: 91/91 (100%)** (excluding N/A) — was 70/70 before #1155 added
+`:cfirst`/`:clast`/`:cwindow`/`:clist`/`:colder`/`:cnewer`/`:cdo`/`:cfdo` plus
+the entire `:l*` location-list family (21 new command ids)
 
 ### VimCode-Specific Ex Commands
 
@@ -719,12 +728,7 @@ does not implement. Every row was verified absent against `origin/develop` @
 
 | Command | Description | Status | Notes |
 |---------|-------------|--------|-------|
-| `:lopen` / `:lclose` / `:lwindow` | Open/close the location-list window | ❌ | The location list does not exist at all — not a gap in one command but a missing parallel structure to quickfix (#1155) |
-| `:lnext` / `:lprevious` / `:lfirst` / `:llast` / `:ll` | Navigate the location list | ❌ | #1155 |
-| `:llist` / `:lolder` / `:lnewer` / `:ldo` | List / walk the location-list stack | ❌ | #1155 |
-| `:cwindow` / `:clist` | Quickfix window-if-errors, and list entries | ❌ | `:copen`/`:cclose`/`:cnext`/`:cprevious`/`:cc`/`:cfirst`/`:clast` **do** exist (#1154); these are the remainder (#1155) |
-| `:colder` / `:cnewer` | Walk the quickfix stack | ❌ | vimcode keeps one quickfix list, not a stack (#1155) |
-| `:cdo` / `:cfdo` | Run a command over every quickfix entry/file | ❌ | #1155 |
+| `:lolder` / `:lnewer` | Walk the location-list stack | ❌ | The per-window equivalent of `:colder`/`:cnewer` (#1155 shipped a global quickfix stack, `:lopen`/`:l*`/`:ll*`/`:ldo`/`:lfdo`/`:llist` and the location list itself, but not a per-window history stack) — follow-up |
 | `:earlier` / `:later` | Move through undo states by count or time | ❌ | Needs the undo tree — the timeline is linear today (#1156) |
 | `:fold` / `:foldopen` / `:foldclose` / `:foldtoggle` | Create and toggle folds from ex | ❌ | Folds exist, but only via `zf`/`zo`/`zc` with `foldmethod` of `manual`/`indent` (#1159) |
 | `:digraphs` | List/define digraphs | ❌ | No digraph table; insert-mode `<C-k>` is also absent (#1160) |
@@ -795,11 +799,22 @@ own footer said 30, and the truth is 38.
 ratchet performs (`parse_compatibility_doc` in `tests/nvim_conformance.rs`); a
 hand-maintained summary over a machine-parsed table will drift again otherwise.
 
+**Stale as of #1155** — this table's "Ex Commands" and "Not implemented" rows
+(and the grand "Total") predate #1155 moving 16 `❌` ids to `✅` (quickfix
+completion + the whole `:l*` location-list family), adding 5 more brand-new
+`✅` ids that had no prior row (`:cfirst`/`:clast`/`:lfdo`/`:lgrep`/
+`:lvimgrep`), and adding 2 new `❌` ids (`:lolder`/`:lnewer`). Per the note
+above, re-run the parse rather than
+hand-editing these numbers; not done here to avoid re-typing the exact drift
+this section warns about.
+
 ### Remaining missing commands
 
-**Not "none".** See the [Not implemented](#not-implemented) section above — 29
-in-scope commands, options and modes are enumerated there, every one verified
-absent against `30c0077`.
+**Not "none".** See the [Not implemented](#not-implemented) section above —
+13 in-scope commands, options and modes are enumerated there (was 29 before
+#1155), every one verified absent against `30c0077`, except the 2 new
+`:lolder`/`:lnewer` rows #1155 itself added (verified absent at this same
+SHA).
 
 This file previously ended with *"None — all in-scope Vim commands are
 implemented."* That sentence was true only relative to this document's own row

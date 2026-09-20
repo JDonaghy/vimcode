@@ -126,6 +126,9 @@ impl Engine {
         // Remove window from windows map and any scroll-bind pairs that referenced it.
         let closed_buf_id = self.windows.get(&window_id).map(|w| w.buffer_id);
         self.windows.remove(&window_id);
+        // #1155: CTRL-W window-close drops the window's location list — it
+        // has no meaning once the window it was scoped to is gone.
+        self.location_lists.remove(&window_id);
         self.prune_jump_list_windows(&[window_id]);
         self.scroll_bind_pairs
             .retain(|&(a, b)| a != window_id && b != window_id);
@@ -148,6 +151,7 @@ impl Engine {
                         }
                     }
                     self.windows.remove(&partner);
+                    self.location_lists.remove(&partner);
                     self.prune_jump_list_windows(&[partner]);
                     self.scroll_bind_pairs
                         .retain(|&(x, y)| x != partner && y != partner);
@@ -206,6 +210,7 @@ impl Engine {
         self.prune_jump_list_windows(&windows_to_close);
         for id in windows_to_close {
             self.windows.remove(&id);
+            self.location_lists.remove(&id);
             self.scroll_bind_pairs.retain(|&(a, b)| a != id && b != id);
             if let Some((a, b)) = self.diff_window_pair {
                 if a == id || b == id {
@@ -395,6 +400,7 @@ impl Engine {
         // Remove all windows in this tab
         for window_id in &window_ids {
             self.windows.remove(window_id);
+            self.location_lists.remove(window_id);
             self.scroll_bind_pairs
                 .retain(|&(a, b)| a != *window_id && b != *window_id);
             if let Some((a, b)) = self.diff_window_pair {
@@ -2557,6 +2563,35 @@ impl Engine {
     ///
     /// This is the correct handler for sidebar file clicks — it never replaces
     /// the current tab's contents.
+    /// Open `path` into a *specific* window, replacing its buffer in place —
+    /// unlike [`Engine::open_file_in_tab`], this never creates a new tab or
+    /// window. Used by location-list jumps (`qf_jump` in
+    /// `src/core/engine/picker.rs`), which must stay in the window that owns
+    /// the list rather than scattering each entry across new tabs the way
+    /// the window-agnostic global quickfix list does (#1155).
+    pub fn open_file_in_window(&mut self, window_id: WindowId, path: &Path) {
+        let buffer_id = match self.buffer_manager.open_file(path) {
+            Ok(id) => id,
+            Err(e) => {
+                self.message = format!("Error: {}", e);
+                return;
+            }
+        };
+        self.buffer_manager
+            .apply_language_map(buffer_id, &self.settings.language_map);
+        let view = self.restore_file_position(buffer_id);
+        if let Some(w) = self.windows.get_mut(&window_id) {
+            w.buffer_id = buffer_id;
+            w.view = view;
+        }
+        self.refresh_git_diff(buffer_id);
+        if self.dialog.is_none() {
+            self.message = format!("\"{}\"", path.display());
+        }
+        self.lsp_did_open(buffer_id);
+        self.explorer_reveal_path(path);
+    }
+
     pub fn open_file_in_tab(&mut self, path: &Path) {
         // Clear per-buffer virtual text annotations when switching files.
         self.line_annotations.clear();

@@ -25,6 +25,26 @@ pub struct ProjectMatch {
     pub line_text: String,
 }
 
+/// A quickfix-shaped list of matches plus its own navigation/UI state.
+///
+/// Vim keeps exactly this shape twice: once globally (`:c*`, the quickfix
+/// list) and once per window (`:l*`, the location list). Modelling it as one
+/// struct — rather than four flat fields duplicated per binding — is what
+/// lets `Engine`'s `qf_*` methods (`src/core/engine/picker.rs`) implement
+/// open/close/navigate/jump exactly once and have both `:c*` and `:l*` call
+/// through the same code with a different target (#1155).
+#[derive(Debug, Clone, Default)]
+pub struct QuickfixList {
+    /// The list's entries, in order.
+    pub items: Vec<ProjectMatch>,
+    /// Currently selected entry (0-based).
+    pub selected: usize,
+    /// Whether the list's panel is visible.
+    pub open: bool,
+    /// Whether the panel currently has keyboard focus.
+    pub has_focus: bool,
+}
+
 /// Search-mode toggles (mirrors VS Code's Aa / Ab| / .* buttons).
 #[derive(Debug, Clone, Default)]
 pub struct SearchOptions {

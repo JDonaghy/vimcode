@@ -29,6 +29,7 @@ use crate::core::engine::sidebar::{
 use crate::core::engine::{AlignedDiffEntry, DiffLine, Engine, PanelChromeDesc, SearchDirection};
 pub use crate::core::engine::{BottomPanelKind, DebugSidebarSection};
 use crate::core::lsp::SignatureHelpData;
+use crate::core::project_search::QuickfixList;
 use crate::core::settings::LineNumberMode;
 use crate::core::view::View;
 use crate::core::window::{GroupDivider, GroupId, SplitDirection, WindowDivider};
@@ -4426,14 +4427,26 @@ pub fn post_key_epilogue(
         engine.explorer_rebuild_rows();
     }
 
-    // Keep the selected quickfix entry inside the six-row window.
+    // Keep the selected entry inside the six-row window — the active
+    // window's location list shares this same scroll state when it (rather
+    // than the global quickfix list) is the one occupying the bottom "list
+    // rung" (#1155).
     if let Some(scroll_top) = quickfix_scroll_top {
-        if engine.quickfix_open {
+        let selected = if engine.quickfix.open {
+            Some(engine.quickfix.selected)
+        } else {
+            engine
+                .location_lists
+                .get(&engine.active_window_id())
+                .filter(|l| l.open)
+                .map(|l| l.selected)
+        };
+        if let Some(selected) = selected {
             const QF_VISIBLE: usize = 5; // 6 rows − 1 header
-            if engine.quickfix_selected < *scroll_top {
-                *scroll_top = engine.quickfix_selected;
-            } else if engine.quickfix_selected >= *scroll_top + QF_VISIBLE {
-                *scroll_top = engine.quickfix_selected + 1 - QF_VISIBLE;
+            if selected < *scroll_top {
+                *scroll_top = selected;
+            } else if selected >= *scroll_top + QF_VISIBLE {
+                *scroll_top = selected + 1 - QF_VISIBLE;
             }
         } else {
             *scroll_top = 0;
@@ -6411,8 +6424,8 @@ pub fn apply_scroll_offset(
 //
 //  1. **The quickfix band height had three different rules in one binary.**
 //     The painter reserves rows only for a quickfix that has something in it
-//     (`compute_editor_layout`: `quickfix_open && !quickfix_items.is_empty()`),
-//     but TUI's mouse handler asked `if engine.quickfix_open { 6 }` in **four**
+//     (`compute_editor_layout`: `quickfix.open && !quickfix.items.is_empty()`),
+//     but TUI's mouse handler asked `if engine.quickfix.open { 6 }` in **four**
 //     separate places. `:copen` on an empty list therefore moved every band
 //     *below* the editor — the terminal strip, the separated status line, the
 //     terminal-resize clamp — six rows away from where they were painted, so
@@ -6452,15 +6465,22 @@ pub fn apply_scroll_offset(
 // the same numbers, rather than re-deriving them from `bottom_panel_geometry`
 // by hand the way both backends historically did with everything else.
 
-/// Rows the quickfix panel occupies, as the **painter** reserves them.
+/// Rows the quickfix/location-list panel occupies, as the **painter**
+/// reserves them.
 ///
 /// The single source of truth for "how tall is the quickfix band" on the
 /// mouse-routing side, matching `compute_editor_layout`'s `quickfix_rows`
-/// exactly — including the `!quickfix_items.is_empty()` term that TUI's four
-/// hand-rolled `if engine.quickfix_open { 6 }` copies all omitted (see this
-/// section's banner, point 1).
+/// exactly — including the `!quickfix.items.is_empty()` term that TUI's four
+/// hand-rolled `if engine.quickfix.open { 6 }` copies all omitted (see this
+/// section's banner, point 1), and, since #1155, also the active window's
+/// location list — the two share one bottom "list rung"
+/// ([`QuickfixPanel::title`]).
 pub fn quickfix_panel_rows(engine: &Engine) -> u16 {
-    if engine.quickfix_open && !engine.quickfix_items.is_empty() {
+    let loc_open = engine
+        .location_lists
+        .get(&engine.active_window_id())
+        .is_some_and(|l| l.open && !l.items.is_empty());
+    if (engine.quickfix.open && !engine.quickfix.items.is_empty()) || loc_open {
         6
     } else {
         0
@@ -7558,7 +7578,7 @@ pub fn compose_bottom_band(
         .iter()
         .copied()
         .filter(|op| match op {
-            // Already `None` unless `quickfix_open && !quickfix_items
+            // Already `None` unless `quickfix.open && !quickfix.items
             // .is_empty()` (`build_screen_layout`), the same rule
             // `quickfix_panel_rows` reserves height by — so no second copy of
             // that gate here.
@@ -8990,7 +9010,14 @@ pub(crate) fn overlay_band_title_bar_only_fixture() -> Vec<FrameOp> {
 
 // ─── QuickfixPanel ────────────────────────────────────────────────────────────
 
-/// Data needed to render the quickfix bottom panel.
+/// Data needed to render the quickfix (or location-list) bottom panel.
+///
+/// The same bottom "list rung" renders either the global quickfix list or
+/// the active window's location list — never both at once, matching how
+/// most Vim users actually work with them, and keeping the fixed
+/// `BOTTOM_Z_ORDER` band stack this repo's rendering doc comments describe
+/// (see the comment above [`BOTTOM_Z_ORDER`]) from having to grow a second
+/// independent slot for #1155.
 #[derive(Debug, Clone)]
 pub struct QuickfixPanel {
     /// Formatted display strings: "file.rs:12: line text"
@@ -9001,6 +9028,30 @@ pub struct QuickfixPanel {
     pub total_items: usize,
     /// Whether the quickfix panel has keyboard focus.
     pub has_focus: bool,
+    /// `"QUICKFIX"` for the global list, `"LOCATION LIST"` when this panel
+    /// is showing the active window's `:l*` list instead (#1155).
+    pub title: &'static str,
+}
+
+/// Build a [`QuickfixPanel`] from a [`QuickfixList`] (global quickfix or a
+/// per-window location list — see [`QuickfixPanel::title`]).
+fn quickfix_list_to_panel(list: &QuickfixList, title: &'static str) -> QuickfixPanel {
+    let items = list
+        .items
+        .iter()
+        .map(|m| {
+            let f = m.file.file_name().and_then(|n| n.to_str()).unwrap_or("?");
+            let snippet: String = m.line_text.trim().chars().take(80).collect();
+            format!("{}:{}: {}", f, m.line + 1, snippet)
+        })
+        .collect();
+    QuickfixPanel {
+        items,
+        selected_idx: list.selected,
+        total_items: list.items.len(),
+        has_focus: list.has_focus,
+        title,
+    }
 }
 
 /// A single item rendered in the debug sidebar. Used by win-gui;
@@ -14327,23 +14378,19 @@ pub fn build_screen_layout_with_breadcrumb_row(
         anchor_col: engine.view().cursor.col,
     });
 
-    let quickfix = (engine.quickfix_open && !engine.quickfix_items.is_empty()).then(|| {
-        let items = engine
-            .quickfix_items
-            .iter()
-            .map(|m| {
-                let f = m.file.file_name().and_then(|n| n.to_str()).unwrap_or("?");
-                let snippet: String = m.line_text.trim().chars().take(80).collect();
-                format!("{}:{}: {}", f, m.line + 1, snippet)
-            })
-            .collect();
-        QuickfixPanel {
-            items,
-            selected_idx: engine.quickfix_selected,
-            total_items: engine.quickfix_items.len(),
-            has_focus: engine.quickfix_has_focus,
-        }
-    });
+    // The global quickfix list takes priority over the active window's
+    // location list when both happen to be open — matching how `:copen`
+    // and `:lopen` share this one bottom "list rung" (#1155;
+    // `QuickfixPanel::title` doc comment has the full rationale).
+    let quickfix = if engine.quickfix.open && !engine.quickfix.items.is_empty() {
+        Some(quickfix_list_to_panel(&engine.quickfix, "QUICKFIX"))
+    } else {
+        engine
+            .location_lists
+            .get(&engine.active_window_id())
+            .filter(|l| l.open && !l.items.is_empty())
+            .map(|l| quickfix_list_to_panel(l, "LOCATION LIST"))
+    };
 
     let signature_help = engine
         .lsp_signature_help
@@ -17252,7 +17299,7 @@ pub fn quickfix_to_list_view(qf: &QuickfixPanel) -> quadraui::ListView {
     use quadraui::{ListItem, ListView, StyledText, WidgetId};
 
     let focus_mark = if qf.has_focus { " [FOCUS]" } else { "" };
-    let title_text = format!(" QUICKFIX ({} items){}", qf.total_items, focus_mark);
+    let title_text = format!(" {} ({} items){}", qf.title, qf.total_items, focus_mark);
 
     let items: Vec<ListItem> = qf
         .items
@@ -22012,11 +22059,15 @@ pub fn compute_editor_layout(
         tab_bar_height_px(lh, engine.settings.breadcrumbs)
     };
     let debug_toolbar_h = debug_toolbar_height_px(lh, engine.debug_toolbar_visible);
-    let quickfix_h = if engine.quickfix_open && !engine.quickfix_items.is_empty() {
-        6.0 * lh
-    } else {
-        0.0
-    };
+    // Shares one bottom "list rung" with the active window's location list
+    // (#1155) — see `quickfix_panel_rows`, the TUI-side equivalent of this
+    // same rule.
+    let qf_or_loc_open = (engine.quickfix.open && !engine.quickfix.items.is_empty())
+        || engine
+            .location_lists
+            .get(&engine.active_window_id())
+            .is_some_and(|l| l.open && !l.items.is_empty());
+    let quickfix_h = if qf_or_loc_open { 6.0 * lh } else { 0.0 };
     let has_separated = per_window && !engine.settings.status_line_above_terminal && bp_open;
     let separated_status_h = separated_status_height_px(lh, has_separated);
     let wildmenu_h = if engine.wildmenu_items.is_empty() {
@@ -22036,11 +22087,7 @@ pub fn compute_editor_layout(
             } else {
                 0
             },
-            quickfix_rows: if engine.quickfix_open && !engine.quickfix_items.is_empty() {
-                6
-            } else {
-                0
-            },
+            quickfix_rows: if qf_or_loc_open { 6 } else { 0 },
             debug_toolbar_rows: if engine.debug_toolbar_visible { 1 } else { 0 },
             wildmenu_rows: if engine.wildmenu_items.is_empty() {
                 0
@@ -29629,13 +29676,13 @@ mod slice7_router_tests {
         assert_eq!(scroll_top, 0, "quickfix closed: scroll resets");
 
         // Selection below the six-row window scrolls it down.
-        engine.quickfix_open = true;
-        engine.quickfix_selected = 9;
+        engine.quickfix.open = true;
+        engine.quickfix.selected = 9;
         let mut scroll_top = 0usize;
         post_key_epilogue(&mut engine, Some(&mut scroll_top));
         assert_eq!(scroll_top, 5, "9 must be the last of five visible rows");
         // Selection above it scrolls back up.
-        engine.quickfix_selected = 2;
+        engine.quickfix.selected = 2;
         post_key_epilogue(&mut engine, Some(&mut scroll_top));
         assert_eq!(scroll_top, 2);
 

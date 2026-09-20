@@ -5107,10 +5107,10 @@ mod panel_surfaces {
     fn quickfix_panel_paints() {
         let region = |selected: usize| {
             bottom_region_pixels(1400, 900, move |e| {
-                e.quickfix_items = vec![make_qf_item("a.rs"), make_qf_item("b.rs")];
-                e.quickfix_open = true;
-                e.quickfix_has_focus = true;
-                e.quickfix_selected = selected;
+                e.quickfix.items = vec![make_qf_item("a.rs"), make_qf_item("b.rs")];
+                e.quickfix.open = true;
+                e.quickfix.has_focus = true;
+                e.quickfix.selected = selected;
             })
         };
         assert_region_changed(
@@ -9782,14 +9782,15 @@ mod bottom_band_order {
         engine.settings.window_status_line = true;
         engine.settings.status_line_above_terminal = false;
         engine
-            .quickfix_items
+            .quickfix
+            .items
             .push(crate::core::project_search::ProjectMatch {
                 file: std::path::PathBuf::from("zqxw765.rs"),
                 line: 0,
                 col: 0,
                 line_text: "ZQXW765QF".to_string(),
             });
-        engine.quickfix_open = true;
+        engine.quickfix.open = true;
         engine.bottom_panel_open = true;
         engine.bottom_panel_kind = crate::render::BottomPanelKind::DebugOutput;
         engine.dap_output_lines.push("ZQXW765DBG".to_string());

@@ -271,8 +271,14 @@ impl Engine {
             return EngineAction::None;
         }
 
-        // Quickfix panel intercepts all keys when it has focus.
-        if self.quickfix_has_focus {
+        // Quickfix / active window's location-list panel intercepts all
+        // keys when either has focus (#1155; at most one is focused at a
+        // time — see `qf_open`/`qf_close`).
+        let loc_has_focus = self
+            .location_lists
+            .get(&self.active_window_id())
+            .is_some_and(|l| l.has_focus);
+        if self.quickfix.has_focus || loc_has_focus {
             // TUI sends printable keys as `key_name=""` + `unicode=Some(c)`;
             // GTK sends `key_name="j"`. Normalise so `j`/`k`/`q` close and
             // navigate consistently across backends (mirrors the pattern
@@ -282,7 +288,12 @@ impl Engine {
             } else {
                 key_name.to_string()
             };
-            return self.handle_quickfix_key(&qf_key, ctrl);
+            let win = if loc_has_focus {
+                Some(self.active_window_id())
+            } else {
+                None
+            };
+            return self.qf_handle_key(win, &qf_key, ctrl);
         }
 
         // Debug sidebar intercepts all keys when it has focus
@@ -9652,10 +9663,13 @@ impl Engine {
         self.mouse_drag_active = false;
         self.mouse_drag_origin_window = None;
         // Clicking into the editor returns keyboard focus to the buffer, so
-        // any bottom-panel focus (currently just quickfix) must be released
-        // — otherwise the panel keeps the `[FOCUS]` marker and j/k keep
-        // routing to the panel until Esc is pressed.
-        self.quickfix_has_focus = false;
+        // any bottom-panel focus (quickfix, or this window's location list)
+        // must be released — otherwise the panel keeps the `[FOCUS]` marker
+        // and j/k keep routing to the panel until Esc is pressed (#1155).
+        self.quickfix.has_focus = false;
+        if let Some(list) = self.location_lists.get_mut(&window_id) {
+            list.has_focus = false;
+        }
         // Switch to the group that owns this window.
         self.focus_group_for_window(window_id);
         self.set_cursor_for_window(window_id, line, col);
