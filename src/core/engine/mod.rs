@@ -4640,56 +4640,16 @@ impl Engine {
             pending_platform_actions: Vec::new(),
             explorer_rename: None,
             explorer_new_entry: None,
-            app_shell: {
-                use quadraui::{AppShell, PanelDefinition, WidgetId};
-                AppShell::new(
-                    vec![
-                        PanelDefinition {
-                            id: WidgetId::new("panel:explorer"),
-                            icon: "".to_string(),
-                            tooltip: "Explorer".to_string(),
-                            title: "EXPLORER".to_string(),
-                        },
-                        PanelDefinition {
-                            id: WidgetId::new("panel:search"),
-                            icon: "".to_string(),
-                            tooltip: "Search".to_string(),
-                            title: "SEARCH".to_string(),
-                        },
-                        PanelDefinition {
-                            id: WidgetId::new("panel:debug"),
-                            icon: "".to_string(),
-                            tooltip: "Run and Debug".to_string(),
-                            title: "RUN AND DEBUG".to_string(),
-                        },
-                        PanelDefinition {
-                            id: WidgetId::new("panel:git"),
-                            icon: "".to_string(),
-                            tooltip: "Source Control".to_string(),
-                            title: "SOURCE CONTROL".to_string(),
-                        },
-                        PanelDefinition {
-                            id: WidgetId::new("panel:extensions"),
-                            icon: "".to_string(),
-                            tooltip: "Extensions".to_string(),
-                            title: "EXTENSIONS".to_string(),
-                        },
-                        PanelDefinition {
-                            id: WidgetId::new("panel:ai"),
-                            icon: "".to_string(),
-                            tooltip: "AI".to_string(),
-                            title: "AI".to_string(),
-                        },
-                        PanelDefinition {
-                            id: WidgetId::new("bottom:settings"),
-                            icon: "".to_string(),
-                            tooltip: "Settings".to_string(),
-                            title: "SETTINGS".to_string(),
-                        },
-                    ],
-                    30.0,
-                )
-            },
+            // #1166: the panel list — order, ids, titles, tooltips — is
+            // built from `sidebar::engine_app_shell_panel_definitions`
+            // rather than a hand-transcribed literal, so this shadow
+            // `AppShell` (which `App::shell_config` reads through
+            // `app_shell.panels()` on every GUI backend) can no longer
+            // silently drift out of order with `sidebar::FIXED_ACTIVITY_PANEL_IDS`
+            // — the same constant `TuiShellApp::build_shell_config` iterates
+            // directly. See that function's doc for the two-sources-of-truth
+            // history this replaces.
+            app_shell: quadraui::AppShell::new(sidebar::engine_app_shell_panel_definitions(), 30.0),
             file_watcher: None,
             file_watcher_rx: None,
             file_watcher_pending: HashSet::new(),
