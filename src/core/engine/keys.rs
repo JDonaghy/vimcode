@@ -5832,9 +5832,23 @@ impl Engine {
     /// saved cursor is the position the next edit will actually start from.
     /// `finish_undo_group`/`start_undo_group` are no-ops on an empty group,
     /// so this is free when nothing was typed yet.
+    ///
+    /// Also re-anchors the `'backspace'` `"start"` / Ctrl-U boundary
+    /// (`insert_enter_line`/`insert_enter_col`) to the cursor's post-move
+    /// position. This mirrors real Vim's `stop_arrow()` (`edit.c`), which
+    /// resets `Insstart` on exactly these cursor-movement keys — confirmed
+    /// against real Neovim 0.12.5: `:set backspace=indent,eol` (no
+    /// `start`), enter Insert, type multi-line text, arrow onto a
+    /// pre-existing line and BackSpace is refused outright even though
+    /// that line is nowhere near the line Insert was originally entered on
+    /// (#1206 review). Without this, `line != insert_enter_line` alone
+    /// would wrongly treat *any* non-entry line — including one the user
+    /// merely arrow-navigated to — as "typed this session".
     fn split_insert_undo_group(&mut self) {
         self.finish_undo_group();
         self.start_undo_group();
+        self.insert_enter_line = self.view().cursor.line;
+        self.insert_enter_col = self.view().cursor.col;
     }
 
     /// `:h 'autoindent'`: "If you do not type anything on the new line
@@ -7220,6 +7234,113 @@ impl Engine {
         self.wildmenu_items.clear();
         self.wildmenu_selected = None;
         self.wildmenu_original.clear();
+        self.wildmenu_press = 0;
+    }
+
+    /// `<Tab>`/`<S-Tab>` completion for every `'wildmode'` configuration
+    /// other than the bare default `"full"` (that legacy path stays in
+    /// `handle_command_key`'s `"Tab"` arm unchanged — see
+    /// `Settings::wildmode_is_plain_full`). Builds the candidate list on
+    /// the first press of a round, then applies the flags active for each
+    /// press per `Settings::wildmode_stage_at` (#1206).
+    fn wildmode_tab_press(&mut self, is_backtab: bool) {
+        if is_backtab {
+            // `:h 'wildmode'` doesn't special-case Shift-Tab per stage —
+            // it just cycles backwards through whatever list is already
+            // showing, same as the legacy default path.
+            if !self.wildmenu_items.is_empty() {
+                match self.wildmenu_selected {
+                    None | Some(0) => {
+                        self.wildmenu_selected = Some(self.wildmenu_items.len() - 1);
+                    }
+                    Some(i) => self.wildmenu_selected = Some(i - 1),
+                }
+                if let Some(idx) = self.wildmenu_selected {
+                    self.command_buffer = self.wildmenu_items[idx].clone();
+                    self.command_cursor = self.command_buffer.chars().count();
+                }
+            }
+            return;
+        }
+
+        if self.wildmenu_items.is_empty() {
+            // Fresh completion round — compute candidates once; every
+            // later press in this round reuses this list rather than
+            // recomputing it (the typed prefix doesn't change while the
+            // wildmenu is open, only which stage is applied to it).
+            let partial = self.command_buffer.clone();
+            let completions = self.complete_command(&partial);
+            if completions.is_empty() {
+                return;
+            }
+            if completions.len() == 1 {
+                // Single match: auto-complete, no wildmenu, no stages.
+                self.command_buffer = completions[0].clone();
+                self.command_cursor = self.command_buffer.chars().count();
+                return;
+            }
+            self.wildmenu_original = partial;
+            self.wildmenu_items = completions;
+            self.wildmenu_selected = None;
+            self.wildmenu_press = 0;
+        }
+
+        let stage = self.settings.wildmode_stage_at(self.wildmenu_press);
+        self.wildmenu_press += 1;
+        self.apply_wildmode_stage(stage);
+    }
+
+    /// Apply one `'wildmode'` stage's flags to the already-populated
+    /// `wildmenu_items` (#1206). `longest` takes priority over a
+    /// co-occurring `full` on the same stage (`:h 'wildmode'`:
+    /// `"longest:full"` "does not cycle through full matches").
+    fn apply_wildmode_stage(&mut self, stage: crate::core::settings::WildmodeStage) {
+        if stage.only_first {
+            // `""` — complete the first match once; never cycle or list
+            // further presses of this stage.
+            self.command_buffer = self.wildmenu_items[0].clone();
+            self.command_cursor = self.command_buffer.chars().count();
+        } else if stage.longest {
+            let common = Self::find_common_prefix(&self.wildmenu_items);
+            if common.chars().count() > self.command_buffer.chars().count() {
+                self.command_buffer = common;
+                self.command_cursor = self.command_buffer.chars().count();
+                self.wildmenu_selected = None;
+            } else {
+                // `:h 'wildmode'`: "If this doesn't extend the input, the
+                // next 'wildmode' part is used" — apply it immediately,
+                // within this same press, rather than waiting for another
+                // keypress. Only recurse if the next stage would actually
+                // do something different, to avoid looping forever on a
+                // config that holds on a stuck "longest" stage.
+                let next = self.settings.wildmode_stage_at(self.wildmenu_press);
+                if next.only_first || next.full || (next.longest != stage.longest) {
+                    self.wildmenu_press += 1;
+                    self.apply_wildmode_stage(next);
+                }
+            }
+        } else if stage.full {
+            match self.wildmenu_selected {
+                None => self.wildmenu_selected = Some(0),
+                Some(i) if i + 1 >= self.wildmenu_items.len() => {
+                    self.wildmenu_selected = Some(0);
+                }
+                Some(i) => self.wildmenu_selected = Some(i + 1),
+            }
+            if let Some(idx) = self.wildmenu_selected {
+                self.command_buffer = self.wildmenu_items[idx].clone();
+                self.command_cursor = self.command_buffer.chars().count();
+                // If selected item ends with space, it takes an argument —
+                // clear wildmenu so next Tab triggers argument completion.
+                if self.command_buffer.ends_with(' ') {
+                    self.wildmenu_clear();
+                }
+            }
+        }
+        // Else: `stage.list`-only (or an unwired flag alone, e.g. bare
+        // "lastused") — the item list is already populated above; real
+        // Vim's plain "list" doesn't touch the command line at all, so
+        // there is nothing left to do.
     }
 
     pub(crate) fn handle_command_key(
@@ -7438,6 +7559,16 @@ impl Engine {
                 self.history_search_index = None;
 
                 let is_backtab = key_name == "ISO_Left_Tab";
+
+                // `'wildmode'` != the bare default "full" drives a
+                // genuinely different, stage-based completion sequence
+                // (#1206) — see `wildmode_tab_press` and
+                // `Settings::wildmode_is_plain_full`'s doc comment for why
+                // the default itself keeps this legacy path unchanged.
+                if !self.settings.wildmode_is_plain_full() {
+                    self.wildmode_tab_press(is_backtab);
+                    return EngineAction::None;
+                }
 
                 if !self.wildmenu_items.is_empty() {
                     // Wildmenu already open — cycle through items
@@ -8740,6 +8871,22 @@ impl Engine {
                     let count = self.take_count();
                     for _ in 0..count {
                         self.move_right_whichwrap('>');
+                    }
+                }
+                // `:h 'whichwrap'`: `<BS>`/`<Space>` as motions in Visual
+                // mode too, same `b`/`s` tokens as the Normal-mode arms
+                // above (#1206 review — these were still silent no-ops
+                // here after the Normal-mode arms landed).
+                "BackSpace" => {
+                    let count = self.take_count();
+                    for _ in 0..count {
+                        self.move_left_whichwrap('b');
+                    }
+                }
+                "space" | "Space" => {
+                    let count = self.take_count();
+                    for _ in 0..count {
+                        self.move_right_whichwrap('s');
                     }
                 }
                 "Home" => self.view_mut().cursor.col = 0,

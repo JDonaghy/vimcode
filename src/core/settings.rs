@@ -698,10 +698,21 @@ pub struct Settings {
     /// Command-line completion behavior for repeated `<Tab>`. Corresponds
     /// to Vim's `'wildmode'` / `'wim'`. Validated against Vim's documented
     /// comma/colon grammar (`full`/`longest`/`list`/`longest:full`/etc, `:h
-    /// 'wildmode'`) but not wired to vimcode's own always-on wildmenu
-    /// cycling (`'wildmenu'` in `set_bool_option` — see that arm's doc
-    /// comment for why an unconditional wildmenu already exists here).
-    /// Default `"full"`, matching Neovim.
+    /// 'wildmode'`) and — as of #1206 — drives real, observably different
+    /// Tab-completion behavior per [`WildmodeStage`]/`wildmode_stage_at`:
+    /// `longest` fills only the common prefix without selecting an item,
+    /// `list`-only leaves the command line untouched (the item list is
+    /// shown either way — vimcode's wildmenu is unconditionally on, see
+    /// `'wildmenu'` in `set_bool_option`), and stages advance one per
+    /// `<Tab>` press the way `:h 'wildmode'` describes. The bare default
+    /// value `"full"` is the one exception: it keeps vimcode's
+    /// pre-existing UX (common-prefix on the first press, full-match
+    /// cycling from the second press on) rather than switching to Vim's
+    /// literal "select the first full match immediately" `full` semantics,
+    /// so the already-covered `tests/wildmenu.rs` suite keeps passing
+    /// unchanged — see `Settings::wildmode_is_plain_full`'s doc comment.
+    /// `noselect`/`lastused` parse but are not distinctly wired (see
+    /// `WildmodeStage`). Default `"full"`, matching Neovim.
     #[serde(default = "default_wildmode")]
     pub wildmode: String,
 
@@ -1712,9 +1723,12 @@ fn parse_backspace(spec: &str) -> Result<String, String> {
 }
 
 /// `:h 'wildmode'`'s real per-stage keywords, each comma-separated stage
-/// optionally a colon-separated sequence of these.
+/// optionally a colon-separated sequence of these. `"noselect"` and
+/// `"lastused"` parse as valid (real Vim tokens, `:h 'wildmode'`) but are
+/// not distinctly wired by [`WildmodeStage`] — see its doc comment.
 const WILDMODE_TOKENS: &[&str] = &[
-    "full", "longest", "list", "lastused", "", // "" — an empty stage, e.g. leading `,`
+    "full", "longest", "list", "lastused", "noselect",
+    "", // "" — an empty stage, e.g. leading `,`
 ];
 
 /// Validate a `'wildmode'` value: comma-separated stages, each stage a
@@ -1728,6 +1742,62 @@ fn parse_wildmode(spec: &str) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// One comma-separated stage of `'wildmode'` — the behavior flags active on
+/// a single `<Tab>` press (`:h 'wildmode'`, #1206). Multiple colon-joined
+/// flags in the same stage combine (`"longest:full"` sets both); per the
+/// docs, when `longest` and `full` are both set on the *same* stage,
+/// `longest` wins and the stage does not cycle full matches — callers
+/// implement that by checking `longest` before `full`.
+///
+/// `lastused` (sort buffer-name matches by recency) and `noselect` (show
+/// the menu without preselecting the first item) parse as valid stage
+/// tokens but have no vimcode-side hook to attach to: this codebase's
+/// wildmenu list is unconditionally shown regardless of `'wildmode'` (see
+/// `'wildmenu'`'s `set_bool_option` arm), so `noselect`'s distinction from
+/// plain `full` has nothing to change, and there is no buffer-name
+/// completion sort order to key off `lastused`. Both are accepted rather
+/// than rejected (matching real Vim's grammar) but produce the same
+/// behavior as the stage's other flags alone.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct WildmodeStage {
+    /// `""` — an empty stage: complete the first match once, then stop
+    /// (never cycle or list on repeat presses of *this* stage).
+    pub only_first: bool,
+    pub full: bool,
+    pub longest: bool,
+    #[allow(dead_code)] // parsed for grammar completeness; see struct doc
+    pub list: bool,
+}
+
+/// Parse `'wildmode'` into its ordered stages. `:h 'wildmode'`: "a comma
+/// separated list of up to four parts, corresponding to the first, second,
+/// third, and fourth presses of 'wildchar'" — Vim holds on the last
+/// configured stage for every press beyond that, so callers should clamp
+/// a press index to `stages.len() - 1` (see [`Settings::wildmode_stage_at`])
+/// rather than treating a missing stage as "no more completion".
+fn wildmode_stages(spec: &str) -> Vec<WildmodeStage> {
+    spec.split(',')
+        .map(|stage| {
+            if stage.is_empty() {
+                return WildmodeStage {
+                    only_first: true,
+                    ..Default::default()
+                };
+            }
+            let mut s = WildmodeStage::default();
+            for tok in stage.split(':') {
+                match tok {
+                    "full" => s.full = true,
+                    "longest" => s.longest = true,
+                    "list" => s.list = true,
+                    _ => {} // lastused / noselect — not distinctly wired
+                }
+            }
+            s
+        })
+        .collect()
 }
 
 /// `:h 'listchars'`'s real item keys. `Fixed(n)` items take exactly `n`
@@ -1925,6 +1995,45 @@ impl Settings {
         self.virtualedit
             .split(',')
             .any(|t| t == "all" || t == "onemore")
+    }
+
+    /// The `'wildmode'` flags active on the `press`'th `<Tab>` press of the
+    /// current command-line completion round (0-indexed). Clamps to the
+    /// last configured stage once `press` runs past the configured list,
+    /// matching Vim holding on the last stage for every press beyond it
+    /// (#1206). See [`WildmodeStage`] for which flags are distinctly wired.
+    pub(crate) fn wildmode_stage_at(&self, press: usize) -> WildmodeStage {
+        let stages = wildmode_stages(&self.wildmode);
+        match stages.len() {
+            0 => WildmodeStage {
+                full: true,
+                ..Default::default()
+            },
+            n => stages[press.min(n - 1)],
+        }
+    }
+
+    /// True when `'wildmode'` is (equivalent to) the bare default
+    /// `"full"` — a single stage whose only flag is `full`. vimcode's
+    /// pre-existing Tab-completion UX (common-prefix on the first press,
+    /// then full-match cycling from the second press on) predates this
+    /// option being wired and is kept exactly as-is for this one
+    /// configuration, rather than switched to Vim's literal "select the
+    /// first full match immediately" reading of `'full'` — see the
+    /// `wildmode` field doc comment for why, and `handle_command_key`'s
+    /// `"Tab"` arm for where this carve-out is consulted. Every other
+    /// configuration (`longest`, `list`, multiple stages, …) drives Tab
+    /// completion through [`wildmode_stage_at`](Self::wildmode_stage_at)
+    /// instead, so changing `'wildmode'` away from the default now
+    /// produces genuinely different, observable completion behavior.
+    pub(crate) fn wildmode_is_plain_full(&self) -> bool {
+        let stages = wildmode_stages(&self.wildmode);
+        stages.len() == 1
+            && stages[0]
+                == WildmodeStage {
+                    full: true,
+                    ..Default::default()
+                }
     }
 
     /// Does `'backspace'` include `token` (`"indent"`, `"eol"`, `"start"`,

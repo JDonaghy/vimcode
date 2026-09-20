@@ -439,3 +439,130 @@ fn set_tab_cycles_through_settings() {
     assert_eq!(e.wildmenu_selected, Some(1));
     assert_eq!(e.command_buffer, items[1]);
 }
+
+// ── 'wildmode' drives genuinely different Tab behavior (#1206 review) ───
+//
+// Before this fix, `'wildmode'` was accepted and echoed back by `:set` but
+// consulted nowhere in the Tab-completion path — `:set wildmode=list`
+// changed nothing observable. These assert that different `'wildmode'`
+// values produce different, real `command_buffer`/`wildmenu_selected`
+// outcomes for the exact same keystrokes.
+//
+// `wildmode_longest_fills_common_prefix_without_selecting` and
+// `wildmode_list_leaves_command_line_untouched` are verified RED against
+// unfixed `develop` (via a local revert of the `WildmodeStage`/
+// `wildmode_tab_press` wiring): both failed with `command_buffer ==
+// "DapInfo"` instead of the correct `"DapIn"`/`"Dap"` — i.e. the legacy
+// hardcoded path (select-index-0-immediately) ran regardless of
+// `'wildmode'`, exactly the bug the review reported.
+// `wildmode_longest_comma_full_matches_documented_two_press_sequence`
+// passes even unfixed — the legacy hardcoded default path (common-prefix
+// on press 1, full-cycle from press 2) already happens to coincide with
+// `"longest,full"`'s documented sequence — so it isn't a red/green proof
+// on its own, but it does confirm the new stage-driven path reproduces
+// that coincidence *for the right reason* (consulting `'wildmode'`, not by
+// accident of the hardcoded default), which the two RED tests above prove
+// is no longer a given now that `'wildmode'` actually branches behavior.
+
+#[test]
+fn wildmode_longest_fills_common_prefix_without_selecting() {
+    let mut e = engine_with("hello\n");
+    e.settings.parse_set_option("wildmode=longest").unwrap();
+    press(&mut e, ':');
+    // "DapI" matches exactly two commands — DapInfo, DapInstall — whose
+    // shared prefix "DapIn" extends one char past what was typed.
+    type_chars(&mut e, "DapI");
+    press_key(&mut e, "Tab");
+
+    assert_eq!(e.command_buffer, "DapIn");
+    assert!(
+        e.wildmenu_selected.is_none(),
+        "'longest' alone must never select/highlight a specific item"
+    );
+
+    // A second Tab press can't extend "DapIn" any further (it's already
+    // the longest common prefix, and there is no further 'wildmode' stage
+    // to fall through to), so it stays put rather than starting to cycle.
+    press_key(&mut e, "Tab");
+    assert_eq!(e.command_buffer, "DapIn");
+    assert!(e.wildmenu_selected.is_none());
+}
+
+#[test]
+fn wildmode_list_leaves_command_line_untouched() {
+    let mut e = engine_with("hello\n");
+    e.settings.parse_set_option("wildmode=list").unwrap();
+    press(&mut e, ':');
+    // "Dap" matches all nine Dap* commands, each diverging right after
+    // "Dap" — no common-prefix extension is possible either way, so this
+    // isolates "list" not filling/selecting from "longest" not extending.
+    type_chars(&mut e, "Dap");
+    press_key(&mut e, "Tab");
+
+    // Real Vim's plain "list" stage lists matches but never fills the
+    // command line or selects an item.
+    assert_eq!(e.command_buffer, "Dap");
+    assert!(e.wildmenu_selected.is_none());
+    assert!(
+        !e.wildmenu_items.is_empty(),
+        "the match list should still be populated for display"
+    );
+
+    // Repeat presses stay inert too — "list" alone never advances.
+    press_key(&mut e, "Tab");
+    assert_eq!(e.command_buffer, "Dap");
+    assert!(e.wildmenu_selected.is_none());
+}
+
+#[test]
+fn wildmode_longest_comma_full_matches_documented_two_press_sequence() {
+    // `:h 'wildmode'`'s own example: "set wildmode=longest,full" ->
+    // "First press: longest common substring / Second press: cycle
+    // through full matches."
+    let mut e = engine_with("hello\n");
+    e.settings
+        .parse_set_option("wildmode=longest,full")
+        .unwrap();
+    press(&mut e, ':');
+    type_chars(&mut e, "DapI");
+
+    press_key(&mut e, "Tab");
+    assert_eq!(e.command_buffer, "DapIn");
+    assert!(e.wildmenu_selected.is_none(), "first press: longest only");
+
+    let items = e.wildmenu_items.clone();
+    press_key(&mut e, "Tab");
+    assert_eq!(
+        e.wildmenu_selected,
+        Some(0),
+        "second press: full-match cycling begins"
+    );
+    assert_eq!(e.command_buffer, items[0]);
+
+    press_key(&mut e, "Tab");
+    assert_eq!(e.wildmenu_selected, Some(1));
+    assert_eq!(e.command_buffer, items[1]);
+}
+
+#[test]
+fn wildmode_default_full_keeps_vimcodes_existing_ux() {
+    // The bare default value ("full") deliberately keeps vimcode's
+    // pre-existing common-prefix-then-cycle UX rather than Vim's literal
+    // "select the first full match immediately" reading — this is the
+    // documented carve-out (`Settings::wildmode_is_plain_full`), locked in
+    // by `tab_cycles_through_items` et al. above. This test just confirms
+    // that carve-out and the new stage-driven `'longest'` path above
+    // produce genuinely *different* first-press results, which is the
+    // crux of the review finding this fixes.
+    let mut e = engine_with("hello\n");
+    assert_eq!(e.settings.wildmode, "full");
+    press(&mut e, ':');
+    type_chars(&mut e, "DapI");
+    press_key(&mut e, "Tab");
+
+    assert_eq!(e.command_buffer, "DapIn");
+    assert!(
+        e.wildmenu_selected.is_none(),
+        "default 'full' still shows the common prefix unselected on the first press"
+    );
+}
