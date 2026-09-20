@@ -21555,7 +21555,11 @@ fn test_neither_autoindent_nor_smartindent_nor_cindent_does_not_indent() {
     e.handle_key("A", Some('A'), false);
     e.handle_key("Return", None, false);
     let indent = e.get_line_indent_str(1);
-    assert_eq!(indent.len(), 0, "with all three off, no auto-indenting at all");
+    assert_eq!(
+        indent.len(),
+        0,
+        "with all three off, no auto-indenting at all"
+    );
 }
 
 #[test]

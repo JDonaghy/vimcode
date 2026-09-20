@@ -23740,6 +23740,86 @@ mod tests {
         );
     }
 
+    /// #1207: `:set linebreak` must change *where* a soft-wrapped line
+    /// breaks — at a word boundary instead of mid-word — without changing
+    /// anything about `'wrap'` itself. Drives the real `:set` pipeline
+    /// (`run_ex_command`) end to end into the painted screen, the
+    /// driver-tier twin of `compute_word_wrap_segments`'s unit tests in
+    /// `render.rs`.
+    ///
+    /// The exact wrap column depends on this window's viewport width, which
+    /// this repo computes from pixel/cell geometry rather than exposing as a
+    /// constant — so this test *measures* it first with a boundary-free
+    /// calibration line (a run of `'X'` has no word boundary at all, so
+    /// `'linebreak'` cannot change anything about how it wraps), then
+    /// builds the real fixture positioned relative to that measured column,
+    /// per this file's own "measure, don't hardcode" convention (see
+    /// `:retab`'s tests above).
+    ///
+    /// **Verified RED against unfixed `develop`:** before #1207,
+    /// `compute_word_wrap_segments` had no `linebreak` parameter and always
+    /// sought a word boundary — i.e. the `false` (hard-cut) expectation
+    /// below, `!driver.screen_contains("BBBBBBBBBB")`, would have failed:
+    /// the ten-`B` run would already have been contiguous with `'linebreak'`
+    /// still unset.
+    #[test]
+    fn set_linebreak_wraps_at_word_boundary_instead_of_mid_word_via_shell_app() {
+        let vp = {
+            let mut probe = TuiShellApp::new_for_test();
+            probe.engine.buffer_mut().insert(0, &"X".repeat(300));
+            probe.engine.settings.wrap = true;
+            let mut driver = driver_with_shell(probe, config(), 100, 24);
+            driver.press_named(quadraui::NamedKey::Escape);
+            driver.render();
+            let screen = driver.screen();
+            let first_row = screen
+                .lines()
+                .find(|l| l.contains('X'))
+                .expect("the calibration line of 'X's must appear on screen");
+            first_row.matches('X').count()
+        };
+        assert!(
+            vp > 15,
+            "viewport too narrow for this test's fixture (measured {vp})"
+        );
+
+        // The A-run ends 3 columns before the measured hard-wrap column,
+        // then one space, then a contiguous 10-char B-run. A hard cut at
+        // exactly `vp` (linebreak off) lands 2 columns into the B-run,
+        // splitting it across two screen rows; seeking the nearest word
+        // boundary (linebreak on) backs up to the space instead, so the
+        // whole B-run lands together on the second row.
+        let content = format!("{} BBBBBBBBBB", "A".repeat(vp - 3));
+
+        let mut app = TuiShellApp::new_for_test();
+        app.engine.buffer_mut().insert(0, &content);
+        app.engine.settings.wrap = true;
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        driver.press_named(quadraui::NamedKey::Escape);
+        driver.render();
+        assert!(
+            !driver.screen_contains("BBBBBBBBBB"),
+            "sanity: 'linebreak' defaults off, so the B-run must be hard-cut \
+             mid-word; screen:\n{}",
+            driver.screen()
+        );
+
+        run_ex_command(&mut driver, ":set linebreak");
+        assert!(
+            driver.screen_contains("BBBBBBBBBB"),
+            ":set linebreak must wrap at the space, keeping the B-run whole; \
+             screen:\n{}",
+            driver.screen()
+        );
+
+        run_ex_command(&mut driver, ":set nolinebreak");
+        assert!(
+            !driver.screen_contains("BBBBBBBBBB"),
+            ":set nolinebreak must go back to hard-cutting mid-word; screen:\n{}",
+            driver.screen()
+        );
+    }
+
     /// #1208 bug 1: `apply_list_glyphs` remapped byte-offset `spans` for a
     /// tab's expansion to `^I` (#1190) but left char-index `DiagnosticMark`s
     /// unremapped, so with `'list'` on, a diagnostic positioned after a tab

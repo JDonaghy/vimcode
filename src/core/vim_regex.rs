@@ -1520,17 +1520,9 @@ mod tests {
         assert!(c.is_match("Ñandú"));
         assert!(c.is_match("北京"));
         // `\K` still excludes digits, same as the ASCII default.
-        let c_big = compile_with_keyword_class(
-            "\\K\\+",
-            false,
-            false,
-            true,
-            "",
-            None,
-            (&k, &big_k),
-            true,
-        )
-        .unwrap();
+        let c_big =
+            compile_with_keyword_class("\\K\\+", false, false, true, "", None, (&k, &big_k), true)
+                .unwrap();
         assert!(c_big.is_match("café"));
         assert!(!c_big.is_match("42"));
     }
@@ -1983,8 +1975,8 @@ mod tests {
     #[test]
     fn magic_setting_off_makes_dot_and_star_literal() {
         let k = "0-9A-Za-z_";
-        let c = compile_with_keyword_class("a.c", false, false, true, "", None, (k, k), false)
-            .unwrap();
+        let c =
+            compile_with_keyword_class("a.c", false, false, true, "", None, (k, k), false).unwrap();
         assert!(c.is_match("a.c"));
         assert!(!c.is_match("abc"), "bare '.' must be literal under nomagic");
         let c = compile_with_keyword_class("ab*c", false, false, true, "", None, (k, k), false)
@@ -2001,16 +1993,18 @@ mod tests {
         let k = "0-9A-Za-z_";
         let c = compile_with_keyword_class("a\\.c", false, false, true, "", None, (k, k), false)
             .unwrap();
-        assert!(c.is_match("abc"), "escaped '.' must be special under nomagic");
+        assert!(
+            c.is_match("abc"),
+            "escaped '.' must be special under nomagic"
+        );
     }
 
     #[test]
     fn magic_setting_off_keeps_anchors_special() {
         // `^`/`$` stay bare-special regardless of `'magic'`.
         let k = "0-9A-Za-z_";
-        let c =
-            compile_with_keyword_class("^ab$", false, false, true, "", None, (k, k), false)
-                .unwrap();
+        let c = compile_with_keyword_class("^ab$", false, false, true, "", None, (k, k), false)
+            .unwrap();
         assert!(c.is_match("ab"));
         assert!(!c.is_match("xab"));
     }
