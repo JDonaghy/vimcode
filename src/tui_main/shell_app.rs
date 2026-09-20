@@ -3718,6 +3718,19 @@ impl ShellApp for TuiShellApp {
 
         needs_redraw |= self.engine.poll_idle();
 
+        // #1165: drain the background SC refresh the block below now
+        // triggers with `sc_refresh_async` — same `poll_sc_refresh`/
+        // `Engine::sc_refresh_async` pair `App::handle_poll_tick` (GTK) has
+        // always used. This used to call the *synchronous* `sc_refresh`
+        // directly on this thread every 2 seconds the SC/Explorer panel was
+        // visible — four `git` subprocess spawns per call — which stalls the
+        // single-threaded terminal event loop for however long that takes
+        // (worse than a barely-perceptible pause on a large repo/slow disk),
+        // something GTK's own poll tick was already careful to avoid.
+        if self.engine.poll_sc_refresh() {
+            needs_redraw = true;
+        }
+
         if self.engine.format_save_quit_ready {
             self.engine.format_save_quit_ready = false;
             self.engine.cleanup_all_swaps();
@@ -3732,7 +3745,8 @@ impl ShellApp for TuiShellApp {
             self.engine.explorer_rebuild_rows();
             if self.engine.active_panel_is(PANEL_GIT) || self.engine.active_panel_is(PANEL_EXPLORER)
             {
-                self.engine.sc_refresh();
+                // #1165: async — see the `poll_sc_refresh` drain above.
+                self.engine.sc_refresh_async();
             }
             self.last_sidebar_refresh.set(Instant::now());
             needs_redraw = true;
@@ -5111,6 +5125,67 @@ mod tests {
         app.tick(&mut backend);
         assert!(app.engine.viewport_cols() > 0);
         assert!(app.engine.viewport_lines() > 0);
+    }
+
+    /// #1165: `tick()`'s periodic SC/explorer auto-refresh used to call
+    /// `Engine::sc_refresh` directly — the *synchronous* variant that
+    /// spawns four `git` subprocesses (`status`, `worktree list`,
+    /// `rev-list`, `log`) and blocks until all of them return.
+    /// `App::handle_poll_tick` (GTK's twin of this method) has always used
+    /// the async pair, `sc_refresh_async`/`poll_sc_refresh`, instead —
+    /// specifically to avoid stalling the UI thread on exactly this work.
+    /// A single-threaded terminal event loop has nothing else to run while
+    /// blocked, so TUI's version of this bug was strictly worse than GTK's
+    /// would have been: every repaint, keypress, and cursor blink froze for
+    /// however long those four spawns took on the sidebar's 2-second timer,
+    /// for as long as the SC or Explorer panel stayed open.
+    ///
+    /// Distinguishing "used the async path" from "used the sync path"
+    /// without racing the background thread on wall-clock time:
+    /// `sc_refresh_in_flight` is set `true` by `sc_refresh_async` *before*
+    /// it ever spawns the thread, and is only ever cleared by
+    /// `poll_sc_refresh` — which this test deliberately does not call
+    /// before its first assertion. The synchronous `sc_refresh` never
+    /// touches that flag at all, so it would stay `false` under the old
+    /// code regardless of how fast or slow the `git` subprocesses run —
+    /// the assertion below distinguishes the two code paths
+    /// deterministically.
+    ///
+    /// RED-verification: reverting `tick()`'s sidebar-refresh block back to
+    /// calling `self.engine.sc_refresh()` directly turns this red —
+    /// confirmed by hand before committing.
+    #[test]
+    fn tick_refreshes_sc_panel_asynchronously_not_on_the_event_loop_thread() {
+        let mut app = app_with_sidebar_open();
+        let mut backend = backend_at(100.0, 40.0);
+        app.setup(&mut backend);
+        // Force the 2-second auto-refresh gate open immediately rather than
+        // waiting on it in real time.
+        app.last_sidebar_refresh
+            .set(Instant::now() - Duration::from_secs(3));
+
+        app.tick(&mut backend);
+
+        assert!(
+            app.engine.sc_refresh_in_flight,
+            "tick() did not trigger the async SC refresh -- #1165 found it \
+             calling the synchronous `sc_refresh` directly instead, \
+             blocking this thread (the only thread driving the TUI's event \
+             loop) for every `git` subprocess it spawns"
+        );
+
+        // Drain the background thread so it doesn't outlive the test
+        // process; bounded, not a fixed sleep, so this stays fast on a
+        // quiet repo and still passes on a slow/loaded CI box.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.engine.sc_refresh_in_flight && Instant::now() < deadline {
+            app.engine.poll_sc_refresh();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !app.engine.sc_refresh_in_flight,
+            "background SC refresh thread never completed within 5s"
+        );
     }
 
     /// End-to-end smoke: the `ShellConfig`/`PanelDefinition` wiring this
