@@ -19863,6 +19863,245 @@ mod tests {
         );
     }
 
+    /// #1157: `\%23l` — absolute line-number position assertion. Three
+    /// lines all start with "foo"; `\%2l` restricts the match to line 2
+    /// only, so only that line's leading 'f' is at risk from a following
+    /// `x`.
+    ///
+    /// **Verified RED against unfixed `develop`:** `\%<digits>l` was
+    /// rejected outright (no `\%` position-assertion support existed before
+    /// #1157), so the search failed with a rejection message and the
+    /// cursor never moved.
+    #[test]
+    fn search_pattern_percent_l_restricts_match_to_that_line_via_shell_app() {
+        let mut app = TuiShellApp::new_for_test();
+        app.engine.buffer_mut().insert(0, "fooAAA\nfooBBB\nfooCCC");
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        driver.press_named(quadraui::NamedKey::Escape);
+        driver.render();
+
+        driver.type_char('/');
+        for c in "\\%2lfoo".chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
+        driver.render();
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("match 1 of 1"),
+            "only line 2's \"foo\" satisfies \\%2l, out of three raw \"foo\" \
+             matches in the buffer; screen:\n{screen}"
+        );
+
+        driver.type_char('x');
+        driver.render();
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("ooBBB"),
+            "the cursor should have landed on line 2's leading 'f', so x \
+             deletes it, leaving \"ooBBB\"; screen:\n{screen}"
+        );
+        assert!(
+            screen.contains("fooAAA") && screen.contains("fooCCC"),
+            "lines 1 and 3 must survive untouched; screen:\n{screen}"
+        );
+    }
+
+    /// #1157: `\%23c` — absolute column position assertion. Two lines put
+    /// "foo" at different columns; `\%2c` restricts the match to column 2
+    /// only, so line 1 (where 'f' sits at column 2) qualifies and line 2
+    /// (where 'f' sits at column 3) does not.
+    ///
+    /// **Verified RED against unfixed `develop`:** `\%<digits>c` was
+    /// rejected outright, so the search failed with a rejection message and
+    /// the cursor never moved.
+    #[test]
+    fn search_pattern_percent_c_restricts_match_to_that_column_via_shell_app() {
+        let mut app = TuiShellApp::new_for_test();
+        app.engine.buffer_mut().insert(0, "xfooAAA\nyyfooBBB");
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        driver.press_named(quadraui::NamedKey::Escape);
+        driver.render();
+
+        driver.type_char('/');
+        for c in "\\%2cfoo".chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
+        driver.render();
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("match 1 of 1"),
+            "only line 1's \"foo\" (starting at column 2) satisfies \\%2c; \
+             screen:\n{screen}"
+        );
+
+        driver.type_char('x');
+        driver.render();
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("xooAAA"),
+            "the cursor should have landed on line 1's leading 'f', so x \
+             deletes it, leaving \"xooAAA\"; screen:\n{screen}"
+        );
+        assert!(
+            screen.contains("yyfooBBB"),
+            "line 2 must survive untouched; screen:\n{screen}"
+        );
+    }
+
+    /// #1157: `\%d`/`\%x` char-code literals — `\%d65` is decimal 65
+    /// ('A'), `\%x62` is hex 0x62 ('b'), so `\%d65\%x62` matches the
+    /// literal text "Ab" without either character being typed literally in
+    /// the pattern.
+    ///
+    /// **Verified RED against unfixed `develop`:** `\%d`/`\%x` were
+    /// rejected outright, so the search failed with a rejection message and
+    /// the cursor never landed on "Ab".
+    #[test]
+    fn search_pattern_percent_d_and_x_char_code_literals_via_shell_app() {
+        let mut app = TuiShellApp::new_for_test();
+        app.engine.buffer_mut().insert(0, "xx Ab yy");
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        driver.press_named(quadraui::NamedKey::Escape);
+        driver.render();
+
+        driver.type_char('/');
+        for c in "\\%d65\\%x62".chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
+        driver.render();
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("match 1 of 1"),
+            "\\%d65\\%x62 should match exactly the literal \"Ab\"; \
+             screen:\n{screen}"
+        );
+
+        driver.type_char('x');
+        driver.type_char('x');
+        driver.render();
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("xx  yy"),
+            "the cursor should have landed on \"Ab\", so two x's delete both \
+             characters, leaving \"xx  yy\"; screen:\n{screen}"
+        );
+    }
+
+    /// #1157: `\%V` (charwise) — restricts a match to the last Visual
+    /// selection's exact byte range. Selecting "foo bar" charwise
+    /// (columns 0-6) and running `:%s/\%Vfoo/BAZ/g` must replace only the
+    /// "foo" inside the selection, leaving the second, unselected "foo"
+    /// alone. Drives real `v`/motion/`Escape` keys to set
+    /// `last_visual_anchor`/`last_visual_cursor`, unlike the `vim_regex.rs`
+    /// unit tests, which hand a byte tuple straight to `compile()` and never
+    /// exercise `last_visual_byte_range()` at all.
+    ///
+    /// **Verified RED against unfixed `develop`:** `\%V` was rejected
+    /// outright (no `\%V` support existed before #1157), so `:s` failed
+    /// with a rejection message and neither "foo" changed.
+    #[test]
+    fn substitute_pattern_percent_v_restricts_to_charwise_visual_selection_via_shell_app() {
+        let mut app = TuiShellApp::new_for_test();
+        app.engine.buffer_mut().insert(0, "foo bar foo");
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        driver.press_named(quadraui::NamedKey::Escape);
+        driver.render();
+
+        // v + 6*l selects columns 0..=6, i.e. "foo bar" (7 chars) — the
+        // first "foo" and the space/"bar" after it, not the second "foo".
+        driver.type_char('v');
+        for _ in 0..6 {
+            driver.type_char('l');
+        }
+        driver.press_named(quadraui::NamedKey::Escape);
+        driver.render();
+
+        driver.type_char(':');
+        for c in "%s/\\%Vfoo/BAZ/g".chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
+        driver.render();
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("BAZ bar foo"),
+            "only the first \"foo\", inside the Visual selection, should be \
+             replaced — the second, outside it, must survive; \
+             screen:\n{screen}"
+        );
+    }
+
+    /// #1157 review fix: `\%V` restricted to a **linewise** (`V`) Visual
+    /// selection. `last_visual_byte_range()` used to run the charwise
+    /// column formula for *every* Visual kind, which for a linewise
+    /// selection computed an arithmetically-nonsense column-keyed range
+    /// instead of "every byte on the selected lines" — this pins the fix:
+    /// selecting lines 1-2 with `V`/`j` and running `:%s/\%Vfoo/BAZ/g` must
+    /// replace only those two lines' "foo", not line 3's.
+    ///
+    /// **Verified RED against the pre-fix `last_visual_byte_range`:** the
+    /// selection starts on column 3, so the old charwise formula computed
+    /// `lo = 3` (line 1's char offset + column 3) instead of line 1's real
+    /// start at byte 0 — line 1's "foo" (bytes 0..3) fell outside that
+    /// range and was skipped, reporting "1 substitution on 1 line" instead
+    /// of 2 and leaving "fooAAA" unreplaced; the `BAZAAA` assertion below
+    /// failed against it.
+    #[test]
+    fn substitute_pattern_percent_v_restricts_to_linewise_visual_selection_via_shell_app() {
+        let mut app = TuiShellApp::new_for_test();
+        app.engine.buffer_mut().insert(0, "fooAAA\nfooBBB\nfooCCC");
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        driver.press_named(quadraui::NamedKey::Escape);
+        driver.render();
+
+        // Move onto column 3 (the first 'A') *before* starting Visual-Line,
+        // so anchor/cursor columns are non-zero and non-equal to line
+        // starts — this is what makes the regression observable: the old
+        // charwise-column formula keyed its range off these columns, so a
+        // non-zero column silently shrank the range and dropped line 1's
+        // match. A selection anchored at column 0 wouldn't have caught it
+        // (the buggy range happens to still cover byte 0 in that case).
+        // V + j then selects lines 1-2 (fooAAA, fooBBB) *linewise* — full
+        // lines regardless of the column the cursor is sitting on — leaving
+        // line 3 (fooCCC) out of the selection.
+        driver.type_char('l');
+        driver.type_char('l');
+        driver.type_char('l');
+        driver.type_char('V');
+        driver.type_char('j');
+        driver.press_named(quadraui::NamedKey::Escape);
+        driver.render();
+
+        driver.type_char(':');
+        for c in "%s/\\%Vfoo/BAZ/g".chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
+        driver.render();
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("BAZAAA") && screen.contains("BAZBBB"),
+            "both selected lines' \"foo\" should be replaced; \
+             screen:\n{screen}"
+        );
+        assert!(
+            screen.contains("fooCCC"),
+            "the unselected third line must survive untouched; \
+             screen:\n{screen}"
+        );
+    }
+
     /// The editor context menu's "Go to Definition" row advertises a key
     /// that actually invokes the language server. Since #889 gave `gd` back
     /// to Vim's local-declaration motion, that key is the tag jump
