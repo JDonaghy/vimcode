@@ -3733,7 +3733,13 @@ pub struct Engine {
     /// `yank_highlight` above. Set by `Engine::handle_insert_key` when a
     /// closing `)`/`]`/`}` has a match; cleared at the very top of the same
     /// fn on the *next* key, so a test can observe it True for exactly the
-    /// one key that triggered it.
+    /// one key that triggered it. Painted by `build_rendered_window` in
+    /// `render.rs`, which folds this into `bracket_match_positions` (the
+    /// same `bracket_match_bg`-themed channel `bracket_match` above already
+    /// used) whenever `'showmatch'` is on — so this is user-visible, not
+    /// just engine state; see
+    /// `set_showmatch_flashes_the_matching_open_paren_via_shell_app` in
+    /// `src/tui_main/shell_app.rs` for the driver-tier proof.
     pub showmatch_flash: Option<(usize, usize)>,
 
     // --- Insert mode Ctrl+r pending ---
