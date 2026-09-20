@@ -59,9 +59,13 @@
 //!    change. The genuinely GTK-only remainder —
 //!    `click::build_editor_click_context` (the Pango/Cairo text-measurement
 //!    context, see [`TextMetricsBackend`]), `css::load_css` and `util`'s
-//!    pixbuf/log helpers — stayed in `crate::gtk` and is reached from here
-//!    through explicit `#[cfg(feature = "gui")]` call sites
-//!    (`app_icon_image_for_paint`, `App::new`, the `TextMetricsBackend` impl).
+//!    icon-install/log helpers — stayed in `crate::gtk` and is reached from
+//!    here through explicit `#[cfg(feature = "gui")]` call sites (`App::new`,
+//!    the `TextMetricsBackend` impl). `app_icon_image_for_paint` used to be a
+//!    third such site — GTK got a pre-rasterised PNG, every other backend the
+//!    raw SVG — until quadraui#1014 added a decode cache to
+//!    `Backend::draw_image` itself (#1102), so it now hands every backend the
+//!    same [`crate::render::app_icon_image`] with no fork at all.
 //!
 //! None of this was a "route around it" job: per `CLAUDE.md`'s
 //! Platform-Neutrality Rule, the parts that stayed behind the `gui` feature
@@ -1225,21 +1229,20 @@ fn dialog_btn_index(id: &quadraui::WidgetId) -> Option<usize> {
         .and_then(|s| s.parse::<usize>().ok())
 }
 
-/// The app icon to paint in the menu row. Under `gui`, defers to
-/// `crate::gtk::util::app_icon_image` (the once-rasterised PNG — see its doc
-/// comment for why the raw SVG must never reach `Backend::draw_image`
-/// directly). No non-GTK backend paints this yet, so the fallback is the
-/// plain, un-rasterised builder — never exercised in production today, but
-/// keeps this function (and so `render_content`) resolving without `gui`.
+/// The app icon to paint in the menu row: the one shared builder
+/// ([`crate::render::app_icon_image`]), handed to `Backend::draw_image`
+/// unchanged for every backend.
+///
+/// #1102: before quadraui#1014 added a decode cache to `GtkBackend::draw_image`
+/// itself, this forked on `#[cfg(feature = "gui")]` — GTK got a
+/// once-rasterised small PNG (`crate::gtk::util::app_icon_image`, deleted)
+/// because handing the raw 1024×1024 SVG to the then-uncached `draw_image`
+/// meant librsvg re-rendered it every repaint (+16.5 ms/frame on the headless
+/// GTK harness); every other backend got the plain SVG builder, unexercised
+/// in production since none of them painted this yet. Now that the cache
+/// lives inside quadraui, there is nothing left for this function to fork on.
 fn app_icon_image_for_paint() -> quadraui::Image {
-    #[cfg(feature = "gui")]
-    {
-        crate::gtk::util::app_icon_image()
-    }
-    #[cfg(not(feature = "gui"))]
-    {
-        crate::render::app_icon_image()
-    }
+    crate::render::app_icon_image()
 }
 
 /// Create a new `App` instance.
@@ -7136,12 +7139,9 @@ impl App {
                     ),
                     &filler,
                 );
-                // `app_icon_image_for_paint` (this file), not
-                // `render::app_icon_image`: the former hands over a
-                // once-rasterised small PNG instead of the 1024x1024 SVG,
-                // which `Backend::draw_image` would otherwise re-render
-                // through librsvg on *every* frame (+16.5ms per repaint —
-                // see `crate::gtk::util::app_icon_image`'s doc comment).
+                // `app_icon_image_for_paint` (this file) — see its doc
+                // comment for why every backend can now share the same
+                // [`crate::render::app_icon_image`] builder here (#1102).
                 let _ = backend.draw_image(app_icon_rect, &app_icon_image_for_paint());
             }
         }

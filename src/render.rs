@@ -23098,11 +23098,13 @@ pub fn split_menu_row_for_app_icon(
 /// gdk-pixbuf loader installed) should leave the slot blank rather than paint
 /// a placeholder string where a logo belongs.
 ///
-/// **Painting code wants `gtk::util::app_icon_image()`, not this.** quadraui's
-/// `Image` carries no cache, so `Backend::draw_image` re-decodes `source` every
-/// frame — and a 1024×1024 SVG through librsvg costs ~16.5 ms of that. This
-/// function owns the icon's *identity* (which asset, which fit, which id); the
-/// GTK wrapper reuses all of it and swaps in a once-rasterised small PNG.
+/// Painting code wants `crate::app`'s `app_icon_image_for_paint()`, which
+/// currently just forwards here — kept as a separate name so the paint site
+/// documents *why* it's safe to hand `Backend::draw_image` the raw SVG
+/// directly rather than pre-rasterising it itself: quadraui#1014 added a
+/// decode cache inside `Backend::draw_image` (GTK and macOS so far), so this
+/// function no longer needs a per-backend wrapper to dodge re-decoding the
+/// 1024×1024 SVG through librsvg on every frame (#1102).
 pub fn app_icon_image() -> quadraui::Image {
     quadraui::Image {
         id: quadraui::WidgetId::new("app-icon"),
