@@ -11064,13 +11064,31 @@ mod command_line_selection {
     /// unavailable (which *skips*, not fails) — it proves the assertion
     /// itself is load-bearing, not just reachable.
     ///
-    /// Skips (does not fail) if no live OS clipboard is reachable in this
-    /// sandbox — same accepted pattern quadraui's own
-    /// `gtk::services::clipboard_image_html_file_list_and_clear_round_trip`
-    /// test uses for the identical reason (`arboard::Clipboard::new()`
-    /// fails with no live desktop session, e.g. a headless Linux CI box
-    /// with no `DISPLAY`/`WAYLAND_DISPLAY`).
+    /// `#[ignore]`d (CLAUDE.md: "Any future test that genuinely needs a
+    /// live display must be `#[ignore]`-gated with a comment saying why").
+    /// This test drives `setup_gtk_clipboard` against a *real*
+    /// `quadraui::gtk::backend::GtkBackend`, whose `services().clipboard()`
+    /// is backed by `arboard` — there is no way to swap in a fake from
+    /// vimcode: `GtkClipboard::install_test_contents` (quadraui#991's own
+    /// hermetic-test seam, `quadraui/src/gtk/services.rs:861` at the pinned
+    /// rev `0dc8381`) and the `gtk_clipboard()` accessor needed to reach it
+    /// are both `pub(crate)` inside quadraui, not exported to consuming
+    /// crates. `.github/workflows/ci.yml`'s "Test (Linux, headless, GUI
+    /// feature on)" job asserts `DISPLAY`/`WAYLAND_DISPLAY` are both unset
+    /// before running `cargo test`, so this must not run there — hence
+    /// `#[ignore]` rather than the runtime skip this test used before, which
+    /// silently reported green in CI without ever exercising the round trip.
+    /// A quadraui issue requesting a public seam for hermetic GTK clipboard
+    /// testing (e.g. exporting `install_test_contents`/`gtk_clipboard()`, or
+    /// an equivalent public test-double constructor) is needed before this
+    /// can run unconditionally in CI; until then, run manually with
+    /// `cargo test -- --ignored setup_gtk_clipboard_round_trips` on a
+    /// machine with a live desktop session (X11 or Wayland).
     #[test]
+    #[ignore = "needs a live OS clipboard/display session — see doc comment; \
+                blocked on a quadraui issue for a public hermetic-clipboard \
+                test seam (quadraui#991's install_test_contents/gtk_clipboard \
+                are pub(crate))"]
     fn setup_gtk_clipboard_round_trips_yank_and_paste_through_real_backend_1100() {
         // Mirrors `conformance_harness`'s manual construction (not the
         // `harness()` convenience wrapper) because this test needs the
@@ -11151,8 +11169,13 @@ mod command_line_selection {
             "the pasted line must actually paint, not just exist in the rope"
         );
 
-        drop(cwd);
-        drop(paint);
+        // No explicit `drop(cwd)`/`drop(paint)` here: `paint` and `cwd` are
+        // declared *before* `driver`, so Rust's implicit end-of-scope drop
+        // (reverse declaration order) already drops `driver` — which owns
+        // the Cairo `ImageSurface` and Pango/Cairo-touching teardown — before
+        // releasing the `PaintGuard` mutex. Matches every other test in this
+        // file; see `activity_bar_strip`'s comment for why the order matters
+        // (`FT_Load_Glyph` segfaults on concurrent Pango/Cairo teardown).
     }
 
     /// #1185: adopts quadraui#1001's `Backend::draw_command_line_selection`.
