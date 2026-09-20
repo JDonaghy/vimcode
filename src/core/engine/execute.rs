@@ -4386,7 +4386,31 @@ impl Engine {
             self.settings.smartcase,
             smartcase_applies,
             &self.last_sub_replacement,
+            self.last_visual_byte_range(),
         )
+    }
+
+    /// The last Visual selection's byte range within `self.buffer().to_string()`
+    /// — what `\%V` (#1157) restricts a match to. `None` when there has never
+    /// been one; charwise-only for now (linewise/blockwise `\%V` is a
+    /// documented gap, tracked in #1157 alongside the atom itself).
+    fn last_visual_byte_range(&self) -> Option<(usize, usize)> {
+        let anchor = self.last_visual_anchor?;
+        let cursor = self.last_visual_cursor?;
+        let to_char = |c: Cursor| self.buffer().line_to_char(c.line) + c.col;
+        let (lo, hi) = {
+            let a = to_char(anchor);
+            let b = to_char(cursor);
+            if a <= b {
+                (a, b)
+            } else {
+                (b, a)
+            }
+        };
+        let rope = &self.buffer().content;
+        let lo_byte = rope.char_to_byte(lo.min(rope.len_chars()));
+        let hi_byte = rope.char_to_byte((hi + 1).min(rope.len_chars()));
+        Some((lo_byte, hi_byte.max(lo_byte)))
     }
 
     /// Collect every match of `re` in `text`.

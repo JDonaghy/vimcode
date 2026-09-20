@@ -19780,6 +19780,89 @@ mod tests {
         );
     }
 
+    /// #1157: `\@=` look-ahead — `/foo\(bar\)\@=` matches "foo" only when
+    /// it's immediately followed by "bar", not the "foo" followed by "baz".
+    /// Drives the real `/` search pipeline and reads the painted command
+    /// line (`"match 1 of 1"` proves exactly one of the two "foo"s
+    /// qualified) plus the buffer after `x` (proves *which* one: the
+    /// lookahead is zero-width, so `x` must delete the leading 'f' of the
+    /// first "foo", not consume any of "bar").
+    ///
+    /// **Verified RED against unfixed `develop`:** `\@=` was rejected
+    /// outright (`vim_regex.rs`'s `'@' => Err(...)` arm), so the command
+    /// line painted the rejection message instead of "match 1 of 1", and `x`
+    /// had no match to land on.
+    #[test]
+    fn search_pattern_lookahead_matches_only_where_the_lookahead_holds_via_shell_app() {
+        let mut app = TuiShellApp::new_for_test();
+        app.engine.buffer_mut().insert(0, "xx foobar foobaz");
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        driver.press_named(quadraui::NamedKey::Escape);
+        driver.render();
+
+        driver.type_char('/');
+        for c in "foo\\(bar\\)\\@=".chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
+        driver.render();
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("match 1 of 1"),
+            "only the first \"foo\" (followed by \"bar\") satisfies the \
+             lookahead — the second, followed by \"baz\", must not count; \
+             screen:\n{screen}"
+        );
+
+        driver.type_char('x');
+        driver.render();
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("xx oobar foobaz"),
+            "the lookahead is zero-width, so the cursor lands on the 'f' of \
+             the qualifying \"foo\" and x deletes only that letter, leaving \
+             \"bar\" intact; screen:\n{screen}"
+        );
+    }
+
+    /// #1157: `\_s` — like `\s`, but end-of-line counts too, so a pattern
+    /// can span a line break. `:%s/…\_s…/X/` on two lines whose only
+    /// separator is the newline between them must match across it and merge
+    /// them into one line.
+    ///
+    /// **Verified RED against unfixed `develop`:** `\_` was rejected outright
+    /// (`vim_regex.rs`'s `'_' => Err(...)` arm), so `:s` failed with that
+    /// rejection message and left the two lines untouched.
+    #[test]
+    fn substitute_pattern_underscore_s_matches_across_the_line_break_via_shell_app() {
+        let mut app = TuiShellApp::new_for_test();
+        app.engine.buffer_mut().insert(0, "ZQXAAA\nZQXBBB");
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        driver.press_named(quadraui::NamedKey::Escape);
+        driver.render();
+
+        driver.type_char(':');
+        for c in "%s/ZQXAAA\\_sZQXBBB/MERGED/".chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
+        driver.render();
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("MERGED"),
+            "\\_s must match the newline between the two lines, so the \
+             substitution fires and paints the replacement; screen:\n{screen}"
+        );
+        assert!(
+            !screen.contains("ZQXAAA") && !screen.contains("ZQXBBB"),
+            "the match spans both original lines, so neither original \
+             token should remain on screen; screen:\n{screen}"
+        );
+    }
+
     /// The editor context menu's "Go to Definition" row advertises a key
     /// that actually invokes the language server. Since #889 gave `gd` back
     /// to Vim's local-declaration motion, that key is the tag jump
