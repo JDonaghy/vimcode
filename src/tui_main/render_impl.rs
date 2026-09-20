@@ -369,6 +369,14 @@ pub(super) fn bottom_chrome_rects_for_shell_content(
 /// drift on this logic. `area` stands in for each block's original
 /// `frame.area()` call (all four computed the identical value from the
 /// same frame, just redundantly per-block).
+///
+/// #1167: the build-adapter → `.layout()` → `backend.draw_*` → cache-
+/// output part (identical to GTK's `App::paint_editor_popups_rung`, modulo
+/// coordinate units) now lives once in `render::paint_editor_popups`. This
+/// function's own job shrank to exactly what stays genuinely per-backend:
+/// finding the active window and resolving each popup's on-screen anchor
+/// point from it (gutter width, scroll offsets, tab-aware column math) —
+/// cell math here, pixel math in `App::paint_editor_popups_rung`.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn paint_editor_popups(
     backend: &mut dyn quadraui::Backend,
@@ -386,195 +394,165 @@ pub(super) fn paint_editor_popups(
         area.width as f32,
         area.height as f32,
     );
+    let active_win = screen
+        .windows
+        .iter()
+        .find(|w| w.window_id == screen.active_window_id);
 
-    // ── Completion popup (rendered on top of editor) ───────────────────────
-    if let Some(ref menu) = screen.completion {
-        if let Some(active_win) = screen
-            .windows
-            .iter()
-            .find(|w| w.window_id == screen.active_window_id)
-        {
-            if let Some((cursor_pos, _)) = &active_win.cursor {
-                let gutter_w = active_win.gutter_char_width as u16;
-                let win_x = active_win.rect.x as u16;
-                let win_y = active_win.rect.y as u16;
-                let raw = active_win
-                    .lines
-                    .get(cursor_pos.view_line)
-                    .map(|l| l.raw_text.as_str())
-                    .unwrap_or("");
-                let vis_col = char_col_to_visual(raw, cursor_pos.col, active_win.tabstop)
-                    .saturating_sub(active_win.scroll_left) as u16;
-                let popup_x = win_x + gutter_w + vis_col;
-                let popup_y = win_y + cursor_pos.view_line as u16 + 1;
-                // #420: clamp the popup into the *active window's own*
-                // rect, not the shared `viewport` above (which spans every
-                // split in the editor band, plus the gap the sidebar
-                // already leaves for the first split). Feeding the wider
-                // shared viewport into `Completions::layout` let its
-                // "shift left on right-overflow" clamp push the popup past
-                // the active window's own left edge — into a neighbouring
-                // split, or, with the leftmost split narrow, visibly
-                // against the sidebar boundary. GTK's `paint_editor_popups`
-                // equivalent in `app.rs` already scopes to `win_viewport`
-                // this way; this brings TUI in line with it.
-                //
-                // Built from `tui_window_paint_rect(&active_win.rect)`
-                // rather than the raw (possibly fractional) `active_win.rect`
-                // directly: `RenderedWindow` rects come from continuous
-                // float split math and are not integer-valued in general
-                // (see the doc comment on `tui_window_paint_rect` in
-                // `render.rs`, #1040), and every TUI call site that resolves
-                // geometry against window bounds must snap to the same
-                // whole-cell grid the paint path already truncated to, or it
-                // silently clamps against geometry that was never painted.
-                let win_rect = render::tui_window_paint_rect(&active_win.rect);
-                let win_viewport = quadraui::Rect::from(win_rect);
-                // Per D6: build quadraui::Completions + layout + rasterise.
-                let completions = render::completion_menu_to_quadraui_completions(menu);
-                // #420: `Completions::layout` clamps the popup's *position*
-                // into the viewport (`x.max(viewport.x)`), which is what
-                // fixes the "bleeds into the sidebar/neighbouring split"
-                // symptom above — but it never clamps `popup_width` itself,
-                // so an over-wide popup (a long candidate label in a narrow
-                // split) can still render past the viewport's right edge
-                // even once correctly positioned as far left as it can go.
-                // That's a gap in the shared `quadraui::Completions::layout`
-                // primitive (it already does the symmetric clamp for
-                // height, `clipped_h` below `desired_height`), not something
-                // to patch around per-backend here — see the Platform-
-                // Neutrality Rule. Left as a tracked follow-up pending a
-                // quadraui-side fix; do not re-add a `.min(win_viewport...)`
-                // cap here without one.
-                let popup_width = (menu.max_width as f32 + 4.0).max(12.0);
-                let max_popup_height = 10.0;
-                let layout = completions.layout(
-                    popup_x as f32,
-                    popup_y as f32 - 1.0, // cursor y; layout adds line_height below
-                    1.0,
-                    win_viewport,
-                    popup_width,
-                    max_popup_height,
-                    |_| quadraui::CompletionItemMeasure::new(1.0),
-                );
-                backend.draw_completions(&completions, &layout);
-                *completion_layout_out = Some(layout);
-            }
-        }
-    }
+    // ── Completion popup anchor ─────────────────────────────────────────────
+    let completion = active_win.and_then(|active_win| {
+        let menu = screen.completion.as_ref()?;
+        let (cursor_pos, _) = active_win.cursor.as_ref()?;
+        let gutter_w = active_win.gutter_char_width as u16;
+        let win_x = active_win.rect.x as u16;
+        let win_y = active_win.rect.y as u16;
+        let raw = active_win
+            .lines
+            .get(cursor_pos.view_line)
+            .map(|l| l.raw_text.as_str())
+            .unwrap_or("");
+        let vis_col = char_col_to_visual(raw, cursor_pos.col, active_win.tabstop)
+            .saturating_sub(active_win.scroll_left) as u16;
+        let popup_x = win_x + gutter_w + vis_col;
+        let popup_y = win_y + cursor_pos.view_line as u16;
+        // #420: clamp the popup into the *active window's own* rect, not
+        // the shared `viewport` above (which spans every split in the
+        // editor band, plus the gap the sidebar already leaves for the
+        // first split). Feeding the wider shared viewport into
+        // `Completions::layout` let its "shift left on right-overflow"
+        // clamp push the popup past the active window's own left edge —
+        // into a neighbouring split, or, with the leftmost split narrow,
+        // visibly against the sidebar boundary. GTK's
+        // `paint_editor_popups_rung` equivalent in `app.rs` already scopes
+        // to `win_viewport` this way; this brings TUI in line with it.
+        //
+        // Built from `tui_window_paint_rect(&active_win.rect)` rather than
+        // the raw (possibly fractional) `active_win.rect` directly:
+        // `RenderedWindow` rects come from continuous float split math and
+        // are not integer-valued in general (see the doc comment on
+        // `tui_window_paint_rect` in `render.rs`, #1040), and every TUI
+        // call site that resolves geometry against window bounds must snap
+        // to the same whole-cell grid the paint path already truncated to,
+        // or it silently clamps against geometry that was never painted.
+        let win_rect = render::tui_window_paint_rect(&active_win.rect);
+        let win_viewport = quadraui::Rect::from(win_rect);
+        // #420: `Completions::layout` clamps the popup's *position* into
+        // the viewport (`x.max(viewport.x)`), which is what fixes the
+        // "bleeds into the sidebar/neighbouring split" symptom above — but
+        // it never clamps `popup_width` itself, so an over-wide popup (a
+        // long candidate label in a narrow split) can still render past
+        // the viewport's right edge even once correctly positioned as far
+        // left as it can go. That's a gap in the shared
+        // `quadraui::Completions::layout` primitive (it already does the
+        // symmetric clamp for height, `clipped_h` below `desired_height`),
+        // not something to patch around per-backend here — see the
+        // Platform-Neutrality Rule. Left as a tracked follow-up pending a
+        // quadraui-side fix; do not re-add a `.min(win_viewport...)` cap
+        // here without one.
+        let popup_width = (menu.max_width as f32 + 4.0).max(12.0);
+        let max_popup_height = 10.0;
+        Some((
+            render::PopupAnchor {
+                x: popup_x as f32,
+                y: popup_y as f32,
+                viewport: win_viewport,
+            },
+            popup_width,
+            max_popup_height,
+        ))
+    });
 
-    // ── Hover popup (rendered on top of editor) ──────────────────────────────
-    if let Some(ref hover) = screen.hover {
-        if let Some(active_win) = screen
-            .windows
-            .iter()
-            .find(|w| w.window_id == screen.active_window_id)
-        {
-            let gutter_w = active_win.gutter_char_width as u16;
-            let win_x = active_win.rect.x as u16;
-            let win_y = active_win.rect.y as u16;
-            let anchor_view = hover.anchor_line.saturating_sub(active_win.scroll_top) as u16;
-            let vis_col = hover.anchor_col.saturating_sub(active_win.scroll_left) as u16;
-            let popup_x = win_x + gutter_w + vis_col;
-            let popup_y = win_y + anchor_view;
-            // Per D6: build quadraui::Tooltip + layout + rasterise. Unit
-            // scale is 1.0/1.0 — TUI coordinates are already cell-native
-            // (#669 widened this adapter to also serve GTK's pixel space).
-            let (tooltip, layout) = render::hover_popup_to_quadraui_tooltip(
-                hover,
-                popup_x as f32,
-                popup_y as f32,
-                viewport,
-                1.0,
-                1.0,
-            );
-            backend.draw_tooltip(&tooltip, &layout);
-        }
-    }
+    // ── Hover popup anchor ───────────────────────────────────────────────────
+    let hover = active_win.and_then(|active_win| {
+        let hover = screen.hover.as_ref()?;
+        let gutter_w = active_win.gutter_char_width as u16;
+        let win_x = active_win.rect.x as u16;
+        let win_y = active_win.rect.y as u16;
+        let anchor_view = hover.anchor_line.saturating_sub(active_win.scroll_top) as u16;
+        let vis_col = hover.anchor_col.saturating_sub(active_win.scroll_left) as u16;
+        Some(render::PopupAnchor {
+            x: (win_x + gutter_w + vis_col) as f32,
+            y: (win_y + anchor_view) as f32,
+            viewport,
+        })
+    });
 
-    // ── Editor hover popup (rich markdown, triggered by gh or mouse dwell) ─
-    *editor_hover_popup_rect_out = None; // Clear stale rect before rendering
-    *editor_hover_scrollbar_out = None;
-    if let Some(ref eh) = screen.editor_hover {
-        if let Some(active_win) = screen
-            .windows
-            .iter()
-            .find(|w| w.window_id == screen.active_window_id)
-        {
-            let gutter_w = active_win.gutter_char_width as u16;
-            let win_x = active_win.rect.x as u16;
-            let win_y = active_win.rect.y as u16;
-            // Use frozen scroll offsets so the popup stays fixed on screen
-            let anchor_view = eh.anchor_line.saturating_sub(eh.frozen_scroll_top) as u16;
-            let vis_col = eh.anchor_col.saturating_sub(eh.frozen_scroll_left) as u16;
-            let popup_x = win_x + gutter_w + vis_col;
-            let popup_y = win_y + anchor_view;
-            let (eh_links, eh_rect, eh_sb) =
-                render_editor_hover_popup(backend, eh, popup_x, popup_y, area, theme);
-            *editor_hover_link_rects_out = eh_links;
-            *editor_hover_popup_rect_out = eh_rect;
-            *editor_hover_scrollbar_out = eh_sb;
-        }
-    }
+    // ── Editor hover popup anchor (rich markdown, gh key or mouse dwell) ────
+    // Frozen scroll offsets so the popup stays fixed on screen.
+    let editor_hover = active_win.and_then(|active_win| {
+        let eh = screen.editor_hover.as_ref()?;
+        let gutter_w = active_win.gutter_char_width as u16;
+        let win_x = active_win.rect.x as u16;
+        let win_y = active_win.rect.y as u16;
+        let anchor_view = eh.anchor_line.saturating_sub(eh.frozen_scroll_top) as u16;
+        let vis_col = eh.anchor_col.saturating_sub(eh.frozen_scroll_left) as u16;
+        Some(render::PopupAnchor {
+            x: (win_x + gutter_w + vis_col) as f32,
+            y: (win_y + anchor_view) as f32,
+            viewport,
+        })
+    });
 
-    // ── Diff peek popup (inline git hunk preview) ──────────────────────────
-    if let Some(ref peek) = screen.diff_peek {
-        if let Some(active_win) = screen
-            .windows
-            .iter()
-            .find(|w| w.window_id == screen.active_window_id)
-        {
-            let gutter_w = active_win.gutter_char_width as u16;
-            let win_x = active_win.rect.x as u16;
-            let win_y = active_win.rect.y as u16;
-            let anchor_view = peek.anchor_line.saturating_sub(active_win.scroll_top) as u16;
-            let popup_x = win_x + gutter_w;
-            // anchor at the cursor's own row; placement=Bottom (with
-            // primitive fallback to Top) puts the popup just below it.
-            let popup_y = win_y + anchor_view;
-            // Per D6: build quadraui::Tooltip + layout + rasterise. Unit
-            // scale 1.0/1.0 — see the hover popup's comment above (#669).
-            let (tooltip, layout) = render::diff_peek_to_quadraui_tooltip(
-                peek,
-                popup_x as f32,
-                popup_y as f32,
-                viewport,
-                theme,
-                1.0,
-                1.0,
-            );
-            backend.draw_tooltip(&tooltip, &layout);
-        }
-    }
+    // ── Diff peek popup anchor (inline git hunk preview) ────────────────────
+    let diff_peek = active_win.and_then(|active_win| {
+        let peek = screen.diff_peek.as_ref()?;
+        let gutter_w = active_win.gutter_char_width as u16;
+        let win_x = active_win.rect.x as u16;
+        let win_y = active_win.rect.y as u16;
+        let anchor_view = peek.anchor_line.saturating_sub(active_win.scroll_top) as u16;
+        // Anchor at the cursor's own row, left edge (no column offset);
+        // placement=Bottom (with primitive fallback to Top) puts the
+        // popup just below it.
+        Some(render::PopupAnchor {
+            x: (win_x + gutter_w) as f32,
+            y: (win_y + anchor_view) as f32,
+            viewport,
+        })
+    });
 
-    // ── Signature-help popup (shown in insert mode when cursor is inside a call) ─
-    if let Some(ref sig) = screen.signature_help {
-        if let Some(active_win) = screen
-            .windows
-            .iter()
-            .find(|w| w.window_id == screen.active_window_id)
-        {
-            let gutter_w = active_win.gutter_char_width as u16;
-            let win_x = active_win.rect.x as u16;
-            let win_y = active_win.rect.y as u16;
-            let anchor_view = sig.anchor_line.saturating_sub(active_win.scroll_top) as u16;
-            let vis_col = sig.anchor_col.saturating_sub(active_win.scroll_left) as u16;
-            let popup_x = win_x + gutter_w + vis_col;
-            let popup_y = win_y + anchor_view;
-            // Per D6: build quadraui::Tooltip + layout + rasterise. Unit
-            // scale 1.0/1.0 — see the hover popup's comment above (#669).
-            let (tooltip, layout) = render::signature_help_to_quadraui_tooltip(
-                sig,
-                popup_x as f32,
-                popup_y as f32,
-                viewport,
-                theme,
-                1.0,
-                1.0,
-            );
-            backend.draw_tooltip(&tooltip, &layout);
-        }
-    }
+    // ── Signature-help popup anchor (insert mode, cursor inside a call) ─────
+    let signature_help = active_win.and_then(|active_win| {
+        let sig = screen.signature_help.as_ref()?;
+        let gutter_w = active_win.gutter_char_width as u16;
+        let win_x = active_win.rect.x as u16;
+        let win_y = active_win.rect.y as u16;
+        let anchor_view = sig.anchor_line.saturating_sub(active_win.scroll_top) as u16;
+        let vis_col = sig.anchor_col.saturating_sub(active_win.scroll_left) as u16;
+        Some(render::PopupAnchor {
+            x: (win_x + gutter_w + vis_col) as f32,
+            y: (win_y + anchor_view) as f32,
+            viewport,
+        })
+    });
+
+    // The deleted per-popup `render_editor_hover_popup` wrapper used to
+    // re-sync the theme right before painting the rich-markdown editor-hover
+    // popup specifically; both frame-level call sites (`draw_frame` /
+    // `TuiShellApp::render_content`) already sync it earlier in the same
+    // frame, so this is redundant in practice — kept anyway since it's a
+    // one-line no-op when already in sync, and removing it isn't part of
+    // this convergence.
+    backend.set_theme(super::quadraui_tui::q_theme(theme));
+
+    // Per D6: unit scale is 1.0/1.0 — TUI coordinates are already
+    // cell-native (#669 widened these adapters to also serve GTK's pixel
+    // space).
+    render::paint_editor_popups(
+        backend,
+        screen,
+        theme,
+        1.0,
+        1.0,
+        completion,
+        hover,
+        editor_hover,
+        diff_peek,
+        signature_help,
+        completion_layout_out,
+        editor_hover_link_rects_out,
+        editor_hover_popup_rect_out,
+        editor_hover_scrollbar_out,
+    );
 }
 
 // ─── Tab bar hit testing ─────────────────────────────────────────────────────

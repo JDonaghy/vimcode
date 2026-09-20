@@ -1571,19 +1571,21 @@ pub fn editor_hover_to_quadraui_rich_text(
 /// `src/gtk/draw.rs::draw_editor_hover_popup`, with an added Pango-exact
 /// link-width measure; that precision isn't reachable from
 /// `render_content`'s `&mut dyn Backend`-only signature (no raw
-/// `pango::Layout`, same class of gap TUI's own `render_editor_hover_popup`
-/// hit for the raw `Frame` — see `PLAN.md`), so both backends now use the
-/// same char-count-based `link_widths` closure, scaled by `unit_w`. This
-/// only affects link *hit-region* precision, not paint — the rasteriser
-/// re-measures glyphs itself when drawing.
+/// `pango::Layout`, same class of gap TUI's now-deleted
+/// `render_editor_hover_popup` wrapper hit for the raw `Frame` — see
+/// `PLAN.md`), so both backends now use the same char-count-based
+/// `link_widths` closure, scaled by `unit_w`. This only affects link
+/// *hit-region* precision, not paint — the rasteriser re-measures glyphs
+/// itself when drawing.
 ///
 /// `unit_w` / `unit_h` are `1.0, 1.0` for TUI (cell-native) or
 /// `char_width, line_height` in pixels for GTK. `popup_x` / `popup_y` /
 /// `viewport` must already be expressed in that same space.
 ///
 /// Returns `(link_rects, popup_bounds, scrollbar_hit)` — all `quadraui::Rect`,
-/// in the caller's units — for mouse hit-testing. TUI calls this directly
-/// too (`render_impl.rs::paint_editor_popups`, unit_w/unit_h = 1.0); there is
+/// in the caller's units — for mouse hit-testing. Called by the shared
+/// [`paint_editor_popups`] (#1167), which both `render_impl.rs`'s TUI
+/// wrapper and GTK's `App::paint_editor_popups_rung` call through; there is
 /// no per-backend copy of this geometry any more (#831).
 #[allow(clippy::type_complexity, clippy::too_many_arguments)]
 pub fn editor_hover_popup_paint(
@@ -1650,6 +1652,147 @@ pub fn editor_hover_popup_paint(
         total: popup.lines.len(),
     });
     (link_rects, popup_rect, scrollbar_hit)
+}
+
+/// A single editor-anchored popup's already-resolved paint position: the
+/// on-screen anchor point plus the viewport it clamps into, both expressed
+/// in the caller's native units (TUI cell columns/rows, GTK pixels).
+#[derive(Debug, Clone, Copy)]
+pub struct PopupAnchor {
+    pub x: f32,
+    pub y: f32,
+    pub viewport: quadraui::Rect,
+}
+
+/// Paint the editor-anchored popups: completion menu, LSP hover, the rich
+/// "editor hover" markdown popup, diff-peek, and signature-help.
+///
+/// Shared by TUI (`tui_main::render_impl::paint_editor_popups`) and GTK
+/// (`App::paint_editor_popups_rung`) as of #1167 — before that the two were
+/// ~160/~164-line near-verbatim copies of the same five
+/// build-adapter → `.layout()` → `backend.draw_*` → cache-output-for-hit-
+/// testing blocks, differing only in coordinate units and in exactly how
+/// each anchor point is derived from the active window (gutter width,
+/// scroll offsets, tab-aware column resolution for the cursor).
+///
+/// This function owns everything from "given a resolved anchor + viewport"
+/// onward. Resolving the anchor itself stays at each call site as thin
+/// per-backend wiring, because two of the five have a narrow *pre-existing*
+/// per-backend difference this convergence deliberately carries forward
+/// unchanged rather than silently folding together (that would be a
+/// behavior change needing its own issue + black-box test, not something to
+/// smuggle into a mechanical refactor):
+/// - the completion popup's cursor column: TUI resolves tab expansion via
+///   `char_col_to_visual` before placing the popup, GTK currently uses the
+///   raw character column;
+/// - the editor-hover popup's clip viewport: TUI clamps into the whole
+///   frame `area`, GTK clamps into the active window's own rect.
+///
+/// The four output caches are cleared unconditionally at the top (matching
+/// GTK's existing per-frame behavior) rather than only-on-`Some` (TUI's
+/// prior behavior for `completion_layout`/`editor_hover_link_rects`) —
+/// verified safe, not a behavior change: every consumer
+/// (`render::route_modal_overlay_click`'s `completion_open` /
+/// `editor_hover_*` routing) already gates on live engine state before ever
+/// reading the cached layout, so a stale cache was unreachable dead data,
+/// never a click-routing hazard.
+#[allow(clippy::too_many_arguments)]
+pub fn paint_editor_popups(
+    backend: &mut dyn quadraui::Backend,
+    screen: &ScreenLayout,
+    theme: &Theme,
+    unit_w: f32,
+    unit_h: f32,
+    completion: Option<(PopupAnchor, f32, f32)>,
+    hover: Option<PopupAnchor>,
+    editor_hover: Option<PopupAnchor>,
+    diff_peek: Option<PopupAnchor>,
+    signature_help: Option<PopupAnchor>,
+    completion_layout_out: &mut Option<quadraui::CompletionsLayout>,
+    editor_hover_link_rects_out: &mut Vec<(quadraui::Rect, String)>,
+    editor_hover_popup_rect_out: &mut Option<quadraui::Rect>,
+    editor_hover_scrollbar_out: &mut Option<PopupScrollbarHit>,
+) {
+    *completion_layout_out = None;
+    editor_hover_link_rects_out.clear();
+    *editor_hover_popup_rect_out = None;
+    *editor_hover_scrollbar_out = None;
+
+    // ── Completion popup (rendered on top of editor) ───────────────────────
+    if let (Some(menu), Some((anchor, popup_width, max_popup_height))) =
+        (&screen.completion, completion)
+    {
+        let completions = completion_menu_to_quadraui_completions(menu);
+        let layout = completions.layout(
+            anchor.x,
+            anchor.y,
+            unit_h,
+            anchor.viewport,
+            popup_width,
+            max_popup_height,
+            |_| quadraui::CompletionItemMeasure::new(unit_h),
+        );
+        backend.draw_completions(&completions, &layout);
+        *completion_layout_out = Some(layout);
+    }
+
+    // ── Hover popup (rendered on top of editor) ──────────────────────────────
+    if let (Some(hv), Some(anchor)) = (&screen.hover, hover) {
+        let (tooltip, layout) = hover_popup_to_quadraui_tooltip(
+            hv,
+            anchor.x,
+            anchor.y,
+            anchor.viewport,
+            unit_w,
+            unit_h,
+        );
+        backend.draw_tooltip(&tooltip, &layout);
+    }
+
+    // ── Editor hover popup (rich markdown, triggered by gh or mouse dwell) ─
+    if let (Some(eh), Some(anchor)) = (&screen.editor_hover, editor_hover) {
+        let (links, rect, sb) = editor_hover_popup_paint(
+            backend,
+            eh,
+            anchor.x,
+            anchor.y,
+            anchor.viewport,
+            theme,
+            unit_w,
+            unit_h,
+        );
+        *editor_hover_link_rects_out = links;
+        *editor_hover_popup_rect_out = rect;
+        *editor_hover_scrollbar_out = sb;
+    }
+
+    // ── Diff peek popup (inline git hunk preview) ──────────────────────────
+    if let (Some(peek), Some(anchor)) = (&screen.diff_peek, diff_peek) {
+        let (tooltip, layout) = diff_peek_to_quadraui_tooltip(
+            peek,
+            anchor.x,
+            anchor.y,
+            anchor.viewport,
+            theme,
+            unit_w,
+            unit_h,
+        );
+        backend.draw_tooltip(&tooltip, &layout);
+    }
+
+    // ── Signature-help popup (shown in insert mode when cursor is inside a call) ─
+    if let (Some(sig), Some(anchor)) = (&screen.signature_help, signature_help) {
+        let (tooltip, layout) = signature_help_to_quadraui_tooltip(
+            sig,
+            anchor.x,
+            anchor.y,
+            anchor.viewport,
+            theme,
+            unit_w,
+            unit_h,
+        );
+        backend.draw_tooltip(&tooltip, &layout);
+    }
 }
 
 // ─── SignatureHelp ────────────────────────────────────────────────────────────
