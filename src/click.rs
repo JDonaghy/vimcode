@@ -232,6 +232,15 @@ pub(crate) fn pixel_to_click_target(
     frame_hit_map: Option<&quadraui::FrameHitMap>,
     tab_bar_zones: &HashMap<usize, (GroupId, quadraui::Rect)>,
     mutate_focus: bool,
+    // #1187: the shared `quadraui::DragState` a real press arms so a
+    // following drag-move traverses the whole file instead of re-seeking
+    // per move — see `render::minimap_press`'s doc comment. Only ever
+    // touched under `mutate_focus` (a hover/drag-continuation query must
+    // never arm a new gesture), so callers that never pass `true` (there are
+    // none left, but the parameter still has to exist for every call site)
+    // could in principle thread a scratch `DragState`; every real call site
+    // threads its own backend's live one.
+    drag: &mut quadraui::DragState,
 ) -> ClickTarget {
     // #752: the separated status line's arm was here, and the per-window
     // status line's arm was in the `WindowZone::StatusBar` match below. Both
@@ -241,19 +250,39 @@ pub(crate) fn pixel_to_click_target(
     // shared router (not this backend) decides the order the three bars are
     // arbitrated in.
 
-    // ── Minimap click / drag (#35, #722) ────────────────────────────────────
-    // Pure rect plumbing: the shared resolver owns the hit-test and the
-    // scroll. Checked before the zone walk because every window's strip is
-    // carved out of that window's own rect, so a `ScreenZone::Window` hit
-    // would otherwise swallow it. Gated on `mutate_focus` so a hover query
-    // never scrolls. `apply_minimap_click` resolves against *every* pane's
-    // strip and reports which one it hit — never assumed to be the active
-    // window, since a split can have a strip on an inactive pane too.
+    // ── Minimap press (#35, #722, #1187) ────────────────────────────────────
+    // Pure rect plumbing: the shared resolver owns the hit-test, the
+    // #1093 jump-to-position, and the drag geometry. Checked before the zone
+    // walk because every window's strip is carved out of that window's own
+    // rect, so a `ScreenZone::Window` hit would otherwise swallow it. Gated
+    // on `mutate_focus` so a hover query never scrolls or arms a drag.
+    // `minimap_press` resolves against *every* pane's strip and reports
+    // which one it hit — never assumed to be the active window, since a
+    // split can have a strip on an inactive pane too.
     if mutate_focus {
-        if let Some((window_id, line)) =
-            render_mod::apply_minimap_click(engine, cached_layout, x, y)
-        {
-            return ClickTarget::Minimap(window_id, line);
+        if let Some(press) = render_mod::minimap_press(engine, cached_layout, x, y) {
+            if press.jump {
+                render_mod::apply_minimap_click(engine, cached_layout, x, y);
+            } else {
+                // #722: a press directly on the highlight band skips
+                // `apply_minimap_click`'s centring (nothing should scroll
+                // yet — that's the whole point of preserving the grab
+                // offset), but a click on a *background* pane's strip must
+                // still focus that pane, exactly like every other click
+                // does. `apply_minimap_click`'s `jump` branch above already
+                // covers this itself.
+                engine.activate_window(press.window_id);
+            }
+            drag.begin(quadraui::DragTarget::ScrollbarY {
+                widget: render_mod::minimap_drag_widget(press.window_id),
+                track_start: press.track_start,
+                track_length: press.track_length,
+                thumb_length: press.thumb_length,
+                max_scroll: press.max_scroll,
+                grab_offset: press.grab_offset,
+                inverted: false,
+            });
+            return ClickTarget::Minimap(press.window_id, 0);
         }
     }
 
@@ -613,6 +642,7 @@ pub(crate) fn handle_mouse_click(
     tab_pixel_hits: &TabPixelHitMap,
     frame_hit_map: Option<&quadraui::FrameHitMap>,
     tab_bar_zones: &HashMap<usize, (GroupId, quadraui::Rect)>,
+    drag: &mut quadraui::DragState,
 ) -> (Option<bool>, Option<EngineAction>) {
     match pixel_to_click_target(
         engine,
@@ -626,6 +656,7 @@ pub(crate) fn handle_mouse_click(
         frame_hit_map,
         tab_bar_zones,
         true, // real click: focus/tab/gutter side effects are intended
+        drag,
     ) {
         ClickTarget::BufferPos(wid, line, col) => {
             // Alt+Click in VSCode mode → add cursor at position
@@ -681,6 +712,7 @@ pub(crate) fn handle_mouse_double_click(
     tab_pixel_hits: &TabPixelHitMap,
     frame_hit_map: Option<&quadraui::FrameHitMap>,
     tab_bar_zones: &HashMap<usize, (GroupId, quadraui::Rect)>,
+    drag: &mut quadraui::DragState,
 ) {
     if let ClickTarget::BufferPos(wid, line, col) = pixel_to_click_target(
         engine,
@@ -694,6 +726,7 @@ pub(crate) fn handle_mouse_double_click(
         frame_hit_map,
         tab_bar_zones,
         true, // real click: focus/tab/gutter side effects are intended
+        drag,
     ) {
         engine.mouse_double_click(wid, line, col);
     }
@@ -726,6 +759,7 @@ pub(crate) fn handle_mouse_drag(
     tab_pixel_hits: &TabPixelHitMap,
     frame_hit_map: Option<&quadraui::FrameHitMap>,
     tab_bar_zones: &HashMap<usize, (GroupId, quadraui::Rect)>,
+    drag: &mut quadraui::DragState,
 ) {
     if let ClickTarget::BufferPos(wid, line, col) = pixel_to_click_target(
         engine,
@@ -739,6 +773,7 @@ pub(crate) fn handle_mouse_drag(
         frame_hit_map,
         tab_bar_zones,
         false, // drag continuation: pure query, no focus/tab/gutter side effects
+        drag,
     ) {
         engine.mouse_drag(wid, line, col);
     }

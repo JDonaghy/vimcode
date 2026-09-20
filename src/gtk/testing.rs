@@ -7629,6 +7629,109 @@ mod minimap {
         );
     }
 
+    /// #1187 acceptance (black-box, driver tier, GTK): dragging the
+    /// minimap's own viewport-highlight thumb from the top of the strip to
+    /// the bottom must scroll through virtually the whole file in one
+    /// gesture — exactly like dragging the real vertical scrollbar handle
+    /// the same distance — not crawl within roughly one strip-window's
+    /// worth of lines. GTK counterpart of the TUI acceptance test
+    /// `tui_main::shell_app::tests::
+    /// dragging_the_minimap_viewport_highlight_scrolls_the_whole_file_not_a_crawl`.
+    ///
+    /// With the file scrolled to the top, the highlight band's own top edge
+    /// coincides with the strip's top row (#1093: the highlight always
+    /// starts where the editor's own viewport does), so pressing there and
+    /// dragging to the strip's bottom row is exactly the issue's own
+    /// reproduction: "press on the highlight's top edge, drag to the bottom
+    /// of the strip".
+    ///
+    /// 200,000 lines is comfortably past the compression ceiling
+    /// (`MINIMAP_MAX_COMPRESSION * target_lines`) at this harness's
+    /// geometry, so the strip's window genuinely slides rather than holding
+    /// the whole file in one uncompressed view — the regime #1187's root
+    /// cause needs to reproduce at all.
+    ///
+    /// **RED against unfixed `develop`:** confirmed by hand — reverting
+    /// `click::pixel_to_click_target`'s minimap rung to call
+    /// `render::apply_minimap_click` directly (no `DragTarget::ScrollbarY`
+    /// arm) and `App::handle_mouse_drag_msg`'s `MouseDragRoute::Minimap` arm
+    /// to keep re-running it per move reproduces #1187's root cause: the
+    /// strip's own painted window slides in lockstep with `scroll_top`
+    /// (#1093), so the drag's motion mostly cancels itself out and the
+    /// final assertion below (>90% of the file) fails, landing well under
+    /// 20%.
+    #[test]
+    fn dragging_the_minimap_viewport_highlight_scrolls_the_whole_file_on_gtk() {
+        const TOTAL_LINES: usize = 200_000;
+        fn engine_with_very_long_buffer() -> Engine {
+            let mut engine = Engine::new();
+            let text: String = (0..TOTAL_LINES)
+                .map(|i| format!("line {i} content\n"))
+                .collect();
+            engine.buffer_mut().insert(0, &text);
+            engine
+        }
+
+        let mut h = harness(engine_with_very_long_buffer(), 1400, 900);
+        let win = h.engine.borrow().active_window_id();
+        h.driver.render();
+
+        assert_eq!(
+            h.engine.borrow().windows.get(&win).unwrap().view.scroll_top,
+            0,
+            "fixture must start at the top of the file"
+        );
+
+        let strip = {
+            let layout = h.screen_layout.borrow();
+            let mm = layout
+                .as_ref()
+                .expect("render_content must have painted a ScreenLayout")
+                .minimap
+                .iter()
+                .find(|m| m.window_id == win)
+                .expect("a 200,000-line buffer must publish a minimap strip");
+            crate::render::minimap_strip_rect(mm)
+        };
+
+        let x = (strip.x + strip.width / 2.0) as f32;
+        // Press on the strip's very top row — with the file scrolled to the
+        // top, that coincides with the viewport-highlight band's own top
+        // edge — then drag to the strip's bottom row.
+        h.driver.mouse_down(x, strip.y + 1.0);
+        h.driver.mouse_move(x, strip.y + strip.height - 1.0);
+        h.driver.mouse_up(x, strip.y + strip.height - 1.0);
+        h.driver.render();
+
+        // Read the scroll position back from what actually painted (not
+        // engine state) — the lowest `line N` number among the frame's
+        // painted text runs, mirroring the TUI acceptance test's `top_line`.
+        fn top_line(texts: &[&str]) -> Option<usize> {
+            texts
+                .iter()
+                .filter_map(|t| {
+                    t.strip_prefix("line ")?
+                        .split_whitespace()
+                        .next()?
+                        .parse()
+                        .ok()
+                })
+                .min()
+        }
+        let texts = h.driver.painted_texts();
+        let top = top_line(&texts).unwrap_or_else(|| {
+            panic!("the editor must still paint line numbers; painted: {texts:?}")
+        });
+
+        assert!(
+            top > TOTAL_LINES * 9 / 10,
+            "dragging from the highlight's top edge to the strip's bottom \
+             row must scroll through virtually the whole file in one \
+             gesture, not crawl within one strip window — landed on line \
+             {top} of {TOTAL_LINES}"
+        );
+    }
+
     /// #1093 review follow-up: the two GTK minimap-click driver tests above
     /// (`minimap_click_at_the_middle_scrolls_to_half_the_file`, 400 lines at
     /// a 1400x900 harness) and below in `editor_mouse_rungs`
@@ -7929,6 +8032,115 @@ mod minimap {
                 seen
             );
         }
+    }
+
+    /// #722/#1187: a press that lands **inside** a background pane's own
+    /// viewport-highlight band — not on the bare track outside it — must
+    /// still focus that pane, exactly like every other minimap press
+    /// (`minimap_click_on_a_background_pane_focuses_that_pane` in
+    /// `render.rs` pins the same claim for a press *outside* the band, via
+    /// `apply_minimap_click` directly).
+    ///
+    /// #1187 pulled the "jump-to-centre + focus" pair
+    /// (`apply_minimap_click`) off the in-band path entirely — an in-band
+    /// press must arm a grab-offset-preserving drag without scrolling
+    /// anything yet, which is exactly what the second assertion below pins
+    /// — so the focus half of that pair had to move into its own call
+    /// (`click::pixel_to_click_target`'s minimap rung, the `else` arm next
+    /// to `apply_minimap_click`). This test is the regression guard that
+    /// split survived.
+    ///
+    /// **RED against a version of this fix that drops that `else` arm:**
+    /// confirmed by hand — deleting the
+    /// `engine.focus_group_for_window(press.window_id)` call (leaving the
+    /// non-jump branch a no-op) makes the first assertion fail: the
+    /// background pane never gains focus, `active_window_id()` stays on the
+    /// pane that was already active.
+    #[test]
+    fn press_inside_a_background_panes_highlight_band_still_focuses_it_on_gtk() {
+        let mut h = harness(engine_with_split_shaped_buffer(), 1400, 900);
+        let active_before = h.engine.borrow().active_window_id();
+        h.window_center(active_before)
+            .expect("editor pane must paint");
+
+        let background_win = {
+            let layout = h.screen_layout.borrow();
+            let l = layout
+                .as_ref()
+                .expect("render_content must have painted a ScreenLayout");
+            assert_eq!(
+                l.minimap.len(),
+                2,
+                "a vsplit must give each pane its own minimap strip"
+            );
+            l.minimap
+                .iter()
+                .find(|m| m.window_id != active_before)
+                .expect("the split must have a non-active pane with its own minimap")
+                .window_id
+        };
+        assert_eq!(
+            h.engine
+                .borrow()
+                .windows
+                .get(&background_win)
+                .unwrap()
+                .view
+                .scroll_top,
+            0,
+            "fixture must start unscrolled"
+        );
+
+        // Resolve the press against the shared, read-only `minimap_press`
+        // *before* driving the real event — this is what guarantees the
+        // chosen point genuinely lands inside the band (never a hardcoded
+        // coordinate; #1093 puts the band's own top edge at the strip's top
+        // row while `scroll_top` is 0).
+        let (x, y) = {
+            let layout_ref = h.screen_layout.borrow();
+            let layout = layout_ref.as_ref().unwrap();
+            let mm = layout
+                .minimap
+                .iter()
+                .find(|m| m.window_id == background_win)
+                .unwrap();
+            let strip = crate::render::minimap_strip_rect(mm);
+            let x = strip.x as f64 + strip.width as f64 / 2.0;
+            let y = strip.y as f64 + 5.0;
+            let press = crate::render::minimap_press(&h.engine.borrow(), layout, x, y)
+                .expect("the strip must hit");
+            assert_eq!(press.window_id, background_win);
+            assert!(
+                !press.jump,
+                "test setup sanity: the chosen press point must land \
+                 inside the highlight band, not on the bare track — this \
+                 test is specifically about the in-band case"
+            );
+            (x, y)
+        };
+
+        h.driver.mouse_down(x as f32, y as f32);
+        h.driver.render();
+
+        assert_eq!(
+            h.engine.borrow().active_window_id(),
+            background_win,
+            "a press inside a background pane's own highlight band must \
+             focus that pane"
+        );
+        assert_eq!(
+            h.engine
+                .borrow()
+                .windows
+                .get(&background_win)
+                .unwrap()
+                .view
+                .scroll_top,
+            0,
+            "a press inside the highlight band must not scroll the pane — \
+             only a subsequent drag move should (the grab offset is what \
+             keeps the band from jumping under the cursor)"
+        );
     }
 
     /// #722 acceptance, painted-output tier: switching focus between panes
