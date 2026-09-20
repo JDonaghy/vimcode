@@ -33989,6 +33989,7 @@ fn test_1160_ctrl_x_ctrl_f_completes_filename_in_cwd() {
     press_ctrl(&mut engine, 'f');
     let line0: String = engine.buffer().content.line(0).chars().collect();
     assert_eq!(line0, "vimcode_ctrlxf_target.txt");
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -34012,4 +34013,5 @@ fn test_1160_ctrl_x_ctrl_f_wins_over_ctrl_f_find_replace_binding() {
         !engine.find_replace_open,
         "find/replace must not have opened"
     );
+    let _ = std::fs::remove_dir_all(&dir);
 }

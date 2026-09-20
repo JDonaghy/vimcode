@@ -4263,7 +4263,25 @@ pub fn dispatch_sidebar_panel_key(
 /// `request_full_repaint`-shaped hook. Tracked as an upstream gap alongside
 /// the popup-disappearance clear in `TuiShellApp::render_content`; until it
 /// lands, both backends do the honest thing and request an ordinary redraw.
-pub fn is_force_redraw_key(key_name: &str, unicode: Option<char>, ctrl: bool) -> bool {
+///
+/// `insert_ctrl_x_pending` is `engine.insert_ctrl_x_pending` (only ever true
+/// in the one-keystroke window right after `<C-x>` in Insert mode): right
+/// after `<C-x>`, `<C-x><C-l>` is the whole-line completion sub-mode
+/// (`:h i_CTRL-X_CTRL-L`, #1160), not a repaint request. This rung runs
+/// *before* `Engine::handle_key` is ever called on either backend
+/// (`app.rs`/`shell_app.rs`), so without this carve-out the keystroke never
+/// reaches the engine at all for `<C-x><C-l>` to see it — the same shape of
+/// bug the `<C-x><C-f>` (find/replace) and `<C-x><C-s>` (save) carve-outs
+/// fix inside `Engine::handle_key` itself, just one layer further out.
+pub fn is_force_redraw_key(
+    key_name: &str,
+    unicode: Option<char>,
+    ctrl: bool,
+    insert_ctrl_x_pending: bool,
+) -> bool {
+    if insert_ctrl_x_pending {
+        return false;
+    }
     ctrl && (matches!(unicode, Some('l') | Some('L')) || key_name == "l" || key_name == "L")
 }
 
@@ -30630,14 +30648,26 @@ mod slice7_router_tests {
     #[test]
     fn ctrl_l_is_a_force_redraw_from_either_backends_spelling() {
         // TUI hands a `unicode` char; GTK hands a one-character `key_name`.
-        assert!(is_force_redraw_key("", Some('l'), true));
-        assert!(is_force_redraw_key("", Some('L'), true));
-        assert!(is_force_redraw_key("l", None, true));
-        assert!(is_force_redraw_key("L", None, true));
+        assert!(is_force_redraw_key("", Some('l'), true, false));
+        assert!(is_force_redraw_key("", Some('L'), true, false));
+        assert!(is_force_redraw_key("l", None, true, false));
+        assert!(is_force_redraw_key("L", None, true, false));
         // Without Ctrl, `l` is vim's cursor-right and must fall through —
         // the bug GTK had, where Ctrl+L moved the cursor.
-        assert!(!is_force_redraw_key("l", Some('l'), false));
-        assert!(!is_force_redraw_key("k", Some('k'), true));
+        assert!(!is_force_redraw_key("l", Some('l'), false, false));
+        assert!(!is_force_redraw_key("k", Some('k'), true, false));
+    }
+
+    /// #1160: right after `<C-x>` in Insert mode, `<C-x><C-l>` is the
+    /// whole-line completion sub-mode (`:h i_CTRL-X_CTRL-L`), not a repaint
+    /// request — `insert_ctrl_x_pending = true` must make the same Ctrl+L
+    /// chord that `ctrl_l_is_a_force_redraw_from_either_backends_spelling`
+    /// asserts *is* a force-redraw fall through instead, on both backends'
+    /// key spellings.
+    #[test]
+    fn ctrl_l_falls_through_when_ctrl_x_completion_is_pending() {
+        assert!(!is_force_redraw_key("", Some('l'), true, true));
+        assert!(!is_force_redraw_key("l", None, true, true));
     }
 
     #[test]
