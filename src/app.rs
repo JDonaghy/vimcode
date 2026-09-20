@@ -3602,11 +3602,22 @@ impl App {
     /// the middle of what #766 makes a statement of the frame's *order*.
     /// Deliberately **not** a `FrameOp` rung: these are anchored to the active
     /// window's cursor rather than to a band, and both backends compose them at
-    /// exactly this point (TUI through `shell_app.rs`'s `paint_editor_popups`),
+    /// exactly this point (TUI through `render_impl.rs`'s `paint_editor_popups`),
     /// between the editor band and the bottom band.
     ///
+    /// #1167: the build-adapter → `.layout()` → `backend.draw_*` → cache-
+    /// output part (identical to TUI's `render_impl::paint_editor_popups`,
+    /// modulo coordinate units) now lives once in `render::paint_editor_popups`.
+    /// This method's own job shrank to exactly what stays genuinely
+    /// per-backend: finding the active window and resolving each popup's
+    /// on-screen anchor point from it (gutter width, scroll offsets) in GTK's
+    /// native pixel units (`lh`/`cw`) — cell math instead in TUI's
+    /// `render_impl.rs`.
+    ///
     /// `main` is `AppShellLayout::main_content_bounds` — the clip viewport
-    /// every popup is placed inside.
+    /// every popup but the completion menu and editor-hover popup is placed
+    /// inside; those two clamp to the active window's own rect instead (see
+    /// `render::paint_editor_popups`'s doc for why).
     fn paint_editor_popups_rung(
         &self,
         backend: &mut dyn quadraui::Backend,
@@ -3616,173 +3627,151 @@ impl App {
         lh: f64,
         cw: f64,
     ) {
-        use quadraui::{ScreenLayout as QSL, Surface};
-
-        // ── Draw editor-anchored popups (on top of everything else) ────────────
-        // Completion menu, LSP hover, editor hover (rich markdown), diff peek,
-        // signature help. (#669) Ported from the dead `src/gtk/draw.rs` path —
-        // same class of gap as the breadcrumb note above (#547): the #540
-        // Relm4->ShellApp migration dropped this paint step even though the
-        // engine has populated these `screen.*` fields unchanged the whole
-        // time. Content comes from the same shared `render::` adapters TUI's
-        // `paint_editor_popups` uses (`completion_menu_to_quadraui_completions`,
-        // `hover_popup_to_quadraui_tooltip`, `signature_help_to_quadraui_tooltip`,
-        // `diff_peek_to_quadraui_tooltip`, `editor_hover_popup_paint`); geometry
-        // is expressed in GTK's native pixel units (`lh`/`cw`) rather than TUI's
-        // cell units, which those adapters accept as an explicit `unit_w`/
-        // `unit_h` scale — mirroring how `Completions::layout`/
-        // `RichTextPopup::layout` already take an explicit `line_height`/
-        // `row_height` rather than assuming cells.
-        if let Some(active_win) = screen
+        let active_win = screen
             .windows
             .iter()
-            .find(|w| w.window_id == screen.active_window_id)
-        {
-            let gutter_w = active_win.gutter_char_width as f64 * cw;
-            let h_scroll = active_win.scroll_left as f64 * cw;
-            let win_x = active_win.rect.x;
-            let win_y = active_win.rect.y;
-            let win_viewport = quadraui::Rect::new(
+            .find(|w| w.window_id == screen.active_window_id);
+
+        let win_viewport = active_win.map(|active_win| {
+            quadraui::Rect::new(
                 active_win.rect.x as f32,
                 active_win.rect.y as f32,
                 active_win.rect.width as f32,
                 active_win.rect.height as f32,
-            );
+            )
+        });
 
-            // Completion popup — cache the layout so the click handler
-            // (B.5b Stage 5) can hit-test items and register the popup on
-            // the modal stack.
-            *self.completion_layout.borrow_mut() = None;
-            if let (Some(menu), Some((cursor_pos, _))) = (&screen.completion, &active_win.cursor) {
-                let cursor_x = win_x + gutter_w + cursor_pos.col as f64 * cw - h_scroll;
-                let cursor_y = win_y + cursor_pos.view_line as f64 * lh;
-                // Longest candidate + 2 cells of padding/border, floored at
-                // 100px.
-                //
-                // #420: `Completions::layout` clamps the popup's *position*
-                // into `win_viewport` (`x.max(viewport.x)`) but never
-                // clamps `popup_w` itself, so a long enough candidate label
-                // can still render past the window's own right edge even
-                // once positioned as far left as it can go. That's a gap in
-                // the shared `quadraui::Completions::layout` primitive
-                // (it already clips height the same way, via `clipped_h`),
-                // not something to patch around per-backend — see the
-                // Platform-Neutrality Rule. Tracked as a follow-up pending
-                // a quadraui-side fix rather than duplicating a `.min(...)`
-                // clamp here and in `tui_main::render_impl`.
-                let popup_w = ((menu.max_width + 2) as f64 * cw).max(100.0);
-                let max_popup_h = 10.0 * lh;
-                let completions = render::completion_menu_to_quadraui_completions(menu);
-                let q_layout = completions.layout(
-                    cursor_x as f32,
-                    cursor_y as f32,
-                    lh as f32,
-                    win_viewport,
-                    popup_w as f32,
-                    max_popup_h as f32,
-                    |_| quadraui::CompletionItemMeasure::new(lh as f32),
-                );
-                let mut frame = QSL::new();
-                frame.push(Surface::Completions {
-                    completions: &completions,
-                    layout: &q_layout,
-                });
-                frame.draw(backend);
-                *self.completion_layout.borrow_mut() = Some(q_layout);
-            }
+        // Completion popup anchor — cache the layout so the click handler
+        // (B.5b Stage 5) can hit-test items and register the popup on the
+        // modal stack.
+        let completion = active_win.and_then(|active_win| {
+            let menu = screen.completion.as_ref()?;
+            let (cursor_pos, _) = active_win.cursor.as_ref()?;
+            let gutter_w = active_win.gutter_char_width as f64 * cw;
+            let h_scroll = active_win.scroll_left as f64 * cw;
+            let win_x = active_win.rect.x;
+            let win_y = active_win.rect.y;
+            let cursor_x = win_x + gutter_w + cursor_pos.col as f64 * cw - h_scroll;
+            let cursor_y = win_y + cursor_pos.view_line as f64 * lh;
+            // Longest candidate + 2 cells of padding/border, floored at
+            // 100px.
+            //
+            // #420: `Completions::layout` clamps the popup's *position*
+            // into `win_viewport` (`x.max(viewport.x)`) but never clamps
+            // `popup_w` itself, so a long enough candidate label can still
+            // render past the window's own right edge even once positioned
+            // as far left as it can go. That's a gap in the shared
+            // `quadraui::Completions::layout` primitive (it already clips
+            // height the same way, via `clipped_h`), not something to patch
+            // around per-backend — see the Platform-Neutrality Rule.
+            // Tracked as a follow-up pending a quadraui-side fix rather than
+            // duplicating a `.min(...)` clamp here and in
+            // `tui_main::render_impl`.
+            let popup_w = ((menu.max_width + 2) as f64 * cw).max(100.0);
+            let max_popup_h = 10.0 * lh;
+            Some((
+                render::PopupAnchor {
+                    x: cursor_x as f32,
+                    y: cursor_y as f32,
+                    viewport: win_viewport?,
+                },
+                popup_w as f32,
+                max_popup_h as f32,
+            ))
+        });
 
-            // Simple LSP hover popup (plain text, non-interactive).
-            if let Some(ref hover) = screen.hover {
-                let anchor_view = hover.anchor_line.saturating_sub(active_win.scroll_top) as f64;
-                let anchor_x = win_x + gutter_w + hover.anchor_col as f64 * cw - h_scroll;
-                let anchor_y = win_y + anchor_view * lh;
-                let (tooltip, tip_layout) = render::hover_popup_to_quadraui_tooltip(
-                    hover,
-                    anchor_x as f32,
-                    anchor_y as f32,
-                    main,
-                    cw as f32,
-                    lh as f32,
-                );
-                let mut frame = QSL::new();
-                frame.push(Surface::Tooltip {
-                    tooltip: &tooltip,
-                    layout: &tip_layout,
-                });
-                frame.draw(backend);
-            }
+        // Simple LSP hover popup anchor (plain text, non-interactive).
+        let hover = active_win.and_then(|active_win| {
+            let hover = screen.hover.as_ref()?;
+            let gutter_w = active_win.gutter_char_width as f64 * cw;
+            let h_scroll = active_win.scroll_left as f64 * cw;
+            let win_x = active_win.rect.x;
+            let win_y = active_win.rect.y;
+            let anchor_view = hover.anchor_line.saturating_sub(active_win.scroll_top) as f64;
+            let anchor_x = win_x + gutter_w + hover.anchor_col as f64 * cw - h_scroll;
+            let anchor_y = win_y + anchor_view * lh;
+            Some(render::PopupAnchor {
+                x: anchor_x as f32,
+                y: anchor_y as f32,
+                viewport: main,
+            })
+        });
 
-            // Signature-help popup (insert mode, cursor inside a call).
-            if let Some(ref sig) = screen.signature_help {
-                let anchor_view = sig.anchor_line.saturating_sub(active_win.scroll_top) as f64;
-                let anchor_x = win_x + gutter_w + sig.anchor_col as f64 * cw - h_scroll;
-                let anchor_y = win_y + anchor_view * lh;
-                let (tooltip, tip_layout) = render::signature_help_to_quadraui_tooltip(
-                    sig,
-                    anchor_x as f32,
-                    anchor_y as f32,
-                    main,
-                    theme,
-                    cw as f32,
-                    lh as f32,
-                );
-                let mut frame = QSL::new();
-                frame.push(Surface::Tooltip {
-                    tooltip: &tooltip,
-                    layout: &tip_layout,
-                });
-                frame.draw(backend);
-            }
+        // Signature-help popup anchor (insert mode, cursor inside a call).
+        let signature_help = active_win.and_then(|active_win| {
+            let sig = screen.signature_help.as_ref()?;
+            let gutter_w = active_win.gutter_char_width as f64 * cw;
+            let h_scroll = active_win.scroll_left as f64 * cw;
+            let win_x = active_win.rect.x;
+            let win_y = active_win.rect.y;
+            let anchor_view = sig.anchor_line.saturating_sub(active_win.scroll_top) as f64;
+            let anchor_x = win_x + gutter_w + sig.anchor_col as f64 * cw - h_scroll;
+            let anchor_y = win_y + anchor_view * lh;
+            Some(render::PopupAnchor {
+                x: anchor_x as f32,
+                y: anchor_y as f32,
+                viewport: main,
+            })
+        });
 
-            // Diff-peek popup (inline git hunk preview).
-            if let Some(ref peek) = screen.diff_peek {
-                let anchor_view = peek.anchor_line.saturating_sub(active_win.scroll_top) as f64;
-                let anchor_x = win_x + gutter_w;
-                let anchor_y = win_y + anchor_view * lh;
-                let (tooltip, tip_layout) = render::diff_peek_to_quadraui_tooltip(
-                    peek,
-                    anchor_x as f32,
-                    anchor_y as f32,
-                    main,
-                    theme,
-                    cw as f32,
-                    lh as f32,
-                );
-                let mut frame = QSL::new();
-                frame.push(Surface::Tooltip {
-                    tooltip: &tooltip,
-                    layout: &tip_layout,
-                });
-                frame.draw(backend);
-            }
+        // Diff-peek popup anchor (inline git hunk preview).
+        let diff_peek = active_win.and_then(|active_win| {
+            let peek = screen.diff_peek.as_ref()?;
+            let gutter_w = active_win.gutter_char_width as f64 * cw;
+            let win_x = active_win.rect.x;
+            let win_y = active_win.rect.y;
+            let anchor_view = peek.anchor_line.saturating_sub(active_win.scroll_top) as f64;
+            let anchor_x = win_x + gutter_w;
+            let anchor_y = win_y + anchor_view * lh;
+            Some(render::PopupAnchor {
+                x: anchor_x as f32,
+                y: anchor_y as f32,
+                viewport: main,
+            })
+        });
 
-            // Editor hover popup (rich markdown; `gh` key, diagnostic/
-            // annotation/plugin hovers, or mouse dwell). Bounds/link rects/
-            // scrollbar geometry are cached for the click + drag handlers
-            // (#215), same as `draw.rs::draw_editor_hover_popup` did.
-            self.editor_hover_popup_rect.set(None);
-            self.editor_hover_link_rects.borrow_mut().clear();
-            self.editor_hover_scrollbar.set(None);
-            if let Some(ref eh) = screen.editor_hover {
-                let anchor_view = eh.anchor_line.saturating_sub(eh.frozen_scroll_top) as f64;
-                let vis_col = eh.anchor_col.saturating_sub(eh.frozen_scroll_left) as f64;
-                let anchor_x = win_x + gutter_w + vis_col * cw;
-                let anchor_y = win_y + anchor_view * lh;
-                let (links, rect, sb) = render::editor_hover_popup_paint(
-                    backend,
-                    eh,
-                    anchor_x as f32,
-                    anchor_y as f32,
-                    win_viewport,
-                    theme,
-                    cw as f32,
-                    lh as f32,
-                );
-                self.editor_hover_popup_rect.set(rect);
-                *self.editor_hover_link_rects.borrow_mut() = links;
-                self.editor_hover_scrollbar.set(sb);
-            }
-        }
+        // Editor hover popup anchor (rich markdown; `gh` key, diagnostic/
+        // annotation/plugin hovers, or mouse dwell). Bounds/link rects/
+        // scrollbar geometry are cached for the click + drag handlers
+        // (#215), same as `draw.rs::draw_editor_hover_popup` did.
+        let editor_hover = active_win.and_then(|active_win| {
+            let eh = screen.editor_hover.as_ref()?;
+            let gutter_w = active_win.gutter_char_width as f64 * cw;
+            let win_x = active_win.rect.x;
+            let win_y = active_win.rect.y;
+            let anchor_view = eh.anchor_line.saturating_sub(eh.frozen_scroll_top) as f64;
+            let vis_col = eh.anchor_col.saturating_sub(eh.frozen_scroll_left) as f64;
+            let anchor_x = win_x + gutter_w + vis_col * cw;
+            let anchor_y = win_y + anchor_view * lh;
+            Some(render::PopupAnchor {
+                x: anchor_x as f32,
+                y: anchor_y as f32,
+                viewport: win_viewport?,
+            })
+        });
+
+        let mut completion_layout = self.completion_layout.borrow_mut();
+        let mut editor_hover_link_rects = self.editor_hover_link_rects.borrow_mut();
+        let mut editor_hover_popup_rect = self.editor_hover_popup_rect.get();
+        let mut editor_hover_scrollbar = self.editor_hover_scrollbar.get();
+        render::paint_editor_popups(
+            backend,
+            screen,
+            theme,
+            cw as f32,
+            lh as f32,
+            completion,
+            hover,
+            editor_hover,
+            diff_peek,
+            signature_help,
+            &mut completion_layout,
+            &mut editor_hover_link_rects,
+            &mut editor_hover_popup_rect,
+            &mut editor_hover_scrollbar,
+        );
+        self.editor_hover_popup_rect.set(editor_hover_popup_rect);
+        self.editor_hover_scrollbar.set(editor_hover_scrollbar);
     }
 
     /// Per-frame state pushes that must happen before anything is composed.

@@ -885,52 +885,6 @@ pub(super) fn render_panel_hover_popup(
     (link_rects, Some(layout.bounds))
 }
 
-// ─── Editor hover popup ─────────────────────────────────────────────────────
-
-/// Render an editor hover popup via the shared `render::editor_hover_popup_paint`
-/// (#831) — this used to be its own ~90-line copy of that function's
-/// `RichTextPopup::layout` + hit-region-extraction, differing from GTK's only
-/// in rounding the result to `u16` cells instead of keeping `quadraui::Rect`'s
-/// native `f32`. Now that the caches on both backends are `quadraui::Rect`
-/// (there is no unit parameter in quadraui's layout API — TUI's cell
-/// coordinates and GTK's pixel coordinates are both plain `f32`), TUI calls
-/// the exact same paint step GTK does, with `unit_w`/`unit_h` = `1.0, 1.0`.
-///
-/// `backend` is `&mut dyn quadraui::Backend` (not the concrete `TuiBackend`)
-/// so this is callable from `TuiShellApp::render_content` (#601) — see
-/// `render_impl.rs::render_tab_bar`'s doc comment for the general rationale.
-#[allow(clippy::type_complexity)]
-pub(super) fn render_editor_hover_popup(
-    backend: &mut dyn quadraui::Backend,
-    eh: &render::EditorHoverPopupData,
-    popup_x: u16,
-    popup_y: u16,
-    term_area: Rect,
-    theme: &Theme,
-) -> (
-    Vec<(quadraui::Rect, String)>,
-    Option<quadraui::Rect>,
-    Option<render::PopupScrollbarHit>,
-) {
-    let viewport = quadraui::Rect::new(
-        term_area.x as f32,
-        term_area.y as f32,
-        term_area.width as f32,
-        term_area.height as f32,
-    );
-    backend.set_theme(super::quadraui_tui::q_theme(theme));
-    render::editor_hover_popup_paint(
-        backend,
-        eh,
-        popup_x as f32,
-        popup_y as f32,
-        viewport,
-        theme,
-        1.0,
-        1.0,
-    )
-}
-
 // ─── Extensions sidebar panel ─────────────────────────────────────────────────
 
 /// Render the Extensions sidebar panel.
