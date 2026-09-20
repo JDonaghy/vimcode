@@ -2271,6 +2271,16 @@ impl Engine {
             return EngineAction::None;
         }
 
+        // Handle `:digraphs` (`:h :digraphs`, #1160): with no arguments,
+        // lists the digraph table; with `{char1}{char2} {number} ...`
+        // arguments, defines a user digraph (`:h :dig`/`:h digraph-usage`).
+        // `:digraph` is the same command — both spellings normalize to
+        // "digraphs" via `EX_ABBREVS`.
+        if cmd == "digraphs" || cmd.starts_with("digraphs ") {
+            let args = cmd.strip_prefix("digraphs").unwrap_or("").trim();
+            return self.ex_digraphs(args);
+        }
+
         match cmd {
             "write" => {
                 let _ = self.save_with_format(false);

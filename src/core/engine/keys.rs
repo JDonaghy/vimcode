@@ -337,8 +337,11 @@ impl Engine {
             return EngineAction::None;
         }
 
-        // Ctrl-S: save in any mode (does not change mode).
-        if ctrl && key_name == "s" {
+        // Ctrl-S: save in any mode (does not change mode) — except right
+        // after `<C-x>` in Insert mode, where `<C-x><C-s>` is the
+        // spelling-suggestion completion sub-mode (`:h i_CTRL-X_CTRL-S`,
+        // #1160), not save.
+        if ctrl && key_name == "s" && !(self.mode == Mode::Insert && self.insert_ctrl_x_pending) {
             if let Err(e) = self.save_with_format(false) {
                 self.message = format!("Save failed: {}", e);
             }
@@ -438,6 +441,8 @@ impl Engine {
         }
 
         // Ctrl+F: open find/replace from any mode (Visual captures the selection)
+        // — except right after `<C-x>` in Insert mode, where `<C-x><C-f>` is
+        // filename completion (`:h i_CTRL-X_CTRL-F`, #1160), not find/replace.
         if ctrl
             && key_name == "f"
             && self.settings.ctrl_f_action() == "find"
@@ -445,6 +450,7 @@ impl Engine {
                 self.mode,
                 Mode::Visual | Mode::VisualLine | Mode::VisualBlock | Mode::Insert
             )
+            && !(self.mode == Mode::Insert && self.insert_ctrl_x_pending)
         {
             self.open_find_replace();
             return EngineAction::None;
@@ -6023,6 +6029,94 @@ impl Engine {
         // key ends the run.
         if key_name != "Down" && key_name != "Up" {
             self.insert_vertical_want_col = None;
+        }
+
+        // ── Ctrl-X: completion submode dispatch (`:h i_CTRL-X`, #1160) ───────
+        // Checked before Ctrl-K digraph entry below so `<C-x><C-k>`
+        // (dictionary completion) isn't swallowed by the digraph-entry
+        // trigger, which also fires on a bare `<C-k>`.
+        if ctrl && key_name == "x" && !self.insert_ctrl_x_pending {
+            self.insert_ctrl_x_pending = true;
+            return;
+        }
+        if self.insert_ctrl_x_pending {
+            self.insert_ctrl_x_pending = false;
+            if ctrl {
+                match key_name {
+                    "n" => self.ctrl_x_keyword_completion(true, changed),
+                    "p" => self.ctrl_x_keyword_completion(false, changed),
+                    "l" => self.ctrl_x_line_completion(changed),
+                    "f" => self.ctrl_x_filename_completion(changed),
+                    "k" => self.ctrl_x_dictionary_completion(changed),
+                    "s" => self.ctrl_x_spell_completion(changed),
+                    "o" => {
+                        // Omni completion: no separate omni source exists in
+                        // vimcode, so this delegates to the same manual
+                        // completion trigger Ctrl-Space uses (buffer words +
+                        // async LSP candidates), matching `i_CTRL-X_CTRL-O`'s
+                        // usual real-world behavior (LSP-backed omnifunc).
+                        self.trigger_completion(true);
+                    }
+                    "t" => {
+                        // Thesaurus: no `'thesaurus'` file is bundled or
+                        // configurable yet.
+                        self.message = "E756: No thesaurus file".to_string();
+                    }
+                    "bracketright" | "]" => {
+                        // Tags: no ctags/tag-jump subsystem exists yet.
+                        self.message = "E433: No tags file".to_string();
+                    }
+                    "i" => {
+                        // Included files: no include-path resolution exists yet.
+                        self.message = "E387: No included files".to_string();
+                    }
+                    "v" => {
+                        // Command-line completion: not supported.
+                        self.message = "Command-line completion not supported".to_string();
+                    }
+                    "e" => {
+                        // `:h i_CTRL-X_CTRL-E`: "like using CTRL-E in Normal
+                        // mode" — scroll the window down one line (fold-aware)
+                        // without changing the selected completion match.
+                        let count = self.take_count();
+                        self.scroll_viewport_with_cursor(1, count);
+                    }
+                    "y" => {
+                        // `:h i_CTRL-X_CTRL-Y`: mirrors Normal-mode Ctrl-Y —
+                        // scroll the window up one line.
+                        let count = self.take_count();
+                        self.scroll_viewport_with_cursor(-1, count);
+                    }
+                    _ => {}
+                }
+            }
+            return;
+        }
+
+        // ── Ctrl-K: digraph entry (`:h i_CTRL-K`, #1160) ──────────────────────
+        // Checked after the Ctrl-X block above (see its comment) so
+        // `<C-x><C-k>` reaches dictionary completion rather than digraph
+        // entry. Otherwise takes priority over everything else so the two
+        // characters typed after `<C-k>` (often themselves punctuation like
+        // `:`, `'`, `>`) aren't intercepted by an unrelated binding below.
+        if ctrl && key_name == "k" && self.insert_ctrl_k_pending.is_none() {
+            self.insert_ctrl_k_pending = Some(None);
+            return;
+        }
+        if let Some(state) = self.insert_ctrl_k_pending {
+            match state {
+                None => {
+                    // Waiting for the first of the two digraph characters.
+                    self.insert_ctrl_k_pending = unicode.map(Some);
+                }
+                Some(c1) => {
+                    self.insert_ctrl_k_pending = None;
+                    if let Some(c2) = unicode {
+                        self.insert_digraph(c1, c2, changed);
+                    }
+                }
+            }
+            return;
         }
 
         // ── Configured completion trigger (e.g. Ctrl-Space) ──────────────────

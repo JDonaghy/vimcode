@@ -6,6 +6,7 @@ pub mod comment;
 pub mod cursor;
 pub mod dap;
 pub mod dap_manager;
+pub mod digraphs;
 pub mod engine;
 pub mod extensions;
 pub mod git;

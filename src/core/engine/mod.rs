@@ -303,6 +303,7 @@ static EX_ABBREVS: &[(&str, usize)] = &[
     ("cwindow", 2),
     ("delete", 1),
     ("delmarks", 4),
+    ("digraphs", 3),
     ("display", 2),
     ("echo", 2),
     ("edit", 1),
@@ -3746,6 +3747,19 @@ pub struct Engine {
     /// When true, the next keypress in Insert (or Replace) mode inserts a register's content.
     pub insert_ctrl_r_pending: bool,
     pub insert_ctrl_g_pending: bool,
+    /// `<C-k>` digraph entry (`:h digraphs`, #1160). `None` when not
+    /// entering a digraph; `Some(None)` right after `<C-k>` itself (waiting
+    /// for the first of the two digraph characters); `Some(Some(c1))` after
+    /// the first character has been typed (waiting for the second).
+    pub insert_ctrl_k_pending: Option<Option<char>>,
+    /// `<C-x>` completion submode (`:h i_CTRL-X`, #1160): true right after
+    /// `<C-x>` while waiting for the sub-mode selector key
+    /// (`<C-x><C-n>`/`<C-x><C-f>`/etc).
+    pub insert_ctrl_x_pending: bool,
+    /// User-defined digraphs added via `:digraph {char1}{char2} {number}`
+    /// (`:h digraph-usage`). Consulted before the builtin table so a user
+    /// override wins; keyed in the order the two characters were typed.
+    pub custom_digraphs: HashMap<(char, char), char>,
     /// When true, after one Normal-mode command, auto-return to Insert mode (Ctrl-O).
     pub insert_ctrl_o_active: bool,
     /// Column of the `'backspace'` `"start"` / Ctrl-U boundary (`:h
@@ -4592,6 +4606,9 @@ impl Engine {
             showmatch_flash: None,
             insert_ctrl_r_pending: false,
             insert_ctrl_g_pending: false,
+            insert_ctrl_k_pending: None,
+            insert_ctrl_x_pending: false,
+            custom_digraphs: HashMap::new(),
             insert_ctrl_o_active: false,
             insert_enter_col: 0,
             insert_enter_line: 0,
@@ -5569,6 +5586,7 @@ mod acp_ops;
 mod buffers;
 mod dap_ops;
 pub use dap_ops::DEBUG_BUTTON_IDS;
+mod digraph_ops;
 mod explorer_ops;
 pub use explorer_ops::ExplorerKeyResult;
 mod execute;

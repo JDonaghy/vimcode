@@ -33796,3 +33796,220 @@ fn test_1206_timeoutlen_zero_disables_the_timed_wait() {
     );
     assert!(!engine.tick_keymap_timeout());
 }
+
+// ── #1160: insert-mode digraphs (<C-k>) and the <C-x> completion submode ──
+
+#[test]
+fn test_1160_ctrl_k_inserts_digraph() {
+    let mut engine = engine_with_text("");
+    press_char(&mut engine, 'i');
+    press_ctrl(&mut engine, 'k');
+    press_char(&mut engine, 'a');
+    press_char(&mut engine, ':');
+    let line0: String = engine.buffer().content.line(0).chars().collect();
+    assert_eq!(line0, "ä");
+}
+
+#[test]
+fn test_1160_ctrl_k_unknown_pair_leaves_buffer_untouched_and_reports() {
+    let mut engine = engine_with_text("");
+    press_char(&mut engine, 'i');
+    press_ctrl(&mut engine, 'k');
+    press_char(&mut engine, 'q');
+    press_char(&mut engine, 'q');
+    let line0: String = engine.buffer().content.line(0).chars().collect();
+    assert_eq!(line0, "");
+    assert!(engine.message.contains("E790"), "{}", engine.message);
+}
+
+#[test]
+fn test_1160_ctrl_k_custom_digraph_from_ex_command() {
+    let mut engine = engine_with_text("");
+    engine.execute_command("digraph zz 9733"); // ★
+    press_char(&mut engine, 'i');
+    press_ctrl(&mut engine, 'k');
+    press_char(&mut engine, 'z');
+    press_char(&mut engine, 'z');
+    let line0: String = engine.buffer().content.line(0).chars().collect();
+    assert_eq!(line0, "★");
+}
+
+#[test]
+fn test_1160_digraphs_ex_command_via_min_abbreviation() {
+    // `:dig` is Vim's minimum abbreviation for `:digraphs`.
+    let mut engine = engine_with_text("");
+    engine.execute_command("dig");
+    assert!(engine.message.contains("a: ä"), "{}", engine.message);
+}
+
+#[test]
+fn test_1160_ctrl_x_ctrl_l_completes_whole_line() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "hello world\nhel");
+    press_char(&mut engine, 'G');
+    press_char(&mut engine, 'A');
+    press_ctrl(&mut engine, 'x');
+    press_ctrl(&mut engine, 'l');
+    let line1: String = engine.buffer().content.line(1).chars().collect();
+    assert_eq!(line1, "hello world");
+}
+
+#[test]
+fn test_1160_ctrl_x_ctrl_n_completes_keyword_in_current_buffer() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "foobar\nfoo");
+    press_char(&mut engine, 'G');
+    press_char(&mut engine, 'A');
+    press_ctrl(&mut engine, 'x');
+    press_ctrl(&mut engine, 'n');
+    let line1: String = engine.buffer().content.line(1).chars().collect();
+    assert!(
+        line1.starts_with("foobar"),
+        "<C-x><C-n> should complete to foobar, got: {line1}"
+    );
+}
+
+#[test]
+fn test_1160_ctrl_x_ctrl_k_completes_from_bundled_dictionary() {
+    let mut engine = engine_with_text("hous");
+    press_char(&mut engine, 'A');
+    press_ctrl(&mut engine, 'x');
+    press_ctrl(&mut engine, 'k');
+    let line0: String = engine.buffer().content.line(0).chars().collect();
+    // Candidates are sorted byte-wise, so a capitalized proper noun already
+    // in the bundled dictionary (e.g. "House", "Houston") can sort ahead of
+    // the plain lowercase word — case-insensitive compare is the real
+    // assertion here, not "which candidate happened to sort first".
+    assert!(
+        line0.eq_ignore_ascii_case("house"),
+        "expected a case-insensitive match for house, got {line0:?}"
+    );
+}
+
+#[test]
+fn test_1160_ctrl_x_ctrl_s_suggests_spelling_fix() {
+    let mut engine = engine_with_text("helo");
+    engine.settings.spell = true;
+    press_char(&mut engine, 'A');
+    press_ctrl(&mut engine, 'x');
+    press_ctrl(&mut engine, 's');
+    let line0: String = engine.buffer().content.line(0).chars().collect();
+    assert_ne!(
+        line0, "helo",
+        "spelling-suggestion completion should replace the misspelled word"
+    );
+    assert!(!line0.is_empty());
+}
+
+#[test]
+fn test_1160_ctrl_x_ctrl_s_without_spell_option_reports_message() {
+    let mut engine = engine_with_text("helo");
+    press_char(&mut engine, 'A');
+    press_ctrl(&mut engine, 'x');
+    press_ctrl(&mut engine, 's');
+    let line0: String = engine.buffer().content.line(0).chars().collect();
+    assert_eq!(line0, "helo");
+    assert!(engine.message.contains("Spell checking is off"));
+}
+
+#[test]
+fn test_1160_ctrl_x_ctrl_o_delegates_to_manual_completion_trigger() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "foobar\nfoo");
+    press_char(&mut engine, 'G');
+    press_char(&mut engine, 'A');
+    press_ctrl(&mut engine, 'x');
+    press_ctrl(&mut engine, 'o');
+    assert!(
+        engine.completion_candidates.iter().any(|c| c == "foobar"),
+        "{:?}",
+        engine.completion_candidates
+    );
+}
+
+#[test]
+fn test_1160_ctrl_x_ctrl_e_and_ctrl_y_scroll_the_window() {
+    let mut engine = Engine::new();
+    let mut buf = String::new();
+    for i in 0..50 {
+        buf.push_str(&format!("line {i}\n"));
+    }
+    engine.buffer_mut().insert(0, &buf);
+    engine.view_mut().viewport_lines = 10;
+    // Put the cursor inside the intended scrolled viewport *before* entering
+    // Insert mode: entering Insert calls `ensure_cursor_visible`, which would
+    // otherwise snap a scroll position chosen independently of the cursor
+    // straight back to wherever the cursor already is.
+    engine.view_mut().cursor.line = 8;
+    engine.view_mut().scroll_top = 5;
+    press_char(&mut engine, 'i');
+    assert_eq!(
+        engine.view().scroll_top,
+        5,
+        "sanity: entering Insert must not itself have moved the viewport"
+    );
+    press_ctrl(&mut engine, 'x');
+    press_ctrl(&mut engine, 'e');
+    assert_eq!(engine.view().scroll_top, 6);
+    press_ctrl(&mut engine, 'x');
+    press_ctrl(&mut engine, 'y');
+    assert_eq!(engine.view().scroll_top, 5);
+}
+
+#[test]
+fn test_1160_ctrl_x_unbacked_submodes_report_and_do_not_panic() {
+    for (key, needle) in [
+        ('t', "E756"),
+        (']', "E433"),
+        ('i', "E387"),
+        ('v', "Command-line completion not supported"),
+    ] {
+        let mut engine = engine_with_text("");
+        press_char(&mut engine, 'i');
+        press_ctrl(&mut engine, 'x');
+        press_ctrl(&mut engine, key);
+        assert!(
+            engine.message.contains(needle),
+            "key {key:?}: message was {:?}",
+            engine.message
+        );
+    }
+}
+
+#[test]
+fn test_1160_ctrl_x_ctrl_f_completes_filename_in_cwd() {
+    let dir = std::env::temp_dir().join("vimcode_test_1160_ctrl_x_ctrl_f");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("vimcode_ctrlxf_target.txt"), "").unwrap();
+
+    let mut engine = engine_with_text("vimcode_ctrlxf_targ");
+    engine.cwd = dir.clone();
+    press_char(&mut engine, 'A');
+    press_ctrl(&mut engine, 'x');
+    press_ctrl(&mut engine, 'f');
+    let line0: String = engine.buffer().content.line(0).chars().collect();
+    assert_eq!(line0, "vimcode_ctrlxf_target.txt");
+}
+
+#[test]
+fn test_1160_ctrl_x_ctrl_f_wins_over_ctrl_f_find_replace_binding() {
+    // VSCode-mode's default `ctrl_f_action` is "find" (opens find/replace on
+    // a bare `<C-f>` in Insert mode) — `<C-x><C-f>` must still reach filename
+    // completion instead of being swallowed by that global binding (#1160).
+    let dir = std::env::temp_dir().join("vimcode_test_1160_ctrl_x_ctrl_f_vscode");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("vimcode_ctrlxf_vscode_target.txt"), "").unwrap();
+
+    let mut engine = engine_with_text("vimcode_ctrlxf_vscode_targ");
+    engine.cwd = dir.clone();
+    engine.settings.ctrl_f_action = Some("find".to_string());
+    press_char(&mut engine, 'A');
+    press_ctrl(&mut engine, 'x');
+    press_ctrl(&mut engine, 'f');
+    let line0: String = engine.buffer().content.line(0).chars().collect();
+    assert_eq!(line0, "vimcode_ctrlxf_vscode_target.txt");
+    assert!(
+        !engine.find_replace_open,
+        "find/replace must not have opened"
+    );
+}
