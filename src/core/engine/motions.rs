@@ -3420,6 +3420,21 @@ impl Engine {
         })
     }
 
+    /// Is the current mode a Visual variant that gets one extra column of
+    /// rightward slack before Normal mode's clamp would kick in (`Visual`,
+    /// `VisualBlock` — not `VisualLine`, where individual-column clamping
+    /// isn't meaningful)? Verified against real Neovim 0.12.5: from the
+    /// last real character of a line, in Visual mode, a single rightward
+    /// press (`<Space>`/`l`/`<Right>`) lands one column *past* it — still
+    /// the same line — and only a second press actually crosses into the
+    /// next line. `move_right_whichwrap`/`move_left_whichwrap` are the only
+    /// two whichwrap entry points, so this is handled locally in both
+    /// rather than in the shared `move_right`/`move_left` primitives other,
+    /// Normal-mode-only call sites rely on (#1206 review).
+    fn visual_wrap_slack(&self) -> usize {
+        usize::from(matches!(self.mode, Mode::Visual | Mode::VisualBlock))
+    }
+
     /// Normal/Visual-mode "move left", wrapping to the end of the previous
     /// line when at column 0 and `'whichwrap'` includes `token` (#1206).
     /// Shared by `h` (`token = 'h'`), `<BS>` (`token = 'b'`), and `<Left>`
@@ -3430,8 +3445,9 @@ impl Engine {
             let line = self.view().cursor.line;
             if line > 0 && self.whichwrap_allows(token) {
                 let prev = line - 1;
+                let landing = self.get_max_cursor_col(prev) + self.visual_wrap_slack();
                 self.view_mut().cursor.line = prev;
-                self.view_mut().cursor.col = self.get_max_cursor_col(prev);
+                self.view_mut().cursor.col = landing;
             }
             return;
         }
@@ -3444,14 +3460,23 @@ impl Engine {
     /// `<Right>` (`token = '>'`) — see [`Self::move_left_whichwrap`].
     pub(crate) fn move_right_whichwrap(&mut self, token: char) {
         let line = self.view().cursor.line;
-        let max_col =
+        let normal_max =
             self.get_max_cursor_col(line) + usize::from(self.settings.virtualedit_allows_onemore());
-        if self.view().cursor.col >= max_col {
+        let max_col = normal_max + self.visual_wrap_slack();
+        let col = self.view().cursor.col;
+        if col >= max_col {
             let max_line = self.buffer().len_lines().saturating_sub(1);
             if line < max_line && self.whichwrap_allows(token) {
                 self.view_mut().cursor.line = line + 1;
                 self.view_mut().cursor.col = 0;
             }
+            return;
+        }
+        if col >= normal_max {
+            // The Visual-only extra column: `move_right()` itself won't
+            // step past `normal_max` (its own clamp is Normal-mode-only),
+            // so advance directly onto it.
+            self.view_mut().cursor.col = col + 1;
             return;
         }
         self.move_right();
@@ -3791,9 +3816,15 @@ impl Engine {
 
     /// Does `'backspace'` allow BackSpace to delete the character just
     /// before `(line, col)`? Only ever restrictive when `(line, col)` is at
-    /// or before the position where the current Insert session began — the
-    /// `"start"` token (`:h 'backspace'`, #1206). Everywhere else BackSpace
-    /// is unrestricted regardless of `'backspace'`.
+    /// or before `insert_enter_line`/`insert_enter_col` — the `"start"`
+    /// token (`:h 'backspace'`, #1206). That anchor is not fixed at Insert
+    /// entry: `split_insert_undo_group` re-anchors it to the cursor's
+    /// position on every arrow/Home/End keypress (mirroring Vim's
+    /// `stop_arrow()`), so navigating onto a pre-existing line — even one
+    /// this Insert session never typed on — blocks BackSpace there just
+    /// like real Vim, while freely-typed text (including across a `<CR>`
+    /// the session itself inserted) stays deletable up to the last place
+    /// the cursor was moved to non-destructively.
     pub(crate) fn backspace_may_delete_before(&self, line: usize, col: usize) -> bool {
         self.settings.backspace_allows("start")
             || line != self.insert_enter_line

@@ -6510,6 +6510,39 @@ const CASES_OPT: &[Case] = &[
         "i<BS><Esc>",
         "vim.o.backspace = 'indent,eol,start'",
     ),
+    // Review finding (#1206 iteration 1): without "start", BackSpace must
+    // be refused outright once the cursor has moved (even just an <Up>,
+    // no typing) onto a line the current Insert session never touched —
+    // not only the exact line Insert was entered on. Before this fix,
+    // `backspace_may_delete_before`'s `line != insert_enter_line` check
+    // was true for ANY line other than the literal entry line, so it
+    // wrongly allowed deleting into "AAAA" here. Verified RED against
+    // unfixed `develop` via a local revert of the `split_insert_undo_group`
+    // re-anchoring fix (`git stash`-equivalent revert + rerun), which
+    // failed BUF: vimcode produced "AAA\nBBBB\nCCCC" (deleted the trailing
+    // 'A') while real Neovim left the buffer untouched.
+    cs(
+        "opt:backspace without start blocks BS after cursor moves off the typed line",
+        &["AAAA", "BBBB", "CCCC"],
+        2,
+        3,
+        "i<Up><BS><Esc>",
+        "vim.o.backspace = 'indent,eol'",
+    ),
+    // Non-blocking review finding (#1206 iteration 1): `'whichwrap'`'s
+    // `<BS>`/`<Space>` `"b"`/`"s"` tokens were only wired into
+    // `handle_normal_key`'s "BackSpace"/"space"/"Space" arms — Visual mode
+    // (a separate match, not falling through to Normal-mode handling) had
+    // no arm for either key at all, so `<BS>` in Visual mode stayed a
+    // silent no-op even with the default `'whichwrap'` (`"b,s"`).
+    cs(
+        "opt:whichwrap Visual-mode <BS> wraps like Normal-mode h",
+        &["ab", "cd"],
+        2,
+        1,
+        "v<BS>d",
+        "vim.o.whichwrap = 'b,s'",
+    ),
 ];
 
 // ─────────────────── H. multi-file jumplist (#985) ───────────────────

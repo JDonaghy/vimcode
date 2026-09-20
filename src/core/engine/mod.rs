@@ -2644,6 +2644,12 @@ pub struct Engine {
     pub wildmenu_selected: Option<usize>,
     /// Original command buffer before wildmenu was opened (for cycling back).
     pub wildmenu_original: String,
+    /// How many `<Tab>` presses into the current wildmenu completion round
+    /// we are — indexes into `'wildmode'`'s comma-separated stages
+    /// (`Settings::wildmode_stage_at`, #1206). Reset by `wildmenu_clear`.
+    /// Only consulted for `'wildmode'` configurations other than the bare
+    /// default `"full"` — see `Settings::wildmode_is_plain_full`.
+    pub wildmenu_press: usize,
     /// Status message shown in the command line area (e.g. "written", errors).
     pub message: String,
     /// Current search query (from last `/` or `?` search).
@@ -3722,14 +3728,22 @@ pub struct Engine {
     pub insert_ctrl_g_pending: bool,
     /// When true, after one Normal-mode command, auto-return to Insert mode (Ctrl-O).
     pub insert_ctrl_o_active: bool,
-    /// Column where insert mode was entered (for Ctrl-U to delete only typed text).
+    /// Column of the `'backspace'` `"start"` / Ctrl-U boundary (`:h
+    /// i_CTRL-U`, `:h 'backspace'`'s `"start"` token, #1206). Set when
+    /// Insert mode is entered, then **re-anchored to the cursor's new
+    /// position by `split_insert_undo_group`** every time an insert-mode
+    /// cursor-movement key (arrow/Home/End) fires — mirroring real Vim's
+    /// `stop_arrow()`, which resets `Insstart` on exactly those keys. This
+    /// is why it is *not* simply "where insert mode was entered" after the
+    /// first cursor move.
     pub insert_enter_col: usize,
-    /// Line where insert mode was entered (`:h 'backspace'`'s `"start"`
-    /// token, #1206) — `insert_enter_col` alone can't tell "BackSpace is
-    /// about to delete text that predates this Insert session" from "the
-    /// cursor moved to a different line since" (e.g. after `<CR>`); this
-    /// pairs with it so the `"start"` gate only fires on the line insert
-    /// actually began on.
+    /// Line counterpart to `insert_enter_col` — `insert_enter_col` alone
+    /// can't tell "BackSpace is about to delete text that predates this
+    /// Insert session" from "the cursor moved to a different line since"
+    /// (e.g. after `<CR>`, or after an arrow key re-anchored both fields to
+    /// a pre-existing line); this pairs with it so the `"start"` gate only
+    /// fires relative to the *current* anchor line, which moves with
+    /// `insert_enter_col` (see there for when).
     pub insert_enter_line: usize,
     /// Line index of a freshly created, still-untouched autoindent-only line
     /// (`:h 'autoindent'`), or `None`. Set when `<CR>`/`o`/`O` create a line
@@ -4181,6 +4195,7 @@ impl Engine {
             wildmenu_items: Vec::new(),
             wildmenu_selected: None,
             wildmenu_original: String::new(),
+            wildmenu_press: 0,
             message: String::new(),
             search_query: String::new(),
             search_matches: Vec::new(),
