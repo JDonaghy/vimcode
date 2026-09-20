@@ -494,16 +494,19 @@ pub struct TuiShellApp {
     last_sidebar_refresh: Cell<Instant>,
     yank_hl_deadline: Cell<Option<Instant>>,
     tab_switcher_last_cycle: Cell<Option<Instant>>,
-    /// Mirrors `event_loop`'s once-computed `keyboard_enhanced` flag
-    /// (`mod.rs:696`, from `supports_keyboard_enhancement()` before the
-    /// loop starts) — threaded into `render::engine_key_from_ui` (#826) to
-    /// disambiguate a handful of Ctrl-combo escape sequences (Ctrl+\, Ctrl+/,
+    /// Cached copy of `quadraui::BackendCaps::kitty_keyboard` (#1109 — read
+    /// once in `setup()` via `backend.backend_caps()` rather than a second,
+    /// redundant call to crossterm's own keyboard-enhancement-support probe;
+    /// quadraui's own live runner already ran that probe and recorded the
+    /// result before `setup()` ran) — threaded into
+    /// `render::engine_key_from_ui` (#826) to disambiguate a handful of
+    /// Ctrl-combo escape sequences (Ctrl+\, Ctrl+/,
     /// Ctrl+Shift+[/]) that arrive ambiguously without the kitty keyboard
-    /// protocol. Defaults to `false`, the same value `unwrap_or(false)`
-    /// falls back to on any terminal that doesn't support the protocol —
-    /// exactly what every `driver_with_shell` test gets, since
-    /// `ShellApp::setup` only queries the real terminal when [`Self::live`]
-    /// is set (see that field and `setup`'s own doc comments for why).
+    /// protocol. Defaults to `false`, the same value the cap defaults to on
+    /// any terminal that doesn't support the protocol — exactly what every
+    /// `driver_with_shell` test gets, since `ShellApp::setup` only reads the
+    /// live-probed cap when [`Self::live`] is set (see that field and
+    /// `setup`'s own doc comments for why).
     keyboard_enhanced: bool,
     /// What this app believes the *runner's* `AppShell` (the
     /// `ShellAdapter`-owned instance that paints the activity bar and
@@ -532,16 +535,21 @@ pub struct TuiShellApp {
     suppress_shell_panel_echo: bool,
     /// Set by [`Self::prepare_for_live_run`], never by anything else — in
     /// particular never by a `driver_with_shell` test. Gates the two
-    /// `ShellApp::setup` steps that are unsound or unsafe to run under a
+    /// `ShellApp::setup` steps that are unsound or wrong to run under a
     /// short-lived headless test instance (#635, Stage 6b item F):
     ///
-    /// - `supports_keyboard_enhancement()` does a blocking round-trip
-    ///   against the real terminal (enables raw mode if not already on,
-    ///   writes a query escape sequence, and reads/polls for the
-    ///   response — see crossterm's `query_keyboard_enhancement_flags_*`).
-    ///   Under `driver_with_shell`'s `TestBackend` there is no real
-    ///   terminal to answer, so every test using the driver would pay that
-    ///   round-trip's latency (or worse, hang) for no benefit.
+    /// - Reading `backend.backend_caps().kitty_keyboard` into
+    ///   [`Self::keyboard_enhanced`] is a plain field read, not I/O — since
+    ///   #1109 the actual blocking round-trip (enabling raw mode if not
+    ///   already on, writing a query escape sequence, and reading/polling
+    ///   for the response — crossterm's `query_keyboard_enhancement_flags_*`
+    ///   under the hood) happens once inside `quadraui::tui::run::run`,
+    ///   before `setup()` is ever called, live runs only. This stays gated
+    ///   on `self.live` anyway so `keyboard_enhanced` keeps its documented
+    ///   `false` default under `driver_with_shell`: that harness's
+    ///   `TuiBackend` never goes through the live runner's probe, so its cap
+    ///   is just `TuiBackend::new()`'s environment-only guess, not a
+    ///   meaningful answer to read.
     /// - `core::swap::register_emergency_engine` stores a raw
     ///   `*const Engine` in a process-global `static`, on the explicit
     ///   contract that "the caller must ensure `engine` lives for the rest
@@ -588,6 +596,28 @@ impl TuiShellApp {
             .and_then(|n| n.to_str())
             .map(|n| n.to_string())
             .unwrap_or_else(|| "VimCode".to_string())
+    }
+
+    /// Editor mode → hardware caret shape (#1109): block for Normal/Visual,
+    /// bar for Insert, underline for a pending replace-char (`r`) command —
+    /// the same three-way mapping the old hand-rolled crossterm cursor-style
+    /// write used, now feeding `backend.set_caret_shape` (quadraui#1015)
+    /// instead. Split out as a
+    /// pure function, separate from `tick()`'s `self.live`-gated write right
+    /// below it, specifically so the *decision* is unit-testable —
+    /// `set_caret_shape`'s `TuiBackend` impl writes straight to the real
+    /// process `std::io::stdout()` with no test-mode guard (see its own doc
+    /// comment), so the write itself can't be observed from this crate's
+    /// test suite any more than `tick_title_sync_is_reachable_but_gated_on_live_so_black_box_untestable`'s
+    /// title write can — that's a `SMOKE_TESTS` item, not a driver test.
+    fn caret_shape_for_mode(&self) -> quadraui::EditorCursorShape {
+        if !self.sidebar.has_focus && self.engine.pending_key == Some('r') {
+            quadraui::EditorCursorShape::Underline
+        } else if !self.sidebar.has_focus && self.engine.mode == Mode::Insert {
+            quadraui::EditorCursorShape::Bar
+        } else {
+            quadraui::EditorCursorShape::Block
+        }
     }
 
     /// Compose the **bottom band** (#765, #735 slice 4): the chrome vimcode
@@ -2098,12 +2128,18 @@ impl ShellApp for TuiShellApp {
         // round-trip, and an unsound dangling-pointer registration),
         // not just redundant work.
         if self.live {
-            // Mirrors `event_loop`'s once-computed `keyboard_enhanced`
-            // query (`mod.rs:696`) — same call, same fallback, just moved
-            // to run once here instead of in the wrapper, since by this
-            // point `self` has reached the stable address the SAFETY note
-            // below also depends on.
-            self.keyboard_enhanced = supports_keyboard_enhancement().unwrap_or(false);
+            // #1109: was a direct call to crossterm's keyboard-enhancement-
+            // support probe (a blocking round-trip) duplicating a probe
+            // `quadraui::tui::run::run` already performs before `setup()`
+            // ever runs (`push_keyboard_enhancement` + `set_kitty_keyboard`,
+            // `quadraui/src/tui/run.rs`) — a second rule-6 escape-sequence
+            // reach-past on top of a redundant round-trip. `backend_caps()`
+            // just reads the value quadraui already computed live, so this
+            // stays inside `if self.live` not because the read itself could
+            // hang (it can't — no I/O), but so `keyboard_enhanced` keeps its
+            // documented `false` default under `driver_with_shell`, where
+            // `TuiBackend` never went through the live runner's probe at all.
+            self.keyboard_enhanced = backend.backend_caps().kitty_keyboard;
 
             // SAFETY: `run_with_shell` → `build_shell_adapter` →
             // `tui::run::run`'s own `mut app: A` local is what finally
@@ -3623,12 +3659,19 @@ impl ShellApp for TuiShellApp {
         // line-number citation it used to carry (the GTK loop it named is
         // gone, and this has no GTK counterpart — GTK4 owns cursor shape
         // and window title).
-        // Cursor shape per mode is a plain escape sequence rather than
-        // anything ratatui buffers, so writing it to the shared process
-        // stdout between frames is exactly what `event_loop` did through
-        // `terminal.backend_mut()`. Live runs only: under `driver_with_shell`
-        // there is no real terminal, and emitting control sequences from a
-        // test binary would corrupt the harness' own output.
+        // Cursor shape per mode used to be a hand-rolled crossterm
+        // cursor-style write straight to the shared process stdout (an
+        // `execute!` of crossterm's own cursor-style command) — a rule-6
+        // violation (only quadraui should emit escape
+        // sequences). #1109 routed it through `backend.set_caret_shape(..)`
+        // instead: `TuiBackend`'s impl (quadraui#1015) emits the exact same
+        // DECSCUSR sequence underneath, it just no longer happens in this
+        // crate. Still live-runs-only: under `driver_with_shell` there is no
+        // real terminal, and `set_caret_shape`'s `TuiBackend` impl writes to
+        // `std::io::stdout()` unconditionally (no test-mode guard of its
+        // own — see its doc comment), so calling it outside `self.live`
+        // would corrupt the harness' own output exactly as the old
+        // hand-rolled write would have.
         //
         // The emulator window title used to be hand-rolled the same way
         // (crossterm's `SetTitle` directly), but #1124 routed it through
@@ -3638,15 +3681,7 @@ impl ShellApp for TuiShellApp {
         // same reason as the cursor style, it just no longer names the
         // escape sequence itself.
         if self.live {
-            let cursor_style = if !self.sidebar.has_focus && self.engine.pending_key == Some('r') {
-                SetCursorStyle::SteadyUnderScore
-            } else if !self.sidebar.has_focus && self.engine.mode == Mode::Insert {
-                SetCursorStyle::BlinkingBar
-            } else {
-                SetCursorStyle::SteadyBlock
-            };
-            let mut out = io::stdout();
-            let _ = execute!(out, cursor_style);
+            backend.set_caret_shape(self.caret_shape_for_mode());
             let tui_title = self
                 .engine
                 .active_buffer_name()
@@ -5005,6 +5040,54 @@ mod tests {
              live=false, or tick() would attempt the real stdout OSC write \
              during ordinary test runs -- see \
              prepare_for_live_run_only_sets_the_flag"
+        );
+    }
+
+    /// [`TuiShellApp::caret_shape_for_mode`] (#1109) is the pure decision
+    /// `tick()` feeds `backend.set_caret_shape` — block for Normal, bar for
+    /// Insert, underline for a pending `r` (replace-char). Unlike the title
+    /// write right next to it in `tick()`, this branching has no I/O of its
+    /// own, so — unlike
+    /// `tick_title_sync_is_reachable_but_gated_on_live_so_black_box_untestable`
+    /// right above — it genuinely can be exercised directly, distinct from
+    /// the `self.live`-gated `set_caret_shape` write itself, which remains
+    /// out of this crate's reach for the same reason the title write is (see
+    /// that test, and `caret_shape_for_mode`'s own doc comment).
+    ///
+    /// RED-verification: before wiring `caret_shape_for_mode` in, this
+    /// module had no mode->shape mapping to call at all (the old code
+    /// inlined the three-way `if` straight into `tick()`'s crossterm call),
+    /// so there was nothing for a test like this to assert on — the old
+    /// arrangement was exactly the "no driver-testable seam" gap #1109
+    /// closes by extracting the decision into its own method.
+    #[test]
+    fn caret_shape_for_mode_tracks_engine_mode_and_pending_replace() {
+        let mut app = TuiShellApp::new_for_test();
+        assert!(
+            !app.sidebar.has_focus,
+            "fixture must start with sidebar unfocused, or every branch \
+             below falls through to Block regardless of mode/pending_key"
+        );
+
+        assert_eq!(
+            app.caret_shape_for_mode(),
+            quadraui::EditorCursorShape::Block,
+            "Normal mode, no pending key -> Block"
+        );
+
+        app.engine.mode = Mode::Insert;
+        assert_eq!(
+            app.caret_shape_for_mode(),
+            quadraui::EditorCursorShape::Bar,
+            "Insert mode -> Bar"
+        );
+
+        app.engine.mode = Mode::Normal;
+        app.engine.pending_key = Some('r');
+        assert_eq!(
+            app.caret_shape_for_mode(),
+            quadraui::EditorCursorShape::Underline,
+            "pending 'r' (replace-char) -> Underline, even back in Normal mode"
         );
     }
 
@@ -13274,7 +13357,7 @@ mod tests {
     // and never parses real ANSI (see this file's module doc, "raw-mode,
     // SGR mouse... stay outside its reach"), so it cannot exercise
     // anything specific to the live terminal — raw-mode escape sequence
-    // parsing, a real PTY, `supports_keyboard_enhancement()`'s blocking
+    // parsing, a real PTY, the keyboard-enhancement-support probe's blocking
     // round-trip, or genuine OS-level blocking/deadlock. A live-terminal
     // repro attempt (this session: `vcd` under `tmux`, real SGR mouse
     // byte sequences, ~150+ hamburger interactions across the same

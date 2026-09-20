@@ -20,7 +20,7 @@
     clippy::explicit_counter_loop
 )]
 
-use std::io::{self, Write};
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -298,10 +298,7 @@ macro_rules! debug_log {
 #[allow(unused_imports)]
 pub(crate) use debug_log;
 
-use ratatui::crossterm::cursor::SetCursorStyle;
 use ratatui::crossterm::event::{Event, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
-use ratatui::crossterm::execute;
-use ratatui::crossterm::terminal::supports_keyboard_enhancement;
 use ratatui::layout::{Constraint, Direction, Layout, Rect, Size};
 // `RColor`/`Modifier` are only referenced by the `#[cfg(test)]` legacy paint
 // helpers (`set_cell`, `rc`) now that `event_loop` is gone.
