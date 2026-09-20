@@ -8716,7 +8716,7 @@ mod app_icon {
         // installs the loader explicitly (see `.github/workflows/ci.yml`),
         // so skip the pixel assertions rather than hard-failing when it's
         // genuinely absent.
-        if crate::gtk::util::cached_app_icon_png().is_none() {
+        if !crate::gtk::util::host_has_svg_loader() {
             eprintln!(
                 "skipping app_icon_paints_left_of_the_file_menu: no gdk-pixbuf \
                  SVG loader on this host"

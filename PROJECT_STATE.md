@@ -1,6 +1,36 @@
 # VimCode Project State
 
-**Last updated:** September 19, 2026 (#1155 — built the location list: a
+**Last updated:** September 20, 2026 (#1102 — deleted GTK's `gdk_pixbuf`
+app-icon pre-rasteriser now that quadraui#1014's `draw_image` decode cache is
+already on the pinned rev (`d907a06`, an ancestor of the current pin
+`0dc8381`). `src/gtk/util.rs`: removed `app_icon_image`/`cached_app_icon_png`/
+`rasterise_app_icon_png`/`APP_ICON_RASTER_PX` — the once-per-run PNG
+pre-rasterisation that dodged librsvg re-decoding the 1024² SVG every repaint
+(+16.5 ms/frame) is now redundant, since `GtkBackend::draw_image` caches the
+decoded/scaled `Pixbuf` itself. `src/app.rs`'s `app_icon_image_for_paint` no
+longer forks on `#[cfg(feature = "gui")]` — every backend now hands
+`crate::render::app_icon_image()` (the raw SVG) straight to
+`Backend::draw_image` unchanged. Kept (out of scope for #1102, and the reason
+`src/gtk/util.rs` still names `gdk_pixbuf`): `install_icon_and_desktop_at`'s
+own, unrelated `gdk_pixbuf` use to render the on-disk XDG hicolor-theme PNG
+icons (a completely different feature — files an external WM/compositor
+reads, not anything `Backend::draw_image` touches) and a small
+`#[cfg(test)]` `host_has_svg_loader()` probe that replaced
+`cached_app_icon_png` as the "does this host have an SVG loader" skip-gate
+for three installer tests and the #720 GTK pixel probe
+(`app_icon_paints_left_of_the_file_menu` in `src/gtk/testing.rs`), which
+still passes and still asserts on **pixels**, not state. Deleted the now-
+inverted `painted_app_icon_is_the_rasterised_png_not_the_raw_svg` unit test,
+whose entire premise (raw SVG must never reach `draw_image`) is exactly what
+#1102 now does on purpose. macOS still does not decode SVG at all (that's
+quadraui#1014's explicitly-deferred follow-up, not part of this pin) — so
+macOS still paints no app icon, unchanged from before #1102; only the GTK
+code path and its toolkit-typed workaround were in scope here. No dedicated
+automated "paint-cost" timing guard exists elsewhere in the suite to re-check
+— the one mentioned as a guard in the issue text was the just-deleted test
+itself. `cargo build`/`clippy -D warnings`/`fmt` all clean, both feature
+lanes; `gtk::util`, `gtk::testing::app_icon` and `render::tests` (app-icon
+subset) test modules green.). Prior update: September 19, 2026 (#1155 — built the location list: a
 per-window twin of the global quickfix list, plus the rest of the quickfix
 family. Refactored the 4 flat `quickfix_items`/`quickfix_selected`/
 `quickfix_open`/`quickfix_has_focus` engine fields into one

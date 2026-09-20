@@ -7,8 +7,8 @@
 //! it) could not resolve it without the `gui` feature. `src/gtk/mod.rs`,
 //! `src/gtk/css.rs` and `src/gtk/util.rs` re-export everything below so the
 //! rest of `crate::gtk` keeps resolving these names unchanged. The genuinely
-//! GTK-only siblings (`css::load_css`, `util::app_icon_image`'s PNG
-//! rasterisation, `util::install_icon_and_desktop`, ...) stayed behind.
+//! GTK-only siblings (`css::load_css`, `util::install_icon_and_desktop`, ...)
+//! stayed behind.
 use crate::core;
 use crate::core::Engine;
 use crate::render;
