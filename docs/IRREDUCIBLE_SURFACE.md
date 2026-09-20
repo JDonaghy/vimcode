@@ -10,7 +10,9 @@
 > — the folder-picker row below was wrong; struck, not just re-verdicted. Extended
 > 2026-09-16 (#1044) — a full rung-by-rung audit of `TuiShellApp`/`mouse.rs` against
 > `App`, adding one new fact (§1, "TUI has no OS window") and correcting §2a's
-> command-line-selection verdict, now stale (§2c). Regenerate, don't trust:
+> command-line-selection verdict (§2c). **§3's table regenerated 2026-09-19 at
+> `30c0077` (#1168); §2c's residual gap is now closed upstream — see §2d.**
+> Regenerate, don't trust:
 > `python3 scripts/prod_lines.py src/gtk src/tui_main src/render.rs` and
 > `python3 scripts/native_lines.py gtk src/gtk/*.rs`._
 
@@ -115,8 +117,8 @@ last verified against, and found the picture has moved:
   (`quadraui/src/primitives/command_line.rs:98,134` — quadraui#705, landed since
   §2a was written) and vimcode has **already adopted both**, unconditionally
   shared by every backend: `render::command_line_click_char_idx` and
-  `render::command_line_selection_rect` (`src/render.rs:19933,19979`) call
-  straight through to them. The hit-test half of §2a's verdict flips from
+  `render::command_line_selection_rect` (`src/render.rs:21024,21070` at
+  `30c0077` — locate by symbol, not line) call straight through to them. The hit-test half of §2a's verdict flips from
   "blocked quadraui gap" to plain **already-shared**.
 - What's left is narrower and still real: `quadraui::CommandLine` has no
   `selection` field, so neither backend's `draw_command_line` can paint a
@@ -125,9 +127,8 @@ last verified against, and found the picture has moved:
   selection is visible today only because it paints the command line
   cell-by-cell with the highlight baked into fg/bg inversion, bypassing
   `draw_command_line` entirely; GTK has **no visual feedback for a selection
-  at all**. Drafted as a fresh quadraui issue in
-  [`docs/PENDING_QUADRAUI_ISSUES.md`](PENDING_QUADRAUI_ISSUES.md) (coordinator/human
-  action to file, per that doc's standing note) — do not re-draft it.
+  at all**. *(Superseded — see §2d.)*
+
 - **The lesson, stated plainly:** "verified against the pinned rev" has a shelf
   life exactly as long as the pin doesn't move. §2a was correct the day it was
   written and wrong five rev-bumps later without anyone re-checking it — the
@@ -138,23 +139,59 @@ last verified against, and found the picture has moved:
   landing). Re-verify a "quadraui gap" verdict against the live pin before
   citing it, the same way you'd re-verify an "irreducible" one.
 
+## 2d. §2c's residual gap is closed upstream (2026-09-19, #1168)
+
+The selection-highlight *paint* gap §2c left open is **shipped**: quadraui#1001
+landed `Backend::draw_command_line_selection` alongside
+`CommandLineLayout::selection_bounds`, and it is live at vimcode's current pin
+`d907a06` (bumped by #1133). Verified by `git grep` against that rev, not inferred
+from the issue being closed.
+
+**There is no quadraui gap left anywhere in this document.** All nine recorded
+verdicts are now either irreducible facts (§1) or ordinary host-side convergence
+work; the count of open upstream blockers on the platform-neutrality goal is
+**zero**.
+
+What remains here is a *consume-side* task and belongs to #1169, not to quadraui:
+vimcode adopts `selection_bounds` but does not yet call
+`draw_command_line_selection`, so `render::command_line_selection_rect` still
+hand-computes the rect and its doc comment still asserts the upstream API does not
+exist. That comment is stale; fixing it is a code change and therefore out of
+scope for this documentation pass — deliberately left for the consume-side issue
+rather than smuggled into a doc-only PR.
+
 ## 3. How much of the backends is actually platform-bound
 
 Production lines that name a toolkit module or type (`gtk4::`/`gio::`/`glib::`/`gdk::`/
 `pango`/`cairo`; `ratatui::`/`crossterm::`/`Buffer`/`Frame`/`Rect`):
 
+*Regenerated 2026-09-19 at `30c0077` — the previous revision of this table was
+measured before #785 moved `src/gtk/mod.rs`'s mass into `src/app.rs`, and read
+`src/gtk/mod.rs` at 7,684 lines when it is now 140.*
+
 | File | Production | Native-touching | |
 |---|---:|---:|---:|
-| `src/gtk/mod.rs` | 7,684 | 62 | 0.8% |
-| `src/gtk/click.rs` | 696 | 8 | 1.1% |
-| `src/gtk/css.rs` | 507 | 5 | 1.0% |
-| `src/gtk/util.rs` | 250 | 8 | 3.2% |
-| `src/tui_main/shell_app.rs` | 3,989 | 43 | 1.1% |
-| `src/tui_main/mouse.rs` | 2,895 | 17 | 0.6% |
-| `src/tui_main/render_impl.rs` | 1,267 | 39 | 3.1% |
-| `src/tui_main/panels.rs` | 1,208 | 55 | 4.6% |
-| `src/tui_main/mod.rs` | 933 | 9 | 1.0% |
-| **both backends** | **19,429** | **246** | **1.3%** |
+| `src/gtk/mod.rs` | 140 | 8 | 5.7% |
+| `src/gtk/click.rs` | 26 | 3 | 11.5% |
+| `src/gtk/css.rs` | 20 | 5 | 25.0% |
+| `src/gtk/util.rs` | 319 | 8 | 2.5% |
+| **GTK subtotal** | **505** | **24** | **4.8%** |
+| `src/tui_main/shell_app.rs` | 4,773 | 51 | 1.1% |
+| `src/tui_main/mouse.rs` | 2,882 | 17 | 0.6% |
+| `src/tui_main/render_impl.rs` | 1,342 | 43 | 3.2% |
+| `src/tui_main/panels.rs` | 1,218 | 63 | 5.2% |
+| `src/tui_main/mod.rs` | 769 | 9 | 1.2% |
+| **TUI subtotal** | **10,984** | **183** | **1.7%** |
+| **both backends** | **11,489** | **207** | **1.8%** |
+
+**The ratio inverted, and that is the headline.** GTK is now *denser* in native
+types (4.8%) than the TUI (1.7%) — because GTK has shrunk to the parts that
+genuinely must touch the toolkit, while the TUI still carries ~11,000 lines that
+name almost no terminal type at all. A low percentage is no longer evidence of
+being close to done; it is evidence of duplicated neutral code. See #1169.
+
+*(The "both backends" total dropped from 19,429 to 11,489 — that is GTK
+converging, not files going missing: `src/gtk/mod.rs` alone went 7,684 → 140.)*
 
 The #47 re-audit reached the same conclusion independently by hand for `src/gtk/mod.rs`
 ("only ~40 lines in the whole file touch `gtk4::`/`gio::`/`pangocairo::`/`glib::`
@@ -181,13 +218,22 @@ convergeable. Some of it is real per-backend *structure* — GTK and TUI compose
 differently even where neither names Cairo or ratatui. The measure establishes what is
 *not* the obstacle; it does not size what is.
 
-**The honest characterisation of the remainder:** `src/gtk/mod.rs` (7,684) and
-`src/tui_main/shell_app.rs` (3,989) are two implementations of the same four `ShellApp`
-entry points — `setup`, `render_content`, `handle`, `tick`. #751–#766 converged the
-*decisions* those implementations make (which surface was hit, which handler owns a key,
-what order the frame composes in — `src/gtk/mod.rs` makes 424 `render::` calls). What was
-not converged is the implementations themselves. That is ordinary duplication, and it is
-the actual remaining work.
+**The honest characterisation of the remainder (rewritten 2026-09-19, #1168):**
+this paragraph used to pair `src/gtk/mod.rs` (7,684) against
+`src/tui_main/shell_app.rs` (3,989) as "two implementations of the same four
+`ShellApp` entry points". **That pairing no longer describes the codebase.** GTK's
+half was converged: production `src/gtk/mod.rs` is **140 lines** making **zero**
+`render::` calls outside `#[cfg(test)]`, and the shell it used to duplicate now
+lives once, in `src/app.rs`, which both GUI backends drive.
+
+What is left is one-sided. `src/tui_main/` still carries its **own**
+`impl quadraui::ShellApp` — `TuiShellApp`, 11,037 production lines against
+`src/app.rs`'s 8,798 — implementing the same `setup`/`render_content`/`handle`/
+`tick`. #751–#766 converged the *decisions* (which surface was hit, which handler
+owns a key, what order the frame composes in); what was never converged is the
+second implementation itself. That is ordinary duplication, it is now
+**exclusively a TUI problem**, and it is the actual remaining work — tracked as
+#1169.
 
 ## 5. Actions falling out of this
 

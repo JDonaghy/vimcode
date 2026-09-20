@@ -33,9 +33,19 @@ quadraui's `driver_with_shell`). See `tests/acceptance.rs` and
 
 Both backends are `quadraui::ShellApp` impls driven by `run_with_shell`; neither
 owns a main loop (`fn event_loop` was deleted by #634). Since #751–#766 they route
-every routing/composition *decision* through `render.rs` — `src/gtk/mod.rs` alone
-makes 424 `render::` calls — so when you are looking for "where is X decided", the
-answer is almost always `render.rs`, not here.
+every routing/composition *decision* through `render.rs`, so when you are looking
+for "where is X decided", the answer is almost always `render.rs`, not here.
+
+**How far that has gone (measured at `30c0077`, 2026-09-19):** production
+`src/gtk/mod.rs` is **138 lines** and makes **zero** `render::` calls outside
+`#[cfg(test)]` — it builds a `ShellConfig` and hands off to
+`quadraui::gtk::shell_runner::run_with_shell`. `src/app.rs` — the shell *both*
+GUI backends drive — makes **484**. An earlier revision of this file said
+"`src/gtk/mod.rs` alone makes 424 `render::` calls"; that was true before #785
+moved the mass into `src/app.rs`, and re-reading it as current state will send you
+looking in the wrong file. **`src/tui_main/` is the one backend that still has its
+own `ShellApp` impl** (11,037 production lines vs GTK's 534 excluding its test
+harness) — that gap is tracked in #1169.
 
 **Do not add feature logic to either directory** (`CLAUDE.md`, Platform-Neutrality
 Rule). Current production size and the north-star target are tracked in
@@ -72,8 +82,12 @@ settings-hot-reload gap on macOS/Win-GUI for free. The portable majority of
 `#[cfg(feature = "gui")]` *inside* `src/app.rs` is genuinely platform-bound:
 `App::new`/`App::assemble`'s display-dependent prologue, the
 `TextMetricsBackend`/`PlatformWindowHandle`/`PlatformCssProvider` impls for the
-concrete GTK types, window *discovery* (`find_visible_window` — quadraui has
-no portable "find the runner's window" surface yet), and a few literal
+concrete GTK types, window *discovery* (`find_visible_window` — quadraui still has
+no portable "find the runner's window" surface; note that `Backend::window()`
+*does* exist and is adopted since #1124/quadraui#950, which took title-sync and
+minimize off this path, leaving it backing only the CSD queries
+`win_is_maximized`/`win_set_decorated` and the session-restore size read), and a
+few literal
 `gtk4::Settings`/`gtk4::IconTheme` call sites. `src/app.rs`'s own module doc
 has the full inventory.
 

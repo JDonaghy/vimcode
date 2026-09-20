@@ -361,7 +361,30 @@ it is recorded here.
 
 ---
 
-## `quadraui::CommandLine` has no `selection` field to paint (blocks vimcode#194, found by vimcode#1044)
+## ~~`quadraui::CommandLine` has no `selection` field to paint~~ — **SHIPPED, do not file (struck 2026-09-19, #1168)**
+
+> **This draft is retired. The API exists and is already pinned.** quadraui#1001
+> landed `Backend::draw_command_line_selection` alongside
+> `CommandLineLayout::selection_bounds`, and vimcode's current pin
+> `d907a06` (bumped by #1133) carries it — verified by `git grep` against that
+> rev, not inferred from the issue being closed. The shape differs from the
+> "Ask" below: upstream chose a **dedicated draw call** rather than a
+> `selection` field on `CommandLine`, so do not go looking for the field.
+>
+> **What is actually left is host-side, and belongs to vimcode#1169, not here:**
+> vimcode adopts `selection_bounds` but does not yet call
+> `draw_command_line_selection`, so `render::command_line_selection_rect` still
+> hand-computes the rect and **its doc comment still claims the upstream API does
+> not exist** — that comment is stale and should be deleted along with the helper
+> when the paint call is adopted. Fixing it is a code change, deliberately out of
+> scope for #1168's documentation pass.
+>
+> vimcode#194's visual-highlight half is therefore **no longer supply-blocked**.
+>
+> The original draft is kept below, struck, so the history of the verdict is
+> readable — **do not file it.**
+
+### ~~Original draft (superseded)~~
 
 **Title:** `CommandLine`/`draw_command_line` cannot paint a selection highlight —
 `CommandLineLayout::hit_test`/`selection_bounds` compute the geometry but nothing
