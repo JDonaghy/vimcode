@@ -326,23 +326,20 @@ pub(super) fn render_search_panel(
 
 // ─── Status / command line ────────────────────────────────────────────────────
 
-/// Paint the `:`-command line row (background fill, text, inverted block
-/// cursor, and the mouse drag-selection inversion).
+/// Paint the `:`-command line row (background fill, text, insert cursor,
+/// and the mouse drag-selection highlight) through the shared
+/// `quadraui::Backend::draw_command_line_selection` primitive (quadraui#1001).
 ///
-/// #605 (Stage 6 parity sweep): this used to write straight into
-/// `frame.buffer_mut()` via `set_cell`, which made it unreachable from
-/// `TuiShellApp::render_content`'s `&mut dyn Backend`-only signature. It now
-/// composes the row into a `(char, fg, bg)` cell vector and paints it through
-/// [`render_impl::draw_rule_row_themed`] — the same
-/// `Backend::draw_status_bar`-stands-in-for-a-raw-`set_cell` trick #609
-/// introduced for the window dividers (see that helper's doc comment).
-///
-/// The two inversions (cursor, then `selection`) are applied to the composed
-/// cells *before* painting rather than as buffer read-back passes afterwards.
-/// That's behaviour-identical to the old two-pass version — including the
-/// double-invert-cancels case where the cursor cell also falls inside the
-/// selection — but needs no `Buffer` access. `selection` is `event_loop`'s
-/// `cmd_sel` local (`(start, end)` character indices, either order).
+/// #1185: this used to hand-compose a `(char, fg, bg)` cell vector and
+/// invert fg/bg per cell for both the cursor and `selection` — the one
+/// backend-specific paint path `CLAUDE.md`'s Platform-Neutrality Rule
+/// exists to delete, and the reason GTK never got a visual selection
+/// highlight at all (there was no shared primitive to paint it through).
+/// `render::command_line_view` builds the same `quadraui::CommandLine`
+/// descriptor GTK's `FrameOp::CommandLine` arm uses; `selection` (`cmd_sel`'s
+/// `(start, end)` character indices, either order, into `command.text`) is
+/// converted to the byte-offset pair the primitive expects via
+/// `render::command_line_selection_bytes`, the exact twin of GTK's call.
 pub(super) fn render_command_line(
     backend: &mut dyn quadraui::Backend,
     area: Rect,
@@ -353,70 +350,10 @@ pub(super) fn render_command_line(
     if area.width == 0 || area.height == 0 {
         return;
     }
-    let fg = theme.command_fg;
-    let bg = theme.command_bg;
-    let width = area.width as usize;
-
-    // Row composition: background fill first, then the text on top.
-    let mut cells: Vec<(char, Color, Color)> = vec![(' ', fg, bg); width];
-    let chars: Vec<char> = command.text.chars().collect();
-    if command.right_align {
-        // Right-aligned text that doesn't fit is dropped entirely — matches
-        // the old `if len <= area.width` guard.
-        if chars.len() <= width {
-            let start = width - chars.len();
-            for (i, &ch) in chars.iter().enumerate() {
-                cells[start + i].0 = ch;
-            }
-        }
-    } else {
-        for (i, &ch) in chars.iter().enumerate() {
-            if i >= width {
-                break;
-            }
-            cells[i].0 = ch;
-        }
-    }
-
-    // Command-line cursor (inverted block at insertion point).
-    if command.show_cursor {
-        let cursor_col = command.cursor_anchor_text.chars().count();
-        let idx = cursor_col.min(width - 1);
-        let cell = &mut cells[idx];
-        std::mem::swap(&mut cell.1, &mut cell.2);
-    }
-
-    // Mouse drag-selection: invert fg/bg for the selected span.
-    if let Some((start, end)) = selection {
-        let lo = start.min(end);
-        let hi = start.max(end);
-        for cell in cells.iter_mut().take(hi + 1).skip(lo) {
-            std::mem::swap(&mut cell.1, &mut cell.2);
-        }
-    }
-
-    // Paint, batching runs of identically-coloured cells into one
-    // `draw_status_bar` call so a plain uncoloured command line costs one
-    // draw rather than `width` of them.
     backend.set_theme(super::quadraui_tui::q_theme(theme));
-    let mut run_start = 0usize;
-    while run_start < width {
-        let (_, run_fg, run_bg) = cells[run_start];
-        let mut run_end = run_start + 1;
-        while run_end < width && cells[run_end].1 == run_fg && cells[run_end].2 == run_bg {
-            run_end += 1;
-        }
-        let text: String = cells[run_start..run_end].iter().map(|c| c.0).collect();
-        super::render_impl::draw_rule_row_themed(
-            backend,
-            area.x + run_start as u16,
-            area.y,
-            &text,
-            run_fg,
-            run_bg,
-        );
-        run_start = run_end;
-    }
+    let cmd = render::command_line_view(command);
+    let sel_bytes = selection.map(|sel| render::command_line_selection_bytes(&command.text, sel));
+    backend.draw_command_line_selection(super::shell_app::to_q_rect(area), &cmd, sel_bytes);
 }
 
 // ─── Input translation ────────────────────────────────────────────────────────

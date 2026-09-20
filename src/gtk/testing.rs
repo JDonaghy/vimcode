@@ -10555,17 +10555,17 @@ mod chrome_rung {
 /// wiring through the shared primitive rather than new GTK-specific
 /// selection code — see `handle_mouse_click_msg`'s "Command line click" rung.
 ///
-/// **What's covered / what isn't:** click-to-reposition-cursor and
-/// drag-to-select (`engine.cmd_sel`/`cmd_dragging`) both land, and
-/// `route_cmdline_selection_key` (already shared with TUI) makes Ctrl+C
-/// copy the selection. The VISIBLE selection highlight does not — quadraui's
-/// `CommandLine` primitive has no selection field and `Backend::draw_command_line`
-/// paints in the command line's own (monospace) font, so there is no
-/// platform-neutral way to overlay a highlight without either painting in
-/// the wrong font (`Backend::draw_status_bar` sets its own chrome font) or
-/// writing GTK-specific Cairo code, which `CLAUDE.md`'s Platform-Neutrality
-/// Rule forbids. That gap needs a quadraui issue (`CommandLine::selection`,
-/// painted by each backend's own rasteriser) before the highlight can land.
+/// **What's covered:** click-to-reposition-cursor, drag-to-select
+/// (`engine.cmd_sel`/`cmd_dragging`), `route_cmdline_selection_key`
+/// (already shared with TUI) making Ctrl+C copy the selection, and — since
+/// #1185 adopted quadraui#1001's `Backend::draw_command_line_selection` —
+/// the VISIBLE selection highlight itself
+/// (`drag_select_paints_a_visible_highlight_over_the_selected_columns`
+/// below). Before #1185 this module's doc comment recorded that last piece
+/// as a genuine quadraui gap (`CommandLine` had no selection field and
+/// `draw_command_line` never painted one); quadraui#1001 shipped a sibling
+/// draw call instead of a new field (see that method's doc comment for
+/// why), and GTK now routes through it exactly like TUI does.
 #[cfg(test)]
 mod command_line_selection {
     use super::*;
@@ -10690,6 +10690,59 @@ mod command_line_selection {
         assert!(
             h.engine.borrow().cmd_sel.get().is_none(),
             "Ctrl+C must clear the selection after copying"
+        );
+    }
+
+    /// #1185: adopts quadraui#1001's `Backend::draw_command_line_selection`.
+    /// Before this, GTK painted `draw_command_line` unconditionally — a
+    /// user who dragged a selection over the command line got working
+    /// `cmd_sel` state and Ctrl+C copy (proven above) but literally zero
+    /// pixel change. Asserts on the actual painted pixel at the selected
+    /// column, not on `cmd_sel` being `Some` (`CLAUDE.md` rule 1 — the same
+    /// "state populated, nothing painted" failure mode #587/#592 hit).
+    #[test]
+    fn drag_select_paints_a_visible_highlight_over_the_selected_columns() {
+        let mut engine = Engine::new_for_test();
+        engine.mode = crate::core::Mode::Command;
+        engine.command_buffer = "wq!".to_string();
+        engine.command_cursor = 3;
+        let mut h = harness(engine, 1200, 800);
+        h.driver.render();
+        h.driver
+            .find_bounds(":wq!")
+            .expect("command line text must paint");
+
+        // Probe pixels before any drag: column 1 ('w', will be selected)
+        // and column 3 ('!', will stay outside the drag).
+        let (wx, wy) = col_center(&h, 1);
+        let (ex, ey) = col_center(&h, 3);
+        let w_before = h.driver.pixel(wx.round() as i32, wy.round() as i32);
+        let excl_before = h.driver.pixel(ex.round() as i32, ey.round() as i32);
+
+        // Drag-select columns 1..2 ("wq") — same inclusive contract
+        // `drag_select_then_ctrl_c_copies_the_command_buffer_substring`
+        // above exercises.
+        let (x0, y0) = col_center(&h, 1);
+        let (x1, _) = col_center(&h, 2);
+        h.driver.drag(x0, y0, x1, y0);
+        h.driver.render();
+
+        assert!(
+            h.engine.borrow().cmd_sel.get().is_some(),
+            "a drag over the command line must arm a selection"
+        );
+
+        let w_after = h.driver.pixel(wx.round() as i32, wy.round() as i32);
+        let excl_after = h.driver.pixel(ex.round() as i32, ey.round() as i32);
+
+        assert_ne!(
+            w_before, w_after,
+            "the selected column's pixel must change once the drag armed \
+             a visible selection highlight"
+        );
+        assert_eq!(
+            excl_before, excl_after,
+            "a column outside the drag must not change colour"
         );
     }
 }
