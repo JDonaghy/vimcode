@@ -337,20 +337,45 @@ pub struct Settings {
     pub iskeyword: String,
 
     /// How folds are found: `"manual"` (only `zf`-created folds — nothing is
-    /// closeable until the user explicitly folds a range) or `"indent"`
-    /// (folds are derived from indentation and recomputed on demand).
-    /// Corresponds to Vim's `'foldmethod'` / `'fdm'`. Default `"manual"`,
-    /// matching Vim (`:h 'foldmethod'`) — a fresh buffer has no folds at all
-    /// until one is created.
+    /// closeable until the user explicitly folds a range), `"indent"`
+    /// (folds are derived from indentation and recomputed on demand), or
+    /// `"marker"` (folds are derived from the literal `'foldmarker'` pair,
+    /// #1159). Corresponds to Vim's `'foldmethod'` / `'fdm'`. Default
+    /// `"manual"`, matching Vim (`:h 'foldmethod'`) — a fresh buffer has no
+    /// folds at all until one is created. `"syntax"`/`"expr"`/`"diff"` are
+    /// not implemented (#1159 scoped them out — see the issue).
     #[serde(default = "default_foldmethod")]
     pub foldmethod: String,
 
-    /// When `'foldmethod'` is `"indent"`, folds nested deeper than this level
-    /// start closed; folds at or above it start open. Corresponds to Vim's
-    /// `'foldlevel'` / `'fdl'`. Default `0`, matching Vim: every indent fold
-    /// starts closed until raised (`:h 'foldlevel'`).
+    /// When `'foldmethod'` is `"indent"` or `"marker"`, folds nested deeper
+    /// than this level start closed; folds at or above it start open.
+    /// Corresponds to Vim's `'foldlevel'` / `'fdl'`. Default `0`, matching
+    /// Vim: every computed fold starts closed until raised (`:h
+    /// 'foldlevel'`).
     #[serde(default)]
     pub foldlevel: usize,
+
+    /// The open/close marker pair used when `'foldmethod'` is `"marker"`: a
+    /// literal-text scan for these two strings, not a regex (`:h
+    /// 'foldmarker'`). Format is `"{open},{close}"`; default `"{{{,}}}"`,
+    /// matching Vim. A following digit on a marker in the text (Vim's
+    /// explicit-fold-level refinement, e.g. `{{{2`) is not parsed specially
+    /// here — the marker is still found as a literal-prefix match, but the
+    /// digit doesn't set an explicit level (#1159 scoped that out: marker
+    /// folding's core value is "a scan for a literal pair").
+    #[serde(default = "default_foldmarker")]
+    pub foldmarker: String,
+
+    /// Maximum fold nesting depth for `'foldmethod'` `"indent"` (Vim also
+    /// documents `"syntax"`, which vimcode doesn't implement — `:h
+    /// 'foldnestmax'`). Deeper levels are absorbed into their `foldnestmax`
+    /// ancestor instead of becoming their own closeable fold. Does **not**
+    /// apply to `"marker"` folds, matching Vim (marker nesting is either the
+    /// literal pair depth or an explicit numbered level, neither of which
+    /// `'foldnestmax'` caps — verified against `nvim --headless`). Default
+    /// `20`, matching Vim.
+    #[serde(default = "default_foldnestmax")]
+    pub foldnestmax: usize,
 
     /// Whether `/` and `?` search wrap around the end/start of the buffer
     /// when no more matches are found in the current direction. Corresponds
@@ -798,6 +823,14 @@ fn default_foldmethod() -> String {
     "manual".to_string()
 }
 
+fn default_foldmarker() -> String {
+    "{{{,}}}".to_string()
+}
+
+fn default_foldnestmax() -> usize {
+    20
+}
+
 fn default_iskeyword() -> String {
     "@,48-57,_,192-255".to_string()
 }
@@ -1215,6 +1248,8 @@ impl Default for Settings {
             iskeyword: default_iskeyword(),
             foldmethod: default_foldmethod(),
             foldlevel: 0,
+            foldmarker: default_foldmarker(),
+            foldnestmax: default_foldnestmax(),
             wrapscan: default_true(),
             shiftround: false,
             gdefault: false,
@@ -2083,10 +2118,10 @@ impl Settings {
                 self.virtualedit = value.to_string();
             }
             "foldmethod" | "fdm" => {
-                if value != "manual" && value != "indent" {
+                if !matches!(value, "manual" | "indent" | "marker") {
                     return Err(format!(
-                        "Invalid value for {name}: '{value}' (only 'manual'/'indent' are \
-                         implemented)"
+                        "Invalid value for {name}: '{value}' (only 'manual'/'indent'/'marker' \
+                         are implemented)"
                     ));
                 }
                 self.foldmethod = value.to_string();
@@ -2096,6 +2131,38 @@ impl Settings {
                     .parse()
                     .map_err(|_| format!("Invalid value for {name}: '{value}'"))?;
                 self.foldlevel = n;
+            }
+            // `:h 'foldmarker'`: exactly two non-empty, comma-separated
+            // strings — "the two markers must be different, in order to
+            // avoid ambiguity" is Vim's own wording, but Vim doesn't
+            // actually enforce that (a same-string pair just never closes a
+            // fold, since every occurrence looks like an open), so this
+            // doesn't either.
+            "foldmarker" | "fmr" => {
+                let Some((open, close)) = value.split_once(',') else {
+                    return Err(format!(
+                        "Invalid value for {name}: '{value}' (expected \
+                         'open,close', e.g. '{{{{{{,}}}}}}')"
+                    ));
+                };
+                if open.is_empty() || close.is_empty() || close.contains(',') {
+                    return Err(format!(
+                        "Invalid value for {name}: '{value}' (expected 'open,close', e.g. \
+                         '{{{{{{,}}}}}}')"
+                    ));
+                }
+                self.foldmarker = value.to_string();
+            }
+            "foldnestmax" | "fdn" => {
+                let n: usize = value
+                    .parse()
+                    .map_err(|_| format!("Invalid value for {name}: '{value}'"))?;
+                if n == 0 {
+                    return Err(format!(
+                        "Invalid value for {name}: '{value}' (must be at least 1)"
+                    ));
+                }
+                self.foldnestmax = n;
             }
             // #1191: validate eagerly (rather than storing an unparsable
             // spec and only failing later, per-character, in
@@ -2364,6 +2431,8 @@ impl Settings {
             "virtualedit" | "ve" => Ok(format!("virtualedit={}", self.virtualedit)),
             "foldmethod" | "fdm" => Ok(format!("foldmethod={}", self.foldmethod)),
             "foldlevel" | "fdl" => Ok(format!("foldlevel={}", self.foldlevel)),
+            "foldmarker" | "fmr" => Ok(format!("foldmarker={}", self.foldmarker)),
+            "foldnestmax" | "fdn" => Ok(format!("foldnestmax={}", self.foldnestmax)),
             "iskeyword" | "isk" => Ok(format!("iskeyword={}", self.iskeyword)),
             // Always on — see the `set_bool_option` "wildmenu" | "wmnu" arm.
             "wildmenu" | "wmnu" => Ok("wildmenu".to_string()),

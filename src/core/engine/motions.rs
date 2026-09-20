@@ -4050,23 +4050,30 @@ impl Engine {
     /// Compute the full nested indent-fold hierarchy: every foldable
     /// region, with its 1-based nesting depth (1 = outermost). See the
     /// module comment above for why this doesn't reuse `detect_fold_range`.
+    /// Nesting is capped at `'foldnestmax'` (#1159; matches Vim — deeper
+    /// levels are absorbed into their `foldnestmax` ancestor rather than
+    /// becoming their own closeable fold, verified against `nvim
+    /// --headless`).
     pub(crate) fn compute_indent_folds(&self) -> Vec<(usize, usize, usize)> {
         let total = self.buffer().len_lines();
         let levels: Vec<usize> = (0..total).map(|i| self.indent_fold_level(i)).collect();
         let mut out = Vec::new();
-        Self::collect_level_folds(&levels, 0, total, 1, &mut out);
+        let nestmax = self.settings.foldnestmax.max(1);
+        Self::collect_level_folds(&levels, 0, total, 1, nestmax, &mut out);
         out
     }
 
     /// Recursive helper for `compute_indent_folds`: within `[from, to)`,
     /// find every maximal run of >= 2 consecutive lines at `level` or
-    /// deeper, record it, then recurse one level deeper over that same
-    /// sub-range to find the folds nested inside it.
+    /// deeper, record it, then — as long as `level` hasn't reached
+    /// `nestmax` — recurse one level deeper over that same sub-range to find
+    /// the folds nested inside it.
     fn collect_level_folds(
         levels: &[usize],
         from: usize,
         to: usize,
         level: usize,
+        nestmax: usize,
         out: &mut Vec<(usize, usize, usize)>,
     ) {
         let mut i = from;
@@ -4079,7 +4086,9 @@ impl Engine {
                 }
                 if end > start {
                     out.push((start, end, level));
-                    Self::collect_level_folds(levels, start, end + 1, level + 1, out);
+                    if level < nestmax {
+                        Self::collect_level_folds(levels, start, end + 1, level + 1, nestmax, out);
+                    }
                 }
                 i = end + 1;
             } else {
@@ -4088,50 +4097,141 @@ impl Engine {
         }
     }
 
-    /// The innermost indent-computed fold containing `line`, if any.
-    fn indent_fold_containing(&self, line: usize) -> Option<(usize, usize)> {
-        self.compute_indent_folds()
+    /// Parse `'foldmarker'` into its `(open, close)` tokens. `set_value_option`
+    /// already rejects anything that isn't `"open,close"` with both halves
+    /// non-empty, so this only needs the default fallback for the
+    /// unreachable-in-practice case of a value that got in some other way
+    /// (e.g. a hand-edited `settings.json`).
+    fn foldmarker_tokens(&self) -> (&str, &str) {
+        self.settings
+            .foldmarker
+            .split_once(',')
+            .filter(|(open, close)| !open.is_empty() && !close.is_empty())
+            .unwrap_or(("{{{", "}}}"))
+    }
+
+    /// Compute the full nested marker-fold hierarchy for `'foldmethod'`
+    /// `"marker"` (#1159): a left-to-right literal-text scan for the
+    /// `'foldmarker'` open/close pair, alternating between whichever marker
+    /// comes first at each position (not "count all opens then all
+    /// closes" — matters when open/close share a line). Nesting depth is
+    /// the marker stack depth, 1-based. Vim's real algorithm additionally
+    /// lets a marker end in a digit to set an explicit fold level; that
+    /// refinement is deliberately out of scope (marker folding's core value
+    /// is "a scan for a literal pair" — see the issue). An unmatched close
+    /// marker is ignored; an unmatched open marker folds to the end of the
+    /// buffer — both verified against `nvim --headless`. `'foldnestmax'`
+    /// does **not** apply here, matching Vim (verified against `nvim
+    /// --headless`; see the field doc on `Settings::foldnestmax`).
+    pub(crate) fn compute_marker_folds(&self) -> Vec<(usize, usize, usize)> {
+        let (open_tok, close_tok) = self.foldmarker_tokens();
+        let total = self.buffer().len_lines();
+        let mut stack: Vec<(usize, usize)> = Vec::new(); // (start_line, level)
+        let mut out: Vec<(usize, usize, usize)> = Vec::new();
+        for line_idx in 0..total {
+            let text: String = self.buffer().content.line(line_idx).chars().collect();
+            let mut pos = 0usize;
+            while pos < text.len() {
+                let next_open = text[pos..].find(open_tok);
+                let next_close = text[pos..].find(close_tok);
+                let is_open = match (next_open, next_close) {
+                    (Some(o), Some(cl)) => o <= cl,
+                    (Some(_), None) => true,
+                    (None, Some(_)) => false,
+                    (None, None) => break,
+                };
+                if is_open {
+                    // Safe: `is_open` only takes this branch when `next_open`
+                    // matched.
+                    let o = next_open.unwrap();
+                    stack.push((line_idx, stack.len() + 1));
+                    pos += o + open_tok.len();
+                } else {
+                    let cl = next_close.unwrap();
+                    if let Some((start, level)) = stack.pop() {
+                        if line_idx > start {
+                            out.push((start, line_idx, level));
+                        }
+                    }
+                    pos += cl + close_tok.len();
+                }
+            }
+        }
+        // Any still-open markers fold to the end of the buffer.
+        let last_line = total.saturating_sub(1);
+        for (start, level) in stack {
+            if last_line > start {
+                out.push((start, last_line, level));
+            }
+        }
+        out
+    }
+
+    /// Does the current `'foldmethod'` compute its fold hierarchy
+    /// automatically (`"indent"`/`"marker"`, #1159), rather than requiring
+    /// the user to build it explicitly with `zf`/`:fold` (`"manual"`)?
+    pub(crate) fn folds_are_computed(&self) -> bool {
+        matches!(self.settings.foldmethod.as_str(), "indent" | "marker")
+    }
+
+    /// The full fold hierarchy under the current `'foldmethod'` — computed
+    /// automatically for `"indent"`/`"marker"` (#1159), empty for
+    /// `"manual"` (there, folds only exist once `zf`/`:fold` puts them in
+    /// `fold_defs`/`folds`, which this function deliberately doesn't read —
+    /// callers needing manual folds too already merge in `fold_defs`
+    /// separately).
+    pub(crate) fn compute_configured_folds(&self) -> Vec<(usize, usize, usize)> {
+        match self.settings.foldmethod.as_str() {
+            "indent" => self.compute_indent_folds(),
+            "marker" => self.compute_marker_folds(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// The innermost computed fold containing `line`, if any.
+    fn configured_fold_containing(&self, line: usize) -> Option<(usize, usize)> {
+        self.compute_configured_folds()
             .into_iter()
             .filter(|(start, end, _)| *start <= line && line <= *end)
             .min_by_key(|(start, end, _)| end - start)
             .map(|(start, end, _)| (start, end))
     }
 
-    /// The nearest indent-fold header strictly after `line`, skipping
+    /// The nearest computed-fold header strictly after `line`, skipping
     /// headers already hidden inside another closed fold.
-    fn indent_fold_after(&self, line: usize) -> Option<usize> {
-        self.compute_indent_folds()
+    fn configured_fold_after(&self, line: usize) -> Option<usize> {
+        self.compute_configured_folds()
             .into_iter()
             .map(|(start, _, _)| start)
             .filter(|&start| start > line && !self.view().is_line_hidden(start))
             .min()
     }
 
-    /// The *end* of the nearest indent fold strictly before `line` — `zk`
+    /// The *end* of the nearest computed fold strictly before `line` — `zk`
     /// moves to the end of the previous fold, not its start (`:h zk`;
     /// verified against `nvim --headless`, #1006), unlike `zj`'s `:h zj`
     /// "start of the next fold". Skips folds already hidden inside another
     /// closed fold.
-    fn indent_fold_end_before(&self, line: usize) -> Option<usize> {
-        self.compute_indent_folds()
+    fn configured_fold_end_before(&self, line: usize) -> Option<usize> {
+        self.compute_configured_folds()
             .into_iter()
             .filter(|(start, end, _)| *end < line && !self.view().is_line_hidden(*start))
             .map(|(_, end, _)| end)
             .max()
     }
 
-    /// Apply `'foldlevel'` under `'foldmethod'` `"indent"`: compute the
-    /// nested indent-fold hierarchy and close every fold nested deeper than
-    /// `level`, processing deepest-first. Deepest-first matters when both a
-    /// fold and its child need closing (`level` 0 with 2+ nesting levels):
-    /// closing the child first and the parent second lets `close_fold`'s
-    /// "drop folds fully contained in the new one" rule fold the child's
-    /// closed entry into the parent's, leaving one clean closed range
-    /// instead of two overlapping ones. Folds at or above `level` are still
-    /// recorded via `define_fold` (not closed) so a later `zo`/`zc` on them
-    /// works from a real definition.
+    /// Apply `'foldlevel'` under a computed `'foldmethod'` (`"indent"` or
+    /// `"marker"`, #1159): compute the nested fold hierarchy and close every
+    /// fold nested deeper than `level`, processing deepest-first.
+    /// Deepest-first matters when both a fold and its child need closing
+    /// (`level` 0 with 2+ nesting levels): closing the child first and the
+    /// parent second lets `close_fold`'s "drop folds fully contained in the
+    /// new one" rule fold the child's closed entry into the parent's,
+    /// leaving one clean closed range instead of two overlapping ones.
+    /// Folds at or above `level` are still recorded via `define_fold` (not
+    /// closed) so a later `zo`/`zc` on them works from a real definition.
     pub fn apply_foldlevel(&mut self, level: usize) {
-        let mut ranges = self.compute_indent_folds();
+        let mut ranges = self.compute_configured_folds();
         ranges.sort_by_key(|(_, _, level)| std::cmp::Reverse(*level));
         for (start, end, fold_level) in ranges {
             if fold_level > level {
@@ -4179,14 +4279,14 @@ impl Engine {
     /// Prefers an already-*defined* fold (`fold_defs`, however it was
     /// created and whether currently open or closed) so a manual `zf` fold
     /// round-trips through `zo`/`zc` back to the same region (#1006) rather
-    /// than trying to rediscover it. With `'foldmethod'` `"indent"` and
-    /// nothing defined yet at the cursor, falls back to the real indent-fold
-    /// computation (`compute_indent_folds`) — Vim computes that method's
-    /// hierarchy automatically, without a `zf`. In `"manual"` mode with
-    /// nothing defined, matches Vim: nothing happens (`E490`), verified
-    /// against `nvim --headless` (#1006) — vimcode used to invent a fold
-    /// from indentation here even in the default manual method, which real
-    /// Vim never does.
+    /// than trying to rediscover it. With `'foldmethod'` `"indent"`/
+    /// `"marker"` (#1159) and nothing defined yet at the cursor, falls back
+    /// to the real computed-fold hierarchy (`compute_configured_folds`) —
+    /// Vim computes those methods' hierarchy automatically, without a `zf`.
+    /// In `"manual"` mode with nothing defined, matches Vim: nothing happens
+    /// (`E490`), verified against `nvim --headless` (#1006) — vimcode used
+    /// to invent a fold from indentation here even in the default manual
+    /// method, which real Vim never does.
     pub(crate) fn cmd_fold_close(&mut self) {
         let line = self.view().cursor.line;
         if let Some(range) = self.view().enclosing_fold_def(line) {
@@ -4194,13 +4294,226 @@ impl Engine {
             self.close_fold_and_clamp(start, end);
             return;
         }
-        if self.settings.foldmethod == "indent" {
-            if let Some((start, end)) = self.indent_fold_containing(line) {
+        if self.folds_are_computed() {
+            if let Some((start, end)) = self.configured_fold_containing(line) {
                 self.close_fold_and_clamp(start, end);
                 return;
             }
         }
         self.message = "E490: No fold found".to_string();
+    }
+
+    // ── `:fold*` ex commands (#1159) ────────────────────────────────────────
+    //
+    // Unlike the z-commands above (which always act on the cursor line, and
+    // for which the header of a closed fold is always the reachable line —
+    // normal-mode movement can't land the cursor on a hidden body line), an
+    // ex-command `[range]` can name any line by number, hidden or not, and
+    // can span several lines that resolve to *different* folds. Both facts
+    // ruled out reusing the cursor-only z-command bodies:
+    //
+    //  - `:{n}foldopen` where line `n` is nested two marker-fold levels deep
+    //    still opens the outermost one, not the fold whose header happens to
+    //    be exactly `n` (verified against `nvim --headless`) — so resolution
+    //    is outermost/innermost-aware per line, not `fold_at`'s exact-header
+    //    match.
+    //  - a multi-line non-bang `[range]` resolves *every* line first, then
+    //    acts once per **maximal** (outermost, for close; the only kind
+    //    open's resolution ever produces) result — not once per line as it's
+    //    resolved. Mutating between lines breaks both directions differently,
+    //    each verified against `nvim --headless`:
+    //      - open: closing... er, *opening* the outer level for an earlier
+    //        line changes what "the outermost closed fold" means for a later
+    //        line still in the range, incorrectly cascading into a nested
+    //        fold that should have stayed closed (`:2,5foldopen` over nested
+    //        2-5/3-4 opens only the outer).
+    //      - close: two different lines in the same range can each resolve
+    //        to their own genuinely-innermost fold (that part matches `zc`)
+    //        — but the range command keeps only the widest result, discarding
+    //        one properly contained in another (`:1,2foldclose` over nested
+    //        1-6/2-4 closes only the outer, even though the single-address
+    //        `:2foldclose` alone closes the inner).
+    //    The recursive (`!`) variants don't have this problem: "act on every
+    //    level, at every line" is idempotent to processing order, so a plain
+    //    per-line sweep already lands on the same end state either way.
+
+    /// `:foldo[pen] [range]` (no `!`) — resolve every line in `[start, end]`
+    /// to the outermost *closed* fold containing it (already the maximal
+    /// answer by construction, so no extra collapsing step is needed the way
+    /// `resolve_close_targets` needs one), dedup, then open each exactly
+    /// once. An already-open fold at a line contributes no target but still
+    /// counts toward `found_any` — Vim's `:foldopen` on an already-open fold
+    /// is a silent no-op, not `E490` (verified against `nvim --headless`).
+    fn resolve_open_targets(&self, start: usize, end: usize) -> (Vec<(usize, usize)>, bool) {
+        let mut targets: Vec<(usize, usize)> = Vec::new();
+        let mut found_any = false;
+        for line in start..=end {
+            if let Some(f) = self.view().enclosing_closed_fold(line) {
+                found_any = true;
+                let t = (f.start, f.end);
+                if !targets.contains(&t) {
+                    targets.push(t);
+                }
+            } else if self.view().enclosing_fold_def(line).is_some()
+                || (self.folds_are_computed() && self.configured_fold_containing(line).is_some())
+            {
+                found_any = true;
+            }
+        }
+        (targets, found_any)
+    }
+
+    /// `:foldc[lose] [range]` (no `!`) — resolve every line in `[start, end]`
+    /// to its *innermost* enclosing fold (same rule as `zc`/`cmd_fold_close`,
+    /// just per-line instead of cursor-only), dedup, then drop any result
+    /// that's a proper subset of another result also in the set — see the
+    /// module comment above for why that collapsing step is needed here but
+    /// not for open.
+    fn resolve_close_targets(&self, start: usize, end: usize) -> Vec<(usize, usize)> {
+        let mut targets: Vec<(usize, usize)> = Vec::new();
+        for line in start..=end {
+            let resolved = self
+                .view()
+                .enclosing_fold_def(line)
+                .map(|f| (f.start, f.end))
+                .or_else(|| {
+                    if self.folds_are_computed() {
+                        self.configured_fold_containing(line)
+                    } else {
+                        None
+                    }
+                });
+            if let Some(t) = resolved {
+                if !targets.contains(&t) {
+                    targets.push(t);
+                }
+            }
+        }
+        let snapshot = targets.clone();
+        targets.retain(|&(s, e)| {
+            !snapshot
+                .iter()
+                .any(|&(os, oe)| (os, oe) != (s, e) && os <= s && e <= oe)
+        });
+        targets
+    }
+
+    /// `:foldopen! [range]` / `:foldclose! [range]` at a single `line`: act
+    /// on every fold level containing it, not just one. For open, finding
+    /// the outermost *closed* fold and calling `open_folds_in_range` over
+    /// its span does this in one step — that removes every fold definition
+    /// whose header falls inside the span, regardless of nesting depth,
+    /// matching Vim's "all folds are opened". For close, every level must be
+    /// recorded separately (unlike opening, where opening the outer level
+    /// already reveals everything nested inside, so one call suffices,
+    /// closing the outer alone would NOT also mark the inner as closed) —
+    /// otherwise a later `zo`/`:foldopen` on the outer fold would incorrectly
+    /// reveal the inner one too. Both verified against `nvim --headless`.
+    fn recursive_fold_toggle_at(&mut self, line: usize, open: bool) -> bool {
+        if open {
+            if let Some((start, end)) = self
+                .view()
+                .enclosing_closed_fold(line)
+                .map(|f| (f.start, f.end))
+            {
+                self.view_mut().open_folds_in_range(start, end);
+                return true;
+            }
+            return self.view().enclosing_fold_def(line).is_some()
+                || (self.folds_are_computed() && self.configured_fold_containing(line).is_some());
+        }
+        let mut ranges: Vec<(usize, usize)> = self
+            .view()
+            .fold_defs
+            .iter()
+            .filter(|f| f.start <= line && line <= f.end)
+            .map(|f| (f.start, f.end))
+            .collect();
+        if self.folds_are_computed() {
+            for (start, end, _) in self.compute_configured_folds() {
+                if start <= line && line <= end && !ranges.contains(&(start, end)) {
+                    ranges.push((start, end));
+                }
+            }
+        }
+        let found = !ranges.is_empty();
+        for (start, end) in ranges {
+            self.view_mut().close_fold(start, end);
+        }
+        found
+    }
+
+    /// `:{range}fold` — create a manual fold for `[range]` (default: the
+    /// cursor line alone, which — like a `1`-line `zf` — defines nothing
+    /// visible, since there's no body left to hide; verified against `nvim
+    /// --headless`). This is Vim's *only* way to create a fold when
+    /// `'foldmethod'` isn't `"manual"` (`:h :fold`); vimcode's `close_fold`
+    /// doesn't care what `'foldmethod'` is either, so no gating is needed
+    /// here.
+    pub(crate) fn ex_fold_create(&mut self, range: Option<(isize, isize)>) -> EngineAction {
+        let last_line = self.buffer().len_lines().saturating_sub(1);
+        let (start, end) = match range {
+            Some((a, b)) => (a.max(0) as usize, (b.max(0) as usize).min(last_line)),
+            None => {
+                let c = self.view().cursor.line;
+                (c, c)
+            }
+        };
+        self.view_mut().close_fold(start, end);
+        self.message = if end > start {
+            format!("{} lines folded", end - start + 1)
+        } else {
+            String::new()
+        };
+        EngineAction::None
+    }
+
+    /// `:foldo[pen][!] [range]` / `:foldc[lose][!] [range]` (#1159) — shared
+    /// body. `open` selects which; `bang` selects one-level vs recursive;
+    /// `range` defaults to the cursor line alone. Verified against `nvim
+    /// --headless`: neither command moves the cursor to the range's last
+    /// address the way most ranged ex commands do — it stays exactly where
+    /// it was, even if that line ends up hidden inside a newly-closed fold.
+    pub(crate) fn ex_fold_open_close(
+        &mut self,
+        range: Option<(isize, isize)>,
+        bang: bool,
+        open: bool,
+    ) -> EngineAction {
+        let last_line = self.buffer().len_lines().saturating_sub(1);
+        let (start, end) = match range {
+            Some((a, b)) => (a.max(0) as usize, (b.max(0) as usize).min(last_line)),
+            None => {
+                let c = self.view().cursor.line;
+                (c, c)
+            }
+        };
+        let found_any = if bang {
+            let mut found_any = false;
+            for line in start..=end {
+                found_any |= self.recursive_fold_toggle_at(line, open);
+            }
+            found_any
+        } else if open {
+            let (targets, found_any) = self.resolve_open_targets(start, end);
+            for (s, _e) in targets {
+                self.view_mut().open_fold(s);
+            }
+            found_any
+        } else {
+            let targets = self.resolve_close_targets(start, end);
+            let found_any = !targets.is_empty();
+            for (s, e) in targets {
+                self.view_mut().close_fold(s, e);
+            }
+            found_any
+        };
+        if !found_any {
+            self.message = "E490: No fold found".to_string();
+            return EngineAction::Error;
+        }
+        self.message = String::new();
+        EngineAction::None
     }
 
     /// Find the enclosing foldable block for `line` by walking upward to find
@@ -4293,15 +4606,15 @@ impl Engine {
 
     /// zM — close every fold in the buffer.
     ///
-    /// With `'foldmethod'` `"indent"` this first computes the whole
-    /// indent-fold hierarchy (Vim derives that method's folds automatically,
-    /// there's no `zf` step) and closes it down to `'foldlevel'` 0 — i.e.
-    /// closes everything (`apply_foldlevel(0)`). Otherwise (`"manual"`) it
-    /// only closes folds that already exist via `zf`; matching Vim, `zM`
-    /// never invents a manual fold (#1006, verified against `nvim
-    /// --headless`).
+    /// With `'foldmethod'` `"indent"`/`"marker"` (#1159) this first computes
+    /// the whole fold hierarchy (Vim derives those methods' folds
+    /// automatically, there's no `zf` step) and closes it down to
+    /// `'foldlevel'` 0 — i.e. closes everything (`apply_foldlevel(0)`).
+    /// Otherwise (`"manual"`) it only closes folds that already exist via
+    /// `zf`; matching Vim, `zM` never invents a manual fold (#1006, verified
+    /// against `nvim --headless`).
     pub(crate) fn cmd_fold_close_all(&mut self) {
-        if self.settings.foldmethod == "indent" {
+        if self.folds_are_computed() {
             self.apply_foldlevel(0);
         } else {
             let mut defs: Vec<(usize, usize)> = self
@@ -4445,10 +4758,10 @@ impl Engine {
     }
 
     /// zj — move to the start of the next fold (open or closed — any
-    /// defined fold, not just closed ones, matches Vim). With
-    /// `'foldmethod'` `"indent"`, also considers folds not yet materialized
-    /// in `fold_defs` (Vim computes that method's hierarchy on demand, not
-    /// just from prior `zf`/`zc`/`zM` calls).
+    /// defined fold, not just closed ones, matches Vim). With `'foldmethod'`
+    /// `"indent"`/`"marker"` (#1159), also considers folds not yet
+    /// materialized in `fold_defs` (Vim computes those methods' hierarchy on
+    /// demand, not just from prior `zf`/`zc`/`zM` calls).
     pub(crate) fn cmd_fold_move_next(&mut self) {
         let cursor_line = self.view().cursor.line;
         let next_fold = self
@@ -4458,8 +4771,8 @@ impl Engine {
             .filter(|f| f.start > cursor_line)
             .map(|f| f.start)
             .min();
-        let next_detectable = if self.settings.foldmethod == "indent" {
-            self.indent_fold_after(cursor_line)
+        let next_detectable = if self.folds_are_computed() {
+            self.configured_fold_after(cursor_line)
         } else {
             None
         };
@@ -4487,8 +4800,8 @@ impl Engine {
             .filter(|f| f.end < cursor_line)
             .map(|f| f.end)
             .max();
-        let prev_detectable = if self.settings.foldmethod == "indent" {
-            self.indent_fold_end_before(cursor_line)
+        let prev_detectable = if self.folds_are_computed() {
+            self.configured_fold_end_before(cursor_line)
         } else {
             None
         };
