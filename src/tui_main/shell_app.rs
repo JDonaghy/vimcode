@@ -17170,15 +17170,17 @@ mod tests {
         // count) — used to prove the click landed *inside* the strip's own
         // window, not deep into the file.
         let target_lines_upper_bound = (strip_bottom - strip_top + 1) * 4;
-        // #1186: `render::MINIMAP_MAX_COMPRESSION` (64, module-private) lets
-        // the window grow to `MINIMAP_MAX_COMPRESSION * target_lines` buffer
-        // lines once the file no longer fits in one uncompressed window —
-        // `TOTAL_LINES` (100,000) is chosen well past that ceiling for any
-        // realistic `target_lines` here, so the clamp binds exactly and the
-        // real window span is `target_lines * 64`, not `target_lines` alone
-        // (#1093's pre-#1186 window length).
-        const COMPRESSION_CEILING_MIRROR: usize = 64;
-        let window_len_upper_bound = target_lines_upper_bound * COMPRESSION_CEILING_MIRROR;
+        // #1186: `render::MINIMAP_MAX_COMPRESSION` lets the window grow to
+        // `MINIMAP_MAX_COMPRESSION * target_lines` buffer lines once the
+        // file no longer fits in one uncompressed window. #1211 made `K`
+        // itself geometry-only (a small, constant value on every real call —
+        // see `MINIMAP_VIEWPORT_MULTIPLE`), so `MINIMAP_MAX_COMPRESSION` is
+        // now only a loose safety-net upper bound rather than the value `K`
+        // actually reaches here — this assertion stays correct (just
+        // looser) either way, using the real, `pub(crate)` constant instead
+        // of a hand-copied mirror that could drift out of sync with it.
+        let window_len_upper_bound =
+            target_lines_upper_bound * crate::render::MINIMAP_MAX_COMPRESSION;
         // Half the strip's own window, not half the file: with the cursor
         // at the top, a middle click must land comfortably inside the
         // window's own first half — confirmed by hand against a reverted
@@ -17279,35 +17281,32 @@ mod tests {
         );
     }
 
-    /// #1186 acceptance (black-box, driver tier): on a long buffer (>=
-    /// 5,000 lines), the strip's own painted extent must cover far more of
-    /// the file than the pre-#1186 fixed one-buffer-line-per-row scale
-    /// could ever reach, driven through the real
-    /// `TuiShellApp`/`TuiDriver` stack (not `build_minimap_data` in
-    /// isolation) so this proves the compression actually lands on the
-    /// path a real keystroke/redraw takes.
+    /// #1211 acceptance (black-box, driver tier): the strip's own painted
+    /// window — measured by clicking its top and bottom rows and reading
+    /// back the resulting scroll positions — must be the **same size**
+    /// for a 2,000-line file and a 20,000-line file at identical strip
+    /// geometry, driven through the real `TuiShellApp`/`TuiDriver` stack
+    /// (not `build_minimap_data` in isolation) so this proves the fix
+    /// actually lands on the path a real keystroke/redraw takes.
     ///
-    /// Two fixtures, same strip geometry:
-    /// - `WIDE_LINES` (8,000) sits past the compression ceiling
-    ///   (`MINIMAP_MAX_COMPRESSION * target_lines`, ~5,120 at this
-    ///   geometry) — a bottom-of-strip click must still reach far past the
-    ///   pre-#1186 `target_lines` ceiling (proving the window grew), while
-    ///   a top-of-strip click still resolves near line 0 (both ends stay
-    ///   reachable, #1093's own guarantee).
-    /// - `WHOLE_FILE_LINES` (2,000) sits comfortably *under* that ceiling —
-    ///   a bottom-of-strip click must resolve within one block-width of
-    ///   the file's actual last line, proving the whole file now paints
-    ///   top-to-bottom instead of only its first `target_lines` lines.
+    /// #1186 derived the window's own compression factor `K` from
+    /// `total_buffer_lines`, which squeezed the *whole file* into the
+    /// strip for every file under `MINIMAP_MAX_COMPRESSION * target_lines`
+    /// — the two fixtures below both sit comfortably under that old
+    /// ceiling, so a pre-#1211 build would show each one to a *different*
+    /// fraction of its own length rather than the same absolute window.
+    /// #1211 makes `K` a function of the strip's geometry alone, so the
+    /// window's absolute size (in buffer lines) must be identical
+    /// regardless of which of the two files is open.
     ///
     /// **RED against unfixed `develop`:** confirmed by hand — reverting
-    /// `build_minimap_data`'s compression (`k` pinned to `1`) caps every
-    /// click's resolved line at `target_lines` regardless of fixture size,
-    /// failing both the "far past target_lines" assertion for `WIDE_LINES`
-    /// and the "within one block of EOF" assertion for `WHOLE_FILE_LINES`
-    /// (whose bottom click would instead land at `target_lines`, far short
-    /// of `WHOLE_FILE_LINES - 1`).
+    /// `build_minimap_data`'s `k` to `total_buffer_lines.div_ceil(target_lines)`
+    /// (#1186's pre-#1211 formula) makes the `assert_eq!` below fail: a
+    /// bottom-of-strip click resolves to line 1,780 on the 2,000-line file
+    /// but line 4,588 on the 20,000-line file — two different absolute
+    /// windows, not the identical value this test requires.
     #[test]
-    fn minimap_covers_far_more_of_a_long_file_under_compression_via_shell_app() {
+    fn minimap_scale_is_constant_across_file_length_via_shell_app() {
         fn top_line(screen: &str) -> Option<usize> {
             screen
                 .split_whitespace()
@@ -17320,8 +17319,7 @@ mod tests {
 
         /// Click the strip's own top and bottom rows (located by its own
         /// painted braille, never hardcoded) and report the resulting
-        /// scroll positions, plus the strip's own measured row count (used
-        /// to estimate the pre-#1186 `target_lines` ceiling).
+        /// scroll positions, plus the strip's own measured row count.
         fn click_top_and_bottom(total_lines: usize) -> (usize, usize, usize) {
             let mut driver =
                 driver_with_shell(app_with_plain_lines(total_lines), config(), 100, 24);
@@ -17367,37 +17365,52 @@ mod tests {
             (top_click_line, bottom_click_line, rows.len())
         }
 
-        const WIDE_LINES: usize = 8_000;
-        let (top_click_line, bottom_click_line, strip_rows) = click_top_and_bottom(WIDE_LINES);
-        let target_lines_estimate = strip_rows * 4;
-        assert!(
-            top_click_line < target_lines_estimate,
-            "a top-of-strip click on a {WIDE_LINES}-line file must still \
-             resolve near the top of the file — got line {top_click_line}"
-        );
-        assert!(
-            bottom_click_line > target_lines_estimate * 4,
-            "a bottom-of-strip click on a {WIDE_LINES}-line file must reach \
-             far past the pre-#1186 target_lines ceiling \
-             ({target_lines_estimate}) — got line {bottom_click_line}, which \
-             would mean the compressed window still only covers the file's \
-             very first slice"
+        const SMALLER_LINES: usize = 2_000;
+        const LARGER_LINES: usize = 20_000;
+        let (top_small, bottom_small, strip_rows_small) = click_top_and_bottom(SMALLER_LINES);
+        let (top_large, bottom_large, strip_rows_large) = click_top_and_bottom(LARGER_LINES);
+
+        assert_eq!(
+            strip_rows_small, strip_rows_large,
+            "both fixtures use identical terminal/strip geometry — the \
+             strip's own painted row count must not differ by file length"
         );
 
-        const WHOLE_FILE_LINES: usize = 2_000;
-        let (_, bottom_click_line, _) = click_top_and_bottom(WHOLE_FILE_LINES);
-        let bottom_frac = bottom_click_line as f64 / WHOLE_FILE_LINES as f64;
+        assert_eq!(
+            top_small, 0,
+            "a top-of-strip click must resolve to line 0 regardless of \
+             file length"
+        );
+        assert_eq!(
+            top_large, 0,
+            "a top-of-strip click must resolve to line 0 regardless of \
+             file length"
+        );
+
+        // The core #1211 property: the window's own absolute size (in
+        // buffer lines), measured as the bottom-of-strip click's resolved
+        // line with the cursor still at the top, must be identical for the
+        // two fixtures — a `K` derived from the strip's geometry alone,
+        // never from `total_buffer_lines`.
+        assert_eq!(
+            bottom_small, bottom_large,
+            "the strip's own painted window must cover the exact same \
+             number of buffer lines for a {SMALLER_LINES}-line file and a \
+             {LARGER_LINES}-line file at identical strip geometry — got \
+             {bottom_small} vs {bottom_large}; a window that differs by \
+             file length means K is still derived from total_buffer_lines"
+        );
+
+        // Sanity: both fixtures are genuinely longer than the strip's own
+        // window (otherwise this test would trivially pass by both files
+        // fitting entirely, which proves nothing about #1211's fix).
         assert!(
-            bottom_frac > 0.8,
-            "a bottom-of-strip click on a {WHOLE_FILE_LINES}-line file — \
-             short enough to fit entirely under the compression ceiling \
-             (target_lines * MINIMAP_MAX_COMPRESSION comfortably exceeds \
-             {WHOLE_FILE_LINES} at this geometry) — must resolve close to \
-             the file's actual last line, proving the whole file now \
-             paints top-to-bottom instead of only its first `target_lines` \
-             lines (which would resolve to well under 10% of the file): \
-             got line {bottom_click_line} of {WHOLE_FILE_LINES} \
-             ({bottom_frac:.3})"
+            bottom_small < SMALLER_LINES / 2,
+            "the {SMALLER_LINES}-line fixture must be longer than the \
+             strip's own window (a bottom-of-strip click must NOT resolve \
+             anywhere near EOF) or this test cannot distinguish the fixed \
+             (post-#1211) window from the whole file — got line \
+             {bottom_small} of {SMALLER_LINES}"
         );
     }
 
@@ -21983,29 +21996,28 @@ mod tests {
         // braille row) — not imported (it's module-private), measured
         // instead via the probe above.
         let target_lines = strip_rows * 4;
-        // #1186: `render::MINIMAP_MAX_COMPRESSION` (64, also module-private)
-        // lets the strip's window grow up to `64 * target_lines` buffer
-        // lines to fit a whole file when it can. A `* 5` multiplier (the
-        // pre-#1186 value) now fits *entirely* inside that compressed
-        // window, so the distinctive line this test plants deep in the
-        // second half would already be visible with the cursor at the top
-        // — exactly the "whole file, not a window" case #1186 introduces on
-        // purpose. `* 100` comfortably exceeds the compression ceiling, so
-        // the strip still has to slide to reach the distinctive line.
+        // #1186 let the strip's window grow past `target_lines` to fit a
+        // whole file when it can, up to a `MINIMAP_MAX_COMPRESSION *
+        // target_lines` ceiling. #1211 changed how that growth factor `K`
+        // is derived — from the strip's own geometry, never from
+        // `total_buffer_lines` (see `MINIMAP_VIEWPORT_MULTIPLE` in
+        // `render.rs`) — so on the TUI `K` now lands at a small constant
+        // (`3`, not a value that grows with the file) for every file longer
+        // than its own geometry-only window. `* 100` comfortably exceeds
+        // that window regardless of which `K` produced it, so the strip
+        // still has to slide to reach the distinctive line.
         let total_lines = target_lines * 100;
         // Deep enough into the second half of the file that it cannot be
         // inside the strip's window while the cursor is still at the top.
         //
-        // #1186: a single distinctive line is no longer a reliable marker.
-        // At this compression (`window_len` clamped to
-        // `MINIMAP_MAX_COMPRESSION * target_lines`, i.e. 64 buffer lines per
-        // block here — comfortably past `MINIMAP_BLOCK_LINE_SAMPLE_CAP`,
-        // 8), `minimap_block_sample_indices` only reads 8 of a block's 64
-        // real lines, spaced every ~8 lines — a single marker line can land
-        // in the 7 lines out of 8 that never get sampled. A
-        // `DISTINCTIVE_BAND_WIDTH`-line band, wider than that worst-case
-        // ~8-line sampling gap, is guaranteed to contain a sampled line
-        // regardless of where it falls inside a block.
+        // #1186/#1211: a single distinctive line is no longer a reliable
+        // marker once `K > 1` — `minimap_block_sample_indices` only reads
+        // up to `MINIMAP_BLOCK_LINE_SAMPLE_CAP` (8) lines per block, spaced
+        // across the block's real width, so a single marker line can land
+        // in a gap that never gets sampled. A `DISTINCTIVE_BAND_WIDTH`-line
+        // band, wider than that worst-case sampling gap, is guaranteed to
+        // contain a sampled line regardless of where it falls inside a
+        // block or how wide the block is.
         const DISTINCTIVE_BAND_WIDTH: usize = 32;
         let distinctive_line = total_lines - target_lines / 2;
 
