@@ -18200,47 +18200,6 @@ pub fn view_row_to_buf_line(
     total_lines.saturating_sub(1)
 }
 
-/// Like `view_row_to_buf_line`, but accounts for word-wrapped lines.
-/// Returns `(buffer_line, segment_col_offset)` — the segment offset is the
-/// character index within the buffer line where the clicked visual segment starts.
-/// Shared across all GUI backends for click hit-testing with `:set wrap`.
-pub fn view_row_to_buf_pos_wrap(
-    view: &crate::core::view::View,
-    buffer: &crate::core::buffer::Buffer,
-    scroll_top: usize,
-    view_row: usize,
-    total_lines: usize,
-    viewport_cols: usize,
-    linebreak: bool,
-) -> (usize, usize) {
-    let mut buf_line = scroll_top;
-    let mut visible = 0usize;
-    while buf_line < total_lines {
-        if view.is_line_hidden(buf_line) {
-            buf_line += 1;
-            continue;
-        }
-        // Compute how many visual rows this buffer line occupies when wrapped.
-        let line_str = buffer.content.line(buf_line).to_string();
-        let line_str = line_str.trim_end_matches('\n');
-        let segments = compute_word_wrap_segments(line_str, viewport_cols, linebreak);
-        let visual_rows = segments.len();
-        if view_row < visible + visual_rows {
-            // The clicked row falls within this buffer line.
-            let seg_idx = view_row - visible;
-            let seg_col_offset = segments.get(seg_idx).map(|&(start, _)| start).unwrap_or(0);
-            return (buf_line, seg_col_offset);
-        }
-        visible += visual_rows;
-        if let Some(fold) = view.fold_at(buf_line) {
-            buf_line = fold.end + 1;
-        } else {
-            buf_line += 1;
-        }
-    }
-    (total_lines.saturating_sub(1), 0)
-}
-
 /// Offset table produced by expanding `'list'` glyphs (`\t`, plus any
 /// `'listchars'` single-character substitutions — `trail`/`nbsp`/`space`,
 /// #1206) in a line's text. Every position-based field a `RenderedLine`
@@ -19380,7 +19339,7 @@ fn build_rendered_window(
     }
 
     // ── Bracket match positions ────────────────────────────────────────────
-    let bracket_match_positions = if engine.settings.match_brackets && is_active {
+    let mut bracket_match_positions = if engine.settings.match_brackets && is_active {
         if let Some((match_line, match_col)) = engine.bracket_match {
             let mut positions = Vec::with_capacity(2);
             // Cursor bracket position
@@ -19405,6 +19364,27 @@ fn build_rendered_window(
     } else {
         Vec::new()
     };
+
+    // `'showmatch'` (#1207): while `Engine::showmatch_flash` is armed (the one
+    // frame right after a matched closing bracket was typed in Insert mode —
+    // cleared at the top of the *next* `handle_insert_key`, see the field's
+    // doc comment on `Engine`), highlight the opening bracket it matched with
+    // the same background used for normal-mode `'matchpairs'` highlighting
+    // (`bracket_match_bg`). This reuses the existing quadraui-consumed
+    // `bracket_match_positions` channel rather than inventing a new one, so
+    // both backends pick it up for free through `to_q_editor`.
+    if is_active && engine.settings.showmatch {
+        if let Some((match_line, match_col)) = engine.showmatch_flash {
+            for (vi, l) in lines.iter().enumerate() {
+                if l.line_idx == match_line && !l.is_ghost_continuation && !l.is_wrap_continuation {
+                    let pos = (vi, match_col.saturating_sub(l.segment_col_offset));
+                    if !bracket_match_positions.contains(&pos) {
+                        bracket_match_positions.push(pos);
+                    }
+                }
+            }
+        }
+    }
 
     // Extra selections for Ctrl+D multi-cursor word selections.
     // Each extra cursor sits at the END of a word; derive selection start

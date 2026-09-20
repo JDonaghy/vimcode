@@ -23820,6 +23820,83 @@ mod tests {
         );
     }
 
+    /// #1207 review fix: `'showmatch'` was engine-state-only — `Engine::
+    /// showmatch_flash` got set by `handle_insert_key` but nothing in
+    /// `render.rs`/`src/gtk`/`src/tui_main` ever read it, so a user running
+    /// `:set showmatch` saw *no* difference from `:set noshowmatch` (a
+    /// closing bracket, and nothing else, ever appeared). This drives the
+    /// real `:set showmatch` → type `(foo)` pipeline end to end into the
+    /// painted screen and asserts on the **painted background colour** of
+    /// the opening `(`, not on `showmatch_flash` being `Some` (`CLAUDE.md`
+    /// rule 1 — the `ScreenLayout.picker` failure mode this repo's Testing
+    /// section names by number).
+    ///
+    /// **Verified RED against unfixed `develop`:** before this fix,
+    /// `bracket_match_positions` in `render.rs` only ever read
+    /// `engine.bracket_match` (gated on `'matchpairs'`/normal mode), never
+    /// `engine.showmatch_flash`; typing `)` in Insert mode with `'showmatch'`
+    /// on left every cell's background exactly as it painted with
+    /// `'showmatch'` off, so the first `assert_eq!` below (open-paren cell
+    /// carries `bracket_match_bg` right after the closing `)` is typed)
+    /// would have failed.
+    #[test]
+    fn set_showmatch_flashes_the_matching_open_paren_via_shell_app() {
+        let app = TuiShellApp::new_for_test();
+        let theme = Theme::from_name(&app.engine.settings.colorscheme);
+        let bracket_bg =
+            quadraui::tui::ratatui_color(super::quadraui_tui::q_theme(&theme).bracket_match_bg);
+
+        let mut driver = driver_with_shell(app, config(), 80, 24);
+        driver.press_named(quadraui::NamedKey::Escape);
+        driver.render();
+
+        run_ex_command(&mut driver, ":set showmatch");
+
+        driver.type_char('i');
+        for ch in "(foo".chars() {
+            driver.type_char(ch);
+        }
+        driver.render();
+
+        let bounds = driver
+            .find_bounds("(foo")
+            .expect("the typed text must paint before the closing ')'");
+        let open_paren_col = bounds.x as u16;
+        let row = bounds.y as u16;
+
+        assert_ne!(
+            driver.style_at(open_paren_col, row).map(|s| s.bg),
+            Some(bracket_bg),
+            "sanity: before the closing ')' is typed, the open paren must \
+             not yet carry the bracket-match background; screen:\n{}",
+            driver.screen()
+        );
+
+        driver.type_char(')');
+        driver.render();
+
+        assert_eq!(
+            driver.style_at(open_paren_col, row).map(|s| s.bg),
+            Some(bracket_bg),
+            "typing the matching ')' with 'showmatch' on must flash the \
+             open paren's background for this frame; screen:\n{}",
+            driver.screen()
+        );
+
+        // The flash is cleared at the top of the *next* key (`handle_insert_
+        // key`'s doc comment on `Engine::showmatch_flash`), so one more
+        // keystroke must make it disappear again.
+        driver.type_char('x');
+        driver.render();
+
+        assert_ne!(
+            driver.style_at(open_paren_col, row).map(|s| s.bg),
+            Some(bracket_bg),
+            "the flash must be gone by the very next keystroke; screen:\n{}",
+            driver.screen()
+        );
+    }
+
     /// #1208 bug 1: `apply_list_glyphs` remapped byte-offset `spans` for a
     /// tab's expansion to `^I` (#1190) but left char-index `DiagnosticMark`s
     /// unremapped, so with `'list'` on, a diagnostic positioned after a tab
