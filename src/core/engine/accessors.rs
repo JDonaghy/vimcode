@@ -183,6 +183,42 @@ impl Engine {
         self.active_buffer_state().dirty
     }
 
+    /// Text for Vim's `'showcmd'` (#1190): the partially-typed Normal-mode
+    /// command so far — register prefix, counts, pending operator/
+    /// find-operator/text-object modifier, and the single pending key for
+    /// two-key sequences like `gg`/`dd` (`:h 'showcmd'`). Reconstructed
+    /// from engine state rather than an exact keystroke echo — good enough
+    /// to show *that* a command is pending and roughly what it is, which is
+    /// what the option is for. Empty when nothing is pending; callers
+    /// should render nothing in that case.
+    pub fn showcmd_text(&self) -> String {
+        let mut s = String::new();
+        if let Some(r) = self.selected_register {
+            s.push('"');
+            s.push(r);
+        }
+        if let Some(n) = self.operator_count {
+            s.push_str(&n.to_string());
+        }
+        if let Some(op) = self.pending_operator {
+            s.push(op);
+        }
+        if let Some((op, find_type)) = self.pending_find_operator {
+            s.push(op);
+            s.push(find_type);
+        }
+        if let Some(to) = self.pending_text_object {
+            s.push(to);
+        }
+        if let Some(n) = self.count {
+            s.push_str(&n.to_string());
+        }
+        if let Some(k) = self.pending_key {
+            s.push(k);
+        }
+        s
+    }
+
     /// True if ANY open buffer has unsaved changes.
     pub fn has_any_unsaved(&self) -> bool {
         self.buffer_manager
@@ -227,6 +263,26 @@ impl Engine {
         self.windows
             .values()
             .any(|w| w.buffer_id == buf_id && !excluded.contains(&w.id))
+    }
+
+    /// Vim's `'hidden'` gate (#1190) for abandoning the active buffer via
+    /// `:edit`, `:bnext`/`:bprevious`/`:bfirst`/`:blast`, `:buffer` and
+    /// `:enew`. Mirrors the `:quit` guard (`execute.rs`'s `"quit"` arm):
+    /// a dirty buffer may always be abandoned when another window still
+    /// shows it (nothing is lost), or when `force` (a trailing `!`) or
+    /// `'hidden'` says so. Otherwise returns the same `E37`-style message
+    /// `:quit`/`:bdelete` already use, for the caller to surface via
+    /// `self.message` + `EngineAction::Error`.
+    pub(crate) fn check_buffer_abandon(&self, force: bool) -> Result<(), String> {
+        if force || self.settings.hidden || !self.dirty() {
+            return Ok(());
+        }
+        let buf_id = self.active_buffer_id();
+        let win_id = self.active_window_id();
+        if self.buffer_has_other_views(buf_id, win_id) {
+            return Ok(());
+        }
+        Err("No write since last change (add ! to override)".to_string())
     }
 
     /// Compute explorer tree indicators: git status + deduplicated diagnostic counts.

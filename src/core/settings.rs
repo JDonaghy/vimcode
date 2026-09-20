@@ -576,6 +576,44 @@ pub struct Settings {
     /// highlighting for huge files.
     #[serde(default = "default_syntax_max_lines")]
     pub syntax_max_lines: usize,
+
+    /// Allow switching away from a modified buffer (`:edit`, `:bnext`,
+    /// `:bprevious`, `:bfirst`, `:blast`, `:buffer`, `:enew`, ...) without
+    /// saving or forcing with `!` — the abandoned buffer stays loaded,
+    /// just not shown in any window. Without it those commands refuse
+    /// with "No write since last change (add ! to override)" unless
+    /// another window still shows the buffer (`:h 'hidden'`, `:h E37`).
+    ///
+    /// Default **on** — historical Vim defaults this off, but Neovim (this
+    /// repo's oracle, per `tests/nvim_conformance.rs`) defaults it on;
+    /// confirmed by hand with `nvim --headless -u NONE -c 'set hidden?'`.
+    /// #1190.
+    #[serde(default = "default_true")]
+    pub hidden: bool,
+
+    /// Show a partially-typed Normal-mode command (count/register/operator
+    /// prefix, e.g. `"a2d`) in the last line while it's being typed.
+    /// Corresponds to Vim's `'showcmd'` / `'sc'`. Default on, matching
+    /// Neovim. #1190.
+    #[serde(default = "default_true")]
+    pub showcmd: bool,
+
+    /// Show the cursor's line/column (and file percentage) in the status
+    /// line. Corresponds to Vim's `'ruler'` / `'ru'`. Default on, matching
+    /// Neovim. #1190.
+    #[serde(default = "default_true")]
+    pub ruler: bool,
+
+    /// Render unprintable characters as glyphs instead of their normal
+    /// whitespace effect: a tab displays as literal `^I` instead of
+    /// expanding to `'tabstop'` width, and the true end of each line gets
+    /// a trailing `$`. Corresponds to Vim's `'list'`. This is the on/off
+    /// switch only — the exact glyphs are hardcoded to Vim's own
+    /// no-`'listchars'`-item fallback (`:h 'listchars'`) until `'listchars'`
+    /// itself lands (sibling value-option tranche). Default off, matching
+    /// Vim. #1190.
+    #[serde(default)]
+    pub list: bool,
 }
 
 /// Mode-derived default for `ctrl_f_action` — see the field doc comment on
@@ -1213,6 +1251,10 @@ impl Default for Settings {
             use_nerd_fonts: None, // backend-derived — see Settings::use_nerd_fonts()
             ctrl_f_action: None,  // mode-derived — see Settings::ctrl_f_action()
             syntax_max_lines: default_syntax_max_lines(),
+            hidden: default_true(),
+            showcmd: default_true(),
+            ruler: default_true(),
+            list: false,
         }
     }
 }
@@ -1223,15 +1265,11 @@ impl Default for Settings {
 /// implement) as each is picked up; see the issue for the full missing-option
 /// audit and rough priority order.
 const UNIMPLEMENTED_BOOL_OPTIONS: &[(&str, &str)] = &[
-    ("hidden", "hid"),
-    ("list", "list"),
     ("magic", "magic"),
     ("showmatch", "sm"),
     ("linebreak", "lbr"),
     ("smartindent", "si"),
     ("cindent", "cin"),
-    ("showcmd", "sc"),
-    ("ruler", "ru"),
 ];
 
 /// Real vim **value** options `:set` recognises by name but does not yet
@@ -1882,6 +1920,10 @@ impl Settings {
             "minimap" => self.minimap = enable,
             "matchbrackets" => self.match_brackets = enable,
             "autopairs" => self.auto_pairs = Some(enable),
+            "hidden" | "hid" => self.hidden = enable,
+            "showcmd" | "sc" => self.showcmd = enable,
+            "ruler" | "ru" => self.ruler = enable,
+            "list" => self.list = enable,
             // `"nf"` is Vim's real abbreviation for `'nrformats'` (a
             // value-option, handled in `set_value_option` below) — nerdfonts
             // (a vimcode-only setting with no real-Vim counterpart) keeps
@@ -2270,6 +2312,26 @@ impl Settings {
             } else {
                 "noautopairs".to_string()
             }),
+            "hidden" | "hid" => Ok(if self.hidden {
+                "hidden".to_string()
+            } else {
+                "nohidden".to_string()
+            }),
+            "showcmd" | "sc" => Ok(if self.showcmd {
+                "showcmd".to_string()
+            } else {
+                "noshowcmd".to_string()
+            }),
+            "ruler" | "ru" => Ok(if self.ruler {
+                "ruler".to_string()
+            } else {
+                "noruler".to_string()
+            }),
+            "list" => Ok(if self.list {
+                "list".to_string()
+            } else {
+                "nolist".to_string()
+            }),
             "extension_registries" => Ok(format!(
                 "extension_registries={}",
                 self.extension_registries.join(",")
@@ -2410,6 +2472,10 @@ impl Settings {
             "scrolloff" => self.scrolloff.to_string(),
             "startofline" | "sol" => self.startofline.to_string(),
             "joinspaces" | "js" => self.joinspaces.to_string(),
+            "hidden" | "hid" => self.hidden.to_string(),
+            "showcmd" | "sc" => self.showcmd.to_string(),
+            "ruler" | "ru" => self.ruler.to_string(),
+            "list" => self.list.to_string(),
             "smarttab" | "sta" => self.smarttab.to_string(),
             "nrformats" | "nf" => self.nrformats.join(","),
             "iskeyword" | "isk" => self.iskeyword.clone(),

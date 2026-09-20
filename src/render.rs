@@ -18074,6 +18074,81 @@ pub fn view_row_to_buf_pos_wrap(
     (total_lines.saturating_sub(1), 0)
 }
 
+/// Vim's `'list'` (#1190): apply the hardcoded default glyph set — a tab
+/// displays as literal `^I` instead of expanding to `'tabstop'` width, and
+/// the true end of line gets a trailing `$` — to one already-built
+/// `(raw_text, spans)` pair. This is Vim's own documented fallback when
+/// `'listchars'` has no `tab:`/`eol:` item (`:h 'listchars'`); full
+/// `'listchars'` support is the sibling value-option tranche.
+///
+/// `mark_eol` is `false` for every wrap-continuation segment except the
+/// last — the `$` belongs at the true end of the buffer line, not at each
+/// mid-line wrap point.
+///
+/// Each tab is a single byte replaced by the 2-byte literal `^I`, which
+/// shifts the byte offset of everything after it on the line — `spans`
+/// (`RenderedLine::spans`' doc: byte-offset based) must be remapped to
+/// match, tracked here via `breakpoints` (old-byte-offset →
+/// cumulative-delta-after, built in text order so the last breakpoint at or
+/// before a given old offset gives that offset's total shift).
+fn apply_list_glyphs(
+    text: String,
+    spans: Vec<StyledSpan>,
+    mark_eol: bool,
+) -> (String, Vec<StyledSpan>) {
+    if !text.contains('\t') {
+        // No tabs — no byte-offset remap needed, so no `spans` work at all.
+        if !mark_eol {
+            return (text, spans);
+        }
+        let text = match text.strip_suffix('\n') {
+            Some(stripped) => format!("{stripped}$\n"),
+            None => format!("{text}$"),
+        };
+        return (text, spans);
+    }
+
+    let mut out = String::with_capacity(text.len());
+    let mut breakpoints: Vec<(usize, i64)> = Vec::new();
+    let mut delta: i64 = 0;
+    for (old_byte, ch) in text.char_indices() {
+        if ch == '\t' {
+            out.push('^');
+            out.push('I');
+            delta += 1; // 1 source byte -> 2 output bytes
+            breakpoints.push((old_byte + ch.len_utf8(), delta));
+        } else {
+            out.push(ch);
+        }
+    }
+    if mark_eol {
+        out = match out.strip_suffix('\n') {
+            Some(stripped) => format!("{stripped}$\n"),
+            None => format!("{out}$"),
+        };
+    }
+
+    let remap = |old_byte: usize| -> usize {
+        let shift = breakpoints
+            .iter()
+            .rev()
+            .find(|(bp, _)| *bp <= old_byte)
+            .map(|(_, d)| *d)
+            .unwrap_or(0);
+        (old_byte as i64 + shift) as usize
+    };
+    let spans = spans
+        .into_iter()
+        .map(|s| StyledSpan {
+            start_byte: remap(s.start_byte),
+            end_byte: remap(s.end_byte),
+            ..s
+        })
+        .collect();
+
+    (out, spans)
+}
+
 /// Slice `spans` to cover only the byte range `[seg_start_byte, seg_end_byte)`,
 /// adjusting `start_byte`/`end_byte` to be relative to `seg_start_byte`.
 /// Used when splitting a wrapped line into per-segment `RenderedLine` entries.
@@ -18627,6 +18702,12 @@ fn build_rendered_window(
         let wrap_on =
             (engine.settings.wrap || is_md_preview) && render_viewport_cols > 0 && !is_fold_header;
         let line_char_len = line_str.chars().count();
+        // 'list' (#1190): applied only to the copy handed to the renderer
+        // below (`raw_text`/`spans`) — `line_str` above (already consumed
+        // by the diagnostics/spell-check UTF-16 offset math) and the word-
+        // wrap segmentation just above stay on the untransformed text, so
+        // this cannot perturb any semantic column math, only what paints.
+        let list_mode = engine.settings.list;
 
         if wrap_on && line_char_len > render_viewport_cols {
             // Split long line into viewport-width segments with word-boundary wrapping.
@@ -18654,6 +18735,12 @@ fn build_rendered_window(
                 let seg_text = line_str[seg_start_byte..seg_end_byte].to_string();
                 let seg_spans = slice_spans_for_segment(&spans, seg_start_byte, seg_end_byte);
                 let is_cont = seg > 0;
+                let is_last_seg = seg + 1 == num_segments;
+                let (seg_text, seg_spans) = if list_mode {
+                    apply_list_glyphs(seg_text, seg_spans, is_last_seg)
+                } else {
+                    (seg_text, seg_spans)
+                };
                 lines.push(RenderedLine {
                     raw_text: seg_text,
                     gutter_text: if is_cont {
@@ -18733,6 +18820,11 @@ fn build_rendered_window(
                 }
             }
         } else {
+            let (line_str, spans) = if list_mode {
+                apply_list_glyphs(line_str, spans, true)
+            } else {
+                (line_str, spans)
+            };
             lines.push(RenderedLine {
                 raw_text: line_str,
                 gutter_text,
@@ -19809,13 +19901,38 @@ fn build_status_line(engine: &Engine) -> (String, String, String) {
     } else {
         String::new()
     };
-    let right = format!(
-        "Ln {}, Col {}  ({} lines){} ",
-        cursor.line + 1,
-        cursor.col + 1,
-        engine.buffer().len_lines(),
-        diag_str
-    );
+    // 'ruler' (#1190): the cursor-position/line-count segment is the part
+    // Vim's `'ruler'` option gates (`:h 'ruler'`) — diagnostics are a
+    // vimcode-only addition with no Vim equivalent, so they stay visible
+    // either way.
+    let ruler_str = if engine.settings.ruler {
+        format!(
+            "Ln {}, Col {}  ({} lines){} ",
+            cursor.line + 1,
+            cursor.col + 1,
+            engine.buffer().len_lines(),
+            diag_str
+        )
+    } else if !diag_str.is_empty() {
+        format!("{} ", diag_str.trim_start())
+    } else {
+        String::new()
+    };
+
+    // 'showcmd' (#1190): the partially-typed Normal-mode command, shown
+    // immediately left of the ruler like Vim's own showcmd area (`:h
+    // 'showcmd'`).
+    let showcmd_str = if engine.settings.showcmd {
+        let sc = engine.showcmd_text();
+        if sc.is_empty() {
+            String::new()
+        } else {
+            format!("{sc} ")
+        }
+    } else {
+        String::new()
+    };
+    let right = format!("{showcmd_str}{ruler_str}");
 
     (prefix, branch, right)
 }
@@ -20247,13 +20364,39 @@ pub fn build_window_status_line(
             })
         };
 
-        let cursor_seg = cursor.map(|c| StatusSegment {
-            text: format!(" Ln {}, Col {} ", c.line + 1, c.col + 1),
-            fg: bar_fg,
-            bg: bar_bg,
-            bold: false,
-            action: Some(StatusAction::GoToLine),
-        });
+        // 'ruler' (#1190): `:h 'ruler'` gates exactly this segment.
+        let cursor_seg = if engine.settings.ruler {
+            cursor.map(|c| StatusSegment {
+                text: format!(" Ln {}, Col {} ", c.line + 1, c.col + 1),
+                fg: bar_fg,
+                bg: bar_bg,
+                bold: false,
+                action: Some(StatusAction::GoToLine),
+            })
+        } else {
+            None
+        };
+
+        // 'showcmd' (#1190): the partially-typed Normal-mode command,
+        // shown immediately left of the ruler like Vim's own showcmd area
+        // (`:h 'showcmd'`). Only present in the *active* window's bar — an
+        // inactive window's pane never has pending Normal-mode input.
+        let showcmd_seg = if engine.settings.showcmd {
+            let sc = engine.showcmd_text();
+            if sc.is_empty() {
+                None
+            } else {
+                Some(StatusSegment {
+                    text: format!(" {sc} "),
+                    fg: bar_fg,
+                    bg: bar_bg,
+                    bold: false,
+                    action: None,
+                })
+            }
+        } else {
+            None
+        };
 
         // Push in priority order: least-important first.
         if let Some(s) = notification_seg {
@@ -20271,6 +20414,9 @@ pub fn build_window_status_line(
             right.push(s);
         }
         if let Some(s) = lsp_seg {
+            right.push(s);
+        }
+        if let Some(s) = showcmd_seg {
             right.push(s);
         }
         if let Some(s) = cursor_seg {
@@ -20301,14 +20447,18 @@ pub fn build_window_status_line(
             });
         }
 
-        let right = if let Some(c) = cursor {
-            vec![StatusSegment {
-                text: format!("Ln {}, Col {} ", c.line + 1, c.col + 1),
-                fg: theme.status_inactive_fg,
-                bg: theme.status_inactive_bg,
-                bold: false,
-                action: None,
-            }]
+        let right = if engine.settings.ruler {
+            if let Some(c) = cursor {
+                vec![StatusSegment {
+                    text: format!("Ln {}, Col {} ", c.line + 1, c.col + 1),
+                    fg: theme.status_inactive_fg,
+                    bg: theme.status_inactive_bg,
+                    bold: false,
+                    action: None,
+                }]
+            } else {
+                vec![]
+            }
         } else {
             vec![]
         };
@@ -30473,5 +30623,82 @@ mod slice7_router_tests {
             "non-native branch must still call draw_context_menu; calls were {:?}",
             in_window_backend.calls
         );
+    }
+
+    // ─── 'list' glyph substitution (#1190) ─────────────────────────────────
+
+    #[test]
+    fn apply_list_glyphs_marks_eol_with_no_tabs() {
+        let (text, spans) = apply_list_glyphs("hello".to_string(), Vec::new(), true);
+        assert_eq!(text, "hello$");
+        assert!(spans.is_empty());
+    }
+
+    #[test]
+    fn apply_list_glyphs_marks_eol_before_trailing_newline() {
+        let (text, _) = apply_list_glyphs("hello\n".to_string(), Vec::new(), true);
+        assert_eq!(
+            text, "hello$\n",
+            "the $ must land before the newline, not after it"
+        );
+    }
+
+    #[test]
+    fn apply_list_glyphs_skips_eol_for_non_final_wrap_segment() {
+        let (text, _) = apply_list_glyphs("hello".to_string(), Vec::new(), false);
+        assert_eq!(text, "hello", "mark_eol=false must not append $");
+    }
+
+    #[test]
+    fn apply_list_glyphs_expands_tab_to_caret_i() {
+        let (text, _) = apply_list_glyphs("a\tb".to_string(), Vec::new(), false);
+        assert_eq!(text, "a^Ib");
+    }
+
+    fn plain_style() -> Style {
+        Style {
+            fg: quadraui::Color::rgb(0, 0, 0),
+            bg: None,
+            bold: false,
+            italic: false,
+            font_scale: 1.0,
+        }
+    }
+
+    #[test]
+    fn apply_list_glyphs_remaps_span_offsets_past_a_tab() {
+        // "a\tbc" — a span covering "bc" (source bytes 2..4) must land on
+        // "^Ibc"'s "bc" (bytes 3..5) once the tab becomes the 2-byte `^I`.
+        let spans = vec![StyledSpan {
+            start_byte: 2,
+            end_byte: 4,
+            style: plain_style(),
+        }];
+        let (text, spans) = apply_list_glyphs("a\tbc".to_string(), spans, false);
+        assert_eq!(text, "a^Ibc");
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].start_byte, 3);
+        assert_eq!(spans[0].end_byte, 5);
+        assert_eq!(&text[spans[0].start_byte..spans[0].end_byte], "bc");
+    }
+
+    #[test]
+    fn apply_list_glyphs_remaps_spans_across_two_tabs() {
+        // "a\tb\tc" — a span on the trailing "c" (source byte 4..5) must
+        // shift by +2 (one extra byte from each of the two tabs).
+        let spans = vec![StyledSpan {
+            start_byte: 4,
+            end_byte: 5,
+            style: plain_style(),
+        }];
+        let (text, spans) = apply_list_glyphs("a\tb\tc".to_string(), spans, false);
+        assert_eq!(text, "a^Ib^Ic");
+        assert_eq!(&text[spans[0].start_byte..spans[0].end_byte], "c");
+    }
+
+    #[test]
+    fn apply_list_glyphs_combines_tab_and_eol() {
+        let (text, _) = apply_list_glyphs("a\tb".to_string(), Vec::new(), true);
+        assert_eq!(text, "a^Ib$");
     }
 }

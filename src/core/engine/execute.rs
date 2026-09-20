@@ -1113,19 +1113,35 @@ impl Engine {
             return EngineAction::OpenFile(PathBuf::from(filename));
         }
 
-        // Handle :e[dit] <filename>
+        // Handle :e[dit] <filename> — 'hidden' guard (#1190): unlike
+        // `:edit!` above, a plain `:edit` abandons the current buffer, so
+        // it must refuse when the buffer is dirty, no other window shows
+        // it, and 'hidden' isn't set (`:h 'hidden'`, `:h E37`).
         if let Some(filename) = cmd.strip_prefix("edit ") {
             let filename = filename.trim();
             if filename.is_empty() {
                 self.message = "No file name".to_string();
                 return EngineAction::Error;
             }
+            if let Err(msg) = self.check_buffer_abandon(false) {
+                self.message = msg;
+                return EngineAction::Error;
+            }
             return EngineAction::OpenFile(PathBuf::from(filename));
         }
 
-        // Handle :b[uffer] <buffer>
-        if let Some(arg) = cmd.strip_prefix("buffer ") {
-            let arg = arg.trim();
+        // Handle :b[uffer][!] <buffer> — same 'hidden' guard as `:edit`,
+        // bypassed by a trailing `!` (#1190).
+        if cmd.starts_with("buffer ") || cmd.starts_with("buffer! ") {
+            let force = cmd.starts_with("buffer! ");
+            let arg = cmd
+                .strip_prefix(if force { "buffer! " } else { "buffer " })
+                .unwrap()
+                .trim();
+            if let Err(msg) = self.check_buffer_abandon(force) {
+                self.message = msg;
+                return EngineAction::Error;
+            }
             if let Ok(num) = arg.parse::<usize>() {
                 self.goto_buffer(num);
             } else if let Some(id) = self.buffer_manager.find_by_path(arg) {
@@ -1569,32 +1585,56 @@ impl Engine {
             return EngineAction::None;
         }
 
-        // Handle :bn[ext]
-        if cmd == "bnext" {
+        // Handle :bn[ext][!] — 'hidden' guard (#1190): each of these
+        // switches the active buffer, so all share `check_buffer_abandon`,
+        // bypassed by a trailing `!`.
+        if cmd == "bnext" || cmd == "bnext!" {
+            if let Err(msg) = self.check_buffer_abandon(cmd.ends_with('!')) {
+                self.message = msg;
+                return EngineAction::Error;
+            }
             self.next_buffer();
             return EngineAction::None;
         }
 
-        // Handle :bp[revious]
-        if cmd == "bprevious" {
+        // Handle :bp[revious][!]
+        if cmd == "bprevious" || cmd == "bprevious!" {
+            if let Err(msg) = self.check_buffer_abandon(cmd.ends_with('!')) {
+                self.message = msg;
+                return EngineAction::Error;
+            }
             self.prev_buffer();
             return EngineAction::None;
         }
 
-        // Handle :bf[irst] — jump to the lowest-numbered buffer.
-        if cmd == "bfirst" {
+        // Handle :bf[irst][!] — jump to the lowest-numbered buffer.
+        if cmd == "bfirst" || cmd == "bfirst!" {
+            if let Err(msg) = self.check_buffer_abandon(cmd.ends_with('!')) {
+                self.message = msg;
+                return EngineAction::Error;
+            }
             self.goto_buffer(1);
             return EngineAction::None;
         }
 
-        // Handle :bl[ast] — jump to the highest-numbered buffer.
-        if cmd == "blast" {
+        // Handle :bl[ast][!] — jump to the highest-numbered buffer.
+        if cmd == "blast" || cmd == "blast!" {
+            if let Err(msg) = self.check_buffer_abandon(cmd.ends_with('!')) {
+                self.message = msg;
+                return EngineAction::Error;
+            }
             self.goto_buffer(self.buffer_manager.len());
             return EngineAction::None;
         }
 
-        // Handle :buffer# (alternate buffer) — normalizer turns b# → buffer#
-        if cmd == "buffer#" {
+        // Handle :buffer#[!] (alternate buffer) — normalizer turns b# →
+        // buffer# and b!# → buffer!#, so the force spelling has the bang
+        // before the `#`.
+        if cmd == "buffer#" || cmd == "buffer!#" {
+            if let Err(msg) = self.check_buffer_abandon(cmd == "buffer!#") {
+                self.message = msg;
+                return EngineAction::Error;
+            }
             self.alternate_buffer();
             return EngineAction::None;
         }
@@ -2750,7 +2790,13 @@ impl Engine {
                 self.message = format!("\"{name}\"{modified} {total} lines --{pct}%--");
                 EngineAction::None
             }
-            "enew" => {
+            // 'hidden' guard (#1190): `:enew` abandons the current buffer
+            // for a fresh unnamed one, same rule as `:edit`/`:bnext`.
+            "enew" | "enew!" => {
+                if let Err(msg) = self.check_buffer_abandon(cmd == "enew!") {
+                    self.message = msg;
+                    return EngineAction::Error;
+                }
                 let new_id = self.buffer_manager.create();
                 self.switch_window_buffer(new_id);
                 self.message = "New buffer".to_string();
