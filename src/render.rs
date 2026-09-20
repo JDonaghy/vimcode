@@ -11202,26 +11202,53 @@ pub fn gtk_minimap_sizing() -> quadraui::MinimapSizing {
 /// i.e. the ~2–6 px band #35 asks for.
 const MINIMAP_LINES_PER_ROW: usize = 4;
 
-/// Ceiling on the compression factor `K` [`build_minimap_data`] applies when
-/// the buffer is longer than the strip's own `target_lines` sample budget
-/// (#1186 — the "compressed scale mode" #1093 deferred). Below this ceiling
-/// the window grows to `K * target_lines` buffer lines — every file that
-/// fits comfortably under that span is shown in full, VS-Code-style, instead
-/// of only its first `target_lines` lines. Past it, the window is capped at
-/// `MINIMAP_MAX_COMPRESSION * target_lines` lines and slides with the
-/// editor's own scroll position (#1093's original behaviour), so both ends
-/// of an arbitrarily large file stay reachable.
+/// Ceiling on the compression factor `K` [`build_minimap_data`] applies —
+/// still a safety clamp (#1186's "compressed scale mode"), but since #1211 no
+/// longer the *load-bearing* knob: `K` is derived from the strip's own
+/// geometry (see [`MINIMAP_VIEWPORT_MULTIPLE`]), never from
+/// `total_buffer_lines`, so `K` stays small and constant for every real
+/// caller and only a pathological `rect`/`editor_visible_rows` pairing (a
+/// strip far shorter than the editor's own viewport) could ever push it this
+/// high.
 ///
 /// Chosen empirically against [`MINIMAP_BLOCK_LINE_SAMPLE_CAP`] (8): once a
 /// block is wider than the cap, `minimap_block_sample_indices` already
 /// spreads exactly `cap` samples across it regardless of how much wider it
 /// gets, so growing `K` past the point where blocks already exceed the cap
 /// costs no extra line fetches — only a larger buffer span per block. A
-/// `K_max` far beyond that point (64, i.e. blocks up to 8x the sample cap
-/// once a file is that much longer than `target_lines`) still keeps each
-/// block's aggregated row a meaningful, dithered summary of real content
-/// rather than a coin-flip over the whole file.
-const MINIMAP_MAX_COMPRESSION: usize = 64;
+/// `K_max` far beyond that point (64, i.e. blocks up to 8x the sample cap)
+/// still keeps each block's aggregated row a meaningful, dithered summary of
+/// real content rather than a coin-flip over the whole file.
+///
+/// `pub(crate)` since #1211 so `src/tui_main/shell_app.rs`'s tests can read
+/// the real ceiling instead of hand-copying a `COMPRESSION_CEILING_MIRROR`
+/// constant that could drift out of sync with this one.
+pub(crate) const MINIMAP_MAX_COMPRESSION: usize = 64;
+
+/// How many editor viewports [`build_minimap_data`]'s window covers at its
+/// default, uncompressed scale (`K == 1`) — VS Code's own default minimap
+/// (`editor.minimap.size: "proportional"`, decoded from the shipped bundle
+/// for #1211): a fixed `BASE_CHAR_HEIGHT * scale` row pitch against a
+/// `lineHeight` roughly 9x taller, independent of the file's length. `K` is
+/// then chosen (see the comment at its own definition, below) so the
+/// window's real line count — `target_lines * K` — comes out to
+/// `editor_visible_rows * MINIMAP_VIEWPORT_MULTIPLE`, regardless of how
+/// `target_lines` itself was derived (GTK's ~2px fixed pitch vs the TUI's
+/// braille-native one): on GTK, `target_lines` already comes out to roughly
+/// `9 * editor_visible_rows` (`gtk_row_capacity`, above), so `K` naturally
+/// falls out to `1` — one buffer line per row, #1093's slide re-engaged. On
+/// the TUI, `target_lines` is only `4 * editor_visible_rows`
+/// (`MINIMAP_LINES_PER_ROW`), so `K` comes out to `ceil(9 / 4) == 3` — three
+/// real buffer lines dithered into each braille row — the TUI's rough
+/// approximation of the same ~9-viewport window, bounded and constant
+/// instead of growing without limit as the file gets longer (#1211's root
+/// cause: the pre-fix `K` was `total_buffer_lines.div_ceil(target_lines)`,
+/// which squeezed the *whole file* into the strip for every file shorter
+/// than `MINIMAP_MAX_COMPRESSION * target_lines` — i.e. essentially every
+/// real file — disabling #1093's slide on both backends and regressing GTK,
+/// which was already at exact VS Code parity at `K == 1`, from correct to
+/// "whole file squeezed in").
+const MINIMAP_VIEWPORT_MULTIPLE: usize = 9;
 
 /// Ceiling on how many characters into a line `build_minimap_data`'s
 /// `to_col` closure ever looks when measuring a highlight's own column.
@@ -11682,14 +11709,27 @@ pub fn build_minimap_data(
     // `minimap_block_bounds` (just below) takes its striding branch instead
     // of its "never upscales" one and each block becomes `k` real buffer
     // lines wide, aggregated by the exact same `minimap_block_text` path
-    // #1085 built for this. `k` is chosen to fit the *whole* buffer into one
-    // window whenever that stays under `MINIMAP_MAX_COMPRESSION`; past that
-    // ceiling the window is capped at `MINIMAP_MAX_COMPRESSION * target_lines`
-    // lines and slides with the editor's scroll position exactly like
-    // #1093's original window did, so both ends of a very large file stay
-    // reachable even though the strip can no longer show all of it at once.
-    let k = total_buffer_lines
-        .div_ceil(target_lines)
+    // #1085 built for this.
+    //
+    // #1211: `k` is a function of the strip's own geometry
+    // (`editor_visible_rows`, `target_lines`) — **never** of
+    // `total_buffer_lines`. The pre-#1211 `k` here was
+    // `total_buffer_lines.div_ceil(target_lines)`, chosen to fit the *whole
+    // buffer* into one window — which squeezed the entire file into the
+    // strip for every file shorter than `MINIMAP_MAX_COMPRESSION *
+    // target_lines` (essentially every real file), pinning `max_start` to
+    // `0` below and permanently disabling #1093's slide. See
+    // `MINIMAP_VIEWPORT_MULTIPLE`'s own doc comment for why this
+    // `desired_window_lines` formula reproduces VS Code's default
+    // (`minimap.size: "proportional"`) fixed-scale behaviour on GTK
+    // (`k == 1`) while still giving the TUI's coarser `target_lines` a small,
+    // constant compression factor (`k == 3`) instead of one that grows
+    // without bound as the file gets longer.
+    let desired_window_lines = editor_visible_rows
+        .max(1)
+        .saturating_mul(MINIMAP_VIEWPORT_MULTIPLE);
+    let k = desired_window_lines
+        .div_ceil(target_lines.max(1))
         .clamp(1, MINIMAP_MAX_COMPRESSION);
     // quadraui's own `MinimapSizing::FixedPitch` already implements this
     // slide (`slide_window_start_row`) — but only engages once it's handed
@@ -26904,13 +26944,12 @@ mod tests {
     /// against that shape at any scroll position, including the top.
     #[test]
     fn minimap_window_stays_short_of_eof_when_scrolled_to_the_top() {
-        // #1186: at this rect's `target_lines` (160), a 2,000-line buffer
-        // (`k = ceil(2_000 / 160) = 13 <= MINIMAP_MAX_COMPRESSION`) now fits
-        // *entirely* inside one compressed window — exactly #1186's own
-        // point. 20,000 lines comfortably exceeds
-        // `MINIMAP_MAX_COMPRESSION * 160` (10,240), so the window still
-        // cannot cover the whole file and this test keeps exercising
-        // #1093's genuine sliding-window regime.
+        // #1211: `K` (hence the window's own length) is now a function of
+        // this call's geometry alone (`editor_visible_rows`, `target_lines`
+        // == 160 here) — never of the buffer's own length — so any file
+        // longer than that geometry-only window still cannot cover the
+        // whole file, and 20,000 lines keeps exercising #1093's genuine
+        // sliding-window regime exactly as it always has.
         let e = large_minimap_engine(20_000);
         let theme = Theme::onedark();
         let wid = e.active_window_id();
@@ -26937,9 +26976,10 @@ mod tests {
     /// scrolling, VS Code's `minimap.size: proportional`).
     #[test]
     fn minimap_window_reaches_eof_when_scrolled_to_the_bottom() {
-        // #1186: see the sibling "stays short of eof" test's comment — a
-        // 20,000-line buffer stays outside the compression ceiling at this
-        // rect's `target_lines` (160), so the window still has to slide.
+        // #1211: see the sibling "stays short of eof" test's comment — the
+        // window's length is geometry-only, so a 20,000-line buffer stays
+        // outside it at this rect's `target_lines` (160) and the window
+        // still has to slide.
         let mut e = large_minimap_engine(20_000);
         let theme = Theme::onedark();
         let wid = e.active_window_id();
@@ -26979,21 +27019,27 @@ mod tests {
         );
     }
 
-    /// #1186 superseded #1093 acceptance criterion 3 (which pinned the
-    /// vertical scale as *always* one buffer line per painted row,
-    /// regardless of file length — exactly the bug #1186 reports: that
-    /// fixed scale is what limits the strip to a small fraction of a large
-    /// file). The new invariant: the scale (buffer lines per painted row)
-    /// **grows** with file length up to the point where the whole file fits
-    /// in one window, then **caps** at `MINIMAP_MAX_COMPRESSION` for files
-    /// beyond that — never unbounded, never regressing to #1093's fixed 1.
+    /// #1211 acceptance: the scale (buffer lines per painted row) is a
+    /// function of the strip's own geometry (`editor_visible_rows`,
+    /// `target_lines`) — **never** of `total_buffer_lines`. #1186 derived
+    /// `K` from `total_buffer_lines.div_ceil(target_lines)`, which squeezed
+    /// the *whole file* into the strip for every file shorter than
+    /// `MINIMAP_MAX_COMPRESSION * target_lines` (essentially every real
+    /// file), disabling #1093's slide — this test locks in the fix: two
+    /// files of wildly different lengths, same strip geometry, must land on
+    /// the *identical* scale, and neither shows through to EOF while
+    /// scrolled to the top (both must still slide to reach it).
     ///
-    /// **RED against unfixed `develop`:** the pre-#1186 scale was pinned at
-    /// exactly 1 regardless of file length — `step(&mm_medium) > 1` and
-    /// `step(&mm_huge) == MINIMAP_MAX_COMPRESSION` both fail against that
-    /// shape (both would observe `1`).
+    /// **RED against unfixed `develop`:** confirmed by hand — restoring the
+    /// pre-#1211 `k = total_buffer_lines.div_ceil(target_lines)` makes
+    /// `step(&mm_medium)` (1,500 lines) come out to `10` and
+    /// `step(&mm_huge)` (50,000 lines) come out to `64` (the
+    /// `MINIMAP_MAX_COMPRESSION` clamp binding) — different from each other,
+    /// failing the `assert_eq!` below — and `mm_medium` reaches EOF from the
+    /// top (the whole 1,500-line file fit in one window), failing the
+    /// "must NOT reach EOF" assertion for the medium fixture.
     #[test]
-    fn minimap_scale_grows_with_file_length_then_caps_at_the_compression_ceiling() {
+    fn minimap_scale_is_constant_across_file_length_not_derived_from_it() {
         let theme = Theme::onedark();
         // `target_lines` at this rect geometry (pinned by the sibling
         // windowing tests' own comments): 160.
@@ -27018,58 +27064,54 @@ mod tests {
 
         let step = |mm: &quadraui::Minimap| mm.lines[1].line_idx - mm.lines[0].line_idx;
 
-        // A file shorter than `target_lines` needs no compression at all.
+        // A file shorter than `target_lines` needs no compression at all —
+        // unaffected by this fix, kept as a sibling floor.
         assert_eq!(
             step(&mm_short),
             1,
             "a file shorter than target_lines must sample one buffer line \
-             per painted row, exactly like pre-#1186"
+             per painted row"
         );
-        // A file that fits entirely under `MINIMAP_MAX_COMPRESSION *
-        // target_lines` (1,500 < 64 * 160 = 10,240) is compressed just
-        // enough to show the whole thing, not clamped to the old scale of 1.
-        assert!(
-            step(&mm_medium) > 1,
-            "a 1,500-line file at target_lines=160 must compress (step > 1) \
-             so the whole file fits — got step {}",
-            step(&mm_medium)
-        );
+
+        // The core #1211 property: 1,500 lines and 50,000 lines, same
+        // geometry, must produce the exact same scale — `K` is a function
+        // of the strip, not the file.
         assert_eq!(
-            mm_medium.lines[0].line_idx, 0,
-            "a file within the compression ceiling must show from the top"
-        );
-        // The last block's own *start* need not equal `total - 1` exactly
-        // (it's a several-lines-wide block, not a single line) — what
-        // matters is that its range reaches EOF, i.e. its start is within
-        // one block-width of the file's last line. `minimap_block_bounds`'s
-        // boundaries are each `floor(r * stride)`, so a block can be up to
-        // `ceil(stride)` wide (one wider than the average `step` between
-        // the first two blocks, from truncation) — `step(&mm_medium) + 1`
-        // covers that.
-        assert!(
-            mm_medium.total_buffer_lines - mm_medium.lines.last().unwrap().line_idx
-                <= step(&mm_medium) + 1,
-            "a file within the compression ceiling must show through to EOF \
-             with the cursor at the top — the whole file fits in one window \
-             (last block starts at line {}, of {} total, block width {})",
-            mm_medium.lines.last().unwrap().line_idx,
-            mm_medium.total_buffer_lines,
-            step(&mm_medium)
-        );
-        // A file far beyond the compression ceiling (50,000 >> 10,240) caps
-        // at MINIMAP_MAX_COMPRESSION rather than compressing further —
-        // #1093's sliding window still applies beyond this point.
-        assert_eq!(
+            step(&mm_medium),
             step(&mm_huge),
-            MINIMAP_MAX_COMPRESSION,
-            "a file far beyond the compression ceiling must cap its scale \
-             at MINIMAP_MAX_COMPRESSION, not keep growing"
+            "the painted lines-per-row must be identical for a 1,500-line \
+             and a 50,000-line file at the same strip geometry — got {} vs \
+             {}; a scale that differs by file length means K is still \
+             derived from total_buffer_lines",
+            step(&mm_medium),
+            step(&mm_huge)
         );
         assert!(
-            mm_huge.lines.last().unwrap().line_idx < mm_huge.total_buffer_lines - 1,
-            "a file beyond the compression ceiling must NOT reach EOF while \
-             scrolled to the top — the window still has to slide"
+            step(&mm_medium) > 1 && step(&mm_medium) <= MINIMAP_MAX_COMPRESSION,
+            "the shared scale must compress (TUI-shaped geometry: more than \
+             one buffer line per row) but stay within the safety ceiling — \
+             got {}",
+            step(&mm_medium)
         );
+
+        // Neither file's window may reach EOF while scrolled to the top —
+        // both are longer than the (geometry-only) window, so #1093's slide
+        // must still be required to reach the end, for the small file just
+        // as much as the huge one.
+        for (label, mm) in [("medium", &mm_medium), ("huge", &mm_huge)] {
+            assert_eq!(
+                mm.lines[0].line_idx, 0,
+                "{label} fixture must start at the top"
+            );
+            assert!(
+                mm.lines.last().unwrap().line_idx < mm.total_buffer_lines - 1,
+                "{label} fixture must NOT reach EOF while scrolled to the \
+                 top — the window still has to slide (last painted line \
+                 {} of {})",
+                mm.lines.last().unwrap().line_idx,
+                mm.total_buffer_lines
+            );
+        }
     }
 
     /// #1093 acceptance criterion 6: a file that fits entirely within the

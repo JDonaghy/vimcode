@@ -7770,18 +7770,24 @@ mod minimap {
     #[test]
     fn minimap_click_near_the_bottom_pages_instead_of_jumping_to_eof_on_gtk() {
         // Enough lines that the strip's real GTK row capacity (measured at
-        // ~378 rows for this harness's 1400x900 size by the #1052 test
+        // ~375 rows for this harness's 1400x900 size by the #1052 test
         // above) is exceeded well over an order of magnitude, so the
         // sliding-window math is actually exercised rather than the
         // "whole file already fits" branch every other GTK minimap test in
         // this module happens to take.
         //
-        // #1186: a 5,000-line buffer used to guarantee that (`target_lines`
-        // ~378, well under 5,000) — but #1186 lets the window grow up to
-        // `MINIMAP_MAX_COMPRESSION` (64, module-private in `render.rs`)
-        // times `target_lines`, i.e. up to ~24,192 lines here, comfortably
-        // swallowing 5,000 lines whole. 200,000 lines comfortably exceeds
-        // that compression ceiling too, so the window still has to slide.
+        // #1186 let the window grow past `target_lines` by a factor `K`,
+        // derived (pre-#1211) from `total_buffer_lines` — which meant even
+        // very large files could get squeezed whole into the strip (up to
+        // `MINIMAP_MAX_COMPRESSION * target_lines`, i.e. ~24,000 lines
+        // here), silently disabling the sliding-window math this test is
+        // about. #1211 made `K` a function of the strip's own geometry
+        // instead (see `MINIMAP_VIEWPORT_MULTIPLE` in `render.rs`), so on
+        // GTK — already at `target_lines ~= 9 * editor_visible_rows`, VS
+        // Code's own default ratio — `K` now resolves to `1` again: one
+        // buffer line per painted row, a window of ~375 lines. 200,000
+        // lines comfortably exceeds that either way, so the window still
+        // has to slide regardless of which `K` produced it.
         let n_lines = 200_000usize;
         let mut engine = Engine::new_for_test();
         let text: String = (0..n_lines).map(|i| format!("line {i}\n")).collect();
@@ -7876,6 +7882,113 @@ mod minimap {
              strip-window's worth of file ({window_len} lines) forward, \
              not jump to (or near) EOF — got scroll_top={scroll_top} of \
              {total}"
+        );
+        assert!(
+            scroll_top < total - window_len,
+            "a bottom-of-strip click must not jump anywhere near EOF — \
+             got scroll_top={scroll_top} of {total} (window={window_len})"
+        );
+    }
+
+    /// #1211 acceptance: a *moderately* long file — long enough that #1186's
+    /// pre-#1211 `K` (`total_buffer_lines.div_ceil(target_lines)`) squeezed
+    /// it whole into the strip, but nowhere near
+    /// `MINIMAP_MAX_COMPRESSION * target_lines` — must still show a genuine
+    /// sliding window, not the whole file, on GTK.
+    ///
+    /// The sibling test above bumped its own fixture from 5,000 lines to
+    /// 200,000 specifically to route around this bug (see its own comment's
+    /// history): at 5,000 lines and this harness's ~375-line
+    /// `target_lines`, the pre-#1211 `K` came out to
+    /// `ceil(5_000 / 375) == 14`, and `window_len =
+    /// min(375 * 14, 5_000) == 5_000` — the *entire* file, disabling the
+    /// slide. This test restores that exact scale and asserts the window
+    /// stays far short of it.
+    ///
+    /// **RED against unfixed `develop`:** confirmed by hand — reverting
+    /// `build_minimap_data`'s `k` to
+    /// `total_buffer_lines.div_ceil(target_lines)` makes the "must be well
+    /// short of the file's actual last line" assertion below fail: with the
+    /// cursor at the top, `last_painted_line + window_len` lands at (or
+    /// past) `total - 1` because the whole 5,000-line file fits in one
+    /// window.
+    #[test]
+    fn minimap_slides_even_for_a_moderately_long_file_on_gtk() {
+        let n_lines = 5_000usize;
+        let mut engine = Engine::new_for_test();
+        let text: String = (0..n_lines).map(|i| format!("line {i}\n")).collect();
+        engine.buffer_mut().insert(0, &text);
+
+        let mut h = harness(engine, 1400, 900);
+        let win = h.engine.borrow().active_window_id();
+        h.window_center(win).expect("editor pane must paint");
+        assert_eq!(
+            h.engine.borrow().scroll_top(),
+            0,
+            "fixture must start at the top of the file"
+        );
+
+        let (strip, window_len, last_painted_line, total) = {
+            let layout = h.screen_layout.borrow();
+            let mm = layout
+                .as_ref()
+                .unwrap()
+                .minimap
+                .iter()
+                .find(|m| m.window_id == win)
+                .expect("minimap must be present for the active pane");
+            let block_width = mm
+                .minimap
+                .lines
+                .get(1)
+                .map(|l| l.line_idx - mm.minimap.lines[0].line_idx)
+                .unwrap_or(1)
+                .max(1);
+            (
+                mm.rect,
+                mm.minimap.lines.len() * block_width,
+                mm.minimap.lines.last().map(|l| l.line_idx).unwrap_or(0),
+                mm.minimap.total_buffer_lines,
+            )
+        };
+        assert!(
+            (n_lines..=n_lines + 1).contains(&total),
+            "sanity: the fixture's own line count ({n_lines}) must reach \
+             the painted layout (got total_buffer_lines={total})"
+        );
+
+        // The core #1211 property: even at this moderate file length, the
+        // window must be a small fraction of the file, not the whole thing.
+        assert!(
+            window_len < total / 4,
+            "the strip's own window ({window_len} lines) must be well \
+             short of the {total}-line file's own length — a window this \
+             close to the whole file means K is still being inflated to \
+             swallow it, exactly the #1186 regression this issue reports"
+        );
+        assert!(
+            last_painted_line + window_len < total - 1,
+            "with the cursor at the top of a {total}-line file, the \
+             strip's last painted row (buffer line {last_painted_line}, \
+             window of {window_len} rows) must be well short of the \
+             file's actual last line ({}) — a squeezed-whole-file window \
+             pins the last painted row to the file's end regardless of \
+             scroll position",
+            total - 1
+        );
+
+        // A bottom-of-strip click must page, not jump to EOF.
+        h.driver.click(
+            (strip.x + strip.width / 2.0) as f32,
+            (strip.y + strip.height * 0.95) as f32,
+        );
+        h.driver.render();
+
+        let scroll_top = h.engine.borrow().scroll_top();
+        assert!(
+            scroll_top > 0,
+            "a click near the bottom of the strip must still scroll \
+             forward from the top of the file — got scroll_top=0"
         );
         assert!(
             scroll_top < total - window_len,

@@ -2605,15 +2605,22 @@ mod tests {
     /// call makes the non-blank-braille assertion below fail — confirmed by
     /// hand before restoring the fix.
     ///
-    /// #1093 updated the golden file: the strip now holds a fixed-scale
-    /// *window* onto the buffer (121 lines, well over this geometry's
-    /// ~52-line window) rather than the whole file squeezed to fit, so the
-    /// indent step — real buffer lines 40..80 — now shows only the
-    /// `40..52` slice that falls inside the window, one row earlier than
-    /// before (the pre-#1093 compression happened to land it at row 4;
-    /// windowing, with one buffer line per `lines` entry, lands it at row
-    /// 10 — `40 / MINIMAP_LINES_PER_ROW`). Confirmed by hand: this is the
-    /// same fixture, same terminal size, only the sampling scale changed.
+    /// #1093 introduced a fixed-scale *window* onto the buffer instead of
+    /// squeezing the whole file to fit. #1186 then let that window grow to
+    /// a multi-line-per-row *compressed* window once the file exceeds the
+    /// strip's own `target_lines` sample budget — at this fixture's
+    /// geometry, `target_lines == 52`, so this 120-line file compresses to
+    /// `K == 3` real buffer lines per painted row (well within
+    /// `MINIMAP_MAX_COMPRESSION`), showing the whole file top-to-bottom
+    /// rather than only its first `target_lines` lines.
+    ///
+    /// #1211 changed how `K` itself is derived — from the strip's own
+    /// geometry (`editor_visible_rows`, `target_lines`), never from
+    /// `total_buffer_lines` (see `MINIMAP_VIEWPORT_MULTIPLE` in
+    /// `render.rs`) — but at this fixture's specific geometry the new
+    /// formula still resolves to the same `K == 3`, so this golden file is
+    /// unchanged by that fix: confirmed by hand, this test stayed green
+    /// across it.
     #[test]
     fn snapshot_minimap_braille() {
         let text: String = (0..120)
