@@ -213,11 +213,30 @@ Vim patterns are translated to Rust `regex` before matching, so `/`, `?`, `:s`,
 | `\n` `\t` `\r` `\e` | multi-line search works across the whole buffer |
 | `\s \d \w \a \l \u \x \o \h \i \k \f \p` + uppercase negations | character classes |
 | `\%^` `\%$` | start/end of buffer |
+| `\1`…`\9` | back-references **in the pattern** (#1004) — see the engine note below |
 
 **Not supported** — these are *rejected with an error*, never silently matched
-as literal text: back-references in a pattern (`\1`…`\9`), look-around
-(`\@=`, `\@!`), `\&`, and `\_x`. The Rust `regex` crate has no back-tracking,
-so it cannot express them.
+as literal text: look-around (`\@=`, `\@!`, `\@<=`, `\@<!`), `\&`, `\_x`,
+`\%V`, and `\%23l`/`\%23c`. Tracked by **#1157**.
+
+**Engine note (corrected 2026-09-19, #1163).** This section used to list
+back-references alongside the above and explain the whole group with "the Rust
+`regex` crate has no back-tracking, so it cannot express them". That is no
+longer the mechanism. `fancy-regex` — which *does* back-track — has been a
+direct dependency since #1004 (`Cargo.toml`), and `src/core/vim_regex.rs`
+routes a pattern to it **only** when the pattern actually contains a `\1`…`\9`
+atom (`has_backref`), keeping the fast non-backtracking engine for everything
+else. So back-references work today, and the remaining rejections above are a
+*translation* gap rather than an engine limitation — #1157 exists precisely
+because look-around is a rejection branch to flip, not a crate to replace.
+
+**Known limitation — `:normal` and special-key notation.** The `:normal` row
+below is accurate: it feeds its argument through the normal-mode dispatcher.
+But `<Esc>`/`<CR>`-style *notation* is not expanded in that argument — the
+characters are taken literally — and because this project has no `:execute`
+(and will not: see #1170's scope boundary), there is no supported way to send a
+real `<Esc>` through `:normal`. Vim users routinely rely on
+`:execute "normal! ..\<Esc>"`, so the gap is more visible than the row suggests.
 
 **Known deviation — jumplist scope (#674):** stock Vim keeps one jumplist
 *per window* (`:help jumplist`): `CTRL-O`/`CTRL-I` never cross a window or
@@ -232,6 +251,15 @@ choice, not an oversight: the reported use case is explicitly cross-tab —
 "jump back to a tab I visited a few minutes earlier, then forward again" —
 which a strictly per-window jumplist cannot do. A tab/split closing prunes
 its entries from the list so `CTRL-O`/`CTRL-I` keep working afterward.
+
+**Resolved 2026-09-19 (#1158, PR #1173) — the file-open jumplist bug.** Separately
+from the deliberate scope choice above, `:e`/`:tabnew`/`:split` genuinely failed to
+push a jumplist entry before switching away, so `CTRL-O` after opening a file did
+nothing. `open_file_with_mode`, `new_tab` and `split_window_with_new_first` now call
+`push_jump_location` first. The nine labels this cost
+`tests/nvim_conformance.rs`'s `KNOWN_DEVIATIONS_MULTI` all pass against real Neovim
+now, and that array is `&[]`. It is a shrink-only gate, so that is a floor rather
+than a snapshot.
 
 ---
 
@@ -340,12 +368,12 @@ its entries from the list so `CTRL-O`/`CTRL-I` keep working afterward.
 | `gm` / `gM` | Middle of screen/text line | ✅ | |
 | `g?{motion}` | ROT13 encode | ✅ | Supports text objects, all motions |
 | `g@{motion}` | Call operatorfunc | ✅ | Lua plugin API: `vimcode.set_operatorfunc(fn)` |
-| `g+` / `g-` | Undo tree newer/older | ✅ | Chronological timeline navigation |
+| `g+` / `g-` | Newer/older text state | ⚠️ | **Not undo-*tree* navigation.** The timeline is linear: an edit made after an undo discards the branch it moved off, so `g-`/`g+` walk one chronological list rather than across branches. Vim keeps every branch reachable. No `:earlier`/`:later`, no `undofile`. Tracked by #1156 |
 | `gR` | Virtual replace mode | ✅ | Tab-aware overwrite; `gr` is LSP references |
 | `g'` / `` g` `` | Mark without jumplist | ✅ | |
 | `g&` | Repeat `:s` all lines | ✅ | |
 | `gh` | Editor hover popup (diagnostics, annotations, LSP hover) | ✅ | VimCode-specific (Vim: Select mode) |
-| `gH` / `gV` | Select mode | N/A | No Select mode |
+| `gH` / `gV` | Select mode | ❌ | Select mode is **deferred, not out of scope** (#1170) — it is reachable without an expression evaluator. `COVERAGE_PHASE5.md` already marks both ❌; N/A here was the disagreeing cell |
 
 **g-commands: 41/41 (100%)**
 
@@ -379,8 +407,8 @@ its entries from the list so `CTRL-O`/`CTRL-I` keep working afterward.
 | `zh` / `zl` | Scroll horizontally | ✅ | With count support |
 | `zH` / `zL` | Scroll half-screen horiz. | ✅ | |
 | `ze` / `zs` | Scroll to cursor right/left | ✅ | |
-| `z=` | Spelling suggestions | N/A | No spell check |
-| `zg` / `zw` / `zG` / `zW` | Spelling word lists | N/A | No spell check |
+| `z=` | Spelling suggestions | ✅ | `src/core/spell.rs`; `:set spell` |
+| `zg` / `zw` / `zG` / `zW` | Spelling word lists | ✅ | Good/bad word lists, internal and persistent variants |
 
 **z-commands: 23/23 (100%)** (excluding N/A)
 
@@ -446,7 +474,7 @@ its entries from the list so `CTRL-O`/`CTRL-I` keep working afterward.
 | `[/` / `]/` | C comment start/end | ✅ | Alias for `[*`/`]*` |
 | `[#` / `]#` | Preprocessor directive | ✅ | Depth-tracked `#if`/`#else`/`#endif` |
 | `[z` / `]z` | Fold start/end | ✅ | Navigate within fold |
-| `[s` / `]s` | Spelling errors | N/A | No spell check |
+| `[s` / `]s` | Move to prev/next misspelling | ✅ | `src/core/spell.rs` |
 
 **Bracket commands: 13/13 (100%)** (excluding N/A)
 
@@ -541,7 +569,7 @@ Operators `d`, `c`, `y`, `>`, `<`, `=`, `g~`, `gu`, `gU` all accept these motion
 | `:bn` / `:bp` | Buffer next/prev | ✅ | |
 | `:bfirst` / `:blast` | Buffer first/last | ✅ | |
 | `:b#` | Alternate buffer | ✅ | |
-| `:b {N}` | Go to buffer N | ⚠️ | By number only, not by name |
+| `:b {N}` | Go to buffer N | ✅ | `:b[uffer] <arg>` takes a number **or** a name — `execute.rs`'s handler parses the argument as a buffer id and falls back to `find_by_path`. The ⚠️ "by number only, not by name" this row used to carry contradicted the `:b {name}` row below and was wrong (#1163) |
 | `:bd` / `:bdelete` | Delete buffer | ✅ | |
 | `:bw` / `:bwipeout` | Wipe out buffer | ✅ | Shares `:bdelete`'s implementation — vimcode has no separate unloaded-but-listed buffer state |
 | `:ls` / `:buffers` | List buffers | ✅ | |
@@ -573,7 +601,7 @@ Operators `d`, `c`, `y`, `>`, `<`, `=`, `g~`, `gu`, `gU` all accept these motion
 | `:noh` / `:nohlsearch` | Clear highlight | ✅ | |
 | `:startinsert` / `:stopinsert` | Enter/leave Insert mode | ✅ | `!` variant appends at end of line |
 | Ex ranges | `N`, `.`, `$`, `%`, `'m`, `'<,'>`, `/pat/`, `?pat?`, `+N`/`-N`, `a,b`, `a;b` | ✅ | Accepted by `:s`, `:g`, `:d`, `:y`, `:j`, `:>`, `:<`, `:t`, `:m`, `:normal` |
-| `:set {option}` | Set option | ✅ | Full `:set` syntax, several options per command (`:set ic scs`) |
+| `:set {option}` | Set option | ⚠️ | Full `:set` *syntax*, several options per command (`:set ic scs`). Since #1153 an unrecognised name gives one of **two** distinct outcomes: a real vim option vimcode does not yet implement is rejected with a "recognised but not implemented" message (never silently no-op'd), while a genuine typo gives `Unknown option`. The option *namespace* is still well short of vim's — see the **Not implemented** section |
 | `:r {file}` / `:read` | Read file into buffer | ✅ | |
 | `:!{cmd}` | Execute shell command | ✅ | |
 | `:reg` / `:registers` | Display registers | ✅ | |
@@ -656,27 +684,115 @@ These are not in Vim but are part of VimCode:
 
 ---
 
+## Not implemented
+
+Commands, options and modes that Vim has, that are **in scope for this project**
+(they need no expression evaluator — see #1170's scope boundary), and that vimcode
+does not implement. Every row was verified absent against `origin/develop` @
+`30c0077` before being listed.
+
+> **This section exists to fix a measurement bug, not for tidiness.** The coverage
+> ratchet in `tests/nvim_conformance.rs` parses this document, so **a command that
+> has no row here cannot be counted as missing.** Before #1163 this file ended with
+> "Remaining Missing Commands: **None**", which was true only relative to its own
+> row list — the commands below were simply never written down, so they could never
+> appear as ❌ and the ratchet's denominator silently excluded them.
+>
+> **This list is seeded from #1170's open children and is explicitly NOT
+> exhaustive.** #26 (`:help` coverage audit) is the issue that makes it so, by
+> walking Vim's own `:help` indexes rather than starting from what this file
+> already lists. Until #26 lands, treat the true uncovered surface as *larger* than
+> anything computed from this document.
+
+| Command | Description | Status | Notes |
+|---------|-------------|--------|-------|
+| `:lopen` / `:lclose` / `:lwindow` | Open/close the location-list window | ❌ | The location list does not exist at all — not a gap in one command but a missing parallel structure to quickfix (#1155) |
+| `:lnext` / `:lprevious` / `:lfirst` / `:llast` / `:ll` | Navigate the location list | ❌ | #1155 |
+| `:llist` / `:lolder` / `:lnewer` / `:ldo` | List / walk the location-list stack | ❌ | #1155 |
+| `:cwindow` / `:clist` | Quickfix window-if-errors, and list entries | ❌ | `:copen`/`:cclose`/`:cnext`/`:cprevious`/`:cc`/`:cfirst`/`:clast` **do** exist (#1154); these are the remainder (#1155) |
+| `:colder` / `:cnewer` | Walk the quickfix stack | ❌ | vimcode keeps one quickfix list, not a stack (#1155) |
+| `:cdo` / `:cfdo` | Run a command over every quickfix entry/file | ❌ | #1155 |
+| `:earlier` / `:later` | Move through undo states by count or time | ❌ | Needs the undo tree — the timeline is linear today (#1156) |
+| `:fold` / `:foldopen` / `:foldclose` / `:foldtoggle` | Create and toggle folds from ex | ❌ | Folds exist, but only via `zf`/`zo`/`zc` with `foldmethod` of `manual`/`indent` (#1159) |
+| `:digraphs` | List/define digraphs | ❌ | No digraph table; insert-mode `<C-k>` is also absent (#1160) |
+
+### Not implemented — options
+
+| Command | Description | Status | Notes |
+|---------|-------------|--------|-------|
+| `'foldmethod=marker'` | Fold on `{{{`/`}}}` markers | ❌ | Only `manual` and `indent` are accepted (#1159) |
+| `'foldmethod=syntax'` | Fold on syntax regions | ❌ | Needs syntax-region hooks; parked, not refused (#1170) |
+| `'foldmethod=expr'` / `'foldexpr'` | Fold by expression | N/A | Requires an expression evaluator — permanently out of scope (#1170) |
+| `'undofile'` | Persist undo history across sessions | ❌ | #1156 |
+
+Beyond these, `:set` recognises a substantially wider set of real vim option
+*names* than it implements: since #1153 those are rejected with a "recognised but
+not implemented" message rather than `Unknown option`. That set is enumerated in
+`src/core/settings.rs` (`UNIMPLEMENTED_BOOL_OPTIONS`), not here, because it
+changes with every option that lands.
+
+### Not implemented — modes
+
+| Command | Description | Status | Notes |
+|---------|-------------|--------|-------|
+| `` `<C-\><C-n>` `` | Terminal-normal mode | ❌ | A genuinely missing mode. **Deferred, not refused** — reachable without an interpreter (#1170) |
+
+Select mode is the other missing mode; its keys are already rowed above
+(`gH`/`gV` under g-Commands, both ❌). Note that **`gh` is deliberately rebound**
+by vimcode to the editor hover popup and is ✅ for that meaning — it is not a
+Select-mode gap.
+
+---
+
 ## Summary
+
+**Recounted 2026-09-19 (#1163) — the previous table undercounted by ~28%.**
+"Implemented" is ✅ + ⚠️ rows. "Total" means *in scope*: ❌ rows count against it,
+while N/A rows (VimScript, and anything needing an expression evaluator) are
+excluded entirely. The column keeps its old name so the ratchet's
+`NON_COMMAND_TABLE_HEADERS` allowlist still recognises this roll-up table.
 
 | Category | Implemented | Total | Coverage |
 |----------|-------------|-------|----------|
-| Insert Mode | 21 | 23 | 91% |
+| Insert Mode | 23 | 23 | 100% |
 | Movement | 48 | 48 | 100% |
-| Editing | 51 | 51 | 100% |
-| Search & Marks | 26 | 26 | 100% |
-| Normal — Other | 33 | 33 | 100% |
-| Text Objects | 16 | 16 | 100% |
-| g-Commands | 41 | 41 | 100% |
-| z-Commands | 23 | 23 | 100% |
+| Editing | 50 | 50 | 100% |
+| Search & Marks | 31 | 31 | 100% |
+| Normal — Other | 34 | 34 | 100% |
+| Text Objects | 32 | 32 | 100% |
+| g-Commands | 50 | 52 | 96% |
+| z-Commands | 33 | 33 | 100% |
 | Window (CTRL-W) | 33 | 33 | 100% |
-| Bracket ([ / ]) | 13 | 13 | 100% |
-| Operator-Pending | 21 | 21 | 100% |
-| Visual Mode | 26 | 26 | 100% |
-| Ex Commands | 70 | 70 | 100% |
-| **Total** | **422** | **424** | **100%** |
+| Bracket ([ / ]) | 28 | 28 | 100% |
+| Operator-Pending | 59 | 59 | 100% |
+| Visual Mode | 38 | 38 | 100% |
+| Ex Commands | 126 | 126 | 100% |
+| **Not implemented** (new) | **0** | **29** | **0%** |
+| **Total** | **585** | **616** | **95%** |
 
-N/A commands (VimScript, digraphs, spelling, etc.) are excluded from totals.
+**Why the old numbers were wrong, since it is instructive.** They were not merely
+out of date — they were counted differently from the way the document is *parsed*.
+A row whose Command cell holds several aliases (`` `zg` / `zw` / `zG` / `zW` ``)
+is **four** commands to the ratchet and was **one** to whoever typed the summary.
+That is the whole ~28% gap: the old "424 total" against a real 607 parsed rows.
+The Visual row was the visible symptom — the summary said 26 while the section's
+own footer said 30, and the truth is 38.
 
-### Remaining Missing Commands
+**Regenerate, do not re-type.** These counts come from the same parse the coverage
+ratchet performs (`parse_compatibility_doc` in `tests/nvim_conformance.rs`); a
+hand-maintained summary over a machine-parsed table will drift again otherwise.
 
-None — all in-scope Vim commands are implemented.
+### Remaining missing commands
+
+**Not "none".** See the [Not implemented](#not-implemented) section above — 29
+in-scope commands, options and modes are enumerated there, every one verified
+absent against `30c0077`.
+
+This file previously ended with *"None — all in-scope Vim commands are
+implemented."* That sentence was true only relative to this document's own row
+list, which is exactly the problem #1163 was filed to fix: commands that were
+never written down could not be counted as missing, so the ratchet's denominator
+excluded them and the resulting coverage figure flattered itself. **The list above
+is not exhaustive either** — #26 is the audit that walks Vim's `:help` indexes
+instead of this file's existing rows, and until it lands the true uncovered
+surface is larger than anything computed here.

@@ -6576,7 +6576,9 @@ enum DocStatus {
     Partial,
     /// ❌ — claimed not implemented. Out of scope for this gate.
     Missing,
-    /// N/A — deliberately not in scope (VimScript, digraphs, spelling…).
+    /// N/A — deliberately not in scope (VimScript, digraphs, and anything
+    /// needing an expression evaluator). **Not** spelling: `src/core/spell.rs`
+    /// implements it and #1163 moved those rows to ✅.
     NotApplicable,
 }
 
@@ -6640,6 +6642,14 @@ const SECTION_KEYS: &[(&str, &str)] = &[
     ("Operator-Pending Mode", "oppend"),
     ("Visual Mode", "visual"),
     ("Core Vim Ex Commands", "ex"),
+    // #1163: the "Not implemented" section. Its rows are ❌ (or N/A), so they
+    // are out of `in_scope` and carry no probes — but they must still parse,
+    // because the whole point of the section is that a command with no row
+    // cannot be counted as missing. Three keys, not one, because a `###`
+    // subheading resets `section`.
+    ("Not implemented", "missing"),
+    ("Not implemented — options", "missingopt"),
+    ("Not implemented — modes", "missingmode"),
 ];
 
 /// Rows whose Command cell is prose rather than a `` `keystroke` `` span.
@@ -7393,6 +7403,16 @@ const COMMAND_PROBES: &[CommandProbe] = &[
     p("z:zF", Keys("zF")),
     p("z:zv", Keys("zv")),
     p("z:zx", Keys("zx")),
+    // #1163: spell is implemented (`src/core/spell.rs`) and these rows moved
+    // N/A → ✅, so they are in scope and need probes. The corpus has no spell
+    // cases at all today, so all seven are seeded into COVERAGE_EXEMPT — that
+    // is a measured gap, and the bidirectional gate forces them to be deleted
+    // from there the moment a case starts matching.
+    p("z:z=", Label("spell:z= suggestions")),
+    p("z:zg", Label("spell:zg good word")),
+    p("z:zw", Label("spell:zw bad word")),
+    p("z:zG", Label("spell:zG good word internal")),
+    p("z:zW", Label("spell:zW bad word internal")),
     p("z:zj", Label("fold:zj moves to the defined fold header")),
     p("z:zk", Label("fold:zk moves to the defined fold header")),
     p("z:zh", Keys("zh")),
@@ -7437,6 +7457,9 @@ const COMMAND_PROBES: &[CommandProbe] = &[
     p("win:CTRL-W d", Keys("<C-w>d")),
     // --- Bracket Commands (bracket) ---
     p("bracket:]c", Keys("]c")),
+    // #1163: see the z-section note — spell moved N/A → ✅.
+    p("bracket:[s", Label("spell:[s prev misspelling")),
+    p("bracket:]s", Label("spell:]s next misspelling")),
     p("bracket:[c", Keys("[c")),
     p("bracket:]d", Keys("]d")),
     p("bracket:[d", Keys("[d")),
@@ -7731,6 +7754,18 @@ const COMMAND_PROBES: &[CommandProbe] = &[
 // ---------------------------------------------------------------------------
 
 const COVERAGE_EXEMPT: &[&str] = &[
+    // --- Spell (#1163) ---
+    // `src/core/spell.rs` implements all seven, so they are ✅ in the doc and
+    // in scope here — but the oracle corpus contains no spell case whatsoever,
+    // so every probe above matches nothing. Exempt, and shrinkable: adding one
+    // real spell case forces its entry to be deleted from this list.
+    "z:z=",
+    "z:zg",
+    "z:zw",
+    "z:zG",
+    "z:zW",
+    "bracket:[s",
+    "bracket:]s",
     // --- Insert Mode (ins) ---
     "ins:CTRL-@",
     "ins:CTRL-G j/k",
