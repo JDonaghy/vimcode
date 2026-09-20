@@ -2273,6 +2273,158 @@ fn test_redo_cleared_on_new_edit() {
     assert!(engine.message.contains("Already at newest"));
 }
 
+// --- Undo tree tests (#1156) ---
+//
+// Before #1156, `redo_stack`/`undo_timeline` were both cleared/truncated on
+// every new edit, so an edit made after `u` permanently discarded the branch
+// it moved off — `test_redo_cleared_on_new_edit` above locks in that a plain
+// `<C-r>` correctly does *not* resurrect it, but `g-`/`:earlier`/`:undolist`
+// must still be able to reach it. These tests were run against unfixed
+// `develop` (the linear `undo_stack`/`undo_timeline` design) and observed
+// RED — `g-` only walked the single surviving branch, so it never saw the
+// abandoned "hello" state at all.
+
+#[test]
+fn test_g_minus_reaches_branch_abandoned_by_undo_then_edit() {
+    let mut engine = Engine::new();
+
+    // First edit: "hello".
+    send_keys(&mut engine, "ihello<Esc>");
+    assert_eq!(engine.buffer().to_string(), "hello");
+
+    // Undo it, then make a *different* edit — the point at which a linear
+    // undo_stack design permanently discards "hello".
+    send_keys(&mut engine, "u");
+    assert_eq!(engine.buffer().to_string(), "");
+    send_keys(&mut engine, "iworld<Esc>");
+    assert_eq!(engine.buffer().to_string(), "world");
+
+    // g- walks chronologically across every branch: "world" -> "hello" (the
+    // abandoned branch) -> "" (root). A single g- already crosses into it,
+    // since "hello" was recorded before "world" regardless of which branch
+    // either sits on.
+    press_char(&mut engine, 'g');
+    press_char(&mut engine, '-');
+    assert_eq!(
+        engine.buffer().to_string(),
+        "hello",
+        "g- must cross into the branch `u` + a new edit abandoned"
+    );
+
+    press_char(&mut engine, 'g');
+    press_char(&mut engine, '-');
+    assert_eq!(engine.buffer().to_string(), "");
+}
+
+#[test]
+fn test_g_plus_walks_back_across_an_abandoned_branch() {
+    let mut engine = Engine::new();
+    send_keys(&mut engine, "ihello<Esc>");
+    send_keys(&mut engine, "u");
+    send_keys(&mut engine, "iworld<Esc>");
+
+    // Two steps back reaches the root; two steps forward must retrace the
+    // same chronological path, landing back on "world".
+    press_char(&mut engine, 'g');
+    press_char(&mut engine, '-');
+    press_char(&mut engine, 'g');
+    press_char(&mut engine, '-');
+    assert_eq!(engine.buffer().to_string(), "");
+
+    press_char(&mut engine, 'g');
+    press_char(&mut engine, '+');
+    assert_eq!(engine.buffer().to_string(), "hello");
+    press_char(&mut engine, 'g');
+    press_char(&mut engine, '+');
+    assert_eq!(engine.buffer().to_string(), "world");
+}
+
+#[test]
+fn test_ctrl_r_after_branch_switch_follows_the_branch_actually_taken() {
+    // <C-r> is not "the newest thing ever recorded" (that's g+'s job) — it's
+    // "redo whatever *this* undo just undid". After u-ing back past the
+    // branch point, <C-r> must return to "world" (the live branch), not the
+    // earlier, abandoned "hello" branch.
+    let mut engine = Engine::new();
+    send_keys(&mut engine, "ihello<Esc>");
+    send_keys(&mut engine, "u");
+    send_keys(&mut engine, "iworld<Esc>");
+    send_keys(&mut engine, "u");
+    assert_eq!(engine.buffer().to_string(), "");
+
+    press_ctrl(&mut engine, 'r');
+    assert_eq!(engine.buffer().to_string(), "world");
+}
+
+#[test]
+fn test_undolist_shows_every_live_branch() {
+    let mut engine = Engine::new();
+    send_keys(&mut engine, "ihello<Esc>");
+    send_keys(&mut engine, "u");
+    send_keys(&mut engine, "iworld<Esc>");
+
+    engine.execute_command("undolist");
+    let lines: Vec<&str> = engine.message.lines().collect();
+    // Header + one row per live node (the abandoned "hello" branch's node
+    // and the current "world" node) — the root, which is never a change in
+    // its own right, is not listed, matching Vim.
+    assert_eq!(
+        lines.len(),
+        3,
+        ":undolist must list both branches, not just the active one: {:?}",
+        lines
+    );
+}
+
+#[test]
+fn test_ex_earlier_later_step_by_count() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "abcdef");
+    engine.update_syntax();
+
+    press_char(&mut engine, 'x');
+    press_char(&mut engine, 'x');
+    assert_eq!(engine.buffer().to_string(), "cdef");
+
+    engine.execute_command("earlier 2");
+    assert_eq!(engine.buffer().to_string(), "abcdef");
+
+    engine.execute_command("later 1");
+    assert_eq!(engine.buffer().to_string(), "bcdef");
+}
+
+#[test]
+fn test_ex_earlier_time_spec_falls_back_to_oldest_state() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "abc");
+    engine.update_syntax();
+    press_char(&mut engine, 'x');
+    assert_eq!(engine.buffer().to_string(), "bc");
+
+    // "1h" ago predates every recorded node, so this falls back to the
+    // oldest live state (the pre-edit buffer).
+    engine.execute_command("earlier 1h");
+    assert_eq!(engine.buffer().to_string(), "abc");
+}
+
+#[test]
+fn test_undojoin_merges_next_change_into_previous_undo_step() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "abc");
+    engine.update_syntax();
+
+    press_char(&mut engine, 'x'); // "bc" — its own undo step
+    assert_eq!(engine.buffer().to_string(), "bc");
+
+    engine.execute_command("undojoin");
+    press_char(&mut engine, 'x'); // "c" — fused onto the previous step
+    assert_eq!(engine.buffer().to_string(), "c");
+
+    // A single `u` reverts both x's, since :undojoin fused them.
+    press_char(&mut engine, 'u');
+    assert_eq!(engine.buffer().to_string(), "abc");
+}
+
 #[test]
 fn test_multiple_undos() {
     let mut engine = Engine::new();

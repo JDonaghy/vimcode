@@ -1228,8 +1228,7 @@ impl Engine {
                     if let Some(state) = self.buffer_manager.get_mut(id) {
                         state.buffer.content = ropey::Rope::from_str(&content);
                         state.dirty = false;
-                        state.undo_stack.clear();
-                        state.redo_stack.clear();
+                        state.reset_undo_history();
                     }
                     self.refresh_git_diff(id);
                 }

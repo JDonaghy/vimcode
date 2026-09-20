@@ -392,7 +392,7 @@ than a snapshot.
 | `gm` / `gM` | Middle of screen/text line | ✅ | |
 | `g?{motion}` | ROT13 encode | ✅ | Supports text objects, all motions |
 | `g@{motion}` | Call operatorfunc | ✅ | Lua plugin API: `vimcode.set_operatorfunc(fn)` |
-| `g+` / `g-` | Newer/older text state | ⚠️ | **Not undo-*tree* navigation.** The timeline is linear: an edit made after an undo discards the branch it moved off, so `g-`/`g+` walk one chronological list rather than across branches. Vim keeps every branch reachable. No `:earlier`/`:later`, no `undofile`. Tracked by #1156 |
+| `g+` / `g-` | Newer/older text state | ✅ | Real undo-tree navigation (#1156): walks every branch in chronological order, including one an `u` + a new edit left behind — a plain `<C-r>` still only follows the branch actually taken, matching Vim. `:earlier`/`:later`/`:undolist`/`:undojoin` and `'undofile'`/`'undodir'`/`'undolevels'` are also implemented |
 | `gR` | Virtual replace mode | ✅ | Tab-aware overwrite; `gr` is LSP references |
 | `g'` / `` g` `` | Mark without jumplist | ✅ | |
 | `g&` | Repeat `:s` all lines | ✅ | |
@@ -634,6 +634,9 @@ Operators `d`, `c`, `y`, `>`, `<`, `=`, `g~`, `gu`, `gU` all accept these motion
 | `:digraphs` | List digraphs / define a custom one | ✅ | `:digraph {c1}{c2} {number}` adds a user entry (#1160); same command, both spellings |
 | `:changes` | Display change list | ✅ | |
 | `:history` | Display command history | ✅ | |
+| `:undolist` | List every live undo-tree state, across branches | ✅ | #1156 |
+| `:earlier` / `:later` | Move through undo states by count (`5`) or time (`5m`/`2h`/`3d`/`10s`) | ✅ | Crosses branches, like `g-`/`g+` (#1156) |
+| `:undojoin` | Fold the next change into the previous undo step | ✅ | `E790` if there's no previous change to join with (#1156) |
 | `:echo {text}` | Display message | ✅ | |
 | `:pwd` | Print directory | ✅ | |
 | `:file` | Show file info | ✅ | |
@@ -741,7 +744,6 @@ does not implement. Every row was verified absent against `origin/develop` @
 | Command | Description | Status | Notes |
 |---------|-------------|--------|-------|
 | `:lolder` / `:lnewer` | Walk the location-list stack | ❌ | The per-window equivalent of `:colder`/`:cnewer` (#1155 shipped a global quickfix stack, `:lopen`/`:l*`/`:ll*`/`:ldo`/`:lfdo`/`:llist` and the location list itself, but not a per-window history stack) — follow-up |
-| `:earlier` / `:later` | Move through undo states by count or time | ❌ | Needs the undo tree — the timeline is linear today (#1156) |
 | `:fold` / `:foldopen` / `:foldclose` / `:foldtoggle` | Create and toggle folds from ex | ❌ | Folds exist, but only via `zf`/`zo`/`zc` with `foldmethod` of `manual`/`indent` (#1159) |
 
 ### Not implemented — options
@@ -751,7 +753,6 @@ does not implement. Every row was verified absent against `origin/develop` @
 | `'foldmethod=marker'` | Fold on `{{{`/`}}}` markers | ❌ | Only `manual` and `indent` are accepted (#1159) |
 | `'foldmethod=syntax'` | Fold on syntax regions | ❌ | Needs syntax-region hooks; parked, not refused (#1170) |
 | `'foldmethod=expr'` / `'foldexpr'` | Fold by expression | N/A | Requires an expression evaluator — permanently out of scope (#1170) |
-| `'undofile'` | Persist undo history across sessions | ❌ | #1156 |
 
 Beyond these, `:set` recognises a substantially wider set of real vim option
 *names* than it implements: since #1153 those are rejected with a "recognised but

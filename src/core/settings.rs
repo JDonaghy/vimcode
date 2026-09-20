@@ -562,6 +562,30 @@ pub struct Settings {
     #[serde(default = "default_updatetime")]
     pub updatetime: u32,
 
+    // ── Undo persistence (#1156) ─────────────────────────────────────────────
+    /// Maximum number of live undo-tree states kept per buffer, across every
+    /// branch. Corresponds to Vim's `'undolevels'` / `'ul'`. Once exceeded,
+    /// the globally-oldest branch tip not on the buffer's active path is
+    /// pruned first (see `buffer_manager::UndoTree::enforce_undolevels`).
+    /// Default `1000`, matching Vim/Neovim.
+    #[serde(default = "default_undolevels")]
+    pub undolevels: usize,
+
+    /// Persist each buffer's undo tree to a file under `'undodir'` on save,
+    /// and reload it the next time that file is opened — undo history then
+    /// survives quitting and reopening. Corresponds to Vim's `'undofile'`.
+    /// Default off, matching Vim/Neovim.
+    #[serde(default)]
+    pub undofile: bool,
+
+    /// Directory undofiles are written to when `'undofile'` is on. Empty
+    /// string (the default) means `~/.config/vimcode/undo/` (see
+    /// `undofile::default_undo_dir`) — unlike Vim's `'undodir'`, this is a
+    /// single directory rather than a priority list, since vimcode has no
+    /// per-directory-unwritable fallback logic to drive a list with.
+    #[serde(default)]
+    pub undodir: String,
+
     /// Show breadcrumbs bar (file path + symbol hierarchy) below the tab bar.
     #[serde(default = "default_breadcrumbs")]
     pub breadcrumbs: bool,
@@ -889,6 +913,10 @@ fn default_breadcrumbs() -> bool {
 
 fn default_updatetime() -> u32 {
     4000
+}
+
+fn default_undolevels() -> usize {
+    1000
 }
 
 fn default_explorer_visible() -> bool {
@@ -1460,6 +1488,9 @@ impl Default for Settings {
             explorer_sort_case_insensitive: true,
             swap_file: default_swap_file(),
             updatetime: default_updatetime(),
+            undolevels: default_undolevels(),
+            undofile: false,
+            undodir: String::new(),
             breadcrumbs: default_breadcrumbs(),
             hide_single_tab: false,
             autohide_panels: false,
@@ -2470,6 +2501,10 @@ impl Settings {
             "showhiddenfiles" | "shf" => self.show_hidden_files = enable,
             "explorersortcaseinsensitive" | "esci" => self.explorer_sort_case_insensitive = enable,
             "swapfile" => self.swap_file = enable,
+            "undofile" | "udf" => {
+                self.undofile = enable;
+                crate::core::undofile::set_enabled(enable);
+            }
             "wrapscan" | "ws" => self.wrapscan = enable,
             "shiftround" | "sr" => self.shiftround = enable,
             "gdefault" | "gd" => self.gdefault = enable,
@@ -2621,6 +2656,17 @@ impl Settings {
                     .map_err(|_| format!("Invalid value for {name}: '{value}'"))?;
                 self.syntax_max_lines = n;
                 crate::core::buffer_manager::set_syntax_max_lines(n);
+            }
+            "undolevels" | "ul" => {
+                let n: usize = value
+                    .parse()
+                    .map_err(|_| format!("Invalid value for {name}: '{value}'"))?;
+                self.undolevels = n;
+                crate::core::buffer_manager::set_undo_levels(n);
+            }
+            "undodir" | "udir" => {
+                self.undodir = value.to_string();
+                crate::core::undofile::set_dir(value);
             }
             "softtabstop" | "sts" => {
                 let n: i32 = value
@@ -2816,6 +2862,7 @@ impl Settings {
             "font_size" => Some(self.font_size as i64),
             "ui_font_size" => Some(self.ui_font_size as i64),
             "syntax_max_lines" | "syntaxmaxlines" => Some(self.syntax_max_lines as i64),
+            "undolevels" | "ul" => Some(self.undolevels as i64),
             "softtabstop" | "sts" => Some(self.softtabstop as i64),
             "foldlevel" | "fdl" => Some(self.foldlevel as i64),
             "foldnestmax" | "fdn" => Some(self.foldnestmax as i64),
@@ -3100,6 +3147,13 @@ impl Settings {
             "syntax_max_lines" | "syntaxmaxlines" => {
                 Ok(format!("syntax_max_lines={}", self.syntax_max_lines))
             }
+            "undolevels" | "ul" => Ok(format!("undolevels={}", self.undolevels)),
+            "undofile" | "udf" => Ok(if self.undofile {
+                "undofile".to_string()
+            } else {
+                "noundofile".to_string()
+            }),
+            "undodir" | "udir" => Ok(format!("undodir={}", self.undodir)),
             "wrapscan" | "ws" => Ok(if self.wrapscan {
                 "wrapscan".to_string()
             } else {
@@ -3287,6 +3341,9 @@ impl Settings {
             }
             "swapfile" | "swap_file" => self.swap_file.to_string(),
             "updatetime" | "ut" => self.updatetime.to_string(),
+            "undolevels" | "ul" => self.undolevels.to_string(),
+            "undofile" | "udf" => self.undofile.to_string(),
+            "undodir" | "udir" => self.undodir.clone(),
             "breadcrumbs" => self.breadcrumbs.to_string(),
             "hide_single_tab" | "hidesingletab" | "hst" => self.hide_single_tab.to_string(),
             "autohide_panels" | "autohidepanels" => self.autohide_panels.to_string(),
@@ -3424,6 +3481,20 @@ impl Settings {
                 self.updatetime = value
                     .parse()
                     .map_err(|_| format!("Invalid updatetime: {value}"))?;
+            }
+            "undolevels" | "ul" => {
+                self.undolevels = value
+                    .parse()
+                    .map_err(|_| format!("Invalid undolevels: {value}"))?;
+                crate::core::buffer_manager::set_undo_levels(self.undolevels);
+            }
+            "undofile" | "udf" => {
+                self.undofile = value == "true";
+                crate::core::undofile::set_enabled(self.undofile);
+            }
+            "undodir" | "udir" => {
+                self.undodir = value.to_string();
+                crate::core::undofile::set_dir(&self.undodir);
             }
             "breadcrumbs" => self.breadcrumbs = value == "true",
             "hide_single_tab" | "hidesingletab" | "hst" => self.hide_single_tab = value == "true",
@@ -3737,6 +3808,30 @@ pub static SETTING_DEFS: &[SettingDef] = &[
             min: 100,
             max: 60000,
         },
+    },
+    SettingDef {
+        key: "undolevels",
+        label: "Undo Levels",
+        description: "Maximum number of undo states kept per buffer, across every branch (like Vim's undolevels option)",
+        category: "Editor",
+        setting_type: SettingType::Integer {
+            min: 1,
+            max: 1_000_000,
+        },
+    },
+    SettingDef {
+        key: "undofile",
+        label: "Persistent Undo",
+        description: "Save undo history to disk so it survives closing and reopening a file (like Vim's undofile option)",
+        category: "Editor",
+        setting_type: SettingType::Bool,
+    },
+    SettingDef {
+        key: "undodir",
+        label: "Undo Directory",
+        description: "Directory undo history is saved to when Persistent Undo is on (default: ~/.config/vimcode/undo/)",
+        category: "Editor",
+        setting_type: SettingType::StringVal,
     },
     SettingDef {
         key: "syntax_max_lines",
@@ -4251,6 +4346,59 @@ mod tests {
         let mut s = Settings::default();
         s.parse_set_option("ts=8").unwrap();
         assert_eq!(s.tabstop, 8);
+    }
+
+    // ── #1156: 'undolevels' / 'undofile' / 'undodir' ────────────────────────
+
+    #[test]
+    fn test_set_undolevels_and_alias() {
+        let mut s = Settings::default();
+        assert_eq!(s.undolevels, 1000);
+        let msg = s.parse_set_option("undolevels=50").unwrap();
+        assert_eq!(msg, "undolevels=50");
+        assert_eq!(s.undolevels, 50);
+        s.parse_set_option("ul=10").unwrap();
+        assert_eq!(s.undolevels, 10);
+        assert_eq!(s.parse_set_option("ul?").unwrap(), "undolevels=10");
+    }
+
+    #[test]
+    fn test_set_undofile_and_alias_toggle_and_query() {
+        let mut s = Settings::default();
+        assert!(!s.undofile);
+        s.parse_set_option("undofile").unwrap();
+        assert!(s.undofile);
+        assert_eq!(s.parse_set_option("udf?").unwrap(), "undofile");
+        s.parse_set_option("noundofile").unwrap();
+        assert!(!s.undofile);
+        assert_eq!(s.parse_set_option("undofile?").unwrap(), "noundofile");
+    }
+
+    #[test]
+    fn test_set_undodir_round_trips() {
+        let mut s = Settings::default();
+        assert_eq!(s.undodir, "");
+        s.parse_set_option("undodir=/tmp/myundo").unwrap();
+        assert_eq!(s.undodir, "/tmp/myundo");
+        assert_eq!(s.parse_set_option("udir?").unwrap(), "undodir=/tmp/myundo");
+    }
+
+    #[test]
+    fn undolevels_undofile_undodir_round_trip_through_get_set_by_key() {
+        let mut s = Settings::default();
+        s.set_value_str("undolevels", "42").unwrap();
+        assert_eq!(s.get_value_str("undolevels"), "42");
+        s.set_value_str("undofile", "true").unwrap();
+        assert_eq!(s.get_value_str("undofile"), "true");
+        s.set_value_str("undodir", "/tmp/u").unwrap();
+        assert_eq!(s.get_value_str("undodir"), "/tmp/u");
+    }
+
+    #[test]
+    fn undo_settings_appear_in_the_settings_registry() {
+        assert!(SETTING_DEFS.iter().any(|d| d.key == "undolevels"));
+        assert!(SETTING_DEFS.iter().any(|d| d.key == "undofile"));
+        assert!(SETTING_DEFS.iter().any(|d| d.key == "undodir"));
     }
 
     #[test]

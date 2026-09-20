@@ -26,6 +26,7 @@ pub mod syntax;
 pub mod tab;
 pub mod terminal;
 pub mod tool_client;
+pub mod undofile;
 pub mod view;
 pub mod vim_regex;
 pub mod window;

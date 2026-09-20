@@ -1,7 +1,7 @@
-# src/core/engine/mod.rs — 5,568 lines
+# src/core/engine/mod.rs — 5,639 lines
 
 Core engine definition. Contains the `Engine` struct (all editor state), enums, types, `new()` constructor, free functions, and `mod` declarations for all submodules.
-(Line count last verified 2026-09-19, #1155 — earlier counts predate several
+(Line count last verified 2026-09-20, #1156 — earlier counts predate several
 unrelated sessions' worth of growth, not just this one.)
 
 ## Key Types
