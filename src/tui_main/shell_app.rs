@@ -23330,4 +23330,153 @@ mod tests {
              screen:\n{screen}"
         );
     }
+
+    // ─── #1190: 'ruler' / 'showcmd' / 'list' ────────────────────────────────
+
+    /// `:set noruler` must remove the `Ln N, Col N` readout from the status
+    /// line, and `:set ruler` must bring it back — the driver-tier twin of
+    /// the `build_status_line`/`build_window_status_line` gating in
+    /// `render.rs`.
+    ///
+    /// RED against unfixed `develop`: `'ruler'` was still in
+    /// `UNIMPLEMENTED_BOOL_OPTIONS`, so `:set noruler` errored with
+    /// "recognised but not implemented yet" and the readout never moved —
+    /// this assertion would have failed on the very first `noruler` check.
+    #[test]
+    fn set_noruler_hides_and_ruler_restores_the_cursor_position_readout_via_shell_app() {
+        let mut app = TuiShellApp::new_for_test();
+        app.engine.buffer_mut().insert(0, "hello");
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        driver.press_named(quadraui::NamedKey::Escape);
+        driver.render();
+        assert!(
+            driver.screen_contains("Ln 1, Col 1"),
+            "sanity: 'ruler' defaults on; screen:\n{}",
+            driver.screen()
+        );
+
+        driver.type_char(':');
+        for c in "set noruler".chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
+        driver.render();
+        assert!(
+            !driver.screen().contains("Ln 1, Col 1"),
+            ":set noruler must remove the cursor-position readout; screen:\n{}",
+            driver.screen()
+        );
+
+        driver.type_char(':');
+        for c in "set ruler".chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
+        driver.render();
+        assert!(
+            driver.screen_contains("Ln 1, Col 1"),
+            ":set ruler must bring the readout back; screen:\n{}",
+            driver.screen()
+        );
+    }
+
+    /// A partially-typed Normal-mode count+operator (`2d`, still pending a
+    /// motion) must show up in the status line while `'showcmd'` is on, and
+    /// disappear once `:set noshowcmd` turns it off.
+    ///
+    /// RED against unfixed `develop`: `'showcmd'` was still in
+    /// `UNIMPLEMENTED_BOOL_OPTIONS` (`:set noshowcmd` errored), and nothing
+    /// rendered `Engine::showcmd_text` at all, so `"2d"` never appeared on
+    /// screen regardless of the setting.
+    #[test]
+    fn showcmd_shows_pending_count_and_operator_via_shell_app() {
+        let mut app = TuiShellApp::new_for_test();
+        app.engine.buffer_mut().insert(0, "hello world\n");
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        driver.press_named(quadraui::NamedKey::Escape);
+        driver.render();
+        assert!(
+            !driver.screen_contains("2d"),
+            "sanity: no pending command yet; screen:\n{}",
+            driver.screen()
+        );
+
+        // `2d` — count then operator, still waiting on a motion.
+        driver.type_char('2');
+        driver.type_char('d');
+        driver.render();
+        assert!(
+            driver.screen_contains("2d"),
+            "'showcmd' defaults on, so the pending \"2d\" must be visible; \
+             screen:\n{}",
+            driver.screen()
+        );
+
+        // Finish the command so nothing is left pending, then turn showcmd
+        // off and repeat — it must no longer appear.
+        driver.type_char('w');
+        driver.render();
+
+        driver.type_char(':');
+        for c in "set noshowcmd".chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
+        driver.render();
+
+        driver.type_char('2');
+        driver.type_char('d');
+        driver.render();
+        assert!(
+            !driver.screen_contains("2d"),
+            ":set noshowcmd must hide the pending-command readout; screen:\n{}",
+            driver.screen()
+        );
+    }
+
+    /// `:set list` must render a tab as literal `^I` instead of expanding it
+    /// to `'tabstop'` width, and disappear again on `:set nolist` — the
+    /// driver-tier twin of `apply_list_glyphs`'s unit tests in `render.rs`.
+    ///
+    /// RED against unfixed `develop`: `'list'` was still in
+    /// `UNIMPLEMENTED_BOOL_OPTIONS` (`:set list` errored with "recognised
+    /// but not implemented yet"), so the tab painted as normal whitespace
+    /// and `^I` never appeared on screen.
+    #[test]
+    fn set_list_renders_tab_as_caret_i_via_shell_app() {
+        let mut app = TuiShellApp::new_for_test();
+        app.engine.buffer_mut().insert(0, "a\tb");
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        driver.press_named(quadraui::NamedKey::Escape);
+        driver.render();
+        assert!(
+            !driver.screen_contains("^Ib"),
+            "sanity: 'list' defaults off; screen:\n{}",
+            driver.screen()
+        );
+
+        driver.type_char(':');
+        for c in "set list".chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
+        driver.render();
+        assert!(
+            driver.screen_contains("^Ib"),
+            ":set list must render the tab as literal ^I; screen:\n{}",
+            driver.screen()
+        );
+
+        driver.type_char(':');
+        for c in "set nolist".chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
+        driver.render();
+        assert!(
+            !driver.screen_contains("^Ib"),
+            ":set nolist must go back to normal tab rendering; screen:\n{}",
+            driver.screen()
+        );
+    }
 }

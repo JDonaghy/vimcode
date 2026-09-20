@@ -1021,6 +1021,8 @@ fn apply_setup(settings: &mut Settings, setup: &str) -> Result<(), String> {
             "iskeyword" | "isk" => {
                 settings.iskeyword = value.to_string();
             }
+            // #1190
+            "hidden" | "hid" => settings.hidden = parse_lua_bool(name, value)?,
             other => {
                 return Err(format!(
                     "no vimcode Settings mapping for option '{other}' (from {stmt:?}) — add one \
@@ -4018,6 +4020,40 @@ const CASES_EX: &[Case] = &[
         1,
         1,
         "x:bwipeout<CR>",
+    ),
+    // #1190: `'hidden'`'s guard on `:enew` — before this fix vimcode had
+    // *no* dirty check on `:enew`/`:edit`/`:bnext`/`:bprevious`/`:bfirst`/
+    // `:blast`/`:buffer` at all (see `Engine::check_buffer_abandon`'s doc
+    // comment), so an un-forced `:enew` always silently wiped the modified
+    // buffer. Neovim's *actual* default for `'hidden'` is ON (confirmed by
+    // hand: `nvim --headless -u NONE -c 'set hidden?'` reports "hidden",
+    // not "nohidden" — unlike historical Vim, whose documented default is
+    // off), so the un-configured case below expects the abandon to
+    // *succeed*; the refusal only shows up once `'hidden'` is explicitly
+    // turned off. Same "real edit via `x`" reasoning as the `:bw`/
+    // `:bwipeout` cases above for why this isn't the harness's raw seed
+    // insert.
+    c(
+        "ex:enew abandons a dirty buffer by default ('hidden' is on)",
+        &["ab", "c"],
+        1,
+        1,
+        "x:enew<CR>",
+    ),
+    c(
+        "ex:enew! forces past a dirty buffer",
+        &["ab", "c"],
+        1,
+        1,
+        "x:enew!<CR>",
+    ),
+    cs(
+        "ex:enew refuses on a dirty buffer with 'nohidden' and no bang",
+        &["ab", "c"],
+        1,
+        1,
+        "x:enew<CR>",
+        "vim.o.hidden=false",
     ),
     c("ex:delmarks a", &["a", "b", "c"], 2, 1, "ma:delmarks a<CR>"),
     c(
@@ -8045,7 +8081,6 @@ const COVERAGE_EXEMPT: &[&str] = &[
     "ex::wqa",
     "ex::xa",
     "ex::edit",
-    "ex::enew",
     "ex::bn",
     "ex::bp",
     "ex::b#",

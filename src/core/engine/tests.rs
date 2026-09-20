@@ -29478,9 +29478,13 @@ fn test_1153_unimplemented_recognised_option_is_not_unknown_option() {
     // A real vim option vimcode doesn't implement yet must not read as an
     // unrecognised typo (`Unknown option`) — it gets a distinct
     // "recognised but not implemented" rejection instead.
+    //
+    // #1190 implemented 'hidden' (this test's original example) — 'magic'
+    // is still in `UNIMPLEMENTED_BOOL_OPTIONS`, see that issue's table for
+    // the remaining rows.
     let mut engine = Engine::new();
-    let result = engine.settings.parse_set_option("hidden");
-    let err = result.expect_err("hidden is not yet implemented");
+    let result = engine.settings.parse_set_option("magic");
+    let err = result.expect_err("magic is not yet implemented");
     assert!(
         err.contains("recognised but not implemented"),
         "unexpected message: {err}"
@@ -30717,6 +30721,133 @@ fn test_nvim_enew_creates_empty_buffer() {
     engine.feed_keys(":enew<CR>");
     let after = engine.active_buffer_id();
     assert_ne!(before, after, ":enew should switch to a new buffer");
+}
+
+// -- 'hidden' (#1190): abandoning a dirty buffer via :edit/:bnext/:bprevious/
+// :bfirst/:blast/:buffer/:enew must refuse (mirroring the existing `:quit`
+// guard) unless another window still shows the buffer, the command carries
+// a `!`, or 'hidden' is set. See `Engine::check_buffer_abandon`
+// (accessors.rs) and its call sites in execute.rs.
+//
+// `Settings::default()` has `hidden: true` — confirmed by hand against
+// `nvim --headless -u NONE -c 'set hidden?'`, Neovim's own default is ON
+// (historical Vim's is off). So the "blocks"/"bang overrides" scenarios
+// below explicitly `set hidden = false` to exercise the guard at all;
+// `test_default_settings_allow_enew_over_dirty_buffer_1190` pins the
+// default-on behavior on its own.
+
+#[test]
+fn test_default_settings_allow_enew_over_dirty_buffer_1190() {
+    let mut engine = Engine::new();
+    assert!(
+        engine.settings.hidden,
+        "Settings::default() must match Neovim's 'hidden' default"
+    );
+    engine.feed_keys("ihello<Esc>");
+    assert!(engine.dirty());
+    let before = engine.active_buffer_id();
+    let action = type_command_action(&mut engine, "enew");
+    assert_eq!(action, EngineAction::None);
+    assert_ne!(
+        engine.active_buffer_id(),
+        before,
+        "default 'hidden' (on) should let :enew abandon the dirty buffer"
+    );
+}
+
+#[test]
+fn test_set_nohidden_blocks_enew_on_dirty_buffer_1190() {
+    let mut engine = Engine::new();
+    type_command(&mut engine, "set nohidden");
+    assert!(!engine.settings.hidden);
+    engine.feed_keys("ihello<Esc>");
+    assert!(engine.dirty());
+    let before = engine.active_buffer_id();
+    let action = type_command_action(&mut engine, "enew");
+    assert_eq!(action, EngineAction::Error);
+    assert!(engine.message.contains("No write since last change"));
+    assert_eq!(
+        engine.active_buffer_id(),
+        before,
+        "dirty buffer must not be abandoned once 'hidden' is off"
+    );
+}
+
+#[test]
+fn test_enew_bang_forces_past_dirty_buffer_even_with_nohidden_1190() {
+    let mut engine = Engine::new();
+    engine.settings.hidden = false;
+    engine.feed_keys("ihello<Esc>");
+    assert!(engine.dirty());
+    let before = engine.active_buffer_id();
+    let action = type_command_action(&mut engine, "enew!");
+    assert_eq!(action, EngineAction::None);
+    assert_ne!(engine.active_buffer_id(), before);
+}
+
+#[test]
+fn test_bnext_blocks_on_dirty_buffer_then_bang_overrides_1190() {
+    let mut engine = Engine::new();
+    engine.settings.hidden = false;
+    engine.feed_keys(":enew<CR>"); // second buffer so :bnext has somewhere to go
+    engine.feed_keys("ihello<Esc>");
+    assert!(engine.dirty());
+    let before = engine.active_buffer_id();
+
+    type_command(&mut engine, "bnext");
+    assert!(engine.message.contains("No write since last change"));
+    assert_eq!(engine.active_buffer_id(), before);
+
+    let action = type_command_action(&mut engine, "bnext!");
+    assert_eq!(action, EngineAction::None);
+    assert_ne!(
+        engine.active_buffer_id(),
+        before,
+        ":bnext! must force through a dirty buffer"
+    );
+}
+
+#[test]
+fn test_bnext_does_not_block_when_dirty_buffer_has_another_view_1190() {
+    let mut engine = Engine::new();
+    engine.settings.hidden = false;
+    engine.feed_keys(":enew<CR>"); // second buffer so :bnext has somewhere to go
+    engine.feed_keys("ihello<Esc>");
+    assert!(engine.dirty());
+    engine.open_editor_group(SplitDirection::Vertical); // second view of the dirty buffer
+    let before = engine.active_buffer_id();
+
+    let action = type_command_action(&mut engine, "bnext");
+    assert_eq!(
+        action,
+        EngineAction::None,
+        "another view of the dirty buffer survives, so :bnext must not block"
+    );
+    assert_ne!(engine.active_buffer_id(), before);
+}
+
+#[test]
+fn test_edit_blocks_on_dirty_buffer_1190() {
+    let mut engine = Engine::new();
+    engine.settings.hidden = false;
+    engine.feed_keys("ihello<Esc>");
+    assert!(engine.dirty());
+    let action = type_command_action(&mut engine, "edit somefile_1190.txt");
+    assert_eq!(action, EngineAction::Error);
+    assert!(engine.message.contains("No write since last change"));
+}
+
+#[test]
+fn test_edit_bang_bypasses_dirty_guard_1190() {
+    let mut engine = Engine::new();
+    engine.settings.hidden = false;
+    engine.feed_keys("ihello<Esc>");
+    assert!(engine.dirty());
+    let action = type_command_action(&mut engine, "edit! somefile_1190.txt");
+    assert_eq!(
+        action,
+        EngineAction::OpenFile(std::path::PathBuf::from("somefile_1190.txt"))
+    );
 }
 
 // -- Window move (<C-w>H/J/K/L) --
