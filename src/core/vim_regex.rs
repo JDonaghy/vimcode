@@ -1470,6 +1470,28 @@ mod tests {
     }
 
     #[test]
+    fn lookahead_after_a_bare_quantifier_fails_to_compile_not_silently_wrong() {
+        // #1157 review: `last_atom_start` isn't updated by a bare `\+`/`*`/
+        // `\=` quantifier, so a look-around stacked directly after one
+        // (`x\+\@=`) doesn't wrap the quantified atom `x\+` the way
+        // `\(x\)\+\@=` would — it re-points at the quantifier's own output
+        // offset and wraps just the `+`, producing `x(?=+)`. Real Vim
+        // rejects this shape outright (`piece = atom multi?`, so `\@=` can't
+        // follow another multi: E61 "Nested *"), which this translator
+        // doesn't proactively detect. But `translate()` succeeding here is
+        // still safe: `(?=+)` is not a valid `fancy_regex` pattern (a
+        // look-around needs something other than a bare quantifier inside
+        // it), so `compile()` — the layer every caller actually goes
+        // through — rejects it with a clear "Invalid pattern" error rather
+        // than silently matching the wrong text. Confusing message for
+        // valid-ish-looking syntax, but still rejection, never fallback.
+        let t = translate("x\\+\\@=", Magic::Magic, "").expect("translation itself succeeds");
+        assert_eq!(t.regex, "x(?=+)");
+        let err = compile("x\\+\\@=", false, false, true, "", None).unwrap_err();
+        assert!(err.contains("Invalid pattern"), "{err}");
+    }
+
+    #[test]
     fn lookaround_atomic_group_is_rejected_with_a_clear_message() {
         let err = translate("\\(foo\\)\\@>", Magic::Magic, "").unwrap_err();
         assert!(err.contains("atomic group"), "{err}");

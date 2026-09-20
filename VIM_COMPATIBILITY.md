@@ -199,7 +199,10 @@ See [README.md](README.md) for full feature documentation.
 ### Search pattern syntax (`src/core/vim_regex.rs`)
 
 Vim patterns are translated to Rust `regex` before matching, so `/`, `?`, `:s`,
-`:g` and the ex `/pat/` address all share one engine.
+`:g` and the ex `/pat/` address all share one engine. Patterns that need
+back-tracking (back-references, look-around) route through `fancy_regex`
+instead — plain `regex` has none — chosen per-pattern so the common case still
+gets `regex`'s guaranteed-linear-time matching.
 
 | Supported | Notes |
 |---|---|
@@ -213,22 +216,32 @@ Vim patterns are translated to Rust `regex` before matching, so `/`, `?`, `:s`,
 | `\n` `\t` `\r` `\e` | multi-line search works across the whole buffer |
 | `\s \d \w \a \l \u \x \o \h \i \k \f \p` + uppercase negations | character classes |
 | `\%^` `\%$` | start/end of buffer |
-| `\1`…`\9` | back-references **in the pattern** (#1004) — see the engine note below |
+| `\1`…`\9` | back-references to a pattern's own `\(…\)` groups (`fancy_regex`, #1004) |
+| `\@=` `\@!` `\@<=` `\@<!` (and `\v` form `(…)@=` etc.) | look-ahead/look-behind (`fancy_regex`, #1157); `\@>` (atomic group) is rejected with a clear message — no `fancy_regex` equivalent |
+| `\_x` — `\_.` `\_s` `\_d` `\_[…]` `\_^` `\_$` etc | cross-line character classes/anchors: like `\x` but also matches the newline (#1157) |
+| `\%23l` `\%<23l` `\%>23l` | absolute line-number position assertion (#1157) |
+| `\%23c` `\%<23c` `\%>23c` | absolute column position assertion (#1157) |
+| `\%V` | restrict the match to the last Visual selection (#1157) — charwise and linewise selections only; a Visual-Block selection makes `\%V` match nothing rather than compute a wrong range (see `last_visual_byte_range` in `src/core/engine/execute.rs`) |
+| `\%d123` `\%x2a` | decimal/hex character-code literals (#1157); `\%o` (octal) and `\%u`/`\%U` (Unicode) are not yet implemented |
 
 **Not supported** — these are *rejected with an error*, never silently matched
-as literal text: look-around (`\@=`, `\@!`, `\@<=`, `\@<!`), `\&`, `\_x`,
-`\%V`, and `\%23l`/`\%23c`. Tracked by **#1157**.
+as literal text: `\&` (branch concat — "match this branch, but the *reported*
+match is the last branch"), `\%[…]` (optional-sequence), and `\@>` (atomic
+group). Neither `regex` nor `fancy_regex` exposes a primitive that faithfully
+expresses any of them.
 
-**Engine note (corrected 2026-09-19, #1163).** This section used to list
-back-references alongside the above and explain the whole group with "the Rust
-`regex` crate has no back-tracking, so it cannot express them". That is no
-longer the mechanism. `fancy-regex` — which *does* back-track — has been a
-direct dependency since #1004 (`Cargo.toml`), and `src/core/vim_regex.rs`
-routes a pattern to it **only** when the pattern actually contains a `\1`…`\9`
-atom (`has_backref`), keeping the fast non-backtracking engine for everything
-else. So back-references work today, and the remaining rejections above are a
-*translation* gap rather than an engine limitation — #1157 exists precisely
-because look-around is a rejection branch to flip, not a crate to replace.
+**Engine note (corrected 2026-09-19, #1163; extended by #1157).** This section
+used to list back-references among the rejections and explain the whole group
+with "the Rust `regex` crate has no back-tracking, so it cannot express them".
+That was never the real mechanism. `fancy-regex` — which *does* back-track —
+has been a direct dependency since #1004 (`Cargo.toml`), and
+`src/core/vim_regex.rs` routes a pattern to it **only** when the pattern
+actually needs back-tracking (a `\1`…`\9` back-reference or a look-around
+atom), keeping the fast non-backtracking engine for everything else. #1163
+diagnosed the remaining rejections as a *translation* gap rather than an engine
+limitation, and #1157 closed that gap: look-around, `\_x`, `\%23l`/`\%23c`,
+`\%V` and `\%d`/`\%x` were rejection branches to flip, not a crate to replace.
+What is left rejected above is genuinely inexpressible in either engine.
 
 **Known limitation — `:normal` and special-key notation.** The `:normal` row
 below is accurate: it feeds its argument through the normal-mode dispatcher.

@@ -4392,25 +4392,61 @@ impl Engine {
 
     /// The last Visual selection's byte range within `self.buffer().to_string()`
     /// — what `\%V` (#1157) restricts a match to. `None` when there has never
-    /// been one; charwise-only for now (linewise/blockwise `\%V` is a
-    /// documented gap, tracked in #1157 alongside the atom itself).
+    /// been one, *or* when the last selection was Visual-Block.
+    ///
+    /// Charwise (`v`) and linewise (`V`) selections are both a single
+    /// contiguous run of text, so both translate cleanly into the `[lo, hi)`
+    /// byte span `Compiled::pos_ok` filters against. Visual-Block (`CTRL-V`)
+    /// is *not* contiguous — it's a per-line column range (e.g. columns 3..6
+    /// on every selected line) — and `pos_ok`'s single-span representation
+    /// cannot express that shape at all.
+    ///
+    /// This used to (incorrectly) run the charwise column formula for every
+    /// Visual kind, which for linewise/blockwise produced a range that looked
+    /// plausible but was arithmetically nonsense (silently wrong matches,
+    /// not a "no selection" no-op). Since there is no faithful contiguous
+    /// approximation for Visual-Block, this refuses instead: no range means
+    /// `\%V` never matches, the same safe behaviour already covered by
+    /// `percent_v_with_no_visual_range_never_matches` for "no selection yet".
+    /// Rejection, never fallback — the same doctrine `vim_regex`'s module doc
+    /// states for the untranslatable-pattern case. Proper Visual-Block
+    /// support needs a per-line-range `\%V` representation and is a
+    /// follow-up, not a fix folded into this pass.
     fn last_visual_byte_range(&self) -> Option<(usize, usize)> {
         let anchor = self.last_visual_anchor?;
         let cursor = self.last_visual_cursor?;
-        let to_char = |c: Cursor| self.buffer().line_to_char(c.line) + c.col;
-        let (lo, hi) = {
-            let a = to_char(anchor);
-            let b = to_char(cursor);
-            if a <= b {
-                (a, b)
-            } else {
-                (b, a)
-            }
+        let (start, end) = if anchor.line < cursor.line
+            || (anchor.line == cursor.line && anchor.col <= cursor.col)
+        {
+            (anchor, cursor)
+        } else {
+            (cursor, anchor)
         };
         let rope = &self.buffer().content;
-        let lo_byte = rope.char_to_byte(lo.min(rope.len_chars()));
-        let hi_byte = rope.char_to_byte((hi + 1).min(rope.len_chars()));
-        Some((lo_byte, hi_byte.max(lo_byte)))
+        match self.last_visual_mode {
+            Mode::Visual => {
+                let to_char = |c: Cursor| self.buffer().line_to_char(c.line) + c.col;
+                let lo = to_char(start);
+                let hi = to_char(end);
+                let lo_byte = rope.char_to_byte(lo.min(rope.len_chars()));
+                let hi_byte = rope.char_to_byte((hi + 1).min(rope.len_chars()));
+                Some((lo_byte, hi_byte.max(lo_byte)))
+            }
+            Mode::VisualLine => {
+                let start_char = self.buffer().line_to_char(start.line);
+                let end_char = if end.line + 1 < self.buffer().len_lines() {
+                    self.buffer().line_to_char(end.line + 1)
+                } else {
+                    self.buffer().len_chars()
+                };
+                Some((rope.char_to_byte(start_char), rope.char_to_byte(end_char)))
+            }
+            // Visual-Block (and any other mode `last_visual_mode` could in
+            // principle hold, though anchor/cursor being `Some` means it's
+            // realistically always one of the three Visual kinds) — refuse,
+            // see the doc comment above.
+            _ => None,
+        }
     }
 
     /// Collect every match of `re` in `text`.
