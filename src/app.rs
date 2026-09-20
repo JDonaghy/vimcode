@@ -9006,6 +9006,77 @@ mod portable_entry_point_tests {
         }
     }
 
+    /// #1166: `App::shell_config` (GTK/macOS/Win-GUI) derives its panel
+    /// *order* from `self.engine.app_shell.panels()` — the engine's shadow
+    /// `AppShell`, built by `Engine::new_from_state` from
+    /// `sidebar::engine_app_shell_panel_definitions()` — while
+    /// `TuiShellApp::build_shell_config` derives its order by iterating
+    /// `sidebar::FIXED_ACTIVITY_PANEL_IDS` directly. Both now trace back to
+    /// the same constant, but the icon test above only compares icons *per
+    /// id* — it never looks at relative order, so a future edit that
+    /// reintroduces an independent order for one side (e.g. a
+    /// hand-transcribed panel list, or a stray `.sort()`) would still pass
+    /// it while shipping a different activity-bar order per backend, the
+    /// same shape of bug #1107 fixed for icons. This pins order the same
+    /// way that test pins icons.
+    ///
+    /// Note for reviewers: like the icon test above, this does not go red
+    /// against unfixed `develop` — the hand-transcribed literal
+    /// `Engine::new_from_state` used to build `self.app_shell` from
+    /// happened to list the same six ids in the same order as
+    /// `FIXED_ACTIVITY_PANEL_IDS` already, so the *values* never
+    /// disagreed. #1166 is the refactor that deletes the second copy of
+    /// the order (no user-visible behaviour change) so the two can no
+    /// longer independently drift; this test is the structural regression
+    /// guard for that, not a bug-fix repro (verified red by temporarily
+    /// reverting `engine_app_shell_panel_definitions` to a hand-ordered
+    /// literal with two ids swapped: this test caught it, the icon test
+    /// above did not).
+    #[cfg(feature = "gui")]
+    #[test]
+    fn shell_config_resolves_the_same_panel_order_on_every_backend_for_every_shared_panel() {
+        let engine = Rc::new(RefCell::new(Engine::new_for_test()));
+        let app = App::new_headless(engine);
+        let gtk_cfg = app.shell_config();
+        let tui_cfg = crate::tui_main::testing::TuiShellApp::build_shell_config(false);
+
+        let order_of = |cfg: &quadraui::ShellConfig| -> Vec<String> {
+            cfg.panels
+                .iter()
+                .chain(cfg.bottom_items.iter())
+                .map(|p| p.id.as_str().to_string())
+                .collect()
+        };
+        let gtk_order = order_of(&gtk_cfg);
+        let tui_order = order_of(&tui_cfg);
+
+        // Both orderings restricted to the ids the two backends share, each
+        // kept in that backend's own relative order — panels only one
+        // backend claims (extension panels; there are no built-in-only ids
+        // today) are irrelevant to whether the *shared* panels agree.
+        let shared_gtk_order: Vec<String> = gtk_order
+            .iter()
+            .filter(|id| tui_order.contains(id))
+            .cloned()
+            .collect();
+        let shared_tui_order: Vec<String> = tui_order
+            .iter()
+            .filter(|id| gtk_order.contains(id))
+            .cloned()
+            .collect();
+
+        assert!(
+            shared_gtk_order.iter().any(|id| id == "panel:search"),
+            "precondition: both backends must claim the search panel for \
+             this test to mean anything"
+        );
+        assert_eq!(
+            shared_gtk_order, shared_tui_order,
+            "GTK and TUI resolved the shared activity-bar panels to \
+             different relative orders (GTK: {gtk_order:?}, TUI: {tui_order:?})"
+        );
+    }
+
     /// #949 review: makes the "closes the macOS/Win-GUI settings hot-reload
     /// gap for free" claim testable. `handle_poll_tick` used to be reached
     /// only via a GTK-only `gio::FileMonitor` callback
