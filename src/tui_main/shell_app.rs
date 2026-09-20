@@ -11402,10 +11402,10 @@ mod tests {
 
     /// Command mode paints the typed `:command` *and* its inverted block
     /// cursor. The cursor is a colour inversion, invisible to `screen()`'s
-    /// text dump, so this asserts on the text and relies on the run-batching
-    /// in `render_command_line` not swallowing cells: a cursor mid-string
-    /// splits the row into three colour runs, so a bug there would drop or
-    /// duplicate characters rather than merely mis-colour them.
+    /// text dump, so this asserts on the text and relies on `panels::
+    /// render_command_line` (which now delegates to quadraui's own
+    /// `Backend::draw_command_line_selection`, #1185) not swallowing cells: a
+    /// cursor mid-string must not drop or duplicate the characters around it.
     #[test]
     fn render_content_paints_command_mode_text_with_cursor_via_shell_app() {
         let mut app = TuiShellApp::new(None);
@@ -11418,6 +11418,68 @@ mod tests {
         assert!(
             screen.contains(":ZQXW605CMD"),
             "command-mode text should paint intact around the inverted cursor cell; screen:\n{screen}"
+        );
+    }
+
+    /// #1185: adopts quadraui#1001's `Backend::draw_command_line_selection`.
+    /// Before this, GTK painted no visual feedback at all for a command-line
+    /// drag-selection (`cmd_sel`/Ctrl+C-copy worked; nothing was drawn), and
+    /// TUI got a highlight only via its own hand-rolled per-cell fg/bg
+    /// inversion in `panels::render_command_line` — exactly the kind of
+    /// per-backend paint code `CLAUDE.md`'s Platform-Neutrality Rule exists
+    /// to delete. This seeds `engine.cmd_sel` directly (the doc comment at
+    /// its definition recommends exactly this for tests that need it, rather
+    /// than driving a synthetic mouse drag) and asserts on the **painted
+    /// background colour** of individual columns — not on `cmd_sel` being
+    /// `Some` (`CLAUDE.md` rule 1: `ScreenLayout.picker`'s #587/#592 history
+    /// is why state-only assertions are rejected here).
+    ///
+    /// Confirmed RED against unfixed `develop`: reverting this PR's
+    /// `panels::render_command_line` restores the hand-rolled inversion,
+    /// which never applies `theme.selection`'s colour to any cell (it swaps
+    /// the existing `theme.command_fg`/`theme.command_bg` pair instead), so
+    /// the `sel_bg` assertions below fail without the fix.
+    #[test]
+    fn render_content_paints_command_line_selection_highlight_via_shell_app() {
+        let mut app = TuiShellApp::new_for_test();
+        app.engine.mode = crate::core::Mode::Command;
+        app.engine.command_buffer = "wq!".to_string();
+        app.engine.command_cursor = 3;
+        // Full displayed text is ":wq!" (prompt + buffer). Char indices
+        // (1, 2) select "wq" — columns 1 (':') skipped, 'w' and 'q' selected,
+        // '!' left unselected. Same inclusive-range convention as GTK's
+        // `drag_select_then_ctrl_c_copies_the_command_buffer_substring`.
+        app.engine.cmd_sel.set(Some((1usize, 2usize)));
+
+        let theme = Theme::from_name(&app.engine.settings.colorscheme);
+        let sel_bg = quadraui::tui::ratatui_color(super::quadraui_tui::q_theme(&theme).selection);
+
+        let driver = driver_with_shell(app, config(), 80, 24);
+        let bounds = driver
+            .find_bounds(":wq!")
+            .expect("command line text must paint");
+        let row = bounds.y as u16;
+        let col0 = bounds.x as u16; // ':'
+
+        assert_eq!(
+            driver.style_at(col0 + 1, row).map(|s| s.bg),
+            Some(sel_bg),
+            "selected column 'w' must carry the selection background"
+        );
+        assert_eq!(
+            driver.style_at(col0 + 2, row).map(|s| s.bg),
+            Some(sel_bg),
+            "selected column 'q' must carry the selection background"
+        );
+        assert_ne!(
+            driver.style_at(col0 + 3, row).map(|s| s.bg),
+            Some(sel_bg),
+            "unselected column '!' must not carry the selection background"
+        );
+        assert_ne!(
+            driver.style_at(col0, row).map(|s| s.bg),
+            Some(sel_bg),
+            "unselected prompt column ':' must not carry the selection background"
         );
     }
 

@@ -8854,11 +8854,12 @@ pub(crate) fn chrome_band_fixture(wildmenu: bool) -> Vec<FrameOp> {
 
 /// The `quadraui::CommandLine` descriptor for this frame's Vim command line.
 ///
-/// GTK's [`FrameOp::CommandLine`] rung built this inline; TUI's rasteriser
-/// composes cells itself (`panels::render_command_line`, which also applies the
-/// `cmd_sel` drag-selection inversion), so only GTK consumes it today — but the
-/// *descriptor* is app state, not geometry, and belongs beside the rest of the
-/// chrome band rather than buried in a backend.
+/// GTK's [`FrameOp::CommandLine`] rung and TUI's `panels::render_command_line`
+/// both build the descriptor this way and hand it (plus `cmd_sel`, converted
+/// via [`command_line_selection_bytes`]) to `Backend::
+/// draw_command_line_selection` (#1185) — the *descriptor* is app state, not
+/// geometry, and belongs beside the rest of the chrome band rather than
+/// buried in either backend.
 pub fn command_line_view(command: &CommandLineData) -> quadraui::CommandLine {
     quadraui::CommandLine {
         id: "cmd".into(),
@@ -20468,6 +20469,17 @@ fn to_quadraui_theme_chrome(theme: &Theme) -> quadraui::Theme {
         accent_bg: theme.tab_active_accent,
         scrollbar_track: theme.separator,
         scrollbar_thumb: theme.scrollbar_thumb,
+        // #1185: quadraui's `command_line_{bg,fg}` default to its own
+        // hardcoded colours (`Theme::default()`'s `bg`/`fg`, unrelated to
+        // this literal's `background`/`foreground` override above) unless
+        // mapped explicitly. Both backends now paint the command line
+        // through `Backend::draw_command_line_selection`, which reads
+        // these two fields — without this mapping, adopting that call
+        // would have silently swapped every colourscheme's themed command
+        // line for quadraui's defaults (a regression for TUI, which used
+        // to read `theme.command_{fg,bg}` by hand).
+        command_line_bg: theme.command_bg,
+        command_line_fg: theme.command_fg,
         ..quadraui::Theme::default()
     }
 }
@@ -21092,43 +21104,25 @@ pub fn command_line_click_char_idx(
     ))
 }
 
-/// Rect spanning a mouse selection `sel` (character-count `(anchor, head)`,
-/// either order) over `text`, painted into `rect` — the paintable geometry
-/// [`quadraui::CommandLineLayout::selection_bounds`] hands back, in the same
-/// ABSOLUTE units as `rect`. `None` for an empty selection or one that maps
-/// to zero width.
-///
-/// **Not wired into either backend's paint path yet (#816 review).** TUI
-/// paints its selection by inverting fg/bg per character cell
-/// (`tui_main::panels::render_command_line`) and never needs pixel geometry.
-/// GTK has no equivalent: `quadraui::CommandLine` carries no `selection`
-/// field, and neither the GTK nor TUI `draw_command_line` in quadraui paints
-/// one — so a GTK user who drags a selection over the command line gets
-/// `cmd_sel`/Ctrl+C-copy behaviour with zero visual feedback. Hand-rolling a
-/// Cairo highlight rect here (even using this function's geometry) would be
-/// exactly the per-backend workaround CLAUDE.md's Platform-Neutrality Rule
-/// forbids; the correct fix is a `CommandLine::selection` field painted by
-/// quadraui's own `draw_command_line` (both backends). This function exists
-/// so that fix has the geometry math ready the day the primitive lands — see
-/// the quadraui issue tracking that gap (file one against
-/// `JDonaghy/quadraui` if it does not already exist; #816 stays open behind
-/// it rather than being closed as GTK-selection-complete).
-pub fn command_line_selection_rect(
-    rect: quadraui::Rect,
-    text: &str,
-    char_width: f32,
-    sel: (usize, usize),
-) -> Option<quadraui::Rect> {
-    let cmd = quadraui::CommandLine {
-        id: quadraui::WidgetId::new("cmdline:selection"),
-        text: text.to_string(),
-        cursor_offset: None,
-        right_align: false,
-    };
-    let layout = cmd.layout(rect, quadraui::CommandLineMeasure::new(char_width));
-    let lo = command_line_char_to_byte_idx(text, sel.0);
-    let hi = command_line_char_to_byte_idx(text, sel.1);
-    layout.selection_bounds((lo, hi))
+/// Convert a mouse selection `sel` (character-count `(anchor, head)`,
+/// either order — the unit `Engine::cmd_sel` uses throughout, INCLUSIVE at
+/// both ends: `route_cmdline_selection_key`'s Ctrl+C copy keeps every char
+/// with `lo <= i <= hi`, and a bare click with no drag sets `(idx, idx)`
+/// to highlight that one character) into the byte-offset `(start, end)`
+/// pair [`quadraui::Backend::draw_command_line_selection`] expects, relative
+/// to `text`. That pair is EXCLUSIVE at `end` (same contract as
+/// `CommandLineLayout::selection_bounds`, which supplies its geometry) —
+/// hence the `hi + 1` below, not a straight per-endpoint byte conversion.
+/// Both backends' paint paths call this immediately before handing `cmd_sel`
+/// to that method (issue #1185 — the consume side of quadraui#1001, which
+/// shipped the primitive this function now feeds).
+pub fn command_line_selection_bytes(text: &str, sel: (usize, usize)) -> (usize, usize) {
+    let lo = sel.0.min(sel.1);
+    let hi = sel.0.max(sel.1);
+    (
+        command_line_char_to_byte_idx(text, lo),
+        command_line_char_to_byte_idx(text, hi + 1),
+    )
 }
 
 // ─── Shared click target + layout geometry helpers ──────────────────────────
@@ -26710,21 +26704,21 @@ mod tests {
     }
 
     #[test]
-    fn command_line_selection_rect_spans_the_selected_columns() {
-        let rect = quadraui::Rect::new(0.0, 0.0, 20.0, 1.0);
-        // Select ":wq" from ":wq!" — char indices 0..3.
-        let r = command_line_selection_rect(rect, ":wq!", 1.0, (0, 3)).unwrap();
-        assert_eq!((r.x, r.width), (0.0, 3.0));
+    fn command_line_selection_bytes_converts_char_indices_to_byte_offsets() {
+        // ":éditer" — 'é' is 2 bytes. Inclusive char selection (1, 3) covers
+        // chars 1..=3 ("édi"); char 1 starts at byte 1, char 4 ('t', one
+        // past the inclusive end) starts at byte 5.
+        let (lo, hi) = command_line_selection_bytes(":éditer", (1, 3));
+        assert_eq!((lo, hi), (1, 5));
     }
 
     #[test]
-    fn command_line_selection_rect_order_independent_and_empty_is_none() {
-        let rect = quadraui::Rect::new(0.0, 0.0, 20.0, 1.0);
-        assert_eq!(
-            command_line_selection_rect(rect, ":wq!", 1.0, (3, 0)),
-            command_line_selection_rect(rect, ":wq!", 1.0, (0, 3))
-        );
-        assert!(command_line_selection_rect(rect, ":wq!", 1.0, (2, 2)).is_none());
+    fn command_line_selection_bytes_is_order_independent_and_end_inclusive() {
+        // No multibyte prefix: char count and byte count coincide. (1, 2)
+        // inclusive covers chars 1 and 2 ("wq" of ":wq!") -> exclusive byte
+        // range [1, 3). Either endpoint order gives the same result.
+        assert_eq!(command_line_selection_bytes(":wq!", (1, 2)), (1, 3));
+        assert_eq!(command_line_selection_bytes(":wq!", (2, 1)), (1, 3));
     }
 
     #[test]

@@ -8385,7 +8385,16 @@ impl quadraui::ShellApp for App {
                     // cache in `shell_app.rs`'s own `FrameOp::CommandLine`
                     // arm.
                     self.engine.borrow().command_line_rect.set(cmd_rect);
-                    backend.draw_command_line(cmd_rect, &cmd);
+                    // #1185: paint through `draw_command_line_selection`
+                    // (quadraui#1001) instead of the selection-blind
+                    // `draw_command_line` — `cmd_sel` is character indices
+                    // into `screen.command.text`, converted to the byte
+                    // offsets the primitive expects.
+                    let sel_bytes =
+                        self.engine.borrow().cmd_sel.get().map(|sel| {
+                            render::command_line_selection_bytes(&screen.command.text, sel)
+                        });
+                    backend.draw_command_line_selection(cmd_rect, &cmd, sel_bytes);
                     composed.push(render::FrameOp::CommandLine);
                 }
 
