@@ -11040,6 +11040,121 @@ mod command_line_selection {
         );
     }
 
+    /// #1100: `App::setup_gtk_clipboard` wires `engine.clipboard_read`/
+    /// `clipboard_write` through `backend.services().clipboard()` —
+    /// quadraui#991's `PlatformServices` seam — instead of the deleted
+    /// `copypasta_ext` stack. Unlike every other clipboard test in this
+    /// file (which manually installs its own capture-only
+    /// `engine.clipboard_write` closure and never touches a real
+    /// backend), this one calls the *production* `setup_gtk_clipboard`
+    /// against a real `quadraui::gtk::backend::GtkBackend` — the only way
+    /// to prove the actual wiring this issue changed, not a stand-in for
+    /// it — and drives a real `yy`/`j`/`p` through the engine so the
+    /// yanked line has to survive an out-and-back trip through the OS
+    /// clipboard to land on the pasted line.
+    ///
+    /// **Verified RED**: temporarily commenting out the
+    /// `self.sync_plus_register_to_clipboard()` call `run_post_key_epilogue`
+    /// makes after every key (the one `yy` relies on to push the yanked
+    /// register out through `engine.clipboard_write`) turns this red —
+    /// `pasted_line` comes back `""` instead of `"QUADRAUI_991_ALPHA"`,
+    /// because `p`'s `preload_paste_clipboard` reloads from a clipboard
+    /// nothing ever wrote to. Restored before committing. This is a
+    /// deliberately different failure mode than the probe below going
+    /// unavailable (which *skips*, not fails) — it proves the assertion
+    /// itself is load-bearing, not just reachable.
+    ///
+    /// Skips (does not fail) if no live OS clipboard is reachable in this
+    /// sandbox — same accepted pattern quadraui's own
+    /// `gtk::services::clipboard_image_html_file_list_and_clear_round_trip`
+    /// test uses for the identical reason (`arboard::Clipboard::new()`
+    /// fails with no live desktop session, e.g. a headless Linux CI box
+    /// with no `DISPLAY`/`WAYLAND_DISPLAY`).
+    #[test]
+    fn setup_gtk_clipboard_round_trips_yank_and_paste_through_real_backend_1100() {
+        // Mirrors `conformance_harness`'s manual construction (not the
+        // `harness()` convenience wrapper) because this test needs the
+        // `backend` handle itself to pass to `setup_gtk_clipboard` —
+        // `harness()` builds and discards its own.
+        let paint = crate::test_paint::PaintGuard::acquire();
+        let cwd = crate::test_cwd::CwdReadGuard::acquire();
+
+        let backend: Rc<RefCell<Box<dyn crate::app::TextMetricsBackend>>> = Rc::new(RefCell::new(
+            Box::new(crate::gtk::backend::GtkBackend::new()),
+        ));
+
+        let mut engine = Engine::new_for_test();
+        crate::app::setup_gtk_clipboard(&mut engine, backend.clone());
+
+        // Probe: does this sandbox have a live OS clipboard at all? Real
+        // GTK/desktop machines do; a headless CI box with no display
+        // server usually doesn't (`arboard::Clipboard::new()` fails, so
+        // `GtkClipboard`'s `inner` stays `None` and every call is a
+        // no-op/`Err`).
+        const PROBE: &str = "quadraui-991-clipboard-probe-1100";
+        let probe_write_ok = engine.clipboard_write.as_ref().expect(
+            "setup_gtk_clipboard must always install clipboard_write, live clipboard or not",
+        )(PROBE)
+        .is_ok();
+        let probe_read = engine.clipboard_read.as_ref().expect(
+            "setup_gtk_clipboard must always install clipboard_read, live clipboard or not",
+        )();
+        if !probe_write_ok || probe_read.as_deref() != Ok(PROBE) {
+            eprintln!(
+                "skipping setup_gtk_clipboard_round_trips_yank_and_paste_through_real_backend_1100: \
+                 no live OS clipboard in this sandbox (probe write_ok={probe_write_ok}, read={probe_read:?})"
+            );
+            return;
+        }
+
+        engine.buffer_mut().insert(0, "QUADRAUI_991_ALPHA\nBETA\n");
+        let engine = Rc::new(RefCell::new(engine));
+        let (app, config) = crate::harness::build_app_and_config(Rc::clone(&engine), backend);
+        let mut driver = driver_with_shell(app, config, 1200, 800);
+        driver.render();
+
+        let press = |driver: &mut GtkDriver<_>, ch: char| {
+            driver.dispatch(quadraui::UiEvent::KeyPressed {
+                key: quadraui::Key::Char(ch),
+                modifiers: quadraui::Modifiers::default(),
+                repeat: false,
+            });
+        };
+
+        // `yy`: linewise-yank line 0 ("QUADRAUI_991_ALPHA") — via
+        // `run_post_key_epilogue`'s `sync_plus_register_to_clipboard`,
+        // this writes out to the real OS clipboard through
+        // `engine.clipboard_write`.
+        press(&mut driver, 'y');
+        press(&mut driver, 'y');
+        // `j`: move to line 1 ("BETA").
+        press(&mut driver, 'j');
+        // `p`: paste below the cursor line. `render::preload_paste_clipboard`
+        // reloads the paste register from `engine.clipboard_read` — the
+        // real OS clipboard — immediately before this dispatches.
+        press(&mut driver, 'p');
+        driver.render();
+
+        let pasted_line = {
+            let eng = engine.borrow();
+            eng.buffer().content.line(2).to_string()
+        };
+        assert_eq!(
+            pasted_line.trim_end_matches('\n'),
+            "QUADRAUI_991_ALPHA",
+            "pasting after `yy`/`j` must reproduce the yanked line — proving \
+             it made a real out-and-back trip through \
+             backend.services().clipboard(), not just the local `\"` register"
+        );
+        assert!(
+            driver.screen_contains("QUADRAUI_991_ALPHA"),
+            "the pasted line must actually paint, not just exist in the rope"
+        );
+
+        drop(cwd);
+        drop(paint);
+    }
+
     /// #1185: adopts quadraui#1001's `Backend::draw_command_line_selection`.
     /// Before this, GTK painted `draw_command_line` unconditionally — a
     /// user who dragged a selection over the command line got working

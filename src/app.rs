@@ -98,8 +98,6 @@ use core::engine::{EngineAction, PendingPlatformAction};
 use core::{Engine, WindowRect};
 use render::Theme;
 
-use copypasta_ext::ClipboardProviderExt;
-
 use crate::app_support::*;
 use crate::click::*;
 use crate::core::engine::sidebar::*;
@@ -1115,81 +1113,76 @@ fn map_gtk_key_with_unicode(gdk_name: &str) -> (&str, Option<char>) {
     }
 }
 
-/// Set up system clipboard callbacks on the engine via copypasta_ext.
+/// Set up system clipboard callbacks on the engine via
+/// `backend.services().clipboard()` (issue #1100 — quadraui#991's
+/// `PlatformServices` seam, replacing the bespoke `copypasta_ext` stack).
 ///
-/// On X11 we prefer `x11_bin` (xclip/xsel subprocesses) over `try_context`'s
-/// default `x11_fork`: the fork variant opens its own in-process X11 connection
-/// and contends with GTK's main-thread X11 event loop. Subprocess reads do not.
+/// `backend` is `App`'s own held handle — `Rc<RefCell<Box<dyn
+/// TextMetricsBackend>>>`, distinct from the runner-owned `&mut dyn
+/// quadraui::Backend` `ShellApp::setup`/`handle`/`tick` receive only
+/// transiently (see [`PendingFileDialog`]'s doc for why that distinction
+/// matters for file dialogs). Cloning the `Rc` into each closure lets
+/// `engine.clipboard_read`/`clipboard_write` — plain `Fn` callbacks with no
+/// backend parameter of their own, called from deep inside `core::engine`
+/// code that has no `Backend` handle at all — reach the clipboard on every
+/// call, long after this function itself returns.
 ///
-/// Only `App::new` (`gui`-gated) calls this today; it names no toolkit type
-/// (`copypasta_ext` is a plain, unconditional dependency) so it stays
-/// un-gated itself, allowed rather than `#[cfg]`-gated.
+/// Unlike the file-dialog case, clipboard access needs none of
+/// `self.backend`'s modal-pump-depth machinery (`ModalPumpDepth`/
+/// `pump_until_ready` only guard the nested main-loop wait `gtk4::FileDialog`/
+/// `AlertDialog` need), so borrowing it here — a second `Backend` instance
+/// from the runner's own, each with its own independent `PlatformServices` —
+/// is safe: `Clipboard::read_text`/`write_text` talk straight to the OS
+/// clipboard (`arboard` on GTK, matching what TUI's `TuiPlatformServices`
+/// already uses — see `tui_main::mod::setup_tui_clipboard`), not to any
+/// runner-owned state.
+///
+/// `TextMetricsBackend: quadraui::Backend` (see that trait's doc), so this
+/// names no concrete toolkit type and works unchanged for GTK, macOS, and
+/// Win-GUI — every `App::new`/`App::new_portable` caller passes its own
+/// concrete backend through the same `Rc<RefCell<Box<dyn
+/// TextMetricsBackend>>>` seam #861 opened.
+///
+/// ## #587 follow-up: does `arboard`'s X11 connection contend with GTK's?
+///
+/// #587's hang was `copypasta_ext`'s `x11_fork` variant calling `fork()`
+/// inside this GTK4 process — a multi-threaded fork is what risked a
+/// deadlocked child, not "a second X11 connection" per se. `arboard` never
+/// forks; its Linux backend owns a background thread with its own XCB
+/// connection, entirely separate from GDK's. That is *already* running in
+/// every GTK session today regardless of this change: `quadraui::gtk::run`
+/// unconditionally constructs its own `GtkBackend` (and therefore its own
+/// `GtkPlatformServices`, and therefore its own `arboard::Clipboard::new()`)
+/// before `ShellApp::setup` ever runs — see
+/// `quadraui::gtk::run::run`/`quadraui::gtk::backend::GtkBackend::new`. That
+/// same arboard-backed clipboard is also already exercised interactively
+/// through quadraui's own `sidebar_search`/`text_input` Ctrl-Shift-V/
+/// middle-click paste paths (quadraui#120/`fd0029f`). No hang has ever been
+/// reported against that code path, so this diff adds a *second* independent
+/// `arboard::Clipboard` instance to an already-arboard-using process, not a
+/// wholly new interaction with GTK's main loop.
 #[cfg_attr(not(feature = "gui"), allow(dead_code))]
-fn setup_gtk_clipboard(engine: &mut Engine) {
-    let ctx: Option<Box<dyn ClipboardProviderExt>> = {
-        #[cfg(all(
-            unix,
-            not(any(target_os = "macos", target_os = "android", target_os = "emscripten"))
-        ))]
-        if copypasta_ext::display::is_x11() {
-            copypasta_ext::x11_bin::ClipboardContext::new()
-                .ok()
-                .map(|c| Box::new(c) as Box<dyn ClipboardProviderExt>)
-                .or_else(|| {
-                    // xclip/xsel aren't on PATH, so `x11_bin` failed. Do NOT
-                    // fall back to `copypasta_ext::try_context()` here — on
-                    // X11 that prefers `x11_fork::ClipboardContext` by
-                    // default (#587 Problem 2, discovered via manual GTK
-                    // smoke test): its `set_contents` calls `fork()` inside
-                    // this GTK4 process, and its `get_contents` opens its
-                    // own in-process X11 connection. Forking a process with
-                    // GTK's thread pool, glib workers, gdbus and Cairo/Mesa
-                    // threads risks the child inheriting a mutex locked by a
-                    // thread that doesn't exist in the child and hanging
-                    // forever; the extra connection also contends with
-                    // GTK's main-thread X11 event loop per the module doc
-                    // above. Any machine without xclip/xsel installed hit
-                    // this fallback and froze the whole app on clipboard
-                    // access. `X11ClipboardContext` (used here directly,
-                    // bypassing `x11_fork`) does the same I/O on a
-                    // background thread with a bounded (3s) read timeout
-                    // and never calls `fork()`.
-                    use copypasta_ext::copypasta::x11_clipboard::{Clipboard, X11ClipboardContext};
-                    X11ClipboardContext::<Clipboard>::new()
-                        .ok()
-                        .map(|c| Box::new(c) as Box<dyn ClipboardProviderExt>)
-                })
-        } else {
-            copypasta_ext::try_context()
-        }
-        #[cfg(not(all(
-            unix,
-            not(any(target_os = "macos", target_os = "android", target_os = "emscripten"))
-        )))]
-        copypasta_ext::try_context()
-    };
-
-    let Some(ctx) = ctx else { return };
-    // `engine.clipboard_{read,write}` are `Fn` (shared-ref callbacks), but
-    // `ClipboardProviderExt::{get,set}_contents` take `&mut self`. Wrap the
-    // provider in `Rc<RefCell<…>>` so both closures can share it and acquire
-    // a mutable borrow at call time.
-    let ctx = Rc::new(RefCell::new(ctx));
-
-    let read_ctx = ctx.clone();
+pub(crate) fn setup_gtk_clipboard(
+    engine: &mut Engine,
+    backend: Rc<RefCell<Box<dyn TextMetricsBackend>>>,
+) {
+    let read_backend = backend.clone();
     engine.clipboard_read = Some(Box::new(move || {
-        read_ctx
-            .borrow_mut()
-            .get_contents()
-            .map_err(|e| format!("clipboard read: {e}"))
+        read_backend
+            .borrow()
+            .services()
+            .clipboard()
+            .read_text()
+            .ok_or_else(|| "clipboard empty or unavailable".to_string())
     }));
 
-    let write_ctx = ctx;
     engine.clipboard_write = Some(Box::new(move |text: &str| {
-        write_ctx
-            .borrow_mut()
-            .set_contents(text.to_string())
-            .map_err(|e| format!("clipboard write: {e}"))
+        backend
+            .borrow()
+            .services()
+            .clipboard()
+            .write_text_result(text)
+            .map_err(|e| format!("clipboard write: {e:?}"))
     }));
 }
 
@@ -1285,7 +1278,7 @@ impl App {
             e.startup(file_path.as_deref());
             e
         };
-        setup_gtk_clipboard(&mut engine);
+        setup_gtk_clipboard(&mut engine, backend.clone());
 
         let initial_theme = Theme::from_name(&engine.settings.colorscheme);
         let css_provider: Option<Box<dyn PlatformCssProvider>> =
@@ -1369,11 +1362,12 @@ impl App {
     /// constructor to call here.
     ///
     /// Everything else — engine construction and startup, nerd-font
-    /// selection, the clipboard provider (`setup_gtk_clipboard` names no
-    /// toolkit type and already `cfg`s its X11 branch off on macOS), the
-    /// emergency-engine registration the panic hook's swap flush needs, and
-    /// the whole of [`App::assemble`] — is shared verbatim, so the two
-    /// constructors cannot drift on anything that affects behaviour.
+    /// selection, the clipboard provider (`setup_gtk_clipboard` (#1100)
+    /// names no concrete toolkit type — it goes through the generic
+    /// `TextMetricsBackend: quadraui::Backend` seam), the emergency-engine
+    /// registration the panic hook's swap flush needs, and the whole of
+    /// [`App::assemble`] — is shared verbatim, so the two constructors
+    /// cannot drift on anything that affects behaviour.
     ///
     /// `backend` is the caller's [`TextMetricsBackend`], the seam #861 opened
     /// and `src/gtk/mod.rs::run` names in its own comment as "the seam a
@@ -1403,7 +1397,7 @@ impl App {
             e.startup(file_path.as_deref());
             e
         };
-        setup_gtk_clipboard(&mut engine);
+        setup_gtk_clipboard(&mut engine, backend.clone());
 
         let last_colorscheme = engine.settings.colorscheme.clone();
 
@@ -1734,7 +1728,16 @@ impl App {
     ///   panics with no `DISPLAY`. `css_provider` is left `None` — even
     ///   `gtk4::CssProvider::new()` asserts `gtk::init` has run, and a provider
     ///   attached to no display styles nothing.
-    /// - `setup_gtk_clipboard`, which probes X11 / spawns `xclip`.
+    /// - `setup_gtk_clipboard` (#1100), which would install
+    ///   `backend.services().clipboard()` callbacks. Every other test in
+    ///   `src/gtk/testing.rs` that needs `engine.clipboard_read`/
+    ///   `clipboard_write` installs its own capture-only closure directly
+    ///   instead of calling through here, for exactly this reason — the
+    ///   one exception,
+    ///   `setup_gtk_clipboard_round_trips_yank_and_paste_through_real_backend_1100`,
+    ///   builds its own real (non-headless) `GtkBackend` and calls
+    ///   `setup_gtk_clipboard` explicitly rather than going through this
+    ///   constructor.
     /// - `Engine::startup`, which would restore *the developer's real last
     ///   session*. Tests pass the exact buffers/groups they mean to assert on.
     /// - `core::swap::register_emergency_engine`, whose contract is that the
