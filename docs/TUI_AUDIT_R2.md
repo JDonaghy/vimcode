@@ -74,12 +74,12 @@ this audit.
 | 11 | `render_ext_sidebar` | 84 | quadraui-gap | Same `render::ext_sidebar_to_multi_section_view` + `MultiSectionView::render` GTK's `PANEL_EXTENSIONS` arm calls, but TUI paints two additional header/search chrome rows by hand (`fill_row`, not even the shared `draw_settings_chrome`) that GTK's arm has no equivalent of at all — see the open question in §5 item 3. |
 | 12 | `render_ai_sidebar` | 21 | already-shared | Doc comment: "delegates its entire paint to the shared `engine.ai_chat` (`quadraui::ChatController`), the same controller GTK's `render_content` `PANEL_AI` arm now also renders — one implementation instead of two" (#819). Confirmed: `paint_sidebar_panel_rung`'s `PANEL_AI` arm is the same three calls (`populate_ai_chat_controller`, set rect, `.render()`), modulo `Cell`-vs-field caching of backend metrics. |
 | 13 | `render_debug_sidebar` | 56 | quadraui-gap | Same `render::debug_sidebar_chrome_to_status_bars` + four `quadraui::TreeView`s (`populate_dap_sidebar_system`) GTK's `PANEL_DEBUG` arm calls; TUI's body is a superset only in how it slices the chrome rows into `Rect`s (cell arithmetic) vs. GTK's `f32` pixel arithmetic for the same two bars — same composition shape as the rest of §2.9's bucket, smaller because the chrome here really is just two `StatusBar`s, no extra TUI-only chrome layer. |
-| 14 | Doc-comment/module overhead (headers, the deleted-`draw_frame` note at line 1103, section dividers) | ~65 | irreducible | Prose, not logic — accounts for the gap between the sum of the rows above (~891) and the measured 1,122; not a rung. |
+| 14 | Doc-comment/module overhead (headers, the deleted-`draw_frame` note at line 1103, section dividers) | ~231 | irreducible | Prose, not logic — accounts for the gap between the sum of the rows above (891 = 616 quadraui-gap + 275 already-shared) and the measured 1,122; not a rung. |
 
 ### 2.9. The quadraui-gap bucket, named once
 
-Six of the eight sidebar-panel-body rungs (2, 5, 8, 9, 11, 13 — **671
-production lines**, 60% of the file) share one shape: the *decision* and the
+Six of the eight sidebar-panel-body rungs (2, 5, 8, 9, 11, 13 — **616
+production lines**, ~55% of the file) share one shape: the *decision* and the
 *data adapter* (`render::sc_*`, `render::ext_panel_to_tree_view`,
 `render::populate_*`) are already fully shared with `paint_sidebar_panel_rung`;
 what's independently written on each side is the panel's **chrome
@@ -140,32 +140,32 @@ asserts, the two files' share of that:
 
 | Bucket | `panels.rs` | `render_impl.rs` | Total |
 |---|---:|---:|---:|
-| quadraui-gap (blocked on upstream primitive) | 671 | 0 | **671** |
+| quadraui-gap (blocked on upstream primitive) | 616 | 0 | **616** |
 | convergeable (no blocker, needs a PR) | 0 | 122 | **122** |
-| already-shared (decision shared; thin per-backend wiring only) | 220 | 702 | 922 |
+| already-shared (decision shared; thin per-backend wiring only) | 275 | 702 | 977 |
 | irreducible (documented architectural fact) | 0 | 410 | 410 |
-| doc-comment/module overhead (not logic) | ~65 | ~144 | ~209 |
+| doc-comment/module overhead (not logic) | ~231 | ~144 | ~375 |
 | **Measured total** | **1,122** | **1,378** | **2,500** |
 
 **Confirms the ~2,000 ± 500 figure — these two files alone account for a
 material fraction of it, concentrated almost entirely in `panels.rs`'s
-quadraui-gap bucket.** 671 + 122 = **793 lines** of these two files are
+quadraui-gap bucket.** 616 + 122 = **738 lines** of these two files are
 "genuinely duplicated implementation" by #1044's own definition (a second
 hand-written answer to a question the other backend already has a shared
 answer to, or would have one if a quadraui primitive existed) — roughly a
 third of the citywide estimate, from 2 of the TUI's 5 largest files. The
-remaining ~1,200 ± 500 lines of the estimate most plausibly sit in
+remaining ~1,250 ± 500 lines of the estimate most plausibly sit in
 `mouse.rs`/`shell_app.rs`'s own click-routing halves of these same eight
 panels (out of this audit's scope; #1108's companion `mouse.rs` coverage was
 already done by #1044 itself, verdicted mostly already-shared there — see
 `GOALS.md`'s rung table, `mouse.rs` row 1) and in doc-comment/structural
 overhead the same way `IRREDUCIBLE_SURFACE.md` §5 already flags ("39% of the
-surrounding mass being comments" — this audit's own ~209-line overhead
-bucket, 8% of the 2,500 measured here, is consistent with that being an
+surrounding mass being comments" — this audit's own ~375-line overhead
+bucket, 15% of the 2,500 measured here, is consistent with that being an
 overall-corpus average pulled up by files denser in comments than these two).
 
 **What this does not confirm:** that 2,000 lines are mechanically
-convergeable today. 671 of the 793 "genuinely duplicated" lines are
+convergeable today. 616 of the 738 "genuinely duplicated" lines are
 **quadraui-gap**, not convergeable — per the issue's own instruction and
 #1169's prior ruling, that bucket does not get a vimcode PR until the
 upstream primitive in §2.9 exists.
@@ -225,7 +225,7 @@ referencing #1108.
    body widget, optional scrollbar, parameterized by `unit_w`/`unit_h` per
    the existing `FrameMetrics` convention) that both `panels.rs`'s six
    quadraui-gap-verdicted renderers and `app.rs`'s `paint_sidebar_panel_rung`
-   arms could delegate their entire body to — collapsing 671 TUI lines + a
+   arms could delegate their entire body to — collapsing 616 TUI lines + a
    comparable share of GTK's 272-line match into one shared implementation
    plus two thin per-backend `Host` impls. **Do not implement the vimcode
    side of this before the primitive ships upstream** — per
