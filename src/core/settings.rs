@@ -4560,6 +4560,89 @@ mod tests {
         assert!(!s.wrap);
     }
 
+    // ── #1207: the last five `UNIMPLEMENTED_BOOL_OPTIONS` (#1190 tranche 2) ──
+    //
+    // RED against unfixed `develop`: before #1207, every one of `magic`,
+    // `showmatch`, `linebreak`, `smartindent`, `cindent` was listed in
+    // `UNIMPLEMENTED_BOOL_OPTIONS`, so `parse_set_option` rejected all of
+    // them with "recognised but not implemented yet" instead of setting the
+    // field — every assertion below that a field flips would have failed
+    // (the `unwrap()` on `parse_set_option` would have panicked on the
+    // `Err`).
+
+    #[test]
+    fn test_settings_magic_defaults_on_and_round_trips() {
+        let mut s = Settings::default();
+        assert!(s.magic, "'magic' defaults on, matching real Vim");
+        let msg = s.parse_set_option("nomagic").unwrap();
+        assert_eq!(msg, "nomagic");
+        assert!(!s.magic);
+        let msg = s.parse_set_option("magic").unwrap();
+        assert_eq!(msg, "magic");
+        assert!(s.magic);
+        assert_eq!(s.parse_set_option("magic?").unwrap(), "magic");
+    }
+
+    #[test]
+    fn test_settings_showmatch_defaults_off_and_round_trips_via_abbrev() {
+        let mut s = Settings::default();
+        assert!(!s.showmatch);
+        let msg = s.parse_set_option("sm").unwrap();
+        assert_eq!(msg, "sm");
+        assert!(s.showmatch);
+        assert_eq!(s.parse_set_option("showmatch?").unwrap(), "showmatch");
+        let msg = s.parse_set_option("nosm").unwrap();
+        assert_eq!(msg, "nosm");
+        assert!(!s.showmatch);
+    }
+
+    #[test]
+    fn test_settings_linebreak_defaults_off_and_round_trips_via_abbrev() {
+        let mut s = Settings::default();
+        assert!(!s.linebreak);
+        let msg = s.parse_set_option("lbr").unwrap();
+        assert_eq!(msg, "lbr");
+        assert!(s.linebreak);
+        assert_eq!(s.parse_set_option("linebreak?").unwrap(), "linebreak");
+        let msg = s.parse_set_option("nolbr").unwrap();
+        assert_eq!(msg, "nolbr");
+        assert!(!s.linebreak);
+    }
+
+    #[test]
+    fn test_settings_smartindent_defaults_off_and_round_trips_via_abbrev() {
+        let mut s = Settings::default();
+        assert!(!s.smartindent);
+        let msg = s.parse_set_option("si").unwrap();
+        assert_eq!(msg, "si");
+        assert!(s.smartindent);
+        assert_eq!(s.parse_set_option("smartindent?").unwrap(), "smartindent");
+        let msg = s.parse_set_option("nosi").unwrap();
+        assert_eq!(msg, "nosi");
+        assert!(!s.smartindent);
+    }
+
+    #[test]
+    fn test_settings_cindent_defaults_off_and_round_trips_via_abbrev() {
+        let mut s = Settings::default();
+        assert!(!s.cindent);
+        let msg = s.parse_set_option("cin").unwrap();
+        assert_eq!(msg, "cin");
+        assert!(s.cindent);
+        assert_eq!(s.parse_set_option("cindent?").unwrap(), "cindent");
+        let msg = s.parse_set_option("nocin").unwrap();
+        assert_eq!(msg, "nocin");
+        assert!(!s.cindent);
+    }
+
+    #[test]
+    fn test_unimplemented_bool_options_is_now_empty() {
+        // #1207 implemented the last five entries #1190 left behind
+        // (`magic`, `showmatch`, `linebreak`, `smartindent`, `cindent`).
+        // Kept as `&[]` rather than removed — see the constant's own doc.
+        assert!(UNIMPLEMENTED_BOOL_OPTIONS.is_empty());
+    }
+
     #[test]
     fn test_toggle_bang_expandtab() {
         let mut s = Settings::default();

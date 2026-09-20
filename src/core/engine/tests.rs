@@ -21518,6 +21518,215 @@ fn test_auto_outdent_closing_brace() {
     );
 }
 
+// ── #1207: 'smartindent' / 'cindent' / 'showmatch' ──────────────────────────
+//
+// RED against unfixed `develop`: before #1207, `smart_indent_for_newline`
+// and `auto_outdent_for_closing` were gated on `auto_indent` alone —
+// `smartindent`/`cindent` didn't exist as fields at all, so every test
+// below that sets `auto_indent = false` and relies on `smartindent`/
+// `cindent` alone would have seen zero indent (the fields wouldn't even
+// have compiled), and every `showmatch_flash` assertion would have failed
+// to compile (`Engine` had no such field).
+
+#[test]
+fn test_smartindent_alone_without_autoindent_indents_after_brace() {
+    let mut e = engine_with_lang("fn main() {\n", "rs");
+    e.settings.auto_indent = false;
+    e.settings.smartindent = true;
+    e.view_mut().cursor.line = 0;
+    e.handle_key("A", Some('A'), false);
+    assert_eq!(e.mode, Mode::Insert);
+    e.handle_key("Return", None, false);
+    let indent = e.get_line_indent_str(1);
+    assert_eq!(
+        indent.len(),
+        e.settings.shift_width as usize,
+        "'smartindent' alone (no 'autoindent') must still indent after '{{'"
+    );
+}
+
+#[test]
+fn test_neither_autoindent_nor_smartindent_nor_cindent_does_not_indent() {
+    let mut e = engine_with_lang("fn main() {\n", "rs");
+    e.settings.auto_indent = false;
+    e.settings.smartindent = false;
+    e.settings.cindent = false;
+    e.view_mut().cursor.line = 0;
+    e.handle_key("A", Some('A'), false);
+    e.handle_key("Return", None, false);
+    let indent = e.get_line_indent_str(1);
+    assert_eq!(indent.len(), 0, "with all three off, no auto-indenting at all");
+}
+
+#[test]
+fn test_cindent_alone_without_autoindent_indents_after_brace() {
+    let mut e = engine_with_lang("fn main() {\n", "rs");
+    e.settings.auto_indent = false;
+    e.settings.cindent = true;
+    e.view_mut().cursor.line = 0;
+    e.handle_key("A", Some('A'), false);
+    e.handle_key("Return", None, false);
+    let indent = e.get_line_indent_str(1);
+    assert_eq!(
+        indent.len(),
+        e.settings.shift_width as usize,
+        "'cindent' alone (no 'autoindent') must still indent after '{{'"
+    );
+}
+
+#[test]
+fn test_cindent_supersedes_smartindent_language_trigger() {
+    // Python `:` is one of `line_triggers_indent`'s language-aware
+    // triggers — real `smartindent` alone would indent after it (like
+    // `test_smart_indent_python_colon` above), but `:h 'cindent'` says
+    // "'cindent' ... overrules 'smartindent'", and this repo's `cindent`
+    // is deliberately the simple C-only subset (brace-based, no language
+    // triggers) — so with both set, the python `:` trigger must NOT fire.
+    let mut e = engine_with_lang("def foo():\n", "py");
+    e.settings.auto_indent = false;
+    e.settings.smartindent = true;
+    e.settings.cindent = true;
+    e.view_mut().cursor.line = 0;
+    e.handle_key("A", Some('A'), false);
+    e.handle_key("Return", None, false);
+    let indent = e.get_line_indent_str(1);
+    assert_eq!(
+        indent.len(),
+        0,
+        "'cindent' must supersede 'smartindent': no brace, no indent"
+    );
+}
+
+#[test]
+fn test_cindent_outdent_closing_brace_without_autoindent() {
+    let mut e = engine_with_lang("fn main() {\n        \n}\n", "rs");
+    e.settings.auto_indent = false;
+    e.settings.cindent = true;
+    e.start_undo_group();
+    e.mode = Mode::Insert;
+    e.view_mut().cursor.line = 1;
+    e.view_mut().cursor.col = 8;
+    e.handle_key("}", Some('}'), false);
+    let indent = e.get_line_indent_str(1);
+    assert_eq!(
+        indent.len(),
+        4,
+        "'cindent' alone must still outdent a lone closing brace by one shiftwidth"
+    );
+}
+
+#[test]
+fn test_smartindent_hash_moves_to_column_zero() {
+    let mut e = engine_with_lang("    \n", "c");
+    e.settings.auto_indent = false;
+    e.settings.smartindent = true;
+    e.start_undo_group();
+    e.mode = Mode::Insert;
+    e.view_mut().cursor.line = 0;
+    e.view_mut().cursor.col = 4;
+    e.handle_key("#", Some('#'), false);
+    let line_text: String = e.buffer().content.line(0).chars().collect();
+    assert_eq!(line_text.trim_end_matches(['\n', '\r']), "#");
+    assert_eq!(e.get_line_indent_str(0).len(), 0);
+}
+
+#[test]
+fn test_cindent_hash_moves_to_column_zero() {
+    let mut e = engine_with_lang("    \n", "c");
+    e.settings.auto_indent = false;
+    e.settings.cindent = true;
+    e.start_undo_group();
+    e.mode = Mode::Insert;
+    e.view_mut().cursor.line = 0;
+    e.view_mut().cursor.col = 4;
+    e.handle_key("#", Some('#'), false);
+    let line_text: String = e.buffer().content.line(0).chars().collect();
+    assert_eq!(line_text.trim_end_matches(['\n', '\r']), "#");
+    assert_eq!(e.get_line_indent_str(0).len(), 0);
+}
+
+#[test]
+fn test_hash_is_untouched_without_smartindent_or_cindent() {
+    // Plain 'autoindent' (neither 'smartindent' nor 'cindent') must NOT
+    // move a typed '#' to column 0 — real Vim's preprocessor special case
+    // belongs to 'smartindent'/'cindent' only.
+    let mut e = engine_with_lang("    \n", "c");
+    e.settings.auto_indent = true;
+    e.settings.smartindent = false;
+    e.settings.cindent = false;
+    e.start_undo_group();
+    e.mode = Mode::Insert;
+    e.view_mut().cursor.line = 0;
+    e.view_mut().cursor.col = 4;
+    e.handle_key("#", Some('#'), false);
+    assert_eq!(e.get_line_indent_str(0).len(), 4);
+}
+
+#[test]
+fn test_showmatch_flashes_matching_open_paren() {
+    let mut e = Engine::new();
+    e.settings.showmatch = true;
+    e.buffer_mut().insert(0, "(foo");
+    e.start_undo_group();
+    e.mode = Mode::Insert;
+    e.view_mut().cursor.line = 0;
+    e.view_mut().cursor.col = 4;
+    e.handle_key(")", Some(')'), false);
+    assert_eq!(e.buffer().to_string(), "(foo)");
+    // Cursor must land right after the typed ')', never at the match.
+    assert_eq!(e.view().cursor.col, 5);
+    assert_eq!(
+        e.showmatch_flash,
+        Some((0, 0)),
+        "flash must record the opening paren's (line, col)"
+    );
+}
+
+#[test]
+fn test_showmatch_flash_clears_on_the_next_key() {
+    let mut e = Engine::new();
+    e.settings.showmatch = true;
+    e.buffer_mut().insert(0, "(foo");
+    e.start_undo_group();
+    e.mode = Mode::Insert;
+    e.view_mut().cursor.line = 0;
+    e.view_mut().cursor.col = 4;
+    e.handle_key(")", Some(')'), false);
+    assert!(e.showmatch_flash.is_some());
+    e.handle_key("x", Some('x'), false);
+    assert_eq!(
+        e.showmatch_flash, None,
+        "the flash must end as soon as the next key arrives"
+    );
+    assert_eq!(e.buffer().to_string(), "(foo)x");
+}
+
+#[test]
+fn test_showmatch_off_by_default_never_flashes() {
+    let mut e = Engine::new();
+    assert!(!e.settings.showmatch, "'showmatch' defaults off");
+    e.buffer_mut().insert(0, "(foo");
+    e.start_undo_group();
+    e.mode = Mode::Insert;
+    e.view_mut().cursor.line = 0;
+    e.view_mut().cursor.col = 4;
+    e.handle_key(")", Some(')'), false);
+    assert_eq!(e.showmatch_flash, None);
+}
+
+#[test]
+fn test_showmatch_with_no_match_does_not_flash() {
+    let mut e = Engine::new();
+    e.settings.showmatch = true;
+    e.buffer_mut().insert(0, "foo");
+    e.start_undo_group();
+    e.mode = Mode::Insert;
+    e.view_mut().cursor.line = 0;
+    e.view_mut().cursor.col = 3;
+    e.handle_key(")", Some(')'), false);
+    assert_eq!(e.showmatch_flash, None);
+}
+
 #[test]
 fn test_auto_indent_equals_operator_with_brace() {
     let mut e = engine_with_lang("fn main() {\nlet x = 1;\n}\n", "rs");
@@ -29590,12 +29799,12 @@ fn test_1153_unimplemented_recognised_option_is_not_unknown_option() {
     // unrecognised typo (`Unknown option`) — it gets a distinct
     // "recognised but not implemented" rejection instead.
     //
-    // #1190 implemented 'hidden' (this test's original example) — 'magic'
-    // is still in `UNIMPLEMENTED_BOOL_OPTIONS`, see that issue's table for
-    // the remaining rows.
+    // #1190 implemented 'hidden' (this test's original example), #1207
+    // implemented 'magic' (this test's second example) — 'clipboard' is
+    // the sole remaining entry, in `UNIMPLEMENTED_VALUE_OPTIONS`.
     let mut engine = Engine::new();
-    let result = engine.settings.parse_set_option("magic");
-    let err = result.expect_err("magic is not yet implemented");
+    let result = engine.settings.parse_set_option("clipboard=unnamed");
+    let err = result.expect_err("clipboard is not yet implemented");
     assert!(
         err.contains("recognised but not implemented"),
         "unexpected message: {err}"
