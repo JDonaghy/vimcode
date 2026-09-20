@@ -7021,6 +7021,60 @@ impl SidebarBodyGeometry {
     }
 }
 
+/// Resolve `pos` (absolute, same units the panel was last painted with) to
+/// a flat row index into the plugin panel's tree, or `None` when the point
+/// is outside the painted body, on the chrome above it, or past the last
+/// row (`TreeViewHit::Empty`).
+///
+/// Reads `Engine::ext_panel_tree_layout` — the `Backend::tree_layout` cached
+/// by whichever paint arm ran this frame — rather than re-deriving row
+/// geometry from a uniform `row_h`; see that field's own doc for why
+/// (#1089).
+pub fn ext_panel_hit_flat_index(engine: &Engine, pos: quadraui::Point) -> Option<usize> {
+    let cached = engine.ext_panel_tree_layout.borrow();
+    let (body_rect, layout) = cached.as_ref()?;
+    if pos.x < body_rect.x
+        || pos.x >= body_rect.x + body_rect.width
+        || pos.y < body_rect.y
+        || pos.y >= body_rect.y + body_rect.height
+    {
+        return None;
+    }
+    match layout.hit_test(pos.x - body_rect.x, pos.y - body_rect.y) {
+        quadraui::TreeViewHit::Row(i) | quadraui::TreeViewHit::Chevron(i) => Some(i),
+        quadraui::TreeViewHit::Empty => None,
+    }
+}
+
+/// Apply a press at `pos` to the plugin panel: select the row it landed on
+/// and perform the same select/toggle action a real `Enter` press (or a
+/// double-click) would. Shared by TUI's `tui_main::mouse::handle_mouse` and
+/// the cross-backend `App::try_route_sidebar_mouse_event` (GTK/macOS/Win)
+/// so the two backends' plugin-panel click geometry can't drift apart the
+/// way their *paint* geometry used to (#1089) — both derive `pos`'s
+/// resolution from [`ext_panel_hit_flat_index`], never a hand-rolled
+/// per-backend formula.
+///
+/// A no-op (selection unchanged) when `pos` doesn't land on a row, or when
+/// the resolved index is past the end of the flat row list (stale cache).
+pub fn route_ext_panel_click(engine: &mut Engine, pos: quadraui::Point, is_double_click: bool) {
+    let Some(flat_idx) = ext_panel_hit_flat_index(engine, pos) else {
+        return;
+    };
+    if flat_idx >= engine.ext_panel_flat_len() {
+        return;
+    }
+    engine.ext_panel_selected = flat_idx;
+    if is_double_click {
+        engine.handle_ext_panel_double_click();
+    } else {
+        // Single-click toggles sections/expandable items — suppressed on a
+        // double-click so the second `Down` doesn't un-toggle what the
+        // first one just toggled (#484).
+        engine.handle_ext_panel_key("Return", false, None);
+    }
+}
+
 /// Hover feedback for the sidebar — the Source Control toolbar buttons and
 /// section rows, and plugin ext-panel rows.
 ///

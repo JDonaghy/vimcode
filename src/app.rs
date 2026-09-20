@@ -3533,11 +3533,57 @@ impl App {
                     .render_and_cache(backend, q_sb);
             }
             id if id.starts_with("ext:") => {
-                // Extension panel — render via ext_sidebar_system.
-                Self::refresh_ext_sidebar_metrics(backend, engine);
-                render::populate_ext_sidebar_system(engine);
-                engine.ext_sidebar_body_rect.set(q_sb);
-                engine.ext_sidebar_system.borrow().render(backend, q_sb);
+                // #1089: a plugin-provided panel — paint its own sections +
+                // items via `render::ext_panel_to_tree_view` +
+                // `Backend::draw_tree`, the same adapter
+                // `tui_main::panels::render_ext_panel` uses, instead of
+                // falling through to `ext_sidebar_system` (the extension
+                // *marketplace* — INSTALLED/AVAILABLE — which is what this
+                // arm painted before this fix, unconditionally, for every
+                // `ext:<name>` id).
+                if let Some(ref panel) = screen.ext_panel {
+                    let input_visible = panel.input_active || !panel.input_text.is_empty();
+                    let chrome_rows: f32 = if input_visible { 2.0 } else { 1.0 };
+                    let chrome_h = (chrome_rows * lh as f32).min(q_sb.height);
+                    // Cache the whole content rect (chrome included),
+                    // verbatim — mirrors `render_ext_panel`'s own
+                    // `ext_panel_content_rect` write so a future hover/geometry
+                    // consumer can't tell which backend painted this frame.
+                    engine.ext_panel_content_rect.set(q_sb);
+                    let header_title = format!(" {}", panel.title);
+                    let chrome_area = quadraui::Rect::new(q_sb.x, q_sb.y, q_sb.width, chrome_h);
+                    backend.draw_settings_chrome(
+                        chrome_area,
+                        &header_title,
+                        &panel.input_text,
+                        "",
+                        panel.input_active,
+                    );
+
+                    let body_h = (q_sb.height - chrome_h).max(0.0);
+                    if body_h > 0.0 {
+                        let body_rect =
+                            quadraui::Rect::new(q_sb.x, q_sb.y + chrome_h, q_sb.width, body_h);
+                        let tree = render::ext_panel_to_tree_view(panel, theme);
+                        backend.draw_tree(body_rect, &tree);
+                        // #1089: cache the exact `Backend::tree_layout` this
+                        // frame painted with — the click router
+                        // (`render::route_ext_panel_click`, shared with TUI's
+                        // `mouse::handle_mouse`) reads this instead of
+                        // re-deriving row geometry from a uniform row height.
+                        // See `Engine::ext_panel_tree_layout`'s own doc for why
+                        // that matters here: this backend pitches a tree's
+                        // header rows shorter than its item rows.
+                        let tree_layout = backend.tree_layout(body_rect, &tree);
+                        engine
+                            .ext_panel_tree_layout
+                            .replace(Some((body_rect, tree_layout)));
+                    } else {
+                        engine.ext_panel_tree_layout.replace(None);
+                    }
+                } else {
+                    engine.ext_panel_tree_layout.replace(None);
+                }
             }
             PANEL_AI => {
                 // #819: adopts quadraui's `ChatController` — one shared
@@ -6371,14 +6417,53 @@ impl App {
                 true
             }
             render::SidebarOwner::ExtPanel(_) => {
-                // Plugin-provided panel: `render_content` paints it through the
-                // same `ext_sidebar_system` at the same rect, so it routes the
-                // same way.
+                // #1089: `render_content` now paints this panel through
+                // `render::ext_panel_to_tree_view` — the same adapter TUI
+                // uses — not `ext_sidebar_system` (the extension
+                // marketplace), so routing goes through the shared
+                // `render::route_ext_panel_click` router instead, built on
+                // the `Backend::tree_layout` cached at paint time
+                // (`Engine::ext_panel_tree_layout`) rather than a
+                // hand-rolled row formula (this backend pitches a tree's
+                // header rows shorter than its item rows — see that cache
+                // field's own doc).
                 let mut engine = self.engine.borrow_mut();
                 if is_press {
-                    engine.ext_sidebar_has_focus = true;
+                    engine.ext_panel_has_focus = true;
                 }
-                engine.handle_ext_sidebar_ui_event(event.clone());
+                match event {
+                    UiEvent::Scroll { delta, .. } => {
+                        let flat_len = engine.ext_panel_flat_len();
+                        let step = (delta.y.abs() * 3.0).round().max(1.0) as usize;
+                        if delta.y > 0.0 {
+                            // Positive y = up toward the top of the content
+                            // (quadraui's convention for an already-resolved
+                            // `UiEvent::Scroll`; see `handle_mouse_scroll_msg`'s
+                            // #554 comment on the raw-vs-quadraui polarity
+                            // split this event predates).
+                            engine.ext_panel_scroll_top =
+                                engine.ext_panel_scroll_top.saturating_sub(step);
+                        } else {
+                            engine.ext_panel_scroll_top = (engine.ext_panel_scroll_top + step)
+                                .min(flat_len.saturating_sub(1));
+                        }
+                    }
+                    UiEvent::DoubleClick { .. } => {
+                        render::route_ext_panel_click(&mut engine, pos, true);
+                    }
+                    UiEvent::MouseDown {
+                        button: quadraui::MouseButton::Left,
+                        ..
+                    } => {
+                        render::route_ext_panel_click(&mut engine, pos, false);
+                    }
+                    // Right-click context menu and mid-drag follow-through
+                    // (`MouseUp`/`MouseMoved`) aren't wired for this panel yet
+                    // — out of #1089's scope (paint + left-click selection);
+                    // still consumed below so neither leaks through to the
+                    // editor underneath.
+                    _ => {}
+                }
                 true
             }
             render::SidebarOwner::Ai => self.route_ai_sidebar_event(event, starts_interaction),

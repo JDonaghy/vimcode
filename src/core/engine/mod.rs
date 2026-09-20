@@ -4021,6 +4021,25 @@ pub struct Engine {
     /// every click one row low. Mirrors `explorer_tree_rect` /
     /// `dap_sidebar_body_rect`'s "cache what was actually painted" pattern.
     pub ext_panel_content_rect: std::cell::Cell<quadraui::Rect>,
+    /// The `Backend::tree_layout` result for the plugin panel's tree body,
+    /// paired with the body rect (chrome excluded) it was computed
+    /// against — cached by whichever paint arm ran this frame
+    /// (`tui_main::panels::render_ext_panel` or `App::
+    /// paint_sidebar_panel_rung`'s `ext:` arm) so a later click resolves
+    /// against the *exact* geometry that was painted (#1089).
+    ///
+    /// Why not extend `ext_panel_content_rect` + `SidebarBodyGeometry`'s
+    /// uniform-row-height formula instead: GTK/macOS/Win pitch a tree's
+    /// `Decoration::Header` rows at `line_height` and every other row at
+    /// `line_height * 1.4` (`quadraui::TreeStyle::row_height`'s own doc).
+    /// Every real plugin panel has more than one section, so it has no
+    /// single row height a linear formula could hit-test against on those
+    /// backends — only `Backend::tree_layout`'s own per-row bounds (the
+    /// same ones `Backend::draw_tree` painted with) resolve correctly.
+    /// `None` when nothing is currently painted (no live registration, or
+    /// the panel's body has zero height this frame).
+    pub ext_panel_tree_layout:
+        std::cell::RefCell<Option<(quadraui::Rect, quadraui::TreeViewLayout)>>,
 
     // --- Notifications (background operation progress) ---
     /// Active notifications (spinner/bell indicators in status bar).
@@ -4668,6 +4687,7 @@ impl Engine {
             ext_panel_help_open: false,
             ext_panel_help_bindings: HashMap::new(),
             ext_panel_content_rect: std::cell::Cell::new(quadraui::Rect::new(0.0, 0.0, 0.0, 0.0)),
+            ext_panel_tree_layout: std::cell::RefCell::new(None),
             notifications: Vec::new(),
             next_notification_id: 1,
             toasts: Vec::new(),

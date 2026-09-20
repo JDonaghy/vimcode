@@ -1916,42 +1916,22 @@ pub(super) fn handle_mouse(
             sidebar.has_focus = true;
             engine.ext_panel_has_focus = true;
 
-            // Account for the search input row when it's visible — this is
-            // panel-specific chrome (`render_ext_panel`'s own `chrome_h`),
-            // separate from `AppShellLayout`'s own sidebar header row, which
-            // `geometry.bounds` below already excludes.
-            let input_rows: u16 = if engine.ext_panel_input_active
-                || engine
-                    .ext_panel_active
-                    .as_ref()
-                    .and_then(|n| engine.ext_panel_input_text.get(n))
-                    .map(|t| !t.is_empty())
-                    .unwrap_or(false)
-            {
-                1
-            } else {
-                0
-            };
-
-            // #1086: derive the content-row index from the rect
-            // `render_ext_panel` actually painted into last frame
-            // (`ext_panel_content_rect`, cached from `AppShellLayout::
-            // sidebar_content_bounds`) via the shared `SidebarBodyGeometry`,
-            // instead of hand-rolling `sidebar_row - content_start` from
-            // `menu_rows`. That hand-rolled math never budgeted for
-            // `AppShellLayout`'s own one-row sidebar header *above*
-            // `sidebar_content_bounds` — it landed every click exactly one
-            // row low (`content_start` was short by that header row,
-            // independent of the menu bar or scroll position). `content_row`
-            // returns `None` for both that header row and this panel's own
-            // header/search chrome (`header_rows` below), so both stay a
-            // no-op without a magic `sidebar_row == 0` special case.
-            let geometry = render::SidebarBodyGeometry {
-                bounds: engine.ext_panel_content_rect.get(),
-                row_h: 1.0,
-                header_rows: (1 + input_rows) as f32,
-            };
-            let content_row = geometry.content_row(row as f32);
+            // #1089: row resolution goes through `render::
+            // ext_panel_hit_flat_index`/`route_ext_panel_click` — the same
+            // shared router `App::try_route_sidebar_mouse_event`
+            // (GTK/macOS/Win) uses — which reads the `Backend::tree_layout`
+            // `render_ext_panel` cached this frame
+            // (`Engine::ext_panel_tree_layout`) instead of a hand-rolled
+            // `sidebar_row - content_start` formula. That formula never
+            // budgeted for `AppShellLayout`'s own one-row sidebar header
+            // *above* `sidebar_content_bounds` (#1086's own fix) and, more
+            // fundamentally, assumed one uniform row height — wrong the
+            // moment a pixel backend pitches section headers shorter than
+            // item rows (see `ext_panel_tree_layout`'s own doc). Both
+            // out-of-bounds cases (the sidebar header row above the panel,
+            // and this panel's own header/search chrome) resolve to `None`
+            // without a magic `sidebar_row == 0` special case.
+            let click_pos = quadraui::Point::new(col as f32, row as f32);
 
             // Right-click fires panel_context_menu event.
             // #451: accept Up(Right) too (Alacritty/crossterm-0.28 only sends Up).
@@ -1959,10 +1939,8 @@ pub(super) fn handle_mouse(
                 ev.kind,
                 MouseEventKind::Down(MouseButton::Right) | MouseEventKind::Up(MouseButton::Right)
             ) {
-                if let Some(item_row) = content_row {
-                    let flat_idx = engine.ext_panel_scroll_top + item_row;
-                    let flat_len = engine.ext_panel_flat_len();
-                    if flat_idx < flat_len {
+                if let Some(flat_idx) = render::ext_panel_hit_flat_index(engine, click_pos) {
+                    if flat_idx < engine.ext_panel_flat_len() {
                         engine.ext_panel_selected = flat_idx;
                     }
                 }
@@ -1970,28 +1948,9 @@ pub(super) fn handle_mouse(
                 return sidebar_width;
             }
 
-            let flat_len = engine.ext_panel_flat_len();
-
-            if let Some(item_row) = content_row {
-                let flat_idx = engine.ext_panel_scroll_top + item_row;
-                if flat_idx < flat_len {
-                    engine.ext_panel_selected = flat_idx;
-                    // #817: double-click verdict from the backend's
-                    // `DoubleClickDetector`, not a re-derived local timer.
-                    let is_double = is_double_click;
-                    if is_double {
-                        engine.handle_ext_panel_double_click();
-                    } else {
-                        // Single-click toggles sections/expandable items.
-                        // Suppressed on double-click so the second Down doesn't
-                        // un-toggle what the first one just toggled (#484).
-                        engine.handle_ext_panel_key("Return", false, None);
-                    }
-                }
-            }
-            // `content_row == None`: outside the content rect entirely, on
-            // `AppShellLayout`'s sidebar header row, or on this panel's own
-            // header/search chrome — no-op either way.
+            // #817: double-click verdict from the backend's
+            // `DoubleClickDetector`, not a re-derived local timer.
+            render::route_ext_panel_click(engine, click_pos, is_double_click);
         } else if owner == render::SidebarOwner::Explorer {
             sidebar.has_focus = true;
             engine.explorer_has_focus = true;
