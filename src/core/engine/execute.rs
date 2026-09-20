@@ -1857,6 +1857,11 @@ impl Engine {
             return action;
         }
 
+        // `:undolist`, `:earlier`, `:later`, `:undojoin` (#1156).
+        if let Some(action) = self.try_execute_undo_command(cmd) {
+            return action;
+        }
+
         // `[range]s/pattern/replacement/flags`, `:&`, `:&&`, `:~`.
         if let Some(action) = self.try_execute_substitute(cmd) {
             return action;
@@ -2934,8 +2939,10 @@ impl Engine {
 
         let keys_chars: Vec<char> = keys.chars().collect();
 
-        // Save undo stack depth so we can merge all new entries into one step
-        let saved_undo_len = self.active_buffer_state_mut().undo_stack.len();
+        // Save the undo-tree position so all the per-line commands below can
+        // be merged into one undoable step (#1156: was a saved undo-stack
+        // *length*, since replaced with a tree `seq` mark).
+        let saved_undo_seq = self.active_buffer_state_mut().undo_seq();
 
         for line_num in start_line..=end_line {
             if line_num >= self.buffer().len_lines() {
@@ -3000,21 +3007,11 @@ impl Engine {
         }
 
         // Finalize the last open undo group (e.g. from trailing insert mode)
-        self.active_buffer_state_mut().finish_undo_group();
+        self.finish_undo_group();
 
-        // Merge all undo entries created during :norm into a single undoable step
-        let state = self.active_buffer_state_mut();
-        if state.undo_stack.len() > saved_undo_len + 1 {
-            let new_entries: Vec<UndoEntry> = state.undo_stack.drain(saved_undo_len..).collect();
-            let cursor_before = new_entries[0].cursor_before;
-            let merged_ops: Vec<_> = new_entries.into_iter().flat_map(|e| e.ops).collect();
-            if !merged_ops.is_empty() {
-                state.undo_stack.push(UndoEntry {
-                    ops: merged_ops,
-                    cursor_before,
-                });
-            }
-        }
+        // Merge all undo steps created during :norm into a single undoable step
+        self.active_buffer_state_mut()
+            .merge_undo_since(saved_undo_seq);
 
         let n = end_line.saturating_sub(start_line) + 1;
         self.message = format!("{} line{} affected", n, if n == 1 { "" } else { "s" });
@@ -3145,7 +3142,7 @@ impl Engine {
         // immediately finishes this outer group (empty, so it's discarded)
         // and starts its own, so without the merge below `u` only reverts
         // the *last* matching line, and the buffer + cursor are both wrong.
-        let saved_undo_len = self.active_buffer_state_mut().undo_stack.len();
+        let saved_undo_seq = self.active_buffer_state_mut().undo_seq();
         while idx < pending.len() {
             let line = pending[idx];
             idx += 1;
@@ -3172,23 +3169,13 @@ impl Engine {
         }
         // Finalize the last open undo group (e.g. from a trailing insert-mode
         // sub-command).
-        self.active_buffer_state_mut().finish_undo_group();
+        self.finish_undo_group();
 
-        // Merge every undo entry created by the sub-commands above into a
+        // Merge every undo step created by the sub-commands above into a
         // single step, so `u` reverts all of `:g`'s edits at once and lands
         // on the position of the *first* one (#886).
-        let state = self.active_buffer_state_mut();
-        if state.undo_stack.len() > saved_undo_len + 1 {
-            let new_entries: Vec<UndoEntry> = state.undo_stack.drain(saved_undo_len..).collect();
-            let cursor_before = new_entries[0].cursor_before;
-            let merged_ops: Vec<_> = new_entries.into_iter().flat_map(|e| e.ops).collect();
-            if !merged_ops.is_empty() {
-                state.undo_stack.push(UndoEntry {
-                    ops: merged_ops,
-                    cursor_before,
-                });
-            }
-        }
+        self.active_buffer_state_mut()
+            .merge_undo_since(saved_undo_seq);
 
         let max_line = self.buffer().len_lines().saturating_sub(1);
         if self.view().cursor.line > max_line {
@@ -3202,6 +3189,82 @@ impl Engine {
             if executed == 1 { "" } else { "s" }
         );
         EngineAction::None
+    }
+
+    /// `:undolist`, `:earlier {count}`/`:earlier {N}[smhd]`, `:later
+    /// {count}`/`:later {N}[smhd]`, `:undojoin` (#1156). Returns `None` when
+    /// `cmd` doesn't name one of these, so the caller falls through to the
+    /// rest of `execute_command`'s dispatch.
+    pub(crate) fn try_execute_undo_command(&mut self, cmd: &str) -> Option<EngineAction> {
+        let (name, args) = split_ex_name(cmd);
+        match name {
+            "undolist" => Some(self.ex_undolist()),
+            "earlier" => Some(match self.ex_earlier(args) {
+                Ok(()) => EngineAction::None,
+                Err(e) => {
+                    self.message = e;
+                    EngineAction::Error
+                }
+            }),
+            "later" => Some(match self.ex_later(args) {
+                Ok(()) => EngineAction::None,
+                Err(e) => {
+                    self.message = e;
+                    EngineAction::Error
+                }
+            }),
+            "undojoin" => Some(self.ex_undojoin()),
+            _ => None,
+        }
+    }
+
+    /// `:undolist` (#1156): list every live undo-tree node in chronological
+    /// (`seq`) order — the same order `g-`/`g+`/`:earlier`/`:later` walk —
+    /// marking the buffer's current position with `>`, like Vim's `:h
+    /// :undolist` (columns simplified: Vim's `changes` count is the number
+    /// of *lines* touched, which vimcode doesn't track per-node, so this
+    /// shows the `seq` twice — once as the undo number, once standing in for
+    /// "how many edits deep" — rather than fabricate a lines-changed count).
+    fn ex_undolist(&mut self) -> EngineAction {
+        let bs = self.active_buffer_state();
+        let current_seq = bs.undo_tree.current_seq();
+        let nodes = bs.undo_tree.live_nodes_for_listing();
+        let now = std::time::SystemTime::now();
+        let mut lines = vec!["    number  changes  seconds ago".to_string()];
+        for n in nodes {
+            if n.seq == 0 {
+                continue; // root: the pre-edit state, Vim's :undolist omits it too
+            }
+            let marker = if n.seq == current_seq { ">" } else { " " };
+            let secs_ago = now
+                .duration_since(n.timestamp)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            lines.push(format!(
+                "{marker}   {:4}  {:7}  {:4}",
+                n.seq, n.seq, secs_ago
+            ));
+        }
+        self.message = lines.join("\n");
+        EngineAction::None
+    }
+
+    /// `:undojoin` (#1156): fold the *next* committed undo group back into
+    /// whatever undo step precedes it, so undoing after that next change
+    /// reverts both together as one `u`. Errors like Vim's `E790` if
+    /// there's no previous change to join with (a fresh buffer, or already
+    /// at the oldest undo state).
+    fn ex_undojoin(&mut self) -> EngineAction {
+        match self.active_buffer_state().undo_parent_seq() {
+            Some(mark) => {
+                self.pending_undojoin = Some(mark);
+                EngineAction::None
+            }
+            None => {
+                self.message = "E790: undojoin is not allowed after undo".to_string();
+                EngineAction::Error
+            }
+        }
     }
 
     /// `:[range]fold`, `:foldo[pen][!] [range]`, `:foldc[lose][!] [range]`,
@@ -3282,7 +3345,7 @@ impl Engine {
         let mut idx = 0usize;
         // See `execute_global_command`'s matching comment (#886): `:folddo*`
         // is one undoable step however many lines it touches.
-        let saved_undo_len = self.active_buffer_state_mut().undo_stack.len();
+        let saved_undo_seq = self.active_buffer_state_mut().undo_seq();
         while idx < pending.len() {
             let line = pending[idx];
             idx += 1;
@@ -3307,19 +3370,9 @@ impl Engine {
                 }
             }
         }
-        self.active_buffer_state_mut().finish_undo_group();
-        let state = self.active_buffer_state_mut();
-        if state.undo_stack.len() > saved_undo_len + 1 {
-            let new_entries: Vec<UndoEntry> = state.undo_stack.drain(saved_undo_len..).collect();
-            let cursor_before = new_entries[0].cursor_before;
-            let merged_ops: Vec<_> = new_entries.into_iter().flat_map(|e| e.ops).collect();
-            if !merged_ops.is_empty() {
-                state.undo_stack.push(UndoEntry {
-                    ops: merged_ops,
-                    cursor_before,
-                });
-            }
-        }
+        self.finish_undo_group();
+        self.active_buffer_state_mut()
+            .merge_undo_since(saved_undo_seq);
 
         let max_line = self.buffer().len_lines().saturating_sub(1);
         if self.view().cursor.line > max_line {

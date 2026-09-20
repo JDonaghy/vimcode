@@ -1,7 +1,7 @@
-# src/core/engine/execute.rs — 6,416 lines
+# src/core/engine/execute.rs — 6,670 lines
 
 Ex-command dispatcher. Parses and executes all `:` commands entered in command mode.
-(Line count last verified 2026-09-19, #1155 — earlier counts in this file predate
+(Line count last verified 2026-09-20, #1156 — earlier counts in this file predate
 several unrelated sessions' worth of growth, not just this one.)
 
 ## Key Methods
@@ -17,4 +17,5 @@ several unrelated sessions' worth of growth, not just this one.)
 - `run_search()`, `search_next()`, `search_prev()`, `submit_search(raw, count)` — `/` and `?`, with `:h search-offset` support
 - `splice_buffer_text(new_text)` — replace the buffer's text as one undo step, touching only the differing region
 - `ex_copy_move(start, end, dest, is_move)` — shared `:t` / `:co` / `:m`
+- `try_execute_undo_command(cmd)` (#1156) — `:undolist`, `:earlier`/`:later` (count or `{N}[smhd]`, delegates to `engine::buffers::ex_earlier`/`ex_later`), `:undojoin`
 - Falls through to plugin command dispatch if no built-in match

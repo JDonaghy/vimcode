@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 use super::ai::AiMessage;
 use super::buffer::{Buffer, BufferId};
-use super::buffer_manager::{BufferManager, BufferState, UndoEntry};
+use super::buffer_manager::{BufferManager, BufferState};
 use super::comment;
 use super::dap::{BreakpointInfo, DapEvent, DapVariable, StackFrame};
 use super::dap_manager::{
@@ -305,6 +305,7 @@ static EX_ABBREVS: &[(&str, usize)] = &[
     ("delmarks", 4),
     ("digraphs", 3),
     ("display", 2),
+    ("earlier", 2),
     ("echo", 2),
     ("edit", 1),
     ("enew", 3),
@@ -317,6 +318,7 @@ static EX_ABBREVS: &[(&str, usize)] = &[
     ("inoreabbrev", 6),
     ("join", 1),
     ("jumps", 2),
+    ("later", 3),
     ("lclose", 3),
     ("ldo", 3),
     ("lfdo", 4),
@@ -361,6 +363,8 @@ static EX_ABBREVS: &[(&str, usize)] = &[
     ("terminal", 2),
     ("unabbreviate", 3),
     ("undo", 1),
+    ("undojoin", 5),
+    ("undolist", 5),
     ("update", 2),
     ("version", 2),
     ("vimgrep", 3),
@@ -3707,6 +3711,13 @@ pub struct Engine {
     /// Last executed ex command (for @: repeat).
     pub last_ex_command: Option<String>,
 
+    /// Set by `:undojoin` (#1156): the undo-tree `seq` to fold the *next*
+    /// committed undo group back into, so the change `:undojoin` precedes
+    /// and the one that follows it undo as a single `u`. Consumed (cleared)
+    /// by the next `Engine::finish_undo_group` call, whether or not it
+    /// actually commits anything.
+    pub pending_undojoin: Option<usize>,
+
     // --- Last substitute (&) ---
     /// Last substitute (pattern, replacement, flags) for & repeat.
     pub last_substitute: Option<(String, String, String)>,
@@ -4610,6 +4621,7 @@ impl Engine {
             change_list_pos: 0,
             last_inserted_text: String::new(),
             last_ex_command: None,
+            pending_undojoin: None,
             last_substitute: None,
             last_sub_replacement: String::new(),
             yank_highlight: None,
@@ -4780,6 +4792,13 @@ impl Engine {
         // is opened via restore_session_files / CLI args, so huge buffers
         // skip the expensive initial tree-sitter parse.
         crate::core::buffer_manager::set_syntax_max_lines(engine.settings.syntax_max_lines);
+        // Sync undo-tree settings (#1156) the same way, before any file is
+        // opened: `undolevels` bounds tree growth on every commit,
+        // `undofile`/`undodir` decide whether/where a freshly-opened file's
+        // undo history gets loaded from.
+        crate::core::buffer_manager::set_undo_levels(engine.settings.undolevels);
+        crate::core::undofile::set_enabled(engine.settings.undofile);
+        crate::core::undofile::set_dir(&engine.settings.undodir);
         engine.explorer_rebuild_rows();
         // Record the startup position for `seed_jump_list_if_line_left` —
         // see that function's doc comment (#806).

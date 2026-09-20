@@ -1,4 +1,4 @@
-# src/core/engine/buffers.rs — 3,244 lines
+# src/core/engine/buffers.rs — 4,023 lines
 
 File I/O, buffer management, syntax updates, undo/redo, git diff, markdown preview, netrw directory browser, and workspace operations.
 
@@ -15,10 +15,13 @@ File I/O, buffer management, syntax updates, undo/redo, git diff, markdown previ
 - `refresh_git_diff()` — update git line status markers
 - `tick_syntax_debounce()` — debounced syntax refresh (150ms)
 
-## Undo/Redo
-- `undo()` / `redo()` — undo/redo operations
-- `start_undo_group()` / `finish_undo_group()` — group edits for atomic undo
-- `record_edit(line, old, new)` — record edit for undo history
+## Undo/Redo (#1156: real undo tree, not a linear stack — see `buffer_manager::UndoTree`)
+- `undo()` / `redo()` — undo/redo, thin wrappers over `BufferState::undo`/`redo`
+- `start_undo_group()` / `start_undo_group_at(cursor)` / `finish_undo_group()` — group edits into one undo-tree node
+- `g_earlier()` / `g_later()` — `g-`/`g+`, cross branches (unlike plain `u`/`<C-r>`)
+- `ex_earlier(spec)` / `ex_later(spec)` — `:earlier`/`:later`, count or `{N}[smhd]` time offset
+- `report_undo_nav(cursor, label)` — shared side effects (cursor/dirty/message) for every undo-tree jump
+- `parse_undo_time_spec(spec)` (free fn) — parses `{N}[smhd]` into a `SystemTime` cutoff
 
 ## Navigation
 - `switch_buffer(id)` — switch active window to buffer

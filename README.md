@@ -796,6 +796,9 @@ Runtime changes are written through to `~/.config/vimcode/settings.json` immedia
 | `spell` / `nospell` | | off | Enable spell checking (wavy underline on misspelled words) |
 | `spelllang=XX` | | `en_US` | Spell check language (currently only `en_US` is bundled) |
 | `syntax_max_lines=N` | `syntaxmaxlines` | 20000 | Skip tree-sitter highlighting for buffers over N lines (plain text for huge generated files) |
+| `undolevels=N` | `ul` | 1000 | Maximum undo-tree states kept per buffer, across every branch |
+| `undofile` / `noundofile` | `udf` | off | Persist each buffer's undo tree to disk so it survives closing and reopening the file |
+| `undodir=PATH` | `udir` | `~/.config/vimcode/undo/` | Directory undofiles are written to when `undofile` is on |
 | `explorersortcaseinsensitive` / `noexplorersortcaseinsensitive` | `esci` | on | Case-insensitive sorting in the file explorer |
 | `mode=vim` / `mode=vscode` | | vim | Editor mode (see **VSCode Mode** below) |
 
@@ -1018,7 +1021,7 @@ Full editor in the terminal via ratatui + crossterm — feature-parity with the 
 | `gD` | Diff peek — preview hunk popup with Revert/Stage |
 | `gh` | Editor hover popup — aggregates diagnostics, annotations, plugin content, and LSP hover at cursor; `y`/Ctrl-C copies selected text (or all text if no selection); mouse drag to select |
 | `gR` | Enter virtual replace mode (expands tabs to spaces when overwriting) |
-| `g+` / `g-` | Go to newer / older text state (chronological undo timeline) |
+| `g+` / `g-` | Go to newer / older text state — real undo-tree navigation, crosses into a branch `u` + a new edit left behind (`:earlier`/`:later`/`:undolist`/`:undojoin` cover the ex-command side) |
 | `K` | Show hover info (LSP) |
 | `]c` / `[c` | Next / previous change (works on real files + diff buffers) |
 | `]d` / `[d` | Next / previous diagnostic (LSP) |
@@ -1145,6 +1148,10 @@ All ex commands support Vim-style abbreviations (e.g., `:j` for `:join`, `:y` fo
 | `:jumps` | Display jump list |
 | `:changes` | Display change list |
 | `:history` | Display command history |
+| `:undolist` | List every live undo-tree state, across branches |
+| `:earlier {count}` / `:earlier {N}[smhd]` | Move to an earlier undo state by step count or time offset |
+| `:later {count}` / `:later {N}[smhd]` | Move to a later undo state by step count or time offset |
+| `:undojoin` | Fold the next change into the previous undo step |
 | `:make [args]` | Run `make` with optional arguments |
 | `:b {name}` | Switch to buffer matching partial file name |
 | `:!{cmd}` | Execute shell command and show output |

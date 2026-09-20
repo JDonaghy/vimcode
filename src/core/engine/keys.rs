@@ -468,7 +468,7 @@ impl Engine {
         // established, DRY source of truth for that question in this codebase
         // (see `BufferState::has_unsaved_changes`), and unlike `changed` it
         // can't be missed by a handler that forgets to set the out-param.
-        let dot_pre_undo_len = self.active_buffer_state().undo_stack.len();
+        let dot_pre_undo_len = self.active_buffer_state().undo_commit_count();
 
         // A count typed immediately before this `.` (the "2" of "2.") was
         // buffered into `dot_scratch` as a *pending* count-prefix — by
@@ -620,7 +620,8 @@ impl Engine {
                 // or every later command would be dropped from the candidate.
                 self.dot_skip_command = false;
             } else {
-                let dot_did_change = self.active_buffer_state().undo_stack.len() > dot_pre_undo_len;
+                let dot_did_change =
+                    self.active_buffer_state().undo_commit_count() != dot_pre_undo_len;
                 self.record_dot_keystroke(key_name, unicode, ctrl, dot_was_neutral, dot_did_change);
             }
         }
@@ -9093,9 +9094,9 @@ impl Engine {
         }
         replay.push_str(&keys);
 
-        let pre_undo_len = self.active_buffer_state().undo_stack.len();
+        let pre_undo_len = self.active_buffer_state().undo_commit_count();
         self.replay_dot_keys(&replay);
-        *changed = self.active_buffer_state().undo_stack.len() > pre_undo_len;
+        *changed = self.active_buffer_state().undo_commit_count() != pre_undo_len;
     }
 
     /// `:h redo-register`: `"1p . .` pastes register 1, then 2, then 3, …

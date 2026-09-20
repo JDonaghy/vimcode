@@ -4092,6 +4092,48 @@ const CASES_EX: &[Case] = &[
         1,
         "ma:delm a<CR>",
     ),
+    // #1156: undo tree ex-commands (`:undolist`/`:earlier`/`:later`/`:undojoin`).
+    c(
+        "ex:undolist is a no-op on the buffer",
+        &["abc"],
+        1,
+        1,
+        "x:undolist<CR>",
+    ),
+    c(
+        "ex:earlier 1 undoes one step",
+        &["abc"],
+        1,
+        1,
+        "x:earlier 1<CR>",
+    ),
+    c(
+        "ex:earlier then later round-trips",
+        &["abc"],
+        1,
+        1,
+        "x:earlier 1<CR>:later 1<CR>",
+    ),
+    // `:undojoin` typed interactively (through Command-line mode, which
+    // redraws on <CR> back to Normal) is documented by Vim itself as
+    // "fragile" and meant only for script/function use, not interactive
+    // typing (`:h :undojoin`) — confirmed empirically against this
+    // repo's own oracle transport (`nvim_input`, one key at a time, which
+    // *does* redraw between keys, unlike a bulk `nvim_feedkeys` burst):
+    // "x:undojoin<CR>xu" does NOT merge in real Neovim typed this way, so
+    // it is not a stable cross-oracle case. `:undojoin`'s one reliably
+    // deterministic, non-fragile behavior is `E790` when there is no
+    // previous change to join with — that's what this case probes; the
+    // *merging* behavior is covered self-referentially (not against nvim)
+    // by `test_undojoin_merges_next_change_into_previous_undo_step` in
+    // `src/core/engine/tests.rs`.
+    c(
+        "ex:undojoin with no previous change errors, doesn't touch the buffer",
+        &["abc"],
+        1,
+        1,
+        ":undojoin<CR>",
+    ),
     // `:startinsert` differentially matters (unlike the no-ops above): typed
     // text after it only lands as literal insertion if the command actually
     // entered Insert mode. Before #1154 `:startinsert` fell through to the
@@ -8276,6 +8318,11 @@ const COMMAND_PROBES: &[CommandProbe] = &[
     p("ex::digraphs", Keys(":digraphs")),
     p("ex::changes", Keys(":changes")),
     p("ex::history", Keys(":history")),
+    // #1156 — undo tree ex-commands.
+    p("ex::undolist", Keys(":undolist")),
+    p("ex::earlier", Keys(":earlier")),
+    p("ex::later", Keys(":later")),
+    p("ex::undojoin", Keys(":undojoin")),
     p("ex::echo {text}", Keys(":echo")),
     p("ex::pwd", Keys(":pwd")),
     p("ex::file", Keys(":file")),

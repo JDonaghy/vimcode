@@ -97,15 +97,26 @@ Lua 5.4 plugin manager (mlua 0.9).
 - `call_command(name, args, ctx)` / `call_event(event, ctx)` / `call_keymap(mode, key, ctx)` — dispatch
 - `setup_vimcode_api(lua)` — register `vimcode.*` Lua globals
 
-## buffer_manager.rs — 908 lines
+## buffer_manager.rs — 1,571 lines
 Buffer storage and management.
 ### Types
 - `BufferManager` — `HashMap<BufferId, BufferState>` wrapper
-- `BufferState` — buffer content (Ropey rope), file path, dirty flag, syntax tree, undo/redo stacks, git diff, semantic tokens, diff label
+- `BufferState` — buffer content (Ropey rope), file path, dirty flag, syntax tree, undo tree, git diff, semantic tokens, diff label
 - `Buffer` — Ropey rope wrapper with line/char accessors
+- `UndoTree` / `UndoNode` (#1156) — a buffer's full undo history as a tree (not a stack): every edit is a child of the node you were on, so `u` + a new edit starts a branch instead of discarding the old one. Each node stores the *full* post-edit buffer text (like the old `undo_timeline` did) rather than a diff, so jumping to any node — including across branches — is just "copy the text". `seq`-ordered traversal (`older`/`newer`/`at_or_before`/`at_or_after`) backs `g-`/`g+`/`:earlier`/`:later`; `merge_since` backs `:undojoin` and the `:g`/`:normal {range}`/`:folddo*` "these sub-edits are one undo step" merge
 ### Key Functions
 - `BufferManager::create(path)` / `get(id)` / `get_mut(id)` / `remove(id)`
 - `BufferState::from_text(text)` / `from_file(path)` — buffer creation
+- `BufferState::start_undo_group(cursor)` / `record_insert`/`record_delete` / `finish_undo_group(cursor_after)` — accumulate then commit one undo-tree node
+- `BufferState::undo()` / `redo()` / `undo_older()` (`g-`) / `undo_newer()` (`g+`) / `undo_at_or_before(time)` / `undo_at_or_after(time)` (`:earlier`/`:later`) / `undo_position()` (`:undolist`'s `#N/M`) / `merge_undo_since(mark)` (`:undojoin`)
+- `set_undo_levels(n)` / `undo_levels()` — process-wide `'undolevels'` atomic, same pattern as `set_syntax_max_lines`
+
+## undofile.rs — 187 lines (#1156)
+`'undofile'`/`'undodir'` persistence: saves a buffer's `UndoTree` next to its saves, mirroring `swap.rs`'s directory-and-hash convention for where a per-file sidecar lives. Pretty-JSON with a version header; a version mismatch or content that doesn't match what's on disk is discarded rather than loaded.
+### Key Functions
+- `set_enabled(bool)` / `enabled()` / `set_dir(&str)` / `dir()` — process-wide `'undofile'`/`'undodir'` atomics
+- `path_for(canonical_path, undodir)` — per-file undofile path (path separators mangled to `%`)
+- `write(path, tree)` / `read(path)` — atomic write (`.tmp` + rename) / parse; both no-op or return `None` under `cfg!(test)`
 
 ## syntax.rs — 1,703 lines
 Tree-sitter syntax highlighting for 20 languages. Comprehensive highlight queries with 23 capture names: keyword, keyword.control, operator, string, comment, function, function.call, method.call, type, variable, number, boolean, constant, punctuation.bracket, punctuation.delimiter, macro, attribute, lifetime, escape, module, parameter, property, field.
@@ -180,10 +191,10 @@ jq/python/node) shared by the whole ACP track; drives initialize -> session/new 
 session/prompt -> `stopReason: end_turn`, including a scripted mid-turn agent->client request
 that blocks until answered out of band.
 
-## settings.rs — 2,206 lines
+## settings.rs — 5,473 lines
 User settings with serde JSON persistence.
 ### Types
-- `Settings` — all user-configurable settings (~40 fields with serde defaults)
+- `Settings` — all user-configurable settings (~90 fields with serde defaults), including `undolevels`/`undofile`/`undodir` (#1156)
 ### Key Functions
 - `Settings::load()` — load from `~/.config/vimcode/settings.json` (returns default in tests)
 - `Settings::save()` — write settings to disk

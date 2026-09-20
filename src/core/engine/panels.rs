@@ -2041,7 +2041,10 @@ impl Engine {
             }
         }
         if let Some(state) = self.buffer_manager.get_mut(buffer_id) {
-            state.finish_undo_group();
+            // Not necessarily the active buffer/window, so there's no engine
+            // view cursor to read for "after" — reuse the same position the
+            // group started at (LSP edits don't move the caller's cursor).
+            state.finish_undo_group(cursor);
             // Clear stale semantic tokens immediately — positions are now wrong.
             state.semantic_tokens.clear();
         }
