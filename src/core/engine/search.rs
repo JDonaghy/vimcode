@@ -1261,19 +1261,19 @@ impl Engine {
         if col >= chars.len() {
             return None;
         }
-        if !Self::is_word_char(chars[col]) {
+        if !self.is_word_char(chars[col]) {
             return None;
         }
 
         // Find start of word
         let start = (0..=col)
             .rev()
-            .take_while(|&i| Self::is_word_char(chars[i]))
+            .take_while(|&i| self.is_word_char(chars[i]))
             .last()
             .unwrap_or(col);
         // Find end of word (exclusive)
         let end = (col..chars.len())
-            .take_while(|&i| Self::is_word_char(chars[i]))
+            .take_while(|&i| self.is_word_char(chars[i]))
             .last()
             .map(|i| i + 1)
             .unwrap_or(col + 1);
@@ -1295,7 +1295,7 @@ impl Engine {
         let chars: Vec<char> = line_content.chars().collect();
 
         let mut i = col;
-        while i < chars.len() && !Self::is_word_char(chars[i]) {
+        while i < chars.len() && !self.is_word_char(chars[i]) {
             i += 1;
         }
         if i >= chars.len() {
@@ -1303,11 +1303,11 @@ impl Engine {
         }
         let start = (0..=i)
             .rev()
-            .take_while(|&j| Self::is_word_char(chars[j]))
+            .take_while(|&j| self.is_word_char(chars[j]))
             .last()
             .unwrap_or(i);
         let end = (i..chars.len())
-            .take_while(|&j| Self::is_word_char(chars[j]))
+            .take_while(|&j| self.is_word_char(chars[j]))
             .last()
             .map(|j| j + 1)
             .unwrap_or(i + 1);
@@ -1417,7 +1417,7 @@ impl Engine {
         let total_lines = self.buffer().len_lines();
         for line in search_start_line..total_lines {
             let line_content: String = self.buffer().content.line(line).chars().collect();
-            if let Some(col) = Self::find_whole_word_col(&line_content, &word) {
+            if let Some(col) = self.find_whole_word_col(&line_content, &word) {
                 self.push_jump_location();
                 self.view_mut().cursor.line = line;
                 self.view_mut().cursor.col = col;
@@ -1442,7 +1442,7 @@ impl Engine {
 
     /// First whole-word (`\<word\>`) match of `word` in `line`; returns the
     /// (char) column of the match start.
-    fn find_whole_word_col(line: &str, word: &str) -> Option<usize> {
+    fn find_whole_word_col(&self, line: &str, word: &str) -> Option<usize> {
         let chars: Vec<char> = line.chars().collect();
         let wchars: Vec<char> = word.chars().collect();
         if wchars.is_empty() || chars.len() < wchars.len() {
@@ -1454,9 +1454,9 @@ impl Engine {
                     continue 'outer;
                 }
             }
-            let before_ok = start == 0 || !Self::is_word_char(chars[start - 1]);
+            let before_ok = start == 0 || !self.is_word_char(chars[start - 1]);
             let end = start + wchars.len();
-            let after_ok = end >= chars.len() || !Self::is_word_char(chars[end]);
+            let after_ok = end >= chars.len() || !self.is_word_char(chars[end]);
             if before_ok && after_ok {
                 return Some(start);
             }
@@ -1605,11 +1605,11 @@ impl Engine {
                 if opts.whole_word {
                     let before_ok = start_byte == 0 || {
                         let c = text[..start_byte].chars().last().unwrap_or(' ');
-                        !Self::is_word_char(c)
+                        !self.is_word_char(c)
                     };
                     let after_ok = end_byte >= text.len() || {
                         let c = text[end_byte..].chars().next().unwrap_or(' ');
-                        !Self::is_word_char(c)
+                        !self.is_word_char(c)
                     };
                     if !before_ok || !after_ok {
                         byte_pos = start_byte + 1;

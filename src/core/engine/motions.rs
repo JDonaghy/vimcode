@@ -14,11 +14,11 @@ impl Engine {
         }
 
         let first = self.buffer().content.char(pos);
-        if is_word_char(first) {
-            let wide = is_wide_word_char(first);
+        if self.is_word_char(first) {
+            let wide = self.is_wide_word_char(first);
             while pos < total_chars {
                 let ch = self.buffer().content.char(pos);
-                if !is_word_char(ch) || is_wide_word_char(ch) != wide {
+                if !self.is_word_char(ch) || self.is_wide_word_char(ch) != wide {
                     break;
                 }
                 pos += 1;
@@ -26,7 +26,7 @@ impl Engine {
         } else if !first.is_whitespace() {
             while pos < total_chars {
                 let ch = self.buffer().content.char(pos);
-                if is_word_char(ch) || ch.is_whitespace() {
+                if self.is_word_char(ch) || ch.is_whitespace() {
                     break;
                 }
                 pos += 1;
@@ -115,11 +115,11 @@ impl Engine {
         if ch == '\n' {
             // Landed exactly on a blank line, which Vim counts as its own
             // word — nothing more to extend backward into.
-        } else if is_word_char(ch) {
-            let wide = is_wide_word_char(ch);
+        } else if self.is_word_char(ch) {
+            let wide = self.is_wide_word_char(ch);
             while pos > 0 {
                 let prev = self.buffer().content.char(pos - 1);
-                if !is_word_char(prev) || is_wide_word_char(prev) != wide {
+                if !self.is_word_char(prev) || self.is_wide_word_char(prev) != wide {
                     break;
                 }
                 pos -= 1;
@@ -127,7 +127,7 @@ impl Engine {
         } else {
             while pos > 0 {
                 let prev = self.buffer().content.char(pos - 1);
-                if is_word_char(prev) || prev.is_whitespace() {
+                if self.is_word_char(prev) || prev.is_whitespace() {
                     break;
                 }
                 pos -= 1;
@@ -155,12 +155,12 @@ impl Engine {
         // Check if we're already at the end of a word
         let at_word_end = if pos + 1 < total_chars {
             let next_char = self.buffer().content.char(pos + 1);
-            (is_word_char(current_char)
-                && (!is_word_char(next_char)
-                    || is_wide_word_char(next_char) != is_wide_word_char(current_char)))
-                || (!is_word_char(current_char)
+            (self.is_word_char(current_char)
+                && (!self.is_word_char(next_char)
+                    || self.is_wide_word_char(next_char) != self.is_wide_word_char(current_char)))
+                || (!self.is_word_char(current_char)
                     && !current_char.is_whitespace()
-                    && (is_word_char(next_char) || next_char.is_whitespace()))
+                    && (self.is_word_char(next_char) || next_char.is_whitespace()))
         } else {
             false
         };
@@ -183,11 +183,11 @@ impl Engine {
         }
 
         let ch = self.buffer().content.char(pos);
-        if is_word_char(ch) {
-            let wide = is_wide_word_char(ch);
+        if self.is_word_char(ch) {
+            let wide = self.is_wide_word_char(ch);
             while pos + 1 < total_chars {
                 let next = self.buffer().content.char(pos + 1);
-                if !is_word_char(next) || is_wide_word_char(next) != wide {
+                if !self.is_word_char(next) || self.is_wide_word_char(next) != wide {
                     break;
                 }
                 pos += 1;
@@ -195,7 +195,7 @@ impl Engine {
         } else if !ch.is_whitespace() {
             while pos + 1 < total_chars {
                 let next = self.buffer().content.char(pos + 1);
-                if is_word_char(next) || next.is_whitespace() {
+                if self.is_word_char(next) || next.is_whitespace() {
                     break;
                 }
                 pos += 1;
@@ -222,11 +222,11 @@ impl Engine {
         // Step 1: If on a non-whitespace char, go to the start of the current word.
         // If on whitespace, just move back one to begin searching.
         if !ch.is_whitespace() {
-            if is_word_char(ch) {
-                let wide = is_wide_word_char(ch);
+            if self.is_word_char(ch) {
+                let wide = self.is_wide_word_char(ch);
                 while pos > 0 {
                     let prev = self.buffer().content.char(pos - 1);
-                    if !is_word_char(prev) || is_wide_word_char(prev) != wide {
+                    if !self.is_word_char(prev) || self.is_wide_word_char(prev) != wide {
                         break;
                     }
                     pos -= 1;
@@ -234,7 +234,7 @@ impl Engine {
             } else {
                 while pos > 0 {
                     let prev = self.buffer().content.char(pos - 1);
-                    if is_word_char(prev) || prev.is_whitespace() {
+                    if self.is_word_char(prev) || prev.is_whitespace() {
                         break;
                     }
                     pos -= 1;
@@ -1902,7 +1902,7 @@ impl Engine {
         cursor_pos: usize,
         count: usize,
     ) -> Option<(usize, usize)> {
-        self.find_word_object_classed(modifier, cursor_pos, count, char_class)
+        self.find_word_object_classed(modifier, cursor_pos, count, |c| self.char_class(c))
     }
 
     /// `iW`/`aW`: identical to [`Engine::find_word_object`] except that
@@ -1921,7 +1921,7 @@ impl Engine {
         modifier: char,
         cursor_pos: usize,
         count: usize,
-        class: fn(char) -> u8,
+        class: impl Fn(char) -> u8,
     ) -> Option<(usize, usize)> {
         let total = self.buffer().len_chars();
         if cursor_pos >= total {
@@ -3721,9 +3721,10 @@ impl Engine {
         }
     }
 
-    /// True for word characters: [a-zA-Z0-9_].
-    pub(crate) fn is_word_char(c: char) -> bool {
-        c.is_alphanumeric() || c == '_'
+    /// True for word characters per `'iskeyword'` (#1191) — drives
+    /// `w`/`b`/`e`/`ge`, `*`/`#`, and `iw`/`aw`.
+    pub(crate) fn is_word_char(&self, c: char) -> bool {
+        self.settings.is_keyword_char(c)
     }
 
     /// Walk left from cursor to find the current word prefix.
@@ -3737,7 +3738,7 @@ impl Engine {
         // on lines shorter than expected (e.g. trailing newline excluded).
         let col = col.min(chars.len());
         let mut start = col;
-        while start > 0 && Self::is_word_char(chars[start - 1]) {
+        while start > 0 && self.is_word_char(chars[start - 1]) {
             start -= 1;
         }
         let prefix: String = chars[start..col].iter().collect();
@@ -3759,9 +3760,9 @@ impl Engine {
             let len = chars.len();
             let mut i = 0usize;
             while i < len {
-                if Self::is_word_char(chars[i]) {
+                if self.is_word_char(chars[i]) {
                     let word_start = i;
-                    while i < len && Self::is_word_char(chars[i]) {
+                    while i < len && self.is_word_char(chars[i]) {
                         i += 1;
                     }
                     let word: String = chars[word_start..i].iter().collect();
@@ -3801,9 +3802,9 @@ impl Engine {
             let len = chars.len();
             let mut i = 0usize;
             while i < len {
-                if Self::is_word_char(chars[i]) {
+                if self.is_word_char(chars[i]) {
                     let start = i;
-                    while i < len && Self::is_word_char(chars[i]) {
+                    while i < len && self.is_word_char(chars[i]) {
                         i += 1;
                     }
                     let word: String = chars[start..i].iter().collect();
@@ -7036,44 +7037,56 @@ const CLASS_WORD: u8 = 2;
 const CLASS_PUNCT: u8 = 3;
 const CLASS_WIDE: u8 = 4;
 
-/// True for "wide" (double display-cell) word characters — CJK ideographs,
-/// Hiragana, Katakana, Hangul syllables and similar East-Asian-Wide
-/// alphanumerics.
-///
-/// `is_word_char` alone (Rust's `is_alphanumeric`) does not distinguish
-/// these from ASCII/Latin/Cyrillic letters, but Vim does: verified against
-/// `nvim`, `w` on `foo日本語bar` stops between `foo` and `日本語` even though
-/// nothing separates them, while `w` on `helloжworld` (Cyrillic embedded in
-/// ASCII, both narrow) does not stop there at all — the whole thing is one
-/// word. `w`/`e`/`b`/`ge` and the `iw`/`aw` text objects treat a transition
-/// between narrow-word and wide-word as a boundary the same way they treat a
-/// word/punctuation transition. (#1005)
-///
-/// Reuses `quadraui::text_util::is_wide_char` (unconditionally compiled, no
-/// feature gate) rather than re-deriving East Asian Width locally — see the
-/// Platform-Neutrality Rule in CLAUDE.md.
-pub(crate) fn is_wide_word_char(c: char) -> bool {
-    is_word_char(c) && quadraui::text_util::is_wide_char(c)
+impl Engine {
+    /// True for "wide" (double display-cell) word characters — CJK
+    /// ideographs, Hiragana, Katakana, Hangul syllables and similar
+    /// East-Asian-Wide alphanumerics.
+    ///
+    /// `is_word_char` alone (per `'iskeyword'`) does not distinguish these
+    /// from ASCII/Latin/Cyrillic letters, but Vim does: verified against
+    /// `nvim`, `w` on `foo日本語bar` stops between `foo` and `日本語` even
+    /// though nothing separates them, while `w` on `helloжworld` (Cyrillic
+    /// embedded in ASCII, both narrow) does not stop there at all — the
+    /// whole thing is one word. `w`/`e`/`b`/`ge` and the `iw`/`aw` text
+    /// objects treat a transition between narrow-word and wide-word as a
+    /// boundary the same way they treat a word/punctuation transition.
+    /// (#1005)
+    ///
+    /// Reuses `quadraui::text_util::is_wide_char` (unconditionally
+    /// compiled, no feature gate) rather than re-deriving East Asian Width
+    /// locally — see the Platform-Neutrality Rule in CLAUDE.md.
+    pub(crate) fn is_wide_word_char(&self, c: char) -> bool {
+        self.is_word_char(c) && quadraui::text_util::is_wide_char(c)
+    }
+
+    /// Small-word (`w`/`b`/`e`, `iw`/`aw`) character class — depends on
+    /// `'iskeyword'` via [`Engine::is_word_char`].
+    fn char_class(&self, c: char) -> u8 {
+        if c == '\n' {
+            CLASS_NL
+        } else if c.is_whitespace() {
+            CLASS_BLANK
+        } else if self.is_wide_word_char(c) {
+            CLASS_WIDE
+        } else if self.is_word_char(c) {
+            CLASS_WORD
+        } else {
+            CLASS_PUNCT
+        }
+    }
 }
 
-fn char_class(c: char) -> u8 {
+/// `W`/`B`/`E` (WORD) boundaries are whitespace-only (`:h WORD`) — unlike
+/// small-word [`Engine::char_class`], this does *not* depend on
+/// `'iskeyword'`, so it stays a plain free function with no `Engine`
+/// access.
+fn bigword_class(c: char) -> u8 {
     if c == '\n' {
         CLASS_NL
     } else if c.is_whitespace() {
         CLASS_BLANK
-    } else if is_wide_word_char(c) {
-        CLASS_WIDE
-    } else if is_word_char(c) {
-        CLASS_WORD
     } else {
-        CLASS_PUNCT
-    }
-}
-
-fn bigword_class(c: char) -> u8 {
-    match char_class(c) {
-        CLASS_PUNCT | CLASS_WIDE => CLASS_WORD,
-        other => other,
+        CLASS_WORD
     }
 }
 

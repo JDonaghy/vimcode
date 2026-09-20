@@ -321,6 +321,21 @@ pub struct Settings {
     #[serde(default = "default_nrformats")]
     pub nrformats: Vec<String>,
 
+    /// Characters `w`/`b`/`e`/`ge`, `*`/`#`/`g*`/`g#`, the `iw`/`aw` text
+    /// objects, and the `\k`/`\K` regex classes treat as part of a "word".
+    /// Corresponds to Vim's `'iskeyword'` / `'isk'`. Comma-separated list of
+    /// single characters, `c1-c2` character ranges, decimal character codes,
+    /// decimal code ranges, or `@` (every Unicode alphabetic character —
+    /// vim's "`@` means alphabetic for the current encoding", and vimcode is
+    /// always UTF-8); a leading `^` on an item excludes it instead of
+    /// including it. Default `"@,48-57,_,192-255"`, matching Neovim's UTF-8
+    /// default (`:h 'iskeyword'`) — every Unicode letter, digit, underscore,
+    /// and the Latin-1 supplement block. `w`/`b`/`e`/etc. are ASCII-only
+    /// before this option is consulted (#1191); this also fixes that,
+    /// because the default already includes `@`.
+    #[serde(default = "default_iskeyword")]
+    pub iskeyword: String,
+
     /// How folds are found: `"manual"` (only `zf`-created folds — nothing is
     /// closeable until the user explicitly folds a range) or `"indent"`
     /// (folds are derived from indentation and recomputed on demand).
@@ -745,6 +760,10 @@ fn default_foldmethod() -> String {
     "manual".to_string()
 }
 
+fn default_iskeyword() -> String {
+    "@,48-57,_,192-255".to_string()
+}
+
 fn default_colorscheme() -> String {
     "onedark".to_string()
 }
@@ -1155,6 +1174,7 @@ impl Default for Settings {
             joinspaces: false,
             smarttab: default_smarttab(),
             nrformats: default_nrformats(),
+            iskeyword: default_iskeyword(),
             foldmethod: default_foldmethod(),
             foldlevel: 0,
             wrapscan: default_true(),
@@ -1227,7 +1247,6 @@ const UNIMPLEMENTED_VALUE_OPTIONS: &[(&str, &str)] = &[
     ("laststatus", "ls"),
     ("sidescrolloff", "siso"),
     ("scrolljump", "sj"),
-    ("iskeyword", "isk"),
 ];
 
 /// Shared "recognised, not implemented" message for both option tables
@@ -1236,6 +1255,215 @@ const UNIMPLEMENTED_VALUE_OPTIONS: &[(&str, &str)] = &[
 /// vim option vimcode hasn't wired up yet" at a glance.
 fn not_implemented_message(opt: &str) -> String {
     format!("Option '{opt}' is recognised but not implemented yet")
+}
+
+// ── 'iskeyword' (#1191) ──────────────────────────────────────────────────
+//
+// Vim's char-list grammar, shared (per `:h 'isfname'`) by 'iskeyword',
+// 'isident', 'isprint' and 'isfname': a comma-separated list of items, each
+// either a single character, a `c1-c2` character range, a decimal character
+// code, a decimal `n1-n2` code range, or `@` ("every alphabetic character
+// for the current encoding" — vimcode is always UTF-8, so this means every
+// Unicode alphabetic `char`). A leading `^` on an item excludes it from the
+// set built so far instead of adding it. Later items win over earlier ones
+// for the same character, exactly like Vim evaluates the list in order.
+
+/// One `'iskeyword'`-list item's character-set half (include/exclude is
+/// tracked separately in [`IskeywordEntry`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IskeywordItem {
+    /// Bare `@` — every Unicode alphabetic character.
+    AllAlpha,
+    /// A single literal character.
+    Char(char),
+    /// A `c1-c2` character range (order-independent).
+    Range(char, char),
+    /// A single decimal character code.
+    Code(u32),
+    /// A decimal `n1-n2` code range (order-independent).
+    CodeRange(u32, u32),
+}
+
+#[derive(Debug, Clone, Copy)]
+struct IskeywordEntry {
+    item: IskeywordItem,
+    include: bool,
+}
+
+/// Parse one comma-separated token (after an optional leading `^`, already
+/// stripped by the caller) into an [`IskeywordItem`].
+fn parse_iskeyword_token(tok: &str) -> Result<IskeywordItem, String> {
+    if tok == "@" {
+        return Ok(IskeywordItem::AllAlpha);
+    }
+    // A range is `left-right` with a `-` that isn't the whole token (so a
+    // lone "-" is still the literal dash character, and "@-@" is the
+    // literal '@' via the char-range branch, not the bare-`@` branch above).
+    if tok.len() > 1 {
+        if let Some(dash) = tok.char_indices().skip(1).find(|&(_, c)| c == '-') {
+            let (left, right) = (&tok[..dash.0], &tok[dash.0 + 1..]);
+            if !left.is_empty() && !right.is_empty() {
+                if let (Ok(n1), Ok(n2)) = (left.parse::<u32>(), right.parse::<u32>()) {
+                    return Ok(IskeywordItem::CodeRange(n1, n2));
+                }
+                let (lchars, rchars): (Vec<char>, Vec<char>) =
+                    (left.chars().collect(), right.chars().collect());
+                if lchars.len() == 1 && rchars.len() == 1 {
+                    return Ok(IskeywordItem::Range(lchars[0], rchars[0]));
+                }
+                return Err(format!("bad range '{tok}'"));
+            }
+        }
+    }
+    if let Ok(n) = tok.parse::<u32>() {
+        return Ok(IskeywordItem::Code(n));
+    }
+    let chars: Vec<char> = tok.chars().collect();
+    if chars.len() == 1 {
+        return Ok(IskeywordItem::Char(chars[0]));
+    }
+    Err(format!("bad token '{tok}'"))
+}
+
+/// Parse a full `'iskeyword'` value into its ordered entry list. Empty
+/// tokens (e.g. a trailing comma) are skipped, matching Vim.
+fn parse_iskeyword(spec: &str) -> Result<Vec<IskeywordEntry>, String> {
+    let mut entries = Vec::new();
+    for raw in spec.split(',') {
+        let raw = raw.trim();
+        if raw.is_empty() {
+            continue;
+        }
+        let (include, tok) = match raw.strip_prefix('^') {
+            Some(rest) if !rest.is_empty() => (false, rest),
+            _ => (true, raw),
+        };
+        let item = parse_iskeyword_token(tok)?;
+        entries.push(IskeywordEntry { item, include });
+    }
+    Ok(entries)
+}
+
+/// Does `c` belong to the character class described by `entries`? Order-
+/// sensitive: later entries override earlier ones for the same character,
+/// exactly like Vim evaluates the 'iskeyword' list.
+fn iskeyword_matches(entries: &[IskeywordEntry], c: char) -> bool {
+    let cp = c as u32;
+    let mut result = false;
+    for e in entries {
+        let hit = match e.item {
+            IskeywordItem::AllAlpha => c.is_alphabetic(),
+            IskeywordItem::Char(ch) => c == ch,
+            IskeywordItem::Range(a, b) => {
+                let (lo, hi) = (a.min(b) as u32, a.max(b) as u32);
+                cp >= lo && cp <= hi
+            }
+            IskeywordItem::Code(n) => cp == n,
+            IskeywordItem::CodeRange(n1, n2) => {
+                let (lo, hi) = (n1.min(n2), n1.max(n2));
+                cp >= lo && cp <= hi
+            }
+        };
+        if hit {
+            result = e.include;
+        }
+    }
+    result
+}
+
+/// Escape `c` so it's safe as a literal inside a `[...]` Rust-regex class
+/// body (used by [`iskeyword_regex_class_body`]).
+fn push_class_char(out: &mut String, c: char) {
+    if matches!(c, '\\' | ']' | '^' | '-' | '&') {
+        out.push('\\');
+    }
+    out.push(c);
+}
+
+/// Build the `[...]`-body fragment for `\k` (`'iskeyword'`-driven, `:h
+/// /\k`) from a parsed 'iskeyword' spec.
+///
+/// Vim's real semantics are order-sensitive include/exclude
+/// ([`iskeyword_matches`]), which a single regex character class can't
+/// losslessly represent — a `-=`/`^=`-based *exclusion* is dropped here
+/// (only additive items are represented). That's exact for the default
+/// spec and every `+=`-only customization — the common case — and only
+/// under-covers `\k` relative to real word motions for an explicit
+/// exclusion. Falls back to the historical ASCII-only class if the spec is
+/// somehow unparsable (defensive — `set_value_option` already validates on
+/// write).
+fn iskeyword_regex_class_body(entries: &[IskeywordEntry]) -> String {
+    let mut body = String::new();
+    for e in entries {
+        if !e.include {
+            continue;
+        }
+        match e.item {
+            IskeywordItem::AllAlpha => body.push_str("\\p{Alphabetic}"),
+            IskeywordItem::Char(c) => push_class_char(&mut body, c),
+            IskeywordItem::Range(a, b) => {
+                push_class_char(&mut body, a);
+                body.push('-');
+                push_class_char(&mut body, b);
+            }
+            IskeywordItem::Code(n) => {
+                if let Some(c) = char::from_u32(n) {
+                    push_class_char(&mut body, c);
+                }
+            }
+            IskeywordItem::CodeRange(n1, n2) => {
+                if let (Some(a), Some(b)) = (char::from_u32(n1), char::from_u32(n2)) {
+                    push_class_char(&mut body, a);
+                    body.push('-');
+                    push_class_char(&mut body, b);
+                }
+            }
+        }
+    }
+    if body.is_empty() {
+        body.push_str("0-9A-Za-z_");
+    }
+    body
+}
+
+/// `+=`/`-=`/`^=` combine mode for a comma-separated list-style value
+/// option (`:h :set`, "List of items"). Currently only used by
+/// `'iskeyword'` (#1191) — see `parse_set_option`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ListOp {
+    Append,
+    Remove,
+    Prepend,
+}
+
+/// Apply `op` with `value` (a comma-separated list of items) to `current`
+/// (also comma-separated), returning the new combined string. Used for
+/// `:set iskeyword+=X` / `-=X` / `^=X`.
+fn combine_iskeyword_list(current: &str, value: &str, op: ListOp) -> String {
+    match op {
+        ListOp::Append => {
+            if current.is_empty() {
+                value.to_string()
+            } else {
+                format!("{current},{value}")
+            }
+        }
+        ListOp::Prepend => {
+            if current.is_empty() {
+                value.to_string()
+            } else {
+                format!("{value},{current}")
+            }
+        }
+        ListOp::Remove => {
+            let removed: Vec<&str> = value.split(',').map(|s| s.trim()).collect();
+            current
+                .split(',')
+                .filter(|tok| !removed.contains(&tok.trim()))
+                .collect::<Vec<_>>()
+                .join(",")
+        }
+    }
 }
 
 impl Settings {
@@ -1298,6 +1526,37 @@ impl Settings {
         self.virtualedit
             .split(',')
             .any(|t| t == "all" || t == "onemore")
+    }
+
+    /// Is `c` a "word" character per `'iskeyword'` (#1191)? Drives
+    /// `w`/`b`/`e`/`ge`, `*`/`#`/`g*`/`g#`, and the `iw`/`aw` text objects.
+    ///
+    /// Reparses `self.iskeyword` on every call rather than caching a parsed
+    /// form — deliberately: the spec is short (a handful of comma-separated
+    /// items) and per-call cost is dominated by matching against those few
+    /// items, not by string splitting, so a cache would trade a real
+    /// invalidation-correctness risk (stale entries after `:set
+    /// iskeyword+=...`) for a speedup on a path that isn't hot (word
+    /// motions touch tens of characters, not the whole buffer, per
+    /// keystroke). Falls back to the old ASCII+Unicode-alphanumeric default
+    /// if the stored spec is somehow unparsable (defensive only —
+    /// `set_value_option` validates on write).
+    pub(crate) fn is_keyword_char(&self, c: char) -> bool {
+        match parse_iskeyword(&self.iskeyword) {
+            Ok(entries) => iskeyword_matches(&entries, c),
+            Err(_) => c.is_alphanumeric() || c == '_',
+        }
+    }
+
+    /// The `[...]`-body fragments for `\k` / `\K` (`:h /\k`), derived from
+    /// the current `'iskeyword'`. See [`iskeyword_regex_class_body`] for the
+    /// include/exclude caveat.
+    pub(crate) fn iskeyword_regex_class_bodies(&self) -> (String, String) {
+        let entries = parse_iskeyword(&self.iskeyword).unwrap_or_default();
+        let k = iskeyword_regex_class_body(&entries);
+        // `\K` is `\k` excluding (ASCII) digits — `:h /\K`.
+        let big_k = format!("{k}&&[^0-9]");
+        (k, big_k)
     }
 
     /// Load settings from ~/.config/vimcode/settings.json
@@ -1407,10 +1666,35 @@ impl Settings {
 
         // Set a value option (contains '=').
         if let Some(eq_pos) = arg.find('=') {
-            let name = arg[..eq_pos].trim();
+            let raw_name = arg[..eq_pos].trim();
             let value = arg[eq_pos + 1..].trim();
-            self.set_value_option(name, value)?;
-            return Ok(format!("{name}={value}"));
+
+            // `+=`/`-=`/`^=` (#1191): Vim's list-option modify syntax —
+            // append, remove, or prepend a comma-separated list of items
+            // rather than replacing the whole value. Only 'iskeyword'
+            // supports it today; the other real-vim list options that take
+            // it (`listchars`, `whichwrap`, `backspace`, `clipboard`,
+            // `wildmode`) are still in `UNIMPLEMENTED_VALUE_OPTIONS` and
+            // fall through to the plain `=` path below unchanged, which
+            // reports them as recognised-but-not-implemented exactly as
+            // before.
+            for (suffix, combine) in [
+                ('+', ListOp::Append),
+                ('-', ListOp::Remove),
+                ('^', ListOp::Prepend),
+            ] {
+                if let Some(base) = raw_name.strip_suffix(suffix) {
+                    let base = base.trim();
+                    if matches!(base, "iskeyword" | "isk") {
+                        let combined = combine_iskeyword_list(&self.iskeyword, value, combine);
+                        self.set_value_option(base, &combined)?;
+                        return Ok(format!("{base}={}", self.iskeyword));
+                    }
+                }
+            }
+
+            self.set_value_option(raw_name, value)?;
+            return Ok(format!("{raw_name}={value}"));
         }
 
         // Enable a boolean option.
@@ -1771,6 +2055,20 @@ impl Settings {
                     .map_err(|_| format!("Invalid value for {name}: '{value}'"))?;
                 self.foldlevel = n;
             }
+            // #1191: validate eagerly (rather than storing an unparsable
+            // spec and only failing later, per-character, in
+            // `is_keyword_char`) so a typo'd vimrc line is rejected the way
+            // Vim rejects it, not silently downgraded to the ASCII default.
+            "iskeyword" | "isk" => {
+                parse_iskeyword(value).map_err(|e| {
+                    format!(
+                        "Invalid value for {name}: '{value}' ({e}; expected a comma-separated \
+                         list of characters, 'c1-c2' ranges, decimal codes, decimal 'n1-n2' \
+                         ranges, or '@', each optionally prefixed with '^' to exclude)"
+                    )
+                })?;
+                self.iskeyword = value.to_string();
+            }
             // #1153: see `UNIMPLEMENTED_BOOL_OPTIONS`'s doc comment — same
             // rationale, value-option side.
             _ if UNIMPLEMENTED_VALUE_OPTIONS
@@ -2004,6 +2302,7 @@ impl Settings {
             "virtualedit" | "ve" => Ok(format!("virtualedit={}", self.virtualedit)),
             "foldmethod" | "fdm" => Ok(format!("foldmethod={}", self.foldmethod)),
             "foldlevel" | "fdl" => Ok(format!("foldlevel={}", self.foldlevel)),
+            "iskeyword" | "isk" => Ok(format!("iskeyword={}", self.iskeyword)),
             // Always on — see the `set_bool_option` "wildmenu" | "wmnu" arm.
             "wildmenu" | "wmnu" => Ok("wildmenu".to_string()),
             _ if UNIMPLEMENTED_BOOL_OPTIONS
@@ -2113,6 +2412,7 @@ impl Settings {
             "joinspaces" | "js" => self.joinspaces.to_string(),
             "smarttab" | "sta" => self.smarttab.to_string(),
             "nrformats" | "nf" => self.nrformats.join(","),
+            "iskeyword" | "isk" => self.iskeyword.clone(),
             "colorcolumn" => self.colorcolumn.clone(),
             "textwidth" => self.textwidth.to_string(),
             "hlsearch" => self.hlsearch.to_string(),
@@ -2222,6 +2522,11 @@ impl Settings {
                     .map(|s| s.trim().to_string())
                     .filter(|s| !s.is_empty())
                     .collect();
+            }
+            "iskeyword" | "isk" => {
+                parse_iskeyword(value)
+                    .map_err(|e| format!("Invalid iskeyword: '{value}' ({e})"))?;
+                self.iskeyword = value.to_string();
             }
             "colorcolumn" => self.colorcolumn = value.to_string(),
             "textwidth" => {
@@ -2559,6 +2864,13 @@ pub static SETTING_DEFS: &[SettingDef] = &[
         key: "colorcolumn",
         label: "Color Column",
         description: "Columns to highlight as rulers (e.g. \"80,120\")",
+        category: "Editor",
+        setting_type: SettingType::StringVal,
+    },
+    SettingDef {
+        key: "iskeyword",
+        label: "Keyword Characters",
+        description: "Characters word motions (w/b/e, */#, iw/aw) treat as part of a word",
         category: "Editor",
         setting_type: SettingType::StringVal,
     },
@@ -3195,6 +3507,113 @@ mod tests {
         assert!(s.parse_set_option("unknownoption").is_err());
         assert!(s.parse_set_option("nounknown").is_err());
         assert!(s.parse_set_option("foo=42").is_err());
+    }
+
+    // ── 'iskeyword' (#1191) ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_iskeyword_default_and_isk_alias_readback() {
+        let mut s = Settings::default();
+        assert_eq!(s.iskeyword, "@,48-57,_,192-255");
+        let query = s.parse_set_option("isk?").unwrap();
+        assert_eq!(query, "iskeyword=@,48-57,_,192-255");
+    }
+
+    #[test]
+    fn test_iskeyword_plain_assignment_replaces_value() {
+        let mut s = Settings::default();
+        let msg = s.parse_set_option("iskeyword=@,_").unwrap();
+        assert_eq!(msg, "iskeyword=@,_");
+        assert_eq!(s.iskeyword, "@,_");
+    }
+
+    #[test]
+    fn test_iskeyword_rejects_malformed_value() {
+        // Before #1191, `iskeyword` was in `UNIMPLEMENTED_VALUE_OPTIONS`, so
+        // *every* value (valid or not) was rejected with the same
+        // "recognised but not implemented" message. Now a well-formed value
+        // is accepted (see the other tests in this section) and only a
+        // genuinely malformed one is rejected — with a different message.
+        let mut s = Settings::default();
+        let err = s.parse_set_option("iskeyword=abc-").unwrap_err();
+        assert!(err.contains("Invalid value for iskeyword"), "{err}");
+        // The stored value must be untouched by the rejected attempt.
+        assert_eq!(s.iskeyword, "@,48-57,_,192-255");
+    }
+
+    #[test]
+    fn test_iskeyword_plus_equals_appends() {
+        // Before #1191 this failed outright — `iskeyword` (in any spelling,
+        // any operator) was unconditionally "recognised but not
+        // implemented", so `+=` could never even be attempted.
+        let mut s = Settings::default();
+        let msg = s.parse_set_option("iskeyword+=-").unwrap();
+        assert_eq!(msg, "iskeyword=@,48-57,_,192-255,-");
+        assert_eq!(s.iskeyword, "@,48-57,_,192-255,-");
+    }
+
+    #[test]
+    fn test_iskeyword_caret_equals_prepends() {
+        let mut s = Settings::default();
+        s.parse_set_option("isk^=$").unwrap();
+        assert_eq!(s.iskeyword, "$,@,48-57,_,192-255");
+    }
+
+    #[test]
+    fn test_iskeyword_minus_equals_removes() {
+        let mut s = Settings::default();
+        s.parse_set_option("iskeyword-=_").unwrap();
+        assert_eq!(s.iskeyword, "@,48-57,192-255");
+    }
+
+    #[test]
+    fn test_iskeyword_is_keyword_char_default_is_unicode_aware() {
+        // #1191: the underlying motion/regex bug this issue exists to fix —
+        // before it, word-char classification for anything beyond the
+        // hardcoded ASCII set was wrong for `\k`/`\K` (see vim_regex.rs's
+        // `keyword_class_is_unicode_aware_with_the_default_iskeyword`).
+        // `Settings::is_keyword_char` is the motion-side half of the same
+        // fix: it must treat every Unicode letter as a keyword char under
+        // the default spec, exactly like real Vim's `@` token promises.
+        let s = Settings::default();
+        assert!(s.is_keyword_char('a'));
+        assert!(s.is_keyword_char('_'));
+        assert!(s.is_keyword_char('5'));
+        assert!(s.is_keyword_char('é'));
+        assert!(s.is_keyword_char('Я'));
+        assert!(s.is_keyword_char('北'));
+        assert!(!s.is_keyword_char(' '));
+        assert!(!s.is_keyword_char('.'));
+        assert!(!s.is_keyword_char('-'));
+    }
+
+    #[test]
+    fn test_iskeyword_custom_spec_add_hyphen_as_keyword() {
+        let mut s = Settings::default();
+        s.parse_set_option("iskeyword+=-").unwrap();
+        assert!(s.is_keyword_char('-'));
+        assert!(s.is_keyword_char('a'));
+    }
+
+    #[test]
+    fn test_iskeyword_exclusion_removes_a_default_class() {
+        // `^_` excludes underscore from the (still-present) `@` alphabetic
+        // class — order-sensitive, matching real Vim.
+        let mut s = Settings::default();
+        s.parse_set_option("iskeyword=@,^_").unwrap();
+        assert!(s.is_keyword_char('a'));
+        assert!(!s.is_keyword_char('_'));
+    }
+
+    #[test]
+    fn test_iskeyword_code_range_and_single_char_and_code() {
+        let mut s = Settings::default();
+        s.parse_set_option("iskeyword=65-90,35,36").unwrap();
+        assert!(s.is_keyword_char('A')); // 65
+        assert!(s.is_keyword_char('Z')); // 90
+        assert!(!s.is_keyword_char('a')); // outside 65-90, lowercase not included
+        assert!(s.is_keyword_char('#')); // 35
+        assert!(s.is_keyword_char('$')); // 36
     }
 
     #[test]

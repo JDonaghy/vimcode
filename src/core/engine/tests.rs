@@ -1348,6 +1348,71 @@ fn test_word_forward_does_not_split_on_cyrillic() {
     );
 }
 
+// #1191: `'iskeyword'` is a real input to `w`/`b`/`e`, `*`/`#`, and `iw`/`aw`
+// — before this issue, `:set iskeyword+=-` was flatly rejected
+// ("recognised but not implemented yet"), so these cases could not even be
+// set up, let alone pass: every one of them is red against unfixed
+// `develop`.
+#[test]
+fn test_iskeyword_plus_hyphen_makes_dashed_word_one_word_for_w() {
+    let mut engine = Engine::new();
+    engine.settings.parse_set_option("iskeyword+=-").unwrap();
+    engine.buffer_mut().insert(0, "foo-bar baz");
+
+    press_char(&mut engine, 'w');
+    assert_eq!(
+        engine.view().cursor.col,
+        8,
+        "with iskeyword+=-, 'foo-bar' is one word, so w lands on 'baz'"
+    );
+}
+
+#[test]
+fn test_iskeyword_plus_hyphen_makes_dashed_word_one_word_for_default_w() {
+    // Sanity check that the *default* iskeyword still splits on '-' the
+    // old way, so the case above is really exercising the new option and
+    // not some other change to word motions.
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "foo-bar baz");
+
+    press_char(&mut engine, 'w');
+    assert_eq!(
+        engine.view().cursor.col,
+        3,
+        "without customizing iskeyword, '-' still splits 'foo' from 'bar'"
+    );
+}
+
+#[test]
+fn test_iskeyword_plus_hyphen_extends_star_word_under_cursor() {
+    let mut engine = Engine::new();
+    engine.settings.parse_set_option("iskeyword+=-").unwrap();
+    engine.buffer_mut().insert(0, "foo-bar foo-bar");
+
+    let word = engine.word_under_cursor();
+    assert_eq!(
+        word,
+        Some("foo-bar".to_string()),
+        "iskeyword+=- makes '-' a keyword char, so word_under_cursor (which\
+         backs `*`/`#`) returns the whole hyphenated identifier"
+    );
+}
+
+#[test]
+fn test_iskeyword_plus_hyphen_extends_iw_text_object() {
+    let mut engine = Engine::new();
+    engine.settings.parse_set_option("iskeyword+=-").unwrap();
+    engine.buffer_mut().insert(0, "foo-bar baz");
+    engine.view_mut().cursor.col = 5; // inside "bar"
+
+    let obj = engine.find_word_object('i', 5, 1);
+    assert_eq!(
+        obj,
+        Some((0, 7)),
+        "iw should select the whole 'foo-bar' run, not just 'bar'"
+    );
+}
+
 #[test]
 fn test_word_backward_stops_at_cjk_boundary() {
     let mut engine = Engine::new();
