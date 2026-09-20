@@ -1404,17 +1404,17 @@ impl Engine {
                     self.ensure_spell_checker();
                 }
                 self.update_syntax();
-                // `foldmethod=indent`/`foldlevel=N` (#1153) — recompute the
-                // indent-fold hierarchy against the new level immediately,
-                // mirroring `apply_foldlevel`'s own doc ("processing
-                // deepest-first") rather than waiting for the next `z`
-                // command. Idempotent (a plain re-close/re-define pass), so
-                // it's safe to re-run whenever either option was actually
-                // touched on this `:set` line — gated on that (rather than
-                // unconditionally on every `:set`) so an unrelated option
-                // like `:set ic` doesn't pay to recompute fold state on
-                // large files (#1153 review).
-                if self.settings.foldmethod == "indent"
+                // `foldmethod=indent|marker`/`foldlevel=N` (#1153, #1159) —
+                // recompute the fold hierarchy against the new level
+                // immediately, mirroring `apply_foldlevel`'s own doc
+                // ("processing deepest-first") rather than waiting for the
+                // next `z` command. Idempotent (a plain re-close/re-define
+                // pass), so it's safe to re-run whenever either option was
+                // actually touched on this `:set` line — gated on that
+                // (rather than unconditionally on every `:set`) so an
+                // unrelated option like `:set ic` doesn't pay to recompute
+                // fold state on large files (#1153 review).
+                if self.folds_are_computed()
                     && split_set_args(trimmed)
                         .iter()
                         .any(|a| set_arg_touches_folding(a))
@@ -1468,8 +1468,8 @@ impl Engine {
                 self.update_syntax();
             }
             // See the matching comment in the multi-option branch above
-            // (#1153).
-            if self.settings.foldmethod == "indent" && set_arg_touches_folding(trimmed) {
+            // (#1153, #1159).
+            if self.folds_are_computed() && set_arg_touches_folding(trimmed) {
                 self.apply_foldlevel(self.settings.foldlevel);
             }
             return EngineAction::None;
@@ -1848,6 +1848,12 @@ impl Engine {
 
         // `[range]:g[!]/pat/cmd` and `[range]:v/pat/cmd` — global commands.
         if let Some(action) = self.try_execute_global(cmd) {
+            return action;
+        }
+
+        // `:fold`, `:foldopen[!]`, `:foldclose[!]`, `:folddoopen`,
+        // `:folddoclosed` (#1159).
+        if let Some(action) = self.try_execute_fold_command(cmd) {
             return action;
         }
 
@@ -3161,6 +3167,137 @@ impl Engine {
         // Merge every undo entry created by the sub-commands above into a
         // single step, so `u` reverts all of `:g`'s edits at once and lands
         // on the position of the *first* one (#886).
+        let state = self.active_buffer_state_mut();
+        if state.undo_stack.len() > saved_undo_len + 1 {
+            let new_entries: Vec<UndoEntry> = state.undo_stack.drain(saved_undo_len..).collect();
+            let cursor_before = new_entries[0].cursor_before;
+            let merged_ops: Vec<_> = new_entries.into_iter().flat_map(|e| e.ops).collect();
+            if !merged_ops.is_empty() {
+                state.undo_stack.push(UndoEntry {
+                    ops: merged_ops,
+                    cursor_before,
+                });
+            }
+        }
+
+        let max_line = self.buffer().len_lines().saturating_sub(1);
+        if self.view().cursor.line > max_line {
+            self.view_mut().cursor.line = max_line;
+        }
+        self.clamp_cursor_col();
+
+        self.message = format!(
+            "{} line{} affected",
+            executed,
+            if executed == 1 { "" } else { "s" }
+        );
+        EngineAction::None
+    }
+
+    /// `:[range]fold`, `:foldo[pen][!] [range]`, `:foldc[lose][!] [range]`,
+    /// `:[range]foldd[oopen] {cmd}`, `:[range]folddoc[losed] {cmd}` (#1159)
+    /// — the ex-command surface for folding, previously only reachable
+    /// through the `z` normal-mode commands (0 hits in `src/core/engine/`
+    /// before this). `:foldnew`, mentioned in the issue, does not exist in
+    /// Neovim (`E492: Not an editor command`, checked against `nvim
+    /// --headless -u NONE`) so isn't implemented — there is no oracle to
+    /// verify it against and no such command to be compatible with.
+    ///
+    /// Returns `None` when `cmd` doesn't name one of these, so the caller
+    /// falls through to the rest of `execute_command`'s dispatch.
+    pub(crate) fn try_execute_fold_command(&mut self, cmd: &str) -> Option<EngineAction> {
+        let chars: Vec<char> = cmd.chars().collect();
+        let (range, consumed) = self.parse_ex_range(&chars);
+        let rest: String = chars[consumed..].iter().collect();
+        let rest = rest.trim();
+        let (name, args) = split_ex_name(rest);
+        let (name, bang) = match name.strip_suffix('!') {
+            Some(n) => (n, true),
+            None => (name, false),
+        };
+        let is = |canonical: &str, min: usize| {
+            name.len() >= min && name.len() <= canonical.len() && canonical.starts_with(name)
+        };
+
+        if is("fold", 4) && !bang && args.is_empty() {
+            return Some(self.ex_fold_create(range));
+        }
+        if is("foldopen", 5) && args.is_empty() {
+            return Some(self.ex_fold_open_close(range, bang, true));
+        }
+        if is("foldclose", 5) && args.is_empty() {
+            return Some(self.ex_fold_open_close(range, bang, false));
+        }
+        // Min abbreviations per `:h fold-commands`: `:foldd`/`:folddo` for
+        // `:folddoopen`, `:folddoc` for `:folddoclosed`. Neither takes `!`.
+        if is("folddoclosed", 7) && !bang && !args.is_empty() {
+            return Some(self.execute_folddo_command(range, args, true));
+        }
+        if is("folddoopen", 5) && !bang && !args.is_empty() {
+            return Some(self.execute_folddo_command(range, args, false));
+        }
+        None
+    }
+
+    /// `:[range]foldd[oopen] {cmd}` / `:[range]folddoc[losed] {cmd}` (#1159)
+    /// — run `{cmd}` on every line in `[range]` (default: the whole buffer,
+    /// unlike most other `[range]` ex commands — verified against `nvim
+    /// --headless`) that is/isn't inside a closed fold. `closed` selects
+    /// which of the two. Mirrors `execute_global_command`'s "mark first,
+    /// then run in forward order, shifting remaining marks by each
+    /// sub-command's net line delta" structure and its undo-merging (`:h
+    /// :folddoopen` explicitly compares itself to `:global`: "This works
+    /// like the \":global\" command").
+    pub(crate) fn execute_folddo_command(
+        &mut self,
+        range: Option<(isize, isize)>,
+        cmd: &str,
+        closed: bool,
+    ) -> EngineAction {
+        let num_lines = self.buffer().len_lines();
+        let (first, last) = match range {
+            Some((a, b)) => (
+                a.max(0) as usize,
+                (b.max(0) as usize).min(num_lines.saturating_sub(1)),
+            ),
+            None => (0, num_lines.saturating_sub(1)),
+        };
+
+        let mut pending: Vec<isize> = (first..=last.min(num_lines.saturating_sub(1)))
+            .filter(|&l| self.view().enclosing_closed_fold(l).is_some() == closed)
+            .map(|l| l as isize)
+            .collect();
+
+        let mut executed = 0usize;
+        let mut idx = 0usize;
+        // See `execute_global_command`'s matching comment (#886): `:folddo*`
+        // is one undoable step however many lines it touches.
+        let saved_undo_len = self.active_buffer_state_mut().undo_stack.len();
+        while idx < pending.len() {
+            let line = pending[idx];
+            idx += 1;
+            if line < 0 {
+                continue;
+            }
+            let line = line as usize;
+            let before = self.buffer().len_lines();
+            if line >= before {
+                continue;
+            }
+            self.view_mut().cursor.line = line;
+            self.view_mut().cursor.col = 0;
+            self.execute_command(cmd);
+            executed += 1;
+            let delta = self.buffer().len_lines() as isize - before as isize;
+            if delta != 0 {
+                for l in pending[idx..].iter_mut() {
+                    if *l > line as isize {
+                        *l += delta;
+                    }
+                }
+            }
+        }
+        self.active_buffer_state_mut().finish_undo_group();
         let state = self.active_buffer_state_mut();
         if state.undo_stack.len() > saved_undo_len + 1 {
             let new_entries: Vec<UndoEntry> = state.undo_stack.drain(saved_undo_len..).collect();
@@ -6322,18 +6459,23 @@ pub(crate) fn split_set_args(args: &str) -> Vec<String> {
 }
 
 /// Does a single `:set` argument (one entry from [`split_set_args`], or a
-/// whole single-option `:set` line) name `'foldmethod'`/`'foldlevel'`
-/// (either full name or abbreviation)? Used to skip the
-/// `apply_foldlevel` recompute on `:set` lines that have nothing to do with
-/// folding — see the two call sites in `handle_ex_command` (#1153 review:
-/// re-running the indent-fold pass on every `:set ic` etc. was a needless
-/// cost on large files).
+/// whole single-option `:set` line) name `'foldmethod'`/`'foldlevel'`/
+/// `'foldmarker'`/`'foldnestmax'` (either full name or abbreviation)? Used
+/// to skip the `apply_foldlevel` recompute on `:set` lines that have
+/// nothing to do with folding — see the two call sites in
+/// `handle_ex_command` (#1153 review: re-running the indent-fold pass on
+/// every `:set ic` etc. was a needless cost on large files). `'foldmarker'`/
+/// `'foldnestmax'` joined the list in #1159 — changing either one also
+/// needs a recompute, for the same reason as `'foldmethod'`/`'foldlevel'`.
 fn set_arg_touches_folding(arg: &str) -> bool {
     let arg = arg.trim();
     let arg = arg.strip_suffix('?').unwrap_or(arg);
     let arg = arg.strip_suffix('!').unwrap_or(arg);
     let name = arg.split('=').next().unwrap_or(arg);
-    matches!(name, "foldmethod" | "fdm" | "foldlevel" | "fdl")
+    matches!(
+        name,
+        "foldmethod" | "fdm" | "foldlevel" | "fdl" | "foldmarker" | "fmr" | "foldnestmax" | "fdn"
+    )
 }
 
 /// One parsed `/` or `?` command line.

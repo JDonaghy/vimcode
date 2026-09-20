@@ -992,10 +992,10 @@ fn apply_setup(settings: &mut Settings, setup: &str) -> Result<(), String> {
                 ));
             }
             "foldmethod" | "fdm" => {
-                if value != "manual" && value != "indent" {
+                if !matches!(value, "manual" | "indent" | "marker") {
                     return Err(format!(
-                        "'foldmethod' only 'manual'/'indent' are modeled in apply_setup; \
-                         {raw_value:?} needs real handling there"
+                        "'foldmethod' only 'manual'/'indent'/'marker' are modeled in \
+                         apply_setup; {raw_value:?} needs real handling there"
                     ));
                 }
                 settings.foldmethod = value.to_string();
@@ -1003,6 +1003,15 @@ fn apply_setup(settings: &mut Settings, setup: &str) -> Result<(), String> {
             "foldlevel" | "fdl" => {
                 settings.foldlevel = value.parse::<usize>().map_err(|_| {
                     format!("'foldlevel' expects a non-negative integer, got {raw_value:?}")
+                })?;
+            }
+            // #1159
+            "foldmarker" | "fmr" => {
+                settings.foldmarker = value.to_string();
+            }
+            "foldnestmax" | "fdn" => {
+                settings.foldnestmax = value.parse::<usize>().map_err(|_| {
+                    format!("'foldnestmax' expects a positive integer, got {raw_value:?}")
                 })?;
             }
             // #1153
@@ -1121,12 +1130,14 @@ fn run_in_vimcode(
     // Screen-relative motions (H/M/L, <C-d>, zt) are meaningless unless both
     // sides agree on the window height, so mirror nvim's.
     engine.set_viewport_lines(rows);
-    // Neovim computes the whole 'foldmethod'=indent fold hierarchy (down to
-    // 'foldlevel') as soon as the buffer is loaded, with no explicit `zf` —
-    // mirror that here rather than leaving it for the key sequence to
-    // trigger, since a case may probe fold state without ever pressing a
-    // z-command (e.g. plain `j`/`G` motions across an already-closed fold).
-    if engine.settings.foldmethod == "indent" {
+    // Neovim computes the whole 'foldmethod'=indent/marker fold hierarchy
+    // (down to 'foldlevel') as soon as the buffer is loaded, with no
+    // explicit `zf` — mirror that here rather than leaving it for the key
+    // sequence to trigger, since a case may probe fold state without ever
+    // pressing a z-command (e.g. plain `j`/`G` motions across an
+    // already-closed fold). #1159 extended this from "indent" to also cover
+    // "marker".
+    if matches!(engine.settings.foldmethod.as_str(), "indent" | "marker") {
         engine.apply_foldlevel(engine.settings.foldlevel);
     }
     engine.view_mut().cursor.line = cursor_line_1.saturating_sub(1);
@@ -5965,6 +5976,27 @@ const FOLDNEST: &[&str] = &[
     "}",
 ];
 
+// Two-level nested `foldmethod=marker` fixture (#1159), companion to
+// FOLDNEST above but nested via `{{{`/`}}}` pairs instead of indentation.
+// Verified line-for-line against `nvim --headless`: at `foldlevel=0` lines
+// 1-6 close as one fold (level 1 — the marker on line 1 itself, unlike the
+// indent method's header line, IS part of its own fold, since the marker
+// pair's *first* line is what opens the region); at `foldlevel=1` that fold
+// is open but the nested lines 2-4 are still closed (level 2); at
+// `foldlevel=2` nothing is closed.
+const FOLDMARKERNEST: &[&str] = &[
+    "fn main() { // {{{",
+    "    if true { // {{{",
+    "        x();",
+    "        } // }}}",
+    "    let a = 1;",
+    "} // }}}",
+    "// trailing",
+];
+
+// Minimal fixture for a non-default `'foldmarker'` pair (#1159).
+const FOLDMARKER_CUSTOM: &[&str] = &["alpha [[[", "beta", "]]]", "gamma"];
+
 const CASES_FOLD: &[Case] = &[
     // ── manual folds: zf{motion} ─────────────────────────────────────────
     c("fold:zfj hides one line", FOLDTXT, 1, 1, "zfjj"),
@@ -6154,6 +6186,162 @@ const CASES_FOLD: &[Case] = &[
         1,
         "zozcj",
         "vim.o.foldmethod='indent'",
+    ),
+    // ── 'foldnestmax' (#1159) — only affects "indent"/"syntax", not
+    // "marker" (`:h 'foldnestmax'`; verified against `nvim --headless`:
+    // capping FOLDNEST's would-be level-2 inner fold to foldnestmax=1
+    // absorbs it into the level-1 outer fold instead of leaving it its own
+    // closeable region, so at foldlevel=1 the inner lines are *not* closed
+    // — contrast the default-nestmax case right below it, where they are).
+    cs(
+        "fold:indent:foldnestmax=1 absorbs the level-2 fold into level-1",
+        FOLDNEST,
+        1,
+        1,
+        "jjjj",
+        "vim.o.foldmethod='indent'\nvim.o.foldnestmax=1\nvim.o.foldlevel=1",
+    ),
+    cs(
+        "fold:indent:default foldnestmax leaves the level-2 fold closed",
+        FOLDNEST,
+        1,
+        1,
+        "jjjj",
+        "vim.o.foldmethod='indent'\nvim.o.foldlevel=1",
+    ),
+    // ── foldmethod=marker (#1159) ────────────────────────────────────────
+    c(
+        "fold:marker:set fdm=marker via :set",
+        FOLDMARKERNEST,
+        1,
+        1,
+        ":set fdm=marker<CR>j",
+    ),
+    cs(
+        "fold:marker:foldlevel0 j crosses the whole outer fold",
+        FOLDMARKERNEST,
+        1,
+        1,
+        "j",
+        "vim.o.foldmethod='marker'\nvim.o.foldlevel=0",
+    ),
+    cs(
+        "fold:marker:foldlevel1 j steps to the nested fold header",
+        FOLDMARKERNEST,
+        1,
+        1,
+        "jj",
+        "vim.o.foldmethod='marker'\nvim.o.foldlevel=1",
+    ),
+    cs(
+        "fold:marker:foldlevel1 j skips the closed nested fold",
+        FOLDMARKERNEST,
+        1,
+        1,
+        "jjj",
+        "vim.o.foldmethod='marker'\nvim.o.foldlevel=1",
+    ),
+    cs(
+        "fold:marker:foldlevel2 nothing is folded",
+        FOLDMARKERNEST,
+        1,
+        1,
+        "jjjjjj",
+        "vim.o.foldmethod='marker'\nvim.o.foldlevel=2",
+    ),
+    cs(
+        "fold:marker:zR opens everything",
+        FOLDMARKERNEST,
+        1,
+        1,
+        "zRjjjjjj",
+        "vim.o.foldmethod='marker'",
+    ),
+    cs(
+        "fold:marker:zM recloses after zR",
+        FOLDMARKERNEST,
+        1,
+        1,
+        "zRzMj",
+        "vim.o.foldmethod='marker'",
+    ),
+    cs(
+        "fold:marker:zo opens the level-1 fold, inner stays closed",
+        FOLDMARKERNEST,
+        1,
+        1,
+        "zoj",
+        "vim.o.foldmethod='marker'",
+    ),
+    cs(
+        "fold:marker:zc recloses the level-1 fold",
+        FOLDMARKERNEST,
+        1,
+        1,
+        "zozcj",
+        "vim.o.foldmethod='marker'",
+    ),
+    cs(
+        "fold:marker:custom foldmarker pair",
+        FOLDMARKER_CUSTOM,
+        1,
+        1,
+        "j",
+        "vim.o.foldmethod='marker'\nvim.o.foldmarker='[[[,]]]'",
+    ),
+    // ── `:fold*` ex commands (#1159) — all on FOLDTXT/manual folds, driven
+    // through the real ex-command path so they exercise
+    // `try_execute_fold_command`/`ex_fold_create`/`ex_fold_open_close`
+    // directly, the same way "fold:indent:set fdm=indent via :set" above
+    // exercises the `:set` path rather than the `cs(..)` setup bypass.
+    c(
+        "fold:ex::fold creates and closes a manual fold",
+        FOLDTXT,
+        1,
+        1,
+        ":2,4fold<CR>jj",
+    ),
+    c(
+        "fold:ex::foldopen with a matching range reopens it",
+        FOLDTXT,
+        1,
+        1,
+        ":2,4fold<CR>:2,4foldopen<CR>jj",
+    ),
+    c(
+        "fold:ex::foldopen on a nested range opens only the outer level",
+        FOLDTXT,
+        1,
+        1,
+        ":3,4fold<CR>:2,5fold<CR>:2,5foldopen<CR>jj",
+    ),
+    c(
+        "fold:ex::foldclose on a range spanning two nested headers closes only the outer",
+        FOLDTXT,
+        1,
+        1,
+        ":3,4fold<CR>:2,5fold<CR>:2,5foldopen!<CR>:2,3foldclose<CR>2Gzojj",
+    ),
+    c(
+        "fold:ex::foldclose! on a nested range closes every level",
+        FOLDTXT,
+        1,
+        1,
+        ":3,4fold<CR>:2,5fold<CR>:2,5foldopen!<CR>:2,3foldclose!<CR>2Gzojj",
+    ),
+    c(
+        "fold:ex::folddoopen only touches lines outside the closed fold",
+        FOLDTXT,
+        1,
+        1,
+        ":2,4fold<CR>:folddoopen s/^/X/<CR>",
+    ),
+    c(
+        "fold:ex::folddoclosed only touches lines inside the closed fold",
+        FOLDTXT,
+        1,
+        1,
+        ":2,4fold<CR>:folddoclosed s/^/Z/<CR>",
     ),
 ];
 

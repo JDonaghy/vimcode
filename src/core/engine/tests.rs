@@ -29471,6 +29471,115 @@ fn test_1153_set_foldmethod_indent_folds_take_effect_immediately() {
     assert_eq!(engine.view().cursor.line, 3);
 }
 
+// -- #1159: 'foldmethod=marker', 'foldmarker', 'foldnestmax', ':fold*' --
+
+#[test]
+fn test_1159_set_foldmethod_marker_folds_take_effect_immediately() {
+    // Mirrors test_1153_set_foldmethod_indent_folds_take_effect_immediately
+    // above, but for the new "marker" method: `:set fdm=marker` should
+    // immediately compute + close the marker-fold hierarchy, not wait for a
+    // `zf`/z-command.
+    let mut engine = Engine::new();
+    engine
+        .buffer_mut()
+        .insert(0, "if x: # {{{\n    a\n    b\n# }}}\nelse:\n    c\n");
+    engine.update_syntax();
+    engine.feed_keys(":set fdm=marker<CR>");
+    engine.view_mut().cursor.line = 0;
+    // Lines 1-3 (0-indexed) are hidden inside the closed marker fold, so `j`
+    // from line 0 should skip straight to line 4 ("else:").
+    engine.feed_keys("j");
+    assert_eq!(engine.view().cursor.line, 4);
+}
+
+#[test]
+fn test_1159_foldmarker_rejects_malformed_values() {
+    let mut engine = Engine::new();
+    for bad in ["", "noComma", ",", "open,", ",close", "a,b,c"] {
+        let result = engine.settings.parse_set_option(&format!("foldmarker={bad}"));
+        assert!(result.is_err(), "expected {bad:?} to be rejected");
+    }
+    // A well-formed pair is accepted and round-trips through the query form.
+    engine
+        .settings
+        .parse_set_option("foldmarker=[[[,]]]")
+        .expect("well-formed pair is accepted");
+    assert_eq!(
+        engine.settings.parse_set_option("foldmarker?").unwrap(),
+        "foldmarker=[[[,]]]"
+    );
+}
+
+#[test]
+fn test_1159_foldnestmax_rejects_zero_and_non_numeric() {
+    let mut engine = Engine::new();
+    assert!(engine.settings.parse_set_option("foldnestmax=0").is_err());
+    assert!(engine.settings.parse_set_option("foldnestmax=abc").is_err());
+    engine
+        .settings
+        .parse_set_option("foldnestmax=5")
+        .expect("a positive integer is accepted");
+    assert_eq!(
+        engine.settings.parse_set_option("foldnestmax?").unwrap(),
+        "foldnestmax=5"
+    );
+}
+
+#[test]
+fn test_1159_ex_fold_creates_and_ex_foldopen_reopens() {
+    // `:2,4fold` (1-indexed ex addressing) creates and closes a manual fold
+    // over 0-indexed lines 1..=3; `:2,4foldopen` then reopens it.
+    let mut engine = Engine::new();
+    engine
+        .buffer_mut()
+        .insert(0, "one\ntwo\nthree\nfour\nfive\n");
+    engine.update_syntax();
+    engine.feed_keys(":2,4fold<CR>");
+    engine.view_mut().cursor.line = 0;
+    engine.feed_keys("jj");
+    // Lines 1-3 hidden: two `j` from line 0 lands on line 4 ("five").
+    assert_eq!(engine.view().cursor.line, 4);
+
+    engine.feed_keys(":2,4foldopen<CR>");
+    engine.view_mut().cursor.line = 0;
+    engine.feed_keys("jj");
+    // Now nothing is hidden: two `j` from line 0 lands on line 2 ("three").
+    assert_eq!(engine.view().cursor.line, 2);
+}
+
+#[test]
+fn test_1159_ex_foldclose_on_bare_line_reports_e490() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "one\ntwo\nthree\n");
+    engine.update_syntax();
+    engine.feed_keys(":foldclose<CR>");
+    assert!(
+        engine.message.contains("E490"),
+        "unexpected message: {}",
+        engine.message
+    );
+}
+
+#[test]
+fn test_1159_ex_folddoopen_skips_the_closed_fold_folddoclosed_only_touches_it() {
+    let mut engine = Engine::new();
+    engine
+        .buffer_mut()
+        .insert(0, "one\ntwo\nthree\nfour\nfive\n");
+    engine.update_syntax();
+    engine.feed_keys(":2,4fold<CR>");
+    engine.feed_keys(":folddoopen s/^/X/<CR>");
+    assert_eq!(
+        engine.buffer().to_string(),
+        "Xone\ntwo\nthree\nfour\nXfive\n"
+    );
+    engine.feed_keys(":folddoclosed s/^/Z/<CR>");
+    assert_eq!(
+        engine.buffer().to_string(),
+        "Xone\nZtwo\nZthree\nZfour\nXfive\n"
+    );
+}
+
 // -- #1153: option table extended, not hard-erroring --
 
 #[test]
