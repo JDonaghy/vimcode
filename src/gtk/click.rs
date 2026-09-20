@@ -554,6 +554,7 @@ mod cross_split_drag_focus_tests {
             // `screen_zone_hit_test` fallback path (#449)
             &HashMap::new(),
             false, // mutate_focus: drag continuation
+            &mut quadraui::DragState::default(),
         );
         assert_eq!(
             engine.active_group, group_a,
@@ -596,6 +597,7 @@ mod cross_split_drag_focus_tests {
             None,
             &HashMap::new(),
             true, // mutate_focus: genuine click
+            &mut quadraui::DragState::default(),
         );
         assert_eq!(
             engine.active_group, group_b,
@@ -786,6 +788,7 @@ mod frame_hit_map_tests {
             Some(&hit_map),
             &tab_bar_zones,
             true,
+            &mut quadraui::DragState::default(),
         );
         match target {
             ClickTarget::BufferPos(id, _, _) => assert_eq!(id, wid),
@@ -967,6 +970,7 @@ mod single_group_tab_click_dispatch_tests {
                 None,
                 &HashMap::new(),
                 true, // a genuine click
+                &mut quadraui::DragState::default(),
             )
         }
 
@@ -986,6 +990,7 @@ mod single_group_tab_click_dispatch_tests {
                 &self.tab_pixel_hits,
                 None,
                 &HashMap::new(),
+                &mut quadraui::DragState::default(),
             )
         }
     }

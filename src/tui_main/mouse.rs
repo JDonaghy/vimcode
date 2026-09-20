@@ -932,9 +932,14 @@ pub(super) fn handle_mouse(
                         available.saturating_sub(1).clamp(5, max_rows);
                 }
                 render::MouseDragRoute::Minimap => {
-                    if let Some(layout) = last_layout {
-                        render::apply_minimap_click(engine, layout, col as f64, row as f64);
-                    }
+                    // #1187: a real minimap drag now arms a
+                    // `DragTarget::ScrollbarY` on press (above), so a
+                    // following move routes to `ArmedTarget` above, never
+                    // here — re-running `apply_minimap_click` (an absolute
+                    // seek against the strip's own scroll-following window)
+                    // on every move was the crawl bug this issue fixes. See
+                    // `MouseDragRoute::Minimap`'s doc comment for when this
+                    // arm can still be reached at all.
                 }
                 render::MouseDragRoute::TerminalContent => {
                     // #533: shared drag handler — tries forward_mouse(Move)
@@ -2422,9 +2427,10 @@ pub(super) fn handle_mouse(
         }
     }
 
-    // ── Minimap press (#35) ─────────────────────────────────────────────────
+    // ── Minimap press (#35, #1187) ────────────────────────────────────────
     // Pure rect plumbing: hand the press's cell coordinates to the shared
-    // resolver, which owns the hit-test and the scroll.
+    // resolver, which owns the hit-test, the #1093 jump-to-position, and the
+    // drag geometry.
     //
     // Deliberately *after* both divider hit-tests: the strip is carved off
     // the active window's right edge, so in a `:vsplit` it abuts (and would
@@ -2434,10 +2440,35 @@ pub(super) fn handle_mouse(
     // #756: this arm used to match `Down | Drag`, but it sits below the
     // `ev.kind != Down(Left) → return` gate above, so the `Drag` half was
     // unreachable and press-and-hold on a TUI minimap seeked exactly once. The
-    // drag half is now `render::MouseDragRoute::Minimap`, shared with GTK,
-    // which had the arm working all along.
+    // drag half is now `render::MouseDragRoute::Minimap` for as long as
+    // nothing is armed, but #1187 arms a real `DragTarget::ScrollbarY` here on
+    // press (mirroring the v/h-scrollbar rungs below) so a held drag routes
+    // to `MouseDragRoute::ArmedTarget` instead and traverses the whole file
+    // in one gesture rather than re-seeking against the strip's own
+    // scroll-following window every move.
     if let Some(layout) = last_layout {
-        if render::apply_minimap_click(engine, layout, col as f64, row as f64).is_some() {
+        if let Some(press) = render::minimap_press(engine, layout, col as f64, row as f64) {
+            if press.jump {
+                render::apply_minimap_click(engine, layout, col as f64, row as f64);
+            } else {
+                // #722: a press directly on the highlight band skips
+                // `apply_minimap_click`'s centring (nothing should scroll
+                // yet — that's the whole point of preserving the grab
+                // offset), but a click on a *background* pane's strip must
+                // still focus that pane, exactly like every other click
+                // does. `apply_minimap_click`'s `jump` branch above already
+                // covers this itself.
+                engine.activate_window(press.window_id);
+            }
+            drag_state.begin(quadraui::DragTarget::ScrollbarY {
+                widget: render::minimap_drag_widget(press.window_id),
+                track_start: press.track_start,
+                track_length: press.track_length,
+                thumb_length: press.thumb_length,
+                max_scroll: press.max_scroll,
+                grab_offset: press.grab_offset,
+                inverted: false,
+            });
             return sidebar_width;
         }
     }

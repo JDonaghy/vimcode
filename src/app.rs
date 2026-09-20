@@ -1991,6 +1991,8 @@ impl App {
         if let Some(ref layout) = *layout_ref {
             let mut engine = self.engine.borrow_mut();
             if !engine.picker_open {
+                let drag_rc = self.backend.borrow().drag_state_handle();
+                let mut drag = drag_rc.borrow_mut();
                 if let ClickTarget::BufferPos(_, line, col) = pixel_to_click_target(
                     &mut engine,
                     &**self.backend.borrow(),
@@ -2003,6 +2005,7 @@ impl App {
                     self.cached_frame_hit_map.borrow().as_ref(),
                     &self.cached_tab_bar_zones.borrow(),
                     true, // real click: focus/tab/gutter side effects are intended
+                    &mut drag,
                 ) {
                     engine.add_cursor_at_pos(line, col);
                 }
@@ -2066,6 +2069,7 @@ impl App {
             if !bc_handled {
                 let layout_ref = self.cached_screen_layout.borrow();
                 if let Some(ref layout) = *layout_ref {
+                    let drag_rc = self.backend.borrow().drag_state_handle();
                     handle_mouse_double_click(
                         &mut engine,
                         &**self.backend.borrow(),
@@ -2077,6 +2081,7 @@ impl App {
                         &self.cached_tab_pixel_hits.borrow(),
                         self.cached_frame_hit_map.borrow().as_ref(),
                         &self.cached_tab_bar_zones.borrow(),
+                        &mut drag_rc.borrow_mut(),
                     );
                 }
             }
@@ -4423,6 +4428,7 @@ impl App {
         let layout_ref = self.cached_screen_layout.borrow();
         let layout = layout_ref.as_ref()?;
         let mut engine = self.engine.borrow_mut();
+        let drag_rc = self.backend.borrow().drag_state_handle();
         let target = pixel_to_click_target(
             &mut engine,
             &**self.backend.borrow(),
@@ -4435,6 +4441,7 @@ impl App {
             self.cached_frame_hit_map.borrow().as_ref(),
             &self.cached_tab_bar_zones.borrow(),
             true, // resolving the original tab-bar mouse-down; switching tabs is intended
+            &mut drag_rc.borrow_mut(),
         );
         if !matches!(target, ClickTarget::TabBar) {
             return None;
@@ -5169,6 +5176,8 @@ impl App {
                     let (click_result, engine_action) = {
                         let layout_ref = self.cached_screen_layout.borrow();
                         if let Some(ref layout) = *layout_ref {
+                            let drag_rc = self.backend.borrow().drag_state_handle();
+                            let mut drag = drag_rc.borrow_mut();
                             handle_mouse_click(
                                 &mut engine,
                                 &**self.backend.borrow(),
@@ -5181,6 +5190,7 @@ impl App {
                                 &self.cached_tab_pixel_hits.borrow(),
                                 self.cached_frame_hit_map.borrow().as_ref(),
                                 &self.cached_tab_bar_zones.borrow(),
+                                &mut drag,
                             )
                         } else {
                             (None, None)
@@ -5674,11 +5684,14 @@ impl App {
                 }
             }
             render::MouseDragRoute::Minimap => {
-                let layout_ref = self.cached_screen_layout.borrow();
-                if let Some(ref layout) = *layout_ref {
-                    let mut engine = self.engine.borrow_mut();
-                    render::apply_minimap_click(&mut engine, layout, x, y);
-                }
+                // #1187: a real minimap drag now arms a `DragTarget::ScrollbarY`
+                // on press (`click::pixel_to_click_target`'s minimap rung), so a
+                // following move routes to `MouseDragRoute::ArmedTarget` above,
+                // never here — re-running `apply_minimap_click` (an absolute
+                // seek against the strip's own scroll-following window) on
+                // every move was the crawl bug this issue fixes. See
+                // `MouseDragRoute::Minimap`'s doc comment for when this arm can
+                // still be reached at all.
             }
             render::MouseDragRoute::TerminalContent => {
                 // #533: shared drag handler — tries forward_mouse(Move) when the
@@ -5694,6 +5707,7 @@ impl App {
                 let layout_ref = self.cached_screen_layout.borrow();
                 if let Some(ref layout) = *layout_ref {
                     let mut engine = self.engine.borrow_mut();
+                    let drag_rc = self.backend.borrow().drag_state_handle();
                     handle_mouse_drag(
                         &mut engine,
                         &**self.backend.borrow(),
@@ -5718,6 +5732,7 @@ impl App {
                         &self.cached_tab_pixel_hits.borrow(),
                         self.cached_frame_hit_map.borrow().as_ref(),
                         &self.cached_tab_bar_zones.borrow(),
+                        &mut drag_rc.borrow_mut(),
                     );
                 }
             }

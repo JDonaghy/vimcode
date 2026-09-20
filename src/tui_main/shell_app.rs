@@ -17025,6 +17025,83 @@ mod tests {
         );
     }
 
+    /// #1187 acceptance (black-box, driver tier): dragging the minimap's own
+    /// viewport-highlight thumb from the top of the strip to the bottom must
+    /// scroll through virtually the whole file in one gesture — exactly like
+    /// dragging the real vertical scrollbar handle the same distance — not
+    /// crawl within roughly one strip-window's worth of lines.
+    ///
+    /// With the file scrolled to the top, the highlight band's own top edge
+    /// coincides with the strip's top row (#1093: the highlight always
+    /// starts where the editor's own viewport does), so pressing there and
+    /// dragging to the strip's bottom row is exactly the issue's own
+    /// reproduction: "press on the highlight's top edge, drag to the bottom
+    /// of the strip".
+    ///
+    /// **RED against unfixed `develop`:** confirmed by hand — reverting
+    /// `mouse::handle_mouse`'s minimap press rung to call
+    /// `render::apply_minimap_click` directly (no `DragTarget::ScrollbarY`
+    /// arm) and the drag-move arm to keep re-running it per move reproduces
+    /// the root cause this issue describes: the strip's own painted window
+    /// slides in lockstep with `scroll_top` (#1093), so the drag's motion
+    /// mostly cancels itself out and the reachable range is roughly one
+    /// strip window (`target_lines * MINIMAP_MAX_COMPRESSION`, a few
+    /// thousand lines here) — the final assertion below (>90% of a
+    /// 100,000-line file) fails on that code, landing well under 10%.
+    #[test]
+    fn dragging_the_minimap_viewport_highlight_scrolls_the_whole_file_not_a_crawl() {
+        const TOTAL_LINES: usize = 100_000;
+        let mut driver = driver_with_shell(app_with_plain_lines(TOTAL_LINES), config(), 100, 24);
+
+        fn top_line(screen: &str) -> Option<usize> {
+            screen
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .windows(2)
+                .filter(|w| w[0] == "line")
+                .filter_map(|w| w[1].parse::<usize>().ok())
+                .min()
+        }
+
+        let before = driver.screen();
+        assert_eq!(
+            top_line(&before),
+            Some(0),
+            "fixture must start at the top of the file; screen:\n{before}"
+        );
+
+        // Locate the strip's own painted extent — never hardcode a row.
+        let rows = minimap_painted_rows(&before);
+        assert!(
+            rows.len() >= 4,
+            "precondition: the strip must paint at least 4 rows; got \
+             {rows:?}; screen:\n{before}"
+        );
+        let strip_top = *rows.first().unwrap();
+        let strip_bottom = *rows.last().unwrap();
+        let x = braille_col(&before, strip_top).unwrap_or_else(|| {
+            panic!("the minimap must paint braille on row {strip_top}; screen:\n{before}")
+        }) as f32
+            + 1.0;
+
+        driver.mouse_down(x, strip_top as f32);
+        driver.mouse_move(x, strip_bottom as f32);
+        driver.mouse_up(x, strip_bottom as f32);
+        driver.render();
+
+        let after = driver.screen();
+        let top = top_line(&after)
+            .unwrap_or_else(|| panic!("the editor must still paint line numbers:\n{after}"));
+
+        assert!(
+            top > TOTAL_LINES * 9 / 10,
+            "dragging from the highlight's top edge to the strip's bottom \
+             row must scroll through virtually the whole file in one \
+             gesture, not crawl within one strip window — landed on line \
+             {top} of {TOTAL_LINES}; screen:\n{after}"
+        );
+    }
+
     /// #1186 acceptance (black-box, driver tier): on a long buffer (>=
     /// 5,000 lines), the strip's own painted extent must cover far more of
     /// the file than the pre-#1186 fixed one-buffer-line-per-row scale

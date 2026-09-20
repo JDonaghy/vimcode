@@ -6022,7 +6022,14 @@ pub enum MouseDragRoute {
     TerminalSplitDivider,
     /// The bottom panel's top edge is being dragged (panel resize).
     TerminalPanelResize,
-    /// The pointer is over a minimap strip — keep seeking.
+    /// The pointer is over a minimap strip with nothing armed. #1187: this
+    /// used to re-run `apply_minimap_click` (an absolute seek) on every
+    /// move, which is the bug this issue fixes — a real minimap drag now
+    /// always arms a `DragTarget::ScrollbarY` on press
+    /// ([`minimap_press`]/[`minimap_drag_widget`]), so subsequent moves hit
+    /// the [`Self::ArmedTarget`] rung above instead and this arm is a no-op.
+    /// Still reachable in principle for a drag that never pressed on the
+    /// strip at all (started elsewhere, swept over it with nothing armed).
     Minimap,
     /// The pointer is inside the terminal's content rows — extend the
     /// terminal's own selection (or forward the move to the child).
@@ -6402,6 +6409,20 @@ pub fn apply_scroll_offset(
         // immediately above, one id per axis.
         other if other.starts_with("editor:v_sb:") => {
             let Ok(wid) = other["editor:v_sb:".len()..].parse::<usize>() else {
+                return false;
+            };
+            let window_id = crate::core::WindowId(wid);
+            engine.set_scroll_top_for_window(window_id, new_offset);
+            engine.sync_scroll_binds();
+            true
+        }
+        // The minimap's own viewport-highlight thumb (#1187) —
+        // `minimap_press`/`minimap_drag_widget` arm this on press; every
+        // continued drag-move applies here exactly like the editor's own
+        // v-scrollbar, never re-running `apply_minimap_click`'s #1093
+        // centring jump (that only ever happens once, at press time).
+        other if other.starts_with("minimap:") => {
+            let Ok(wid) = other["minimap:".len()..].parse::<usize>() else {
                 return false;
             };
             let window_id = crate::core::WindowId(wid);
@@ -11917,6 +11938,117 @@ pub fn apply_minimap_click(
     engine.set_scroll_top_for_window(window_id, line.saturating_sub(half_viewport));
     engine.set_cursor_for_window(window_id, line, 0);
     Some((window_id, line))
+}
+
+/// `quadraui::WidgetId` for a minimap strip's own thumb drag (#1187) —
+/// `minimap:<window_id>`, parsed back out by [`apply_scroll_offset`].
+/// Shared by both backends' press rungs so the id can never drift from what
+/// the apply-side table matches on.
+pub fn minimap_drag_widget(window_id: WindowId) -> quadraui::WidgetId {
+    quadraui::WidgetId::new(format!("minimap:{}", window_id.0))
+}
+
+/// Outcome of resolving a **press** (not a continued drag-move) against a
+/// minimap strip (#1187) — mirrors [`EditorScrollbarClick`], but for the
+/// strip's own viewport-highlight band rather than a `quadraui::Scrollbar`
+/// thumb (#723's own scrollbar is deliberately never painted over the band —
+/// see [`draw_minimap_strip`]'s doc comment).
+///
+/// Every press that hits the strip at all begins a
+/// `quadraui::DragTarget::ScrollbarY` drag — there is no `PageTo`-style
+/// track-page outcome here, unlike [`resolve_editor_scrollbar_click`] — a
+/// press outside the band must still jump-to-position (#1093 centring),
+/// which the caller performs by calling [`apply_minimap_click`] before
+/// arming the drag whenever [`Self::jump`] is set, so a plain click's
+/// existing behaviour is unchanged: only what happens on the *next* move
+/// differs.
+///
+/// This is the fix for #1187: previously both backends re-ran
+/// `apply_minimap_click` (an absolute seek against the strip's own,
+/// scroll-following painted window) on every drag-move sample, which mostly
+/// cancelled itself out — the window re-slid the same direction the click
+/// just scrolled. Arming a real `DragTarget::ScrollbarY` against
+/// `max_scroll` (the whole file's scroll ceiling, [`Self::max_scroll`]) once
+/// on press, instead of re-seeking every move, makes a whole-strip drag
+/// traverse the whole file exactly like the real vertical scrollbar does.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MinimapPress {
+    /// The pane whose strip was hit.
+    pub window_id: WindowId,
+    /// Track top, in the same native units as [`minimap_strip_rect`].
+    pub track_start: f32,
+    /// Track length (the strip's full height).
+    pub track_length: f32,
+    /// The painted viewport-highlight band's own height — the "thumb"
+    /// [`quadraui::DragTarget::ScrollbarY`] drags, whether or not the press
+    /// itself landed inside it.
+    pub thumb_length: f32,
+    /// The whole file's scroll ceiling: `total_buffer_lines -
+    /// viewport_lines`, the same arithmetic `View::ensure_cursor_visible`
+    /// clamps `scroll_top` against — never the strip's own (possibly much
+    /// smaller) painted window.
+    pub max_scroll: usize,
+    /// Offset from the band's own top edge, preserved so continued drag
+    /// moves don't jump the band out from under the cursor. `0.0` when
+    /// [`Self::jump`] is set (the press landed on the track outside the
+    /// band), matching [`resolve_editor_scrollbar_click`]'s track-click
+    /// convention — the band's new top after the jump lands under the
+    /// cursor by construction.
+    pub grab_offset: f32,
+    /// The press landed on the track *outside* the viewport-highlight band:
+    /// the caller must call [`apply_minimap_click`] first (today's #1093
+    /// jump-to-position + cursor move) before arming the drag described by
+    /// the rest of this struct.
+    pub jump: bool,
+}
+
+/// Resolve a press against every pane's minimap strip (#722), returning the
+/// geometry needed to arm a [`quadraui::DragTarget::ScrollbarY`] drag. `None`
+/// when no pane has a minimap or the point misses all of them — mirrors
+/// [`minimap_click_line`]'s "first hit wins" contract (panes never overlap).
+///
+/// Read-only (`&Engine`, not `&mut`): unlike [`apply_minimap_click`], this
+/// never mutates scroll/cursor state itself — see [`MinimapPress::jump`] for
+/// why the caller still might need to call that function too.
+pub fn minimap_press(
+    engine: &Engine,
+    screen: &ScreenLayout,
+    x: f64,
+    y: f64,
+) -> Option<MinimapPress> {
+    for mm in &screen.minimap {
+        let bounds = minimap_strip_rect(mm);
+        let layout = mm.minimap.layout_with_sizing(
+            bounds,
+            MINIMAP_LINES_PER_ROW,
+            quadraui::MinimapSizing::FixedPitch(1.0),
+        );
+        if matches!(
+            layout.hit_test(x as f32, y as f32),
+            quadraui::MinimapHit::None
+        ) {
+            continue;
+        }
+        let band = layout.viewport_highlight;
+        let py = y as f32;
+        let in_band = band.height > 0.0 && py >= band.y && py < band.y + band.height;
+        let viewport_lines = engine
+            .windows
+            .get(&mm.window_id)
+            .map(|w| w.view.viewport_lines)
+            .unwrap_or(0);
+        let max_scroll = mm.minimap.total_buffer_lines.saturating_sub(viewport_lines);
+        return Some(MinimapPress {
+            window_id: mm.window_id,
+            track_start: bounds.y,
+            track_length: bounds.height,
+            thumb_length: band.height,
+            max_scroll,
+            grab_offset: if in_band { py - band.y } else { 0.0 },
+            jump: !in_band,
+        });
+    }
+    None
 }
 
 /// Buffer line a minimap click at `fraction` of the track should scroll to,
@@ -26023,6 +26155,167 @@ mod tests {
         );
     }
 
+    /// #1187: a press on the viewport-highlight band itself begins a drag
+    /// that preserves the grab offset — `jump` is unset, and `grab_offset`
+    /// is the press's own offset from the band's top edge, never `0.0`
+    /// (which would jump the band's top under the cursor, the "grab
+    /// anywhere snaps to centre" bug the issue reports).
+    #[test]
+    fn minimap_press_on_the_highlight_band_preserves_the_grab_offset() {
+        let e = windowed_minimap_engine(50_000);
+        let screen = render_engine(&e, 120.0, 30.0);
+        let win_id = screen.windows[0].window_id;
+        let mm = screen.minimap.first().expect("minimap present");
+
+        // The cursor starts at the top of the file, so the viewport
+        // highlight's own top edge coincides with the strip's top row
+        // (#1093). At this fixture's geometry the band is exactly one row
+        // tall (`FixedPitch(1.0)`'s own row pitch), so a press has to land
+        // within that single row — 0.4 units down is safely inside
+        // `[rect.y, rect.y + 1.0)` without being able to round into the row
+        // below.
+        let x = mm.rect.x + 1.0;
+        let y = mm.rect.y + 0.4;
+        let press = minimap_press(&e, &screen, x, y).expect("the strip must hit");
+        assert_eq!(press.window_id, win_id);
+        assert!(
+            !press.jump,
+            "a press 0.4 units below the strip's (and so the band's) own \
+             top edge must land inside the highlight band, not on the bare \
+             track"
+        );
+        assert!(
+            (press.grab_offset - 0.4).abs() < 0.05,
+            "grab_offset must be the press's own offset from the band's top \
+             edge (~0.4 here, matching how far below the strip's top the \
+             press landed) — got {}",
+            press.grab_offset
+        );
+    }
+
+    /// #1187: a press on the track *outside* the band must jump-to-position
+    /// (today's #1093 centring, applied by the caller — see
+    /// `MinimapPress::jump`'s doc comment) and then continue as a normal
+    /// thumb drag with `grab_offset: 0.0`, mirroring
+    /// `resolve_editor_scrollbar_click`'s track-click convention.
+    #[test]
+    fn minimap_press_outside_the_band_sets_jump_and_zero_grab_offset() {
+        let e = windowed_minimap_engine(50_000);
+        let screen = render_engine(&e, 120.0, 30.0);
+        let mm = screen.minimap.first().expect("minimap present");
+
+        // Cursor at the top of the file puts the highlight band at the very
+        // top of the strip; the strip's bottom row is far outside it.
+        let x = mm.rect.x + 1.0;
+        let y = mm.rect.y + mm.rect.height - 1.0;
+        let press = minimap_press(&e, &screen, x, y).expect("the strip must hit");
+        assert!(
+            press.jump,
+            "a press at the strip's bottom row, with the band pinned to \
+             the top, must land outside the band"
+        );
+        assert_eq!(
+            press.grab_offset, 0.0,
+            "a track press outside the band must arm the drag with \
+             grab_offset 0.0, matching resolve_editor_scrollbar_click's \
+             track-click convention"
+        );
+    }
+
+    /// #1187's actual fix: `max_scroll` must be the whole file's scroll
+    /// ceiling (`total_buffer_lines - viewport_lines`, the same arithmetic
+    /// `View::ensure_cursor_visible` clamps against) — never the strip's own
+    /// painted window, which is only a fraction of the file once #1093's
+    /// sliding window is in play. Anchoring to the window instead is exactly
+    /// the root cause: the window re-slides under a drag in lockstep with
+    /// `scroll_top`, so the drag's motion cancels itself out and a
+    /// whole-strip drag reaches only about one window's worth of lines.
+    #[test]
+    fn minimap_press_max_scroll_is_the_whole_files_scroll_ceiling() {
+        let e = windowed_minimap_engine(50_000);
+        let screen = render_engine(&e, 120.0, 30.0);
+        let win_id = screen.windows[0].window_id;
+        let mm = screen.minimap.first().expect("minimap present");
+        let total = mm.minimap.total_buffer_lines;
+        let window_len =
+            mm.minimap.lines.last().unwrap().line_idx + 1 - mm.minimap.lines[0].line_idx;
+        assert!(
+            window_len < total,
+            "test setup sanity: the file must be taller than the strip's \
+             own window (window_len={window_len}, total={total})"
+        );
+
+        let x = mm.rect.x + 1.0;
+        let y = mm.rect.y + 1.0;
+        let press = minimap_press(&e, &screen, x, y).expect("the strip must hit");
+        let viewport_lines = e
+            .windows
+            .get(&win_id)
+            .map(|w| w.view.viewport_lines)
+            .unwrap_or(0);
+        assert_eq!(
+            press.max_scroll,
+            total - viewport_lines,
+            "max_scroll must be the whole file's scroll ceiling, not the \
+             painted window's own (much smaller) length ({window_len})"
+        );
+    }
+
+    /// A point outside the strip must not resolve to a press at all, so the
+    /// caller falls through to normal editor click handling — mirrors
+    /// `minimap_click_line`'s own negative-space case.
+    #[test]
+    fn minimap_press_returns_none_outside_the_strip() {
+        let e = windowed_minimap_engine(50_000);
+        let screen = render_engine(&e, 120.0, 30.0);
+        let mm = screen.minimap.first().expect("minimap present");
+        assert_eq!(
+            minimap_press(&e, &screen, mm.rect.x - 1.0, mm.rect.y + 5.0),
+            None
+        );
+    }
+
+    /// #1187/#722: `Engine::activate_window` — what the minimap press rung's
+    /// non-jump (in-band) branch calls instead of the jump branch's
+    /// `apply_minimap_click` — must switch which window is active without
+    /// moving that (or any) window's cursor or scroll position. This is the
+    /// engine-level contract both backends' click/mouse handlers rely on;
+    /// see the GTK driver-tier acceptance
+    /// (`gtk::testing::minimap::press_inside_a_background_panes_highlight_band_still_focuses_it_on_gtk`)
+    /// for the end-to-end proof through a real press.
+    #[test]
+    fn activate_window_switches_the_active_pane_without_moving_cursor_or_scroll() {
+        let mut e = minimap_engine();
+        e.split_window(crate::core::window::SplitDirection::Vertical, None);
+        let active_before = e.active_window_id();
+        let other = *e
+            .windows
+            .keys()
+            .find(|&&w| w != active_before)
+            .expect("a vsplit must produce a second window");
+
+        let scroll_before = e.windows.get(&other).unwrap().view.scroll_top;
+        let cursor_before = e.windows.get(&other).unwrap().view.cursor;
+
+        e.activate_window(other);
+
+        assert_eq!(
+            e.active_window_id(),
+            other,
+            "activate_window must make the named window active"
+        );
+        assert_eq!(
+            e.windows.get(&other).unwrap().view.scroll_top,
+            scroll_before,
+            "activate_window must not move the window's scroll position"
+        );
+        assert_eq!(
+            e.windows.get(&other).unwrap().view.cursor,
+            cursor_before,
+            "activate_window must not move the window's cursor"
+        );
+    }
+
     /// With the setting off there is nothing to click — the editor keeps the
     /// full width and clicks in that column resolve as normal text clicks.
     #[test]
@@ -29463,6 +29756,7 @@ mod mouse_drag_router_tests {
             "tui:editor:0:vsb",
             "tui:editor:0:hsb",
             "editor:h_sb:0",
+            "minimap:0",
         ];
         let mut engine = drag_engine();
         for id in ids {
@@ -29501,6 +29795,29 @@ mod mouse_drag_router_tests {
             7,
             "applying an `explorer:sb` offset must move the tree, whichever \
              backend's drag emitted it"
+        );
+    }
+
+    /// #1187: `minimap:<window_id>` — armed by `minimap_press` on a strip
+    /// press — must move the *named window's* `scroll_top`, mirroring
+    /// `editor:v_sb:<window_id>`. Asserted on the window's own scroll
+    /// position, not just the table having an arm for the id.
+    #[test]
+    fn a_minimap_scrollbar_offset_moves_the_named_windows_scroll_top() {
+        let mut engine = drag_engine();
+        let win = engine.active_window_id();
+        assert_eq!(engine.windows.get(&win).unwrap().view.scroll_top, 0);
+        assert!(apply_scroll_offset(
+            &mut engine,
+            &format!("minimap:{}", win.0),
+            123,
+            ScrollApplyContext::default()
+        ));
+        assert_eq!(
+            engine.windows.get(&win).unwrap().view.scroll_top,
+            123,
+            "applying a `minimap:<window_id>` offset must move that \
+             window's scroll_top, whichever backend's drag emitted it"
         );
     }
 }

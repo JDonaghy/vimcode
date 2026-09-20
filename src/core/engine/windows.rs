@@ -273,6 +273,14 @@ impl Engine {
     }
 
     /// Switch `active_group` to whichever group owns `window_id`.
+    ///
+    /// Does **not** make `window_id` itself the active window within that
+    /// group — a group's own `active_window` is a separate field (the intra-
+    /// group vim-split pane, e.g. after `:vsplit`), untouched here. Most
+    /// callers pair this with something that also sets `active_window` as a
+    /// side effect (`set_cursor_for_window`, `Engine::mouse_click`); a caller
+    /// that wants "become the active pane" with no other side effect (no
+    /// cursor move, no scroll) wants [`Self::activate_window`] instead.
     pub(crate) fn focus_group_for_window(&mut self, window_id: WindowId) {
         for (&gid, group) in &self.editor_groups {
             for (ti, tab) in group.tabs.iter().enumerate() {
@@ -287,6 +295,27 @@ impl Engine {
                     return;
                 }
             }
+        }
+    }
+
+    /// Make `window_id` the active window — switches `active_group` first
+    /// via [`Self::focus_group_for_window`] (a no-op if it's already
+    /// active), then points that group's own `active_window` at it, without
+    /// touching cursor or scroll position.
+    ///
+    /// #1187: the minimap's own thumb-drag press needs exactly this — a
+    /// press on a background pane's strip must focus that pane like any
+    /// other click, but a press *inside* the viewport-highlight band must
+    /// not also jump/centre the view (that's `apply_minimap_click`'s job,
+    /// reserved for a press on the bare track). Every existing "make this
+    /// window active" call site bundles that with a cursor move
+    /// (`set_cursor_for_window`) or a buffer click
+    /// (`Engine::mouse_click`); this is the first that needs the activation
+    /// alone.
+    pub(crate) fn activate_window(&mut self, window_id: WindowId) {
+        self.focus_group_for_window(window_id);
+        if self.windows.contains_key(&window_id) {
+            self.active_tab_mut().active_window = window_id;
         }
     }
 
