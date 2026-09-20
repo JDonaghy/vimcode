@@ -1305,123 +1305,22 @@ mod mac_driver_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A plugin ext-panel engine: `ext_panel_active` is set directly
-    /// (bypassing `AppShell` registration, which real ext panels also
-    /// bypass — see `render::apply_activity_panel_switch`'s own doc) and
-    /// the sidebar shown via the raw `AppShell::toggle_sidebar`, not
-    /// `Engine::toggle_sidebar` — the latter persists to the developer's
-    /// real session file, the exact reason `crate::gtk::testing::
-    /// sidebar_panel_clicks::panel_harness` avoids it too.
-    ///
-    /// One "available" (not-installed) extension in `ext_registry` gives
-    /// the "AVAILABLE" section content, while "INSTALLED" stays empty —
-    /// pushing the target header down a row, the same filler technique
-    /// [`engine_with_sc_recent_commits`] uses.
-    fn engine_with_marketplace_as_ext_panel() -> Engine {
-        let mut engine = plain_engine();
-        engine.ext_registry = Some(vec![crate::core::extensions::ExtensionManifest {
-            name: "zqxw971-avail".to_string(),
-            display_name: "ZQXW971 Available Ext".to_string(),
-            ..Default::default()
-        }]);
-        engine.ext_panel_active = Some("zqxw971-marketplace-via-ext-panel".to_string());
-        engine.ext_panel_has_focus = true;
-        if !engine.app_shell.sidebar_visible() {
-            engine.app_shell.toggle_sidebar();
-        }
-        engine
-    }
-
-    /// #971: the ext-panel body's "AVAILABLE" section header, clicked
-    /// anywhere inside its own painted glyphs, must always toggle *that*
-    /// section — never the row painted immediately below it.
-    ///
-    /// This exercises `Engine::handle_ext_sidebar_ui_event` ->
-    /// `ext_sidebar_system.handle_cached`, the same cached-`SidebarSystem`
-    /// pattern the SC panel test above pins. It does **not** exercise
-    /// `render::SidebarBodyGeometry::content_row` — #971's own
-    /// "highest-suspicion" independent row formula — because that formula
-    /// is wired *only* to `render::route_sidebar_hover`'s `ExtPanel` arm
-    /// (a `MouseMoved`-only path, never a click), and the hover it drives
-    /// only ever produces a *delayed* (350ms dwell) popup gated on a
-    /// second, currently-disconnected registry
-    /// (`Engine::resolve_panel_hover_item_id` reads `ext_panels`/
-    /// `ext_panel_items`, populated only for a plugin with a live
-    /// registration — unrelated to what `ext_sidebar_system` actually
-    /// paints here). Neither half produces an immediately-painted signal a
-    /// headless driver can read without first fixing that unrelated
-    /// mismatch, which is out of this issue's scope. See this issue's PR
-    /// notes for the follow-up this gap needs.
-    ///
-    /// Uses `sweep_hit_band_integrity_resetting`, not
-    /// `sweep_hit_band_integrity` — see
-    /// `sc_panel_header_click_hit_band_matches_the_painted_row`'s own
-    /// comment on the double-click coalescing this sidesteps. "AVAILABLE"
-    /// is section 1 (`ext_sidebar_system`'s own `SidebarSectionDef` order:
-    /// `["installed", "available"]`, `Engine::new`).
-    ///
-    /// Fingerprint: is the one available extension's distinctive display
-    /// name still painted? A correct hit collapses the "available"
-    /// section, hiding its one row; a mis-hit lands on the row itself
-    /// (`SidebarEvent::RowSelected`), which changes nothing painted,
-    /// disagreeing with the header-hit baseline.
-    #[test]
-    fn ext_panel_header_click_hit_band_matches_the_painted_row() {
-        use quadraui::testing::ConformanceDriver;
-
-        let (_guards, engine, mut driver) =
-            driver_with_engine(engine_with_marketplace_as_ext_panel());
-
-        assert!(
-            driver.screen_contains("AVAILABLE") && driver.screen_contains("ZQXW971 Available Ext"),
-            "precondition: the ext panel must paint the AVAILABLE header \
-             and its one row; painted text was {:?}",
-            driver.painted_texts()
-        );
-
-        // Sanity — see `sc_panel_header_click_hit_band_matches_the_painted_row`'s
-        // own comment on why this is needed before trusting the sweep below.
-        let center = center_of(&driver, "AVAILABLE");
-        driver.click(center.0, center.1);
-        assert!(
-            !driver.screen_contains("ZQXW971 Available Ext"),
-            "sanity: a header click must actually collapse the AVAILABLE \
-             section, hiding its one row; painted text was {:?}",
-            driver.painted_texts()
-        );
-        engine
-            .borrow_mut()
-            .ext_sidebar_system
-            .borrow_mut()
-            .set_collapsed(1, false);
-        driver.render();
-        assert!(
-            driver.screen_contains("ZQXW971 Available Ext"),
-            "sanity restore: re-expanding the section directly must bring \
-             its row back; painted text was {:?}",
-            driver.painted_texts()
-        );
-
-        crate::harness::sweep_hit_band_integrity_resetting(
-            &mut driver,
-            "AVAILABLE",
-            5,
-            |d| {
-                // Break `MacBackend`'s `DoubleClickDetector` position match
-                // before every real probe — see
-                // `sc_panel_header_click_hit_band_matches_the_painted_row`'s
-                // identical comment for the full story.
-                d.click(W as f32 - 20.0, H as f32 - 20.0);
-                engine
-                    .borrow_mut()
-                    .ext_sidebar_system
-                    .borrow_mut()
-                    .set_collapsed(1, false);
-                d.render();
-            },
-            |d| ConformanceDriver::inventory(d).screen_has("ZQXW971 Available Ext"),
-        );
-    }
+    // #1089's own retirement: `ext_panel_header_click_hit_band_matches_the_
+    // painted_row` and its fixture (`engine_with_marketplace_as_ext_panel`)
+    // used to live here. That fixture set `ext_panel_active` to a name with
+    // **no** `PanelRegistration` — a hack that only made sense while
+    // `App::paint_sidebar_panel_rung`'s `ext:` arm unconditionally painted
+    // the extension marketplace regardless of which plugin id was active.
+    // Now that the arm paints a real `PanelRegistration`'s own sections
+    // (#1089), that fixture paints nothing and the test fails on its own
+    // precondition. The property it existed to pin — a section-header
+    // click, swept across its whole painted band, always toggles *that*
+    // header and no other — is now covered against a genuine plugin panel,
+    // on this backend too, by `crate::harness::plugin_panel`'s
+    // `plugin_panel_section_header_hit_band_on_macos`
+    // (`src/harness/plugin_panel/tests.rs`), built on
+    // `engine_with_plugin_panel` (a real registration + `ext_panel_items`)
+    // per that issue's own "Shape of the work" item 3.
 
     /// #971: a unified-picker (fuzzy file finder) result row, clicked
     /// anywhere inside its own painted glyphs, must always select *that*

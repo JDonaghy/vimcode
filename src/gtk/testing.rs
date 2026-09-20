@@ -5270,14 +5270,14 @@ mod panel_surfaces {
     /// both backends: GTK's `App::paint_bottom_band` calls
     /// `render::panel_hover_popup_paint` unconditionally whenever
     /// `screen.panel_hover` is set (`src/app.rs`'s `BottomOp::PanelHover`
-    /// arm), with no gate on `panel_name` — so the fixed anchor math is
-    /// exercised on GTK even though nothing under `src/gtk/`/`src/app.rs`
-    /// paints a plugin ext panel's own tree body yet
-    /// (`render::ext_panel_to_tree_view` has exactly one caller today, TUI's
-    /// `tui_main::panels::render_ext_panel`). That means there's no painted
-    /// row text on this backend to `find_bounds` against the way the TUI
-    /// test locates the hovered row, so this instead asserts the invariant
-    /// the fix establishes: the popup's anchor depends only on the
+    /// arm), with no gate on `panel_name`. Written while GTK's `ext:` arm
+    /// still fell through to the extension marketplace (#1089 fixed that
+    /// separately — `App::paint_sidebar_panel_rung` now paints this
+    /// fixture's own row text too), so this predates having painted row
+    /// text to `find_bounds` against the way the TUI test locates the
+    /// hovered row; kept as-is since it still asserts the stronger,
+    /// backend-agnostic invariant the fix established: the popup's anchor
+    /// depends only on the
     /// *on-screen* row (`item_index - ext_panel_scroll_top`), never on the
     /// raw flat index or the scroll offset individually. Two fixtures reach
     /// the same on-screen row (3) via different (scroll_top, item_index)
@@ -11434,11 +11434,9 @@ mod editor_mouse_rungs {
             !h.driver.screen_contains("ZQXWEXT757"),
             "precondition: the explorer must not be what's painted while \
              ext_panel_active is set — GTK's `id.starts_with(\"ext:\")` arm \
-             (a pre-existing gap, not this issue's to fix) renders the \
-             built-in Extensions *marketplace* tree for any plugin panel \
-             id rather than the specific plugin's own content, so this \
-             checks the explorer's absence rather than the (unrelated)\
-             marketplace's presence; painted: {:?}",
+             paints this registration's own (here, empty) sections via \
+             `render::ext_panel_to_tree_view` (#1089), not the explorer \
+             tree, so this checks the explorer's absence; painted: {:?}",
             h.driver.painted_texts()
         );
 
@@ -12924,23 +12922,6 @@ mod hit_band_sweep_971 {
         engine
     }
 
-    /// Mirrors `src/macos/mod.rs::mac_driver_tests::engine_with_marketplace_as_ext_panel`
-    /// exactly.
-    fn engine_with_marketplace_as_ext_panel() -> Engine {
-        let mut engine = plain_engine();
-        engine.ext_registry = Some(vec![crate::core::extensions::ExtensionManifest {
-            name: "zqxw971-avail".to_string(),
-            display_name: "ZQXW971 Available Ext".to_string(),
-            ..Default::default()
-        }]);
-        engine.ext_panel_active = Some("zqxw971-marketplace-via-ext-panel".to_string());
-        engine.ext_panel_has_focus = true;
-        if !engine.app_shell.sidebar_visible() {
-            engine.app_shell.toggle_sidebar();
-        }
-        engine
-    }
-
     /// Centre point of the first painted text run containing `needle` —
     /// mirrors `src/macos/mod.rs::mac_driver_tests::center_of` exactly.
     fn center_of<D: ConformanceDriver>(driver: &D, needle: &str) -> (f32, f32) {
@@ -13034,78 +13015,23 @@ mod hit_band_sweep_971 {
         );
     }
 
-    /// #971: the ext-panel body's "AVAILABLE" section header, clicked
-    /// anywhere inside its own painted glyphs, must always toggle *that*
-    /// section — never the row painted immediately below it. The GTK twin
-    /// of `mac_driver_tests::ext_panel_header_click_hit_band_matches_the_painted_row`
-    /// — see that test's own doc for the full rationale, including why it
-    /// does not exercise `render::SidebarBodyGeometry::content_row` (out of
-    /// scope — that formula is wired only to a currently-disconnected hover
-    /// path).
-    ///
-    /// **RED-verification (#971):** reverting `App::paint_sidebar_panel_rung`'s
-    /// `PANEL_EXTENSIONS`/`ext:` arms to drop their `set_backend_info` call
-    /// takes this test red on GTK the same way it does on macOS — the
-    /// sanity click stops collapsing the section, so the sanity assertion
-    /// fires before the sweep runs. Confirmed locally with `cargo test
-    /// --features gui ext_panel_header_click_hit_band_matches_the_painted_row_gtk`
-    /// before restoring the fix.
-    #[test]
-    fn ext_panel_header_click_hit_band_matches_the_painted_row_gtk() {
-        let mut h = conformance_harness(engine_with_marketplace_as_ext_panel(), W, H);
-
-        assert!(
-            h.driver.screen_contains("AVAILABLE")
-                && h.driver.screen_contains("ZQXW971 Available Ext"),
-            "precondition: the ext panel must paint the AVAILABLE header \
-             and its one row; painted text was {:?}",
-            h.driver.painted_texts()
-        );
-
-        // Sanity — see `sc_panel_header_click_hit_band_matches_the_painted_row_gtk`'s
-        // own comment on why this is needed before trusting the sweep below.
-        let center = center_of(&h.driver, "AVAILABLE");
-        h.driver.click(center.0, center.1);
-        assert!(
-            !h.driver.screen_contains("ZQXW971 Available Ext"),
-            "sanity: a header click must actually collapse the AVAILABLE \
-             section, hiding its one row; painted text was {:?}",
-            h.driver.painted_texts()
-        );
-        h.engine
-            .borrow_mut()
-            .ext_sidebar_system
-            .borrow_mut()
-            .set_collapsed(1, false);
-        h.driver.render();
-        assert!(
-            h.driver.screen_contains("ZQXW971 Available Ext"),
-            "sanity restore: re-expanding the section directly must bring \
-             its row back; painted text was {:?}",
-            h.driver.painted_texts()
-        );
-
-        let engine = h.engine.clone();
-        crate::harness::sweep_hit_band_integrity_resetting(
-            &mut h.driver,
-            "AVAILABLE",
-            5,
-            |d| {
-                // Break the `DoubleClickDetector`'s position match before
-                // every real probe — see
-                // `sc_panel_header_click_hit_band_matches_the_painted_row_gtk`'s
-                // identical comment for the full story.
-                d.click(W as f32 - 20.0, H as f32 - 20.0);
-                engine
-                    .borrow_mut()
-                    .ext_sidebar_system
-                    .borrow_mut()
-                    .set_collapsed(1, false);
-                d.render();
-            },
-            |d| ConformanceDriver::inventory(d).screen_has("ZQXW971 Available Ext"),
-        );
-    }
+    // #1089's own retirement: `ext_panel_header_click_hit_band_matches_the_
+    // painted_row_gtk` used to live here, pointed at a fixture
+    // (`engine_with_marketplace_as_ext_panel`) that set `ext_panel_active`
+    // to a name with **no** `PanelRegistration` — a fixture hack that only
+    // ever made sense while `App::paint_sidebar_panel_rung`'s `ext:` arm
+    // unconditionally painted the extension marketplace regardless of
+    // which plugin id was active. Now that the arm paints a real
+    // `PanelRegistration`'s own sections (#1089), that fixture paints
+    // nothing (no registration means `render::build_ext_panel_data`
+    // returns `None`) and the test fails on its own precondition. The
+    // property it existed to pin — a section-header click, swept across
+    // its whole painted band, always toggles *that* header and no other —
+    // is now covered against a genuine plugin panel by
+    // `crate::harness::plugin_panel`'s `plugin_panel_section_header_hit_
+    // band_on_gtk` (`src/harness/plugin_panel/tests.rs`), built on
+    // `engine_with_plugin_panel` (a real registration + `ext_panel_items`)
+    // per that issue's own "Shape of the work" item 3.
 }
 
 // ─── #991: merge-conflict rows in the Source Control panel (GTK) ─────────

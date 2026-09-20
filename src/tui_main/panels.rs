@@ -580,6 +580,7 @@ pub(super) fn render_ext_panel(
         render::TUI_MINIMAP_SIZING,
     );
     let Some(ref panel) = screen.ext_panel else {
+        engine.ext_panel_tree_layout.replace(None);
         return;
     };
 
@@ -629,6 +630,16 @@ pub(super) fn render_ext_panel(
         );
         backend.set_theme(super::quadraui_tui::q_theme(theme));
         backend.draw_tree(body_q_rect, &tree);
+        // #1089: cache the exact `Backend::tree_layout` this frame painted
+        // with — the click router (`render::route_ext_panel_click`, shared
+        // with the GTK/macOS/Win `App`) reads this instead of re-deriving
+        // row geometry from a uniform row height. See
+        // `Engine::ext_panel_tree_layout`'s own doc for why that matters on
+        // the pixel backends even though TUI's own rows are uniform.
+        let tree_layout = backend.tree_layout(body_q_rect, &tree);
+        engine
+            .ext_panel_tree_layout
+            .replace(Some((body_q_rect, tree_layout)));
 
         // Scrollbar: `draw_tree` doesn't render scrollbars yet. Total
         // visible rows = tree.rows.len() (sections + their expanded items,
@@ -684,6 +695,8 @@ pub(super) fn render_ext_panel(
                 ),
                 scrollbar: ext_panel_scrollbar,
             });
+    } else {
+        engine.ext_panel_tree_layout.replace(None);
     }
 
     // ── Help popup overlay ──────────────────────────────────────────────────

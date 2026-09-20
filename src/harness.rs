@@ -1314,41 +1314,31 @@ pub(crate) fn assert_text_metrics_backend_applies_metrics<B: TextMetricsBackend>
 // instead of ever reaching the picker's own dismiss routing. Folded into
 // the same `intercepts_blocked` gate every panel intercept already shares.
 pub(crate) const KNOWN_BUGS: &[&str] = &[
-    // ── #1090's plugin-panel scenarios, on every lane that is not
-    // `tui_prod` ──────────────────────────────────────────────────────
+    // ── #1090's plugin-panel scenarios, macOS arm only ──────────────────
     //
-    // Not a new bug and not a regression: #1089, already filed, is that
-    // `crate::app::App` — the cross-backend-shared shell `gtk`, `macos`,
-    // `win` and the `tui` *control* arm all wrap — paints every
-    // `ext:<name>` panel through `render::populate_ext_sidebar_system`,
-    // which builds its rows from the extension **marketplace** manifest
-    // list regardless of which plugin id is active (`src/app.rs`, the
-    // `id if id.starts_with("ext:")` arm). A `PanelRegistration`'s own
-    // sections reach the screen through exactly one call site in this
-    // crate — `crate::tui_main::panels::render_ext_panel` ->
-    // `render::ext_panel_to_tree_view` — which only the shipped TUI shell
-    // (`TuiShellApp`, the `tui_prod` arm) goes through.
+    // #1089 fixed the shared `crate::app::App` paint/click path
+    // (`src/app.rs`'s `ext:` arm + `try_route_sidebar_mouse_event`'s
+    // `ExtPanel` arm) that `gtk`, `macos`, `win` and the `tui` *control*
+    // arm all wrap — it now paints a `PanelRegistration`'s own sections via
+    // `render::ext_panel_to_tree_view` + `Backend::draw_tree`, the same
+    // adapter `tui_main::panels::render_ext_panel` (the `tui_prod` arm) was
+    // already using, instead of falling through to the extension
+    // marketplace (`render::populate_ext_sidebar_system`) for every
+    // `ext:<name>` id. The `gtk` and `tui` (shared `App`) arms below are
+    // confirmed green as of that fix — their entries are gone from this
+    // list.
     //
-    // So each body below asserts *correct* plugin-panel behaviour against
-    // a backend that paints a different panel entirely, and fails on its
-    // own precondition ("SEC_COMMITS is not painted"). #1090 is explicit
-    // that this is the intended outcome — "land the scenarios, let the GUI
-    // lanes go red, and let #1089 turn them green" — and equally explicit
-    // that they must not be `#[cfg]`-gated per backend, which would make
-    // them vacuously pass. This gate is the opposite of vacuous: the
-    // moment #1089's fix makes one of these pass, `known_bug_gate` fails
-    // the build until its entry here is deleted.
-    "plugin_panel_section_header_hit_band::gtk", // #1089
-    "plugin_panel_item_row_hit_band::gtk",       // #1089
-    "plugin_panel_section_header_hit_band_scrolled::gtk", // #1089
-    "plugin_panel_section_header_hit_band_with_search_input::gtk", // #1089
-    "plugin_panel_hover_card_anchors::gtk",      // #1089
-    "plugin_panel_reveal_selects_the_revealed_row::gtk", // #1089
-    "plugin_panel_section_header_hit_band::tui", // #1089
-    "plugin_panel_item_row_hit_band::tui",       // #1089
+    // The `macos` arm is left gated: this fix was written and verified on
+    // Linux (no macOS runner in this environment — see `docs/RELEASING.md`'s
+    // per-backend lane notes), and while the paint/click code it exercises
+    // is the identical shared `App` path, `PROJECT_STATE.md`'s existing
+    // "needs macmini confirmation" pattern applies here too rather than
+    // assuming platform parity sight-unseen. The moment a macOS run finds
+    // one of these passing, `known_bug_gate` fails loudly with the exact
+    // entry to delete — this is not a silent bit to lose track of.
     "plugin_panel_section_header_hit_band::macos", // #1089
-    "plugin_panel_item_row_hit_band::macos",     // #1089
-    "plugin_panel_hover_card_anchors::macos",    // #1089
+    "plugin_panel_item_row_hit_band::macos",       // #1089
+    "plugin_panel_hover_card_anchors::macos",      // #1089
 ];
 
 /// A saved `std::panic::set_hook`/`take_hook` closure — named so
@@ -1939,7 +1929,31 @@ mod tests {
 mod issue_983_row_click_selects_the_row_below {
     use super::*;
     use crate::core::engine::sidebar::PANEL_SETTINGS;
-    use crate::core::extensions::ExtensionManifest;
+
+    // #1089's own retirement: this module used to also carry
+    // `engine_git_insights_scrolled_to_available` and four tests built on
+    // it (`ext_panel_row_click_below_its_glyph_hits_its_own_row_gtk`,
+    // `ext_panel_row_click_above_its_glyph_hits_its_own_row_gtk`,
+    // `ext_panel_row_sweep_hit_band_integrity_gtk`,
+    // `ext_panel_row_sweep_hit_band_integrity_tui`). That fixture set
+    // `ext_panel_active` to `"git-insights"` — a name with **no**
+    // `PanelRegistration` — and its own doc comment named exactly the gap
+    // #1089 closes: "`Engine::populate_ext_sidebar_system` … always builds
+    // its rows from the *marketplace* manifest list, regardless of which
+    // plugin id is active — a separate, already-documented gap … not this
+    // issue's [#983's] to fix." Now that `App::paint_sidebar_panel_rung`'s
+    // `ext:` arm paints a real `PanelRegistration`'s own sections (#1089),
+    // that fixture paints nothing and all four tests fail on their shared
+    // precondition ("AVAILABLE" is not painted). The edge-of-glyph and
+    // sweep-integrity properties they existed to pin are now covered
+    // against a genuine plugin panel by `crate::harness::plugin_panel`
+    // (`src/harness/plugin_panel/tests.rs`'s `plugin_panel_section_header_
+    // hit_band_on_gtk`/`_on_tui_shared_app` and `plugin_panel_item_row_hit_
+    // band_on_gtk`/`_on_tui_shared_app`), built on `engine_with_plugin_panel`
+    // (a real registration + `ext_panel_items`) per #1089's own "Shape of
+    // the work" item 3. The settings-panel half of this module (unaffected
+    // by #1089 — Settings paints through `FormController`, not
+    // `ext_sidebar_system`) stays below.
 
     /// The Settings panel, scrolled so the "LSP" category — flat row 47 of
     /// 62, well below row 0 per this issue's own instruction not to reuse
@@ -1961,86 +1975,31 @@ mod issue_983_row_click_selects_the_row_below {
         engine
     }
 
-    /// The ext-panel / plugin-panel family, with enough filler *installed*
-    /// rows (20) ahead of one *available* extension that the "AVAILABLE"
-    /// section header itself paints well below row 0 — same "well below
-    /// row 0" requirement as the settings fixture above, applied to the
-    /// panel this repo can actually paint content rows for.
-    ///
-    /// `ext_panel_active` is set to `"git-insights"` — the actual reported
-    /// panel's name — rather than opening the built-in Extensions
-    /// marketplace panel (`PANEL_EXTENSIONS`) directly. This is not merely
-    /// cosmetic: `Engine::populate_ext_sidebar_system` (the function every
-    /// `ext:<plugin>` panel id paints through, per `App`'s `id.starts_with
-    /// ("ext:")` render arm) always builds its rows from the *marketplace*
-    /// manifest list, regardless of which plugin id is active — a
-    /// separate, already-documented gap (see
-    /// `gtk::testing::focused_plugin_panel_outranks_a_stale_explorer_flag_on_gtk`'s
-    /// own doc), not this issue's to fix. So this fixture genuinely routes
-    /// through the git-insights plugin panel's own click/paint path; what
-    /// it happens to *show* while doing so is marketplace content, which is
-    /// exactly the shared `SidebarSystem` plumbing the actual git-insights
-    /// panel would use for its own rows once that other gap is closed.
-    fn engine_git_insights_scrolled_to_available() -> Engine {
-        let mut engine = Engine::new_for_test();
-        engine.settings.use_nerd_fonts = Some(false);
-        let mut manifests: Vec<ExtensionManifest> = (0..20)
-            .map(|i| ExtensionManifest {
-                name: format!("zqxw983installed{i}"),
-                display_name: format!("Zqxw983Installed{i}"),
-                ..Default::default()
-            })
-            .collect();
-        for m in &manifests {
-            engine
-                .extension_state
-                .mark_installed_version(&m.name, "1.0.0");
-        }
-        manifests.push(ExtensionManifest {
-            name: "zqxw983avail".to_string(),
-            display_name: "Zqxw983Avail".to_string(),
-            ..Default::default()
-        });
-        engine.ext_registry = Some(manifests);
-        engine.ext_panel_active = Some("git-insights".to_string());
-        engine.ext_panel_has_focus = true;
-        if !engine.app_shell.sidebar_visible() {
-            engine.app_shell.toggle_sidebar();
-        }
-        engine
-    }
-
     // ── Deliverable 1: click the padding strip on *both* sides of a row's
     // own text glyph, well below row 0, and assert the painted outcome
     // landed on the clicked row ────────────────────────────────────────
     //
-    // Hand-written rather than `backend_conformance!`-registered for two
-    // reasons. (a) They are GTK-only by construction — see this module's
-    // top doc — so the macro's per-backend expansion buys nothing. (b) The
-    // probe point is derived from the frame's own *pixels*
-    // (`GtkDriver::pixel`, via `harness::painted_row_band`), and `pixel` is
-    // an inherent `GtkDriver` method, not part of the backend-neutral
-    // `ConformanceDriver` trait the macro's `|driver|` body is generic
-    // over. The pre-existing `ext_panel_row_sweep_hit_band_integrity_gtk`
-    // below is hand-written for its own (different) reason already.
+    // Hand-written rather than `backend_conformance!`-registered: they are
+    // GTK-only by construction — see this module's top doc — so the
+    // macro's per-backend expansion buys nothing, and (b) the probe point
+    // is derived from the frame's own *pixels* (`GtkDriver::pixel`, via
+    // `harness::painted_row_band`), and `pixel` is an inherent `GtkDriver`
+    // method, not part of the backend-neutral `ConformanceDriver` trait the
+    // macro's `|driver|` body is generic over.
     //
-    // RED-verification (#1028): these are not green by accident — two
-    // perturbations were run and confirmed red before being reverted.
-    //
-    // 1. Widen the returned band by a single pixel past the measured
-    //    boundary (`(b.0, b.1 + 1.0)` in `probe_band`) and both
-    //    `BelowGlyph` tests fail on the *final* assertion — settings at
-    //    "y=421.5, band [389, 422)", ext panel at "y=773.5, band
-    //    [741, 774)" — because that one extra pixel is already the first
-    //    row of the *next* row's fill, and the click lands there. That
-    //    one-pixel sensitivity is the whole content of these tests: they
-    //    pin paint and hit to the same boundary, which is exactly what a
-    //    #967-family drift would break.
-    // 2. Seed `probe_band` off a *neighbouring* row ("Enable LSP" instead
-    //    of "▼ LSP"; "Zqxw983Avail" instead of "AVAILABLE") and all four
-    //    fail on the band-containment sanity assert ("the measured band
-    //    [421, 461) must contain \"▼ LSP\"'s own glyph ([393.5, 416.5])"),
-    //    so a mis-seeded band can never masquerade as a passing probe.
+    // RED-verification (#1028): these are not green by accident —
+    // widening the returned band by a single pixel past the measured
+    // boundary (`(b.0, b.1 + 1.0)` in `probe_band`) fails the
+    // `BelowGlyph` test on its *final* assertion ("y=421.5, band
+    // [389, 422)") — because that one extra pixel is already the first
+    // row of the *next* row's fill, and the click lands there. That
+    // one-pixel sensitivity is the whole content of these tests: they
+    // pin paint and hit to the same boundary, which is exactly what a
+    // #967-family drift would break. Seeding `probe_band` off a
+    // *neighbouring* row ("Enable LSP" instead of "▼ LSP") likewise fails
+    // on the band-containment sanity assert ("the measured band [421, 461)
+    // must contain \"▼ LSP\"'s own glyph ([393.5, 416.5])"), so a
+    // mis-seeded band can never masquerade as a passing probe.
 
     /// `needle`'s painted background band, measured off the pixels of the
     /// frame currently on screen.
@@ -2108,65 +2067,14 @@ mod issue_983_row_click_selects_the_row_below {
         );
     }
 
-    #[cfg(feature = "gui")]
-    #[test]
-    fn ext_panel_row_click_below_its_glyph_hits_its_own_row_gtk() {
-        let mut h = crate::gtk::testing::conformance_harness(
-            engine_git_insights_scrolled_to_available(),
-            1400,
-            900,
-        );
-        assert!(
-            h.driver.screen_has("AVAILABLE") && h.driver.screen_has("Zqxw983Avail"),
-            "precondition: the ext panel must paint the pushed-down AVAILABLE \
-             header and its one row; painted: {:?}",
-            h.driver.inventory().text_runs()
-        );
-        let band = probe_band(&mut h.driver, "AVAILABLE", 900);
-        crate::harness::row_click_in_its_painted_band_hits_its_own_row(
-            &mut h.driver,
-            "AVAILABLE",
-            "Zqxw983Avail",
-            band,
-            crate::harness::RowBandEdge::BelowGlyph,
-            |d| !d.screen_has("Zqxw983Avail"),
-        );
-    }
-
-    #[cfg(feature = "gui")]
-    #[test]
-    fn ext_panel_row_click_above_its_glyph_hits_its_own_row_gtk() {
-        let mut h = crate::gtk::testing::conformance_harness(
-            engine_git_insights_scrolled_to_available(),
-            1400,
-            900,
-        );
-        assert!(
-            h.driver.screen_has("AVAILABLE") && h.driver.screen_has("Zqxw983Avail"),
-            "precondition: the ext panel must paint the pushed-down AVAILABLE \
-             header and its one row; painted: {:?}",
-            h.driver.inventory().text_runs()
-        );
-        let band = probe_band(&mut h.driver, "AVAILABLE", 900);
-        crate::harness::row_click_in_its_painted_band_hits_its_own_row(
-            &mut h.driver,
-            "AVAILABLE",
-            "Zqxw983Avail",
-            band,
-            crate::harness::RowBandEdge::AboveGlyph,
-            |d| !d.screen_has("Zqxw983Avail"),
-        );
-    }
-
-    // ── Deliverable 2: sweep_hit_band_integrity over a settings row and
-    // an ext-panel row — the "similar bugs" generalization. These sample
-    // strictly inside the needle's own painted glyph bounds (per that
-    // helper's own contract), i.e. the interior of the band Deliverable 1
-    // above probes the *edges* of (see
-    // `row_click_in_its_painted_band_hits_its_own_row`'s doc) — so both are
+    // ── Deliverable 2: sweep_hit_band_integrity over a settings row — the
+    // "similar bugs" generalization. Samples strictly inside the needle's
+    // own painted glyph bounds (per that helper's own contract), i.e. the
+    // interior of the band Deliverable 1 above probes the *edges* of (see
+    // `row_click_in_its_painted_band_hits_its_own_row`'s doc) — so this is
     // expected to pass today, on every backend, with no KNOWN_BUGS entry.
-    // What they protect against is a *different*, #967-style regression
-    // creeping into either row-pitch formula later, and they cost nothing
+    // What it protects against is a *different*, #967-style regression
+    // creeping into the row-pitch formula later, and it costs nothing
     // extra to also run on TUI (`ConformanceDriver + DriverInput` is
     // TUI's own bound, not a GTK-only one — see this module's top doc on
     // "Which trait bound a scenario needs"), nor on `tui_prod` (#1043) —
@@ -2191,110 +2099,6 @@ mod issue_983_row_click_selects_the_row_below {
             });
         },
     }
-
-    // Not via `backend_conformance!`: this probe's fingerprint (the
-    // AVAILABLE section's collapsed flag) needs to be force-reset via
-    // direct `engine` access between samples, which the macro's
-    // `|driver|`-only body has no way to reach. Same reason #971's own
-    // GTK/macOS twins of this exact probe
-    // (`ext_panel_header_click_hit_band_matches_the_painted_row_gtk`)
-    // are hand-written rather than macro-generated — mirrored here,
-    // just with the AVAILABLE header pushed well below row 0 instead of
-    // sitting at the top of an empty installed section.
-    //
-    // `sweep_hit_band_integrity` (used for the settings probe above, and
-    // for #971's *own* explorer/picker probes) assumes two clicks at the
-    // same point cancel out. That assumption breaks here: quadraui's
-    // `DoubleClickDetector` folds two same-spot `MouseDown`s in quick
-    // succession into a `DoubleClick` on every backend, and
-    // `SidebarSystem::double_click` has no header case (see #971's own
-    // doc on `sc_panel_header_click_hit_band_matches_the_painted_row_gtk`
-    // for the full mechanism) — so a plain same-point restore click
-    // silently no-ops instead of re-expanding the section, and later
-    // samples (landing at different y offsets, which *don't* trip the
-    // detector) toggle from whatever state was actually left behind
-    // rather than from a known baseline. Confirmed by observation before
-    // settling on `_resetting` here: the plain sweep produced an
-    // alternating true/false/true/false/true outcome sequence — exactly
-    // the shape a silently-skipped restore produces, not a real
-    // row-index-dependent hit-band disagreement.
-    #[cfg(feature = "gui")]
-    #[test]
-    fn ext_panel_row_sweep_hit_band_integrity_gtk() {
-        let mut h = crate::gtk::testing::conformance_harness(
-            engine_git_insights_scrolled_to_available(),
-            1400,
-            900,
-        );
-        assert!(
-            h.driver.screen_has("Zqxw983Avail"),
-            "precondition: the pushed-down AVAILABLE row must be painted"
-        );
-        let engine = h.engine.clone();
-        crate::harness::sweep_hit_band_integrity_resetting(
-            &mut h.driver,
-            "AVAILABLE",
-            5,
-            |d| {
-                // Break the `DoubleClickDetector`'s position match before
-                // every real probe (a harmless corner of the window, well
-                // clear of the sidebar) — see this test's own doc.
-                d.click(1380.0, 880.0);
-                engine
-                    .borrow_mut()
-                    .ext_sidebar_system
-                    .borrow_mut()
-                    .set_collapsed(1, false);
-                d.render();
-            },
-            |d| ConformanceDriver::screen_has(d, "Zqxw983Avail"),
-        );
-    }
-
-    #[test]
-    fn ext_panel_row_sweep_hit_band_integrity_tui() {
-        let mut h = crate::tui_main::testing::conformance_harness(
-            engine_git_insights_scrolled_to_available(),
-            1400,
-            900,
-        );
-        assert!(
-            h.driver.screen_has("Zqxw983Avail"),
-            "precondition: the pushed-down AVAILABLE row must be painted"
-        );
-        let engine = h.engine.clone();
-        crate::harness::sweep_hit_band_integrity_resetting(
-            &mut h.driver,
-            "AVAILABLE",
-            5,
-            |d| {
-                d.click(1380.0, 880.0);
-                engine
-                    .borrow_mut()
-                    .ext_sidebar_system
-                    .borrow_mut()
-                    .set_collapsed(1, false);
-                d.render();
-            },
-            |d| ConformanceDriver::screen_has(d, "Zqxw983Avail"),
-        );
-    }
-
-    // #1043: deliberately no `_tui_prod` twin of the two tests above.
-    // Both need `h.engine.clone()` — a live `Rc<RefCell<Engine>>` handle
-    // that keeps working *after* the harness's own app is moved into
-    // `driver_with_shell` — to force-reset the section's collapsed flag
-    // between samples. `crate::tui_main::testing::conformance_harness_prod`
-    // cannot offer that: `App` (what `conformance_harness`, used above,
-    // wraps) stores its engine behind `Rc<RefCell<Engine>>` specifically so
-    // a harness can keep such a handle; `TuiShellApp` (what
-    // `conformance_harness_prod` wraps) owns its `Engine` directly, so
-    // `ConformanceHarness::engine` for that arm is a disconnected
-    // placeholder (see that function's own doc). Porting this scenario
-    // needs either a `TuiShellApp`-side accessor this harness-wiring issue
-    // does not add, or a rewrite of `sweep_hit_band_integrity_resetting`'s
-    // reset step to go through painted-output-only means — filed as a
-    // follow-up rather than silently skipped.
 }
 
 // #984: v0.11.0 bug report -- the file explorer's expand/collapse chevron
