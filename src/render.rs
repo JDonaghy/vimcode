@@ -18217,53 +18217,106 @@ pub fn view_row_to_buf_pos_wrap(
     (total_lines.saturating_sub(1), 0)
 }
 
+/// Offset table produced by expanding `'list'` glyphs (currently just
+/// `\t` -> `^I`) in a line's text. Every position-based field a
+/// `RenderedLine` carries for that line — byte-offset `StyledSpan`s *and*
+/// char-index `DiagnosticMark`/`SpellMark`s — must remap through this single
+/// table rather than recomputing the tab-expansion delta twice, which is how
+/// #1208 happened: the byte-offset remap for `spans` shipped in #1190 with no
+/// equivalent for the char-index diagnostic/spell marks.
+///
+/// Each tab is always exactly 1 byte *and* 1 char pre-expansion, and always
+/// exactly 2 bytes *and* 2 chars (`^I`) post-expansion, so the cumulative
+/// delta is numerically identical whether tracked in bytes or chars — only
+/// the breakpoint *position* to compare against differs. Hence one pass
+/// records both positions per tab, and two lookup methods share the same
+/// delta list.
+struct ListGlyphOffsets {
+    /// `(old_byte_offset_just_past_tab, old_char_offset_just_past_tab, cumulative_delta)`.
+    breakpoints: Vec<(usize, usize, i64)>,
+}
+
+impl ListGlyphOffsets {
+    fn identity() -> Self {
+        Self {
+            breakpoints: Vec::new(),
+        }
+    }
+
+    fn remap_byte(&self, old_byte: usize) -> usize {
+        let shift = self
+            .breakpoints
+            .iter()
+            .rev()
+            .find(|(bp, _, _)| *bp <= old_byte)
+            .map(|(_, _, d)| *d)
+            .unwrap_or(0);
+        (old_byte as i64 + shift) as usize
+    }
+
+    fn remap_char(&self, old_char: usize) -> usize {
+        let shift = self
+            .breakpoints
+            .iter()
+            .rev()
+            .find(|(_, bp, _)| *bp <= old_char)
+            .map(|(_, _, d)| *d)
+            .unwrap_or(0);
+        (old_char as i64 + shift) as usize
+    }
+}
+
+/// Expand `\t` to `^I` in `text`, returning the expanded text plus the offset
+/// table needed to remap any byte- or char-indexed position that pointed into
+/// the original `text` (see `ListGlyphOffsets`).
+fn compute_list_glyph_expansion(text: String) -> (String, ListGlyphOffsets) {
+    if !text.contains('\t') {
+        return (text, ListGlyphOffsets::identity());
+    }
+
+    let mut out = String::with_capacity(text.len());
+    let mut breakpoints: Vec<(usize, usize, i64)> = Vec::new();
+    let mut delta: i64 = 0;
+    for (old_char, (old_byte, ch)) in text.char_indices().enumerate() {
+        if ch == '\t' {
+            out.push('^');
+            out.push('I');
+            delta += 1; // 1 source byte/char -> 2 output bytes/chars
+            breakpoints.push((old_byte + ch.len_utf8(), old_char + 1, delta));
+        } else {
+            out.push(ch);
+        }
+    }
+
+    (out, ListGlyphOffsets { breakpoints })
+}
+
 /// Vim's `'list'` (#1190): apply the hardcoded default glyph set — a tab
 /// displays as literal `^I` instead of expanding to `'tabstop'` width, and
 /// the true end of line gets a trailing `$` — to one already-built
-/// `(raw_text, spans)` pair. This is Vim's own documented fallback when
-/// `'listchars'` has no `tab:`/`eol:` item (`:h 'listchars'`); full
-/// `'listchars'` support is the sibling value-option tranche.
+/// `(raw_text, spans, diagnostics, spell_errors)` tuple. This is Vim's own
+/// documented fallback when `'listchars'` has no `tab:`/`eol:` item
+/// (`:h 'listchars'`); full `'listchars'` support is the sibling
+/// value-option tranche. Callers must not call this for a fold-header line
+/// (`RenderedLine::is_fold_header`) — real vim's `'list'` never marks a
+/// closed fold's display text (#1208).
 ///
 /// `mark_eol` is `false` for every wrap-continuation segment except the
 /// last — the `$` belongs at the true end of the buffer line, not at each
 /// mid-line wrap point.
 ///
-/// Each tab is a single byte replaced by the 2-byte literal `^I`, which
-/// shifts the byte offset of everything after it on the line — `spans`
-/// (`RenderedLine::spans`' doc: byte-offset based) must be remapped to
-/// match, tracked here via `breakpoints` (old-byte-offset →
-/// cumulative-delta-after, built in text order so the last breakpoint at or
-/// before a given old offset gives that offset's total shift).
+/// Remaps `spans` (byte offsets), `diagnostics` and `spell_errors` (char
+/// indices) through one shared [`ListGlyphOffsets`] table computed from the
+/// expansion, rather than two parallel remap implementations that can drift
+/// out of sync (#1208).
 fn apply_list_glyphs(
     text: String,
     spans: Vec<StyledSpan>,
+    diagnostics: Vec<DiagnosticMark>,
+    spell_errors: Vec<SpellMark>,
     mark_eol: bool,
-) -> (String, Vec<StyledSpan>) {
-    if !text.contains('\t') {
-        // No tabs — no byte-offset remap needed, so no `spans` work at all.
-        if !mark_eol {
-            return (text, spans);
-        }
-        let text = match text.strip_suffix('\n') {
-            Some(stripped) => format!("{stripped}$\n"),
-            None => format!("{text}$"),
-        };
-        return (text, spans);
-    }
-
-    let mut out = String::with_capacity(text.len());
-    let mut breakpoints: Vec<(usize, i64)> = Vec::new();
-    let mut delta: i64 = 0;
-    for (old_byte, ch) in text.char_indices() {
-        if ch == '\t' {
-            out.push('^');
-            out.push('I');
-            delta += 1; // 1 source byte -> 2 output bytes
-            breakpoints.push((old_byte + ch.len_utf8(), delta));
-        } else {
-            out.push(ch);
-        }
-    }
+) -> (String, Vec<StyledSpan>, Vec<DiagnosticMark>, Vec<SpellMark>) {
+    let (mut out, offsets) = compute_list_glyph_expansion(text);
     if mark_eol {
         out = match out.strip_suffix('\n') {
             Some(stripped) => format!("{stripped}$\n"),
@@ -18271,25 +18324,31 @@ fn apply_list_glyphs(
         };
     }
 
-    let remap = |old_byte: usize| -> usize {
-        let shift = breakpoints
-            .iter()
-            .rev()
-            .find(|(bp, _)| *bp <= old_byte)
-            .map(|(_, d)| *d)
-            .unwrap_or(0);
-        (old_byte as i64 + shift) as usize
-    };
     let spans = spans
         .into_iter()
         .map(|s| StyledSpan {
-            start_byte: remap(s.start_byte),
-            end_byte: remap(s.end_byte),
+            start_byte: offsets.remap_byte(s.start_byte),
+            end_byte: offsets.remap_byte(s.end_byte),
             ..s
         })
         .collect();
+    let diagnostics = diagnostics
+        .into_iter()
+        .map(|d| DiagnosticMark {
+            start_col: offsets.remap_char(d.start_col),
+            end_col: offsets.remap_char(d.end_col),
+            ..d
+        })
+        .collect();
+    let spell_errors = spell_errors
+        .into_iter()
+        .map(|s| SpellMark {
+            start_col: offsets.remap_char(s.start_col),
+            end_col: offsets.remap_char(s.end_col),
+        })
+        .collect();
 
-    (out, spans)
+    (out, spans, diagnostics, spell_errors)
 }
 
 /// Slice `spans` to cover only the byte range `[seg_start_byte, seg_end_byte)`,
@@ -18879,10 +18938,30 @@ fn build_rendered_window(
                 let seg_spans = slice_spans_for_segment(&spans, seg_start_byte, seg_end_byte);
                 let is_cont = seg > 0;
                 let is_last_seg = seg + 1 == num_segments;
-                let (seg_text, seg_spans) = if list_mode {
-                    apply_list_glyphs(seg_text, seg_spans, is_last_seg)
+                // Diagnostics/spell marks are attached only to the segment
+                // that isn't a continuation (index-0-relative, same as
+                // `seg_text`), so they share that segment's glyph-expansion
+                // offset table rather than a separately-recomputed one (#1208).
+                let seg_diagnostics = if is_cont {
+                    Vec::new()
                 } else {
-                    (seg_text, seg_spans)
+                    line_diagnostics.clone()
+                };
+                let seg_spell_errors = if is_cont {
+                    Vec::new()
+                } else {
+                    line_spell_errors.clone()
+                };
+                let (seg_text, seg_spans, seg_diagnostics, seg_spell_errors) = if list_mode {
+                    apply_list_glyphs(
+                        seg_text,
+                        seg_spans,
+                        seg_diagnostics,
+                        seg_spell_errors,
+                        is_last_seg,
+                    )
+                } else {
+                    (seg_text, seg_spans, seg_diagnostics, seg_spell_errors)
                 };
                 lines.push(RenderedLine {
                     raw_text: seg_text,
@@ -18897,16 +18976,8 @@ fn build_rendered_window(
                     folded_line_count: 0,
                     line_idx,
                     git_diff: if is_cont { None } else { git_status },
-                    diagnostics: if is_cont {
-                        Vec::new()
-                    } else {
-                        line_diagnostics.clone()
-                    },
-                    spell_errors: if is_cont {
-                        Vec::new()
-                    } else {
-                        line_spell_errors.clone()
-                    },
+                    diagnostics: seg_diagnostics,
+                    spell_errors: seg_spell_errors,
                     diff_status,
                     is_breakpoint: !is_cont && is_breakpoint,
                     is_conditional_bp: !is_cont && is_conditional_bp,
@@ -18963,11 +19034,16 @@ fn build_rendered_window(
                 }
             }
         } else {
-            let (line_str, spans) = if list_mode {
-                apply_list_glyphs(line_str, spans, true)
-            } else {
-                (line_str, spans)
-            };
+            // 'list' glyphs never apply to fold-header summary lines (#1208)
+            // — real vim's 'list' doesn't touch the folded-line-count text,
+            // and this branch is also where non-wrapped lines land, so the
+            // gate has to live here rather than on `list_mode` alone.
+            let (line_str, spans, line_diagnostics, line_spell_errors) =
+                if list_mode && !is_fold_header {
+                    apply_list_glyphs(line_str, spans, line_diagnostics, line_spell_errors, true)
+                } else {
+                    (line_str, spans, line_diagnostics, line_spell_errors)
+                };
             lines.push(RenderedLine {
                 raw_text: line_str,
                 gutter_text,
@@ -30772,14 +30848,28 @@ mod slice7_router_tests {
 
     #[test]
     fn apply_list_glyphs_marks_eol_with_no_tabs() {
-        let (text, spans) = apply_list_glyphs("hello".to_string(), Vec::new(), true);
+        let (text, spans, diags, spells) = apply_list_glyphs(
+            "hello".to_string(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            true,
+        );
         assert_eq!(text, "hello$");
         assert!(spans.is_empty());
+        assert!(diags.is_empty());
+        assert!(spells.is_empty());
     }
 
     #[test]
     fn apply_list_glyphs_marks_eol_before_trailing_newline() {
-        let (text, _) = apply_list_glyphs("hello\n".to_string(), Vec::new(), true);
+        let (text, ..) = apply_list_glyphs(
+            "hello\n".to_string(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            true,
+        );
         assert_eq!(
             text, "hello$\n",
             "the $ must land before the newline, not after it"
@@ -30788,13 +30878,25 @@ mod slice7_router_tests {
 
     #[test]
     fn apply_list_glyphs_skips_eol_for_non_final_wrap_segment() {
-        let (text, _) = apply_list_glyphs("hello".to_string(), Vec::new(), false);
+        let (text, ..) = apply_list_glyphs(
+            "hello".to_string(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            false,
+        );
         assert_eq!(text, "hello", "mark_eol=false must not append $");
     }
 
     #[test]
     fn apply_list_glyphs_expands_tab_to_caret_i() {
-        let (text, _) = apply_list_glyphs("a\tb".to_string(), Vec::new(), false);
+        let (text, ..) = apply_list_glyphs(
+            "a\tb".to_string(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            false,
+        );
         assert_eq!(text, "a^Ib");
     }
 
@@ -30817,7 +30919,8 @@ mod slice7_router_tests {
             end_byte: 4,
             style: plain_style(),
         }];
-        let (text, spans) = apply_list_glyphs("a\tbc".to_string(), spans, false);
+        let (text, spans, ..) =
+            apply_list_glyphs("a\tbc".to_string(), spans, Vec::new(), Vec::new(), false);
         assert_eq!(text, "a^Ibc");
         assert_eq!(spans.len(), 1);
         assert_eq!(spans[0].start_byte, 3);
@@ -30834,14 +30937,47 @@ mod slice7_router_tests {
             end_byte: 5,
             style: plain_style(),
         }];
-        let (text, spans) = apply_list_glyphs("a\tb\tc".to_string(), spans, false);
+        let (text, spans, ..) =
+            apply_list_glyphs("a\tb\tc".to_string(), spans, Vec::new(), Vec::new(), false);
         assert_eq!(text, "a^Ib^Ic");
         assert_eq!(&text[spans[0].start_byte..spans[0].end_byte], "c");
     }
 
     #[test]
     fn apply_list_glyphs_combines_tab_and_eol() {
-        let (text, _) = apply_list_glyphs("a\tb".to_string(), Vec::new(), true);
+        let (text, ..) =
+            apply_list_glyphs("a\tb".to_string(), Vec::new(), Vec::new(), Vec::new(), true);
         assert_eq!(text, "a^Ib$");
+    }
+
+    #[test]
+    fn apply_list_glyphs_remaps_diagnostic_and_spell_marks_past_a_tab() {
+        // "\tfoo" — a diagnostic/spell mark on "foo" (char cols 1..4) must
+        // land on "^Ifoo"'s "foo" (char cols 2..5) once the tab expands to
+        // the 2-char `^I` (#1208 bug 1: these are char-index based, unlike
+        // `spans`, so they need their own remap through the same table).
+        let diags = vec![DiagnosticMark {
+            start_col: 1,
+            end_col: 4,
+            severity: crate::core::lsp::DiagnosticSeverity::Error,
+            message: "oops".to_string(),
+        }];
+        let spells = vec![SpellMark {
+            start_col: 1,
+            end_col: 4,
+        }];
+        let (text, _, diags, spells) =
+            apply_list_glyphs("\tfoo".to_string(), Vec::new(), diags, spells, false);
+        assert_eq!(text, "^Ifoo");
+        assert_eq!(diags[0].start_col, 2);
+        assert_eq!(diags[0].end_col, 5);
+        assert_eq!(spells[0].start_col, 2);
+        assert_eq!(spells[0].end_col, 5);
+        let chars: Vec<char> = text.chars().collect();
+        let marked: String = chars[diags[0].start_col..diags[0].end_col].iter().collect();
+        assert_eq!(
+            marked, "foo",
+            "diagnostic mark must land on 'foo', not shifted left"
+        );
     }
 }
