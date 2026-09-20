@@ -7672,7 +7672,14 @@ mod minimap {
         // sliding-window math is actually exercised rather than the
         // "whole file already fits" branch every other GTK minimap test in
         // this module happens to take.
-        let n_lines = 5_000usize;
+        //
+        // #1186: a 5,000-line buffer used to guarantee that (`target_lines`
+        // ~378, well under 5,000) — but #1186 lets the window grow up to
+        // `MINIMAP_MAX_COMPRESSION` (64, module-private in `render.rs`)
+        // times `target_lines`, i.e. up to ~24,192 lines here, comfortably
+        // swallowing 5,000 lines whole. 200,000 lines comfortably exceeds
+        // that compression ceiling too, so the window still has to slide.
+        let n_lines = 200_000usize;
         let mut engine = Engine::new_for_test();
         let text: String = (0..n_lines).map(|i| format!("line {i}\n")).collect();
         engine.buffer_mut().insert(0, &text);
@@ -7695,9 +7702,23 @@ mod minimap {
                 .iter()
                 .find(|m| m.window_id == win)
                 .expect("minimap must be present for the active pane");
+            // #1186: `mm.minimap.lines.len()` is a *block count*, not the
+            // real span of buffer lines the window covers — a block can now
+            // aggregate several real lines, so the two only agree when
+            // every block is exactly one line wide (`K == 1`). Multiply by
+            // the measured block width (the gap between the first two
+            // sampled lines) to recover the real span this test's
+            // assertions actually need.
+            let block_width = mm
+                .minimap
+                .lines
+                .get(1)
+                .map(|l| l.line_idx - mm.minimap.lines[0].line_idx)
+                .unwrap_or(1)
+                .max(1);
             (
                 mm.rect,
-                mm.minimap.lines.len(),
+                mm.minimap.lines.len() * block_width,
                 mm.minimap.lines.last().map(|l| l.line_idx).unwrap_or(0),
                 mm.minimap.total_buffer_lines,
             )
