@@ -18659,6 +18659,44 @@ mod tests {
         );
     }
 
+    /// #1206: `'laststatus'` `0` hides the status line entirely, regardless
+    /// of `'windowstatusline'` being on — `render::effective_window_status_line`
+    /// is what every status-visibility read site now goes through instead of
+    /// the raw `window_status_line` field.
+    ///
+    /// RED against unfixed `develop`: `'laststatus'` was still in
+    /// `UNIMPLEMENTED_VALUE_OPTIONS` (`:set laststatus=0` errored with
+    /// "recognised but not implemented yet"), and even ignoring that error,
+    /// nothing consulted the field, so the status line painted regardless.
+    #[test]
+    fn set_laststatus_0_hides_the_status_line_via_shell_app() {
+        let mut app = TuiShellApp::new(None);
+        app.engine.settings.window_status_line = true;
+        app.engine.buffer_mut().insert(0, "alpha\nbeta\ngamma\n");
+        app.engine.git_branch = None;
+
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        assert!(
+            driver.screen_contains("Ln 1, Col 1"),
+            "sanity: the status line must paint before 'laststatus' is touched; screen:\n{}",
+            driver.screen()
+        );
+
+        run_ex_command(&mut driver, ":set laststatus=0");
+        let screen = driver.screen();
+        assert!(
+            !screen.contains("Ln 1, Col 1"),
+            "'laststatus=0' must hide the status line entirely; screen:\n{screen}"
+        );
+
+        run_ex_command(&mut driver, ":set laststatus=2");
+        assert!(
+            driver.screen_contains("Ln 1, Col 1"),
+            "'laststatus=2' must bring the status line back; screen:\n{}",
+            driver.screen()
+        );
+    }
+
     /// #752: clicking a tab in an *unsplit* window must switch the painted
     /// editor pane to that tab's own buffer — regression coverage for the
     /// single-group arm of `handle_mouse` now delegating to
@@ -23637,6 +23675,15 @@ mod tests {
             driver.type_char(c);
         }
         driver.press_named(quadraui::NamedKey::Enter);
+        // #1206: Neovim's real default 'listchars' ("tab:> ,trail:-,nbsp:+")
+        // renders a tab as a fill of '>' + spaces, not literal ^I — clear it
+        // so this test keeps exercising the documented "no tab: item"
+        // fallback (`^I`) it's named for, independent of that default.
+        driver.type_char(':');
+        for c in "set listchars=".chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
         driver.render();
         assert!(
             driver.screen_contains("^Ib"),
@@ -23653,6 +23700,42 @@ mod tests {
         assert!(
             !driver.screen_contains("^Ib"),
             ":set nolist must go back to normal tab rendering; screen:\n{}",
+            driver.screen()
+        );
+    }
+
+    /// #1206: `'listchars'` end-to-end through `:set` — a custom `tab:`
+    /// glyph paints instead of the classic `^I` fallback, and disappears
+    /// again once `'list'` is switched off. Neovim's real default
+    /// `'listchars'` (`"tab:> ,trail:-,nbsp:+"`) is exercised directly here
+    /// too, by leaving it untouched.
+    ///
+    /// RED against unfixed `develop`: `'listchars'` was still in
+    /// `UNIMPLEMENTED_VALUE_OPTIONS` (`:set listchars=...` errored with
+    /// "recognised but not implemented yet"), and `'list'`'s own glyph
+    /// rendering was hardcoded to `^I`/`$`, so a `tab:>-` fill could never
+    /// appear on screen at all.
+    #[test]
+    fn set_listchars_custom_tab_glyph_paints_via_shell_app() {
+        let mut app = TuiShellApp::new_for_test();
+        app.engine.buffer_mut().insert(0, "a\tb");
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        driver.press_named(quadraui::NamedKey::Escape);
+
+        run_ex_command(&mut driver, ":set list");
+        // vimcode's default 'tabstop' is 4 — a tab right after "a" (column
+        // 1) fills columns 1..4: '>' then two '-' fill chars.
+        run_ex_command(&mut driver, ":set listchars=tab:>-");
+        assert!(
+            driver.screen_contains("a>--b"),
+            ":set listchars=tab:>- must paint the configured fill glyph; screen:\n{}",
+            driver.screen()
+        );
+
+        run_ex_command(&mut driver, ":set nolist");
+        assert!(
+            !driver.screen_contains("a>--b"),
+            ":set nolist must stop painting the configured tab glyph; screen:\n{}",
             driver.screen()
         );
     }
@@ -23772,6 +23855,11 @@ mod tests {
 
         run_ex_command(&mut driver, ":set fdm=marker");
         run_ex_command(&mut driver, ":set list");
+        // #1206: Neovim's real default 'listchars' has no `eol` item, so
+        // this test's "an ordinary line still gets marked" sanity check
+        // needs one configured explicitly — independent of the fold-header
+        // exclusion behavior this test actually exists to cover.
+        run_ex_command(&mut driver, ":set listchars=eol:$");
 
         let screen = driver.screen();
         let header_row = screen

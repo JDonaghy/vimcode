@@ -1341,8 +1341,8 @@ impl Engine {
                     None => self.move_left(),
                 }
             }
-            "Left" => self.move_left(),
-            "Right" => self.move_right(),
+            "Left" => self.move_left_insert_whichwrap('['),
+            "Right" => self.move_right_insert_whichwrap(']'),
             "Up" => {
                 if self.view().cursor.line > 0 {
                     self.view_mut().cursor.line -= 1;
@@ -3410,6 +3410,87 @@ impl Engine {
         }
     }
 
+    /// Is `token` present in `'whichwrap'` (#1206, `:h 'whichwrap'`)? `token`
+    /// is one of that option's per-key letters (`b`, `s`, `h`, `l`, `<`,
+    /// `>`, `[`, `]`) identifying which motion is asking.
+    pub(crate) fn whichwrap_allows(&self, token: char) -> bool {
+        self.settings.whichwrap.split(',').any(|t| {
+            let t = t.trim();
+            t.chars().count() == 1 && t.starts_with(token)
+        })
+    }
+
+    /// Normal/Visual-mode "move left", wrapping to the end of the previous
+    /// line when at column 0 and `'whichwrap'` includes `token` (#1206).
+    /// Shared by `h` (`token = 'h'`), `<BS>` (`token = 'b'`), and `<Left>`
+    /// (`token = '<'`) — real Vim gates all three on `'whichwrap'`, just
+    /// with different letters.
+    pub(crate) fn move_left_whichwrap(&mut self, token: char) {
+        if self.view().cursor.col == 0 {
+            let line = self.view().cursor.line;
+            if line > 0 && self.whichwrap_allows(token) {
+                let prev = line - 1;
+                self.view_mut().cursor.line = prev;
+                self.view_mut().cursor.col = self.get_max_cursor_col(prev);
+            }
+            return;
+        }
+        self.move_left();
+    }
+
+    /// Normal/Visual-mode "move right", wrapping to the start of the next
+    /// line when at the last column and `'whichwrap'` includes `token`
+    /// (#1206). Shared by `l` (`token = 'l'`), `<Space>` (`token = 's'`), and
+    /// `<Right>` (`token = '>'`) — see [`Self::move_left_whichwrap`].
+    pub(crate) fn move_right_whichwrap(&mut self, token: char) {
+        let line = self.view().cursor.line;
+        let max_col =
+            self.get_max_cursor_col(line) + usize::from(self.settings.virtualedit_allows_onemore());
+        if self.view().cursor.col >= max_col {
+            let max_line = self.buffer().len_lines().saturating_sub(1);
+            if line < max_line && self.whichwrap_allows(token) {
+                self.view_mut().cursor.line = line + 1;
+                self.view_mut().cursor.col = 0;
+            }
+            return;
+        }
+        self.move_right();
+    }
+
+    /// Insert/Replace-mode "move left", wrapping to the end (one past the
+    /// last character — the Insert-mode landing column, not Normal mode's)
+    /// of the previous line when at column 0 and `'whichwrap'` includes
+    /// `token` (`token = '['`, #1206).
+    pub(crate) fn move_left_insert_whichwrap(&mut self, token: char) {
+        if self.view().cursor.col == 0 {
+            let line = self.view().cursor.line;
+            if line > 0 && self.whichwrap_allows(token) {
+                let prev = line - 1;
+                self.view_mut().cursor.line = prev;
+                self.view_mut().cursor.col = self.get_line_len_for_insert(prev);
+            }
+            return;
+        }
+        self.move_left();
+    }
+
+    /// Insert/Replace-mode "move right", wrapping to the start of the next
+    /// line when at the end of the line and `'whichwrap'` includes `token`
+    /// (`token = ']'`, #1206). See [`Self::move_left_insert_whichwrap`].
+    pub(crate) fn move_right_insert_whichwrap(&mut self, token: char) {
+        let line = self.view().cursor.line;
+        let max = self.get_line_len_for_insert(line);
+        if self.view().cursor.col >= max {
+            let max_line = self.buffer().len_lines().saturating_sub(1);
+            if line < max_line && self.whichwrap_allows(token) {
+                self.view_mut().cursor.line = line + 1;
+                self.view_mut().cursor.col = 0;
+            }
+            return;
+        }
+        self.move_right_insert();
+    }
+
     /// Returns `false` when already on the last visible line (no-op) — used
     /// by the `j` handler to detect a failed move for macro-abort purposes
     /// (#806).
@@ -3706,6 +3787,17 @@ impl Engine {
             .and_then(|s| s.detected_indent)
             .map(|n| n as usize)
             .unwrap_or(self.settings.shift_width as usize)
+    }
+
+    /// Does `'backspace'` allow BackSpace to delete the character just
+    /// before `(line, col)`? Only ever restrictive when `(line, col)` is at
+    /// or before the position where the current Insert session began — the
+    /// `"start"` token (`:h 'backspace'`, #1206). Everywhere else BackSpace
+    /// is unrestricted regardless of `'backspace'`.
+    pub(crate) fn backspace_may_delete_before(&self, line: usize, col: usize) -> bool {
+        self.settings.backspace_allows("start")
+            || line != self.insert_enter_line
+            || col > self.insert_enter_col
     }
 
     /// Return the effective `'softtabstop'` — the Insert-mode Tab/BS "feels

@@ -1032,6 +1032,19 @@ fn apply_setup(settings: &mut Settings, setup: &str) -> Result<(), String> {
             }
             // #1190
             "hidden" | "hid" => settings.hidden = parse_lua_bool(name, value)?,
+            // #1206
+            "whichwrap" | "ww" => settings.whichwrap = value.to_string(),
+            "backspace" | "bs" => settings.backspace = value.to_string(),
+            "scrolljump" | "sj" => {
+                settings.scrolljump = value.parse::<usize>().map_err(|_| {
+                    format!("'scrolljump' expects a non-negative integer, got {raw_value:?}")
+                })?;
+            }
+            "sidescrolloff" | "siso" => {
+                settings.sidescrolloff = value.parse::<usize>().map_err(|_| {
+                    format!("'sidescrolloff' expects a non-negative integer, got {raw_value:?}")
+                })?;
+            }
             other => {
                 return Err(format!(
                     "no vimcode Settings mapping for option '{other}' (from {stmt:?}) — add one \
@@ -6449,6 +6462,56 @@ const CASES_MAP: &[Case] = &[
     ),
 ];
 
+// ───────────────────── G3. value options (#1206) ─────────────────────
+//
+// Oracle coverage for the buffer/cursor-observable half of #1206's option
+// tranche: 'whichwrap' and 'backspace'. ('wildmode', 'scrolljump' and
+// 'sidescrolloff' only affect scroll position/command-line state, which
+// this per-case harness doesn't capture — see the module docs' "Nothing
+// here is hand-authored" note on what `run_case` actually diffs.)
+const CASES_OPT: &[Case] = &[
+    cs(
+        "opt:whichwrap h wraps to end of previous line",
+        &["ab", "cd"],
+        2,
+        1,
+        "h",
+        "vim.o.whichwrap = 'h'",
+    ),
+    cs(
+        "opt:whichwrap h does not wrap without the token",
+        &["ab", "cd"],
+        2,
+        1,
+        "h",
+        "vim.o.whichwrap = 's'",
+    ),
+    cs(
+        "opt:whichwrap l wraps to start of next line",
+        &["ab", "cd"],
+        1,
+        2,
+        "l",
+        "vim.o.whichwrap = 'l'",
+    ),
+    cs(
+        "opt:backspace without eol keeps lines separate",
+        &["ab", "cd"],
+        2,
+        1,
+        "i<BS><Esc>",
+        "vim.o.backspace = 'indent,start'",
+    ),
+    cs(
+        "opt:backspace with eol still joins (matches default)",
+        &["ab", "cd"],
+        2,
+        1,
+        "i<BS><Esc>",
+        "vim.o.backspace = 'indent,eol,start'",
+    ),
+];
+
 // ─────────────────── H. multi-file jumplist (#985) ───────────────────
 //
 // Cross-buffer/cross-tab/cross-split `<C-o>`/`<C-i>`, plus `:jumps` list
@@ -6601,6 +6664,7 @@ const CATEGORIES: &[(&str, &[Case])] = &[
     ("misc    misc", CASES_MISC),
     ("fold    folds (#1006)", CASES_FOLD),
     ("map     :map family (#1151)", CASES_MAP),
+    ("opt     value options (#1206)", CASES_OPT),
 ];
 
 // ---------------------------------------------------------------------------

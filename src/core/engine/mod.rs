@@ -2691,6 +2691,14 @@ pub struct Engine {
     pub keymap_buf: Vec<String>,
     /// Guard: true while replaying buffered keys through handle_key.
     pub keymap_replaying: bool,
+    /// When `keymap_buf` is a non-empty, still-ambiguous prefix of some
+    /// mapping's lhs, the instant `'timeoutlen'` ms after the *last*
+    /// keystroke — refreshed on every keypress that extends the buffer,
+    /// consulted by `tick_keymap_timeout` (`poll_idle`, #1206, `:h
+    /// 'timeoutlen'`). `None` when the buffer is empty, or when
+    /// `'timeoutlen'` is `0` (the pre-#1206 behavior: wait indefinitely for
+    /// a resolving keystroke, never auto-flush on idle).
+    pub keymap_buf_deadline: Option<std::time::Instant>,
     /// Set by `focus_window_direction` when navigation overflows the window list.
     /// `Some(false)` = tried to go left past first window, `Some(true)` = right past last.
     /// Consumed by the UI backend to move focus to sidebar/toolbar.
@@ -3716,6 +3724,13 @@ pub struct Engine {
     pub insert_ctrl_o_active: bool,
     /// Column where insert mode was entered (for Ctrl-U to delete only typed text).
     pub insert_enter_col: usize,
+    /// Line where insert mode was entered (`:h 'backspace'`'s `"start"`
+    /// token, #1206) — `insert_enter_col` alone can't tell "BackSpace is
+    /// about to delete text that predates this Insert session" from "the
+    /// cursor moved to a different line since" (e.g. after `<CR>`); this
+    /// pairs with it so the `"start"` gate only fires on the line insert
+    /// actually began on.
+    pub insert_enter_line: usize,
     /// Line index of a freshly created, still-untouched autoindent-only line
     /// (`:h 'autoindent'`), or `None`. Set when `<CR>`/`o`/`O` create a line
     /// whose only content is the copied indent; cleared by any key other
@@ -4183,6 +4198,7 @@ impl Engine {
             user_abbrevs: Vec::new(),
             keymap_buf: Vec::new(),
             keymap_replaying: false,
+            keymap_buf_deadline: None,
             window_nav_overflow: None,
             activity_bar_focused: false,
             activity_bar_selected: 1,
@@ -4523,6 +4539,7 @@ impl Engine {
             insert_ctrl_g_pending: false,
             insert_ctrl_o_active: false,
             insert_enter_col: 0,
+            insert_enter_line: 0,
             insert_indent_only_line: None,
             insert_last_key_char: None,
             insert_ctrl_v_pending: false,
@@ -4807,6 +4824,7 @@ impl Engine {
         redraw |= self.poll_blame();
         redraw |= self.tick_ai_completion();
         redraw |= self.tick_syntax_debounce();
+        redraw |= self.tick_keymap_timeout();
         self.tick_swap_files();
         self.tick_file_watcher();
         redraw |= self.tick_git_branch();

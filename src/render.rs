@@ -30,7 +30,7 @@ use crate::core::engine::{AlignedDiffEntry, DiffLine, Engine, PanelChromeDesc, S
 pub use crate::core::engine::{BottomPanelKind, DebugSidebarSection};
 use crate::core::lsp::SignatureHelpData;
 use crate::core::project_search::QuickfixList;
-use crate::core::settings::LineNumberMode;
+use crate::core::settings::{LineNumberMode, Settings};
 use crate::core::view::View;
 use crate::core::window::{GroupDivider, GroupId, SplitDirection, WindowDivider};
 use crate::core::{Cursor, GitLineStatus, Mode, WindowId, WindowRect};
@@ -14383,11 +14383,28 @@ pub fn window_status_row_reserved(engine: &Engine) -> bool {
     if engine.terminal_maximized {
         return false;
     }
-    let per_window_status = engine.settings.window_status_line;
+    let per_window_status = effective_window_status_line(engine);
     let bottom_panel_open = engine.terminal_open || engine.bottom_panel_open;
     let separate_status =
         per_window_status && !engine.settings.status_line_above_terminal && bottom_panel_open;
     per_window_status && !separate_status
+}
+
+/// `Settings::window_status_line` narrowed by `'laststatus'` (#1206, `:h
+/// 'laststatus'`) — the value every status-line-visibility read site should
+/// use instead of the raw field.
+///
+/// `'laststatus'` is `0`/`1`/`2`/`3` in real Vim; vimcode's status line is
+/// architecturally per-window (`Settings::window_status_line`), not the
+/// single split-spanning line real Vim's `3` draws, so `3` falls back to
+/// `2`'s behavior here rather than being modeled — see the field doc
+/// comment on [`crate::core::Settings::laststatus`].
+pub fn effective_window_status_line(engine: &Engine) -> bool {
+    match engine.settings.laststatus {
+        0 => false,
+        1 => engine.settings.window_status_line && engine.windows.len() > 1,
+        _ => engine.settings.window_status_line,
+    }
 }
 
 // ─── build_screen_layout ──────────────────────────────────────────────────────
@@ -14471,7 +14488,7 @@ pub fn build_screen_layout_with_breadcrumb_row(
 
     let tab_bar = build_tab_bar(engine);
 
-    let per_window_status = engine.settings.window_status_line;
+    let per_window_status = effective_window_status_line(engine);
     let bottom_panel_open = engine.terminal_open || engine.bottom_panel_open;
     // When status_line_above_terminal is OFF and the terminal is open, extract the
     // active window's status into a separated bar rendered above the terminal.
@@ -18217,23 +18234,24 @@ pub fn view_row_to_buf_pos_wrap(
     (total_lines.saturating_sub(1), 0)
 }
 
-/// Offset table produced by expanding `'list'` glyphs (currently just
-/// `\t` -> `^I`) in a line's text. Every position-based field a
-/// `RenderedLine` carries for that line — byte-offset `StyledSpan`s *and*
-/// char-index `DiagnosticMark`/`SpellMark`s — must remap through this single
-/// table rather than recomputing the tab-expansion delta twice, which is how
-/// #1208 happened: the byte-offset remap for `spans` shipped in #1190 with no
+/// Offset table produced by expanding `'list'` glyphs (`\t`, plus any
+/// `'listchars'` single-character substitutions — `trail`/`nbsp`/`space`,
+/// #1206) in a line's text. Every position-based field a `RenderedLine`
+/// carries for that line — byte-offset `StyledSpan`s *and* char-index
+/// `DiagnosticMark`/`SpellMark`s — must remap through this single table
+/// rather than recomputing the expansion delta twice, which is how #1208
+/// happened: the byte-offset remap for `spans` shipped in #1190 with no
 /// equivalent for the char-index diagnostic/spell marks.
 ///
-/// Each tab is always exactly 1 byte *and* 1 char pre-expansion, and always
-/// exactly 2 bytes *and* 2 chars (`^I`) post-expansion, so the cumulative
-/// delta is numerically identical whether tracked in bytes or chars — only
-/// the breakpoint *position* to compare against differs. Hence one pass
-/// records both positions per tab, and two lookup methods share the same
-/// delta list.
+/// Byte and char deltas are tracked *separately* (#1206): a tab expansion
+/// changes both by the same amount only when the configured tab glyph is
+/// pure ASCII, and a single-character substitution (`trail:·`, say) can
+/// change the byte length while leaving the char count at exactly 1 — the
+/// pre-#1206 shared-delta design (`:h` #1208's own doc) was only ever exact
+/// for the ASCII-only `^I` fallback it was built for.
 struct ListGlyphOffsets {
-    /// `(old_byte_offset_just_past_tab, old_char_offset_just_past_tab, cumulative_delta)`.
-    breakpoints: Vec<(usize, usize, i64)>,
+    /// `(old_byte_offset_just_past_this_char, old_char_offset_just_past_this_char, cumulative_byte_delta, cumulative_char_delta)`.
+    breakpoints: Vec<(usize, usize, i64, i64)>,
 }
 
 impl ListGlyphOffsets {
@@ -18248,8 +18266,8 @@ impl ListGlyphOffsets {
             .breakpoints
             .iter()
             .rev()
-            .find(|(bp, _, _)| *bp <= old_byte)
-            .map(|(_, _, d)| *d)
+            .find(|(bp, _, _, _)| *bp <= old_byte)
+            .map(|(_, _, d, _)| *d)
             .unwrap_or(0);
         (old_byte as i64 + shift) as usize
     }
@@ -18259,51 +18277,113 @@ impl ListGlyphOffsets {
             .breakpoints
             .iter()
             .rev()
-            .find(|(_, bp, _)| *bp <= old_char)
-            .map(|(_, _, d)| *d)
+            .find(|(_, bp, _, _)| *bp <= old_char)
+            .map(|(_, _, _, d)| *d)
             .unwrap_or(0);
         (old_char as i64 + shift) as usize
     }
 }
 
-/// Expand `\t` to `^I` in `text`, returning the expanded text plus the offset
-/// table needed to remap any byte- or char-indexed position that pointed into
-/// the original `text` (see `ListGlyphOffsets`).
-fn compute_list_glyph_expansion(text: String) -> (String, ListGlyphOffsets) {
-    if !text.contains('\t') {
+/// Expand `'list'` glyphs in `text` per the current `'listchars'`
+/// (`settings.listchars`) and `'tabstop'` (`settings.tabstop`), returning
+/// the expanded text plus the offset table needed to remap any byte- or
+/// char-indexed position that pointed into the original `text` (see
+/// [`ListGlyphOffsets`]).
+///
+/// `tab` fills to the next `'tabstop'` stop the way Vim renders it
+/// (`:h lcs-tab`) — `col` (visual column, 0-based) is tracked from the
+/// start of `text` as if `text` began at column 0, matching how the rest of
+/// this rendering pipeline already treats each `RenderedLine` segment (a
+/// wrap-continuation segment's own tab/indent-guide math restarts at column
+/// 0 too, e.g. the `cols`/`indent` loop building indent guides) — so this
+/// isn't a new limitation, just consistent with the existing one. No
+/// `tab:` item falls back to the literal `^I` Vim shows when `'listchars'`
+/// doesn't mention tabs at all (`:h lcs-tab`, "When tab: is omitted, a tab
+/// is shown as ^I").
+fn compute_list_glyph_expansion(text: String, settings: &Settings) -> (String, ListGlyphOffsets) {
+    let listchars = &settings.listchars;
+    let tab_glyph = crate::core::settings::listchars_tab(listchars);
+    let trail_glyph = crate::core::settings::listchars_char(listchars, "trail", None);
+    let nbsp_glyph = crate::core::settings::listchars_char(listchars, "nbsp", None);
+    let space_glyph = crate::core::settings::listchars_char(listchars, "space", None);
+
+    if !text.contains('\t')
+        && trail_glyph.is_none()
+        && nbsp_glyph.is_none()
+        && space_glyph.is_none()
+    {
         return (text, ListGlyphOffsets::identity());
     }
 
+    let tabstop = (settings.tabstop as usize).max(1);
+
+    // Trailing-space run (char indices into `text`): where 'trail' applies
+    // instead of 'space'/nothing (`:h lcs-trail`: "Overrides the space and
+    // multispace settings for trailing spaces"). Excludes a trailing '\n'.
+    let core_len = text.chars().count() - usize::from(text.ends_with('\n'));
+    let core_chars: Vec<char> = text.chars().take(core_len).collect();
+    let mut trail_start = core_len;
+    while trail_start > 0 && core_chars[trail_start - 1] == ' ' {
+        trail_start -= 1;
+    }
+
     let mut out = String::with_capacity(text.len());
-    let mut breakpoints: Vec<(usize, usize, i64)> = Vec::new();
-    let mut delta: i64 = 0;
+    let mut breakpoints: Vec<(usize, usize, i64, i64)> = Vec::new();
+    let mut byte_delta: i64 = 0;
+    let mut char_delta: i64 = 0;
+    let mut col: usize = 0;
+
     for (old_char, (old_byte, ch)) in text.char_indices().enumerate() {
-        if ch == '\t' {
-            out.push('^');
-            out.push('I');
-            delta += 1; // 1 source byte/char -> 2 output bytes/chars
-            breakpoints.push((old_byte + ch.len_utf8(), old_char + 1, delta));
+        let rendered: String = if ch == '\t' {
+            let width = tabstop - (col % tabstop);
+            match &tab_glyph {
+                Some(g) => g.render(width),
+                None => "^I".to_string(),
+            }
+        } else if ch == ' ' && old_char >= trail_start && old_char < core_len {
+            trail_glyph.map_or_else(|| ch.to_string(), String::from)
+        } else if ch == '\u{a0}' {
+            nbsp_glyph.map_or_else(|| ch.to_string(), String::from)
+        } else if ch == ' ' {
+            space_glyph.map_or_else(|| ch.to_string(), String::from)
         } else {
-            out.push(ch);
+            ch.to_string()
+        };
+
+        col += rendered.chars().count();
+        out.push_str(&rendered);
+
+        let new_byte_delta = byte_delta + rendered.len() as i64 - ch.len_utf8() as i64;
+        let new_char_delta = char_delta + rendered.chars().count() as i64 - 1;
+        if new_byte_delta != byte_delta || new_char_delta != char_delta {
+            byte_delta = new_byte_delta;
+            char_delta = new_char_delta;
+            breakpoints.push((
+                old_byte + ch.len_utf8(),
+                old_char + 1,
+                byte_delta,
+                char_delta,
+            ));
         }
     }
 
     (out, ListGlyphOffsets { breakpoints })
 }
 
-/// Vim's `'list'` (#1190): apply the hardcoded default glyph set — a tab
-/// displays as literal `^I` instead of expanding to `'tabstop'` width, and
-/// the true end of line gets a trailing `$` — to one already-built
-/// `(raw_text, spans, diagnostics, spell_errors)` tuple. This is Vim's own
-/// documented fallback when `'listchars'` has no `tab:`/`eol:` item
-/// (`:h 'listchars'`); full `'listchars'` support is the sibling
-/// value-option tranche. Callers must not call this for a fold-header line
+/// Vim's `'list'` (#1190, `'listchars'` support #1206): apply the configured
+/// glyph set to one already-built `(raw_text, spans, diagnostics,
+/// spell_errors)` tuple. Callers must not call this for a fold-header line
 /// (`RenderedLine::is_fold_header`) — real vim's `'list'` never marks a
 /// closed fold's display text (#1208).
 ///
 /// `mark_eol` is `false` for every wrap-continuation segment except the
-/// last — the `$` belongs at the true end of the buffer line, not at each
-/// mid-line wrap point.
+/// last — an `eol` glyph belongs at the true end of the buffer line, not at
+/// each mid-line wrap point — and even on the last segment, nothing is
+/// appended unless `'listchars'` actually has an `eol:` item (Neovim's real
+/// default doesn't: `:h 'listchars'`'s default is `"tab:> ,trail:-,nbsp:+"`,
+/// no `eol`, so `'list'` shows no trailing `$` out of the box — #1190's
+/// hardcoded always-`$` only matched classic Vim's *empty*-`'listchars'`
+/// fallback, not this).
 ///
 /// Remaps `spans` (byte offsets), `diagnostics` and `spell_errors` (char
 /// indices) through one shared [`ListGlyphOffsets`] table computed from the
@@ -18315,13 +18395,16 @@ fn apply_list_glyphs(
     diagnostics: Vec<DiagnosticMark>,
     spell_errors: Vec<SpellMark>,
     mark_eol: bool,
+    settings: &Settings,
 ) -> (String, Vec<StyledSpan>, Vec<DiagnosticMark>, Vec<SpellMark>) {
-    let (mut out, offsets) = compute_list_glyph_expansion(text);
+    let (mut out, offsets) = compute_list_glyph_expansion(text, settings);
     if mark_eol {
-        out = match out.strip_suffix('\n') {
-            Some(stripped) => format!("{stripped}$\n"),
-            None => format!("{out}$"),
-        };
+        if let Some(eol) = crate::core::settings::listchars_char(&settings.listchars, "eol", None) {
+            out = match out.strip_suffix('\n') {
+                Some(stripped) => format!("{stripped}{eol}\n"),
+                None => format!("{out}{eol}"),
+            };
+        }
     }
 
     let spans = spans
@@ -18959,6 +19042,7 @@ fn build_rendered_window(
                         seg_diagnostics,
                         seg_spell_errors,
                         is_last_seg,
+                        &engine.settings,
                     )
                 } else {
                     (seg_text, seg_spans, seg_diagnostics, seg_spell_errors)
@@ -19040,7 +19124,14 @@ fn build_rendered_window(
             // gate has to live here rather than on `list_mode` alone.
             let (line_str, spans, line_diagnostics, line_spell_errors) =
                 if list_mode && !is_fold_header {
-                    apply_list_glyphs(line_str, spans, line_diagnostics, line_spell_errors, true)
+                    apply_list_glyphs(
+                        line_str,
+                        spans,
+                        line_diagnostics,
+                        line_spell_errors,
+                        true,
+                        &engine.settings,
+                    )
                 } else {
                     (line_str, spans, line_diagnostics, line_spell_errors)
                 };
@@ -22592,7 +22683,7 @@ pub fn compute_editor_layout(
     menu_in_viewport: bool,
 ) -> EditorLayout {
     let lh = line_height;
-    let per_window = engine.settings.window_status_line;
+    let per_window = effective_window_status_line(engine);
     let bp_open = engine.terminal_open || engine.bottom_panel_open;
 
     let menu_h = if menu_in_viewport && engine.menu_bar_visible {
@@ -30844,16 +30935,27 @@ mod slice7_router_tests {
         );
     }
 
-    // ─── 'list' glyph substitution (#1190) ─────────────────────────────────
+    // ─── 'list' glyph substitution (#1190, 'listchars' #1206) ──────────────
+
+    /// A `Settings` with `listchars` overridden and `tabstop` at its default
+    /// (8) — the shape every `apply_list_glyphs`/`compute_list_glyph_expansion`
+    /// test below needs, since #1206 made both option-driven.
+    fn list_glyphs_settings(listchars: &str) -> Settings {
+        let mut settings = Settings::default();
+        settings.listchars = listchars.to_string();
+        settings
+    }
 
     #[test]
     fn apply_list_glyphs_marks_eol_with_no_tabs() {
+        let settings = list_glyphs_settings("eol:$");
         let (text, spans, diags, spells) = apply_list_glyphs(
             "hello".to_string(),
             Vec::new(),
             Vec::new(),
             Vec::new(),
             true,
+            &settings,
         );
         assert_eq!(text, "hello$");
         assert!(spans.is_empty());
@@ -30863,12 +30965,14 @@ mod slice7_router_tests {
 
     #[test]
     fn apply_list_glyphs_marks_eol_before_trailing_newline() {
+        let settings = list_glyphs_settings("eol:$");
         let (text, ..) = apply_list_glyphs(
             "hello\n".to_string(),
             Vec::new(),
             Vec::new(),
             Vec::new(),
             true,
+            &settings,
         );
         assert_eq!(
             text, "hello$\n",
@@ -30878,26 +30982,121 @@ mod slice7_router_tests {
 
     #[test]
     fn apply_list_glyphs_skips_eol_for_non_final_wrap_segment() {
+        let settings = list_glyphs_settings("eol:$");
         let (text, ..) = apply_list_glyphs(
             "hello".to_string(),
             Vec::new(),
             Vec::new(),
             Vec::new(),
             false,
+            &settings,
         );
         assert_eq!(text, "hello", "mark_eol=false must not append $");
     }
 
+    /// RED against unfixed `develop` (#1206): before this change,
+    /// `apply_list_glyphs` unconditionally appended `$` regardless of
+    /// `'listchars'` — this asserts the *opposite* (default `'listchars'`
+    /// has no `eol` item, so nothing is appended), which fails against the
+    /// pre-#1206 hardcoded-`$` implementation.
     #[test]
-    fn apply_list_glyphs_expands_tab_to_caret_i() {
+    fn apply_list_glyphs_default_listchars_has_no_eol_marker() {
+        let settings = Settings::default();
+        let (text, ..) = apply_list_glyphs(
+            "hello".to_string(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            true,
+            &settings,
+        );
+        assert_eq!(
+            text, "hello",
+            "Neovim's real default 'listchars' has no eol item"
+        );
+    }
+
+    #[test]
+    fn apply_list_glyphs_expands_tab_to_caret_i_when_no_tab_item() {
+        let settings = list_glyphs_settings("");
         let (text, ..) = apply_list_glyphs(
             "a\tb".to_string(),
             Vec::new(),
             Vec::new(),
             Vec::new(),
             false,
+            &settings,
         );
         assert_eq!(text, "a^Ib");
+    }
+
+    /// RED against unfixed `develop` (#1206): before this change, `'list'`
+    /// always rendered a tab as literal `^I`. Neovim's real default
+    /// `'listchars'` (`"tab:> ,trail:-,nbsp:+"`) instead fills to the next
+    /// `'tabstop'` stop with `>` then spaces — this fails against the
+    /// pre-#1206 hardcoded-`^I` implementation.
+    #[test]
+    fn apply_list_glyphs_default_listchars_renders_tab_as_arrow_fill() {
+        let settings = Settings::default();
+        // vimcode's default 'tabstop' is 4 (not Vim's classic 8 — see
+        // `default_tabstop`); a tab right after "a" (column 1) fills
+        // columns 1..4 — '>' then 2 more spaces (3 cells total).
+        let (text, ..) = apply_list_glyphs(
+            "a\tb".to_string(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            false,
+            &settings,
+        );
+        assert_eq!(text, "a>  b");
+    }
+
+    /// RED against unfixed `develop` (#1206): 'trail' had no implementation
+    /// at all before this change (trailing spaces just rendered as spaces).
+    #[test]
+    fn apply_list_glyphs_trailing_spaces_use_trail_glyph() {
+        let settings = list_glyphs_settings("trail:-");
+        let (text, ..) = apply_list_glyphs(
+            "ab  ".to_string(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            false,
+            &settings,
+        );
+        assert_eq!(text, "ab--");
+    }
+
+    /// A leading/mid-line space must NOT be treated as trailing.
+    #[test]
+    fn apply_list_glyphs_trail_glyph_does_not_touch_non_trailing_spaces() {
+        let settings = list_glyphs_settings("trail:-");
+        let (text, ..) = apply_list_glyphs(
+            "a  b  ".to_string(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            false,
+            &settings,
+        );
+        assert_eq!(text, "a  b--");
+    }
+
+    /// RED against unfixed `develop` (#1206): 'nbsp' had no implementation
+    /// at all before this change.
+    #[test]
+    fn apply_list_glyphs_nbsp_uses_nbsp_glyph() {
+        let settings = list_glyphs_settings("nbsp:+");
+        let (text, ..) = apply_list_glyphs(
+            "a\u{a0}b".to_string(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            false,
+            &settings,
+        );
+        assert_eq!(text, "a+b");
     }
 
     fn plain_style() -> Style {
@@ -30914,13 +31113,20 @@ mod slice7_router_tests {
     fn apply_list_glyphs_remaps_span_offsets_past_a_tab() {
         // "a\tbc" — a span covering "bc" (source bytes 2..4) must land on
         // "^Ibc"'s "bc" (bytes 3..5) once the tab becomes the 2-byte `^I`.
+        let settings = list_glyphs_settings("");
         let spans = vec![StyledSpan {
             start_byte: 2,
             end_byte: 4,
             style: plain_style(),
         }];
-        let (text, spans, ..) =
-            apply_list_glyphs("a\tbc".to_string(), spans, Vec::new(), Vec::new(), false);
+        let (text, spans, ..) = apply_list_glyphs(
+            "a\tbc".to_string(),
+            spans,
+            Vec::new(),
+            Vec::new(),
+            false,
+            &settings,
+        );
         assert_eq!(text, "a^Ibc");
         assert_eq!(spans.len(), 1);
         assert_eq!(spans[0].start_byte, 3);
@@ -30932,21 +31138,35 @@ mod slice7_router_tests {
     fn apply_list_glyphs_remaps_spans_across_two_tabs() {
         // "a\tb\tc" — a span on the trailing "c" (source byte 4..5) must
         // shift by +2 (one extra byte from each of the two tabs).
+        let settings = list_glyphs_settings("");
         let spans = vec![StyledSpan {
             start_byte: 4,
             end_byte: 5,
             style: plain_style(),
         }];
-        let (text, spans, ..) =
-            apply_list_glyphs("a\tb\tc".to_string(), spans, Vec::new(), Vec::new(), false);
+        let (text, spans, ..) = apply_list_glyphs(
+            "a\tb\tc".to_string(),
+            spans,
+            Vec::new(),
+            Vec::new(),
+            false,
+            &settings,
+        );
         assert_eq!(text, "a^Ib^Ic");
         assert_eq!(&text[spans[0].start_byte..spans[0].end_byte], "c");
     }
 
     #[test]
     fn apply_list_glyphs_combines_tab_and_eol() {
-        let (text, ..) =
-            apply_list_glyphs("a\tb".to_string(), Vec::new(), Vec::new(), Vec::new(), true);
+        let settings = list_glyphs_settings("eol:$");
+        let (text, ..) = apply_list_glyphs(
+            "a\tb".to_string(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            true,
+            &settings,
+        );
         assert_eq!(text, "a^Ib$");
     }
 
@@ -30956,6 +31176,7 @@ mod slice7_router_tests {
         // land on "^Ifoo"'s "foo" (char cols 2..5) once the tab expands to
         // the 2-char `^I` (#1208 bug 1: these are char-index based, unlike
         // `spans`, so they need their own remap through the same table).
+        let settings = list_glyphs_settings("");
         let diags = vec![DiagnosticMark {
             start_col: 1,
             end_col: 4,
@@ -30966,8 +31187,14 @@ mod slice7_router_tests {
             start_col: 1,
             end_col: 4,
         }];
-        let (text, _, diags, spells) =
-            apply_list_glyphs("\tfoo".to_string(), Vec::new(), diags, spells, false);
+        let (text, _, diags, spells) = apply_list_glyphs(
+            "\tfoo".to_string(),
+            Vec::new(),
+            diags,
+            spells,
+            false,
+            &settings,
+        );
         assert_eq!(text, "^Ifoo");
         assert_eq!(diags[0].start_col, 2);
         assert_eq!(diags[0].end_col, 5);
