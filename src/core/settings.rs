@@ -639,6 +639,97 @@ pub struct Settings {
     /// Vim. #1190.
     #[serde(default)]
     pub list: bool,
+
+    /// Which characters `'list'` mode uses for otherwise-invisible glyphs.
+    /// Corresponds to Vim's `'listchars'` / `'lcs'`. Comma-separated
+    /// `item:chars` pairs. Recognised-and-wired items: `eol`, `tab`
+    /// (two or three characters), `trail`, `nbsp`, `space` (each a single
+    /// character). Recognised-and-*validated*-but-not-painted:
+    /// `extends`/`precedes` (`'wrap'`-off horizontal-scroll clipping isn't
+    /// glyph-annotated here) and `multispace`/`lead`/`leadmultispace`/
+    /// `leadtab`/`conceal` (real Vim items with no vimcode rendering path
+    /// yet — accepted so a pasted vimrc line doesn't read as a typo, exactly
+    /// like `UNIMPLEMENTED_VALUE_OPTIONS`, but scoped per-item rather than
+    /// per-option since the *option* itself is otherwise fully implemented).
+    /// Default `"tab:> ,trail:-,nbsp:+"`, matching Neovim (`:h 'listchars'`)
+    /// — note this has no `eol` item, so `'list'` does **not** show a
+    /// trailing `$` out of the box (#1190's hardcoded always-`$`/`^I`
+    /// fallback only matched classic Vim's *empty*-`'listchars'` behavior,
+    /// not Neovim's real default).
+    #[serde(default = "default_listchars")]
+    pub listchars: String,
+
+    /// Comma-separated list of Vim's per-key wrap tokens governing which
+    /// motions may cross a line boundary instead of stopping at column 0 /
+    /// the last column: `b` (`<BS>`), `s` (`<Space>`), `h`, `l`, `<`, `>`
+    /// (Left/Right arrows, Normal and Visual mode), `[`, `]` (Left/Right
+    /// arrows, Insert/Replace mode), `~` (the `~` command — accepted but not
+    /// wired; `~` never advances past end-of-line here regardless of this
+    /// setting). Corresponds to Vim's `'whichwrap'` / `'ww'`. Default
+    /// `"b,s"`, matching Neovim (`:h 'whichwrap'`).
+    #[serde(default = "default_whichwrap")]
+    pub whichwrap: String,
+
+    /// Comma-separated list of what Insert-mode `<BS>` may delete across:
+    /// `"indent"` (autoindent — accepted but not distinctly wired; the
+    /// existing autoindent-aware BackSpace behavior doesn't yet gate on
+    /// this token), `"eol"` (the start of a line, joining with the previous
+    /// line), `"start"` (the position where the current Insert session
+    /// began). `"nostop"` is accepted (real Vim item, an `"eol"` variant)
+    /// but not distinctly wired. A legacy numeric value (`0`-`3`, pre-7.4
+    /// Vim) is also accepted and expanded to the equivalent list on write.
+    /// Corresponds to Vim's `'backspace'` / `'bs'`. Default
+    /// `"indent,eol,start"`, matching Neovim (`:h 'backspace'`) — this also
+    /// matches vimcode's own pre-existing (hardcoded, unconditional)
+    /// BackSpace behavior, so the default changes nothing out of the box.
+    #[serde(default = "default_backspace")]
+    pub backspace: String,
+
+    /// Milliseconds to wait, after typing a keystroke that's an ambiguous
+    /// prefix of a key-to-keys mapping (#1151), for a further keystroke that
+    /// resolves it before giving up and replaying the buffered keys as
+    /// typed. `0` disables the wait — the buffered keys are replayed as soon
+    /// as nothing else could still match, matching vimcode's pre-existing
+    /// (untimed) behavior. Corresponds to Vim's `'timeoutlen'` / `'tm'`.
+    /// Default `1000`, matching Neovim (`:h 'timeoutlen'`).
+    #[serde(default = "default_timeoutlen")]
+    pub timeoutlen: u32,
+
+    /// Command-line completion behavior for repeated `<Tab>`. Corresponds
+    /// to Vim's `'wildmode'` / `'wim'`. Validated against Vim's documented
+    /// comma/colon grammar (`full`/`longest`/`list`/`longest:full`/etc, `:h
+    /// 'wildmode'`) but not wired to vimcode's own always-on wildmenu
+    /// cycling (`'wildmenu'` in `set_bool_option` — see that arm's doc
+    /// comment for why an unconditional wildmenu already exists here).
+    /// Default `"full"`, matching Neovim.
+    #[serde(default = "default_wildmode")]
+    pub wildmode: String,
+
+    /// When the per-window status line is shown: `0` never, `1` only when
+    /// there are 2+ windows, `2` always. `3` (one global status line instead
+    /// of per-window) is accepted but not modeled — falls back to `2`'s
+    /// behavior (`render::effective_window_status_line`), since vimcode's
+    /// status line is architecturally per-window
+    /// (`Settings::window_status_line`). Corresponds to Vim's `'laststatus'`
+    /// / `'ls'`. Default `2`, matching Neovim (`:h 'laststatus'`).
+    #[serde(default = "default_laststatus")]
+    pub laststatus: u8,
+
+    /// Horizontal counterpart to `'scrolloff'`: minimum number of screen
+    /// columns to keep to the left/right of the cursor when `'wrap'` is
+    /// off. Corresponds to Vim's `'sidescrolloff'` / `'siso'`. Default `0`,
+    /// matching Neovim (`:h 'sidescrolloff'`).
+    #[serde(default)]
+    pub sidescrolloff: usize,
+
+    /// Minimum number of lines to scroll when the cursor moves off the top
+    /// or bottom of the window. Corresponds to Vim's `'scrolljump'` /
+    /// `'sj'`. Default `1`, matching Neovim (`:h 'scrolljump'`) — the
+    /// minimum needed to bring the cursor back into view, i.e. vimcode's
+    /// pre-existing behavior. Vim's documented "negative value is a
+    /// percentage of the window height" is not modeled.
+    #[serde(default = "default_scrolljump")]
+    pub scrolljump: usize,
 }
 
 /// Mode-derived default for `ctrl_f_action` — see the field doc comment on
@@ -1206,6 +1297,34 @@ fn default_ui_font_size() -> u8 {
     10
 }
 
+fn default_listchars() -> String {
+    "tab:> ,trail:-,nbsp:+".to_string()
+}
+
+fn default_whichwrap() -> String {
+    "b,s".to_string()
+}
+
+fn default_backspace() -> String {
+    "indent,eol,start".to_string()
+}
+
+fn default_timeoutlen() -> u32 {
+    1000
+}
+
+fn default_wildmode() -> String {
+    "full".to_string()
+}
+
+fn default_laststatus() -> u8 {
+    2
+}
+
+fn default_scrolljump() -> usize {
+    1
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Settings {
@@ -1290,6 +1409,14 @@ impl Default for Settings {
             showcmd: default_true(),
             ruler: default_true(),
             list: false,
+            listchars: default_listchars(),
+            whichwrap: default_whichwrap(),
+            backspace: default_backspace(),
+            timeoutlen: default_timeoutlen(),
+            wildmode: default_wildmode(),
+            laststatus: default_laststatus(),
+            sidescrolloff: 0,
+            scrolljump: default_scrolljump(),
         }
     }
 }
@@ -1310,17 +1437,7 @@ const UNIMPLEMENTED_BOOL_OPTIONS: &[(&str, &str)] = &[
 /// Real vim **value** options `:set` recognises by name but does not yet
 /// wire to any behaviour. See [`UNIMPLEMENTED_BOOL_OPTIONS`]'s doc — same
 /// rationale, same table shape.
-const UNIMPLEMENTED_VALUE_OPTIONS: &[(&str, &str)] = &[
-    ("listchars", "lcs"),
-    ("whichwrap", "ww"),
-    ("backspace", "bs"),
-    ("clipboard", "cb"),
-    ("timeoutlen", "tm"),
-    ("wildmode", "wim"),
-    ("laststatus", "ls"),
-    ("sidescrolloff", "siso"),
-    ("scrolljump", "sj"),
-];
+const UNIMPLEMENTED_VALUE_OPTIONS: &[(&str, &str)] = &[("clipboard", "cb")];
 
 /// Shared "recognised, not implemented" message for both option tables
 /// (#1153) — deliberately distinct wording from `"Unknown option: {opt}"` so
@@ -1499,9 +1616,13 @@ fn iskeyword_regex_class_body(entries: &[IskeywordEntry]) -> String {
     body
 }
 
-/// `+=`/`-=`/`^=` combine mode for a comma-separated list-style value
-/// option (`:h :set`, "List of items"). Currently only used by
-/// `'iskeyword'` (#1191) — see `parse_set_option`.
+/// `+=`/`-=`/`^=` combine mode for either shape of value option `:set`
+/// accepts an operator on: a comma-separated list-style option (`:h :set`,
+/// "List of items" — `Append`/`Remove`/`Prepend` act on whole comma-
+/// separated tokens) or a numeric option (`:h :set`, "For number options" —
+/// `Append`/`Remove`/`Prepend` mean add/subtract/multiply). #1191 added this
+/// for `'iskeyword'` alone; #1206 generalised it to every list- and number-
+/// shaped option (`parse_set_option`'s combine loop).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ListOp {
     Append,
@@ -1511,8 +1632,9 @@ enum ListOp {
 
 /// Apply `op` with `value` (a comma-separated list of items) to `current`
 /// (also comma-separated), returning the new combined string. Used for
-/// `:set iskeyword+=X` / `-=X` / `^=X`.
-fn combine_iskeyword_list(current: &str, value: &str, op: ListOp) -> String {
+/// `:set iskeyword+=X` / `-=X` / `^=X`, and (#1206) every other list-style
+/// value option (`'whichwrap'`, `'backspace'`, `'wildmode'`, `'listchars'`).
+fn combine_csv_list(current: &str, value: &str, op: ListOp) -> String {
     match op {
         ListOp::Append => {
             if current.is_empty() {
@@ -1537,6 +1659,210 @@ fn combine_iskeyword_list(current: &str, value: &str, op: ListOp) -> String {
                 .join(",")
         }
     }
+}
+
+/// `:h 'whichwrap'`'s real per-key wrap-token characters. Anything else in a
+/// `'whichwrap'` value is a malformed token.
+const WHICHWRAP_TOKENS: &[char] = &['b', 's', 'h', 'l', '<', '>', '~', '[', ']'];
+
+/// Validate a `'whichwrap'` value: comma-separated, each token one of
+/// [`WHICHWRAP_TOKENS`].
+fn parse_whichwrap(spec: &str) -> Result<(), String> {
+    for tok in spec.split(',') {
+        let tok = tok.trim();
+        if tok.is_empty() {
+            continue;
+        }
+        let chars: Vec<char> = tok.chars().collect();
+        if chars.len() != 1 || !WHICHWRAP_TOKENS.contains(&chars[0]) {
+            return Err(format!("bad token '{tok}'"));
+        }
+    }
+    Ok(())
+}
+
+/// `:h 'backspace'`'s real list-form tokens (`"nostop"` is a real Vim 8.2+
+/// item — an `"eol"` variant that also disables `'start'`-style stopping
+/// when crossing into the previous line — accepted here but not distinctly
+/// wired; see the field doc comment).
+const BACKSPACE_TOKENS: &[&str] = &["indent", "eol", "start", "nostop"];
+
+/// Validate and normalise a `'backspace'` value. Accepts both the modern
+/// comma-list form and Vim's legacy pre-7.4 numeric shorthand (`0`-`3`),
+/// expanding the latter to its equivalent list form so every other call
+/// site only ever has to deal with one shape (`:h 'backspace'`).
+fn parse_backspace(spec: &str) -> Result<String, String> {
+    match spec {
+        "0" => return Ok(String::new()),
+        "1" => return Ok("indent,eol".to_string()),
+        "2" => return Ok("indent,eol,start".to_string()),
+        "3" => return Ok("indent,eol,nostop".to_string()),
+        _ => {}
+    }
+    for tok in spec.split(',') {
+        let tok = tok.trim();
+        if tok.is_empty() {
+            continue;
+        }
+        if !BACKSPACE_TOKENS.contains(&tok) {
+            return Err(format!("bad token '{tok}'"));
+        }
+    }
+    Ok(spec.to_string())
+}
+
+/// `:h 'wildmode'`'s real per-stage keywords, each comma-separated stage
+/// optionally a colon-separated sequence of these.
+const WILDMODE_TOKENS: &[&str] = &[
+    "full", "longest", "list", "lastused", "", // "" — an empty stage, e.g. leading `,`
+];
+
+/// Validate a `'wildmode'` value: comma-separated stages, each stage a
+/// colon-separated sequence of [`WILDMODE_TOKENS`].
+fn parse_wildmode(spec: &str) -> Result<(), String> {
+    for stage in spec.split(',') {
+        for tok in stage.split(':') {
+            if !WILDMODE_TOKENS.contains(&tok) {
+                return Err(format!("bad token '{tok}'"));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `:h 'listchars'`'s real item keys. `Fixed(n)` items take exactly `n`
+/// characters; `Tab` takes two or three; `Cyclic` (`multispace`,
+/// `leadmultispace`) takes one or more.
+enum ListcharsItemShape {
+    Fixed(usize),
+    Tab,
+    Cyclic,
+}
+
+/// `(key, shape, is_wired)` — `is_wired` items are the ones
+/// `render::apply_list_glyphs` actually paints; the rest are accepted (real
+/// Vim items) but not rendered specially — see the `listchars` field doc.
+const LISTCHARS_ITEMS: &[(&str, ListcharsItemShape, bool)] = &[
+    ("eol", ListcharsItemShape::Fixed(1), true),
+    ("tab", ListcharsItemShape::Tab, true),
+    ("trail", ListcharsItemShape::Fixed(1), true),
+    ("nbsp", ListcharsItemShape::Fixed(1), true),
+    ("space", ListcharsItemShape::Fixed(1), true),
+    ("extends", ListcharsItemShape::Fixed(1), false),
+    ("precedes", ListcharsItemShape::Fixed(1), false),
+    ("multispace", ListcharsItemShape::Cyclic, false),
+    ("lead", ListcharsItemShape::Fixed(1), false),
+    ("leadmultispace", ListcharsItemShape::Cyclic, false),
+    ("leadtab", ListcharsItemShape::Tab, false),
+    ("conceal", ListcharsItemShape::Fixed(1), false),
+];
+
+/// Validate a `'listchars'` value: comma-separated `item:chars` pairs, each
+/// `item` one of [`LISTCHARS_ITEMS`] and `chars` matching that item's shape.
+fn parse_listchars(spec: &str) -> Result<(), String> {
+    // Deliberately does NOT trim each comma-split token (unlike every other
+    // list option in this file): a trailing space can be a meaningful part
+    // of an item's `chars` — Neovim's own default value is `"tab:> ,..."`,
+    // where the tab glyph's second character *is* a space — so trimming it
+    // away here would silently corrupt the parse.
+    for tok in spec.split(',') {
+        if tok.is_empty() {
+            continue;
+        }
+        let Some((key, chars)) = tok.split_once(':') else {
+            return Err(format!("bad item '{tok}' (expected 'item:chars')"));
+        };
+        let Some((_, shape, _)) = LISTCHARS_ITEMS.iter().find(|(k, ..)| *k == key) else {
+            return Err(format!("unknown listchars item '{key}'"));
+        };
+        let n = chars.chars().count();
+        let ok = match shape {
+            ListcharsItemShape::Fixed(want) => n == *want,
+            ListcharsItemShape::Tab => n == 2 || n == 3,
+            ListcharsItemShape::Cyclic => n >= 1,
+        };
+        if !ok {
+            return Err(format!("bad value '{chars}' for listchars item '{key}'"));
+        }
+    }
+    Ok(())
+}
+
+/// Look up the single-character glyph configured for `item` in `listchars`
+/// (`self.settings.listchars`), falling back to `default_char` if the item
+/// isn't present. Used by `render::apply_list_glyphs` for `'list'`'s
+/// `eol`/`trail`/`nbsp`/`space` glyphs.
+///
+/// No `.trim()` on each comma-split token — see [`parse_listchars`]'s doc
+/// comment; a trailing space can be the configured glyph itself.
+pub(crate) fn listchars_char(
+    listchars: &str,
+    item: &str,
+    default_char: Option<char>,
+) -> Option<char> {
+    for tok in listchars.split(',') {
+        if let Some(chars) = tok.strip_prefix(&format!("{item}:")) {
+            return chars.chars().next();
+        }
+    }
+    default_char
+}
+
+/// A parsed `'listchars'` `tab:xy` or `tab:xyz` item (`:h lcs-tab`). The two
+/// forms fill a tabstop-width gap differently — see [`Self::render`] — so
+/// this keeps them distinct rather than collapsing `xy` into `(x, y, y)`,
+/// which would get the width-1 case wrong (the 2-char form always shows
+/// `x` for a single-column gap; the 3-char form always shows `z`).
+pub(crate) enum TabGlyph {
+    /// `tab:xy` — `x` is always used first, then `y` fills the rest.
+    Two(char, char),
+    /// `tab:xyz` — `z` is always used last, `x` first, `y` fills the middle.
+    Three(char, char, char),
+}
+
+impl TabGlyph {
+    /// Render this glyph to fill a `width`-column gap (`width >= 1`).
+    pub(crate) fn render(&self, width: usize) -> String {
+        let width = width.max(1);
+        match *self {
+            TabGlyph::Two(x, y) => {
+                let mut s = String::new();
+                s.push(x);
+                for _ in 1..width {
+                    s.push(y);
+                }
+                s
+            }
+            TabGlyph::Three(x, y, z) => {
+                if width == 1 {
+                    return z.to_string();
+                }
+                let mut s = String::new();
+                s.push(x);
+                for _ in 0..width.saturating_sub(2) {
+                    s.push(y);
+                }
+                s.push(z);
+                s
+            }
+        }
+    }
+}
+
+/// Look up the `'listchars'` `tab:xy[z]` item, if present. No `.trim()` on
+/// each comma-split token — see [`parse_listchars`]'s doc comment.
+pub(crate) fn listchars_tab(listchars: &str) -> Option<TabGlyph> {
+    for tok in listchars.split(',') {
+        if let Some(spec) = tok.strip_prefix("tab:") {
+            let chars: Vec<char> = spec.chars().collect();
+            return match chars.len() {
+                2 => Some(TabGlyph::Two(chars[0], chars[1])),
+                3 => Some(TabGlyph::Three(chars[0], chars[1], chars[2])),
+                _ => None,
+            };
+        }
+    }
+    None
 }
 
 impl Settings {
@@ -1599,6 +1925,13 @@ impl Settings {
         self.virtualedit
             .split(',')
             .any(|t| t == "all" || t == "onemore")
+    }
+
+    /// Does `'backspace'` include `token` (`"indent"`, `"eol"`, `"start"`,
+    /// or `"nostop"`)? #1206 — see the field doc comment on
+    /// [`Settings::backspace`] for which tokens are distinctly wired.
+    pub(crate) fn backspace_allows(&self, token: &str) -> bool {
+        self.backspace.split(',').any(|t| t.trim() == token)
     }
 
     /// Is `c` a "word" character per `'iskeyword'` (#1191)? Drives
@@ -1742,15 +2075,24 @@ impl Settings {
             let raw_name = arg[..eq_pos].trim();
             let value = arg[eq_pos + 1..].trim();
 
-            // `+=`/`-=`/`^=` (#1191): Vim's list-option modify syntax —
-            // append, remove, or prepend a comma-separated list of items
-            // rather than replacing the whole value. Only 'iskeyword'
-            // supports it today; the other real-vim list options that take
-            // it (`listchars`, `whichwrap`, `backspace`, `clipboard`,
-            // `wildmode`) are still in `UNIMPLEMENTED_VALUE_OPTIONS` and
-            // fall through to the plain `=` path below unchanged, which
-            // reports them as recognised-but-not-implemented exactly as
-            // before.
+            // `+=`/`-=`/`^=` (#1191, generalised #1206): Vim's option-modify
+            // syntax. For a comma-separated list-style option, append,
+            // remove, or prepend items rather than replacing the whole
+            // value (`:h :set`, "List of items"). For a number option, add,
+            // subtract, or multiply (same section, "For number options").
+            //
+            // #1191 handled only 'iskeyword'; every other base fell through
+            // to the plain `=` path *with the operator still attached to its
+            // name* (`raw_name` was e.g. `"whichwrap+"`), so
+            // `set_value_option` did an exact-name match against that and
+            // reported "Unknown option: whichwrap+" instead of recognising
+            // the real option. Stripping the suffix unconditionally here —
+            // for every base, not just the ones with a combine helper below
+            // — fixes that: an option with no list/numeric handling still
+            // falls through to `set_value_option(base, value)`, which now
+            // sees the real name and reports its real status (implemented,
+            // "recognised but not implemented" for 'clipboard', or a genuine
+            // "Unknown option" for an actual typo).
             for (suffix, combine) in [
                 ('+', ListOp::Append),
                 ('-', ListOp::Remove),
@@ -1758,11 +2100,29 @@ impl Settings {
             ] {
                 if let Some(base) = raw_name.strip_suffix(suffix) {
                     let base = base.trim();
-                    if matches!(base, "iskeyword" | "isk") {
-                        let combined = combine_iskeyword_list(&self.iskeyword, value, combine);
-                        self.set_value_option(base, &combined)?;
-                        return Ok(format!("{base}={}", self.iskeyword));
+                    if let Some(current) = self.current_numeric_value(base) {
+                        let delta: i64 = value
+                            .parse()
+                            .map_err(|_| format!("Invalid value for {base}: '{value}'"))?;
+                        let new_val = match combine {
+                            ListOp::Append => current + delta,
+                            ListOp::Remove => current - delta,
+                            ListOp::Prepend => current * delta,
+                        };
+                        self.set_value_option(base, &new_val.to_string())?;
+                        // Re-read rather than trust `new_val` verbatim: some
+                        // numeric options clamp on write (e.g. `font_size`),
+                        // so the displayed message must match what's
+                        // actually stored, not the raw arithmetic result.
+                        return self.query_option(base);
                     }
+                    if let Some(current) = self.current_list_value(base) {
+                        let combined = combine_csv_list(&current, value, combine);
+                        self.set_value_option(base, &combined)?;
+                        return self.query_option(base);
+                    }
+                    self.set_value_option(base, value)?;
+                    return Ok(format!("{base}={value}"));
                 }
             }
 
@@ -2178,6 +2538,72 @@ impl Settings {
                 })?;
                 self.iskeyword = value.to_string();
             }
+            // #1206
+            "whichwrap" | "ww" => {
+                parse_whichwrap(value).map_err(|e| {
+                    format!(
+                        "Invalid value for {name}: '{value}' ({e}; expected a comma-separated \
+                         list of b/s/h/l/</>/~/[/])"
+                    )
+                })?;
+                self.whichwrap = value.to_string();
+            }
+            "backspace" | "bs" => {
+                let normalized = parse_backspace(value).map_err(|e| {
+                    format!(
+                        "Invalid value for {name}: '{value}' ({e}; expected a comma-separated \
+                         list of indent/eol/start/nostop, or the legacy 0-3)"
+                    )
+                })?;
+                self.backspace = normalized;
+            }
+            "timeoutlen" | "tm" => {
+                let n: u32 = value
+                    .parse()
+                    .map_err(|_| format!("Invalid value for {name}: '{value}'"))?;
+                self.timeoutlen = n;
+            }
+            "wildmode" | "wim" => {
+                parse_wildmode(value).map_err(|e| {
+                    format!(
+                        "Invalid value for {name}: '{value}' ({e}; expected comma-separated \
+                         stages of colon-separated full/longest/list/lastused)"
+                    )
+                })?;
+                self.wildmode = value.to_string();
+            }
+            "laststatus" | "ls" => {
+                let n: u8 = value
+                    .parse()
+                    .map_err(|_| format!("Invalid value for {name}: '{value}'"))?;
+                if n > 3 {
+                    return Err(format!(
+                        "Invalid value for {name}: '{value}' (expected 0-3)"
+                    ));
+                }
+                self.laststatus = n;
+            }
+            "sidescrolloff" | "siso" => {
+                let n: usize = value
+                    .parse()
+                    .map_err(|_| format!("Invalid value for {name}: '{value}'"))?;
+                self.sidescrolloff = n;
+            }
+            "scrolljump" | "sj" => {
+                let n: usize = value
+                    .parse()
+                    .map_err(|_| format!("Invalid value for {name}: '{value}'"))?;
+                self.scrolljump = n;
+            }
+            "listchars" | "lcs" => {
+                parse_listchars(value).map_err(|e| {
+                    format!(
+                        "Invalid value for {name}: '{value}' ({e}; expected comma-separated \
+                         item:chars pairs, e.g. 'tab:> ,trail:-')"
+                    )
+                })?;
+                self.listchars = value.to_string();
+            }
             // #1153: see `UNIMPLEMENTED_BOOL_OPTIONS`'s doc comment — same
             // rationale, value-option side.
             _ if UNIMPLEMENTED_VALUE_OPTIONS
@@ -2198,6 +2624,73 @@ impl Settings {
             }
         }
         Ok(())
+    }
+
+    /// The current value of `base` as an `i64`, if `base` names a numeric
+    /// value option — used by `parse_set_option`'s `+=`/`-=`/`^=` handling
+    /// (#1206) to compute add/subtract/multiply without a second, parallel
+    /// name-to-field match. Deliberately narrow: only options whose
+    /// `set_value_option` arm does a plain integer parse belong here — a
+    /// list-style option (even one that happens to look numeric, like the
+    /// legacy `'backspace'` shorthand) must go through
+    /// [`Self::current_list_value`] instead, or it would silently reinterpret
+    /// `:set bs+=1` as arithmetic instead of the list append Vim performs.
+    fn current_numeric_value(&self, base: &str) -> Option<i64> {
+        match base {
+            "tabstop" | "ts" => Some(self.tabstop as i64),
+            "shiftwidth" | "sw" => Some(self.shift_width as i64),
+            "scrolloff" | "so" => Some(self.scrolloff as i64),
+            "textwidth" | "tw" => Some(self.textwidth as i64),
+            "updatetime" | "ut" => Some(self.updatetime as i64),
+            "hover_delay" | "hd" => Some(self.hover_delay as i64),
+            "font_size" => Some(self.font_size as i64),
+            "ui_font_size" => Some(self.ui_font_size as i64),
+            "syntax_max_lines" | "syntaxmaxlines" => Some(self.syntax_max_lines as i64),
+            "softtabstop" | "sts" => Some(self.softtabstop as i64),
+            "foldlevel" | "fdl" => Some(self.foldlevel as i64),
+            "foldnestmax" | "fdn" => Some(self.foldnestmax as i64),
+            "timeoutlen" | "tm" => Some(self.timeoutlen as i64),
+            "laststatus" | "ls" => Some(self.laststatus as i64),
+            "sidescrolloff" | "siso" => Some(self.sidescrolloff as i64),
+            "scrolljump" | "sj" => Some(self.scrolljump as i64),
+            _ => None,
+        }
+    }
+
+    /// The current value of `base` as a raw comma-separated string, if
+    /// `base` names a list-style value option — used by
+    /// `parse_set_option`'s `+=`/`-=`/`^=` handling (#1206) the same way
+    /// [`Self::current_numeric_value`] is. `'clipboard'` deliberately has no
+    /// arm: it's list-shaped in real Vim, but vimcode has no stored value to
+    /// combine against (it's in `UNIMPLEMENTED_VALUE_OPTIONS`) — leaving it
+    /// out here means its `+=`/`-=`/`^=` case falls through to the plain
+    /// `set_value_option(base, value)` call, which is what reports the
+    /// "recognised but not implemented" message.
+    fn current_list_value(&self, base: &str) -> Option<String> {
+        match base {
+            "iskeyword" | "isk" => Some(self.iskeyword.clone()),
+            "whichwrap" | "ww" => Some(self.whichwrap.clone()),
+            "wildmode" | "wim" => Some(self.wildmode.clone()),
+            "listchars" | "lcs" => Some(self.listchars.clone()),
+            // Pre-existing list-style options #1206 didn't add but whose
+            // `+=`/`-=`/`^=` this same generalisation now has to get right
+            // too — without an arm here, the generic strip above would
+            // silently reinterpret e.g. `:set nrformats+=octal` as `:set
+            // nrformats=octal` (replacing, not appending), which is a worse
+            // outcome than #1191's old "Unknown option: nrformats+" error.
+            "nrformats" | "nf" => Some(self.nrformats.join(",")),
+            "colorcolumn" | "cc" => Some(self.colorcolumn.clone()),
+            "virtualedit" | "ve" => Some(self.virtualedit.clone()),
+            // 'backspace' also accepts a legacy *numeric* shorthand
+            // (0-3, expanded by `parse_backspace`), which would collide with
+            // `current_numeric_value`'s arithmetic if it were listed there
+            // too — it belongs here, as a list option, because `:h :set`
+            // classifies `'backspace'` itself as a list-of-items string
+            // option, and Vim's own `+=`/`-=`/`^=` on it does list
+            // append/remove/prepend, not arithmetic on the legacy digit.
+            "backspace" | "bs" => Some(self.backspace.clone()),
+            _ => None,
+        }
     }
 
     fn query_option(&self, opt: &str) -> Result<String, String> {
@@ -2436,6 +2929,15 @@ impl Settings {
             "iskeyword" | "isk" => Ok(format!("iskeyword={}", self.iskeyword)),
             // Always on — see the `set_bool_option` "wildmenu" | "wmnu" arm.
             "wildmenu" | "wmnu" => Ok("wildmenu".to_string()),
+            // #1206
+            "whichwrap" | "ww" => Ok(format!("whichwrap={}", self.whichwrap)),
+            "backspace" | "bs" => Ok(format!("backspace={}", self.backspace)),
+            "timeoutlen" | "tm" => Ok(format!("timeoutlen={}", self.timeoutlen)),
+            "wildmode" | "wim" => Ok(format!("wildmode={}", self.wildmode)),
+            "laststatus" | "ls" => Ok(format!("laststatus={}", self.laststatus)),
+            "sidescrolloff" | "siso" => Ok(format!("sidescrolloff={}", self.sidescrolloff)),
+            "scrolljump" | "sj" => Ok(format!("scrolljump={}", self.scrolljump)),
+            "listchars" | "lcs" => Ok(format!("listchars={}", self.listchars)),
             _ if UNIMPLEMENTED_BOOL_OPTIONS
                 .iter()
                 .any(|(n, a)| *n == opt || *a == opt)
@@ -2545,6 +3047,14 @@ impl Settings {
             "showcmd" | "sc" => self.showcmd.to_string(),
             "ruler" | "ru" => self.ruler.to_string(),
             "list" => self.list.to_string(),
+            "listchars" | "lcs" => self.listchars.clone(),
+            "whichwrap" | "ww" => self.whichwrap.clone(),
+            "backspace" | "bs" => self.backspace.clone(),
+            "timeoutlen" | "tm" => self.timeoutlen.to_string(),
+            "wildmode" | "wim" => self.wildmode.clone(),
+            "laststatus" | "ls" => self.laststatus.to_string(),
+            "sidescrolloff" | "siso" => self.sidescrolloff.to_string(),
+            "scrolljump" | "sj" => self.scrolljump.to_string(),
             "smarttab" | "sta" => self.smarttab.to_string(),
             "nrformats" | "nf" => self.nrformats.join(","),
             "iskeyword" | "isk" => self.iskeyword.clone(),
@@ -4285,5 +4795,253 @@ mod tests {
         }
 
         assert!(s.set_value_str("menu_style", "bogus").is_err());
+    }
+
+    // ── #1206: generic `+=`/`-=`/`^=` strip ──────────────────────────────
+
+    /// RED against unfixed `develop`: before #1206, only `'iskeyword'` had
+    /// its `+=`/`-=`/`^=` suffix stripped before the name lookup — every
+    /// other option's raw name still carried the operator into
+    /// `set_value_option`'s exact-name match, so `whichwrap+` (not
+    /// `whichwrap`) is what got looked up and reported as unknown.
+    #[test]
+    fn plus_equals_on_a_list_option_other_than_iskeyword_no_longer_names_the_option_wrong() {
+        let mut s = Settings::default();
+        let err = s.parse_set_option("clipboard+=unnamed").unwrap_err();
+        assert_eq!(
+            err, "Option 'clipboard' is recognised but not implemented yet",
+            "must name the real option 'clipboard', not 'clipboard+'"
+        );
+    }
+
+    #[test]
+    fn plus_equals_on_whichwrap_appends_to_the_list() {
+        let mut s = Settings::default();
+        let msg = s.parse_set_option("whichwrap+=h,l").unwrap();
+        assert_eq!(msg, "whichwrap=b,s,h,l");
+        assert_eq!(s.whichwrap, "b,s,h,l");
+    }
+
+    #[test]
+    fn minus_equals_on_whichwrap_removes_from_the_list() {
+        let mut s = Settings::default();
+        s.parse_set_option("ww-=b").unwrap();
+        assert_eq!(s.whichwrap, "s");
+    }
+
+    #[test]
+    fn caret_equals_on_backspace_prepends_to_the_list() {
+        let mut s = Settings::default();
+        s.parse_set_option("bs^=nostop").unwrap();
+        assert_eq!(s.backspace, "nostop,indent,eol,start");
+    }
+
+    /// Numeric options also take `+=`/`-=`/`^=` in real Vim (add/subtract/
+    /// multiply) — #1206 generalised the same strip loop to cover them too,
+    /// not just list options.
+    #[test]
+    fn plus_equals_on_a_numeric_option_adds() {
+        let mut s = Settings::default();
+        let msg = s.parse_set_option("scrolloff+=3").unwrap();
+        assert_eq!(msg, "scrolloff=3");
+        assert_eq!(s.scrolloff, 3);
+        s.parse_set_option("so+=2").unwrap();
+        assert_eq!(s.scrolloff, 5);
+    }
+
+    #[test]
+    fn minus_equals_on_a_numeric_option_subtracts() {
+        let mut s = Settings::default();
+        s.scrolljump = 5;
+        s.parse_set_option("scrolljump-=2").unwrap();
+        assert_eq!(s.scrolljump, 3);
+    }
+
+    #[test]
+    fn caret_equals_on_a_numeric_option_multiplies() {
+        let mut s = Settings::default();
+        s.parse_set_option("timeoutlen=100").unwrap();
+        s.parse_set_option("tm^=3").unwrap();
+        assert_eq!(s.timeoutlen, 300);
+    }
+
+    /// A pre-existing list option #1206 didn't add (`'nrformats'`) must
+    /// also get real list append/remove, not silent overwrite — see the
+    /// `current_list_value` doc comment for why this would otherwise be a
+    /// worse regression than the bug #1206 fixes.
+    #[test]
+    fn plus_equals_on_a_pre_existing_list_option_appends_not_overwrites() {
+        let mut s = Settings::default();
+        assert_eq!(s.nrformats, vec!["bin", "hex"]);
+        s.parse_set_option("nrformats+=octal").unwrap();
+        assert_eq!(s.nrformats, vec!["bin", "hex", "octal"]);
+    }
+
+    // ── #1206: 'whichwrap' ───────────────────────────────────────────────
+
+    #[test]
+    fn whichwrap_default_matches_neovim() {
+        assert_eq!(Settings::default().whichwrap, "b,s");
+    }
+
+    #[test]
+    fn whichwrap_rejects_bad_token() {
+        let mut s = Settings::default();
+        let err = s.parse_set_option("whichwrap=x").unwrap_err();
+        assert!(err.contains("Invalid value for whichwrap"), "{err}");
+    }
+
+    #[test]
+    fn whichwrap_accepts_every_real_token() {
+        let mut s = Settings::default();
+        s.parse_set_option("ww=b,s,h,l,<,>,~,[,]").unwrap();
+        assert_eq!(s.whichwrap, "b,s,h,l,<,>,~,[,]");
+    }
+
+    // ── #1206: 'backspace' ───────────────────────────────────────────────
+
+    #[test]
+    fn backspace_default_matches_neovim() {
+        assert_eq!(Settings::default().backspace, "indent,eol,start");
+    }
+
+    #[test]
+    fn backspace_rejects_bad_token() {
+        let mut s = Settings::default();
+        let err = s.parse_set_option("backspace=bogus").unwrap_err();
+        assert!(err.contains("Invalid value for backspace"), "{err}");
+    }
+
+    #[test]
+    fn backspace_legacy_numeric_values_expand_to_the_list_form() {
+        let mut s = Settings::default();
+        s.parse_set_option("bs=0").unwrap();
+        assert_eq!(s.backspace, "");
+        s.parse_set_option("bs=1").unwrap();
+        assert_eq!(s.backspace, "indent,eol");
+        s.parse_set_option("bs=2").unwrap();
+        assert_eq!(s.backspace, "indent,eol,start");
+        s.parse_set_option("bs=3").unwrap();
+        assert_eq!(s.backspace, "indent,eol,nostop");
+    }
+
+    // ── #1206: 'timeoutlen' ──────────────────────────────────────────────
+
+    #[test]
+    fn timeoutlen_default_matches_neovim() {
+        assert_eq!(Settings::default().timeoutlen, 1000);
+    }
+
+    #[test]
+    fn timeoutlen_set_and_query() {
+        let mut s = Settings::default();
+        let msg = s.parse_set_option("timeoutlen=250").unwrap();
+        assert_eq!(msg, "timeoutlen=250");
+        assert_eq!(s.parse_set_option("tm?").unwrap(), "timeoutlen=250");
+    }
+
+    // ── #1206: 'wildmode' ────────────────────────────────────────────────
+
+    #[test]
+    fn wildmode_default_matches_neovim() {
+        assert_eq!(Settings::default().wildmode, "full");
+    }
+
+    #[test]
+    fn wildmode_accepts_documented_stage_grammar() {
+        let mut s = Settings::default();
+        s.parse_set_option("wildmode=longest:full,full").unwrap();
+        assert_eq!(s.wildmode, "longest:full,full");
+    }
+
+    #[test]
+    fn wildmode_rejects_bad_token() {
+        let mut s = Settings::default();
+        let err = s.parse_set_option("wildmode=bogus").unwrap_err();
+        assert!(err.contains("Invalid value for wildmode"), "{err}");
+    }
+
+    // ── #1206: 'laststatus' ──────────────────────────────────────────────
+
+    #[test]
+    fn laststatus_default_matches_neovim() {
+        assert_eq!(Settings::default().laststatus, 2);
+    }
+
+    #[test]
+    fn laststatus_rejects_out_of_range() {
+        let mut s = Settings::default();
+        let err = s.parse_set_option("laststatus=4").unwrap_err();
+        assert!(err.contains("Invalid value for laststatus"), "{err}");
+    }
+
+    #[test]
+    fn laststatus_accepts_0_through_3() {
+        let mut s = Settings::default();
+        for n in 0..=3 {
+            s.parse_set_option(&format!("ls={n}")).unwrap();
+            assert_eq!(s.laststatus, n);
+        }
+    }
+
+    // ── #1206: 'sidescrolloff' / 'scrolljump' ────────────────────────────
+
+    #[test]
+    fn sidescrolloff_and_scrolljump_defaults_match_neovim() {
+        let s = Settings::default();
+        assert_eq!(s.sidescrolloff, 0);
+        assert_eq!(s.scrolljump, 1);
+    }
+
+    #[test]
+    fn sidescrolloff_set_and_query() {
+        let mut s = Settings::default();
+        s.parse_set_option("siso=8").unwrap();
+        assert_eq!(s.sidescrolloff, 8);
+        assert_eq!(
+            s.parse_set_option("sidescrolloff?").unwrap(),
+            "sidescrolloff=8"
+        );
+    }
+
+    #[test]
+    fn scrolljump_accepts_zero() {
+        // Neovim itself accepts `scrolljump=0` (verified against
+        // `nvim --headless`) — must not be rejected here.
+        let mut s = Settings::default();
+        s.parse_set_option("sj=0").unwrap();
+        assert_eq!(s.scrolljump, 0);
+    }
+
+    // ── #1206: 'listchars' ───────────────────────────────────────────────
+
+    #[test]
+    fn listchars_default_matches_neovim() {
+        assert_eq!(Settings::default().listchars, "tab:> ,trail:-,nbsp:+");
+    }
+
+    #[test]
+    fn listchars_rejects_unknown_item() {
+        let mut s = Settings::default();
+        let err = s.parse_set_option("listchars=bogus:x").unwrap_err();
+        assert!(err.contains("Invalid value for listchars"), "{err}");
+    }
+
+    #[test]
+    fn listchars_rejects_wrong_length_value() {
+        let mut s = Settings::default();
+        assert!(s.parse_set_option("lcs=eol:$$").is_err());
+        assert!(s.parse_set_option("lcs=tab:x").is_err());
+        assert!(s.parse_set_option("lcs=tab:wxyz").is_err());
+    }
+
+    #[test]
+    fn listchars_accepts_three_char_tab_and_unwired_real_items() {
+        let mut s = Settings::default();
+        // 'multispace'/'lead'/etc are real Vim items with no vimcode glyph
+        // yet — must be accepted, not rejected as a typo.
+        s.parse_set_option("lcs=tab:<->,multispace:-+,lead:.,conceal:x")
+            .unwrap();
+        assert_eq!(s.listchars, "tab:<->,multispace:-+,lead:.,conceal:x");
     }
 }

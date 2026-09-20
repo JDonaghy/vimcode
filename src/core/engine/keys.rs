@@ -619,9 +619,11 @@ impl Engine {
             }
         }
 
-        // Track where insert mode was entered (for Ctrl-U boundary)
+        // Track where insert mode was entered (for Ctrl-U boundary, and
+        // 'backspace''s "start" token, #1206)
         if !matches!(pre_mode, Mode::Insert) && self.mode == Mode::Insert {
             self.insert_enter_col = self.view().cursor.col;
+            self.insert_enter_line = self.view().cursor.line;
         }
 
         if changed {
@@ -1158,7 +1160,7 @@ impl Engine {
             Some('h') => {
                 let count = self.take_count();
                 for _ in 0..count {
-                    self.move_left();
+                    self.move_left_whichwrap('h');
                 }
             }
             Some('j') => {
@@ -1186,7 +1188,7 @@ impl Engine {
             Some('l') => {
                 let count = self.take_count();
                 for _ in 0..count {
-                    self.move_right();
+                    self.move_right_whichwrap('l');
                 }
             }
             Some('i') => {
@@ -2032,7 +2034,7 @@ impl Engine {
                 "Left" => {
                     let count = self.take_count();
                     for _ in 0..count {
-                        self.move_left();
+                        self.move_left_whichwrap('<');
                     }
                 }
                 "Down" => {
@@ -2050,7 +2052,28 @@ impl Engine {
                 "Right" => {
                     let count = self.take_count();
                     for _ in 0..count {
-                        self.move_right();
+                        self.move_right_whichwrap('>');
+                    }
+                }
+                // `:h 'whichwrap'`: `<BS>`/`<Space>` as Normal-mode motions
+                // (`b`/`s` tokens — the *default* `'whichwrap'` value, so
+                // these wrap into the previous/next line out of the box).
+                // There was no Normal-mode handling for either key at all
+                // before #1206 — both silently no-op'd.
+                "BackSpace" => {
+                    let count = self.take_count();
+                    for _ in 0..count {
+                        self.move_left_whichwrap('b');
+                    }
+                }
+                // Both spellings: real key events use "Space" (see
+                // `tui_main::shell_app`'s `Key::Char(' ')` mapping) but
+                // `encode_keypress`/`decode_keypress` and existing tests
+                // also use lowercase "space" interchangeably (#1206).
+                "space" | "Space" => {
+                    let count = self.take_count();
+                    for _ in 0..count {
+                        self.move_right_whichwrap('s');
                     }
                 }
                 "Home" => self.view_mut().cursor.col = 0,
@@ -6323,8 +6346,9 @@ impl Engine {
                     self.view_mut().cursor.col = i;
                     *changed = true;
                 }
-            } else if line > 0 {
-                // At column 1: join with the previous line, same as BackSpace.
+            } else if line > 0 && self.settings.backspace_allows("eol") {
+                // At column 1: join with the previous line, same as BackSpace
+                // — including the `'backspace'` `"eol"` gate (#1206).
                 let prev_line_len = self.buffer().line_len_chars(line - 1);
                 let new_col = prev_line_len.saturating_sub(1);
                 let char_idx = self.buffer().line_to_char(line);
@@ -6754,24 +6778,42 @@ impl Engine {
                         self.view_mut().cursor.col = new_col;
                         *changed = true;
                     } else if col > 0 {
-                        // Auto-pair backspace: delete both opener and closer
-                        let prev_char = self.buffer().content.char(char_idx - 1);
-                        let next_char_matches =
-                            if self.settings.auto_pairs() && char_idx < self.buffer().len_chars() {
+                        // `:h 'backspace'`: without the `"start"` token,
+                        // BackSpace refuses to delete at or before the
+                        // position where the current Insert session began
+                        // (#1206). This has to be its own `col > 0` arm
+                        // rather than folded into the condition — falling
+                        // through to `else if` here would hit the
+                        // `line > 0` line-join branch below even though
+                        // `col > 0`, which is wrong (it isn't the "at
+                        // column 0" case at all, it's "blocked mid-line").
+                        if self.backspace_may_delete_before(line, col) {
+                            // Auto-pair backspace: delete both opener and closer
+                            let prev_char = self.buffer().content.char(char_idx - 1);
+                            let next_char_matches = if self.settings.auto_pairs()
+                                && char_idx < self.buffer().len_chars()
+                            {
                                 let next = self.buffer().content.char(char_idx);
                                 auto_pair_closer(prev_char) == Some(next)
                             } else {
                                 false
                             };
-                        if next_char_matches {
-                            // Delete both the opener (before cursor) and closer (after cursor)
-                            self.delete_with_undo(char_idx - 1, char_idx + 1);
-                        } else {
-                            self.delete_with_undo(char_idx - 1, char_idx);
+                            if next_char_matches {
+                                // Delete both the opener (before cursor) and closer (after cursor)
+                                self.delete_with_undo(char_idx - 1, char_idx + 1);
+                            } else {
+                                self.delete_with_undo(char_idx - 1, char_idx);
+                            }
+                            self.view_mut().cursor.col -= 1;
+                            *changed = true;
                         }
-                        self.view_mut().cursor.col -= 1;
-                        *changed = true;
-                    } else if line > 0 {
+                    } else if line > 0 && self.settings.backspace_allows("eol") {
+                        // `:h 'backspace'`: crossing into the previous line
+                        // (joining it with this one) requires the `"eol"`
+                        // token — gated here rather than earlier so every
+                        // other BackSpace behavior (auto-pair, softtabstop,
+                        // smarttab) stays available up to the true start of
+                        // the line regardless of `'backspace'` (#1206).
                         let prev_line_len = self.buffer().line_len_chars(line - 1);
                         let new_col = if prev_line_len > 0 {
                             prev_line_len - 1
@@ -6932,12 +6974,12 @@ impl Engine {
             }
             "Left" => {
                 self.cancel_insert_repeat_count();
-                self.move_left();
+                self.move_left_insert_whichwrap('[');
                 self.split_insert_undo_group();
             }
             "Right" => {
                 self.cancel_insert_repeat_count();
-                self.move_right_insert();
+                self.move_right_insert_whichwrap(']');
                 self.split_insert_undo_group();
             }
             "Up" => {
@@ -8540,7 +8582,7 @@ impl Engine {
             Some('h') => {
                 let count = self.take_count();
                 for _ in 0..count {
-                    self.move_left();
+                    self.move_left_whichwrap('h');
                 }
             }
             Some('j') => {
@@ -8568,7 +8610,7 @@ impl Engine {
             Some('l') => {
                 let count = self.take_count();
                 for _ in 0..count {
-                    self.move_right();
+                    self.move_right_whichwrap('l');
                 }
             }
             Some('w') => {
@@ -8679,7 +8721,7 @@ impl Engine {
                 "Left" => {
                     let count = self.take_count();
                     for _ in 0..count {
-                        self.move_left();
+                        self.move_left_whichwrap('<');
                     }
                 }
                 "Down" => {
@@ -8697,7 +8739,7 @@ impl Engine {
                 "Right" => {
                     let count = self.take_count();
                     for _ in 0..count {
-                        self.move_right();
+                        self.move_right_whichwrap('>');
                     }
                 }
                 "Home" => self.view_mut().cursor.col = 0,
@@ -9446,6 +9488,7 @@ impl Engine {
 
         if let Some((action, noremap)) = exact_match {
             self.keymap_buf.clear();
+            self.keymap_buf_deadline = None;
             let explicit_count = self.peek_count();
             let count = self.take_count();
             *changed = true;
@@ -9478,18 +9521,40 @@ impl Engine {
         }
 
         if has_prefix {
-            // More keys needed — consume this keypress
+            // More keys needed — consume this keypress. Arm/refresh the
+            // 'timeoutlen' deadline (#1206): each keystroke that extends an
+            // still-ambiguous buffer gets its own full 'timeoutlen' window,
+            // matching Vim's "waited... for a key code or mapped key
+            // sequence to complete" (`:h 'timeoutlen'`). `0` means "no
+            // timed wait" — leave `keymap_buf_deadline` unset so
+            // `tick_keymap_timeout` never fires and the buffer only
+            // resolves on the next keystroke, exactly like before #1206.
+            self.keymap_buf_deadline = (self.settings.timeoutlen > 0).then(|| {
+                std::time::Instant::now()
+                    + std::time::Duration::from_millis(self.settings.timeoutlen as u64)
+            });
             return Some(EngineAction::None);
         }
 
         // No match and no prefix. Replay buffered keys.
+        self.keymap_buf_deadline = None;
         let buf: Vec<String> = std::mem::take(&mut self.keymap_buf);
+        self.replay_keymap_buf(buf)
+    }
+
+    /// Replay a buffered (encoded) keypress sequence that turned out not to
+    /// match any user keymap because the *next* keystroke ruled it out
+    /// (`try_user_keymap`'s own fallthrough — not used by
+    /// [`Self::tick_keymap_timeout`], which has no such live keystroke and
+    /// so dispatches unconditionally, including a 1-key buffer, instead).
+    /// A single buffered key with no match is left alone here — the
+    /// still-in-progress `handle_key` call for that same keystroke falls
+    /// through to built-in handling for it rather than this re-dispatching
+    /// it, since a lone key can't have been "replayed" from anywhere.
+    fn replay_keymap_buf(&mut self, buf: Vec<String>) -> Option<EngineAction> {
         if buf.len() <= 1 {
-            // Single key, no match — fall through to built-in handling
             return None;
         }
-
-        // Multi-key sequence that didn't match any keymap: replay all keys
         self.keymap_replaying = true;
         let mut last_action = EngineAction::None;
         for encoded_key in buf {
@@ -9498,6 +9563,47 @@ impl Engine {
         }
         self.keymap_replaying = false;
         Some(last_action)
+    }
+
+    /// Idle-tick companion to [`Self::try_user_keymap`] (`poll_idle`,
+    /// #1206): if a keypress buffer has been sitting as an unresolved
+    /// mapping prefix for `'timeoutlen'` ms with no further keystroke, give
+    /// up waiting and dispatch it as the individual keys it contains.
+    ///
+    /// Unlike [`Self::replay_keymap_buf`] (used when a *keystroke* proves
+    /// the buffer has no match — that keystroke's own `handle_key` call is
+    /// still on the stack and falls through to built-in handling for a
+    /// lone buffered key itself), a 1-key buffer here gets dispatched too:
+    /// there is no live keystroke left to fall through on, and a 1-key
+    /// buffer is the *common* case (typing the first key of a 2-key mapping
+    /// and then pausing) — dropping it would silently eat that keystroke
+    /// instead of letting it act as the plain key it is (`:h 'timeoutlen'`).
+    /// Returns `true` if a redraw is needed (the replay changed something).
+    pub fn tick_keymap_timeout(&mut self) -> bool {
+        let Some(deadline) = self.keymap_buf_deadline else {
+            return false;
+        };
+        if std::time::Instant::now() < deadline {
+            return false;
+        }
+        self.keymap_buf_deadline = None;
+        let buf: Vec<String> = std::mem::take(&mut self.keymap_buf);
+        if buf.is_empty() {
+            return false;
+        }
+        self.keymap_replaying = true;
+        for encoded_key in buf {
+            let (rk_name, rk_unicode, rk_ctrl) = decode_keypress(&encoded_key);
+            self.handle_key(&rk_name, rk_unicode, rk_ctrl);
+        }
+        self.keymap_replaying = false;
+        // `EngineAction::None` is also the return value for most ordinary,
+        // state-changing key handling (not just genuine no-ops), so it
+        // can't distinguish "changed something" here — always report a
+        // redraw when a replay actually ran, same as the live-keystroke
+        // path (`try_user_keymap`'s caller sets `*changed = true`
+        // unconditionally once it decides to replay).
+        true
     }
 
     /// Feed a key-to-keys mapping's rhs back through `handle_key`.

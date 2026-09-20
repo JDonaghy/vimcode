@@ -33271,3 +33271,315 @@ fn normalized_ctrl_space_round_trips_through_encode_keypress() {
         encode_keypress("Tab", None, true)
     );
 }
+
+// ── #1206: 'whichwrap' ───────────────────────────────────────────────────
+
+#[test]
+fn test_1206_whichwrap_h_does_not_wrap_by_default() {
+    // Default 'whichwrap' is "b,s" — h/l must NOT wrap, matching vimcode's
+    // pre-#1206 hardcoded (never-wrap) `h`/`l` behavior.
+    let mut engine = engine_with_text("first\nsecond\n");
+    engine.view_mut().cursor.line = 1;
+    engine.view_mut().cursor.col = 0;
+    engine.feed_keys("h");
+    assert_eq!(engine.cursor().line, 1);
+    assert_eq!(engine.cursor().col, 0);
+}
+
+#[test]
+fn test_1206_whichwrap_h_wraps_to_previous_line_when_configured() {
+    let mut engine = engine_with_text("first\nsecond\n");
+    engine.feed_keys(":set whichwrap+=h<CR>");
+    engine.view_mut().cursor.line = 1;
+    engine.view_mut().cursor.col = 0;
+    engine.feed_keys("h");
+    assert_eq!(
+        engine.cursor().line,
+        0,
+        "h must wrap onto the previous line"
+    );
+    assert_eq!(
+        engine.cursor().col,
+        4,
+        "lands on 'first''s last char (index 4)"
+    );
+}
+
+#[test]
+fn test_1206_whichwrap_l_wraps_to_next_line_when_configured() {
+    let mut engine = engine_with_text("first\nsecond\n");
+    engine.feed_keys(":set whichwrap+=l<CR>");
+    engine.view_mut().cursor.line = 0;
+    engine.view_mut().cursor.col = 4; // last char of "first"
+    engine.feed_keys("l");
+    assert_eq!(engine.cursor().line, 1, "l must wrap onto the next line");
+    assert_eq!(engine.cursor().col, 0);
+}
+
+/// RED against unfixed `develop` (#1206): before this change, Normal-mode
+/// `<BS>` had no handling at all (silently no-op'd) — this fails against
+/// that dead binding. Default `'whichwrap'` includes `b`, so this wraps out
+/// of the box.
+#[test]
+fn test_1206_whichwrap_backspace_key_wraps_by_default() {
+    let mut engine = engine_with_text("first\nsecond\n");
+    engine.view_mut().cursor.line = 1;
+    engine.view_mut().cursor.col = 0;
+    engine.feed_keys("<BS>");
+    assert_eq!(
+        engine.cursor().line,
+        0,
+        "<BS> must wrap by default (b in whichwrap)"
+    );
+    assert_eq!(engine.cursor().col, 4);
+}
+
+/// RED against unfixed `develop` (#1206): Normal-mode `<Space>` had no
+/// handling at all before this change either.
+///
+/// `settings.leader` defaults to `' '` (space) too (vimcode's own
+/// pre-existing, unrelated choice — matches the common modern-vimrc
+/// `<Space>`-as-leader convention), and the leader-key check in
+/// `handle_normal_key` runs *before* this motion, so it must be changed
+/// here or a plain `<Space>` will never reach `whichwrap`'s `s` handling at
+/// all under vimcode's real defaults — that's a pre-existing precedence
+/// choice, not something #1206 changes.
+#[test]
+fn test_1206_whichwrap_space_key_wraps_by_default() {
+    let mut engine = engine_with_text("first\nsecond\n");
+    engine.settings.leader = ',';
+    engine.view_mut().cursor.line = 0;
+    engine.view_mut().cursor.col = 4;
+    // `feed_keys(" ")` synthesizes a literal-char keypress (key_name " "),
+    // not the real "Space" named key `tui_main::shell_app` actually sends
+    // for the space bar — call `handle_key` directly with that real name
+    // (matches the existing `handle_key("space", Some(' '), false)`
+    // convention other tests in this file already use).
+    engine.handle_key("space", Some(' '), false);
+    assert_eq!(
+        engine.cursor().line,
+        1,
+        "<Space> must wrap by default (s in whichwrap)"
+    );
+    assert_eq!(engine.cursor().col, 0);
+}
+
+#[test]
+fn test_1206_whichwrap_left_right_arrows_normal_mode() {
+    let mut engine = engine_with_text("first\nsecond\n");
+    engine.feed_keys(":set whichwrap+=<,><CR>");
+    engine.view_mut().cursor.line = 1;
+    engine.view_mut().cursor.col = 0;
+    engine.feed_keys("<Left>");
+    assert_eq!(engine.cursor().line, 0);
+    assert_eq!(engine.cursor().col, 4);
+    engine.feed_keys("<Right>");
+    assert_eq!(engine.cursor().line, 1);
+    assert_eq!(engine.cursor().col, 0);
+}
+
+#[test]
+fn test_1206_whichwrap_insert_mode_left_right_use_bracket_tokens() {
+    let mut engine = engine_with_text("first\nsecond\n");
+    engine.feed_keys(":set whichwrap+=[,]<CR>");
+    engine.feed_keys("gg0i"); // insert mode, line 0 col 0
+    engine.feed_keys("<Left>");
+    // Insert-mode Left at col 0 of the first line has no previous line to
+    // wrap to — must stay put, not panic/underflow.
+    assert_eq!(engine.cursor().line, 0);
+    assert_eq!(engine.cursor().col, 0);
+    engine.feed_keys("<Esc>");
+
+    engine.view_mut().cursor.line = 0;
+    engine.view_mut().cursor.col = 5; // end of "first" in insert-mode terms
+    engine.set_mode(crate::core::Mode::Insert);
+    engine.feed_keys("<Right>");
+    assert_eq!(engine.cursor().line, 1, "] must let Insert-mode Right wrap");
+    assert_eq!(engine.cursor().col, 0);
+    engine.feed_keys("<Esc>");
+}
+
+// ── #1206: 'backspace' ───────────────────────────────────────────────────
+
+#[test]
+fn test_1206_backspace_default_still_joins_lines_at_col_zero() {
+    // Default "indent,eol,start" must reproduce vimcode's pre-#1206
+    // hardcoded (always-join) BackSpace behavior exactly.
+    let mut engine = engine_with_text("first\nsecond\n");
+    engine.view_mut().cursor.line = 1;
+    engine.view_mut().cursor.col = 0;
+    engine.set_mode(crate::core::Mode::Insert);
+    engine.feed_keys("<BS>");
+    assert_eq!(engine.buffer().to_string(), "firstsecond\n");
+    engine.feed_keys("<Esc>");
+}
+
+/// RED against unfixed `develop` (#1206): before this option existed,
+/// BackSpace always joined lines at column 0 regardless of any setting —
+/// this fails against that hardcoded behavior.
+#[test]
+fn test_1206_backspace_without_eol_does_not_join_lines() {
+    let mut engine = engine_with_text("first\nsecond\n");
+    engine.feed_keys(":set backspace-=eol<CR>");
+    engine.view_mut().cursor.line = 1;
+    engine.view_mut().cursor.col = 0;
+    engine.set_mode(crate::core::Mode::Insert);
+    engine.feed_keys("<BS>");
+    assert_eq!(
+        engine.buffer().to_string(),
+        "first\nsecond\n",
+        "without 'eol', BackSpace at column 0 must not join lines"
+    );
+    assert_eq!(engine.cursor().line, 1);
+    assert_eq!(engine.cursor().col, 0);
+    engine.feed_keys("<Esc>");
+}
+
+/// RED against unfixed `develop` (#1206): before this option existed,
+/// BackSpace could always delete back through pre-existing text with no
+/// concept of "where this Insert session started" — this fails against
+/// that unrestricted behavior.
+#[test]
+fn test_1206_backspace_without_start_stops_at_insert_start() {
+    let mut engine = engine_with_text("hello world\n");
+    engine.feed_keys(":set backspace=indent,eol<CR>"); // no 'start'
+    engine.view_mut().cursor.line = 0;
+    engine.view_mut().cursor.col = 6; // just before "world"
+    engine.set_mode(crate::core::Mode::Insert);
+    // insert_enter_line/col are only recorded by the mode-transition
+    // tracked in `handle_key` — enter Insert via a real command so that
+    // bookkeeping runs, rather than poking `self.mode` directly above.
+    engine.set_mode(crate::core::Mode::Normal);
+    engine.view_mut().cursor.col = 6;
+    engine.feed_keys("i");
+    engine.feed_keys("X"); // type one char — cursor now at col 7
+    assert_eq!(engine.buffer().to_string(), "hello Xworld\n");
+    engine.feed_keys("<BS>"); // deletes the typed "X" — col back to 6
+    assert_eq!(engine.buffer().to_string(), "hello world\n");
+    engine.feed_keys("<BS>"); // at insert-start boundary, 'start' absent: no-op
+    assert_eq!(
+        engine.buffer().to_string(),
+        "hello world\n",
+        "without 'start', BackSpace must not delete past where Insert began"
+    );
+    engine.feed_keys("<Esc>");
+}
+
+// ── #1206: 'sidescrolloff' / 'scrolljump' ─────────────────────────────────
+
+#[test]
+fn test_1206_sidescrolloff_keeps_columns_visible() {
+    let mut engine = Engine::new();
+    let long_line = "x".repeat(200);
+    engine.buffer_mut().insert(0, &format!("{long_line}\n"));
+    engine.update_syntax();
+    engine.settings.wrap = false;
+    engine.settings.sidescrolloff = 10;
+    engine.view_mut().viewport_cols = 40;
+
+    engine.view_mut().cursor.col = 150;
+    engine.ensure_cursor_visible();
+    let scroll_left = engine.view().scroll_left;
+    assert!(
+        engine.cursor().col >= scroll_left + 10,
+        "sidescrolloff=10: cursor should keep >= 10 cols from the left edge ({scroll_left})"
+    );
+    assert!(
+        engine.cursor().col + 10 <= scroll_left + 40,
+        "sidescrolloff=10: cursor should keep >= 10 cols from the right edge ({scroll_left})"
+    );
+}
+
+#[test]
+fn test_1206_scrolljump_scrolls_at_least_the_configured_amount() {
+    let mut engine = Engine::new();
+    let mut buf = String::new();
+    for i in 0..100 {
+        buf.push_str(&format!("line {i}\n"));
+    }
+    engine.buffer_mut().insert(0, &buf);
+    engine.update_syntax();
+    engine.view_mut().viewport_lines = 20;
+    engine.view_mut().scroll_top = 0;
+    engine.settings.scrolljump = 10;
+
+    // Cursor moves one line past the bottom edge (would need scroll_top=1
+    // with scrolljump's default of 1) — with scrolljump=10 the scroll must
+    // jump by at least 10 lines instead of the bare minimum.
+    engine.view_mut().cursor.line = 20;
+    engine.ensure_cursor_visible();
+    assert!(
+        engine.view().scroll_top >= 10,
+        "scrolljump=10: a bottom-edge scroll must move at least 10 lines ({})",
+        engine.view().scroll_top
+    );
+}
+
+#[test]
+fn test_1206_scrolljump_default_matches_pre_existing_minimal_scroll() {
+    // scrolljump=1 (the default) must reproduce vimcode's pre-#1206 exact
+    // "scroll the minimal amount" behavior.
+    let mut engine = Engine::new();
+    let mut buf = String::new();
+    for i in 0..100 {
+        buf.push_str(&format!("line {i}\n"));
+    }
+    engine.buffer_mut().insert(0, &buf);
+    engine.update_syntax();
+    engine.view_mut().viewport_lines = 20;
+    engine.view_mut().scroll_top = 0;
+
+    engine.view_mut().cursor.line = 20;
+    engine.ensure_cursor_visible();
+    assert_eq!(engine.view().scroll_top, 1);
+}
+
+// ── #1206: 'timeoutlen' ────────────────────────────────────────────────
+
+#[test]
+fn test_1206_timeoutlen_flushes_ambiguous_keymap_prefix_after_elapsed_time() {
+    let mut engine = engine_with_text("hello\n");
+    engine.settings.keymaps.push("n! ab dd".to_string());
+    engine.rebuild_user_keymaps();
+    engine.settings.timeoutlen = 50;
+
+    engine.feed_keys("a");
+    // 'a' alone is an ambiguous prefix of "ab" — must be buffered, not
+    // executed as plain `a` (append) yet.
+    assert!(
+        !engine.keymap_buf.is_empty(),
+        "a lone ambiguous prefix keystroke must be buffered while waiting"
+    );
+    assert!(engine.keymap_buf_deadline.is_some());
+
+    // Simulate the deadline having already elapsed, then run the same idle
+    // tick both backends call periodically.
+    engine.keymap_buf_deadline =
+        Some(std::time::Instant::now() - std::time::Duration::from_millis(1));
+    let redrew = engine.tick_keymap_timeout();
+    assert!(redrew);
+    assert!(
+        engine.keymap_buf.is_empty(),
+        "the buffer must be flushed once the deadline passes"
+    );
+    // The lone 'a' must have been dispatched as the plain Normal-mode `a`
+    // command (enter Insert mode after the cursor), not silently dropped.
+    assert_eq!(engine.mode, crate::core::Mode::Insert);
+}
+
+#[test]
+fn test_1206_timeoutlen_zero_disables_the_timed_wait() {
+    let mut engine = engine_with_text("hello\n");
+    engine.settings.keymaps.push("n! ab dd".to_string());
+    engine.rebuild_user_keymaps();
+    engine.settings.timeoutlen = 0;
+
+    engine.feed_keys("a");
+    assert!(!engine.keymap_buf.is_empty());
+    assert!(
+        engine.keymap_buf_deadline.is_none(),
+        "'timeoutlen'=0 must not arm a timed flush — matches vimcode's pre-#1206 \
+         (wait indefinitely for a resolving keystroke) behavior"
+    );
+    assert!(!engine.tick_keymap_timeout());
+}

@@ -140,17 +140,33 @@ impl Engine {
             let viewport_lines = self.effective_viewport_lines();
             let cursor_line = self.view().cursor.line;
             let scroll_top = self.view().scroll_top;
+            // `:h 'scrolljump'` (#1206): the minimum number of lines to
+            // scroll when the cursor moves off the top/bottom edge. `sj`'s
+            // formula collapses to the pre-#1206 "jump exactly the minimal
+            // amount" behavior when `scrolljump` is `1` (its default) —
+            // `jumped` and `minimal` are then never more than one line
+            // apart in the direction that matters, so `min`/`max` always
+            // pick `minimal`. `.max(1)` treats a stored `0` (Neovim accepts
+            // it) the same as `1`, since a zero-line "minimum jump" isn't a
+            // real constraint.
+            let sj = self.settings.scrolljump.max(1);
             if cursor_line < scroll_top + scrolloff {
-                self.view_mut().scroll_top = cursor_line.saturating_sub(scrolloff);
+                let minimal = cursor_line.saturating_sub(scrolloff);
+                let jumped = scroll_top.saturating_sub(sj);
+                self.view_mut().scroll_top = jumped.min(minimal);
             } else if viewport_lines > 0
                 && cursor_line + scrolloff + 1 > scroll_top + viewport_lines
             {
-                self.view_mut().scroll_top = cursor_line + scrolloff + 1 - viewport_lines;
+                let minimal = cursor_line + scrolloff + 1 - viewport_lines;
+                let jumped = scroll_top + sj;
+                self.view_mut().scroll_top = jumped.max(minimal);
             }
 
-            // Horizontal: keep cursor within the visible column range.
-            // Prefer paint-time viewport_cols (exact) over the resize
-            // handler's approximate value.
+            // Horizontal: keep cursor within the visible column range,
+            // respecting 'sidescrolloff' (#1206, `:h 'sidescrolloff'`) —
+            // the horizontal counterpart of 'scrolloff' above. Prefer
+            // paint-time viewport_cols (exact) over the resize handler's
+            // approximate value.
             let wid = self.active_window_id();
             let viewport_cols = self
                 .paint_viewport_cols
@@ -160,11 +176,12 @@ impl Engine {
                 .unwrap_or(self.view().viewport_cols);
             let cursor_col = self.view().cursor.col;
             let scroll_left = self.view().scroll_left;
+            let sso = self.settings.sidescrolloff;
             if viewport_cols > 0 {
-                if cursor_col < scroll_left {
-                    self.view_mut().scroll_left = cursor_col;
-                } else if cursor_col >= scroll_left + viewport_cols {
-                    self.view_mut().scroll_left = cursor_col + 1 - viewport_cols;
+                if cursor_col < scroll_left + sso {
+                    self.view_mut().scroll_left = cursor_col.saturating_sub(sso);
+                } else if cursor_col + sso + 1 > scroll_left + viewport_cols {
+                    self.view_mut().scroll_left = cursor_col + sso + 1 - viewport_cols;
                 }
             }
         }
