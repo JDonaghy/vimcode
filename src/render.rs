@@ -29886,6 +29886,46 @@ mod tests {
             "APP_ICON_INTRINSIC_SIZE must match the asset's own viewBox"
         );
     }
+
+    // ── #1207: 'linebreak' wrap-point selection ─────────────────────────
+    //
+    // RED against unfixed `develop`: before #1207,
+    // `compute_word_wrap_segments` had no `linebreak` parameter at all and
+    // *always* sought a word boundary — i.e. it always did what
+    // `linebreak_off_hard_cuts_mid_word` asserts must NOT happen, so that
+    // test would have failed (the segment boundary would have fallen back
+    // to the space, not the viewport column).
+
+    #[test]
+    fn linebreak_off_hard_cuts_mid_word() {
+        // "helloworld" is 10 chars with no word boundary anywhere; a 5-col
+        // viewport with linebreak off must cut mid-word at column 5.
+        let segs = compute_word_wrap_segments("helloworld", 5, false);
+        assert_eq!(segs, vec![(0, 5), (5, 10)]);
+    }
+
+    #[test]
+    fn linebreak_on_breaks_at_word_boundary() {
+        // "hello world" (11 chars) with an 8-col viewport: a hard cut at
+        // column 8 would split "wor|ld", but 'linebreak' must back up to
+        // the space at index 5 instead.
+        let segs = compute_word_wrap_segments("hello world", 8, true);
+        assert_eq!(segs, vec![(0, 6), (6, 11)]);
+    }
+
+    #[test]
+    fn linebreak_on_falls_back_to_hard_cut_with_no_boundary() {
+        // No word boundary anywhere in "helloworld" — 'linebreak' can't do
+        // anything but the same hard cut as linebreak-off.
+        let segs = compute_word_wrap_segments("helloworld", 5, true);
+        assert_eq!(segs, vec![(0, 5), (5, 10)]);
+    }
+
+    #[test]
+    fn linebreak_is_a_no_op_when_the_line_fits() {
+        assert_eq!(compute_word_wrap_segments("short", 80, false), vec![(0, 5)]);
+        assert_eq!(compute_word_wrap_segments("short", 80, true), vec![(0, 5)]);
+    }
 }
 
 // ═══ Drag-rung tests (#756, mouse-ladder slice 6) ════════════════════════════
