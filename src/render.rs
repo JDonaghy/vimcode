@@ -18120,10 +18120,25 @@ fn build_tab_bar(engine: &Engine) -> Vec<TabInfo> {
     }
 }
 
-/// Compute word-aware wrap segment boundaries for a line.
-/// Returns a list of `(start_char, end_char)` pairs. Breaks prefer word boundaries
-/// (spaces, hyphens, punctuation) so words are not split mid-way.
-pub fn compute_word_wrap_segments(line: &str, viewport_cols: usize) -> Vec<(usize, usize)> {
+/// Compute wrap segment boundaries for a line, when `'wrap'` soft-wraps it.
+/// Returns a list of `(start_char, end_char)` pairs.
+///
+/// `linebreak` selects which of Vim's two wrap behaviours to use (`:h
+/// 'linebreak'`, #1207):
+/// - `false` (Vim's own default, and this fn's behaviour before #1207):
+///   hard-break exactly at `viewport_cols`, splitting a word mid-way if
+///   that's where the column falls.
+/// - `true`: break at a word boundary (space, hyphen, or `/`) at or before
+///   the column, so words are never split — falling back to a hard break
+///   only when no boundary exists in the segment.
+///
+/// Purely a display-time choice: never mutates or reflows what's actually
+/// stored in the buffer.
+pub fn compute_word_wrap_segments(
+    line: &str,
+    viewport_cols: usize,
+    linebreak: bool,
+) -> Vec<(usize, usize)> {
     let chars: Vec<char> = line.chars().collect();
     let total = chars.len();
     if viewport_cols == 0 || total <= viewport_cols {
@@ -18138,23 +18153,14 @@ pub fn compute_word_wrap_segments(line: &str, viewport_cols: usize) -> Vec<(usiz
             break;
         }
         let end = pos + viewport_cols;
-        // Scan backwards from the break point to find a word boundary (space or after punctuation).
         let mut break_at = end;
-        for i in (pos + 1..=end).rev() {
-            if chars[i - 1] == ' ' || chars[i - 1] == '-' || chars[i - 1] == '/' {
-                break_at = i;
-                break;
-            }
-        }
-        // If no boundary found within the segment, hard-break at viewport width.
-        if break_at == end && !chars[end - 1].is_whitespace() {
-            // Check if we found a boundary at all (break_at didn't change means
-            // the for loop completed without breaking).
-            let found = (pos + 1..=end)
-                .rev()
-                .any(|i| chars[i - 1] == ' ' || chars[i - 1] == '-' || chars[i - 1] == '/');
-            if !found {
-                break_at = end;
+        if linebreak {
+            // Scan backwards from the break point to find a word boundary (space or after punctuation).
+            for i in (pos + 1..=end).rev() {
+                if chars[i - 1] == ' ' || chars[i - 1] == '-' || chars[i - 1] == '/' {
+                    break_at = i;
+                    break;
+                }
             }
         }
         segments.push((pos, break_at));
@@ -18205,6 +18211,7 @@ pub fn view_row_to_buf_pos_wrap(
     view_row: usize,
     total_lines: usize,
     viewport_cols: usize,
+    linebreak: bool,
 ) -> (usize, usize) {
     let mut buf_line = scroll_top;
     let mut visible = 0usize;
@@ -18216,7 +18223,7 @@ pub fn view_row_to_buf_pos_wrap(
         // Compute how many visual rows this buffer line occupies when wrapped.
         let line_str = buffer.content.line(buf_line).to_string();
         let line_str = line_str.trim_end_matches('\n');
-        let segments = compute_word_wrap_segments(line_str, viewport_cols);
+        let segments = compute_word_wrap_segments(line_str, viewport_cols, linebreak);
         let visual_rows = segments.len();
         if view_row < visible + visual_rows {
             // The clicked row falls within this buffer line.
@@ -18998,7 +19005,8 @@ fn build_rendered_window(
             // Split long line into viewport-width segments with word-boundary wrapping.
             let vp = render_viewport_cols;
             // Build segment boundaries using word-aware splitting.
-            let segment_boundaries = compute_word_wrap_segments(&line_str, vp);
+            let segment_boundaries =
+                compute_word_wrap_segments(&line_str, vp, engine.settings.linebreak);
             let num_segments = segment_boundaries.len();
             let cursor_seg = if line_idx == cursor_line {
                 // Find which segment contains the cursor column.

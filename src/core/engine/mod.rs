@@ -3722,6 +3722,20 @@ pub struct Engine {
     /// Updated at the end of `handle_key()`.
     pub bracket_match: Option<(usize, usize)>,
 
+    /// `'showmatch'` (#1207): the (line, col) of the opening bracket a just-
+    /// typed closing bracket in Insert mode matched, while the momentary
+    /// "flash" is active. Deliberately never moves `view.cursor` — Vim's own
+    /// `'showmatch'` is a *display* trick (it repaints the cursor over the
+    /// match, waits, then repaints it back) that does not touch where the
+    /// next typed character lands; representing that as a display-only
+    /// cursor move would need a real timer (`'matchtime'`, out of scope,
+    /// #1207), so this is a transient side channel instead — analogous to
+    /// `yank_highlight` above. Set by `Engine::handle_insert_key` when a
+    /// closing `)`/`]`/`}` has a match; cleared at the very top of the same
+    /// fn on the *next* key, so a test can observe it True for exactly the
+    /// one key that triggered it.
+    pub showmatch_flash: Option<(usize, usize)>,
+
     // --- Insert mode Ctrl+r pending ---
     /// When true, the next keypress in Insert (or Replace) mode inserts a register's content.
     pub insert_ctrl_r_pending: bool,
@@ -4550,6 +4564,7 @@ impl Engine {
             last_sub_replacement: String::new(),
             yank_highlight: None,
             bracket_match: None,
+            showmatch_flash: None,
             insert_ctrl_r_pending: false,
             insert_ctrl_g_pending: false,
             insert_ctrl_o_active: false,

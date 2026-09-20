@@ -1346,7 +1346,7 @@ impl Engine {
         // Vim places the cursor on the start of the identified word first.
         self.view_mut().cursor.col = start_col;
 
-        let escaped = crate::core::vim_regex::escape_vim_literal(&word);
+        let escaped = crate::core::vim_regex::escape_vim_literal(&word, self.settings.magic);
         self.search_query = if whole_word {
             format!("\\<{}\\>", escaped)
         } else {
@@ -1440,7 +1440,7 @@ impl Engine {
                 self.view_mut().cursor.col = col;
 
                 // Seed the search register so `n` continues forward from here.
-                let escaped = crate::core::vim_regex::escape_vim_literal(&word);
+                let escaped = crate::core::vim_regex::escape_vim_literal(&word, self.settings.magic);
                 self.search_query = format!("\\<{}\\>", escaped);
                 self.search_offset.clear();
                 self.search_smartcase_applies = false;

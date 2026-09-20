@@ -3735,10 +3735,24 @@ impl Engine {
     /// Compute the indent string for a new line inserted after `line_idx`.
     /// When `auto_indent` is on this copies the previous line's indent *and*
     /// adds an extra indent level when the line ends with an indent-trigger
-    /// (language-aware via `line_triggers_indent`).
+    /// (language-aware via `line_triggers_indent`) — real Vim only does the
+    /// trigger-based extra indent with `'smartindent'` (or a filetype indent
+    /// plugin) on top of `'autoindent'`, but this repo's `auto_indent` has
+    /// carried that behaviour unconditionally since before #1207, so it's
+    /// left as-is here rather than reshaped as part of this issue; #1207
+    /// only *widens* the gate so `'smartindent'` alone (without
+    /// `'autoindent'`) also reaches this same logic, matching real Vim
+    /// (`:h 'smartindent'` works independently of `'autoindent'`).
+    ///
+    /// `'cindent'` (also #1207) supersedes this entirely when set — see
+    /// [`Self::cindent_indent_for_newline`] and `:h 'cindent'`: "'cindent'
+    /// ... overrules 'smartindent'".
     pub(crate) fn smart_indent_for_newline(&self, line_idx: usize) -> String {
-        if !self.settings.auto_indent {
+        if !(self.settings.auto_indent || self.settings.smartindent || self.settings.cindent) {
             return String::new();
+        }
+        if self.settings.cindent {
+            return self.cindent_indent_for_newline(line_idx);
         }
         let base = self.get_line_indent_str(line_idx);
         let line_text: String = self.buffer().content.line(line_idx).chars().collect();
@@ -3757,13 +3771,44 @@ impl Engine {
         }
     }
 
+    /// `'cindent'`'s (#1207) counterpart to [`Self::smart_indent_for_newline`]
+    /// — a deliberately simple C-aware subset, not the much richer rule set
+    /// `:h 'cindent'` describes: indent one `'shiftwidth'` further after a
+    /// line ending in `{`, otherwise copy the previous line's indent
+    /// verbatim. Unlike `'smartindent'`, this does **not** consult
+    /// `line_triggers_indent`'s language-aware triggers (Python `:`,
+    /// Lua/Ruby/Shell `do`/`then`, ...) — those are `'smartindent'`'s
+    /// behaviour, and `'cindent'` replaces it rather than layering on top,
+    /// per `:h 'cindent'`.
+    fn cindent_indent_for_newline(&self, line_idx: usize) -> String {
+        let base = self.get_line_indent_str(line_idx);
+        let line_text: String = self.buffer().content.line(line_idx).chars().collect();
+        let trimmed = line_text.trim_end_matches(['\n', '\r']);
+        if trimmed.trim_end().ends_with('{') {
+            let sw = self.effective_shift_width();
+            let extra = if self.settings.expand_tab {
+                " ".repeat(sw)
+            } else {
+                "\t".to_string()
+            };
+            format!("{}{}", base, extra)
+        } else {
+            base
+        }
+    }
+
     /// Check whether a closing character (`}`, `)`, `]`) just typed on a
     /// line that was previously only whitespace should auto-outdent (reduce
     /// indent by one `shift_width`).  Called *after* the character has been
     /// inserted.  Returns the new indent string if outdenting is appropriate,
     /// or `None` to leave indent unchanged.
+    ///
+    /// Shared verbatim by `'autoindent'`, `'smartindent'` and `'cindent'`
+    /// (#1207 widened the gate from `auto_indent` alone) — the outdent-by-
+    /// one-shiftwidth rule for a lone closing bracket doesn't differ between
+    /// them the way the newline-indent rule does.
     pub(crate) fn auto_outdent_for_closing(&self, line_idx: usize) -> Option<String> {
-        if !self.settings.auto_indent {
+        if !(self.settings.auto_indent || self.settings.smartindent || self.settings.cindent) {
             return None;
         }
         let line_text: String = self.buffer().content.line(line_idx).chars().collect();
@@ -3787,6 +3832,30 @@ impl Engine {
         } else {
             Some(String::new())
         }
+    }
+
+    /// `'smartindent'`/`'cindent'` (#1207): typing `#` as the first non-
+    /// blank character on a line unconditionally removes that line's
+    /// indent — Vim's preprocessor-directive special case (`:h
+    /// 'smartindent'`: "make typing # a bit better"), shared by both
+    /// options. Plain `'autoindent'` (with neither `'smartindent'` nor
+    /// `'cindent'` set) does **not** do this, matching real Vim. Called
+    /// *after* the `#` has been inserted, mirroring
+    /// [`Self::auto_outdent_for_closing`]'s shape.
+    pub(crate) fn auto_outdent_for_hash(&self, line_idx: usize) -> Option<String> {
+        if !(self.settings.smartindent || self.settings.cindent) {
+            return None;
+        }
+        let line_text: String = self.buffer().content.line(line_idx).chars().collect();
+        let trimmed = line_text.trim_end_matches(['\n', '\r']);
+        let before = trimmed.trim_end_matches('#');
+        if !before.chars().all(|c| c == ' ' || c == '\t') {
+            return None;
+        }
+        if self.get_line_indent_str(line_idx).is_empty() {
+            return None;
+        }
+        Some(String::new())
     }
 
     /// Return the leading whitespace string (spaces/tabs) of the given buffer line.

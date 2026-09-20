@@ -4690,6 +4690,7 @@ impl Engine {
             &self.last_sub_replacement,
             self.last_visual_byte_range(),
             (&keyword_class, &keyword_class_no_digits),
+            self.settings.magic,
         )
     }
 
