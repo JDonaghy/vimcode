@@ -352,19 +352,35 @@ fn test_invalid_pattern_is_rejected_not_matched_literally() {
     // #801 acceptance: a pattern the engine cannot translate must produce an
     // error, never a silent fall-back to literal matching.
     //
-    // #1004 moved back-references out of the untranslatable set (they now
-    // compile via `fancy_regex` — see the two tests below), so this uses
-    // look-around, which stays genuinely unsupported. The buffer contains the
-    // pattern verbatim, so a literal fall-back *would* find a match here.
-    let mut e = engine_with("a foo\\@= b\n");
-    search_fwd(&mut e, "foo\\@=");
+    // The untranslatable set keeps shrinking, so this test has to keep moving
+    // to an atom that is still in it: #1004 took back-references out (they
+    // compile via `fancy_regex`), and #1157 took look-around out for the same
+    // reason. `\&` (branch concat) stays — neither `regex` nor `fancy_regex`
+    // exposes a "match this branch but report the last one" primitive. The
+    // buffer contains the pattern verbatim, so a literal fall-back *would*
+    // find a match here.
+    let mut e = engine_with("a foo\\&f b\n");
+    search_fwd(&mut e, "foo\\&f");
     assert!(
-        e.message.contains("look-around"),
+        e.message.contains("branch concat"),
         "expected a rejection message, got {:?}",
         e.message
     );
     // The cursor did not move to a bogus "literal" match.
     assert_cursor(&e, 0, 0);
+}
+
+#[test]
+fn test_lookaround_pattern_is_no_longer_rejected() {
+    // #1157: the counterpart to the test above — look-around used to be in
+    // the untranslatable set, and now compiles via `fancy_regex`. `\@=` is
+    // zero-width, so `/foo\(bar\)\@=` lands on the 'f' of the "foo" that is
+    // followed by "bar" and nowhere else. Searching from col 0 skips the
+    // match under the cursor, so the qualifying "foo" here is the second one.
+    let mut e = engine_with("foobaz x foobar\n");
+    search_fwd(&mut e, "foo\\(bar\\)\\@=");
+    assert_eq!(e.message, "match 1 of 1");
+    assert_cursor(&e, 0, 9);
 }
 
 #[test]
