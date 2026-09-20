@@ -35,13 +35,24 @@ See [README.md](README.md) for full feature documentation.
 | `CTRL-A` | Insert previously inserted text | ✅ | |
 | `CTRL-@` | Insert prev text and stop insert | ✅ | |
 | `CTRL-V {char}` | Insert literal character | ✅ | Tab, Return also handled |
-| `CTRL-K {c1}{c2}` | Enter digraph | N/A | No digraph support planned |
-| `CTRL-X ...` | Completion sub-modes | N/A | VimCode uses auto-popup + LSP instead |
-| `CTRL-]` | Trigger abbreviation | N/A | No abbreviations |
+| `CTRL-K {c1}{c2}` | Enter digraph | ✅ | Curated builtin table (#1160) + `:digraph` user entries |
+| `CTRL-X CTRL-N/CTRL-P` | Keyword completion (current buffer) | ✅ | #1160 |
+| `CTRL-X CTRL-L` | Whole-line completion | ✅ | #1160 |
+| `CTRL-X CTRL-F` | Filename completion | ✅ | #1160 |
+| `CTRL-X CTRL-K` | Dictionary completion | ✅ | Against bundled `dictionaries/en_US.dic` (#1160) |
+| `CTRL-X CTRL-S` | Spelling-suggestion completion | ✅ | Requires `'spell'` (#1160) |
+| `CTRL-X CTRL-O` | Omni completion | ⚠️ | Delegates to the same manual completion trigger (buffer words + LSP) — no separate omnifunc source (#1160) |
+| `CTRL-X CTRL-E/CTRL-Y` | Scroll window | ✅ | #1160 |
+| `CTRL-X CTRL-T` | Thesaurus completion | ❌ | No `'thesaurus'` file bundled or configurable (#1160) |
+| `CTRL-X CTRL-]` | Tag completion | ❌ | No ctags/tag-jump subsystem (#1160) |
+| `CTRL-X CTRL-I` | Included-file completion | ❌ | No include-path resolution (#1160) |
+| `CTRL-X CTRL-V` | Command-line completion | ❌ | Not implemented (#1160) |
+| `CTRL-]` | Trigger abbreviation | ❌ | Abbreviation expansion exists (`:iabbrev`, #1152) but not this explicit trigger key |
+| `CTRL-Z` | Suspend (or literal insert, `'insertmode'`) | ❌ | Not implemented |
 | `CTRL-G u` | Break undo sequence | ✅ | |
 | `CTRL-G j/k` | Move cursor down/up | ✅ | |
 
-**Insert mode: 21/23 (91%)**
+**Insert mode: 29/37 (78%)**
 
 ---
 
@@ -620,6 +631,7 @@ Operators `d`, `c`, `y`, `>`, `<`, `=`, `g~`, `gu`, `gU` all accept these motion
 | `:reg` / `:registers` | Display registers | ✅ | |
 | `:marks` | Display marks | ✅ | |
 | `:jumps` | Display jump list | ✅ | |
+| `:digraphs` | List digraphs / define a custom one | ✅ | `:digraph {c1}{c2} {number}` adds a user entry (#1160); same command, both spellings |
 | `:changes` | Display change list | ✅ | |
 | `:history` | Display command history | ✅ | |
 | `:echo {text}` | Display message | ✅ | |
@@ -668,7 +680,7 @@ Operators `d`, `c`, `y`, `>`, `<`, `=`, `g~`, `gu`, `gU` all accept these motion
 | `:Sexplore` / `:Sex` | Horizontal split + netrw | ✅ | |
 | `:Vexplore` / `:Vex` | Vertical split + netrw | ✅ | |
 
-**Ex commands: 91/91 (100%)** (excluding N/A) — was 70/70 before #1155 added
+**Ex commands: 92/92 (100%)** (excluding N/A) — was 70/70 before #1155 added
 `:cfirst`/`:clast`/`:cwindow`/`:clist`/`:colder`/`:cnewer`/`:cdo`/`:cfdo` plus
 the entire `:l*` location-list family (21 new command ids)
 
@@ -731,7 +743,6 @@ does not implement. Every row was verified absent against `origin/develop` @
 | `:lolder` / `:lnewer` | Walk the location-list stack | ❌ | The per-window equivalent of `:colder`/`:cnewer` (#1155 shipped a global quickfix stack, `:lopen`/`:l*`/`:ll*`/`:ldo`/`:lfdo`/`:llist` and the location list itself, but not a per-window history stack) — follow-up |
 | `:earlier` / `:later` | Move through undo states by count or time | ❌ | Needs the undo tree — the timeline is linear today (#1156) |
 | `:fold` / `:foldopen` / `:foldclose` / `:foldtoggle` | Create and toggle folds from ex | ❌ | Folds exist, but only via `zf`/`zo`/`zc` with `foldmethod` of `manual`/`indent` (#1159) |
-| `:digraphs` | List/define digraphs | ❌ | No digraph table; insert-mode `<C-k>` is also absent (#1160) |
 
 ### Not implemented — options
 

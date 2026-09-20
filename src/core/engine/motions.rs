@@ -4038,6 +4038,163 @@ impl Engine {
         self.view_mut().cursor.col = start + candidate.len();
     }
 
+    // ─── <C-x> completion submode (`:h i_CTRL-X`, #1160) ───────────────────
+
+    /// Shared "start a fresh completion popup, or cycle to the next/previous
+    /// candidate if one is already active" logic used by every `<C-x>`
+    /// sub-mode. `candidates`/`start_col` are only consulted when starting a
+    /// fresh popup — repeating the same `<C-x><C-?>` chord on an already-open
+    /// popup just cycles it (`:h popupmenu-completion`).
+    pub(crate) fn ctrl_x_cycle_or_start(
+        &mut self,
+        candidates: Vec<String>,
+        start_col: usize,
+        next: bool,
+        changed: &mut bool,
+    ) {
+        if self.completion_idx.is_some() {
+            let len = self.completion_candidates.len();
+            let cur = self.completion_idx.unwrap();
+            let new_idx = if next {
+                (cur + 1) % len
+            } else {
+                (cur + len - 1) % len
+            };
+            self.completion_idx = Some(new_idx);
+            self.apply_completion_candidate(new_idx);
+            *changed = true;
+            return;
+        }
+        if candidates.is_empty() {
+            self.message = "No completions".to_string();
+            return;
+        }
+        self.completion_start_col = start_col;
+        self.completion_candidates = candidates;
+        let idx = if next {
+            0
+        } else {
+            self.completion_candidates.len() - 1
+        };
+        self.completion_idx = Some(idx);
+        self.apply_completion_candidate(idx);
+        *changed = true;
+    }
+
+    /// `<C-x><C-n>` / `<C-x><C-p>`: keyword completion restricted to the
+    /// current buffer (`:h i_CTRL-X_CTRL-N`/`:h i_CTRL-X_CTRL-P`).
+    /// `word_completions_for_prefix` already only scans `self.buffer()`
+    /// (the active buffer), which is exactly this sub-mode's scope.
+    pub(crate) fn ctrl_x_keyword_completion(&mut self, next: bool, changed: &mut bool) {
+        let (prefix, start_col) = self.completion_prefix_at_cursor();
+        let candidates = self.word_completions_for_prefix(&prefix);
+        self.ctrl_x_cycle_or_start(candidates, start_col, next, changed);
+    }
+
+    /// `<C-x><C-l>`: whole-line completion (`:h i_CTRL-X_CTRL-L`) — matches
+    /// other lines in the buffer that start with the text already typed on
+    /// the current line, completing to the rest of the matched line.
+    pub(crate) fn ctrl_x_line_completion(&mut self, changed: &mut bool) {
+        let cur_line = self.view().cursor.line;
+        let col = self.view().cursor.col;
+        let chars: Vec<char> = self.buffer().content.line(cur_line).chars().collect();
+        let col = col.min(chars.len());
+        let prefix: String = chars[..col].iter().collect();
+        let mut candidates: Vec<String> = Vec::new();
+        for i in 0..self.buffer().len_lines() {
+            if i == cur_line {
+                continue;
+            }
+            let text: String = self
+                .buffer()
+                .content
+                .line(i)
+                .chars()
+                .filter(|c| *c != '\n')
+                .collect();
+            if !text.is_empty() && text.starts_with(&prefix) && !candidates.contains(&text) {
+                candidates.push(text);
+            }
+        }
+        self.ctrl_x_cycle_or_start(candidates, 0, true, changed);
+    }
+
+    /// Characters allowed in a filesystem path for `<C-x><C-f>` prefix
+    /// detection — word characters plus the punctuation paths commonly use.
+    fn is_path_char(c: char) -> bool {
+        c.is_alphanumeric() || matches!(c, '.' | '_' | '-' | '/' | '~')
+    }
+
+    /// `<C-x><C-f>`: filename completion (`:h i_CTRL-X_CTRL-F`) against the
+    /// directory containing the path fragment typed before the cursor,
+    /// relative to `self.cwd` when the fragment isn't absolute.
+    pub(crate) fn ctrl_x_filename_completion(&mut self, changed: &mut bool) {
+        let line = self.view().cursor.line;
+        let col = self.view().cursor.col;
+        let chars: Vec<char> = self.buffer().content.line(line).chars().collect();
+        let col = col.min(chars.len());
+        let mut start = col;
+        while start > 0 && Self::is_path_char(chars[start - 1]) {
+            start -= 1;
+        }
+        let prefix: String = chars[start..col].iter().collect();
+        let (dir_part, file_prefix) = match prefix.rfind('/') {
+            Some(idx) => (&prefix[..=idx], &prefix[idx + 1..]),
+            None => ("", prefix.as_str()),
+        };
+        let dir = if dir_part.is_empty() {
+            self.cwd.clone()
+        } else if Path::new(dir_part).is_absolute() {
+            PathBuf::from(dir_part)
+        } else {
+            self.cwd.join(dir_part)
+        };
+        let mut candidates: Vec<String> = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if name.starts_with(file_prefix) && name != file_prefix {
+                    let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+                    let suffix = if is_dir { "/" } else { "" };
+                    candidates.push(format!("{dir_part}{name}{suffix}"));
+                }
+            }
+        }
+        candidates.sort();
+        self.ctrl_x_cycle_or_start(candidates, start, true, changed);
+    }
+
+    /// `<C-x><C-k>`: dictionary completion (`:h i_CTRL-X_CTRL-K`) against
+    /// the bundled word list (`dictionaries/en_US.dic`, also used by
+    /// `src/core/spell.rs`'s spell checker).
+    pub(crate) fn ctrl_x_dictionary_completion(&mut self, changed: &mut bool) {
+        let (prefix, start_col) = self.completion_prefix_at_cursor();
+        let candidates = crate::core::spell::dictionary_words_with_prefix(&prefix);
+        self.ctrl_x_cycle_or_start(candidates, start_col, true, changed);
+    }
+
+    /// `<C-x><C-s>`: spelling-suggestion completion (`:h i_CTRL-X_CTRL-S`)
+    /// for the word before the cursor, reusing the same spell-checker
+    /// suggestions `z=` shows in Normal mode. Requires `'spell'` to be set,
+    /// same as real Vim.
+    pub(crate) fn ctrl_x_spell_completion(&mut self, changed: &mut bool) {
+        let (prefix, start_col) = self.completion_prefix_at_cursor();
+        if prefix.is_empty() {
+            self.message = "No word to check".to_string();
+            return;
+        }
+        if !self.settings.spell {
+            self.message = "Spell checking is off (use :set spell)".to_string();
+            return;
+        }
+        self.ensure_spell_checker();
+        let candidates = match &self.spell_checker {
+            Some(checker) => checker.suggest(&prefix),
+            None => Vec::new(),
+        };
+        self.ctrl_x_cycle_or_start(candidates, start_col, true, changed);
+    }
+
     /// Handle a mouse click on the completion popup.
     /// Returns `true` if the click was consumed (inside the popup).
     pub fn handle_completion_click(&mut self, hit: quadraui::CompletionsHit) -> bool {

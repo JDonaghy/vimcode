@@ -4482,6 +4482,34 @@ const CASES_INS: &[Case] = &[
     ),
     c("ins:C-t noet", &["a"], 1, 1, ":set noet<CR>i<C-t><Esc>"),
     c("ins:C-k digraph skip", &["a"], 1, 1, "l"),
+    // #1160: <C-k> digraph entry and the <C-x> completion submode.
+    c("ins:C-k a: digraph", &["x"], 1, 1, "A<C-k>a:<Esc>"),
+    // Escape must land the cursor back *on* the just-inserted multi-byte
+    // character (not past it) — nvim's cursor column is byte-based and
+    // vimcode's is char-based, so a trailing ASCII character after the
+    // arrow would make the two column numbering schemes disagree even
+    // though both editors agree on the buffer content and cursor cell.
+    c("ins:C-k -> digraph arrow", &["x"], 1, 1, "A<C-k>-><Esc>"),
+    c(
+        "ins:C-x C-l line completion",
+        &["hello world", "hel"],
+        2,
+        4,
+        "A<C-x><C-l><Esc>",
+    ),
+    // Both the oracle (nvim) and vimcode's own test process run with the
+    // crate root as their working directory (`cargo test` sets it; neither
+    // side passes `current_dir` for this single-buffer harness — #1160), so
+    // a real, checked-in, unambiguously-prefixed filename is a stable
+    // cross-process fixture: "Cargo.tom" has exactly one match in the repo
+    // root, `Cargo.toml` (`Cargo.lock` diverges at the 8th character).
+    c(
+        "ins:C-x C-f filename completion",
+        &["Cargo.tom"],
+        1,
+        10,
+        "A<C-x><C-f><Esc>",
+    ),
     c(
         "ins:BS join with autoindent",
         &["a", "    b"],
@@ -7141,9 +7169,10 @@ enum DocStatus {
     Partial,
     /// ❌ — claimed not implemented. Out of scope for this gate.
     Missing,
-    /// N/A — deliberately not in scope (VimScript, digraphs, and anything
-    /// needing an expression evaluator). **Not** spelling: `src/core/spell.rs`
-    /// implements it and #1163 moved those rows to ✅.
+    /// N/A — deliberately not in scope (VimScript and anything needing an
+    /// expression evaluator). **Not** spelling or digraphs: `src/core/spell.rs`
+    /// implements the former (#1163 moved those rows to ✅) and
+    /// `src/core/digraphs.rs` the latter (#1160 moved those rows to ✅).
     NotApplicable,
 }
 
@@ -7693,6 +7722,18 @@ const COMMAND_PROBES: &[CommandProbe] = &[
     p("ins:CTRL-V {char}", Label("ins:C-v Tab")),
     p("ins:CTRL-G u", Label("undo:C-g u splits")),
     p("ins:CTRL-G j/k", Keys("<C-g>j")),
+    // #1160: digraphs + the <C-x> completion submode.
+    p("ins:CTRL-K {c1}{c2}", Label("ins:C-k a: digraph")),
+    p("ins:CTRL-X CTRL-N/CTRL-P", Label("ins:C-x C-n")),
+    p("ins:CTRL-X CTRL-L", Label("ins:C-x C-l line completion")),
+    p(
+        "ins:CTRL-X CTRL-F",
+        Label("ins:C-x C-f filename completion"),
+    ),
+    p("ins:CTRL-X CTRL-K", Label("ins:C-x C-k dictionary")),
+    p("ins:CTRL-X CTRL-S", Label("ins:C-x C-s spell")),
+    p("ins:CTRL-X CTRL-O", Label("ins:C-x C-o omni")),
+    p("ins:CTRL-X CTRL-E/CTRL-Y", Label("ins:C-x C-e scroll")),
     // --- Normal Mode - Movement (move) ---
     p("move:h", Label("word:h at start")),
     p("move:j", Label("word:j col memory short")),
@@ -8231,6 +8272,8 @@ const COMMAND_PROBES: &[CommandProbe] = &[
     p("ex::registers", Keys(":registers")),
     p("ex::marks", Keys(":marks")),
     p("ex::jumps", Keys(":jumps")),
+    // #1160 — same message-only-command shape as `:marks`/`:jumps` above.
+    p("ex::digraphs", Keys(":digraphs")),
     p("ex::changes", Keys(":changes")),
     p("ex::history", Keys(":history")),
     p("ex::echo {text}", Keys(":echo")),
@@ -8356,6 +8399,18 @@ const COVERAGE_EXEMPT: &[&str] = &[
     // --- Insert Mode (ins) ---
     "ins:CTRL-@",
     "ins:CTRL-G j/k",
+    // #1160: source-dependent <C-x> sub-modes — oracle cases exist for
+    // CTRL-X CTRL-L/CTRL-F above; the rest are covered by unit tests instead
+    // (per the issue: "the rest of the CTRL-X family is source-dependent and
+    // belongs in unit tests" — buffer-scoped keyword completion, the bundled
+    // dictionary, spell suggestions, LSP-backed omni, and window scrolling
+    // are all either non-deterministic against a live oracle or already
+    // exercised at the engine-test level in `src/core/engine/tests.rs`).
+    "ins:CTRL-X CTRL-N/CTRL-P",
+    "ins:CTRL-X CTRL-K",
+    "ins:CTRL-X CTRL-S",
+    "ins:CTRL-X CTRL-O",
+    "ins:CTRL-X CTRL-E/CTRL-Y",
     // --- Normal Mode - Movement (move) ---
     "move:l",
     "move:g0",
@@ -8543,6 +8598,7 @@ const COVERAGE_EXEMPT: &[&str] = &[
     "ex::registers",
     "ex::marks",
     "ex::jumps",
+    "ex::digraphs",
     "ex::changes",
     "ex::history",
     "ex::echo {text}",
