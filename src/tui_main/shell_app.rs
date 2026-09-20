@@ -16935,9 +16935,18 @@ mod tests {
     /// `build_minimap_data`'s windowing makes the new `frac < 0.4`
     /// assertion below fail, since the click would once again land near
     /// the file's actual middle.
+    ///
+    /// #1186: `app_with_shaped_buffer`'s original 240 lines now fits
+    /// *entirely* inside this geometry's compressed window (#1186's whole
+    /// point — small files show top-to-bottom now), so `TOTAL_LINES` below
+    /// is a much larger fixture, comfortably past
+    /// `render::MINIMAP_MAX_COMPRESSION * target_lines`, to keep exercising
+    /// #1093's genuine sliding-window regime that this test is actually
+    /// about.
     #[test]
     fn minimap_click_at_the_middle_scrolls_to_the_middle_of_the_painted_window() {
-        let mut driver = driver_with_shell(app_with_shaped_buffer(), config(), 100, 24);
+        const TOTAL_LINES: usize = 100_000;
+        let mut driver = driver_with_shell(app_with_plain_lines(TOTAL_LINES), config(), 100, 24);
 
         /// Lowest `line N` number visible on screen — the file's scroll
         /// position, read back out of the paint.
@@ -16980,31 +16989,161 @@ mod tests {
             .unwrap_or_else(|| panic!("the editor must still paint line numbers:\n{after}"));
 
         // The strip's own painted rows, at 4 buffer lines per row, is a
-        // measured upper bound on the window's length — used to prove the
-        // click landed *inside* the strip's own window, not deep into the
-        // 240-line file.
-        let window_len_upper_bound = (strip_bottom - strip_top + 1) * 4;
+        // measured upper bound on `target_lines` (the strip's own block
+        // count) — used to prove the click landed *inside* the strip's own
+        // window, not deep into the file.
+        let target_lines_upper_bound = (strip_bottom - strip_top + 1) * 4;
+        // #1186: `render::MINIMAP_MAX_COMPRESSION` (64, module-private) lets
+        // the window grow to `MINIMAP_MAX_COMPRESSION * target_lines` buffer
+        // lines once the file no longer fits in one uncompressed window —
+        // `TOTAL_LINES` (100,000) is chosen well past that ceiling for any
+        // realistic `target_lines` here, so the clamp binds exactly and the
+        // real window span is `target_lines * 64`, not `target_lines` alone
+        // (#1093's pre-#1186 window length).
+        const COMPRESSION_CEILING_MIRROR: usize = 64;
+        let window_len_upper_bound = target_lines_upper_bound * COMPRESSION_CEILING_MIRROR;
         // Half the strip's own window, not half the file: with the cursor
         // at the top, a middle click must land comfortably inside the
         // window's own first half — confirmed by hand against a reverted
         // fix (window computed over the whole buffer again), where the
-        // same click lands at line 76 of a ~80-line window (i.e. near its
-        // *end*, having resolved against the whole 240-line file's own
-        // middle instead) versus line 12 with the fix in place.
+        // same click lands near the file's own middle instead of near the
+        // top of its (much smaller) window.
         let half_window = window_len_upper_bound / 2;
         assert!(
             top < half_window,
             "clicking the middle of the minimap while the cursor is at \
              the top of the file must land well inside the strip's own \
              window (half of it is {half_window} lines), not deep into \
-             the 240-line file: landed on line {top}; screen:\n{after}"
+             the {TOTAL_LINES}-line file: landed on line {top}; screen:\n{after}"
         );
-        let frac = top as f64 / 240.0;
+        let frac = top as f64 / TOTAL_LINES as f64;
         assert!(
             frac < 0.4,
             "clicking the middle of the minimap must NOT scroll to ~50% \
              of the whole file — that is the pre-#1093 whole-buffer- \
              squeeze bug: landed on line {top} ({frac:.3}); screen:\n{after}"
+        );
+    }
+
+    /// #1186 acceptance (black-box, driver tier): on a long buffer (>=
+    /// 5,000 lines), the strip's own painted extent must cover far more of
+    /// the file than the pre-#1186 fixed one-buffer-line-per-row scale
+    /// could ever reach, driven through the real
+    /// `TuiShellApp`/`TuiDriver` stack (not `build_minimap_data` in
+    /// isolation) so this proves the compression actually lands on the
+    /// path a real keystroke/redraw takes.
+    ///
+    /// Two fixtures, same strip geometry:
+    /// - `WIDE_LINES` (8,000) sits past the compression ceiling
+    ///   (`MINIMAP_MAX_COMPRESSION * target_lines`, ~5,120 at this
+    ///   geometry) — a bottom-of-strip click must still reach far past the
+    ///   pre-#1186 `target_lines` ceiling (proving the window grew), while
+    ///   a top-of-strip click still resolves near line 0 (both ends stay
+    ///   reachable, #1093's own guarantee).
+    /// - `WHOLE_FILE_LINES` (2,000) sits comfortably *under* that ceiling —
+    ///   a bottom-of-strip click must resolve within one block-width of
+    ///   the file's actual last line, proving the whole file now paints
+    ///   top-to-bottom instead of only its first `target_lines` lines.
+    ///
+    /// **RED against unfixed `develop`:** confirmed by hand — reverting
+    /// `build_minimap_data`'s compression (`k` pinned to `1`) caps every
+    /// click's resolved line at `target_lines` regardless of fixture size,
+    /// failing both the "far past target_lines" assertion for `WIDE_LINES`
+    /// and the "within one block of EOF" assertion for `WHOLE_FILE_LINES`
+    /// (whose bottom click would instead land at `target_lines`, far short
+    /// of `WHOLE_FILE_LINES - 1`).
+    #[test]
+    fn minimap_covers_far_more_of_a_long_file_under_compression_via_shell_app() {
+        fn top_line(screen: &str) -> Option<usize> {
+            screen
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .windows(2)
+                .filter(|w| w[0] == "line")
+                .filter_map(|w| w[1].parse::<usize>().ok())
+                .min()
+        }
+
+        /// Click the strip's own top and bottom rows (located by its own
+        /// painted braille, never hardcoded) and report the resulting
+        /// scroll positions, plus the strip's own measured row count (used
+        /// to estimate the pre-#1186 `target_lines` ceiling).
+        fn click_top_and_bottom(total_lines: usize) -> (usize, usize, usize) {
+            let mut driver =
+                driver_with_shell(app_with_plain_lines(total_lines), config(), 100, 24);
+            let before = driver.screen();
+            assert_eq!(
+                top_line(&before),
+                Some(0),
+                "fixture must start at the top of the file; screen:\n{before}"
+            );
+            let rows = minimap_painted_rows(&before);
+            assert!(
+                rows.len() >= 4,
+                "precondition: the strip must paint at least 4 rows; got \
+                 {rows:?}; screen:\n{before}"
+            );
+            let strip_top = *rows.first().unwrap();
+            let strip_bottom = *rows.last().unwrap();
+
+            let top_x = braille_col(&before, strip_top).unwrap_or_else(|| {
+                panic!("the minimap must paint braille on row {strip_top}; screen:\n{before}")
+            });
+            driver.click(top_x as f32 + 1.0, strip_top as f32);
+            driver.render();
+            let top_click_line = top_line(&driver.screen()).unwrap_or_else(|| {
+                panic!(
+                    "the editor must still paint line numbers:\n{}",
+                    driver.screen()
+                )
+            });
+
+            let bottom_x = braille_col(&before, strip_bottom).unwrap_or_else(|| {
+                panic!("the minimap must paint braille on row {strip_bottom}; screen:\n{before}")
+            });
+            driver.click(bottom_x as f32 + 1.0, strip_bottom as f32);
+            driver.render();
+            let bottom_click_line = top_line(&driver.screen()).unwrap_or_else(|| {
+                panic!(
+                    "the editor must still paint line numbers:\n{}",
+                    driver.screen()
+                )
+            });
+
+            (top_click_line, bottom_click_line, rows.len())
+        }
+
+        const WIDE_LINES: usize = 8_000;
+        let (top_click_line, bottom_click_line, strip_rows) = click_top_and_bottom(WIDE_LINES);
+        let target_lines_estimate = strip_rows * 4;
+        assert!(
+            top_click_line < target_lines_estimate,
+            "a top-of-strip click on a {WIDE_LINES}-line file must still \
+             resolve near the top of the file — got line {top_click_line}"
+        );
+        assert!(
+            bottom_click_line > target_lines_estimate * 4,
+            "a bottom-of-strip click on a {WIDE_LINES}-line file must reach \
+             far past the pre-#1186 target_lines ceiling \
+             ({target_lines_estimate}) — got line {bottom_click_line}, which \
+             would mean the compressed window still only covers the file's \
+             very first slice"
+        );
+
+        const WHOLE_FILE_LINES: usize = 2_000;
+        let (_, bottom_click_line, _) = click_top_and_bottom(WHOLE_FILE_LINES);
+        let bottom_frac = bottom_click_line as f64 / WHOLE_FILE_LINES as f64;
+        assert!(
+            bottom_frac > 0.8,
+            "a bottom-of-strip click on a {WHOLE_FILE_LINES}-line file — \
+             short enough to fit entirely under the compression ceiling \
+             (target_lines * MINIMAP_MAX_COMPRESSION comfortably exceeds \
+             {WHOLE_FILE_LINES} at this geometry) — must resolve close to \
+             the file's actual last line, proving the whole file now \
+             paints top-to-bottom instead of only its first `target_lines` \
+             lines (which would resolve to well under 10% of the file): \
+             got line {bottom_click_line} of {WHOLE_FILE_LINES} \
+             ({bottom_frac:.3})"
         );
     }
 
@@ -20805,12 +20944,22 @@ mod tests {
         app
     }
 
-    /// Paint a buffer of `n_lines` plain lines and report which screen rows
-    /// the minimap strip touched.
-    fn minimap_rows_for_line_count(n_lines: usize) -> (Vec<usize>, String) {
+    /// A [`app_for_minimap_test`] app with `n_lines` plain `line N` lines —
+    /// the shared body [`minimap_rows_for_line_count`] and the #1186
+    /// windowed-click tests below both need, split out so the latter can
+    /// keep the driver alive to click on rather than only reading back its
+    /// first screen.
+    fn app_with_plain_lines(n_lines: usize) -> TuiShellApp {
         let mut app = app_for_minimap_test();
         let text: String = (0..n_lines).map(|i| format!("line {i}\n")).collect();
         app.engine.buffer_mut().insert(0, &text);
+        app
+    }
+
+    /// Paint a buffer of `n_lines` plain lines and report which screen rows
+    /// the minimap strip touched.
+    fn minimap_rows_for_line_count(n_lines: usize) -> (Vec<usize>, String) {
+        let app = app_with_plain_lines(n_lines);
         let mut driver = driver_with_shell(app, config(), 100, 24);
         // One benign dispatch so `TuiShellApp::handle`'s end-of-dispatch
         // sidebar/title-bar syncs land before the frame under assertion —
@@ -21542,9 +21691,30 @@ mod tests {
         // braille row) — not imported (it's module-private), measured
         // instead via the probe above.
         let target_lines = strip_rows * 4;
-        let total_lines = target_lines * 5;
+        // #1186: `render::MINIMAP_MAX_COMPRESSION` (64, also module-private)
+        // lets the strip's window grow up to `64 * target_lines` buffer
+        // lines to fit a whole file when it can. A `* 5` multiplier (the
+        // pre-#1186 value) now fits *entirely* inside that compressed
+        // window, so the distinctive line this test plants deep in the
+        // second half would already be visible with the cursor at the top
+        // — exactly the "whole file, not a window" case #1186 introduces on
+        // purpose. `* 100` comfortably exceeds the compression ceiling, so
+        // the strip still has to slide to reach the distinctive line.
+        let total_lines = target_lines * 100;
         // Deep enough into the second half of the file that it cannot be
         // inside the strip's window while the cursor is still at the top.
+        //
+        // #1186: a single distinctive line is no longer a reliable marker.
+        // At this compression (`window_len` clamped to
+        // `MINIMAP_MAX_COMPRESSION * target_lines`, i.e. 64 buffer lines per
+        // block here — comfortably past `MINIMAP_BLOCK_LINE_SAMPLE_CAP`,
+        // 8), `minimap_block_sample_indices` only reads 8 of a block's 64
+        // real lines, spaced every ~8 lines — a single marker line can land
+        // in the 7 lines out of 8 that never get sampled. A
+        // `DISTINCTIVE_BAND_WIDTH`-line band, wider than that worst-case
+        // ~8-line sampling gap, is guaranteed to contain a sampled line
+        // regardless of where it falls inside a block.
+        const DISTINCTIVE_BAND_WIDTH: usize = 32;
         let distinctive_line = total_lines - target_lines / 2;
 
         // `ShellAdapter<TuiShellApp>`'s inner app is crate-private once
@@ -21557,7 +21727,7 @@ mod tests {
             let mut app = app_for_minimap_test();
             let mut text = String::with_capacity(total_lines * 2);
             for i in 0..total_lines {
-                if i == distinctive_line {
+                if (distinctive_line..distinctive_line + DISTINCTIVE_BAND_WIDTH).contains(&i) {
                     text.push_str(&"z".repeat(20));
                 } else {
                     text.push('x');

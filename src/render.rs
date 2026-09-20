@@ -10966,6 +10966,27 @@ pub fn gtk_minimap_sizing() -> quadraui::MinimapSizing {
 /// i.e. the ~2–6 px band #35 asks for.
 const MINIMAP_LINES_PER_ROW: usize = 4;
 
+/// Ceiling on the compression factor `K` [`build_minimap_data`] applies when
+/// the buffer is longer than the strip's own `target_lines` sample budget
+/// (#1186 — the "compressed scale mode" #1093 deferred). Below this ceiling
+/// the window grows to `K * target_lines` buffer lines — every file that
+/// fits comfortably under that span is shown in full, VS-Code-style, instead
+/// of only its first `target_lines` lines. Past it, the window is capped at
+/// `MINIMAP_MAX_COMPRESSION * target_lines` lines and slides with the
+/// editor's own scroll position (#1093's original behaviour), so both ends
+/// of an arbitrarily large file stay reachable.
+///
+/// Chosen empirically against [`MINIMAP_BLOCK_LINE_SAMPLE_CAP`] (8): once a
+/// block is wider than the cap, `minimap_block_sample_indices` already
+/// spreads exactly `cap` samples across it regardless of how much wider it
+/// gets, so growing `K` past the point where blocks already exceed the cap
+/// costs no extra line fetches — only a larger buffer span per block. A
+/// `K_max` far beyond that point (64, i.e. blocks up to 8x the sample cap
+/// once a file is that much longer than `target_lines`) still keeps each
+/// block's aggregated row a meaningful, dithered summary of real content
+/// rather than a coin-flip over the whole file.
+const MINIMAP_MAX_COMPRESSION: usize = 64;
+
 /// Ceiling on how many characters into a line `build_minimap_data`'s
 /// `to_col` closure ever looks when measuring a highlight's own column.
 /// Past this many characters, `aggregate_spans` would discard the column
@@ -11419,6 +11440,21 @@ pub fn build_minimap_data(
     // slides as the editor scrolls, so both ends of the file are reachable
     // and a bottom click pages roughly one strip's worth of file.
     //
+    // #1186: that fixed one-line-per-block window is #1093's *uncompressed*
+    // (`K == 1`) case. `k` below grows the window to `k * target_lines`
+    // lines — still capped, still O(target_lines) blocks — so
+    // `minimap_block_bounds` (just below) takes its striding branch instead
+    // of its "never upscales" one and each block becomes `k` real buffer
+    // lines wide, aggregated by the exact same `minimap_block_text` path
+    // #1085 built for this. `k` is chosen to fit the *whole* buffer into one
+    // window whenever that stays under `MINIMAP_MAX_COMPRESSION`; past that
+    // ceiling the window is capped at `MINIMAP_MAX_COMPRESSION * target_lines`
+    // lines and slides with the editor's scroll position exactly like
+    // #1093's original window did, so both ends of a very large file stay
+    // reachable even though the strip can no longer show all of it at once.
+    let k = total_buffer_lines
+        .div_ceil(target_lines)
+        .clamp(1, MINIMAP_MAX_COMPRESSION);
     // quadraui's own `MinimapSizing::FixedPitch` already implements this
     // slide (`slide_window_start_row`) — but only engages once it's handed
     // more `lines` than the strip can hold. Handing it the *whole* buffer
@@ -11427,7 +11463,7 @@ pub fn build_minimap_data(
     // is computed here, host-side, over a `lines` vector that never
     // exceeds `target_lines` — `slide_window_start_row` then always takes
     // its "already fits" branch and returns `0`, by construction.
-    let window_len = target_lines.min(total_buffer_lines);
+    let window_len = target_lines.saturating_mul(k).min(total_buffer_lines);
     let max_start = total_buffer_lines - window_len;
     let window_start_line = if max_start == 0 {
         // The whole file already fits in one window — top-aligned, no
@@ -11507,13 +11543,15 @@ pub fn build_minimap_data(
     // `bounds` is *window*-relative (`0..window_len`), matching
     // `minimap_block_sample_indices`'s own contract — remapped to real
     // buffer line numbers below (`+ window_start_line`), both when reading
-    // from `rope` and when stamping `MinimapLine::line_idx`. At scale 1
-    // (`window_len <= target_lines`, always true by construction above)
-    // this takes the "never upscales" branch and every block is exactly
-    // one line wide — the aggregation this loop still runs stays the
-    // right path for a future compressed mode (a user-configurable
-    // `editor.minimap.scale`-style setting, deliberately out of this
-    // issue's scope), it just has nothing to aggregate today.
+    // from `rope` and when stamping `MinimapLine::line_idx`. At `K == 1`
+    // (`window_len <= target_lines`) this takes the "never upscales" branch
+    // and every block is exactly one line wide, same as pre-#1186; at `K >
+    // 1` (#1186's compressed mode, `window_len == target_lines * k`) it
+    // takes the striding branch instead and each block becomes `k` real
+    // buffer lines wide — the exact multi-line aggregation this loop and
+    // `minimap_block_text` were already built for by #1085, now actually
+    // exercised by the one production call site instead of only by tests
+    // that pass a `total_lines` bigger than `target_lines` directly.
     let bounds = minimap_block_bounds(window_len, target_lines);
     if bounds.len() < 2 {
         return None;
@@ -11621,14 +11659,22 @@ pub fn build_minimap_data(
     // this function's doc comment (#1085).
     let scroll_top = window.view.scroll_top.min(total_buffer_lines);
     let viewport_end = scroll_top.saturating_add(editor_visible_rows.max(1));
+    // #1186: each `lines` entry is a block that can now span several real
+    // buffer lines (`K > 1`), so `scroll_top`/`viewport_end` will usually
+    // fall *inside* a block's line range rather than land exactly on a
+    // `line_idx` boundary. The pre-#1186 formula
+    // (`position(|l| l.line_idx >= scroll_top)`) is only correct when every
+    // block is exactly one line wide — otherwise it skips the block that
+    // actually *contains* `scroll_top` and finds the next one instead.
+    // `partition_point` finds the last block whose start is `<= scroll_top`
+    // (i.e. the block `scroll_top` itself falls inside): at `K == 1` a block
+    // with `line_idx == scroll_top` is always present, so the two formulas
+    // agree exactly — this is a strict generalisation, not a behaviour
+    // change, for the uncompressed case.
     let visible_row_start = lines
-        .iter()
-        .position(|l| l.line_idx >= scroll_top)
-        .unwrap_or(lines.len().saturating_sub(1));
-    let visible_row_end = lines
-        .iter()
-        .position(|l| l.line_idx >= viewport_end)
-        .unwrap_or(lines.len());
+        .partition_point(|l| l.line_idx <= scroll_top)
+        .saturating_sub(1);
+    let visible_row_end = lines.partition_point(|l| l.line_idx < viewport_end);
 
     Some(RenderedMinimap {
         window_id,
@@ -24910,6 +24956,24 @@ mod tests {
         test_engine(&text)
     }
 
+    /// A large, syntax-free buffer used to force the strip into #1093's
+    /// genuine sliding-window regime even under #1186's compression: `n` is
+    /// picked per call site to comfortably exceed
+    /// `MINIMAP_MAX_COMPRESSION * target_lines` for that call's own strip
+    /// geometry, so `build_minimap_data` cannot show the whole file no
+    /// matter how generous `K_max` is. Tests using this fixture are
+    /// specifically about the windowed case (file too large to ever fully
+    /// fit), as distinct from the compressed-but-whole-file case #1186
+    /// introduced — see `minimap_scale_grows_to_show_the_whole_file_when_it_fits_the_compression_ceiling`
+    /// for that one.
+    fn windowed_minimap_engine(n: usize) -> Engine {
+        let mut text = String::with_capacity(n * 14);
+        for i in 0..n {
+            text.push_str(&format!("line {i} content\n"));
+        }
+        test_engine(&text)
+    }
+
     /// A synthetic file large enough to make an O(buffer) per-frame cost
     /// visible: `n_lines` lines, none of them trivially short (so a full
     /// buffer-wide `String` materialisation actually does real allocation
@@ -25827,12 +25891,21 @@ mod tests {
     /// outright, since the window would once again cover the entire file.
     #[test]
     fn minimap_click_at_the_middle_seeks_to_the_middle_of_the_painted_window() {
-        let mut e = minimap_engine();
+        // #1186: `minimap_engine()`'s 201 lines now fits *entirely* inside
+        // this strip's window (compression covers whole small files, which
+        // is the point of #1186) — `windowed_minimap_engine` is large enough
+        // to stay in #1093's genuine sliding-window regime even after
+        // #1186's compression, which is what this test is actually about.
+        let mut e = windowed_minimap_engine(50_000);
         let screen = render_engine(&e, 120.0, 30.0);
         let win_id = screen.windows[0].window_id;
         let mm = screen.minimap.first().expect("minimap present");
         let total = mm.minimap.total_buffer_lines;
-        let window_len = mm.minimap.lines.len();
+        // The real span of buffer lines the window covers — `lines.len()`
+        // (a row/block *count*) stopped being a reliable proxy for that the
+        // moment #1186 let a block cover more than one buffer line.
+        let window_len =
+            mm.minimap.lines.last().unwrap().line_idx + 1 - mm.minimap.lines[0].line_idx;
         assert!(
             window_len < total,
             "test setup sanity: the file must be taller than the strip's \
@@ -25904,12 +25977,20 @@ mod tests {
     /// really is in the file's last tenth regardless of scroll position.
     #[test]
     fn minimap_click_at_the_bottom_does_not_jump_to_eof() {
-        let e = minimap_engine();
+        // #1186: see the sibling middle-click test's doc comment — a
+        // 201-line file now fits entirely inside this geometry's compressed
+        // window, so a much larger fixture is needed to keep exercising
+        // #1093's genuine sliding-window regime.
+        let e = windowed_minimap_engine(50_000);
         let screen = render_engine(&e, 120.0, 30.0);
         let win_id = screen.windows[0].window_id;
         let mm = screen.minimap.first().expect("minimap present");
         let total = mm.minimap.total_buffer_lines;
-        let window_len = mm.minimap.lines.len();
+        // Real buffer-line span the window covers — see the sibling test's
+        // comment on why `lines.len()` (a row count) is no longer a
+        // reliable proxy for this under #1186's multi-line blocks.
+        let window_len =
+            mm.minimap.lines.last().unwrap().line_idx + 1 - mm.minimap.lines[0].line_idx;
         assert!(
             window_len < total,
             "test setup sanity: the file must be taller than the strip's \
@@ -26010,7 +26091,14 @@ mod tests {
     /// against that shape at any scroll position, including the top.
     #[test]
     fn minimap_window_stays_short_of_eof_when_scrolled_to_the_top() {
-        let e = large_minimap_engine(2_000);
+        // #1186: at this rect's `target_lines` (160), a 2,000-line buffer
+        // (`k = ceil(2_000 / 160) = 13 <= MINIMAP_MAX_COMPRESSION`) now fits
+        // *entirely* inside one compressed window — exactly #1186's own
+        // point. 20,000 lines comfortably exceeds
+        // `MINIMAP_MAX_COMPRESSION * 160` (10,240), so the window still
+        // cannot cover the whole file and this test keeps exercising
+        // #1093's genuine sliding-window regime.
+        let e = large_minimap_engine(20_000);
         let theme = Theme::onedark();
         let wid = e.active_window_id();
         let rect = WindowRect::new(0.0, 0.0, 100.0, 40.0);
@@ -26036,7 +26124,10 @@ mod tests {
     /// scrolling, VS Code's `minimap.size: proportional`).
     #[test]
     fn minimap_window_reaches_eof_when_scrolled_to_the_bottom() {
-        let mut e = large_minimap_engine(2_000);
+        // #1186: see the sibling "stays short of eof" test's comment — a
+        // 20,000-line buffer stays outside the compression ceiling at this
+        // rect's `target_lines` (160), so the window still has to slide.
+        let mut e = large_minimap_engine(20_000);
         let theme = Theme::onedark();
         let wid = e.active_window_id();
         let rect = WindowRect::new(0.0, 0.0, 100.0, 40.0);
@@ -26055,11 +26146,18 @@ mod tests {
             .expect("minimap must build")
             .minimap;
 
-        assert_eq!(
-            mm.lines.last().unwrap().line_idx,
-            total_buffer_lines - 1,
-            "scrolled to the bottom, the strip's last painted row must be \
-             the file's actual last line"
+        // #1186: the last `lines` entry is now a *block's* starting line,
+        // not necessarily the file's literal last line — a block can cover
+        // several real lines (`MINIMAP_MAX_COMPRESSION` at most here, since
+        // 20,000 lines sits well past the compression ceiling), so "reaches
+        // EOF" means the last block's own range covers `total_buffer_lines
+        // - 1`, i.e. its start is within one block-width of the end.
+        let last_line_idx = mm.lines.last().unwrap().line_idx;
+        assert!(
+            total_buffer_lines - last_line_idx <= MINIMAP_MAX_COMPRESSION,
+            "scrolled to the bottom, the strip's last painted block (starting \
+             at line {last_line_idx} of {total_buffer_lines}) must reach the \
+             file's actual last line, within one block's own width"
         );
         assert!(
             mm.lines[0].line_idx > 0,
@@ -26068,42 +26166,96 @@ mod tests {
         );
     }
 
-    /// #1093 acceptance criterion 3: a 200-line file and a 2,000-line file
-    /// opened into the *same* strip must sample the same number of buffer
-    /// lines per painted row — the fixed vertical scale this issue asks
-    /// for, independent of file length.
+    /// #1186 superseded #1093 acceptance criterion 3 (which pinned the
+    /// vertical scale as *always* one buffer line per painted row,
+    /// regardless of file length — exactly the bug #1186 reports: that
+    /// fixed scale is what limits the strip to a small fraction of a large
+    /// file). The new invariant: the scale (buffer lines per painted row)
+    /// **grows** with file length up to the point where the whole file fits
+    /// in one window, then **caps** at `MINIMAP_MAX_COMPRESSION` for files
+    /// beyond that — never unbounded, never regressing to #1093's fixed 1.
     ///
-    /// **RED against unfixed `develop`:** the pre-#1093 scale was
-    /// `total_buffer_lines / target_lines` — a number that moves with the
-    /// file — so a 10x-longer file at the same strip geometry sampled a 10x
-    /// coarser scale; this equality fails against that shape.
+    /// **RED against unfixed `develop`:** the pre-#1186 scale was pinned at
+    /// exactly 1 regardless of file length — `step(&mm_medium) > 1` and
+    /// `step(&mm_huge) == MINIMAP_MAX_COMPRESSION` both fail against that
+    /// shape (both would observe `1`).
     #[test]
-    fn minimap_scale_is_independent_of_file_length() {
+    fn minimap_scale_grows_with_file_length_then_caps_at_the_compression_ceiling() {
         let theme = Theme::onedark();
+        // `target_lines` at this rect geometry (pinned by the sibling
+        // windowing tests' own comments): 160.
         let rect = WindowRect::new(0.0, 0.0, 100.0, 40.0);
 
-        let short = large_minimap_engine(200);
-        let long = large_minimap_engine(2_000);
+        let short = large_minimap_engine(50);
+        let medium = large_minimap_engine(1_500);
+        let huge = large_minimap_engine(50_000);
         let wid_short = short.active_window_id();
-        let wid_long = long.active_window_id();
+        let wid_medium = medium.active_window_id();
+        let wid_huge = huge.active_window_id();
 
         let mm_short = build_minimap_data(&short, &theme, wid_short, rect, 1.0, 40)
             .expect("minimap must build for the short fixture")
             .minimap;
-        let mm_long = build_minimap_data(&long, &theme, wid_long, rect, 1.0, 40)
-            .expect("minimap must build for the long fixture")
+        let mm_medium = build_minimap_data(&medium, &theme, wid_medium, rect, 1.0, 40)
+            .expect("minimap must build for the medium fixture")
+            .minimap;
+        let mm_huge = build_minimap_data(&huge, &theme, wid_huge, rect, 1.0, 40)
+            .expect("minimap must build for the huge fixture")
             .minimap;
 
-        // At a fixed scale, `lines[i].line_idx` advances by exactly the same
-        // step regardless of `total_buffer_lines` — checked between any two
-        // consecutive sampled rows so this doesn't depend on either fixture
-        // actually needing a window (the short one may not).
         let step = |mm: &quadraui::Minimap| mm.lines[1].line_idx - mm.lines[0].line_idx;
+
+        // A file shorter than `target_lines` needs no compression at all.
         assert_eq!(
             step(&mm_short),
-            step(&mm_long),
-            "the buffer-lines-per-painted-row must be identical for a \
-             200-line and a 2,000-line file at the same strip geometry"
+            1,
+            "a file shorter than target_lines must sample one buffer line \
+             per painted row, exactly like pre-#1186"
+        );
+        // A file that fits entirely under `MINIMAP_MAX_COMPRESSION *
+        // target_lines` (1,500 < 64 * 160 = 10,240) is compressed just
+        // enough to show the whole thing, not clamped to the old scale of 1.
+        assert!(
+            step(&mm_medium) > 1,
+            "a 1,500-line file at target_lines=160 must compress (step > 1) \
+             so the whole file fits — got step {}",
+            step(&mm_medium)
+        );
+        assert_eq!(
+            mm_medium.lines[0].line_idx, 0,
+            "a file within the compression ceiling must show from the top"
+        );
+        // The last block's own *start* need not equal `total - 1` exactly
+        // (it's a several-lines-wide block, not a single line) — what
+        // matters is that its range reaches EOF, i.e. its start is within
+        // one block-width of the file's last line. `minimap_block_bounds`'s
+        // boundaries are each `floor(r * stride)`, so a block can be up to
+        // `ceil(stride)` wide (one wider than the average `step` between
+        // the first two blocks, from truncation) — `step(&mm_medium) + 1`
+        // covers that.
+        assert!(
+            mm_medium.total_buffer_lines - mm_medium.lines.last().unwrap().line_idx
+                <= step(&mm_medium) + 1,
+            "a file within the compression ceiling must show through to EOF \
+             with the cursor at the top — the whole file fits in one window \
+             (last block starts at line {}, of {} total, block width {})",
+            mm_medium.lines.last().unwrap().line_idx,
+            mm_medium.total_buffer_lines,
+            step(&mm_medium)
+        );
+        // A file far beyond the compression ceiling (50,000 >> 10,240) caps
+        // at MINIMAP_MAX_COMPRESSION rather than compressing further —
+        // #1093's sliding window still applies beyond this point.
+        assert_eq!(
+            step(&mm_huge),
+            MINIMAP_MAX_COMPRESSION,
+            "a file far beyond the compression ceiling must cap its scale \
+             at MINIMAP_MAX_COMPRESSION, not keep growing"
+        );
+        assert!(
+            mm_huge.lines.last().unwrap().line_idx < mm_huge.total_buffer_lines - 1,
+            "a file beyond the compression ceiling must NOT reach EOF while \
+             scrolled to the top — the window still has to slide"
         );
     }
 
@@ -26294,6 +26446,91 @@ mod tests {
             "the viewport band's own content must differ measurably \
              between a blank run ({blank_dots} set columns) and a dense \
              block ({dense_dots} set columns) of the same file"
+        );
+    }
+
+    /// #1186 acceptance: the viewport-highlight band (`Minimap::visible_row_start`/
+    /// `visible_row_count`, painted as a background band by both backends'
+    /// rasterisers — see `quadraui::tui::minimap`'s module doc) must shrink
+    /// and reposition correctly once blocks start covering more than one
+    /// real buffer line, not stay pinned to the pre-#1186 per-line shape.
+    ///
+    /// A `viewport_lines`-tall editor viewport spans `viewport_lines` real
+    /// buffer lines, which now maps to `ceil(viewport_lines / block_width)`
+    /// **blocks** (clamped to at least 1) rather than `viewport_lines`
+    /// blocks — since each block covers `block_width` real lines. This
+    /// checks that relationship directly against a compressed window
+    /// (`block_width > 1`), and that `visible_row_start` lands on the block
+    /// that actually contains `scroll_top`, not the next one after it (the
+    /// off-by-one the old `position(|l| l.line_idx >= scroll_top)` formula
+    /// would hit once a block's own range no longer starts exactly at
+    /// `scroll_top`).
+    ///
+    /// **RED against unfixed `develop`:** confirmed by hand — reverting
+    /// `visible_row_start`'s `partition_point` formula back to
+    /// `position(|l| l.line_idx >= scroll_top)` (the pre-#1186 formula) at
+    /// this test's compression skips the block that actually contains
+    /// `scroll_top`, landing one block later than expected and failing the
+    /// `visible_row_start` assertion below. Reverted before landing this
+    /// test.
+    #[test]
+    fn viewport_band_scales_down_and_repositions_under_compression() {
+        const N_LINES: usize = 20_000;
+        const EDITOR_VISIBLE_ROWS: usize = 40;
+        let mut e = large_minimap_engine(N_LINES);
+        let theme = Theme::onedark();
+        let wid = e.active_window_id();
+        let rect = WindowRect::new(0.0, 0.0, 100.0, 40.0);
+
+        // Scroll well into the file (but not to the very bottom, so the
+        // scrolled-to line lands squarely inside some block's range rather
+        // than coincidentally on a window boundary).
+        let scroll_top = N_LINES / 3;
+        if let Some(w) = e.windows.get_mut(&wid) {
+            w.view.scroll_top = scroll_top;
+            w.view.cursor.line = scroll_top;
+        }
+
+        let mm = build_minimap_data(&e, &theme, wid, rect, 1.0, EDITOR_VISIBLE_ROWS)
+            .expect("minimap must build")
+            .minimap;
+
+        let block_width = mm.lines[1].line_idx - mm.lines[0].line_idx;
+        assert!(
+            block_width > 1,
+            "test setup sanity: this fixture must be far enough past the \
+             compression ceiling to produce multi-line blocks, or this \
+             test cannot distinguish compressed from uncompressed band math \
+             (block_width={block_width})"
+        );
+
+        // Height: a `EDITOR_VISIBLE_ROWS`-line viewport must cover roughly
+        // `EDITOR_VISIBLE_ROWS / block_width` blocks (clamped to >= 1) —
+        // never the pre-#1186 `EDITOR_VISIBLE_ROWS` blocks a compressed
+        // window would wildly overshoot to.
+        let expected_rows = (EDITOR_VISIBLE_ROWS / block_width).max(1);
+        assert!(
+            mm.visible_row_count <= expected_rows + 1 && mm.visible_row_count >= 1,
+            "a {EDITOR_VISIBLE_ROWS}-line viewport at block_width \
+             {block_width} must show roughly {expected_rows} band block(s) \
+             (clamped to >= 1), got {} — the band must shrink under \
+             compression, not stay pinned to the uncompressed \
+             {EDITOR_VISIBLE_ROWS}",
+            mm.visible_row_count
+        );
+
+        // Position: `visible_row_start` must be the block that actually
+        // *contains* `scroll_top`, i.e. the last block whose own start is
+        // `<= scroll_top`.
+        let expected_start = mm
+            .lines
+            .iter()
+            .rposition(|l| l.line_idx <= scroll_top)
+            .expect("some block must start at or before scroll_top");
+        assert_eq!(
+            mm.visible_row_start, expected_start,
+            "visible_row_start must be the block containing scroll_top \
+             ({scroll_top}), not the next block after it"
         );
     }
 
