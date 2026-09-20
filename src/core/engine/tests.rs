@@ -31818,6 +31818,54 @@ fn test_gf_open_file_with_line_and_col_suffix() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+// --- "# (alternate-file register): `:e other.txt`, <C-^>, "#p (#1161) ---
+
+#[test]
+fn test_alternate_file_register_hash() {
+    let dir = std::env::temp_dir().join("vimcode_test_alt_reg_1161");
+    let _ = std::fs::create_dir_all(&dir);
+    let file_a = dir.join("first.txt");
+    let file_b = dir.join("other.txt");
+    std::fs::write(&file_a, "x").unwrap();
+    std::fs::write(&file_b, "y").unwrap();
+
+    let mut engine = Engine::new();
+    // `:e first.txt` — no alternate yet (only one file has ever been opened).
+    engine
+        .open_file_with_mode(&file_a, OpenMode::Permanent)
+        .unwrap();
+    assert_eq!(
+        engine.get_register_content('#'),
+        Some((String::new(), RegType::Charwise))
+    );
+
+    // `:e other.txt` — first.txt becomes the alternate file.
+    engine
+        .open_file_with_mode(&file_b, OpenMode::Permanent)
+        .unwrap();
+
+    // <C-^> — swap back to first.txt; other.txt is now the alternate.
+    press_ctrl(&mut engine, '6');
+    assert_eq!(
+        engine.active_buffer_state().file_path.as_deref(),
+        Some(file_a.as_path()),
+        "Ctrl-^ should have switched back to first.txt"
+    );
+
+    // "#p should paste "other.txt" (the alternate file's name), matching
+    // what <C-^> itself would switch to.
+    press_char(&mut engine, '"');
+    press_char(&mut engine, '#');
+    press_char(&mut engine, 'p');
+    assert!(
+        engine.buffer().to_string().contains("other.txt"),
+        "\"#p should have pasted the alternate filename \"other.txt\"; buffer is: {:?}",
+        engine.buffer().to_string()
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn test_gf_no_file_shows_message() {
     let mut engine = Engine::new();
