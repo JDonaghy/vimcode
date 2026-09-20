@@ -26,7 +26,9 @@ use super::lsp::{
 use super::lsp_manager::LspManager;
 use super::paths;
 use super::plugin;
-use super::project_search::{self, ProjectMatch, ReplaceResult, SearchError, SearchOptions};
+use super::project_search::{
+    self, ProjectMatch, QuickfixList, ReplaceResult, SearchError, SearchOptions,
+};
 use super::registry;
 use super::session::{ExtensionState, HistoryState, SessionGroupLayout, SessionState};
 use super::settings::{EditorMode, Settings};
@@ -283,16 +285,22 @@ static EX_ABBREVS: &[(&str, usize)] = &[
     ("bwipeout", 2),
     ("cabbrev", 2),
     ("cclose", 3),
+    ("cdo", 3),
+    ("cfdo", 4),
     ("cfirst", 4),
     ("clast", 3),
+    ("clist", 2),
     ("close", 3),
+    ("cnewer", 4),
     ("cnext", 2),
     ("cnoreabbrev", 6),
+    ("colder", 3),
     ("colorscheme", 4),
     ("copen", 4),
     ("copy", 2),
     ("cprevious", 2),
     ("cquit", 2),
+    ("cwindow", 2),
     ("delete", 1),
     ("delmarks", 4),
     ("display", 2),
@@ -308,6 +316,18 @@ static EX_ABBREVS: &[(&str, usize)] = &[
     ("inoreabbrev", 6),
     ("join", 1),
     ("jumps", 2),
+    ("lclose", 3),
+    ("ldo", 3),
+    ("lfdo", 4),
+    ("lfirst", 4),
+    ("lgrep", 2),
+    ("llast", 3),
+    ("llist", 3),
+    ("lnext", 2),
+    ("lopen", 3),
+    ("lprevious", 2),
+    ("lvimgrep", 3),
+    ("lwindow", 2),
     ("make", 3),
     ("mark", 2),
     ("move", 1),
@@ -3136,15 +3156,21 @@ pub struct Engine {
     /// True when navigating via back/forward (suppresses pushing to history).
     tab_nav_navigating: bool,
 
-    // --- Quickfix state ---
-    /// Quickfix list populated by :grep / :vimgrep.
-    pub quickfix_items: Vec<ProjectMatch>,
-    /// Currently selected quickfix item (0-based).
-    pub quickfix_selected: usize,
-    /// Whether the quickfix panel is visible.
-    pub quickfix_open: bool,
-    /// Whether the quickfix panel has keyboard focus.
-    pub quickfix_has_focus: bool,
+    // --- Quickfix / location-list state (#1155) ---
+    /// The global quickfix list, populated by :grep / :vimgrep / :cexpr-style
+    /// producers and driven by the `:c*` family.
+    pub quickfix: QuickfixList,
+    /// History of previous global quickfix lists for `:colder`/`:cnewer`,
+    /// always including the currently-loaded list at `quickfix_stack
+    /// [quickfix_stack_pos]`. Capped at 10 entries, matching Vim's default
+    /// quickfix-stack depth. Vim's location lists don't get their own
+    /// `:lolder`/`:lnewer` stack here — out of scope for #1155.
+    pub quickfix_stack: Vec<QuickfixList>,
+    /// Index of the currently active list within `quickfix_stack`.
+    pub quickfix_stack_pos: usize,
+    /// Per-window location lists — the `:l*` family's target. A window with
+    /// no entry here behaves like Vim's "no location list" (`E776`).
+    pub location_lists: HashMap<WindowId, QuickfixList>,
     /// Whether the debug sidebar has keyboard focus.
     pub dap_sidebar_has_focus: bool,
 
@@ -4335,10 +4361,10 @@ impl Engine {
             tab_nav_history: vec![(GroupId(0), TabId(1))],
             tab_nav_index: 0,
             tab_nav_navigating: false,
-            quickfix_items: Vec::new(),
-            quickfix_selected: 0,
-            quickfix_open: false,
-            quickfix_has_focus: false,
+            quickfix: QuickfixList::default(),
+            quickfix_stack: Vec::new(),
+            quickfix_stack_pos: 0,
+            location_lists: HashMap::new(),
             dap_sidebar_has_focus: false,
             picker_open: false,
             picker_source: PickerSource::Files,

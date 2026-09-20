@@ -13,7 +13,9 @@ pub(super) fn build_screen_for_tui(
     // Global bottom rows: status(1) + cmd(1).  The tab bar row is included in
     // content_bounds and handled by calculate_group_window_rects (tab_bar_height=1).
     // Must match draw_frame's vertical layout exactly.
-    let qf_height: u16 = if engine.quickfix_open { 6 } else { 0 };
+    // `quickfix_panel_rows` also accounts for the active window's open
+    // location list (#1155) — the two share one bottom "list rung".
+    let qf_height: u16 = render::quickfix_panel_rows(engine);
     let bottom_panel_open = engine.terminal_open || engine.bottom_panel_open;
     let term_height: u16 = if bottom_panel_open {
         let target = super::terminal_target_maximize_rows_tui(engine, area.height);
@@ -151,7 +153,9 @@ pub(super) fn build_screen_for_shell_content(
     area: Rect,
     backend: &dyn quadraui::Backend,
 ) -> render::ScreenLayout {
-    let qf_height: u16 = if engine.quickfix_open { 6 } else { 0 };
+    // `quickfix_panel_rows` also accounts for the active window's open
+    // location list (#1155) — the two share one bottom "list rung".
+    let qf_height: u16 = render::quickfix_panel_rows(engine);
     let bottom_panel_open = engine.terminal_open || engine.bottom_panel_open;
     let term_height: u16 = if bottom_panel_open {
         let target = super::terminal_target_maximize_rows_tui(engine, area.height);

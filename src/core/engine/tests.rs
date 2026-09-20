@@ -12848,7 +12848,7 @@ fn test_copen_requires_items() {
     let mut engine = Engine::new();
     engine.execute_command("copen");
     assert!(
-        !engine.quickfix_open,
+        !engine.quickfix.open,
         "copen should not open with empty list"
     );
     assert!(engine.message.contains("empty"));
@@ -12857,59 +12857,59 @@ fn test_copen_requires_items() {
 #[test]
 fn test_copen_cclose() {
     let mut engine = Engine::new();
-    engine.quickfix_items = vec![make_qf_item("test.rs")];
+    engine.quickfix.items = vec![make_qf_item("test.rs")];
     engine.execute_command("copen");
-    assert!(engine.quickfix_open);
-    assert!(engine.quickfix_has_focus);
+    assert!(engine.quickfix.open);
+    assert!(engine.quickfix.has_focus);
     engine.execute_command("cclose");
-    assert!(!engine.quickfix_open);
-    assert!(!engine.quickfix_has_focus);
+    assert!(!engine.quickfix.open);
+    assert!(!engine.quickfix.has_focus);
 }
 
 #[test]
 fn test_cn_cp_navigation() {
     let mut engine = Engine::new();
-    engine.quickfix_items = vec![
+    engine.quickfix.items = vec![
         make_qf_item("a.rs"),
         make_qf_item("b.rs"),
         make_qf_item("c.rs"),
     ];
-    engine.quickfix_selected = 0;
-    engine.quickfix_open = true;
+    engine.quickfix.selected = 0;
+    engine.quickfix.open = true;
 
     // cn moves forward
     engine.execute_command("cn");
-    assert_eq!(engine.quickfix_selected, 1);
+    assert_eq!(engine.quickfix.selected, 1);
     engine.execute_command("cn");
-    assert_eq!(engine.quickfix_selected, 2);
+    assert_eq!(engine.quickfix.selected, 2);
 
     // cn at end clamps
     engine.execute_command("cn");
-    assert_eq!(engine.quickfix_selected, 2, "cn should clamp at last item");
+    assert_eq!(engine.quickfix.selected, 2, "cn should clamp at last item");
 
     // cp moves back
     engine.execute_command("cp");
-    assert_eq!(engine.quickfix_selected, 1);
+    assert_eq!(engine.quickfix.selected, 1);
 
     // cp at start clamps
     engine.execute_command("cp");
     engine.execute_command("cp");
-    assert_eq!(engine.quickfix_selected, 0, "cp should clamp at first item");
+    assert_eq!(engine.quickfix.selected, 0, "cp should clamp at first item");
 }
 
 #[test]
 fn test_cc_jump() {
     let mut engine = Engine::new();
-    engine.quickfix_items = vec![
+    engine.quickfix.items = vec![
         make_qf_item("a.rs"),
         make_qf_item("b.rs"),
         make_qf_item("c.rs"),
     ];
-    engine.quickfix_open = true;
+    engine.quickfix.open = true;
 
     engine.execute_command("cc 2");
     assert_eq!(
-        engine.quickfix_selected, 1,
+        engine.quickfix.selected, 1,
         ":cc 2 should select index 1 (1-based)"
     );
 }
@@ -12919,17 +12919,17 @@ fn test_ex_bare_cc_jumps_to_current_entry_1154() {
     // #1154: bare `:cc` (no count) was entirely unimplemented — only
     // `:cc {N}` existed — despite VIM_COMPATIBILITY.md marking `:cc` ✅.
     let mut engine = Engine::new();
-    engine.quickfix_items = vec![make_qf_item("a.rs"), make_qf_item("b.rs")];
-    engine.quickfix_selected = 1;
-    engine.quickfix_open = true;
-    engine.quickfix_has_focus = true;
+    engine.quickfix.items = vec![make_qf_item("a.rs"), make_qf_item("b.rs")];
+    engine.quickfix.selected = 1;
+    engine.quickfix.open = true;
+    engine.quickfix.has_focus = true;
 
     engine.execute_command("cc");
 
     // Bare :cc re-jumps to whatever is currently selected, without moving
     // the selection, and returns focus to the editor.
-    assert_eq!(engine.quickfix_selected, 1);
-    assert!(!engine.quickfix_has_focus);
+    assert_eq!(engine.quickfix.selected, 1);
+    assert!(!engine.quickfix.has_focus);
 }
 
 #[test]
@@ -12942,26 +12942,26 @@ fn test_ex_cc_on_empty_quickfix_list_errors_1154() {
 #[test]
 fn test_ex_cfirst_clast_jump_to_ends_1154() {
     let mut engine = Engine::new();
-    engine.quickfix_items = vec![
+    engine.quickfix.items = vec![
         make_qf_item("a.rs"),
         make_qf_item("b.rs"),
         make_qf_item("c.rs"),
     ];
-    engine.quickfix_selected = 1;
-    engine.quickfix_open = true;
+    engine.quickfix.selected = 1;
+    engine.quickfix.open = true;
 
     engine.execute_command("clast");
-    assert_eq!(engine.quickfix_selected, 2);
+    assert_eq!(engine.quickfix.selected, 2);
 
     engine.execute_command("cfirst");
-    assert_eq!(engine.quickfix_selected, 0);
+    assert_eq!(engine.quickfix.selected, 0);
 }
 
 #[test]
 fn test_grep_empty_pattern() {
     let mut engine = Engine::new();
     engine.execute_command("grep ");
-    assert!(engine.quickfix_items.is_empty());
+    assert!(engine.quickfix.items.is_empty());
     assert!(engine.message.contains("Usage"));
 }
 
@@ -12972,7 +12972,7 @@ fn test_grep_no_matches() {
     let mut engine = Engine::new();
     engine.cwd = dir.clone();
     engine.execute_command("grep xyzzy_no_match_anywhere_qf_test");
-    assert_eq!(engine.quickfix_items.len(), 0);
+    assert_eq!(engine.quickfix.items.len(), 0);
     assert!(engine.message.contains("0 match"));
 }
 
@@ -12991,12 +12991,12 @@ fn test_grep_populates_quickfix() {
     engine.execute_command("grep qfmain_unique_marker");
 
     assert!(
-        !engine.quickfix_items.is_empty(),
+        !engine.quickfix.items.is_empty(),
         "grep should find matches"
     );
-    assert!(engine.quickfix_open);
+    assert!(engine.quickfix.open);
     assert!(
-        engine.quickfix_has_focus,
+        engine.quickfix.has_focus,
         ":grep should focus the quickfix panel so j/k/Enter drive the results"
     );
     assert!(engine.message.contains("match"));
@@ -13017,10 +13017,10 @@ fn test_vimgrep_alias() {
     engine.execute_command("vimgrep vghello_unique_marker");
 
     assert!(
-        !engine.quickfix_items.is_empty(),
+        !engine.quickfix.items.is_empty(),
         "vimgrep should work same as grep"
     );
-    assert!(engine.quickfix_open);
+    assert!(engine.quickfix.open);
 }
 
 // ─── rename_file / move_file tests ────────────────────────────────────────
@@ -14192,37 +14192,37 @@ fn test_quickfix_j_k_q_work_with_tui_key_encoding() {
     // unlike GTK which sends `key_name="j"`. The quickfix intercept
     // must normalise so j/k/q/n/p behave identically in both backends.
     let mut engine = Engine::new();
-    engine.quickfix_items = vec![
+    engine.quickfix.items = vec![
         make_qf_item("a.rs"),
         make_qf_item("b.rs"),
         make_qf_item("c.rs"),
     ];
-    engine.quickfix_open = true;
-    engine.quickfix_has_focus = true;
-    engine.quickfix_selected = 0;
+    engine.quickfix.open = true;
+    engine.quickfix.has_focus = true;
+    engine.quickfix.selected = 0;
 
     // j (TUI encoding) → selection advances
     engine.handle_key("", Some('j'), false);
-    assert_eq!(engine.quickfix_selected, 1, "j should advance selection");
+    assert_eq!(engine.quickfix.selected, 1, "j should advance selection");
 
     // j again → 2
     engine.handle_key("", Some('j'), false);
-    assert_eq!(engine.quickfix_selected, 2);
+    assert_eq!(engine.quickfix.selected, 2);
 
     // k (TUI encoding) → selection retreats
     engine.handle_key("", Some('k'), false);
-    assert_eq!(engine.quickfix_selected, 1, "k should retreat selection");
+    assert_eq!(engine.quickfix.selected, 1, "k should retreat selection");
 
     // GTK encoding of j/k still works (regression guard)
     engine.handle_key("j", Some('j'), false);
-    assert_eq!(engine.quickfix_selected, 2, "GTK-style j still works");
+    assert_eq!(engine.quickfix.selected, 2, "GTK-style j still works");
     engine.handle_key("k", Some('k'), false);
-    assert_eq!(engine.quickfix_selected, 1, "GTK-style k still works");
+    assert_eq!(engine.quickfix.selected, 1, "GTK-style k still works");
 
     // q (TUI encoding) → close panel
     engine.handle_key("", Some('q'), false);
-    assert!(!engine.quickfix_open, "q should close the panel");
-    assert!(!engine.quickfix_has_focus);
+    assert!(!engine.quickfix.open, "q should close the panel");
+    assert!(!engine.quickfix.has_focus);
 }
 
 #[test]
@@ -14234,15 +14234,382 @@ fn test_mouse_click_clears_quickfix_focus() {
     engine.update_syntax();
 
     // Simulate a focused quickfix panel.
-    engine.quickfix_open = true;
-    engine.quickfix_has_focus = true;
+    engine.quickfix.open = true;
+    engine.quickfix.has_focus = true;
 
     let wid = engine.active_window_id();
     engine.mouse_click(wid, 0, 3);
 
-    assert!(!engine.quickfix_has_focus);
+    assert!(!engine.quickfix.has_focus);
     // Panel stays open — click only releases focus, it doesn't close.
-    assert!(engine.quickfix_open);
+    assert!(engine.quickfix.open);
+}
+
+// ─── Location list + quickfix completion tests (#1155) ─────────────────────
+
+#[test]
+fn test_lopen_with_no_location_list_errors() {
+    let mut engine = Engine::new();
+    engine.execute_command("lopen");
+    let win = engine.active_window_id();
+    assert!(!engine.location_lists.get(&win).is_some_and(|l| l.open));
+    assert!(engine.message.contains("E776"));
+}
+
+#[test]
+fn test_lopen_lclose_are_per_window_and_independent_of_quickfix() {
+    let mut engine = Engine::new();
+    let win = engine.active_window_id();
+    engine
+        .location_lists
+        .entry(win)
+        .or_default()
+        .items
+        .push(make_qf_item("loc_a.rs"));
+
+    engine.execute_command("lopen");
+    assert!(engine.location_lists[&win].open);
+    assert!(engine.location_lists[&win].has_focus);
+    // The global quickfix list is untouched.
+    assert!(!engine.quickfix.open);
+    assert!(engine.quickfix.items.is_empty());
+
+    engine.execute_command("lclose");
+    assert!(!engine.location_lists[&win].open);
+    assert!(!engine.location_lists[&win].has_focus);
+}
+
+#[test]
+fn test_location_lists_are_scoped_per_window() {
+    let mut engine = Engine::new();
+    let win_a = engine.active_window_id();
+    engine
+        .location_lists
+        .entry(win_a)
+        .or_default()
+        .items
+        .push(make_qf_item("a.rs"));
+
+    engine.split_window(SplitDirection::Vertical, None);
+    let win_b = engine.active_window_id();
+    assert_ne!(win_a, win_b, "split must create a second window");
+
+    // Window B has no location list of its own yet.
+    engine.execute_command("lopen");
+    assert!(engine.message.contains("E776"));
+    assert!(engine.location_lists.get(&win_b).is_none_or(|l| !l.open));
+
+    // Window A's list is untouched by window B's failed :lopen.
+    assert!(!engine.location_lists[&win_a].items.is_empty());
+}
+
+#[test]
+fn test_lnext_lprevious_lfirst_llast_navigate_location_list() {
+    let mut engine = Engine::new();
+    let win = engine.active_window_id();
+    let list = engine.location_lists.entry(win).or_default();
+    list.items = vec![
+        make_qf_item("a.rs"),
+        make_qf_item("b.rs"),
+        make_qf_item("c.rs"),
+    ];
+    list.open = true;
+
+    engine.execute_command("lnext");
+    assert_eq!(engine.location_lists[&win].selected, 1);
+    engine.execute_command("lnext");
+    assert_eq!(engine.location_lists[&win].selected, 2);
+    engine.execute_command("lnext");
+    assert_eq!(
+        engine.location_lists[&win].selected, 2,
+        "lnext should clamp at the last entry"
+    );
+
+    engine.execute_command("lprevious");
+    assert_eq!(engine.location_lists[&win].selected, 1);
+
+    engine.execute_command("lfirst");
+    assert_eq!(engine.location_lists[&win].selected, 0);
+    engine.execute_command("llast");
+    assert_eq!(engine.location_lists[&win].selected, 2);
+
+    // The global quickfix list never moved.
+    assert!(engine.quickfix.items.is_empty());
+}
+
+#[test]
+fn test_bare_ll_and_ll_count_jump_like_cc() {
+    let mut engine = Engine::new();
+    let win = engine.active_window_id();
+
+    // No location list at all yet.
+    engine.execute_command("ll");
+    assert!(engine.message.contains("E776"));
+
+    let list = engine.location_lists.entry(win).or_default();
+    list.items = vec![make_qf_item("a.rs"), make_qf_item("b.rs")];
+    list.selected = 1;
+    list.has_focus = true;
+
+    // Bare :ll re-jumps to the current entry and drops panel focus.
+    engine.execute_command("ll");
+    assert_eq!(engine.location_lists[&win].selected, 1);
+    assert!(!engine.location_lists[&win].has_focus);
+
+    // :ll {count} is 1-based, like :cc.
+    engine.execute_command("ll 1");
+    assert_eq!(engine.location_lists[&win].selected, 0);
+}
+
+#[test]
+fn test_lgrep_populates_the_active_window_location_list_not_quickfix() {
+    use std::io::Write;
+    let dir = std::env::temp_dir().join("vimcode_loclist_lgrep_1155");
+    std::fs::create_dir_all(&dir).unwrap();
+    let file_path = dir.join("lgreptest.rs");
+    let mut f = std::fs::File::create(&file_path).unwrap();
+    writeln!(f, "fn lgrep_unique_marker_1155() {{}}").unwrap();
+    drop(f);
+
+    let mut engine = Engine::new();
+    engine.cwd = dir.clone();
+    let win = engine.active_window_id();
+    engine.execute_command("lgrep lgrep_unique_marker_1155");
+
+    assert!(
+        !engine.location_lists[&win].items.is_empty(),
+        "lgrep should populate the active window's location list"
+    );
+    assert!(engine.location_lists[&win].open);
+    assert!(
+        engine.quickfix.items.is_empty(),
+        "lgrep must not touch quickfix"
+    );
+
+    engine.execute_command("lgrep");
+    assert!(engine.message.contains("Usage: :lgrep"));
+}
+
+#[test]
+fn test_cwindow_lwindow_open_only_when_non_empty() {
+    let mut engine = Engine::new();
+
+    // Empty: :cwindow is a no-op, never errors, never opens.
+    engine.execute_command("cwindow");
+    assert!(!engine.quickfix.open);
+
+    engine.quickfix.items = vec![make_qf_item("a.rs")];
+    engine.execute_command("cwindow");
+    assert!(engine.quickfix.open);
+    assert!(engine.quickfix.has_focus);
+
+    // Emptying the list and re-running :cwindow closes it again.
+    engine.quickfix.items.clear();
+    engine.execute_command("cwindow");
+    assert!(!engine.quickfix.open);
+
+    let win = engine.active_window_id();
+    engine
+        .location_lists
+        .entry(win)
+        .or_default()
+        .items
+        .push(make_qf_item("b.rs"));
+    engine.execute_command("lwindow");
+    assert!(engine.location_lists[&win].open);
+}
+
+#[test]
+fn test_clist_llist_print_every_entry() {
+    let mut engine = Engine::new();
+    engine.quickfix.items = vec![make_qf_item("a.rs"), make_qf_item("b.rs")];
+    engine.quickfix.selected = 1;
+    engine.execute_command("clist");
+    assert!(engine.message.contains("a.rs"));
+    assert!(engine.message.contains("b.rs"));
+    // The selected entry is marked.
+    assert!(engine.message.lines().nth(1).unwrap().starts_with('>'));
+
+    engine.quickfix.items.clear();
+    engine.execute_command("clist");
+    assert!(engine.message.contains("empty"));
+
+    let win = engine.active_window_id();
+    engine
+        .location_lists
+        .entry(win)
+        .or_default()
+        .items
+        .push(make_qf_item("loc.rs"));
+    engine.execute_command("llist");
+    assert!(engine.message.contains("loc.rs"));
+}
+
+#[test]
+fn test_colder_cnewer_walk_the_quickfix_stack() {
+    let mut engine = Engine::new();
+    engine.qf_set_list(None, vec![make_qf_item("first.rs")]);
+    engine.qf_set_list(
+        None,
+        vec![make_qf_item("second.rs"), make_qf_item("second2.rs")],
+    );
+
+    assert_eq!(
+        engine.quickfix.items.len(),
+        2,
+        "current list is the newest one"
+    );
+
+    engine.execute_command("colder");
+    assert_eq!(engine.quickfix.items.len(), 1);
+    assert_eq!(
+        engine.quickfix.items[0].file,
+        std::path::PathBuf::from("first.rs")
+    );
+
+    // Already at the bottom.
+    engine.execute_command("colder");
+    assert!(engine.message.contains("E380"));
+
+    engine.execute_command("cnewer");
+    assert_eq!(engine.quickfix.items.len(), 2);
+
+    // Already at the top.
+    engine.execute_command("cnewer");
+    assert!(engine.message.contains("E381"));
+
+    // A fresh list truncates any "newer" history beyond where we're parked.
+    engine.execute_command("colder"); // back to the 1-item list
+    engine.qf_set_list(None, vec![make_qf_item("branched.rs")]);
+    engine.execute_command("cnewer");
+    assert!(
+        engine.message.contains("E381"),
+        "the 2-item list should have been discarded by the new branch"
+    );
+}
+
+#[test]
+fn test_cdo_runs_command_once_per_entry_cfdo_once_per_file() {
+    let entry = |p: &std::path::Path| ProjectMatch {
+        file: p.to_path_buf(),
+        line: 0,
+        col: 0,
+        line_text: String::new(),
+    };
+    let read_line0 = |engine: &mut Engine, path: &std::path::Path| -> String {
+        let buf = engine.buffer_manager.open_file(path).unwrap();
+        engine
+            .buffer_manager
+            .get(buf)
+            .unwrap()
+            .buffer
+            .content
+            .line(0)
+            .chars()
+            .collect()
+    };
+
+    // :cdo touches every entry — two entries in file_a (same line) plus one
+    // in file_b means file_a's line is appended to twice, file_b's once.
+    let dir = std::env::temp_dir().join("vimcode_qf_cdo_1155");
+    std::fs::create_dir_all(&dir).unwrap();
+    let file_a = dir.join("cdo_a.txt");
+    let file_b = dir.join("cdo_b.txt");
+    std::fs::write(&file_a, "alpha\n").unwrap();
+    std::fs::write(&file_b, "beta\n").unwrap();
+
+    let mut engine = Engine::new();
+    engine.qf_set_list(None, vec![entry(&file_a), entry(&file_a), entry(&file_b)]);
+    engine.execute_command("cdo normal! A!");
+    assert!(engine.message.contains("3 quickfix entries"));
+    assert_eq!(read_line0(&mut engine, &file_a).trim(), "alpha!!");
+    assert_eq!(read_line0(&mut engine, &file_b).trim(), "beta!");
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // :cfdo visits each distinct file once, in first-seen order — a fresh
+    // engine/directory so there's no already-open buffer left over from the
+    // :cdo run above to shadow the on-disk reset.
+    let dir = std::env::temp_dir().join("vimcode_qf_cfdo_1155");
+    std::fs::create_dir_all(&dir).unwrap();
+    let file_a = dir.join("cfdo_a.txt");
+    let file_b = dir.join("cfdo_b.txt");
+    std::fs::write(&file_a, "alpha\n").unwrap();
+    std::fs::write(&file_b, "beta\n").unwrap();
+
+    let mut engine = Engine::new();
+    engine.qf_set_list(None, vec![entry(&file_a), entry(&file_a), entry(&file_b)]);
+    engine.execute_command("cfdo normal! A!");
+    assert!(engine.message.contains("2 file(s)"));
+    assert_eq!(
+        read_line0(&mut engine, &file_a).trim(),
+        "alpha!",
+        "cfdo must visit file_a only once despite two entries"
+    );
+    assert_eq!(read_line0(&mut engine, &file_b).trim(), "beta!");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_cdo_on_empty_list_errors_without_running_anything() {
+    let mut engine = Engine::new();
+    engine.execute_command("cdo normal! Ax");
+    assert!(engine.message.contains("empty"));
+
+    engine.execute_command("cdo");
+    assert!(engine.message.contains("E471"));
+}
+
+#[test]
+fn test_ctrl_w_close_window_drops_its_location_list() {
+    let mut engine = Engine::new();
+    engine.split_window(SplitDirection::Vertical, None);
+    let win = engine.active_window_id();
+    engine
+        .location_lists
+        .entry(win)
+        .or_default()
+        .items
+        .push(make_qf_item("a.rs"));
+    assert!(engine.location_lists.contains_key(&win));
+
+    engine.close_window();
+
+    assert!(
+        !engine.location_lists.contains_key(&win),
+        "closing a window must drop its location list — it has no meaning \
+         once the window it was scoped to is gone"
+    );
+}
+
+#[test]
+fn test_loclist_j_k_q_key_routing_is_independent_of_quickfix_focus() {
+    // Mirrors `test_quickfix_j_k_q_work_with_tui_key_encoding`, but for the
+    // active window's location list — the two panels must never cross-talk
+    // (#1155).
+    let mut engine = Engine::new();
+    let win = engine.active_window_id();
+    let list = engine.location_lists.entry(win).or_default();
+    list.items = vec![
+        make_qf_item("a.rs"),
+        make_qf_item("b.rs"),
+        make_qf_item("c.rs"),
+    ];
+    list.open = true;
+    list.has_focus = true;
+    list.selected = 0;
+    // The global quickfix panel is not focused.
+    assert!(!engine.quickfix.has_focus);
+
+    engine.handle_key("", Some('j'), false);
+    assert_eq!(engine.location_lists[&win].selected, 1);
+    assert_eq!(
+        engine.quickfix.selected, 0,
+        "the global quickfix selection must not move"
+    );
+
+    engine.handle_key("", Some('q'), false);
+    assert!(!engine.location_lists[&win].open);
+    assert!(!engine.location_lists[&win].has_focus);
 }
 
 #[test]

@@ -1599,57 +1599,175 @@ impl Engine {
             return EngineAction::None;
         }
 
-        // Quickfix commands
+        // Quickfix / location-list commands (#1155). `:l*` is a thin mirror
+        // of `:c*` over the active window's location list — same `qf_*`
+        // methods (`src/core/engine/picker.rs`), just `Some(window)` instead
+        // of `None` as the target.
         if cmd == "copen" {
-            return self.open_quickfix();
+            return self.qf_open(None);
+        }
+        if cmd == "lopen" {
+            let win = self.active_window_id();
+            return self.qf_open(Some(win));
         }
         if cmd == "cclose" {
-            return self.close_quickfix();
+            return self.qf_close(None);
+        }
+        if cmd == "lclose" {
+            let win = self.active_window_id();
+            return self.qf_close(Some(win));
+        }
+        if cmd == "cwindow" {
+            return self.qf_window(None);
+        }
+        if cmd == "lwindow" {
+            let win = self.active_window_id();
+            return self.qf_window(Some(win));
         }
         if cmd == "cnext" {
-            return self.quickfix_next();
+            return self.qf_next(None);
+        }
+        if cmd == "lnext" {
+            let win = self.active_window_id();
+            return self.qf_next(Some(win));
         }
         if cmd == "cprevious" || cmd == "cN" {
-            return self.quickfix_prev();
+            return self.qf_prev(None);
+        }
+        if cmd == "lprevious" || cmd == "lN" {
+            let win = self.active_window_id();
+            return self.qf_prev(Some(win));
         }
         if let Some(n_str) = cmd.strip_prefix("cc ") {
             if let Some(n) = n_str.trim().parse::<usize>().ok().filter(|&n| n > 0) {
-                return self.quickfix_go(n - 1);
+                return self.qf_go(None, n - 1);
             }
         }
-        // Handle bare :cc — (re-)jump to the current quickfix entry.
+        if let Some(n_str) = cmd.strip_prefix("ll ") {
+            if let Some(n) = n_str.trim().parse::<usize>().ok().filter(|&n| n > 0) {
+                let win = self.active_window_id();
+                return self.qf_go(Some(win), n - 1);
+            }
+        }
+        // Handle bare :cc / :ll — (re-)jump to the current entry.
         if cmd == "cc" {
-            if self.quickfix_items.is_empty() {
+            if self.quickfix.items.is_empty() {
                 self.message = "E42: No errors".to_string();
                 return EngineAction::None;
             }
-            return self.quickfix_jump();
+            return self.qf_jump(None);
         }
-        // Handle :cfirst — jump to the first quickfix entry.
+        if cmd == "ll" {
+            let win = self.active_window_id();
+            if self.qf_get(Some(win)).is_none_or(|l| l.items.is_empty()) {
+                self.message = "E776: No location list".to_string();
+                return EngineAction::None;
+            }
+            return self.qf_jump(Some(win));
+        }
+        // Handle :cfirst / :lfirst — jump to the first entry.
         if cmd == "cfirst" {
-            if self.quickfix_items.is_empty() {
+            if self.quickfix.items.is_empty() {
                 self.message = "E42: No errors".to_string();
                 return EngineAction::None;
             }
-            return self.quickfix_go(0);
+            return self.qf_go(None, 0);
         }
-        // Handle :clast — jump to the last quickfix entry.
+        if cmd == "lfirst" {
+            let win = self.active_window_id();
+            if self.qf_get(Some(win)).is_none_or(|l| l.items.is_empty()) {
+                self.message = "E776: No location list".to_string();
+                return EngineAction::None;
+            }
+            return self.qf_go(Some(win), 0);
+        }
+        // Handle :clast / :llast — jump to the last entry.
         if cmd == "clast" {
-            if self.quickfix_items.is_empty() {
+            if self.quickfix.items.is_empty() {
                 self.message = "E42: No errors".to_string();
                 return EngineAction::None;
             }
-            return self.quickfix_go(self.quickfix_items.len() - 1);
+            return self.qf_go(None, self.quickfix.items.len() - 1);
+        }
+        if cmd == "llast" {
+            let win = self.active_window_id();
+            let Some(len) = self
+                .qf_get(Some(win))
+                .map(|l| l.items.len())
+                .filter(|&n| n > 0)
+            else {
+                self.message = "E776: No location list".to_string();
+                return EngineAction::None;
+            };
+            return self.qf_go(Some(win), len - 1);
+        }
+        // Handle :clist / :llist — print every entry.
+        if cmd == "clist" {
+            return self.qf_list_cmd(None);
+        }
+        if cmd == "llist" {
+            let win = self.active_window_id();
+            return self.qf_list_cmd(Some(win));
+        }
+        // Handle :colder / :cnewer — walk the quickfix stack.
+        if cmd == "colder" || cmd.starts_with("colder ") {
+            let n = cmd
+                .strip_prefix("colder")
+                .unwrap_or("")
+                .trim()
+                .parse::<usize>()
+                .unwrap_or(1);
+            return self.qf_colder(n);
+        }
+        if cmd == "cnewer" || cmd.starts_with("cnewer ") {
+            let n = cmd
+                .strip_prefix("cnewer")
+                .unwrap_or("")
+                .trim()
+                .parse::<usize>()
+                .unwrap_or(1);
+            return self.qf_newer(n);
+        }
+        // Handle :cdo / :cfdo / :ldo / :lfdo — run a command over the list.
+        if let Some(rest) = cmd.strip_prefix("cdo ") {
+            return self.qf_do(None, rest, false);
+        }
+        if let Some(rest) = cmd.strip_prefix("cfdo ") {
+            return self.qf_do(None, rest, true);
+        }
+        if let Some(rest) = cmd.strip_prefix("ldo ") {
+            let win = self.active_window_id();
+            return self.qf_do(Some(win), rest, false);
+        }
+        if let Some(rest) = cmd.strip_prefix("lfdo ") {
+            let win = self.active_window_id();
+            return self.qf_do(Some(win), rest, true);
+        }
+        if matches!(cmd, "cdo" | "cfdo" | "ldo" | "lfdo") {
+            self.message = "E471: Argument required".to_string();
+            return EngineAction::None;
         }
         if let Some(pat) = cmd
             .strip_prefix("grep ")
             .or_else(|| cmd.strip_prefix("vimgrep "))
         {
             let cwd = self.cwd.clone();
-            return self.run_quickfix_grep(pat.trim(), cwd);
+            return self.qf_run_grep(None, pat.trim(), cwd);
         }
         if cmd == "grep" || cmd == "vimgrep" {
             self.message = "Usage: :grep <pattern>".to_string();
+            return EngineAction::None;
+        }
+        if let Some(pat) = cmd
+            .strip_prefix("lgrep ")
+            .or_else(|| cmd.strip_prefix("lvimgrep "))
+        {
+            let cwd = self.cwd.clone();
+            let win = self.active_window_id();
+            return self.qf_run_grep(Some(win), pat.trim(), cwd);
+        }
+        if cmd == "lgrep" || cmd == "lvimgrep" {
+            self.message = "Usage: :lgrep <pattern>".to_string();
             return EngineAction::None;
         }
         if cmd == "Buffers" {

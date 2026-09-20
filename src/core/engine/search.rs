@@ -79,7 +79,7 @@ impl Engine {
     /// Ensure the cursor is visible within the viewport, adjusting scroll_top.
     ///
     /// #185: `view.viewport_lines` is updated by the backends on the next
-    /// draw pass, but engine-side operations (e.g. `quickfix_jump`)
+    /// draw pass, but engine-side operations (e.g. `qf_jump`)
     /// may call this synchronously BEFORE the next draw — at which
     /// point the cached `viewport_lines` reflects the previous chrome
     /// configuration. If a panel (quickfix, terminal, debug output,
@@ -104,7 +104,7 @@ impl Engine {
     /// hasn't happened yet" window.
     fn bottom_chrome_rows_since_last_draw(&self) -> usize {
         // Quickfix panel. Fixed 6-row height in both backends when open.
-        let qf = if self.quickfix_open && !self.quickfix_items.is_empty() {
+        let qf = if self.quickfix.open && !self.quickfix.items.is_empty() {
             6
         } else {
             0

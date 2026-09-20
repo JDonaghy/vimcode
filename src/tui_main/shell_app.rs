@@ -3575,7 +3575,10 @@ impl ShellApp for TuiShellApp {
         let (vw, vh) = (viewport.width as u16, viewport.height as u16);
         {
             let engine = &mut self.engine;
-            let qf_rows: u16 = if engine.quickfix_open { 6 } else { 0 };
+            // `quickfix_panel_rows` also accounts for the active window's
+            // open location list (#1155) — the two share one bottom "list
+            // rung".
+            let qf_rows: u16 = render::quickfix_panel_rows(engine);
             let trm_rows: u16 = if engine.terminal_open || engine.bottom_panel_open {
                 let target = terminal_target_maximize_rows_tui(engine, vh);
                 engine.effective_terminal_panel_rows(target) + 2
@@ -10518,26 +10521,109 @@ mod tests {
     /// distinctive `line_text` (short enough to survive the
     /// `file:line: snippet` formatting `render.rs`'s quickfix adapter
     /// applies) and opens the panel directly on `engine` state, mirroring
-    /// how the live find-references flow sets `quickfix_items` +
-    /// `quickfix_open` (`core/engine/panels.rs`).
+    /// how the live find-references flow sets `quickfix.items` +
+    /// `quickfix.open` (`core/engine/panels.rs`).
     #[test]
     fn render_content_paints_quickfix_panel_via_shell_app() {
         let mut app = TuiShellApp::new(None);
         app.engine
-            .quickfix_items
+            .quickfix
+            .items
             .push(crate::core::project_search::ProjectMatch {
                 file: PathBuf::from("zqxw608.rs"),
                 line: 0,
                 col: 0,
                 line_text: "ZQXW_608_QUICKFIX_MARKER".to_string(),
             });
-        app.engine.quickfix_open = true;
+        app.engine.quickfix.open = true;
 
         let driver = driver_with_shell(app, config(), 80, 24);
         let screen = driver.screen();
         assert!(
             screen.contains("ZQXW_608_QUICKFIX_MARKER"),
             "quickfix panel content should paint via TuiShellApp::render_content; screen:\n{screen}"
+        );
+    }
+
+    /// #1155: the active window's location list shares the quickfix panel's
+    /// bottom "list rung" (`render::quickfix_list_to_panel`,
+    /// `build_screen_layout`'s `quickfix` field population) — `:lopen`
+    /// painting distinct "LOCATION LIST" content proves that wiring, not
+    /// just that `engine.location_lists` got populated (state-only would
+    /// pass even if nothing ever reached the painter, exactly the #587/#592
+    /// failure mode this repo's testing guidance calls out).
+    ///
+    /// RED against unfixed `develop`: before #1155, `engine.location_lists`
+    /// didn't exist, `render.rs`'s quickfix population only ever read
+    /// `engine.quickfix`, and there was no location list to paint here at
+    /// all — this exact scenario had no way to produce "LOCATION LIST" on
+    /// screen.
+    #[test]
+    fn render_content_paints_location_list_panel_via_shell_app() {
+        let mut app = TuiShellApp::new(None);
+        let win = app.engine.active_window_id();
+        let list = app.engine.location_lists.entry(win).or_default();
+        list.items.push(crate::core::project_search::ProjectMatch {
+            file: PathBuf::from("zqxw1155.rs"),
+            line: 0,
+            col: 0,
+            line_text: "ZQXW_1155_LOCLIST_MARKER".to_string(),
+        });
+        list.open = true;
+
+        let driver = driver_with_shell(app, config(), 80, 24);
+        let screen = driver.screen();
+        assert!(
+            screen.contains("ZQXW_1155_LOCLIST_MARKER"),
+            "location-list panel content should paint via TuiShellApp::render_content; screen:\n{screen}"
+        );
+        assert!(
+            screen.contains("LOCATION LIST"),
+            "the shared bottom rung must show the location-list title, not \
+             \"QUICKFIX\", when the global quickfix list is empty/closed; screen:\n{screen}"
+        );
+        assert!(
+            !screen.contains("QUICKFIX ("),
+            "the global quickfix panel must not also paint; screen:\n{screen}"
+        );
+    }
+
+    /// #1155: when *both* the global quickfix list and the active window's
+    /// location list are open, the shared bottom rung shows quickfix — this
+    /// is the priority rule `build_screen_layout` documents, not an
+    /// arbitrary pick between two equally-valid states.
+    #[test]
+    fn quickfix_panel_takes_priority_over_location_list_via_shell_app() {
+        let mut app = TuiShellApp::new(None);
+        app.engine
+            .quickfix
+            .items
+            .push(crate::core::project_search::ProjectMatch {
+                file: PathBuf::from("zqxw1155qf.rs"),
+                line: 0,
+                col: 0,
+                line_text: "ZQXW_1155_QF_MARKER".to_string(),
+            });
+        app.engine.quickfix.open = true;
+        let win = app.engine.active_window_id();
+        let list = app.engine.location_lists.entry(win).or_default();
+        list.items.push(crate::core::project_search::ProjectMatch {
+            file: PathBuf::from("zqxw1155loc.rs"),
+            line: 0,
+            col: 0,
+            line_text: "ZQXW_1155_LOC_MARKER".to_string(),
+        });
+        list.open = true;
+
+        let driver = driver_with_shell(app, config(), 80, 24);
+        let screen = driver.screen();
+        assert!(
+            screen.contains("ZQXW_1155_QF_MARKER"),
+            "quickfix must win the shared bottom rung when both lists are open; screen:\n{screen}"
+        );
+        assert!(
+            !screen.contains("ZQXW_1155_LOC_MARKER"),
+            "the location list must not also paint while quickfix has the rung; screen:\n{screen}"
         );
     }
 
@@ -11328,9 +11414,9 @@ mod tests {
     /// An **open but empty** quickfix list must reserve no rows for mouse
     /// routing, because it reserves none for painting.
     ///
-    /// `compute_editor_layout` gates the quickfix band on `quickfix_open &&
-    /// !quickfix_items.is_empty()`, but `handle_mouse` asked `if
-    /// engine.quickfix_open { 6 }` in four places — so `:copen` on an empty
+    /// `compute_editor_layout` gates the quickfix band on `quickfix.open &&
+    /// !quickfix.items.is_empty()`, but `handle_mouse` asked `if
+    /// engine.quickfix.open { 6 }` in four places — so `:copen` on an empty
     /// list moved every band below the editor six rows up from where it was
     /// painted. `render::quickfix_panel_rows` is now the single rule.
     ///
@@ -11345,8 +11431,8 @@ mod tests {
         let mut app = TuiShellApp::new(None);
         app.engine.terminal_new_tab(80, 8);
         // `:copen` with nothing in the list — open, but paints nothing.
-        app.engine.quickfix_open = true;
-        app.engine.quickfix_items.clear();
+        app.engine.quickfix.open = true;
+        app.engine.quickfix.items.clear();
 
         let mut driver = driver_with_shell(app, config(), 80, 24);
         driver.mouse_up(1.0, 1.0);
@@ -12170,14 +12256,15 @@ mod tests {
         app.engine.settings.window_status_line = true;
         app.engine.settings.status_line_above_terminal = false;
         app.engine
-            .quickfix_items
+            .quickfix
+            .items
             .push(crate::core::project_search::ProjectMatch {
                 file: PathBuf::from("zqxw765.rs"),
                 line: 0,
                 col: 0,
                 line_text: "ZQXW765QF".to_string(),
             });
-        app.engine.quickfix_open = true;
+        app.engine.quickfix.open = true;
         app.engine.bottom_panel_open = true;
         app.engine.bottom_panel_kind = render::BottomPanelKind::DebugOutput;
         app.engine.dap_output_lines.push("ZQXW765DBG".to_string());
@@ -15461,8 +15548,8 @@ mod tests {
     #[test]
     fn post_key_epilogue_scrolls_the_quickfix_selection_into_view() {
         let mut engine = Engine::new();
-        engine.quickfix_open = true;
-        engine.quickfix_selected = 9;
+        engine.quickfix.open = true;
+        engine.quickfix.selected = 9;
         let mut sidebar = TuiSidebar::new();
         let mut folder_picker = None;
         let mut backend = backend_at(80.0, 24.0);
@@ -15487,7 +15574,7 @@ mod tests {
         // 6 panel rows − 1 header = 5 visible; selection 9 ⇒ top 5.
         assert_eq!(scratch.quickfix_scroll_top, 5);
 
-        engine.quickfix_open = false;
+        engine.quickfix.open = false;
         handle_key_pressed(
             quadraui::Key::Named(quadraui::NamedKey::Escape),
             quadraui::Modifiers::default(),
@@ -22650,7 +22737,7 @@ mod tests {
 
     /// #1154 driver-tier coverage: bare `:cc` must actually jump the
     /// painted editor to the currently selected quickfix entry's file, not
-    /// just leave `quickfix_selected` untouched on the `Engine`.
+    /// just leave `quickfix.selected` untouched on the `Engine`.
     ///
     /// RED against unfixed `develop`: bare `:cc` fell through to the
     /// unknown-ex-command fallback (only `:cc {N}` existed), so the screen
@@ -22669,7 +22756,7 @@ mod tests {
         std::fs::write(&file_b, "BBB1154CC\n").unwrap();
 
         let mut app = TuiShellApp::new_for_test();
-        app.engine.quickfix_items = vec![
+        app.engine.quickfix.items = vec![
             crate::core::project_search::ProjectMatch {
                 file: file_a.clone(),
                 line: 0,
@@ -22683,9 +22770,9 @@ mod tests {
                 line_text: String::new(),
             },
         ];
-        app.engine.quickfix_selected = 1;
-        app.engine.quickfix_open = true;
-        app.engine.quickfix_has_focus = true;
+        app.engine.quickfix.selected = 1;
+        app.engine.quickfix.open = true;
+        app.engine.quickfix.has_focus = true;
 
         let mut driver = driver_with_shell(app, config(), 100, 24);
         assert!(

@@ -47,7 +47,7 @@ some test text
 - **First-class Vim mode** — deeply integrated modal editing, not a plugin bolted onto a different editor
 - **Cross-platform** — GTK4 on Linux/macOS, native Win32+Direct2D on Windows, full TUI everywhere
 - **No GPU required** — Cairo/Pango and Direct2D/DirectWrite rendering; hardware compositing when available, software fallback always works (VMs, remote desktops, SSH)
-- **Clean architecture** — platform-agnostic core (`src/core/`), 5,547 tests, zero async runtime dependency
+- **Clean architecture** — platform-agnostic core (`src/core/`), 5,572 tests, zero async runtime dependency
 
 > **Note:** VimCode does not implement VimScript. Extension and scripting is handled via
 > the built-in Lua 5.4 plugin system. The goal is full Vim *keybinding* and *editing*
@@ -475,16 +475,29 @@ Click the search box in the menu bar (or run `:CommandCenter`) to open the unifi
 
 ---
 
-### Quickfix Window
+### Quickfix Window & Location List
 
 - `:grep <pattern>` / `:vimgrep <pattern>` — search project and populate the quickfix list; opens panel automatically
 - `:copen` / `:cope` — open the quickfix panel with focus (shows all matches)
 - `:cclose` / `:ccl` — close the quickfix panel
+- `:cwindow` / `:cw` — open the quickfix panel only if it has entries; closes it otherwise
 - `:cn` / `:cnext` — jump to next match (opens file, positions cursor)
 - `:cp` / `:cprev` / `:cN` — jump to previous match
-- `:cc N` — jump to Nth match (1-based)
+- `:cc N` / bare `:cc` — jump to Nth match (1-based) / re-jump to the current one
+- `:cfirst` / `:clast` — jump to the first / last match
+- `:clist` / `:cl` — print every entry, marking the selected one
+- `:colder` `[N]` / `:cnewer` `[N]` — walk back/forward through the last 10 quickfix lists
+- `:cdo {cmd}` / `:cfdo {cmd}` — run `{cmd}` once per entry / once per distinct file
 - The quickfix panel is a **persistent bottom strip** (6 rows) above the status bar — not a floating modal
 - When open with focus (`j`/`k`, `Ctrl-N`/`Ctrl-P` → navigate; `Enter` → jump and return focus to editor; `q`/`Escape` → close)
+
+**Location list** — a per-window twin of the quickfix list: `:l*` mirrors every
+`:c*` command above (`:lopen`/`:lclose`/`:lwindow`, `:lnext`/`:lprevious`/
+`:lfirst`/`:llast`/`:ll`, `:llist`, `:ldo`/`:lfdo`, `:lgrep`/`:lvimgrep`)
+against the *active window's own* list instead of the shared global one, and
+shares the same bottom panel (quickfix wins if both happen to be open). Useful
+for keeping per-window results (e.g. LSP diagnostics workflows) from clobbering
+a shared quickfix list.
 
 ---
 
@@ -1169,9 +1182,15 @@ All ex commands support Vim-style abbreviations (e.g., `:j` for `:join`, `:y` fo
 | `:grep <pat>` / `:vimgrep <pat>` | Search project, populate quickfix list |
 | `:GrepWord` | Grep the word under cursor (same as `<leader>sw`) |
 | `:Buffers` | Open buffer picker (same as `<leader>sb`) |
-| `:copen` / `:ccl` | Open / close quickfix panel |
-| `:cn` / `:cp` | Next / previous quickfix item |
+| `:copen` / `:ccl` / `:cwindow` | Open / close quickfix panel / open-if-non-empty |
+| `:cn` / `:cp` / `:cfirst` / `:clast` | Next / previous / first / last quickfix item |
 | `:cc N` | Jump to Nth quickfix item (1-based) |
+| `:clist` / `:colder` / `:cnewer` | List entries / walk the 10-deep quickfix stack |
+| `:cdo {cmd}` / `:cfdo {cmd}` | Run `{cmd}` per quickfix entry / per distinct file |
+| `:lopen` / `:lclose` / `:lwindow` | Open / close / open-if-non-empty the **location list** (per-window) |
+| `:lnext` / `:lprevious` / `:lfirst` / `:llast` / `:ll` | Navigate the location list |
+| `:llist` / `:ldo {cmd}` / `:lfdo {cmd}` | List / run `{cmd}` over the location list |
+| `:lgrep <pat>` / `:lvimgrep <pat>` | Search project into the location list |
 | `:LspInfo` | Show running LSP servers |
 | `:LspRestart` | Restart server for current language |
 | `:LspStop` | Stop server for current language |

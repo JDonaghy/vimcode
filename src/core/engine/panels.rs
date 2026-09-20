@@ -1299,8 +1299,12 @@ impl Engine {
                         self.view_mut().cursor.col = col;
                         self.ensure_cursor_visible();
                     } else {
-                        // Multiple results — populate quickfix window
-                        self.quickfix_items = locations
+                        // Multiple results — populate the quickfix window.
+                        // `qf_set_list` also snapshots whatever quickfix list
+                        // was there before onto the `:colder`/`:cnewer` stack
+                        // (#1155), same as `:grep`.
+                        let n = locations.len();
+                        let items = locations
                             .into_iter()
                             .map(|l| ProjectMatch {
                                 file: l.path,
@@ -1309,14 +1313,15 @@ impl Engine {
                                 line_text: String::new(),
                             })
                             .collect();
-                        self.quickfix_selected = 0;
-                        self.quickfix_open = true;
                         // Focus the panel — Neovim convention for `gr`
                         // (Find References) is to land the user in the
                         // quickfix so j/k/Enter drive the result list
                         // without a follow-up `:copen`. Closes #150.
-                        self.quickfix_has_focus = true;
-                        self.message = format!("{} references found", self.quickfix_items.len());
+                        // `qf_set_list` already focuses whenever the new
+                        // list is non-empty, which always holds here (this
+                        // branch is only reached for `locations.len() > 1`).
+                        self.qf_set_list(None, items);
+                        self.message = format!("{n} references found");
                     }
                     redraw = true;
                 }

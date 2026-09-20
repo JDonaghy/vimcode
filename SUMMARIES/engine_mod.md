@@ -1,9 +1,11 @@
-# src/core/engine/mod.rs — 4,756 lines
+# src/core/engine/mod.rs — 5,568 lines
 
 Core engine definition. Contains the `Engine` struct (all editor state), enums, types, `new()` constructor, free functions, and `mod` declarations for all submodules.
+(Line count last verified 2026-09-19, #1155 — earlier counts predate several
+unrelated sessions' worth of growth, not just this one.)
 
 ## Key Types
-- `Engine` — main editor state struct (~830 fields covering buffers, windows, groups, mode, LSP, DAP, search, terminal, plugins, etc.)
+- `Engine` — main editor state struct (~830 fields covering buffers, windows, groups, mode, LSP, DAP, search, terminal, plugins, etc.). Quickfix/location-list state (#1155): `quickfix: QuickfixList` (global), `quickfix_stack: Vec<QuickfixList>` + `quickfix_stack_pos: usize` (the `:colder`/`:cnewer` history, capped at 10), `location_lists: HashMap<WindowId, QuickfixList>` (per-window `:l*` target) — see `src/core/project_search.rs`'s `QuickfixList` and `engine/picker.rs`'s `qf_*` methods, which implement both `:c*` and `:l*` once, parameterized by `win: Option<WindowId>`
 - `EngineAction` — enum returned by key handlers (None, Quit, OpenFile, Redraw, etc.)
 - `Mode` — editor mode (Normal, Insert, Visual, VisualLine, VisualBlock, Command, Search, Replace)
 - `PickerSource` / `PickerItem` / `PickerAction` — unified picker types (includes `CommandCenter` source, `GotoLine(usize)` and `GotoSymbol(PathBuf, usize, usize)` actions; `PickerItem` has `depth`/`expandable`/`expanded` for tree view)

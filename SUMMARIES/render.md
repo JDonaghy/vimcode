@@ -1,4 +1,4 @@
-# src/render.rs — 27,211 lines (~21,405 production)
+# src/render.rs — 29,923 lines (~21,405 production, uncorrected since #1155's edit)
 
 Platform-agnostic rendering abstraction, and since #751–#766 **the place every
 cross-backend decision is made**. Transforms engine state into `ScreenLayout`
@@ -43,7 +43,7 @@ verdicts live here.
 - `HoverPopup` / `EditorHoverPopupData` — hover information popup
 - `SignatureHelp` — function signature popup
 - `PickerPanel` / `PickerPanelItem` — fuzzy finder panel
-- `QuickfixPanel` — quickfix list
+- `QuickfixPanel` — the shared bottom "list rung"; `title` field (`"QUICKFIX"` or `"LOCATION LIST"`) selects which one is currently showing (#1155). Populated from either `engine.quickfix` or the active window's `engine.location_lists` entry via `quickfix_list_to_panel()`; `quickfix_panel_rows()` is the single row-height rule both backends' mouse routing shares
 - `SourceControlData` / `ScFileItem` / `ScLogItem` — git panel data
 - `ExtSidebarData` / `ExtSidebarItem` — extensions panel data
 - `ExtPanelData` / `ExtPanelSectionData` — Lua extension panels
