@@ -1491,6 +1491,167 @@ mod tests {
         e
     }
 
+    // ─── `bottom_band_row_heights` — single-source-of-truth pins (#1164) ───
+    //
+    // `TuiShellApp::tick`'s own regression test
+    // (`tick_viewport_estimate_matches_the_composed_editor_band_height`)
+    // compares `tick()`'s pre-paint estimate against the real composer's
+    // painted output — but that comparison can never distinguish "routes
+    // through `bottom_band_row_heights`" from "hand-rolls an equivalent
+    // formula", because (per that test's own doc comment) the pre-#1164
+    // hand-rolled formula happens to be numerically identical to this
+    // function's output for every reachable `Engine` state. These tests
+    // pin this function's *own* per-field contract directly instead, so a
+    // future edit that changes one field's rule (e.g. reinstating "always
+    // reserve a global status row") fails here even in the states where
+    // `tick()`'s own comparison can't tell the difference.
+
+    /// `global_status` is the pre-#1164 bug's exact axis: reserved only
+    /// when `window_status_line` is off. On, no row is reserved for a
+    /// *global* status line here — the per-window row `render::
+    /// window_status_row_reserved` accounts for lives one layer above this
+    /// function's callers, inside `build_rendered_window`.
+    #[test]
+    fn bottom_band_row_heights_global_status_tracks_window_status_line_setting() {
+        let mut engine = test_engine("");
+        engine.settings.window_status_line = false;
+        assert_eq!(bottom_band_row_heights(&engine, 40).global_status, 1);
+
+        engine.settings.window_status_line = true;
+        assert_eq!(bottom_band_row_heights(&engine, 40).global_status, 0);
+    }
+
+    /// `separated_status` — the one band the pre-#1164 hand-rolled `tick()`
+    /// formula never had a term for at all — is reserved only when *all
+    /// three* of `window_status_line` is on, `status_line_above_terminal`
+    /// is off, and the bottom panel (terminal or debug-output) is open.
+    /// Flips each axis independently to pin that it's a genuine AND, not an
+    /// OR or a two-of-three majority.
+    #[test]
+    fn bottom_band_row_heights_separated_status_requires_all_three_conditions() {
+        let mut engine = test_engine("");
+        engine.settings.window_status_line = true;
+        engine.settings.status_line_above_terminal = false;
+        engine.bottom_panel_open = true;
+        assert_eq!(
+            bottom_band_row_heights(&engine, 40).separated_status,
+            1,
+            "all three conditions met -- must reserve the separated row"
+        );
+
+        engine.settings.window_status_line = false;
+        assert_eq!(
+            bottom_band_row_heights(&engine, 40).separated_status,
+            0,
+            "window_status_line off -- no per-window status to separate"
+        );
+        engine.settings.window_status_line = true;
+
+        engine.settings.status_line_above_terminal = true;
+        assert_eq!(
+            bottom_band_row_heights(&engine, 40).separated_status,
+            0,
+            "status_line_above_terminal on -- status stays inline, not separated"
+        );
+        engine.settings.status_line_above_terminal = false;
+
+        engine.bottom_panel_open = false;
+        assert_eq!(
+            bottom_band_row_heights(&engine, 40).separated_status,
+            0,
+            "bottom panel closed -- nothing to separate the status line from"
+        );
+    }
+
+    /// `quickfix`/`debug_toolbar`/`wildmenu` each track their own single
+    /// `Engine` flag directly, independent of every other band.
+    #[test]
+    fn bottom_band_row_heights_independent_bands_track_their_own_flag_only() {
+        let mut engine = test_engine("");
+        assert_eq!(bottom_band_row_heights(&engine, 40).quickfix, 0);
+        assert_eq!(bottom_band_row_heights(&engine, 40).debug_toolbar, 0);
+        assert_eq!(bottom_band_row_heights(&engine, 40).wildmenu, 0);
+
+        engine
+            .quickfix
+            .items
+            .push(crate::core::project_search::ProjectMatch {
+                file: std::path::PathBuf::from("zqxw1164.rs"),
+                line: 0,
+                col: 0,
+                line_text: "ZQXW_1164_MARKER".to_string(),
+            });
+        engine.quickfix.open = true;
+        let bands = bottom_band_row_heights(&engine, 40);
+        assert_eq!(
+            bands.quickfix, 6,
+            "quickfix panel is a fixed 6 rows once open"
+        );
+        assert_eq!(bands.debug_toolbar, 0);
+        assert_eq!(bands.wildmenu, 0);
+
+        engine.debug_toolbar_visible = true;
+        let bands = bottom_band_row_heights(&engine, 40);
+        assert_eq!(
+            bands.quickfix, 6,
+            "unrelated bands must not move each other"
+        );
+        assert_eq!(bands.debug_toolbar, 1);
+        assert_eq!(bands.wildmenu, 0);
+
+        engine.wildmenu_items = vec!["zqxw1164".to_string()];
+        let bands = bottom_band_row_heights(&engine, 40);
+        assert_eq!(bands.quickfix, 6);
+        assert_eq!(bands.debug_toolbar, 1);
+        assert_eq!(bands.wildmenu, 1);
+    }
+
+    /// `total()` must never drift from a literal re-sum of its own six
+    /// public fields plus the always-present command line -- pins the `1 +`
+    /// constant documented on `total()` itself, across a fixture that
+    /// exercises every band at once.
+    #[test]
+    fn bottom_band_row_heights_total_is_exactly_cmd_plus_every_band() {
+        let mut engine = test_engine("");
+        engine.settings.window_status_line = true;
+        engine.settings.status_line_above_terminal = false;
+        engine.bottom_panel_open = true;
+        engine.debug_toolbar_visible = true;
+        engine.wildmenu_items = vec!["zqxw1164".to_string()];
+        engine
+            .quickfix
+            .items
+            .push(crate::core::project_search::ProjectMatch {
+                file: std::path::PathBuf::from("zqxw1164.rs"),
+                line: 0,
+                col: 0,
+                line_text: "ZQXW_1164_MARKER".to_string(),
+            });
+        engine.quickfix.open = true;
+
+        let bands = bottom_band_row_heights(&engine, 40);
+        assert_eq!(
+            bands.total(),
+            1 + bands.quickfix
+                + bands.terminal
+                + bands.debug_toolbar
+                + bands.wildmenu
+                + bands.global_status
+                + bands.separated_status
+        );
+        // Every band this fixture turned on must actually be nonzero, or
+        // the sum above would trivially hold without exercising anything.
+        assert!(bands.quickfix > 0);
+        assert!(bands.terminal > 0);
+        assert!(bands.debug_toolbar > 0);
+        assert!(bands.wildmenu > 0);
+        assert!(bands.separated_status > 0);
+        assert_eq!(
+            bands.global_status, 0,
+            "window_status_line is on in this fixture"
+        );
+    }
+
     /// Paint `engine`'s editor + bottom bands into a fresh `width`×`height`
     /// grid and return the painted buffer — the shared implementation behind
     /// [`render_tui`] / [`render_tui_row_cells`] / [`render_tui_buffer`].
