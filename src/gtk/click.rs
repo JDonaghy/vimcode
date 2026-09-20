@@ -5,7 +5,9 @@
 //! to the backend-neutral `crate::click` (#862) — none of it named a
 //! `gtk4`/`pango` type. Re-exported below so this module's own tests (and
 //! the rest of `crate::gtk`) keep resolving the names unchanged.
+#[cfg(test)]
 use gtk4::pango;
+#[cfg(test)]
 use pangocairo::functions as pangocairo;
 
 // Only this file's own `#[cfg(test)]` modules below reach these through
@@ -41,35 +43,30 @@ use std::collections::HashMap;
 #[cfg(test)]
 use std::rc::Rc;
 
-/// Build the Pango context the *click* backend (`App::backend`) uses to
-/// resolve editor columns.
-///
-/// vimcode keeps a separate `GtkBackend` for click hit-testing than the one
-/// quadraui's ShellApp runner paints with (see `App::render_content`). That
-/// click backend needs *some* stored `pango::Context` for
+/// Build a throwaway Pango context, fonted with nothing in particular, for
+/// tests that need to hand a `GtkBackend` *some* stored `pango::Context` so
 /// `GtkBackend::editor_col_at_x`'s last-resort `editor_pango_layout()`
-/// fallback (quadraui#971) to have anything to build a `pango::Layout` from
-/// at all — hence this function, called once per frame from
-/// `App::render_content` via `set_text_measurement_context`.
+/// fallback (quadraui#971) has something to build a `pango::Layout` from —
+/// `editor_pango_layout()` fonts that layout from the backend's *own*
+/// `editor_font_family`/`editor_font_size_pt` state (set via
+/// `Backend::set_editor_font`), ignoring whatever font description this
+/// context itself carries, so a throwaway context is exactly as good as a
+/// real widget one for that purpose.
 ///
-/// Before #947 this context also had to *reproduce the painted font*: the
-/// old `editor_col_at_x` fallback built a layout straight off this context's
-/// own font description, so this function hardcoded a `"Monospace"` family
-/// (mirroring the runner's then-hardcoded paint font) and probed a point
-/// size that reproduced the painted `char_width` — because neither backend
-/// read `settings.font_*` at all (#947's root problem: `grep -rn
-/// "set_editor_font" src/` returned zero hits). Getting that probe's family
-/// or size even slightly wrong reintroduced #560's left-growing click drift.
-///
-/// quadraui#971's `editor_pango_layout()` fallback instead fonts the layout
-/// from the backend's *own* `editor_font_family`/`editor_font_size_pt`
-/// state (set via `Backend::set_editor_font`), ignoring whatever font
-/// description this context itself carries. `App::render_content` now calls
-/// `set_editor_font` on both the paint backend (so painted text honours
-/// `settings.font_family`/`font_size`, #947) and this click backend with the
-/// *same* family/size, every frame — so the two agree by construction and
-/// there is nothing left for this function to reproduce by probing. It only
-/// needs to hand back a context to store.
+/// **#1104:** production no longer calls this. Before #1104, vimcode's mouse
+/// handlers never received the runner's own live `GtkBackend` (`App`'s
+/// `handle()` override didn't thread it past `handle_dispatch`), so
+/// `App::render_content` kept a SECOND, separately-constructed `GtkBackend`
+/// (`self.backend`) alive purely for click-time hit-testing, and called this
+/// function every frame to give that second backend a Pango context of its
+/// own — mirroring the "stable widget Pango context" `quadraui::gtk::run`'s
+/// `activate()` already sets on the real backend at widget realize. #1104
+/// threaded the real backend through the whole click/drag/modal-stack call
+/// chain instead, so there is no second backend left needing one of these.
+/// Kept `#[cfg(test)]` as a fixture builder for this module's own
+/// `GtkBackend::editor_col_at_x` unit tests below, which still want a
+/// from-scratch backend with no painted frame.
+#[cfg(test)]
 pub(crate) fn build_editor_click_context() -> Option<pango::Context> {
     let surface = gtk4::cairo::ImageSurface::create(gtk4::cairo::Format::ARgb32, 1, 1).ok()?;
     let cr = gtk4::cairo::Context::new(&surface).ok()?;
@@ -354,9 +351,9 @@ mod emoji_click_column_tests {
 
     /// #947: click-to-column resolution must track `settings.font_family`/
     /// `font_size` — not a hardcoded `"Monospace"` family matched only by a
-    /// probed size. Before #947, `build_editor_click_context` always fonted
-    /// the click backend as `"Monospace"` (mirroring the *paint* side's own
-    /// former hardcode) no matter what `App::render_content` was asked to
+    /// probed size. Before #947, the click backend was always fonted as
+    /// `"Monospace"` (mirroring the *paint* side's own former hardcode) no
+    /// matter what `App::render_content` was asked to
     /// paint, so a non-monospace family would have silently resolved clicks
     /// against the wrong glyph advances — structurally, not just as a bug,
     /// since the family itself was never a parameter. `Backend::set_editor_font`
@@ -374,11 +371,10 @@ mod emoji_click_column_tests {
         }
     }
 
-    /// Shared body for the test above: run the exact production sequence
-    /// `App::render_content` runs for the click backend (`set_editor_font`,
-    /// then a throwaway `set_pango_context` via `build_editor_click_context`
-    /// — #947's `sync_per_frame_backend_state` runs the paint-backend half
-    /// of this same call with the same `(family, size)`), then assert every
+    /// Shared body for the test above: run the exact sequence
+    /// `App::render_content`'s `sync_per_frame_backend_state` runs on the
+    /// (single, #1104) backend every frame — `set_editor_font` with the live
+    /// `(family, size)`, plus a stored Pango context — then assert every
     /// character on a plain ASCII line resolves to its own column via
     /// `GtkBackend::editor_col_at_x` — the exact trait method
     /// `pixel_to_click_target` calls on a live click.
@@ -430,9 +426,10 @@ mod emoji_click_column_tests {
         measure.set_font_description(Some(&font_desc));
         measure.set_text(text);
 
-        // ── The exact production sequence for the click backend (#947):
-        // `set_editor_font` with the live `(family, size)`, then a
-        // throwaway Pango context — NO frame ever painted. ──
+        // ── The exact production sequence `sync_per_frame_backend_state`
+        // runs on the live backend (#947): `set_editor_font` with the live
+        // `(family, size)`, then a throwaway Pango context — NO frame ever
+        // painted. ──
         let backend = Rc::new(RefCell::new(super::backend::GtkBackend::new()));
         backend.borrow_mut().set_editor_font(family, size_pt);
         let click_ctx = super::build_editor_click_context().expect("click ctx");
