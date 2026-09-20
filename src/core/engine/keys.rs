@@ -2864,7 +2864,7 @@ impl Engine {
                 // Register selection: "x sets selected_register for next operation.
                 // Uppercase A-Z appends to lowercase register. `_` is the black
                 // hole (reads/writes go nowhere — `:h quote_`); `.`, `/`, `%`,
-                // `:`, `-` are the read-mostly special registers (`:h
+                // `#`, `:`, `-` are the read-mostly special registers (`:h
                 // registers`); `=` opens the expression-register prompt (#806).
                 if let Some(ch) = unicode {
                     if ch == '=' {
@@ -2879,6 +2879,7 @@ impl Engine {
                         || ch == '.'
                         || ch == '/'
                         || ch == '%'
+                        || ch == '#'
                         || ch == ':'
                         || ch == '-'
                         || ch.is_ascii_digit()
@@ -8265,6 +8266,7 @@ impl Engine {
                         || ch == '.'
                         || ch == '/'
                         || ch == '%'
+                        || ch == '#'
                         || ch == ':'
                         || ch == '-'
                     {

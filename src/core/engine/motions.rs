@@ -5135,6 +5135,38 @@ impl Engine {
                     .unwrap_or_default();
                 Some((name, RegType::Charwise))
             }
+            '#' => {
+                // Alternate filename (read-only) — the same buffer `<C-^>`
+                // (`Engine::alternate_buffer`) switches to (`:h quote_#`).
+                // Empty when there is no alternate buffer, or it has no
+                // backing file (e.g. an unnamed scratch buffer).
+                let name = self
+                    .buffer_manager
+                    .alternate_buffer
+                    .and_then(|id| self.buffer_manager.get(id))
+                    .and_then(|state| state.file_path.as_ref())
+                    .and_then(|p| p.file_name())
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                Some((name, RegType::Charwise))
+            }
+            '=' => {
+                // Expression register: real Vim evaluates a Vimscript
+                // expression here. VimCode has no such evaluator (the
+                // arithmetic-only shortcut in `eval_expr_register` covers
+                // the `"=`/`<C-r>=` *entry* prompt, not a stored general
+                // expression), so reading `"=` outside that prompt reports
+                // itself as unimplemented rather than silently pasting
+                // nothing (#1161).
+                match self.registers.get(&reg).cloned() {
+                    Some(pair) => Some(pair),
+                    None => {
+                        self.message =
+                            "\"=\" register (expression evaluation) is not implemented".to_string();
+                        None
+                    }
+                }
+            }
             '/' => {
                 // Last search pattern (read-only)
                 Some((self.search_query.clone(), RegType::Charwise))
