@@ -2246,7 +2246,7 @@ impl ShellApp for TuiShellApp {
         // generic single-drawer `BottomPanelController`, a different shape
         // than vimcode's stacked chrome, and unwired for `TuiShellApp`
         // regardless — always `None` here).
-        let chrome = bottom_chrome_rects_for_shell_content(&self.engine, &screen, area);
+        let chrome = bottom_chrome_rects_for_shell_content(&self.engine, area);
 
         // ─────────────────────────────────────────────────────────────────
         // #605 (Stage 6 parity sweep): the rest of `draw_frame`'s tail, in
@@ -3575,25 +3575,22 @@ impl ShellApp for TuiShellApp {
         let (vw, vh) = (viewport.width as u16, viewport.height as u16);
         {
             let engine = &mut self.engine;
-            // `quickfix_panel_rows` also accounts for the active window's
-            // open location list (#1155) — the two share one bottom "list
-            // rung".
-            let qf_rows: u16 = render::quickfix_panel_rows(engine);
-            let trm_rows: u16 = if engine.terminal_open || engine.bottom_panel_open {
-                let target = terminal_target_maximize_rows_tui(engine, vh);
-                engine.effective_terminal_panel_rows(target) + 2
-            } else {
-                0
-            };
+            // #1164: `content_rows` used to be a second, hand-summed model
+            // of the bottom chrome's height — `qf_rows`/`trm_rows`/
+            // `menu_row`/`dbg_row`/`wm_row` restated by hand, independently
+            // of `bottom_chrome_rects_for_shell_content`'s `v_chunks` (the
+            // model the paint path actually composes against). Routed
+            // through the same `bottom_band_row_heights` that function now
+            // calls instead — `tick` runs ahead of any paint, so there is
+            // no `ScreenLayout`/`area` to read a rect back from yet, only
+            // the raw `(vw, vh)` viewport; the menu-bar row is carved off
+            // by hand here for the same reason `build_screen_for_tui` does
+            // (see `bottom_band_row_heights`'s own doc comment), since
+            // `bottom_band_row_heights` itself never subtracts it.
             let menu_row: u16 = if engine.menu_bar_visible { 1 } else { 0 };
-            let dbg_row: u16 = if engine.debug_toolbar_visible { 1 } else { 0 };
-            let wm_row: u16 = if !engine.wildmenu_items.is_empty() {
-                1
-            } else {
-                0
-            };
-            let content_rows =
-                vh.saturating_sub(2 + qf_rows + trm_rows + menu_row + dbg_row + wm_row);
+            let content_height = vh.saturating_sub(menu_row);
+            let bands = bottom_band_row_heights(engine, content_height);
+            let content_rows = content_height.saturating_sub(bands.total());
             let gutter_approx = 4u16;
             let sb_visible = engine.app_shell.sidebar_visible();
             let sidebar_cols = if sb_visible {
@@ -3618,7 +3615,23 @@ impl ShellApp for TuiShellApp {
                     1
                 }
             };
-            engine.set_viewport_lines(content_rows.saturating_sub(tab_bar_rows).max(1) as usize);
+            // A per-window status line (`window_status_line`, on by
+            // default) reserves its own bottom row *inside* each window's
+            // rect, on top of everything `bottom_band_row_heights` already
+            // accounted for at the editor-band level — `render::
+            // window_status_row_reserved` is the single gate
+            // `build_rendered_window`'s real per-window `visible_lines`
+            // computation uses for the identical `-1` (see its own doc
+            // comment). This coarse, split-unaware estimate mirrors it for
+            // the common single-window case; `calculate_group_window_rects`
+            // handles the exact per-split accounting for the real paint,
+            // and the "Post-paint feedback" sync right below corrects this
+            // estimate against it one frame later regardless.
+            let mut viewport_lines = content_rows.saturating_sub(tab_bar_rows).max(1);
+            if render::window_status_row_reserved(engine) && viewport_lines > 1 {
+                viewport_lines -= 1;
+            }
+            engine.set_viewport_lines(viewport_lines as usize);
             engine.set_viewport_cols(content_cols.max(1) as usize);
         }
 
@@ -5128,6 +5141,113 @@ mod tests {
         app.tick(&mut backend);
         assert!(app.engine.viewport_cols() > 0);
         assert!(app.engine.viewport_lines() > 0);
+    }
+
+    /// #1164: `tick()`'s per-frame viewport-line estimate must agree with
+    /// the row count the real composer (`build_screen_for_shell_content`,
+    /// which now routes through the shared `bottom_band_row_heights` --
+    /// see that function's doc comment) actually reserves for the editor
+    /// column, given the *same* `Engine` state. Before #1164, `tick()`
+    /// hand-summed its own copy of the bottom-chrome row math
+    /// (`qf_rows`/`trm_rows`/`menu_row`/`dbg_row`/`wm_row`, plus a
+    /// hardcoded `2` standing in for "cmd + global status row") instead of
+    /// routing through the composer's own arithmetic -- a second geometry
+    /// model that could silently drift from the first.
+    ///
+    /// Opens the quickfix panel (a genuine extra band, as the issue
+    /// suggests) *and* turns on `window_status_line`, which flips the
+    /// global status row off (`per_window_status` true) -- something the
+    /// old hand-rolled sum hardcoded to always reserve one row for
+    /// regardless of the setting. That combination is what makes this
+    /// scenario actually diverge under the old code (see the
+    /// RED-verification note below); the quickfix toggle alone wouldn't,
+    /// since `tick()`'s quickfix term was already routed through
+    /// `render::quickfix_panel_rows` before this issue.
+    ///
+    /// Compares against `lines.len()` on a buffer seeded with far more
+    /// lines than any plausible viewport (300), not `rect.height` --
+    /// `lines.len()` is capped at `min(visible_lines, total_lines)`
+    /// (`build_rendered_window`), so with a short buffer it would silently
+    /// read back the buffer's own length instead of the row count actually
+    /// reserved. It is also the one painted-geometry field that already
+    /// bakes in `window_status_line`'s *other* effect -- each window
+    /// reserving its own bottom row for a per-window status line
+    /// (`render::window_status_row_reserved`, applied inside
+    /// `build_rendered_window`, a layer `rect.height` itself sits above) --
+    /// so this comparison does not have to separately reimplement that
+    /// reduction to line up with `tick()`'s own matching term.
+    ///
+    /// RED-verification: reverting `tick()`'s estimate block to the old
+    /// hand-rolled `vh.saturating_sub(2 + qf_rows + trm_rows + menu_row +
+    /// dbg_row + wm_row)` (with no per-window-status-row term at all) turns
+    /// this red -- confirmed by hand before committing. With
+    /// `window_status_line` on and the terminal closed, the composer
+    /// reserves `0` rows for the *global* status line, so its `content_rows`
+    /// is one row taller than the old hardcoded `-2` let `tick()` believe;
+    /// that this test is still green today (not just RED-able) additionally
+    /// proves the fix does not stop there -- `tick()`'s own new
+    /// per-window-status-row term (mirroring `render::
+    /// window_status_row_reserved`) has to claw that extra row back too, or
+    /// this assertion fails the *other* direction instead.
+    #[test]
+    fn tick_viewport_estimate_matches_the_composed_editor_band_height() {
+        let mut app = TuiShellApp::new_for_test();
+        app.engine.settings.window_status_line = true;
+        app.engine
+            .buffer_mut()
+            .insert(0, &(1..=300).map(|n| format!("L{n}\n")).collect::<String>());
+        app.engine
+            .quickfix
+            .items
+            .push(crate::core::project_search::ProjectMatch {
+                file: PathBuf::from("zqxw1164.rs"),
+                line: 0,
+                col: 0,
+                line_text: "ZQXW_1164_MARKER".to_string(),
+            });
+        app.engine.quickfix.open = true;
+        assert!(
+            !app.engine.menu_bar_visible
+                && !app.engine.terminal_open
+                && !app.engine.bottom_panel_open,
+            "fixture must start with no menu bar / bottom panel, or the \
+             area/content_height this test hand-builds below would no \
+             longer match what tick() itself carves off"
+        );
+
+        let mut backend = backend_at(100.0, 40.0);
+        app.setup(&mut backend);
+        app.tick(&mut backend);
+        let estimated = app.engine.viewport_lines();
+
+        // Independently derive the row count the real paint path would
+        // paint into the editor column, by calling the same composer
+        // `TuiShellApp::render_content` calls -- `build_screen_for_shell_content`
+        // -- directly over a hand-built `area` mirroring `main_content_bounds`
+        // for this viewport (no menu-bar row to carve off first, per the
+        // assertion above).
+        let theme = app.theme();
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 40,
+        };
+        let tui_backend = super::super::backend::TuiBackend::new();
+        let screen = build_screen_for_shell_content(&app.engine, &theme, area, &tui_backend);
+        let active_window = screen
+            .windows
+            .iter()
+            .find(|w| w.window_id == screen.active_window_id)
+            .expect("build_screen_for_shell_content must paint the active window");
+        let painted_rows = active_window.lines.len();
+
+        assert_eq!(
+            estimated, painted_rows,
+            "tick()'s viewport-line estimate ({estimated}) drifted from the \
+             row count the real composer painted into the editor column \
+             ({painted_rows}) -- see bottom_band_row_heights (#1164)"
+        );
     }
 
     /// #1165: `tick()`'s periodic SC/explorer auto-refresh used to call

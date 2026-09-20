@@ -1,5 +1,97 @@
 use super::*;
 
+// ─── Bottom band row accounting ────────────────────────────────────────────────
+
+/// The height, in rows, of each vimcode-specific chrome band that stacks
+/// below the editor column: quickfix/location-list, the terminal/debug
+/// bottom panel, the debug toolbar, the wildmenu, and the status line(s).
+/// `AppShellLayout` has no concept of any of these — see
+/// [`bottom_chrome_rects_for_shell_content`]'s doc comment for why they are
+/// carved out by hand.
+///
+/// Single source of truth for this arithmetic (#1164). Before this type
+/// existed, `build_screen_for_tui`, `build_screen_for_shell_content`,
+/// `bottom_chrome_rects_for_shell_content` and `TuiShellApp::tick` each
+/// hand-summed the same five gates independently — `tick` in particular ran
+/// ahead of any paint (no `ScreenLayout` yet to read a rect back from), so
+/// it re-derived every gate from `Engine` flags on its own rather than
+/// composing bands, which is the exact "second geometry model" #1164
+/// flagged: it duplicated `bottom_chrome_rects_for_shell_content`'s
+/// per-band heights, drifting from them under nobody's notice (menu-bar
+/// height folded into the wrong side of the sum, `window_status_line`
+/// ignored in favour of a hardcoded status row) until this convergence.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct BottomBandRowHeights {
+    pub(super) quickfix: u16,
+    pub(super) terminal: u16,
+    pub(super) debug_toolbar: u16,
+    pub(super) wildmenu: u16,
+    pub(super) global_status: u16,
+    pub(super) separated_status: u16,
+}
+
+impl BottomBandRowHeights {
+    /// Total rows this band stack reserves below the editor, **including**
+    /// the always-present 1-row command line but **excluding** the
+    /// menu-bar row — callers that see the raw terminal viewport (`tick`,
+    /// `build_screen_for_tui`) carve that off separately, matching
+    /// `bottom_chrome_rects_for_shell_content`'s `area`, which never
+    /// carries it in the first place (AppShell already carved its own
+    /// title-bar row off before handing out `main_content_bounds`).
+    pub(super) fn total(&self) -> u16 {
+        1 + self.quickfix
+            + self.terminal
+            + self.debug_toolbar
+            + self.wildmenu
+            + self.global_status
+            + self.separated_status
+    }
+}
+
+/// Computes [`BottomBandRowHeights`] from live `Engine` state alone — no
+/// `ScreenLayout` required, so this is cheap enough to call every `tick`,
+/// not just once per paint.
+///
+/// `content_height` bounds the terminal panel's "maximize" target
+/// (`terminal_target_maximize_rows_tui`): pass the editor-column height the
+/// panel will actually be measured against — the AppShell-carved
+/// `area.height` from a paint call, or the menu-row-adjusted raw viewport
+/// height from `tick`.
+pub(super) fn bottom_band_row_heights(
+    engine: &Engine,
+    content_height: u16,
+) -> BottomBandRowHeights {
+    // `quickfix_panel_rows` also accounts for the active window's open
+    // location list (#1155) — the two share one bottom "list rung".
+    let quickfix = render::quickfix_panel_rows(engine);
+    let bottom_panel_open = engine.terminal_open || engine.bottom_panel_open;
+    let terminal = if bottom_panel_open {
+        let target = super::terminal_target_maximize_rows_tui(engine, content_height);
+        engine.effective_terminal_panel_rows(target) + 2 // tab bar + header + content
+    } else {
+        0
+    };
+    let debug_toolbar = if engine.debug_toolbar_visible { 1 } else { 0 };
+    let wildmenu: u16 = if !engine.wildmenu_items.is_empty() {
+        1
+    } else {
+        0
+    };
+    let per_window_status = engine.settings.window_status_line;
+    let global_status = if per_window_status { 0 } else { 1 };
+    let separate_status =
+        per_window_status && !engine.settings.status_line_above_terminal && bottom_panel_open;
+    let separated_status = if separate_status { 1 } else { 0 };
+    BottomBandRowHeights {
+        quickfix,
+        terminal,
+        debug_toolbar,
+        wildmenu,
+        global_status,
+        separated_status,
+    }
+}
+
 // ─── Screen layout bridging ───────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -13,37 +105,10 @@ pub(super) fn build_screen_for_tui(
     // Global bottom rows: status(1) + cmd(1).  The tab bar row is included in
     // content_bounds and handled by calculate_group_window_rects (tab_bar_height=1).
     // Must match draw_frame's vertical layout exactly.
-    // `quickfix_panel_rows` also accounts for the active window's open
-    // location list (#1155) — the two share one bottom "list rung".
-    let qf_height: u16 = render::quickfix_panel_rows(engine);
-    let bottom_panel_open = engine.terminal_open || engine.bottom_panel_open;
-    let term_height: u16 = if bottom_panel_open {
-        let target = super::terminal_target_maximize_rows_tui(engine, area.height);
-        engine.effective_terminal_panel_rows(target) + 2 // tab bar + header + content
-    } else {
-        0
-    };
     let menu_height: u16 = if engine.menu_bar_visible { 1 } else { 0 };
-    let dbg_height: u16 = if engine.debug_toolbar_visible { 1 } else { 0 };
-    let wildmenu_height: u16 = if !engine.wildmenu_items.is_empty() {
-        1
-    } else {
-        0
-    };
-    let per_window_status = engine.settings.window_status_line;
-    let global_status_rows: u16 = if per_window_status { 0 } else { 1 };
-    let separate_status =
-        per_window_status && !engine.settings.status_line_above_terminal && bottom_panel_open;
-    let separated_status_rows: u16 = if separate_status { 1 } else { 0 };
-    let content_rows = area.height.saturating_sub(
-        1 + global_status_rows
-            + qf_height
-            + term_height
-            + menu_height
-            + dbg_height
-            + wildmenu_height
-            + separated_status_rows,
-    ); // cmd(1) + optional status(1) + panels + separated status
+    let content_height = area.height.saturating_sub(menu_height);
+    let bands = bottom_band_row_heights(engine, content_height);
+    let content_rows = content_height.saturating_sub(bands.total()); // cmd(1) + optional status(1) + panels + separated status
     let sv = engine.app_shell.sidebar_visible();
     let sidebar_cols = if sv { sidebar_width + 1 } else { 0 }; // +1 sep
     let ab_width = if engine.settings.autohide_panels && !sv {
@@ -153,37 +218,10 @@ pub(super) fn build_screen_for_shell_content(
     area: Rect,
     backend: &dyn quadraui::Backend,
 ) -> render::ScreenLayout {
-    // `quickfix_panel_rows` also accounts for the active window's open
-    // location list (#1155) — the two share one bottom "list rung".
-    let qf_height: u16 = render::quickfix_panel_rows(engine);
-    let bottom_panel_open = engine.terminal_open || engine.bottom_panel_open;
-    let term_height: u16 = if bottom_panel_open {
-        let target = super::terminal_target_maximize_rows_tui(engine, area.height);
-        engine.effective_terminal_panel_rows(target) + 2
-    } else {
-        0
-    };
     // No `menu_height` term here — `area` already excludes AppShell's own
     // title-bar row. See this function's doc comment.
-    let dbg_height: u16 = if engine.debug_toolbar_visible { 1 } else { 0 };
-    let wildmenu_height: u16 = if !engine.wildmenu_items.is_empty() {
-        1
-    } else {
-        0
-    };
-    let per_window_status = engine.settings.window_status_line;
-    let global_status_rows: u16 = if per_window_status { 0 } else { 1 };
-    let separate_status =
-        per_window_status && !engine.settings.status_line_above_terminal && bottom_panel_open;
-    let separated_status_rows: u16 = if separate_status { 1 } else { 0 };
-    let content_rows = area.height.saturating_sub(
-        1 + global_status_rows
-            + qf_height
-            + term_height
-            + dbg_height
-            + wildmenu_height
-            + separated_status_rows,
-    );
+    let bands = bottom_band_row_heights(engine, area.height);
+    let content_rows = area.height.saturating_sub(bands.total());
     let editor_origin_x = area.x as f64;
     let editor_origin_y = area.y as f64;
     let content_bounds = WindowRect::new(
@@ -284,26 +322,17 @@ pub(super) struct BottomChromeRects {
 
 pub(super) fn bottom_chrome_rects_for_shell_content(
     engine: &Engine,
-    screen: &render::ScreenLayout,
     area: Rect,
 ) -> BottomChromeRects {
-    let qf_height: u16 = if screen.quickfix.is_some() { 6 } else { 0 };
-    let bottom_panel_open = engine.terminal_open || engine.bottom_panel_open;
-    let bottom_panel_height: u16 = if bottom_panel_open {
-        let target = super::terminal_target_maximize_rows_tui(engine, area.height);
-        engine.effective_terminal_panel_rows(target) + 2
-    } else {
-        0
-    };
-    let debug_toolbar_height: u16 = if screen.debug_toolbar.is_some() { 1 } else { 0 };
-    let wildmenu_height: u16 = if screen.wildmenu.is_some() { 1 } else { 0 };
-    let per_window_status = engine.settings.window_status_line;
-    let global_status_height: u16 = if per_window_status { 0 } else { 1 };
-    let separated_status_height: u16 = if screen.separated_status_line.is_some() {
-        1
-    } else {
-        0
-    };
+    // #1164: sourced from the same `bottom_band_row_heights` every other
+    // row-accounting call site now shares, rather than re-deriving each
+    // gate from `screen.<field>.is_some()` — those were always exactly
+    // equivalent to the `Engine`-flag gates below (each `ScreenLayout`
+    // field is populated from precisely one of these flags at `screen`
+    // build time), so this drops a redundant, `ScreenLayout`-shaped
+    // restatement of the same five gates instead of keeping two encodings
+    // of one fact in sync by hand.
+    let bands = bottom_band_row_heights(engine, area.height);
 
     // Mirrors `draw_frame`'s `v_chunks` layout exactly (see its own comment)
     // so `content_rows`'s reservation in `build_screen_for_shell_content`
@@ -311,14 +340,14 @@ pub(super) fn bottom_chrome_rects_for_shell_content(
     let v_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Min(0),                          // 0: editor
-            Constraint::Length(qf_height),               // 1: quickfix
-            Constraint::Length(bottom_panel_height),     // 2: terminal/debug bottom panel
-            Constraint::Length(debug_toolbar_height),    // 3: debug toolbar
-            Constraint::Length(separated_status_height), // 4: separated status
-            Constraint::Length(wildmenu_height),         // 5: wildmenu
-            Constraint::Length(global_status_height),    // 6: global status
-            Constraint::Length(1),                       // 7: cmd
+            Constraint::Min(0),                         // 0: editor
+            Constraint::Length(bands.quickfix),         // 1: quickfix
+            Constraint::Length(bands.terminal),         // 2: terminal/debug bottom panel
+            Constraint::Length(bands.debug_toolbar),    // 3: debug toolbar
+            Constraint::Length(bands.separated_status), // 4: separated status
+            Constraint::Length(bands.wildmenu),         // 5: wildmenu
+            Constraint::Length(bands.global_status),    // 6: global status
+            Constraint::Length(1),                      // 7: cmd
         ])
         .split(area);
 
@@ -1499,7 +1528,7 @@ mod tests {
         };
         let mut tui_backend = super::backend::TuiBackend::new();
         let screen = build_screen_for_shell_content(engine, &theme, area, &tui_backend);
-        let chrome = bottom_chrome_rects_for_shell_content(engine, &screen, area);
+        let chrome = bottom_chrome_rects_for_shell_content(engine, area);
         let tui_tbh: f64 = if engine.settings.breadcrumbs && !engine.terminal_maximized {
             2.0
         } else {
