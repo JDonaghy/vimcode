@@ -23656,4 +23656,146 @@ mod tests {
             driver.screen()
         );
     }
+
+    /// #1208 bug 1: `apply_list_glyphs` remapped byte-offset `spans` for a
+    /// tab's expansion to `^I` (#1190) but left char-index `DiagnosticMark`s
+    /// unremapped, so with `'list'` on, a diagnostic positioned after a tab
+    /// painted its underline one column left of the text it was meant to
+    /// mark — landing on the second half of the `^I` glyph instead of on
+    /// the diagnosed word.
+    ///
+    /// **Verified RED against unfixed `develop`:** before the fix, the
+    /// underline landed at `find_bounds("foo").x - 1` (the `I` of `^I`)
+    /// rather than across all three columns of `"foo"`.
+    #[test]
+    fn driver_list_mode_does_not_shift_diagnostic_mark_past_a_tab_via_shell_app() {
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_test_1208_list_diag_tab_{:?}",
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_path = dir.join("zqxw1208.txt");
+        // A leading tab followed by "foo" — the diagnostic sits on "foo",
+        // strictly after the tab that 'list' will expand to the 2-char `^I`.
+        std::fs::write(&file_path, "\tfoo\n").unwrap();
+
+        let mut app = TuiShellApp::new_for_test();
+        app.engine.new_tab(Some(&file_path));
+        let buf_id = app.engine.active_buffer_id();
+        let canonical = app
+            .engine
+            .buffer_manager
+            .get(buf_id)
+            .and_then(|s| s.canonical_path.clone())
+            .expect("a file opened from disk must cache a canonical path");
+        app.engine.lsp_diagnostics.insert(
+            canonical,
+            vec![crate::core::lsp::Diagnostic {
+                range: crate::core::lsp::LspRange {
+                    start: crate::core::lsp::LspPosition {
+                        line: 0,
+                        character: 1,
+                    },
+                    end: crate::core::lsp::LspPosition {
+                        line: 0,
+                        character: 4,
+                    },
+                },
+                severity: crate::core::lsp::DiagnosticSeverity::Error,
+                message: "zqxw1208 diagnostic".to_string(),
+                source: None,
+                code: None,
+            }],
+        );
+        app.engine.settings.list = true;
+
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        driver.render();
+
+        let bounds = driver.find_bounds("foo").expect(
+            "'list' expands the leading tab to ^I but must still paint \
+             \"foo\" right after it",
+        );
+        let (fx, fy, fw) = (bounds.x as u16, bounds.y as u16, bounds.width as u16);
+
+        for dx in 0..fw {
+            let style = driver
+                .style_at(fx + dx, fy)
+                .unwrap_or_else(|| panic!("no cell painted at ({}, {})", fx + dx, fy));
+            assert!(
+                style
+                    .modifiers
+                    .contains(quadraui::tui::testing::Modifier::UNDERLINED),
+                "the diagnostic underline must cover all of \"foo\" (column \
+                 {} of it did not); screen:\n{}",
+                dx,
+                driver.screen()
+            );
+        }
+        // The cell immediately before "foo" is the second half of the tab's
+        // `^I` glyph. It must NOT be underlined — that's exactly the
+        // one-column-left shift bug 1 describes.
+        let before = driver
+            .style_at(fx - 1, fy)
+            .expect("the ^I glyph's second cell must be painted");
+        assert!(
+            !before
+                .modifiers
+                .contains(quadraui::tui::testing::Modifier::UNDERLINED),
+            "the diagnostic underline must not bleed onto the '^I' tab \
+             glyph; screen:\n{}",
+            driver.screen()
+        );
+    }
+
+    /// #1208 bug 2: the non-wrapped render path applied `apply_list_glyphs`
+    /// (which appends a trailing `$`) to a fold-header line unconditionally
+    /// whenever `'list'` was on — even though real vim's `'list'` never
+    /// marks a closed fold's display text. #1159 made a `marker` fold
+    /// reachable with `:set fdm=marker` (no manual `zf` needed), so this is
+    /// now a plain `:set list` away from a real fold.
+    ///
+    /// **Verified RED against unfixed `develop`:** the fold-header row
+    /// ("if x: # {{{") painted with a trailing `$` before the fix.
+    #[test]
+    fn driver_list_mode_does_not_mark_fold_header_eol_via_shell_app() {
+        let mut app = TuiShellApp::new_for_test();
+        app.engine
+            .buffer_mut()
+            .insert(0, "if x: # {{{\n    a\n    b\n# }}}\nelse:\n    c\n");
+        app.engine.update_syntax();
+
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        driver.press_named(quadraui::NamedKey::Escape);
+        driver.render();
+
+        run_ex_command(&mut driver, ":set fdm=marker");
+        run_ex_command(&mut driver, ":set list");
+
+        let screen = driver.screen();
+        let header_row = screen
+            .lines()
+            .find(|l| l.contains("if x: # {{{"))
+            .unwrap_or_else(|| {
+                panic!("the closed marker fold must still paint its own header text; screen:\n{screen}")
+            });
+        assert!(
+            !header_row.contains('$'),
+            "'list' must not mark a fold-header line's EOL with `$` — real \
+             vim's 'list' does not apply to closed-fold display text; \
+             row: {header_row:?}"
+        );
+
+        let else_row = screen
+            .lines()
+            .find(|l| l.contains("else:"))
+            .expect("the line right after the fold must still be visible");
+        assert!(
+            else_row.contains('$'),
+            "sanity check: 'list' must still mark EOL on an ordinary \
+             (non-fold-header) line, or this test isn't exercising list \
+             mode at all; row: {else_row:?}"
+        );
+    }
 }
