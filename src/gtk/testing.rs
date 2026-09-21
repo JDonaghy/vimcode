@@ -8461,7 +8461,7 @@ mod minimap {
             let strip = crate::render::minimap_strip_rect(mm);
             let x = strip.x as f64 + strip.width as f64 / 2.0;
             let y = strip.y as f64 + 5.0;
-            let press = crate::render::minimap_press(&h.engine.borrow(), layout, x, y)
+            let press = crate::render::minimap_press(&h.engine.borrow(), layout, x, y, false)
                 .expect("the strip must hit");
             assert_eq!(press.window_id, background_win);
             assert!(

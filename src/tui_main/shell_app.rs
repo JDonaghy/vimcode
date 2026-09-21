@@ -17714,6 +17714,119 @@ mod tests {
         );
     }
 
+    /// #1271 acceptance (black-box, driver tier): holding **Alt** at press
+    /// time arms the minimap thumb drag's fine-seek geometry — the same
+    /// strip pixels this test's sibling above drags the *whole file* with
+    /// (#1187) instead steer the buffer at roughly `MINIMAP_LINES_PER_ROW`
+    /// (4) lines per row of pointer travel, scoped to the strip's currently
+    /// painted window (`render::minimap_press`'s `fine` parameter). The
+    /// identical gesture *without* Alt must still seek at the file-wide
+    /// rate — #1187's own guarantee, pinned here rather than only in the
+    /// sibling test so a regression that broke the `alt` plumbing itself
+    /// (e.g. always taking the fine branch) would show up here too.
+    ///
+    /// **RED against unfixed `develop`:** confirmed by hand — before this
+    /// fix, `mouse::handle_mouse` never read `ev.modifiers` for the minimap
+    /// press rung and `render::minimap_press` took no `fine` argument at
+    /// all, so Alt held or not, every drag used the file-wide (#1187)
+    /// geometry — the `fine_top < 200` assertion below fails on that code:
+    /// a 3-row drag at ~100,000/track_length lines/row lands far past 200.
+    #[test]
+    fn alt_drag_on_the_minimap_thumb_fine_seeks_the_painted_window() {
+        const TOTAL_LINES: usize = 100_000;
+        const ROWS_DRAGGED: f32 = 3.0;
+
+        fn top_line(screen: &str) -> Option<usize> {
+            screen
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .windows(2)
+                .filter(|w| w[0] == "line")
+                .filter_map(|w| w[1].parse::<usize>().ok())
+                .min()
+        }
+
+        // Locate the strip's top row and a column that hits its braille the
+        // same way in both halves of this test — never hardcode a coordinate.
+        fn strip_top_and_x(screen: &str) -> (usize, f32) {
+            let rows = minimap_painted_rows(screen);
+            assert!(
+                rows.len() >= 4,
+                "precondition: the strip must paint at least 4 rows; got \
+                 {rows:?}; screen:\n{screen}"
+            );
+            let top = *rows.first().unwrap();
+            let x = braille_col(screen, top).unwrap_or_else(|| {
+                panic!("the minimap must paint braille on row {top}; screen:\n{screen}")
+            }) as f32
+                + 1.0;
+            (top, x)
+        }
+
+        // ── Alt-held drag: fine seek, scoped to the painted window ───────
+        let mut driver = driver_with_shell(app_with_plain_lines(TOTAL_LINES), config(), 100, 24);
+        let before = driver.screen();
+        assert_eq!(
+            top_line(&before),
+            Some(0),
+            "fixture must start at the top of the file; screen:\n{before}"
+        );
+        let (strip_top, x) = strip_top_and_x(&before);
+        let target_row = strip_top as f32 + ROWS_DRAGGED;
+
+        driver.click_with(
+            quadraui::MouseButton::Left,
+            quadraui::Modifiers {
+                alt: true,
+                ..Default::default()
+            },
+            x,
+            strip_top as f32,
+        );
+        driver.mouse_move(x, target_row);
+        driver.mouse_up(x, target_row);
+        driver.render();
+
+        let after = driver.screen();
+        let fine_top = top_line(&after)
+            .unwrap_or_else(|| panic!("the editor must still paint line numbers:\n{after}"));
+
+        // ~4 lines/row, with slack for the strip's own aggregation
+        // (#1186/#1211) and cell-quantised motion — still tiny next to the
+        // 100,000-line file, and asserted against below by the coarse
+        // comparison rather than a single fragile absolute bound.
+        assert!(
+            fine_top < 200,
+            "an Alt-held drag {ROWS_DRAGGED} rows down the strip must \
+             fine-seek within roughly {ROWS_DRAGGED} * MINIMAP_LINES_PER_ROW \
+             (4) lines of the top, not crawl deep into the {TOTAL_LINES}-line \
+             file: landed on line {fine_top}; screen:\n{after}"
+        );
+
+        // ── Same gesture, no Alt: #1187's file-wide guarantee is untouched ──
+        let mut driver2 = driver_with_shell(app_with_plain_lines(TOTAL_LINES), config(), 100, 24);
+        let before2 = driver2.screen();
+        let (strip_top2, x2) = strip_top_and_x(&before2);
+        let target_row2 = strip_top2 as f32 + ROWS_DRAGGED;
+
+        driver2.mouse_down(x2, strip_top2 as f32);
+        driver2.mouse_move(x2, target_row2);
+        driver2.mouse_up(x2, target_row2);
+        driver2.render();
+
+        let after2 = driver2.screen();
+        let coarse_top = top_line(&after2)
+            .unwrap_or_else(|| panic!("the editor must still paint line numbers:\n{after2}"));
+
+        assert!(
+            coarse_top > fine_top * 10,
+            "the identical {ROWS_DRAGGED}-row drag WITHOUT Alt must still \
+             seek at the file-wide rate (#1187), far past the Alt-held \
+             drag's fine-seek landing spot — fine landed on line {fine_top}, \
+             coarse landed on line {coarse_top}; screen:\n{after2}"
+        );
+    }
+
     /// #1211 acceptance (black-box, driver tier): the strip's own painted
     /// window — measured by clicking its top and bottom rows and reading
     /// back the resulting scroll positions — must be the **same size**
