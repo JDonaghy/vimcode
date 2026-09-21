@@ -1948,6 +1948,8 @@ const CASES_OP: &[Case] = &[
         14,
         "d(",
     ),
+    c("op:d{", &["a", "", "b", "", "c"], 5, 1, "d{"),
+    c("op:d}", &["a", "", "b", "", "c"], 1, 1, "d}"),
     c("op:das", &["Hello world. Goodbye now. End."], 1, 15, "das"),
     c("op:dis", &["Hello world. Goodbye now. End."], 1, 15, "dis"),
     c("op:d% on paren", &["foo(a, b) bar"], 1, 4, "d%"),
@@ -1994,6 +1996,10 @@ const CASES_OP: &[Case] = &[
     c("op:F, F, then ,", &["a,b,c,d"], 1, 7, "F,F,,"),
     c("op:t, ; ,", &["a,b,c,d"], 1, 1, "t,;,"),
     c("op:T, then ;", &["a,b,c,d"], 1, 7, "T,;"),
+    c("op:dF,", &["a,b,c,d"], 1, 7, "dF,"),
+    c("op:dT,", &["a,b,c,d"], 1, 7, "dT,"),
+    c("op:d;", &["a,b,c,d"], 1, 1, "f,ld;"),
+    c("op:d,", &["a,b,c,d"], 1, 1, "2f,d,"),
     c("op:f fails no move", &["abc"], 1, 1, "fz"),
     c("op:df fails no delete", &["abc def"], 1, 1, "dfz"),
     c("op:3f.", &["a.b.c.d"], 1, 1, "3f."),
@@ -2004,6 +2010,7 @@ const CASES_OP: &[Case] = &[
     c("op:X at col1", &["abc"], 1, 1, "X"),
     c("op:3X", &["abcdef"], 1, 5, "3X"),
     c("op:5X beyond start", &["abcdef"], 1, 3, "5X"),
+    c("op:dg_", &["  abc  "], 1, 1, "dg_"),
     c("op:dh at col1", &["abc", "def"], 2, 1, "dh"),
     c("op:dl at eol", &["abc"], 1, 3, "dl"),
     c("op:d3l beyond eol", &["abc"], 1, 2, "d3l"),
@@ -2055,6 +2062,7 @@ const CASES_OP: &[Case] = &[
     c("op:gP linewise", &["a", "b"], 1, 1, "yygP"),
     c("op:gp charwise", &["abc"], 1, 1, "ylgp"),
     c("op:]p", &["    a", "b"], 1, 1, "yyj]p"),
+    c("op:[p", &["    a", "b"], 1, 1, "yyj[p"),
     c("op:p charwise at eol", &["abc"], 1, 3, "ylp"),
     c("op:xp swap", &["abc"], 1, 1, "xp"),
     c("op:xp at eol", &["abc"], 1, 3, "xp"),
@@ -2286,6 +2294,7 @@ const CASES_OP: &[Case] = &[
     c("op:A Tab noet", &["a"], 1, 1, ":set noet<CR>A<Tab>x<Esc>"),
     c("op:dvj charwise force", &["abc", "def"], 1, 2, "dvj"),
     c("op:dVw linewise force", &["abc def", "ghi"], 1, 1, "dVw"),
+    c("op:dVj linewise force", &["abc", "def", "ghi"], 1, 2, "dVj"),
     c("op:dve exclusive force", &["abc def"], 1, 1, "dve"),
     c("op:dv$", &["abc def"], 1, 2, "dv$"),
     c(
@@ -2862,6 +2871,15 @@ const CASES_MARK: &[Case] = &[
         "Vj<Esc>gg'>",
     ),
     c("mark:`< after v", &["abc", "def"], 1, 2, "vjl<Esc>gg`<"),
+    // #1279: `mark:'<` is the substring `REGMARK_COVERAGE_EXEMPT`'s own `'<`
+    // row needs, so this one case retires `search:'<` and that row too.
+    c(
+        "mark:'< after v",
+        &["a", "b", "c", "d"],
+        2,
+        1,
+        "vjl<Esc>gg'<",
+    ),
     c(
         "mark:mark shifts after O",
         &["a", "b", "c"],
@@ -4636,6 +4654,14 @@ const CASES_VIS: &[Case] = &[
     c("vis:viwd on whitespace", &["a   b"], 1, 2, "viwd"),
     c("vis:vawd at eol", &["foo bar"], 1, 5, "vawd"),
     c("vis:vjy then P", &["abc", "def"], 1, 2, "vjyP"),
+    // #1279: `visual:P` — replace a charwise selection with a yanked word.
+    c(
+        "vis:vjP force paste",
+        &["abc", "def", "ghi"],
+        1,
+        1,
+        "yiwjvjP",
+    ),
     c("vis:vj< ", &["    a", "    b"], 1, 1, "vj<"),
     c("vis:V3>", &["a"], 1, 1, "V3>"),
     c("vis:vjo then d", &["abc", "def"], 1, 2, "vjod"),
@@ -4976,6 +5002,8 @@ const CASES_NUM: &[Case] = &[
     c("num:V C-a", &["1", "1", "1"], 1, 1, "Vjj<C-a>"),
     c("num:V g C-a", &["1", "1", "1"], 1, 1, "Vjjg<C-a>"),
     c("num:V 2g C-a", &["1", "1", "1"], 1, 1, "Vjj2g<C-a>"),
+    c("num:V C-x", &["5", "5", "5"], 1, 1, "Vjj<C-x>"),
+    c("num:V g C-x", &["5", "5", "5"], 1, 1, "Vjjg<C-x>"),
     c("num:v C-a partial", &["1 1", "1 1"], 1, 1, "vj<C-a>"),
     c("num:C-v block C-a", &["1 1", "1 1"], 1, 3, "<C-v>j<C-a>"),
     c("num:C-a hex mid", &["0x10"], 1, 3, "<C-a>"),
@@ -5342,10 +5370,22 @@ const CASES_WORD: &[Case] = &[
     ),
     c("word:j col memory short", &["abcdef", "ab"], 1, 5, "j"),
     c("word:5l past end", &["abc"], 1, 1, "5l"),
+    // #1279: matches the `NormAudit` "l" recording's own probe needle
+    // (`Label("word:l right")`) so one case retires both `move:l` here and
+    // the `l` row's `NORM_COVERAGE_EXEMPT` entry.
+    c("word:l right", &["abc"], 1, 1, "l"),
     c("word:h at start", &["abc"], 1, 1, "h"),
     c("word:0", &["  ab"], 1, 4, "0"),
     c("word:^", &["  ab"], 1, 4, "^"),
     c("word:g_", &["ab  "], 1, 1, "g_"),
+    // #1279: `word:g0` is the same needle `COMMAND_PROBES` uses for both
+    // `move:g0` and `g:g0` (the doc lists `g0` under both sections).
+    c("word:g0", &["  ab"], 1, 4, "g0"),
+    // #1279: short lines so `gm`/`gM` land at end-of-line on both sides
+    // regardless of the oracle's/vimcode's default window width (neither
+    // harness syncs `columns`, only `rows` — see `run_in_vimcode`).
+    c("word:gm", &["alpha beta gamma"], 1, 1, "gm"),
+    c("word:gM", &["alpha beta gamma"], 1, 1, "gM"),
     c("word:gg indented (nosol)", &["  a", "b"], 2, 1, "gg"),
     cs(
         "word:gg indented (sol)",
@@ -5810,6 +5850,19 @@ const CASES_TO: &[Case] = &[
         "diw",
         "vim.o.iskeyword='@,48-57,_,192-255,-'",
     ),
+    // #1279: the closing-bracket/backtick/quote aliases — `)`/`}`/`]`/`>`
+    // text objects are aliases of `(`/`{`/`[`/`<`, and `a'`/`` a` `` were the
+    // last quote text objects with no oracle case at all.
+    c("to:da'", &["x 'ab' y"], 1, 4, "da'"),
+    c("to:da`", &["x `ab` y"], 1, 4, "da`"),
+    c("to:di)", &["f(a, b)"], 1, 3, "di)"),
+    c("to:da)", &["f(a, b)"], 1, 3, "da)"),
+    c("to:di}", &["{", "  a", "  b", "}"], 2, 3, "di}"),
+    c("to:da}", &["{", "  a", "  b", "}"], 2, 3, "da}"),
+    c("to:di]", &["a[1]"], 1, 3, "di]"),
+    c("to:da]", &["a[1]"], 1, 3, "da]"),
+    c("to:di>", &["<a<b>c>"], 1, 5, "di>"),
+    c("to:da>", &["<a<b>c>"], 1, 2, "da>"),
 ];
 
 // ─────────────────────────── P. misc ───────────────────────────
@@ -8606,16 +8659,8 @@ const COVERAGE_EXEMPT: &[&str] = &[
     // `COMMAND_PROBES` entry and an oracle case, and delete it.
     // ===========================================================================
 
-    // --- Normal Mode - Movement (move) ---
-    "move:l",
-    "move:g0",
-    "move:gm",
-    "move:gM",
-    // --- Normal Mode - Editing (edit) ---
-    "edit:[p",
     // --- Normal Mode - Search & Marks (search) ---
     "search:`{A-Z}",
-    "search:'<",
     "search:g'",
     "search:g`",
     // --- Normal Mode - Other (other) ---
@@ -8630,19 +8675,7 @@ const COVERAGE_EXEMPT: &[&str] = &[
     "other:q:",
     "other:q/",
     "other:q?",
-    // --- Text Objects (textobj) ---
-    "textobj:a'",
-    "textobj:a`",
-    "textobj:i)",
-    "textobj:a)",
-    "textobj:i}",
-    "textobj:a}",
-    "textobj:i]",
-    "textobj:a]",
-    "textobj:i>",
-    "textobj:a>",
     // --- g-Commands (g) ---
-    "g:g0",
     "g:g<Home>",
     "g:g^",
     "g:g$",
@@ -8655,8 +8688,6 @@ const COVERAGE_EXEMPT: &[&str] = &[
     "g:g.",
     "g:ga",
     "g:g8",
-    "g:gm",
-    "g:gM",
     "g:g@{motion}",
     "g:g+",
     // `g:g-` was here until #1156: the new
@@ -8713,7 +8744,6 @@ const COVERAGE_EXEMPT: &[&str] = &[
     "win:CTRL-W f",
     "win:CTRL-W d",
     // --- Bracket Commands (bracket) ---
-    "bracket:[p",
     "bracket:[]",
     "bracket:][",
     "bracket:[m",
@@ -8726,21 +8756,6 @@ const COVERAGE_EXEMPT: &[&str] = &[
     "bracket:]/",
     "bracket:[#",
     "bracket:]#",
-    // --- Operator-Pending Mode (oppend) ---
-    "oppend:g_",
-    "oppend:F",
-    "oppend:T",
-    "oppend:;",
-    "oppend:,",
-    "oppend:{",
-    "oppend:}",
-    "oppend:a'",
-    "oppend:a`",
-    "oppend:o_V",
-    // --- Visual Mode (visual) ---
-    "visual:P",
-    "visual:CTRL-X",
-    "visual:g CTRL-X",
     // --- Core Vim Ex Commands (ex) ---
     "ex::w",
     "ex::write",
@@ -13957,7 +13972,6 @@ const REGMARK_COVERAGE_EXEMPT: &[&str] = &[
     ":marks {arg}",
     ":delm[arks]!",
     "']",
-    "'<",
     "'\"",
     "`\"",
     "'^",
@@ -18644,8 +18658,8 @@ fn visual_audit_gates_are_bidirectional() {
 //                                      ───
 //                                      376 index rows, tagged as 370 entries
 //
-//     ✅ Implemented       208
-//     🟡 Partial            20
+//     ✅ Implemented       211
+//     🟡 Partial            17
 //     ❌ Not implemented   118
 //     ⏭️  Skipped            24   (each carrying a reason from SKIP_REASONS)
 //                          ───
@@ -20358,14 +20372,14 @@ const NORMAL_AUDIT: &[NormAudit] = &[
     na(
         "<{motion}",
         "<",
-        Partial,
+        Implemented,
         Some(nlive(
             NA_IND,
             (1, 5),
             24,
             "<j",
             "alpha beta|gamma delta|    eps zeta",
-            (1, 1),
+            (1, 5),
             "NORMAL",
             "",
             1,
@@ -20375,10 +20389,12 @@ const NORMAL_AUDIT: &[NormAudit] = &[
         )),
         Some(Label("op:< with motion")),
         concat!(
-            "The buffer matches Vim exactly, but the cursor does not: for ",
-            "`<j` over a 4-space-indented block the oracle leaves the cursor ",
-            "in column 5 and vimcode in column 1. Worth fixing as one change ",
-            "with `=`/`>` — same operator plumbing, same one-column error.",
+            "#1279 fixed the one-column cursor bug this row used to record: ",
+            "`apply_linewise_operator` forced the cursor to column 1 before ",
+            "every operator ran, which corrupted `indent_lines`'s own ",
+            "\"restore the original screen column\" logic (it captured the ",
+            "already-zeroed column as `orig_col`). Fixed for `=`/`>` too as ",
+            "the same change — same operator plumbing, same bug.",
         ),
     ),
     na(
@@ -20408,14 +20424,14 @@ const NORMAL_AUDIT: &[NormAudit] = &[
     na(
         "={motion}",
         "=",
-        Partial,
+        Implemented,
         Some(nlive(
             NA_IND,
             (1, 5),
             24,
             "=j",
             "alpha beta|gamma delta|    eps zeta",
-            (1, 1),
+            (1, 5),
             "NORMAL",
             "",
             1,
@@ -20424,10 +20440,7 @@ const NORMAL_AUDIT: &[NormAudit] = &[
             "1* tabs=1/1",
         )),
         Some(Label("op:= with motion")),
-        concat!(
-            "Same one-column cursor difference as `<{motion}`; the ",
-            "re-indented buffer itself matches.",
-        ),
+        "matches Vim: fixed by the same #1279 change as `<{motion}`.",
     ),
     na(
         "==",
@@ -20453,14 +20466,14 @@ const NORMAL_AUDIT: &[NormAudit] = &[
     na(
         ">{motion}",
         ">",
-        Partial,
+        Implemented,
         Some(nlive(
             NA_IND,
             (1, 5),
             24,
             ">j",
             "        alpha beta|        gamma delta|    eps zeta",
-            (1, 1),
+            (1, 5),
             "NORMAL",
             "",
             1,
@@ -20469,10 +20482,7 @@ const NORMAL_AUDIT: &[NormAudit] = &[
             "1* tabs=1/1",
         )),
         Some(Label("op:> with motion")),
-        concat!(
-            "Same one-column cursor difference as `<{motion}`; the shifted ",
-            "buffer itself matches.",
-        ),
+        "matches Vim: fixed by the same #1279 change as `<{motion}`.",
     ),
     na(
         ">>",
@@ -26822,7 +26832,6 @@ const NORM_COVERAGE_EXEMPT: &[&str] = &[
     "`}",
     "do",
     "dp",
-    "l",
     "n",
     "q (while recording)",
     "Q",
@@ -27316,7 +27325,7 @@ fn normal_audit_is_internally_consistent() {
             tally(|e| matches!(e.status, OptStatus::Skipped(_))),
             tally(|e| e.live.is_some()),
         ),
-        (208, 20, 118, 24, 323),
+        (211, 17, 118, 24, 323),
         "the audit tally moved: (implemented, partial, missing, skipped, \
          replayed). Update the section doc's table in the same commit."
     );

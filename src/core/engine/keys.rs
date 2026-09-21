@@ -2223,11 +2223,38 @@ impl Engine {
                 }
                 Some('_') => {
                     // g_: last non-blank character of line (count: Nth line below)
-                    let count = self.take_count();
-                    let line = (self.view().cursor.line + count - 1)
-                        .min(self.buffer().len_lines().saturating_sub(1));
-                    self.view_mut().cursor.line = line;
-                    self.view_mut().cursor.col = self.last_non_blank_col(line);
+                    if let Some(op) = self.pending_operator.take() {
+                        // dg_: delete to the last non-blank character (#1279 —
+                        // this arm used to ignore `pending_operator` entirely,
+                        // so `dg_` moved the cursor and left the buffer
+                        // untouched instead of deleting).
+                        let count = self.take_count();
+                        let start_cursor = self.view().cursor;
+                        let start_pos =
+                            self.buffer().line_to_char(start_cursor.line) + start_cursor.col;
+                        let line = (start_cursor.line + count - 1)
+                            .min(self.buffer().len_lines().saturating_sub(1));
+                        let end_pos =
+                            self.buffer().line_to_char(line) + self.last_non_blank_col(line);
+                        self.view_mut().cursor = start_cursor;
+                        // g_ is inclusive of its landing character (:help
+                        // g_); swap the endpoints when the cursor starts past
+                        // the last non-blank (e.g. sitting in trailing
+                        // whitespace), same as the `ge`/`gE` arms above.
+                        let (lo, hi) = if end_pos >= start_pos {
+                            (start_pos, end_pos)
+                        } else {
+                            (end_pos, start_pos)
+                        };
+                        let hi = (hi + 1).min(self.buffer().len_chars());
+                        self.apply_charwise_operator_inclusive(op, lo, hi, changed);
+                    } else {
+                        let count = self.take_count();
+                        let line = (self.view().cursor.line + count - 1)
+                            .min(self.buffer().len_lines().saturating_sub(1));
+                        self.view_mut().cursor.line = line;
+                        self.view_mut().cursor.col = self.last_non_blank_col(line);
+                    }
                 }
                 Some('*') => {
                     // g*: forward search for word under cursor (no word boundaries)
@@ -4803,7 +4830,15 @@ impl Engine {
         self.force_motion_mode = None;
         let count = end_line - start_line + 1;
         self.view_mut().cursor.line = start_line;
-        self.view_mut().cursor.col = 0;
+        // #1279: this used to also force `cursor.col = 0` here, but real Vim
+        // leaves the cursor on its original column for `d`/`y` through this
+        // path (verified against `nvim --headless`: `dj`/`y}` from col 2
+        // land back on col 2, matching plain `dd`'s own `delete_lines` —
+        // see that function's doc comment, which this preamble was
+        // silently overriding for every *other* linewise motion routed
+        // through here). The operator arms below that need a specific
+        // column (`c`, `~`/`u`/`U`/`R`, `@`) already set one explicitly, so
+        // they are unaffected.
         match operator {
             'y' => {
                 self.yank_lines(count);
