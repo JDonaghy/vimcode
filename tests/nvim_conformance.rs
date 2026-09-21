@@ -10517,11 +10517,12 @@ fn oracle_available_for_unit_test() -> Option<()> {
 // registry in `src/core/settings.rs`, in `:help` order, so the tagging is
 // machine-checked rather than prose in a markdown file that nothing runs.
 //
-// The measurement, as of this slice:
+// The measurement, as of this slice (`undofile`/`undodir`/`undolevels` moved
+// ❌ → ✅/🟡/🟡 when #1156 landed, which is the gate working, not drift):
 //
-//     ✅ Implemented       44
-//     🟡 Partial           10
-//     ❌ Not implemented  185
+//     ✅ Implemented       45
+//     🟡 Partial           12
+//     ❌ Not implemented  182
 //     ⏭️  Intentionally skipped  182   (each with a reason from SKIP_REASONS)
 //                        ────
 //                         421
@@ -11451,12 +11452,15 @@ const OPTION_AUDIT: &[OptionAudit] = &[
       "maximum number of lines for a scroll"),
     o("ttytype", "tty", Skipped(TERMCAP), Absent, None,
       "alias for 'term'"),
-    o("undodir", "udir", NotImplemented, Absent, None,
-      "where to store undo files — nice to have"),
-    o("undofile", "udf", NotImplemented, Absent, None,
-      "save undo information in a file — nice to have"),
-    o("undolevels", "ul", NotImplemented, Absent, None,
-      "vimcode's undo stack is unbounded; worth implementing"),
+    // #1156 implemented these three (they were ❌ Absent when this slice ran).
+    o("undodir", "udir", Partial, Full, Some(OptSetup("vim.o.undodir=")),
+      "accepts one directory; Vim's is a comma-separated priority list with \
+       `.` and `//` forms, which vimcode has no per-directory fallback to drive"),
+    o("undofile", "udf", Implemented, Full, Some(OptSetup("vim.o.undofile=")),
+      "save undo information in a file"),
+    o("undolevels", "ul", Partial, Full, Some(OptSetup("vim.o.undolevels=")),
+      "caps live undo-tree states globally; no `ul=-1` (undo disabled) and no \
+       buffer-local `:setlocal ul`"),
     o("undoreload", "ur", NotImplemented, Absent, None,
       "max nr of lines to save for undo on a buffer reload — nice to have"),
     o("updatecount", "uc", NotImplemented, Absent, None,
@@ -11551,6 +11555,10 @@ const OPTION_AUDIT: &[OptionAudit] = &[
 //     **25 of the 54 options vimcode implements have no oracle case**
 //     (29 are pinned, 54%).
 //
+// #1156 added three more implemented options (see the `undo*` entries at the
+// end of the list), so the live figure is now 28 of 57 unpinned — the ratchet
+// prints the current one on every passing run.
+//
 // Writing the cases that delete these entries is #1162's job; the entry is
 // deleted by the case, never by an editor's judgement, because gate 2 fails
 // the moment a listed option's probe starts matching.
@@ -11592,6 +11600,26 @@ const OPTION_COVERAGE_EXEMPT: &[&str] = &[
     // spell case at all — the same hole COVERAGE_EXEMPT records for z=/zg/zw.
     "spell",
     "spelllang",
+    // Undo persistence (#1156), seeded here the one way this list is allowed
+    // to grow: an option that was ❌ NotImplemented when this slice ran, and
+    // so had no probe and no entry, gained one. None of the three is
+    // reachable from a case's Lua `setup`, and not for want of writing one:
+    //
+    //   * 'undolevels' — `run_in_neovim` *overwrites* it (`= -1` around the
+    //     fixture write, then `= 1000`) after the case's `setup` has run, so
+    //     a setup that pins it is clobbered before the first keystroke. Only
+    //     an `OptKeys(":set ul=")` case could pin it, and that needs
+    //     vimcode's pruning order to match Vim's block-for-block first.
+    //   * 'undofile' / 'undodir' — the effect is a sidecar file written on
+    //     `:w` and re-read on the *next open of the same path*. The case
+    //     shape is one buffer, one keystroke sequence, compare text and
+    //     cursor; it never reopens a file, and `undofile::write` is a
+    //     `cfg!(test)` no-op on the vimcode side besides.
+    //
+    // Deleting these three is #1162's job, same as every entry above.
+    "undodir",
+    "undofile",
+    "undolevels",
 ];
 
 /// Options whose **abbreviation** does not have the same surface as their full
