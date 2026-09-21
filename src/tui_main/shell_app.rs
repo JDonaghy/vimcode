@@ -15691,6 +15691,82 @@ mod tests {
         );
     }
 
+    /// #1239: `sync_tui_clipboard` (now a thin wrapper over
+    /// `render::sync_register_to_clipboard`, matching GTK's
+    /// `App::sync_plus_register_to_clipboard`) must mirror the explicit `+`
+    /// register ahead of the unnamed `"` register, not `"` alone.
+    ///
+    /// `"+yy` writes both `+` and `"` to the same content (`set_register_typed`
+    /// always copies a named-register write into `"` too), so that alone
+    /// can't distinguish the two priorities — the divergence only shows up
+    /// once something *else* changes `"` without touching `+`. A plain `dd`
+    /// with no register prefix is exactly that: it only ever touches the
+    /// unnamed register. Pre-fix `sync_tui_clipboard` mirrored `"` only, so
+    /// this second delete would wrongly clobber the clipboard with the
+    /// deleted line instead of leaving the explicitly-yanked one in place.
+    ///
+    /// **Verified RED against unfixed `develop`:** with the old
+    /// `sync_tui_clipboard` body (mirrors `"` only), the final assertion
+    /// failed — the captured clipboard content was `"BBBB\n"` (the `dd`'s
+    /// deleted line) instead of `"AAAA\n"` (the `"+yy`'d line).
+    #[test]
+    fn handle_key_pressed_clipboard_prioritizes_explicit_plus_register_over_unnamed_1239() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "AAAA\nBBBB\n");
+        let captured = std::rc::Rc::new(std::cell::RefCell::new(None::<String>));
+        let captured_hook = std::rc::Rc::clone(&captured);
+        engine.clipboard_write = Some(Box::new(move |text: &str| {
+            *captured_hook.borrow_mut() = Some(text.to_string());
+            Ok(())
+        }));
+        let mut sidebar = TuiSidebar::new();
+        let mut folder_picker = None;
+        let mut backend = backend_at(80.0, 24.0);
+        let mut scratch = KeyScratch::new();
+
+        let mut press = |ch: char| {
+            let _ = handle_key_pressed(
+                quadraui::Key::Char(ch),
+                quadraui::Modifiers::default(),
+                false,
+                &mut engine,
+                &mut sidebar,
+                &mut folder_picker,
+                false,
+                80,
+                24,
+                &mut backend,
+                &mut scratch.state(),
+            );
+        };
+
+        // `"+yy`: explicit write to the `+` register. `set_register_typed`
+        // also copies it into `"`, so both hold "AAAA\n" afterward.
+        for ch in ['"', '+', 'y', 'y'] {
+            press(ch);
+        }
+        assert_eq!(
+            captured.borrow().as_deref(),
+            Some("AAAA\n"),
+            "\"+yy must push the explicitly-yanked line to the clipboard"
+        );
+
+        press('j'); // move to line 1 ("BBBB") — no register change.
+
+        // `dd`: a plain, no-register delete only ever touches `"`, never `+`.
+        for ch in ['d', 'd'] {
+            press(ch);
+        }
+
+        assert_eq!(
+            captured.borrow().as_deref(),
+            Some("AAAA\n"),
+            "a plain delete must not clobber the clipboard mirror of an \
+             explicit `+` register write — TUI used to mirror `\"` only \
+             (#1239)"
+        );
+    }
+
     // ── #634 (Stage 6): the tiers the cutover would have regressed ──────
 
     /// The single highest-value regression guard for the cutover: with the

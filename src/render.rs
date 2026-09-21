@@ -4618,6 +4618,61 @@ pub fn post_key_epilogue(
     out
 }
 
+/// Sync the system clipboard from the engine's registers
+/// (`clipboard=unnamedplus` semantics), if the mirrored content changed.
+///
+/// Checks the explicit `+` register first — an explicit write (`"+yy`, a
+/// plugin's `vimcode.state.set_register('+', ...)`) always wins — and falls
+/// back to the unnamed `"` register so a plain `yy` still reaches the
+/// clipboard. `last` is the caller's cache of what was last pushed, so an
+/// unchanged register is a no-op rather than a clipboard write on every call.
+///
+/// #1239: GTK (`App::sync_plus_register_to_clipboard`) and TUI
+/// (`sync_tui_clipboard`) used to be two near-identical copies of this that
+/// had drifted — TUI mirrored `"` only, so on TUI a subsequent plain
+/// yank/delete (which only ever touches `"`, never `+`) could clobber the
+/// clipboard mirror of an earlier explicit `+` write instead of leaving it
+/// alone (see the `..._1239` tests in `gtk/testing.rs` and
+/// `tui_main/shell_app.rs` for the exact repro). Both now call this one
+/// function; each backend's own name survives only as a thin wrapper (GTK:
+/// `App::sync_plus_register_to_clipboard`; TUI: `sync_tui_clipboard`) so
+/// their existing call sites don't need to change. (The issue that raised
+/// this bug illustrated the explicit-write case as `:let @+='...'` — that
+/// ex command isn't actually implemented in vimcode, `VIM_COMPATIBILITY.md`
+/// marks `:let` N/A; every real write path to `+`, from `"+yy` to the Lua
+/// plugin API, goes through `Engine::set_register_typed`, which this
+/// function's `+`-first priority now matches on both backends.)
+///
+/// Cadence: called after every editor keypress that might have yanked/cut
+/// text, plus a few early-return tiers that skip the main post-key epilogue
+/// (terminal-focused keys, an ext-panel key, TUI's bracketed-paste event) —
+/// same reason on both backends: whichever tier consumes the key returns
+/// before reaching the shared epilogue tail, so it syncs for itself on the
+/// way out. That per-keypress cadence is still needed now that the register
+/// priority is fixed; it isn't a workaround for the priority bug, so there's
+/// nothing to collapse into a single trigger.
+pub fn sync_register_to_clipboard(engine: &mut Engine, last: &mut Option<String>) {
+    let new_content = engine
+        .registers
+        .get(&'+')
+        .filter(|(s, _)| !s.is_empty())
+        .map(|(s, _)| s.clone())
+        .or_else(|| {
+            engine
+                .registers
+                .get(&'"')
+                .filter(|(s, _)| !s.is_empty())
+                .map(|(s, _)| s.clone())
+        });
+
+    if new_content != *last {
+        if let (Some(ref content), Some(ref cb)) = (&new_content, &engine.clipboard_write) {
+            let _ = cb(content.as_str());
+        }
+        *last = new_content;
+    }
+}
+
 // ─── Panel-accelerator dispatch rung (#761 / #734 slice 6) ──────────────────
 //
 // Both backends register the same 14-entry `panel_keys` accelerator set

@@ -11038,6 +11038,65 @@ mod command_line_selection {
         );
     }
 
+    /// #1239: `App::sync_plus_register_to_clipboard` (now a thin wrapper over
+    /// `render::sync_register_to_clipboard`, the same function TUI's
+    /// `sync_tui_clipboard` delegates to) must keep mirroring the explicit
+    /// `+` register ahead of the unnamed `"` register — this is the parity
+    /// half of #1239's fix: GTK's existing (correct) behaviour must survive
+    /// the refactor into the shared function untouched.
+    ///
+    /// `"+yy` writes both `+` and `"` to the same content
+    /// (`set_register_typed` always copies a named-register write into `"`
+    /// too), so that alone can't distinguish the two priorities — the
+    /// divergence only shows up once something *else* changes `"` without
+    /// touching `+`. A plain `dd` with no register prefix is exactly that.
+    #[test]
+    fn key_press_clipboard_prioritizes_explicit_plus_register_over_unnamed_1239() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "AAAA\nBBBB\n");
+        let captured = std::rc::Rc::new(std::cell::RefCell::new(None::<String>));
+        let captured_hook = std::rc::Rc::clone(&captured);
+        engine.clipboard_write = Some(Box::new(move |text: &str| {
+            *captured_hook.borrow_mut() = Some(text.to_string());
+            Ok(())
+        }));
+        let mut h = harness(engine, 1200, 800);
+        h.driver.render();
+
+        let press = |driver: &mut GtkDriver<_>, ch: char| {
+            driver.dispatch(quadraui::UiEvent::KeyPressed {
+                key: quadraui::Key::Char(ch),
+                modifiers: quadraui::Modifiers::default(),
+                repeat: false,
+            });
+        };
+
+        // `"+yy`: explicit write to the `+` register. `set_register_typed`
+        // also copies it into `"`, so both hold "AAAA\n" afterward.
+        for ch in ['"', '+', 'y', 'y'] {
+            press(&mut h.driver, ch);
+        }
+        assert_eq!(
+            captured.borrow().as_deref(),
+            Some("AAAA\n"),
+            "\"+yy must push the explicitly-yanked line to the clipboard"
+        );
+
+        press(&mut h.driver, 'j'); // move to line 1 ("BBBB") — no register change.
+
+        // `dd`: a plain, no-register delete only ever touches `"`, never `+`.
+        for ch in ['d', 'd'] {
+            press(&mut h.driver, ch);
+        }
+
+        assert_eq!(
+            captured.borrow().as_deref(),
+            Some("AAAA\n"),
+            "a plain delete must not clobber the clipboard mirror of an \
+             explicit `+` register write"
+        );
+    }
+
     /// #1100: `App::setup_gtk_clipboard` wires `engine.clipboard_read`/
     /// `clipboard_write` through `backend.services().clipboard()` —
     /// quadraui#991's `PlatformServices` seam — instead of the deleted
