@@ -1664,6 +1664,153 @@ pub struct PopupAnchor {
     pub viewport: quadraui::Rect,
 }
 
+/// Convert a character-index column to a tab-expanded display column.
+///
+/// Moved here from `tui_main::render_impl` (#1237) so both backends' popup-
+/// anchor math can share it: TUI already expanded tabs before placing the
+/// completion popup, but GTK's equivalent (`App::paint_editor_popups_rung`)
+/// used the raw character column as if it were a display column, which
+/// drifted the popup left of the cursor on tab-indented lines, proportional
+/// to the tab count preceding it. `RenderedWindow::scroll_left` is itself
+/// already in display columns (see `display_col_to_buffer_col`'s doc), so
+/// this must run before any `scroll_left` subtraction, not after.
+pub fn char_col_to_visual(raw_text: &str, char_col: usize, tabstop: usize) -> usize {
+    let tabstop = tabstop.max(1);
+    let mut vis = 0usize;
+    for (i, ch) in raw_text.chars().enumerate() {
+        if ch == '\n' || ch == '\r' {
+            break;
+        }
+        if i >= char_col {
+            break;
+        }
+        if ch == '\t' {
+            vis = ((vis / tabstop) + 1) * tabstop;
+        } else {
+            vis += 1;
+        }
+    }
+    vis
+}
+
+/// Resolved `(x, y)` anchor points for each of the five editor-anchored
+/// popups, in the caller's unit scale (`cw`/`lh`: `1.0`/`1.0` for TUI's
+/// cell-native space, the actual pixel char-width/line-height for GTK).
+/// `None` when that popup isn't open or there's no active window.
+///
+/// Deliberately does *not* carry the viewport each anchor clamps into —
+/// see `paint_editor_popups`'s doc for the one pre-existing, intentional
+/// per-backend difference (`editor_hover`'s clip viewport: TUI clamps into
+/// the whole frame, GTK into the active window's own rect) that callers
+/// still own so this mechanical extraction doesn't silently fold it away.
+pub struct EditorPopupPoints {
+    pub completion: Option<(f32, f32)>,
+    pub hover: Option<(f32, f32)>,
+    pub editor_hover: Option<(f32, f32)>,
+    pub diff_peek: Option<(f32, f32)>,
+    pub signature_help: Option<(f32, f32)>,
+}
+
+/// Compute [`EditorPopupPoints`] from the active window in `screen`.
+///
+/// `win_origin` is the active window's own `(x, y)` in the caller's unit
+/// scale — `None` when there's no active window. Taken as a parameter
+/// rather than read from `RenderedWindow::rect` directly because TUI must
+/// snap it to the whole-cell grid its paint path actually truncated to
+/// first (via [`tui_window_paint_rect`]; `RenderedWindow` rects come from
+/// continuous float split math and are not integer-valued in general,
+/// #1040), while GTK uses its raw sub-pixel float rect as-is — exactly the
+/// same origin each backend already independently derives for its own
+/// `win_viewport`.
+///
+/// Shared by TUI (`tui_main::render_impl::paint_editor_popups`) and GTK
+/// (`App::paint_editor_popups_rung`) as of #1237 — before that each backend
+/// re-derived every one of these five anchor points itself (gutter width,
+/// scroll offset, tab-aware column resolution), and only TUI's completion
+/// anchor happened to call [`char_col_to_visual`] first; the other four
+/// anchors on *both* backends, and GTK's completion anchor specifically,
+/// used the raw character column as a display column outright.
+pub fn editor_popup_anchors(
+    screen: &ScreenLayout,
+    win_origin: Option<(f32, f32)>,
+    cw: f32,
+    lh: f32,
+) -> EditorPopupPoints {
+    let active_win = screen
+        .windows
+        .iter()
+        .find(|w| w.window_id == screen.active_window_id);
+
+    // `view_row` is already relative to the top of the visible window (as
+    // `CursorPos::view_line` is), so every caller below that starts from an
+    // absolute buffer line (`anchor_line`) subtracts its own scroll offset
+    // first.
+    let anchor_xy = |view_row: usize, char_col: usize, scroll_left: usize| -> Option<(f32, f32)> {
+        let win = active_win?;
+        let (win_x, win_y) = win_origin?;
+        let raw = win
+            .lines
+            .get(view_row)
+            .map(|l| l.raw_text.as_str())
+            .unwrap_or("");
+        let vis_col =
+            char_col_to_visual(raw, char_col, win.tabstop).saturating_sub(scroll_left) as f32;
+        let x = win_x + win.gutter_char_width as f32 * cw + vis_col * cw;
+        let y = win_y + view_row as f32 * lh;
+        Some((x, y))
+    };
+
+    let completion = active_win.and_then(|win| {
+        let (cursor_pos, _) = win.cursor.as_ref()?;
+        anchor_xy(cursor_pos.view_line, cursor_pos.col, win.scroll_left)
+    });
+
+    let hover = screen.hover.as_ref().and_then(|h| {
+        let win = active_win?;
+        anchor_xy(
+            h.anchor_line.saturating_sub(win.scroll_top),
+            h.anchor_col,
+            win.scroll_left,
+        )
+    });
+
+    let editor_hover = screen.editor_hover.as_ref().and_then(|eh| {
+        anchor_xy(
+            eh.anchor_line.saturating_sub(eh.frozen_scroll_top),
+            eh.anchor_col,
+            eh.frozen_scroll_left,
+        )
+    });
+
+    let signature_help = screen.signature_help.as_ref().and_then(|sig| {
+        let win = active_win?;
+        anchor_xy(
+            sig.anchor_line.saturating_sub(win.scroll_top),
+            sig.anchor_col,
+            win.scroll_left,
+        )
+    });
+
+    // Diff-peek anchors at the cursor's own row, left edge — no column
+    // offset, so no tab expansion needed.
+    let diff_peek = screen.diff_peek.as_ref().and_then(|peek| {
+        let win = active_win?;
+        let (win_x, win_y) = win_origin?;
+        let view_row = peek.anchor_line.saturating_sub(win.scroll_top);
+        let x = win_x + win.gutter_char_width as f32 * cw;
+        let y = win_y + view_row as f32 * lh;
+        Some((x, y))
+    });
+
+    EditorPopupPoints {
+        completion,
+        hover,
+        editor_hover,
+        diff_peek,
+        signature_help,
+    }
+}
+
 /// Paint the editor-anchored popups: completion menu, LSP hover, the rich
 /// "editor hover" markdown popup, diff-peek, and signature-help.
 ///
@@ -1676,17 +1823,17 @@ pub struct PopupAnchor {
 /// scroll offsets, tab-aware column resolution for the cursor).
 ///
 /// This function owns everything from "given a resolved anchor + viewport"
-/// onward. Resolving the anchor itself stays at each call site as thin
-/// per-backend wiring, because two of the five have a narrow *pre-existing*
-/// per-backend difference this convergence deliberately carries forward
-/// unchanged rather than silently folding together (that would be a
-/// behavior change needing its own issue + black-box test, not something to
-/// smuggle into a mechanical refactor):
-/// - the completion popup's cursor column: TUI resolves tab expansion via
-///   `char_col_to_visual` before placing the popup, GTK currently uses the
-///   raw character column;
-/// - the editor-hover popup's clip viewport: TUI clamps into the whole
-///   frame `area`, GTK clamps into the active window's own rect.
+/// onward. Resolving the anchor point itself now goes through the shared
+/// [`editor_popup_anchors`] (#1237 — see its doc for why GTK's completion
+/// anchor and *all four* non-completion anchors on both backends used to
+/// drift left on tab-indented lines), so only viewport selection and the
+/// completion popup's width/height clamp remain per-backend wiring. One
+/// deliberate *pre-existing* per-backend difference survives that
+/// convergence too — the editor-hover popup's clip viewport: TUI clamps
+/// into the whole frame `area`, GTK clamps into the active window's own
+/// rect. Folding that one together would be a behavior change needing its
+/// own issue + black-box test, not something to smuggle into this
+/// refactor.
 ///
 /// The four output caches are cleared unconditionally at the top (matching
 /// GTK's existing per-frame behavior) rather than only-on-`Some` (TUI's

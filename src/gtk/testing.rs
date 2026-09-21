@@ -4864,6 +4864,62 @@ mod editor_popups {
         assert!(layout.bounds.width > 0.0 && layout.bounds.height > 0.0);
     }
 
+    /// #1237: the completion popup's x anchor must expand tabs to a
+    /// display column, same as TUI already did, instead of treating the
+    /// raw character column as a display column. Two leading tabs
+    /// (`tabstop` defaults to 4) then `"foo"` put the cursor at char
+    /// column 5 but display column 11 — anchoring on the raw char column
+    /// drifts the popup 6 cells left of the caret.
+    ///
+    /// **Verified RED against unfixed `develop`:** before this fix,
+    /// `App::paint_editor_popups_rung`'s completion anchor computed
+    /// `cursor_pos.col as f64 * cw` directly, so `bounds.x` landed at the
+    /// char-column position (`buggy_x` below) rather than the
+    /// tab-expanded one (`expected_x`) — this assertion fails against
+    /// that code.
+    #[test]
+    fn completion_popup_anchors_at_visual_column_on_tab_indented_line() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "\t\tfoo\n");
+        engine.view_mut().cursor.col = 5;
+        engine.completion_candidates = vec!["foobar".to_string()];
+        engine.completion_idx = Some(0);
+        engine.completion_start_col = 2;
+
+        let h = harness(engine, 1400, 900);
+        let layout_cell = h.completion_layout.borrow();
+        let layout = layout_cell
+            .as_ref()
+            .expect("completion popup must have painted a layout");
+
+        let win_id = h.engine.borrow().active_window_id();
+        let (win_x, gutter_w) = {
+            let sl = h.screen_layout.borrow();
+            let rw = sl
+                .as_ref()
+                .expect("render_content must have painted a ScreenLayout")
+                .windows
+                .iter()
+                .find(|w| w.window_id == win_id)
+                .expect("the active window must have painted");
+            (rw.rect.x, rw.gutter_char_width)
+        };
+        let cw = h
+            .painted_char_width
+            .get()
+            .expect("must have painted with a char width");
+
+        let expected_x = win_x + gutter_w as f64 * cw + 11.0 * cw; // display col 11
+        let buggy_x = win_x + gutter_w as f64 * cw + 5.0 * cw; // raw char col 5
+        assert!(
+            (layout.bounds.x as f64 - expected_x).abs() < 0.5,
+            "completion popup must anchor at the tab-expanded display \
+             column (x≈{expected_x}), not the raw char column (x≈{buggy_x}); \
+             got x={}",
+            layout.bounds.x
+        );
+    }
+
     // #420 note: an earlier version of this fix capped `popup_w` in
     // `app.rs` to the active window's own viewport width, with a
     // corresponding `completion_popup_bounds_stay_within_its_own_split`
