@@ -14410,12 +14410,17 @@ fn regmark_audit_gates_are_bidirectional() {
 //
 // The measurement, as of this slice:
 //
-//     ✅ Implemented      117
+//     ✅ Implemented      121
 //     🟡 Partial           53
-//     ❌ Not implemented  203
+//     ❌ Not implemented  199
 //     ⏭️  Intentionally skipped  180   (each with a reason from SKIP_REASONS)
 //                         ────
 //                          553
+//
+// The slice landed at 117/203; #1156's undo tree then moved `:earlier`,
+// `:later`, `:undojoin` and `:undolist` from ❌ to ✅, which is gate 1 doing
+// its job — the branch implemented them, the recorded `ExDispatch` stopped
+// matching the live dispatcher, and the rows had to be re-tagged.
 //
 // ## Why this slice was expected to grow the denominator, and did
 //
@@ -14424,7 +14429,7 @@ fn regmark_audit_gates_are_bidirectional() {
 // wrong about the 70 — it is that "complete" was being measured against a
 // hand-written list of the commands vimcode already had, so a command that
 // was never considered could not show up as missing. 553 rows is the
-// denominator the ratchet can now count against, and 170 of them (✅ + 🟡)
+// denominator the ratchet can now count against, and 174 of them (✅ + 🟡)
 // are the numerator that oracle cases have to reach.
 //
 // ## Gate 1 — the recorded dispatch must match the live dispatcher
@@ -14458,8 +14463,8 @@ fn regmark_audit_gates_are_bidirectional() {
 // measurement it starts from.
 //
 // ❌ rows carry no probe, deliberately. #1226 gave one to every non-skipped
-// row because it had 32 of them; this slice has 203, and 203 permanently
-// exempt entries would drown the ~118 that describe a *real* gap in a
+// row because it had 32 of them; this slice has 199, and 199 permanently
+// exempt entries would drown the ~114 that describe a *real* gap in a
 // shrink-only list nobody can read. ❌ rows are already gated — harder — by
 // gate 1: a command that gains an implementation changes its `ExDispatch`.
 //
@@ -14875,8 +14880,8 @@ const EX_AUDIT: &[ExAudit] = &[
        "tags/'include' file search; vimcode uses LSP go-to-definition and references instead"),
     ex(":e[dit]", ":edit", Implemented, Both, "edit foo", "e foo", Some(Keys(":edit ")),
        "opens a file, with `!` to discard changes"),
-    ex(":ea[rlier]", ":earlier", NotImplemented, Neither, "earlier", "ea", None,
-       "go to older change, undo — the undo-tree surface; tracked by #1156, which is implementing persistent undo and the tree"),
+    ex(":ea[rlier]", ":earlier", Implemented, Both, "earlier", "ea", Some(Label("ex:earlier")),
+       "go to older change, with a count — landed with the undo tree in #1156, alongside `:later`/`:undolist`/`:undojoin`"),
     ex(":ec[ho]", ":echo", Skipped(VIMSCRIPT), Both, "echo", "ec", None,
        "vimcode accepts `:echo {text}` and echoes it back verbatim, which looks like support but evaluates nothing — the expression half is the VimScript half"),
     ex(":echoe[rr]", ":echoerr", Skipped(VIMSCRIPT), Neither, "echoerr", "echoe", None,
@@ -15047,8 +15052,8 @@ const EX_AUDIT: &[ExAudit] = &[
        "go to the last file in the argument list — vimcode has no argument list, and splits+`:buffer` cover the `:s…`/`:sb…` family; moderate value for `:argdo` alone"),
     ex(":lan[guage]", ":language", Skipped(ENCODING), Neither, "language", "lan", None,
        "vimcode is UTF-8 only; no encoding-conversion layer"),
-    ex(":lat[er]", ":later", NotImplemented, Neither, "later", "lat", None,
-       "go to newer change, redo — the undo-tree surface; tracked by #1156, which is implementing persistent undo and the tree"),
+    ex(":lat[er]", ":later", Implemented, Both, "later", "lat", Some(Keys(":later")),
+       "go to newer change, with a count — landed with the undo tree in #1156; pinned by the `:earlier`/`:later` round-trip case"),
     ex(":lbe[fore]", ":lbefore", NotImplemented, Neither, "lbefore", "lbe", None,
        "go to location before current cursor — vimcode's quickfix list is filled by `:grep`/`:make` and LSP diagnostics, never from an error file or expression; low value"),
     ex(":lbel[ow]", ":lbelow", NotImplemented, Neither, "lbelow", "lbel", None,
@@ -15570,11 +15575,11 @@ const EX_AUDIT: &[ExAudit] = &[
     ex(":tu[nmenu]", ":tunmenu", NotImplemented, Neither, "tunmenu", "tu", None,
        "remove menu tooltip — no vimcode equivalent; low value"),
     ex(":u[ndo]", ":undo", Implemented, Both, "undo", "u", Some(Label("ex:undo")),
-       "undo (linear — see #1156 for the undo-tree gap)"),
-    ex(":undoj[oin]", ":undojoin", NotImplemented, Neither, "undojoin", "undoj", None,
-       "join next change with previous undo block — the undo-tree surface; tracked by #1156, which is implementing persistent undo and the tree"),
-    ex(":undol[ist]", ":undolist", NotImplemented, Neither, "undolist", "undol", None,
-       "list leafs of the undo tree — the undo-tree surface; tracked by #1156, which is implementing persistent undo and the tree"),
+       "undo — backed by a real undo tree since #1156, so `g-`/`g+`/`:earlier`/`:later` can reach discarded branches"),
+    ex(":undoj[oin]", ":undojoin", Implemented, Both, "undojoin", "undoj", Some(Label("ex:undojoin")),
+       "join next change with previous undo block — landed in #1156; the oracle case pins the `E790` no-previous-change path, since Vim documents interactive `:undojoin` as fragile"),
+    ex(":undol[ist]", ":undolist", Implemented, Both, "undolist", "undol", Some(Label("ex:undolist")),
+       "list leafs of the undo tree — landed with the undo tree in #1156; message-only, so the oracle case pins that it leaves the buffer alone"),
     ex(":una[bbreviate]", ":unabbreviate", Implemented, Both, "unabbreviate", "una", Some(Keys(":unabbreviate ")),
        "removes an abbreviation"),
     ex(":unh[ide]", ":unhide", NotImplemented, Neither, "unhide", "unh", None,
@@ -15988,7 +15993,7 @@ fn ex_audit_is_internally_consistent() {
             tally(|e| matches!(e.status, OptStatus::NotImplemented)),
             tally(|e| matches!(e.status, OptStatus::Skipped(_))),
         ),
-        (117, 53, 203, 180),
+        (121, 53, 199, 180),
         "the audit tally moved: (implemented, partial, missing, skipped). \
          Update the module doc's table in the same commit."
     );
