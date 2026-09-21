@@ -192,6 +192,11 @@ struct NvimResult {
     line: usize,
     col: usize,
     rows: usize,
+    /// `nvim_win_get_width(0)`, mirrored the same way as `rows` (#1280): the
+    /// six horizontal-scroll rows (`zh`/`zl`/`zH`/`zL`/`ze`/`zs`) are
+    /// meaningless if the two sides disagree on window *width*, same
+    /// reasoning as the height mirror below.
+    cols: usize,
     /// `line('w0')` sampled after **every** key (#1008), never deserialized —
     /// [`run_in_neovim`] fills it in as it feeds the sequence. It is the
     /// evidence that the redraw between keystrokes actually happened, and it
@@ -663,6 +668,15 @@ fn oracle_probe(
     lua.push_str("vim.o.shiftwidth = 4\n");
     lua.push_str("vim.o.expandtab = true\n");
     lua.push_str("vim.o.tabstop = 4\n");
+    // #1280: explicit even though it's already Neovim's default, mirroring
+    // `run_in_vimcode`'s matching `engine.settings.wrap = true` below — both
+    // sides need to agree on it going in, since vimcode's own *default*
+    // (`Settings::default()`) is `wrap: false`, the opposite of Neovim's.
+    // Without this, every screen-line-relative case (`g0`/`g^`/`g$`/`gj`/
+    // `gk`/…) silently compared a wrapped oracle against an unwrapped
+    // vimcode and only two of the four `word:g<Home>`/`g^`/`g$`/`g<End>`
+    // cases added here happened to still agree by coincidence.
+    lua.push_str("vim.o.wrap = true\n");
     lua.push_str(setup);
     lua.push('\n');
     // `nvim_buf_set_lines` is itself an undo step, so without this the `undo:`
@@ -710,7 +724,8 @@ fn oracle_probe(
     let dump = "local buf = vim.api.nvim_buf_get_lines(0, 0, -1, false)\n\
                 local pos = vim.api.nvim_win_get_cursor(0)\n\
                 local rows = vim.api.nvim_win_get_height(0)\n\
-                return vim.fn.json_encode({buf = buf, line = pos[1], col = pos[2] + 1, rows = rows})";
+                local cols = vim.api.nvim_win_get_width(0)\n\
+                return vim.fn.json_encode({buf = buf, line = pos[1], col = pos[2] + 1, rows = rows, cols = cols})";
     let json = nvim.request_pumped(
         "nvim_exec_lua",
         vec![Value::from(dump), Value::Array(Vec::new())],
@@ -1050,6 +1065,10 @@ fn apply_setup(settings: &mut Settings, setup: &str) -> Result<(), String> {
                     format!("'sidescrolloff' expects a non-negative integer, got {raw_value:?}")
                 })?;
             }
+            // #1280: the six horizontal-scroll z-commands only do anything
+            // with 'wrap' off — with it on they're documented no-ops (the
+            // line soft-wraps to another screen row instead of scrolling).
+            "wrap" | "wr" => settings.wrap = parse_lua_bool(name, value)?,
             other => {
                 return Err(format!(
                     "no vimcode Settings mapping for option '{other}' (from {stmt:?}) — add one \
@@ -1127,6 +1146,7 @@ fn run_in_vimcode(
     cursor_col_1: usize,
     keys: &str,
     rows: usize,
+    cols: usize,
     setup: &str,
 ) -> (String, usize, usize) {
     let text = lines.join("\n");
@@ -1134,9 +1154,15 @@ fn run_in_vimcode(
     engine.settings.shift_width = 4;
     engine.settings.expand_tab = true;
     engine.settings.tabstop = 4;
-    // The case's own `setup` goes on last so it overrides those three shared
+    // #1280: vimcode's own default (`Settings::default()`) is `wrap: false`
+    // — Neovim's is on — so this has to be forced the same way the three
+    // options above are, or every screen-line-relative case silently
+    // compares a wrapped oracle against an unwrapped vimcode. See the
+    // matching `vim.o.wrap = true` in `oracle_probe` for the other side.
+    engine.settings.wrap = true;
+    // The case's own `setup` goes on last so it overrides those four shared
     // defaults, mirroring `run_in_neovim`, which likewise splices `setup` in
-    // after its `shiftwidth`/`expandtab`/`tabstop` preamble.
+    // after its `shiftwidth`/`expandtab`/`tabstop`/`wrap` preamble.
     if let Err(why) = apply_setup(&mut engine.settings, setup) {
         panic!("conformance case {label:?}: bad `setup` — {why}");
     }
@@ -1148,6 +1174,9 @@ fn run_in_vimcode(
     // Screen-relative motions (H/M/L, <C-d>, zt) are meaningless unless both
     // sides agree on the window height, so mirror nvim's.
     engine.set_viewport_lines(rows);
+    // Same reasoning, horizontally (#1280): zh/zl/zH/zL/ze/zs are meaningless
+    // if the two sides disagree on window width.
+    engine.set_viewport_cols(cols);
     // Neovim computes the whole 'foldmethod'=indent/marker fold hierarchy
     // (down to 'foldlevel') as soon as the buffer is loaded, with no
     // explicit `zf` — mirror that here rather than leaving it for the key
@@ -2600,6 +2629,17 @@ const CASES_UNDO: &[Case] = &[
         1,
         "ihello<Esc>uiworld<Esc>g-g-",
     ),
+    // #1280: `g+` is `g-`'s forward counterpart — same abandoned-branch
+    // scenario, walked back to the oldest state with two `g-`, then forward
+    // one step with `g+` to land on the intermediate ("helloa") state that
+    // `u` had discarded.
+    c(
+        "undo:g+ crosses a branch abandoned by u then edit",
+        &["a"],
+        1,
+        1,
+        "ihello<Esc>uiworld<Esc>g-g-g+",
+    ),
 ];
 
 // ─────────────────────────── D. registers ───────────────────────────
@@ -3648,6 +3688,15 @@ const CASES_EX: &[Case] = &[
     c("ex:1,3j", &["a", "b", "c"], 1, 1, ":1,3j<CR>"),
     c("ex:j!", &["a", "  b"], 1, 1, ":j!<CR>"),
     c("ex:j 3", &["a", "b", "c", "d"], 1, 1, ":j 3<CR>"),
+    // #1280: the full-word spellings of :d/:m/:co/:j/:y — distinct doc ids
+    // from their abbreviations above (`:delete` is not covered by `:d`
+    // having a case; see the `COMMAND_PROBES` module doc), so each needs its
+    // own case using the literal long form.
+    c("ex:delete", &["a", "b", "c"], 2, 1, ":delete<CR>"),
+    c("ex:move0", &["a", "b", "c"], 3, 1, ":move0<CR>"),
+    c("ex:copy$", &["a", "b"], 1, 1, ":copy$<CR>"),
+    c("ex:join", &["a", "b", "c"], 1, 1, ":join<CR>"),
+    c("ex:yank a", &["a", "b"], 1, 1, ":yank a<CR>j\"ap"),
     c("ex:>", &["a"], 1, 1, ":><CR>"),
     c("ex:>>", &["a"], 1, 1, ":>><CR>"),
     c("ex:2,3>", &["a", "b", "c"], 1, 1, ":2,3><CR>"),
@@ -3813,6 +3862,17 @@ const CASES_EX: &[Case] = &[
         ":s/,/\\r/g<CR>",
     ),
     c("ex:noh no effect", &["a"], 1, 1, "/a<CR>:noh<CR>"),
+    // #1280: full-word spellings, same reasoning as the `:delete`/`:move`/
+    // `:copy`/`:join`/`:yank` block above.
+    c("ex:norm Ax", &["a", "b"], 1, 1, ":norm Ax<CR>"),
+    c(
+        "ex:nohlsearch no effect",
+        &["a"],
+        1,
+        1,
+        "/a<CR>:nohlsearch<CR>",
+    ),
+    c("ex:ma x", &["a", "b", "c"], 2, 1, ":ma x<CR>gg'x"),
     c(
         "ex:2>3? shift count",
         &["a", "b", "c", "d"],
@@ -5214,6 +5274,79 @@ const CASES_SCROLL: &[Case] = &[
     ),
     c("scroll:C-d at last line", LONG, 60, 1, "<C-d>"),
     c("scroll:C-u at line 2", LONG, 2, 1, "<C-u>"),
+    // ── zh/zl/zH/zL/ze/zs: horizontal scroll (#1280) ───────────────────────
+    // Only meaningful with 'wrap' off (with it on, a long line soft-wraps
+    // instead of scrolling — `zh`/`zl`/etc. are then documented no-ops) and
+    // only observable through this harness's (buffer, cursor) comparison —
+    // not `scroll_left` directly — via the "cursor is adjusted if necessary"
+    // clause each of these carries in `:h scroll-horizontal`: scroll the
+    // view far enough that the cursor's column falls outside it, and the
+    // resulting cursor move is the signal. This is also the prerequisite the
+    // issue calls out: `run_in_vimcode` now mirrors the oracle's window
+    // *width* (`nvim_win_get_width`) the same way it already mirrored
+    // height, so both sides agree what "outside the view" means.
+    cs(
+        "scroll:zl scrolls view right and pulls the cursor into it",
+        NA_WIDE,
+        1,
+        1,
+        "50zl",
+        "vim.o.wrap=false",
+    ),
+    cs(
+        "scroll:zh scrolls view left and pulls the cursor into it",
+        NA_WIDE,
+        1,
+        101,
+        "50zh",
+        "vim.o.wrap=false",
+    ),
+    cs(
+        "scroll:zL scrolls a half screenwidth right",
+        NA_WIDE,
+        1,
+        1,
+        "zL",
+        "vim.o.wrap=false",
+    ),
+    cs(
+        "scroll:zH scrolls a half screenwidth left",
+        NA_WIDE,
+        1,
+        101,
+        "zH",
+        "vim.o.wrap=false",
+    ),
+    // ze/zs move no cursor of their own — they only set the horizontal
+    // scroll position — so each is paired with a large trailing `zl` that
+    // reads that position back: `80zl` scrolls the view 80 columns further
+    // right, which only pulls the cursor along (the "adjusted if necessary"
+    // clause again) if the view `ze`/`zs` set up left the cursor's column
+    // within 80 of the *new* left edge. The leading `60zl` matters too:
+    // without it, the initial cursor placement's own
+    // `ensure_cursor_visible` scroll already lands within a column or two of
+    // where `ze` would put it anyway (both hug the cursor's right edge), so
+    // `ze`/`60zl`/`80zl` all land on the same final column — a vacuous
+    // "pass" that would say nothing. `60zl` first displaces the view well
+    // away from that coincidence (measured: plain `60zl 80zl` with no
+    // `ze`/`zs` at all lands on a third, different column), so the value
+    // `ze`/`zs` sets is what the trailing `80zl` actually reads back.
+    cs(
+        "scroll:ze scrolls so cursor is at the right edge",
+        NA_WIDE,
+        1,
+        101,
+        "60zlze80zl",
+        "vim.o.wrap=false",
+    ),
+    cs(
+        "scroll:zs scrolls so cursor is at the left edge",
+        NA_WIDE,
+        1,
+        101,
+        "60zlzs80zl",
+        "vim.o.wrap=false",
+    ),
 ];
 
 // ─────────────────────────── N. word motions & misc motions ───────────────────────────
@@ -5346,6 +5479,90 @@ const CASES_WORD: &[Case] = &[
     c("word:]}", &["{", "a", "}"], 2, 1, "]}"),
     c("word:[(", &["(a (b) c)"], 1, 5, "[("),
     c("word:])", &["(a (b) c)"], 1, 5, "])"),
+    // ── bracket:[] / ][ — section *end* (`}` in column 0), the `[[`/`]]`
+    // pair's `}` counterpart (#1280) ────────────────────────────────────
+    c("word:][", &["a", "}", "b", "}", "c"], 1, 1, "]["),
+    c("word:[]", &["a", "}", "b", "}", "c"], 5, 1, "[]"),
+    // ── bracket:[m/]m/[M/]M — method start/end (any `{`/`}`) (#1280) ─────
+    c(
+        "word:]m next method start",
+        &["fn a() {", "}", "fn b() {", "}"],
+        1,
+        1,
+        "]m",
+    ),
+    c(
+        "word:[m previous method start",
+        &["fn a() {", "}", "fn b() {", "}"],
+        4,
+        1,
+        "[m",
+    ),
+    // Unlike `]m`/`[m` above, `]M`/`[M` need the cursor positioned *inside*
+    // (for `]M`) or *after* (for `[M`) the brace pair, not before/at the
+    // second one — from an as-yet-unentered method Neovim's actual
+    // (Java-class-oriented) algorithm falls back to "start/end of the
+    // class" rather than the next/previous literal brace, which a
+    // same-shaped fixture to `]m`/`[m` above would have hit.
+    c(
+        "word:]M next method end",
+        &["fn a() {", "  body", "}"],
+        2,
+        1,
+        "]M",
+    ),
+    c(
+        "word:[M previous method end",
+        &["fn a() {", "}", "x"],
+        3,
+        1,
+        "[M",
+    ),
+    // ── bracket:[*/]* and their [/// / ]/ aliases — C comment start/end
+    // (#1280) ─────────────────────────────────────────────────────────
+    c(
+        "word:]* comment end",
+        &["a", "/* comment", "middle", "*/ end", "b"],
+        3,
+        1,
+        "]*",
+    ),
+    c(
+        "word:[* comment start",
+        &["a", "/* comment", "middle", "*/ end", "b"],
+        3,
+        1,
+        "[*",
+    ),
+    c(
+        "word:]/ comment end",
+        &["a", "/* comment", "middle", "*/ end", "b"],
+        3,
+        1,
+        "]/",
+    ),
+    c(
+        "word:[/ comment start",
+        &["a", "/* comment", "middle", "*/ end", "b"],
+        3,
+        1,
+        "[/",
+    ),
+    // ── bracket:[#/]# — preprocessor directive, depth-tracked (#1280) ────
+    c(
+        "word:]# forward to matching #else/#endif",
+        &["#if X", "  a", "#else", "  b", "#endif"],
+        2,
+        1,
+        "]#",
+    ),
+    c(
+        "word:[# backward to matching #if/#else",
+        &["#if X", "  a", "#else", "  b", "#endif"],
+        4,
+        1,
+        "[#",
+    ),
     c("word:% on (", &["(a (b) c)"], 1, 1, "%"),
     c("word:% inside", &["(a (b) c)"], 1, 2, "%"),
     c("word:% on [", &["[a]"], 1, 1, "%"),
@@ -5386,9 +5603,50 @@ const CASES_WORD: &[Case] = &[
     // #1279: `word:g0` is the same needle `COMMAND_PROBES` uses for both
     // `move:g0` and `g:g0` (the doc lists `g0` under both sections).
     c("word:g0", &["  ab"], 1, 4, "g0"),
+    // #1280: `g<Home>`/`g^`/`g$`/`g<End>` are distinct doc ids from `g0`
+    // (their own keystrokes, `:h g<Home>` etc.), and only differ from the
+    // buffer-relative `0`/`^`/`$` motions when a line spans more than one
+    // *screen* line — a plain short fixture (like `word:g0` above) can't
+    // exercise that at all, so this one is 87 columns wide against an
+    // 80-column window (`'wrap'` stays on, the default), split into two
+    // screen rows at column 80: cols 0-79 (all blank) and 80-86 ("xyz").
+    // Starting on the second row lets all four disagree with their
+    // buffer-relative counterparts (`0`→col 1, `^`/`$` would land on 'x'/'z'
+    // at cols 85/87 too — same as `g^`/`g$` here only because this fixture
+    // has no blanks *within* the second row; the screen-relative-ness is in
+    // `g<Home>`/`g<End>` landing on col 81/87, not col 1/87).
+    c(
+        "word:g<Home> start of screen line",
+        &["                                                                                    xyz"],
+        1,
+        86,
+        "g<Home>",
+    ),
+    c(
+        "word:g^ first non-blank of screen line",
+        &["                                                                                    xyz"],
+        1,
+        86,
+        "g^",
+    ),
+    c(
+        "word:g$ end of screen line",
+        &["                                                                                    xyz"],
+        1,
+        86,
+        "g$",
+    ),
+    c(
+        "word:g<End> end of screen line",
+        &["                                                                                    xyz"],
+        1,
+        86,
+        "g<End>",
+    ),
     // #1279: short lines so `gm`/`gM` land at end-of-line on both sides
-    // regardless of the oracle's/vimcode's default window width (neither
-    // harness syncs `columns`, only `rows` — see `run_in_vimcode`).
+    // regardless of window width — width is mirrored the same way height is
+    // (#1280, see `run_in_vimcode`) but this predates that and staying
+    // width-independent still doesn't hurt.
     c("word:gm", &["alpha beta gamma"], 1, 1, "gm"),
     c("word:gM", &["alpha beta gamma"], 1, 1, "gM"),
     c("word:gg indented (nosol)", &["  a", "b"], 2, 1, "gg"),
@@ -6081,6 +6339,58 @@ const CASES_MISC: &[Case] = &[
         1,
         "$",
     ),
+    // #1280: `g.` — go to the position of the last change. `wx` changes
+    // (deletes) the 't' of "two" on line 1; `G` moves away to the last
+    // line; `g.` must return to where that change happened, not just to
+    // `` `. `` (a mark, which lands at the same spot here but for a
+    // different documented reason — `g.` is its own doc row).
+    c(
+        "misc:g. returns to last change",
+        &["one two", "three"],
+        1,
+        1,
+        "wxGg.",
+    ),
+    // #1280: `gR` — Virtual Replace mode. Typing exactly enough characters
+    // to span a `<Tab>`'s full visual width (tabstop 4, set by the harness
+    // — the tab at column 1 covers 3 columns to the next stop) consumes it
+    // entirely, landing on the same result a naive "expand tab, then
+    // overwrite" implementation would. `:h Virtual-Replace-mode` documents
+    // that typing *fewer* characters than the tab's width instead leaves it
+    // untouched and inserts before it (verified empirically to be a real,
+    // separate vimcode deviation) — a two-key `gRXY` case exercising that
+    // narrower one is left for a follow-up, since it needs delayed
+    // "replace-pending" bookkeeping across keystrokes, not a one-line fix.
+    c(
+        "misc:gR spans a tab's full width",
+        &["a\tbc"],
+        1,
+        2,
+        "gRXYZ<Esc>",
+    ),
+    // #1280: `g@{motion}` calls a user-registered `'operatorfunc'` — real
+    // buffer-mutating coverage of that needs a Lua callback wired up
+    // identically on both sides, which `apply_setup` has no way to express
+    // (it only translates `vim.o.<name>=<value>`/keymap statements, not
+    // arbitrary Lua function bodies into vimcode's own
+    // `vimcode.set_operatorfunc` Lua API). What *is* comparable without any
+    // of that: with no operatorfunc registered at all (true on both sides —
+    // Neovim errors `E774`, vimcode's own `test_g_at_sets_pending_operator`
+    // pins the same "no crash, no-op" contract engine-side), `g@l` changes
+    // nothing. A no-op case guards nothing on its own (`ex:cc on empty
+    // quickfix list`, #1154), so this is paired with the engine-level
+    // `test_g_at_sets_pending_operator` and the callback-registered
+    // `test_g_at_calls_operatorfunc_{linewise,charwise}`/
+    // `test_g_at_operatorfunc_can_modify_buffer` tests in
+    // `src/core/engine/tests.rs`, which do exercise the real dispatch this
+    // case structurally cannot.
+    c(
+        "misc:g@l with no operatorfunc registered is a no-op",
+        &["hello world"],
+        1,
+        1,
+        "g@l",
+    ),
 ];
 
 // ─────────────────────────── Q. folds (#1006) ───────────────────────────
@@ -6185,6 +6495,47 @@ const CASES_FOLD: &[Case] = &[
     // ── zO/zC ─────────────────────────────────────────────────────────────
     c("fold:zO opens recursively", FOLDTXT, 1, 1, "zfjzOj"),
     c("fold:zC recloses recursively", FOLDTXT, 1, 1, "zfjzozCj"),
+    // ── zA/zF/zv/zx (#1280) ──────────────────────────────────────────────
+    // zA: recursive toggle. Build a nested fold — inner (lines 2-3) created
+    // first, then outer (lines 1-4) wraps it, same construction the zD case
+    // below reuses — and toggle from the outer, closed header. A plain `za`
+    // would only touch the outer level; `zA` must also open the inner one,
+    // so the trailing `j` lands one line lower here (line 2) than a
+    // (hypothetical) single-level toggle would leave it.
+    c(
+        "fold:zA recursively toggles nested folds",
+        FOLDTXT,
+        1,
+        1,
+        "jzfjkzf3jzAj",
+    ),
+    // zF: fold a `count` of lines from the cursor with no motion. `j` after
+    // it lands past the fold (line 4) only if it actually closed lines 1-3.
+    c("fold:zF folds a count of lines", FOLDTXT, 1, 1, "3zFj"),
+    // zv: open just enough folds to reveal a cursor that landed inside a
+    // closed one. `3G` jumps straight to the hidden interior line (folds
+    // don't stop an absolute line jump, only relative motions), then `zv`
+    // must open the enclosing fold for the following `j` to move one real
+    // line (to line 4) rather than skip straight past it (to line 5).
+    c(
+        "fold:zv reveals a cursor hidden by a closed fold",
+        FOLDTXT,
+        1,
+        1,
+        "zf3j3Gzvj",
+    ),
+    // zx: recompute (open all, then reclose all). Open the fold, move the
+    // cursor to its last line (still visible while open), then zx recloses
+    // it — the cursor is now hidden and must snap back up to the fold's
+    // header (line 1), which the trailing case comparison captures directly
+    // (no extra motion needed to observe it, unlike zA/zv above).
+    c(
+        "fold:zx recomputes and clamps a hidden cursor",
+        FOLDTXT,
+        1,
+        1,
+        "zf3jzojjjzx",
+    ),
     // ── zj/zk fold navigation ────────────────────────────────────────────
     c(
         "fold:zj moves to the defined fold header",
@@ -7130,6 +7481,30 @@ const KNOWN_DEVIATIONS: &[&str] = &[
     // dispatch on the vimcode side. #1031 built the real confirm loop
     // (`Engine::confirm_sub`, `execute.rs`) and all 11 now pass, alongside
     // the 5 new cases #1031 itself added right after them in `CASES_EX`.
+    //
+    // ── #1280: "scroll:so=5 30G H", "scroll:so=5 30G L" ──
+    //
+    // Both cases predate this issue and passed on every prior run — because
+    // `run_in_vimcode` never set `'wrap'`, so every case ran against
+    // vimcode's actual default (`Settings::default().wrap == false`) even
+    // though the oracle's default (and Neovim's) is `'wrap'` on. #1280 fixes
+    // that mismatch (`run_in_vimcode`/`oracle_probe` now both force
+    // `wrap=true`, matching Neovim, since screen-line motions like `g$`
+    // otherwise can't be tested meaningfully at all), and that is a real,
+    // previously-hidden gap: `ensure_cursor_visible_wrap` — the vertical
+    // scroll-to-cursor path used when `'wrap'` is on — never reads
+    // `self.settings.scrolloff` at all, unlike the `'wrap'`-off path a few
+    // lines above it in the same file (`ensure_cursor_visible` in
+    // `src/core/engine/search.rs`), which does. `:set so=5` then `30GH`/
+    // `30GL` land one scrolloff-margin short of Neovim as a result. Fixing
+    // it means porting `scrolloff` into the wrap path's visual-row-counting
+    // loop, which is a real feature addition (scrolloff needs to be
+    // expressed in *visual* rows there, not buffer lines) rather than a
+    // small in-scope fix — left here rather than attempted blind. Needs a
+    // filed follow-up issue (number TBD — flagged to the coordinator in this
+    // PR rather than filed directly, since this session cannot run `gh`).
+    "scroll:so=5 30G H",
+    "scroll:so=5 30G L",
 ];
 
 // ---------------------------------------------------------------------------
@@ -8055,10 +8430,10 @@ const COMMAND_PROBES: &[CommandProbe] = &[
     p("g:gg", Label("word:gg indented (nosol)")),
     p("g:g_", Label("word:g_")),
     p("g:g0", Label("word:g0")),
-    p("g:g<Home>", Keys("g<Home>")),
-    p("g:g^", Keys("g^")),
-    p("g:g$", Keys("g$")),
-    p("g:g<End>", Keys("g<End>")),
+    p("g:g<Home>", Label("word:g<Home> start of screen line")),
+    p("g:g^", Label("word:g^ first non-blank of screen line")),
+    p("g:g$", Label("word:g$ end of screen line")),
+    p("g:g<End>", Label("word:g<End> end of screen line")),
     p("g:gj", Label("word:gj gk nowrap")),
     p("g:gk", Label("word:gj gk nowrap")),
     p("g:gE", Label("word:gE")),
@@ -8080,7 +8455,7 @@ const COMMAND_PROBES: &[CommandProbe] = &[
     p("g:gJ", Label("op:gJ")),
     p("g:g;", Label("jump:g;")),
     p("g:g,", Label("jump:g; g; g,")),
-    p("g:g.", Keys("g.")),
+    p("g:g.", Label("misc:g. returns to last change")),
     p("g:gp", Label("op:gp linewise")),
     p("g:gP", Label("op:gP linewise")),
     p("g:gq{motion}", Label("op:gqq tw20")),
@@ -8094,10 +8469,16 @@ const COMMAND_PROBES: &[CommandProbe] = &[
     p("g:gm", Keys("gm")),
     p("g:gM", Keys("gM")),
     p("g:g?{motion}", Label("op:g?? rot13")),
-    p("g:g@{motion}", Keys("g@")),
-    p("g:g+", Keys("g+")),
+    p(
+        "g:g@{motion}",
+        Label("misc:g@l with no operatorfunc registered is a no-op"),
+    ),
+    p(
+        "g:g+",
+        Label("undo:g+ crosses a branch abandoned by u then edit"),
+    ),
     p("g:g-", Keys("g-")),
-    p("g:gR", Keys("gR")),
+    p("g:gR", Label("misc:gR spans a tab's full width")),
     p("g:g'", Label("mark:g'")),
     p("g:g`", Label("mark:g`")),
     p("g:g&", Label("dot:g&")),
@@ -8114,15 +8495,21 @@ const COMMAND_PROBES: &[CommandProbe] = &[
     p("z:zc", Label("fold:zo then zc recloses the same fold")),
     p("z:zR", Label("fold:zR opens all folds")),
     p("z:zM", Label("fold:zM recloses a defined fold")),
-    p("z:zA", Keys("zA")),
+    p("z:zA", Label("fold:zA recursively toggles nested folds")),
     p("z:zO", Label("fold:zO opens recursively")),
     p("z:zC", Label("fold:zC recloses recursively")),
     p("z:zd", Label("fold:zd deletes a fold")),
     p("z:zD", Label("fold:zD deletes a fold recursively")),
     p("z:zf{motion}", Label("fold:zfj hides one line")),
-    p("z:zF", Keys("zF")),
-    p("z:zv", Keys("zv")),
-    p("z:zx", Keys("zx")),
+    p("z:zF", Label("fold:zF folds a count of lines")),
+    p(
+        "z:zv",
+        Label("fold:zv reveals a cursor hidden by a closed fold"),
+    ),
+    p(
+        "z:zx",
+        Label("fold:zx recomputes and clamps a hidden cursor"),
+    ),
     // #1163: spell is implemented (`src/core/spell.rs`) and these rows moved
     // N/A → ✅, so they are in scope and need probes. The corpus has no spell
     // cases at all today, so all seven are seeded into COVERAGE_EXEMPT — that
@@ -8135,12 +8522,24 @@ const COMMAND_PROBES: &[CommandProbe] = &[
     p("z:zW", Label("spell:zW bad word internal")),
     p("z:zj", Label("fold:zj moves to the defined fold header")),
     p("z:zk", Label("fold:zk moves to the defined fold header")),
-    p("z:zh", Keys("zh")),
-    p("z:zl", Keys("zl")),
-    p("z:zH", Label("scroll:zH")),
-    p("z:zL", Keys("zL")),
-    p("z:ze", Label("scroll:ze")),
-    p("z:zs", Label("scroll:zs")),
+    p(
+        "z:zh",
+        Label("scroll:zh scrolls view left and pulls the cursor into it"),
+    ),
+    p(
+        "z:zl",
+        Label("scroll:zl scrolls view right and pulls the cursor into it"),
+    ),
+    p("z:zH", Label("scroll:zH scrolls a half screenwidth left")),
+    p("z:zL", Label("scroll:zL scrolls a half screenwidth right")),
+    p(
+        "z:ze",
+        Label("scroll:ze scrolls so cursor is at the right edge"),
+    ),
+    p(
+        "z:zs",
+        Label("scroll:zs scrolls so cursor is at the left edge"),
+    ),
     // --- Window Commands (CTRL-W) (win) ---
     p("win:CTRL-W h", Keys("<C-w>h")),
     p("win:CTRL-W j", Keys("<C-w>j")),
@@ -8187,22 +8586,28 @@ const COMMAND_PROBES: &[CommandProbe] = &[
     p("bracket:[p", Keys("[p")),
     p("bracket:[[", Label("word:[[")),
     p("bracket:]]", Label("word:]]")),
-    p("bracket:[]", Keys("[]")),
-    p("bracket:][", Keys("][")),
-    p("bracket:[m", Keys("[m")),
-    p("bracket:]m", Keys("]m")),
-    p("bracket:[M", Keys("[M")),
-    p("bracket:]M", Keys("]M")),
+    p("bracket:[]", Label("word:[]")),
+    p("bracket:][", Label("word:][")),
+    p("bracket:[m", Label("word:[m previous method start")),
+    p("bracket:]m", Label("word:]m next method start")),
+    p("bracket:[M", Label("word:[M previous method end")),
+    p("bracket:]M", Label("word:]M next method end")),
     p("bracket:[{", Label("word:[{")),
     p("bracket:]}", Label("word:]}")),
     p("bracket:[(", Label("word:[(")),
     p("bracket:])", Label("word:])")),
-    p("bracket:[*", Keys("[*")),
-    p("bracket:]*", Keys("]*")),
-    p("bracket:[/", Label("word:[/")),
-    p("bracket:]/", Label("word:]/")),
-    p("bracket:[#", Keys("[#")),
-    p("bracket:]#", Keys("]#")),
+    p("bracket:[*", Label("word:[* comment start")),
+    p("bracket:]*", Label("word:]* comment end")),
+    p("bracket:[/", Label("word:[/ comment start")),
+    p("bracket:]/", Label("word:]/ comment end")),
+    p(
+        "bracket:[#",
+        Label("word:[# backward to matching #if/#else"),
+    ),
+    p(
+        "bracket:]#",
+        Label("word:]# forward to matching #else/#endif"),
+    ),
     p("bracket:[z", Label("fold:[z moves to start of open fold")),
     p("bracket:]z", Label("fold:]z moves to end of open fold")),
     // --- Operator-Pending Mode (oppend) ---
@@ -8358,23 +8763,23 @@ const COMMAND_PROBES: &[CommandProbe] = &[
     p("ex::[range]g/pat/cmd", Label("g:d")),
     p("ex::v/pat/cmd", Label("g:v")),
     p("ex::d", Label("ex:d")),
-    p("ex::delete", Keys(":delete")),
+    p("ex::delete", Label("ex:delete")),
     p("ex::m", Label("ex:m0")),
-    p("ex::move", Keys(":move")),
+    p("ex::move", Label("ex:move0")),
     p("ex::t", Label("ex:t.")),
     p("ex::co", Label("ex:1co$")),
-    p("ex::copy", Keys(":copy")),
+    p("ex::copy", Label("ex:copy$")),
     p("ex::j", Label("ex:j")),
-    p("ex::join", Keys(":join")),
+    p("ex::join", Label("ex:join")),
     p("ex::y", Label("ex:y a")),
-    p("ex::yank", Keys(":yank")),
+    p("ex::yank", Label("ex:yank a")),
     p("ex::pu", Label("ex:pu")),
     p("ex::put", Label("ex:put a")),
     p("ex::sort", Label("ex:sort")),
-    p("ex::norm", Keys(":norm ")),
+    p("ex::norm", Label("ex:norm Ax")),
     p("ex::normal", Label("ex:normal Ax")),
     p("ex::noh", Label("ex:noh no effect")),
-    p("ex::nohlsearch", Keys(":nohlsearch")),
+    p("ex::nohlsearch", Label("ex:nohlsearch no effect")),
     p("ex::startinsert", Keys(":startinsert")),
     p("ex::stopinsert", Keys(":stopinsert")),
     p("ex:Ex ranges", Label("ex:2;+1d")),
@@ -8404,7 +8809,7 @@ const COMMAND_PROBES: &[CommandProbe] = &[
     p("ex::#", Keys(":#")),
     p("ex::number", Keys(":number")),
     p("ex::print", Keys(":print")),
-    p("ex::ma", Keys(":ma ")),
+    p("ex::ma", Label("ex:ma x")),
     p("ex::mark", Label("ex:2mark a")),
     p("ex::delmarks", Keys(":delmarks")),
     p("ex::delm", Keys(":delm ")),
@@ -8605,6 +9010,13 @@ const COVERAGE_EXEMPT: &[&str] = &[
     // (VIM_COMPATIBILITY.md:314,386).
     "other:gx",
     "g:gx",
+    // #1280: `gh` is deliberately rebound to the editor hover popup
+    // (VIM_COMPATIBILITY.md:399) — Neovim's `gh` enters Select mode, a
+    // different mode vimcode doesn't implement (that gap is the doc's
+    // separate `` `<C-\><C-n>` `` "Not implemented — modes" row), so a
+    // byte-for-byte comparison would be comparing two unrelated features,
+    // not checking one.
+    "g:gh",
     // --- Ends or leaves the session ---
     // Each of these exits, or would exit, the very vimcode process the probe
     // is driving. There is no "after" state left for the probe to read —
@@ -8684,39 +9096,19 @@ const COVERAGE_EXEMPT: &[&str] = &[
     "other:q/",
     "other:q?",
     // --- g-Commands (g) ---
-    "g:g<Home>",
-    "g:g^",
-    "g:g$",
-    "g:g<End>",
     "g:gf",
     "g:gF",
     "g:gt",
     "g:gT",
     "g:g<Tab>",
-    "g:g.",
     "g:ga",
     "g:g8",
-    "g:g@{motion}",
-    "g:g+",
     // `g:g-` was here until #1156: the new
     // `undo:g- crosses a branch abandoned by u then edit` case presses `g-`,
     // so the probe matches and the ratchet demands the entry be deleted.
     // That is the list shrinking as designed — do not re-add it.
-    "g:gR",
     "g:g'",
     "g:g`",
-    "g:gh",
-    // --- z-Commands (z) ---
-    "z:zA",
-    "z:zF",
-    "z:zv",
-    "z:zx",
-    "z:zh",
-    "z:zl",
-    "z:zH",
-    "z:zL",
-    "z:ze",
-    "z:zs",
     // --- Window Commands (CTRL-W) (win) ---
     "win:CTRL-W h",
     "win:CTRL-W j",
@@ -8751,19 +9143,6 @@ const COVERAGE_EXEMPT: &[&str] = &[
     "win:CTRL-W q",
     "win:CTRL-W f",
     "win:CTRL-W d",
-    // --- Bracket Commands (bracket) ---
-    "bracket:[]",
-    "bracket:][",
-    "bracket:[m",
-    "bracket:]m",
-    "bracket:[M",
-    "bracket:]M",
-    "bracket:[*",
-    "bracket:]*",
-    "bracket:[/",
-    "bracket:]/",
-    "bracket:[#",
-    "bracket:]#",
     // --- Core Vim Ex Commands (ex) ---
     "ex::w",
     "ex::write",
@@ -8788,13 +9167,6 @@ const COVERAGE_EXEMPT: &[&str] = &[
     "ex::tabnext",
     "ex::tabprevious",
     "ex::tabmove",
-    "ex::delete",
-    "ex::move",
-    "ex::copy",
-    "ex::join",
-    "ex::yank",
-    "ex::norm",
-    "ex::nohlsearch",
     "ex::read",
     "ex::reg",
     "ex::registers",
@@ -8810,7 +9182,6 @@ const COVERAGE_EXEMPT: &[&str] = &[
     "ex::#",
     "ex::number",
     "ex::print",
-    "ex::ma",
     "ex::saveas {file}",
     "ex::update",
     "ex::windo {cmd}",
@@ -8902,6 +9273,7 @@ fn run_case(case: &Case) -> Outcome {
         case.cursor_col,
         case.keys,
         nvim.rows,
+        nvim.cols,
         case.setup,
     );
     let nvim_buf = nvim.buf.join("\n");
@@ -9734,6 +10106,7 @@ fn sol_probe(setup: &str) -> (usize, usize) {
         1,
         "G",
         24,
+        80,
         setup,
     );
     (line, col)
@@ -9766,20 +10139,31 @@ fn case_setup_reaches_the_vimcode_side() {
 fn every_setup_option_the_corpus_uses_changes_vimcode_behaviour() {
     // 'joinspaces' — two spaces after a `.` when joining.
     let joined =
-        |setup: &str| run_in_vimcode("self-test:js", &["end.", "next"], 1, 1, "J", 24, setup).0;
+        |setup: &str| run_in_vimcode("self-test:js", &["end.", "next"], 1, 1, "J", 24, 80, setup).0;
     assert_eq!(joined("vim.o.joinspaces=true"), "end.  next");
     assert_eq!(joined(""), "end. next");
 
     // 'smarttab' — <BS> at the start of indent eats a whole shiftwidth with it
     // on, one column with it off.
-    let bs =
-        |setup: &str| run_in_vimcode("self-test:sta", &["    a"], 1, 5, "i<BS><Esc>", 24, setup).0;
+    let bs = |setup: &str| {
+        run_in_vimcode(
+            "self-test:sta",
+            &["    a"],
+            1,
+            5,
+            "i<BS><Esc>",
+            24,
+            80,
+            setup,
+        )
+        .0
+    };
     assert_eq!(bs("vim.o.smarttab=false"), "   a");
     assert_eq!(bs(""), "a");
 
     // 'nrformats' — octal must be opted into; alpha likewise.
     let inc = |lines: &'static [&'static str], setup: &str| {
-        run_in_vimcode("self-test:nf", lines, 1, 1, "<C-a>", 24, setup).0
+        run_in_vimcode("self-test:nf", lines, 1, 1, "<C-a>", 24, 80, setup).0
     };
     assert_eq!(inc(&["007"], "vim.o.nrformats='bin,octal,hex'"), "010");
     assert_eq!(inc(&["007"], ""), "008");
@@ -9787,8 +10171,9 @@ fn every_setup_option_the_corpus_uses_changes_vimcode_behaviour() {
     assert_eq!(inc(&["a"], ""), "a");
 
     // 'autoindent' — `o` off a `    foo` line.
-    let open =
-        |setup: &str| run_in_vimcode("self-test:ai", &["    foo"], 1, 1, "ox<Esc>", 24, setup).0;
+    let open = |setup: &str| {
+        run_in_vimcode("self-test:ai", &["    foo"], 1, 1, "ox<Esc>", 24, 80, setup).0
+    };
     assert_eq!(open("vim.o.autoindent=false"), "    foo\nx");
     assert_eq!(open(""), "    foo\n    x");
 }
@@ -11693,7 +12078,6 @@ const OPTION_COVERAGE_EXEMPT: &[&str] = &[
     "relativenumber",
     "ruler",
     "showcmd",
-    "wrap",
     // Search-highlight and incremental-search state: the corpus compares
     // buffer text and cursor position, never highlight extents.
     "hlsearch",
@@ -25711,13 +26095,20 @@ const NORMAL_AUDIT: &[NormAudit] = &[
             "line 01|line 02|line 03|line 04|line 05|line 06|line 07|line 08|line 09|line 10|line 11|line 12|line 13|line 14|line 15|line 16|line 17|line 18|line 19|line 20|line 21|line 22|line 23|line 24|line 25|line 26|line 27|line 28|line 29|line 30",
             (1, 1),
             "NORMAL",
-            "3 lines folded",
+            // #1280: `3zF` folds 3 total lines (count includes the header),
+            // not 4 — this recording used to claim otherwise (`4 lines`,
+            // range `1,5-30`) because `cmd_fold_create`'s `end` was computed
+            // as `line + count` instead of `line + count - 1`, an off-by-one
+            // measured against the real oracle (`3zF` then `j` landed on
+            // line 5, not Neovim's line 4 — see `fold:zF folds a count of
+            // lines`).
+            "2 lines folded",
             1,
             1,
-            "1,5-30",
+            "1,4-30",
             "1* tabs=1/1",
         )),
-        Some(Label("fold:zF folds N lines")),
+        Some(Label("fold:zF folds a count of lines")),
         "matches Vim: creates a fold for N lines (\"3 lines folded\").",
     ),
     na(
@@ -26971,7 +27362,6 @@ const NORM_COVERAGE_EXEMPT: &[&str] = &[
     "zC",
     "zD",
     "zE",
-    "zF",
     "zG",
     "zH",
     "zL",

@@ -3643,9 +3643,13 @@ impl Engine {
             let trimmed = line.trim();
             if trimmed.contains("*/") {
                 self.view_mut().cursor.line = line_idx;
-                // Position cursor at the '*' of '*/'
+                // Position cursor on the '/' of '*/' — Neovim lands on the
+                // *last* character of the closing marker, the mirror image
+                // of `[*`/`[/` landing on the first character of `/*`
+                // (#1280: this used to point at the '*' instead, one column
+                // short of Neovim).
                 if let Some(pos) = line.find("*/") {
-                    let col = line[..pos].chars().count();
+                    let col = line[..pos].chars().count() + 1;
                     self.view_mut().cursor.col = col;
                 } else {
                     self.view_mut().cursor.col = 0;

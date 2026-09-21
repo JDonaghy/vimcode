@@ -5100,10 +5100,22 @@ impl Engine {
         }
     }
 
-    /// zx — recompute folds: open all, then close all.
+    /// zx — recompute folds: open all, re-apply 'foldlevel' (closing them
+    /// again), then `zv` — Neovim's own doc for `zx` is literally "re-apply
+    /// 'foldlevel', then do zv: View cursor line" (`:h zx`). #1280: this used
+    /// to skip the `zv` step, so a cursor left inside the range that just got
+    /// reclosed stayed clamped to the fold's header — Neovim leaves the
+    /// cursor's line number untouched and only *displays* the header, exactly
+    /// like the plain `zM` case. `cmd_fold_close_all` clamps (correct for
+    /// `zM`, which has no trailing `zv`), so `zx` has to capture the cursor's
+    /// line first and hand it back to `cmd_fold_open_cursor_visible` rather
+    /// than trust whatever `cmd_fold_close_all` left it at.
     pub(crate) fn cmd_fold_recompute(&mut self) {
+        let cursor_line = self.view().cursor.line;
         self.view_mut().open_all_folds();
         self.cmd_fold_close_all();
+        self.view_mut().cursor.line = cursor_line;
+        self.cmd_fold_open_cursor_visible();
     }
 
     /// zj — move to the start of the next fold (open or closed — any

@@ -355,14 +355,16 @@ impl Engine {
     /// When wrap is off, equivalent to `$`.
     pub(crate) fn move_screen_line_end(&mut self) {
         let line = self.view().cursor.line;
-        let line_len = self
-            .buffer()
-            .content
-            .line(line)
-            .len_chars()
-            .saturating_sub(1); // exclude newline
+        // #1280: `get_max_cursor_col` (what plain `$` uses) is the
+        // newline-safe way to find the line's last real column — a raw
+        // `.len_chars().saturating_sub(1)` assumes every line ends with
+        // `\n`, which the buffer's last line does not when the source file
+        // itself has no trailing newline, undercounting that line's length
+        // by one and landing `g$`/`g<End>` one column short of Neovim there.
+        let max_col = self.get_max_cursor_col(line);
+        let line_len = max_col + 1;
         if !self.settings.wrap {
-            self.view_mut().cursor.col = line_len.saturating_sub(1);
+            self.view_mut().cursor.col = max_col;
         } else {
             let vp = self.view().viewport_cols.max(1);
             let col = self.view().cursor.col;
