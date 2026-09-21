@@ -2236,15 +2236,25 @@ impl Engine {
                             .min(self.buffer().len_lines().saturating_sub(1));
                         let end_pos =
                             self.buffer().line_to_char(line) + self.last_non_blank_col(line);
-                        self.view_mut().cursor = start_cursor;
                         // g_ is inclusive of its landing character (:help
                         // g_); swap the endpoints when the cursor starts past
                         // the last non-blank (e.g. sitting in trailing
-                        // whitespace), same as the `ge`/`gE` arms above.
+                        // whitespace), same as the `ge`/`gE` arms above. In
+                        // that swapped case `lo` is `end_pos`, not
+                        // `start_pos` — the cursor must land on `lo`, not
+                        // unconditionally back on `start_cursor`, or a `dg_`
+                        // from mid-trailing-whitespace leaves the cursor one
+                        // column right of where Neovim puts it (#1279).
                         let (lo, hi) = if end_pos >= start_pos {
                             (start_pos, end_pos)
                         } else {
                             (end_pos, start_pos)
+                        };
+                        let lo_line = self.buffer().content.char_to_line(lo);
+                        let lo_col = lo - self.buffer().line_to_char(lo_line);
+                        self.view_mut().cursor = Cursor {
+                            line: lo_line,
+                            col: lo_col,
                         };
                         let hi = (hi + 1).min(self.buffer().len_chars());
                         self.apply_charwise_operator_inclusive(op, lo, hi, changed);
