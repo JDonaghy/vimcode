@@ -511,20 +511,18 @@ fn tui_copy_to_clipboard(text: &str, engine: &mut Engine) {
     engine.message = format!("Link: {} (clipboard unavailable)", text);
 }
 
-/// Sync the unnamed `"` register to the system clipboard if its content changed.
-/// Must be called after every keypress that might have yanked/cut text.
+/// Sync the `+` register, falling back to the unnamed `"` register, to the
+/// system clipboard if the mirrored content changed. Must be called after
+/// every keypress that might have yanked/cut text.
+///
+/// Thin wrapper — see [`crate::render::sync_register_to_clipboard`] (#1239)
+/// for the shared implementation GTK's `App::sync_plus_register_to_clipboard`
+/// also delegates to. TUI used to mirror `"` only, so a plain yank/delete
+/// after an explicit `+` write (e.g. `"+yy` then a bare `dd` elsewhere) could
+/// clobber the clipboard's mirror of the `+` write instead of leaving it in
+/// place.
 fn sync_tui_clipboard(engine: &mut Engine, last: &mut Option<String>) {
-    let current = engine
-        .registers
-        .get(&'"')
-        .filter(|(s, _)| !s.is_empty())
-        .map(|(s, _)| s.clone());
-    if current != *last {
-        if let (Some(ref text), Some(ref cb_write)) = (&current, &engine.clipboard_write) {
-            let _ = cb_write(text.as_str());
-        }
-        *last = current;
-    }
+    crate::render::sync_register_to_clipboard(engine, last);
 }
 
 /// The TUI entry point: initialise the engine and drive it through

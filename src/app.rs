@@ -2330,29 +2330,14 @@ impl App {
 
     /// Sync the unnamed `"` register (and explicit `+` register) to the system clipboard
     /// whenever their content changes (clipboard=unnamedplus semantics).
+    ///
+    /// Thin wrapper — see [`render::sync_register_to_clipboard`] (#1239) for
+    /// the shared implementation TUI's `sync_tui_clipboard` also delegates to.
     fn sync_plus_register_to_clipboard(&mut self) {
-        let engine = self.engine.borrow();
-        // Check both `"` (auto-yank) and `+` (explicit clipboard writes from plugins)
-        let new_content = engine
-            .registers
-            .get(&'+')
-            .filter(|(s, _)| !s.is_empty())
-            .map(|(s, _)| s.clone())
-            .or_else(|| {
-                engine
-                    .registers
-                    .get(&'"')
-                    .filter(|(s, _)| !s.is_empty())
-                    .map(|(s, _)| s.clone())
-            });
-
-        if new_content != self.last_clipboard_content {
-            if let (Some(ref content), Some(ref cb)) = (&new_content, &engine.clipboard_write) {
-                let _ = cb(content.as_str());
-            }
-            drop(engine);
-            self.last_clipboard_content = new_content;
-        }
+        render::sync_register_to_clipboard(
+            &mut self.engine.borrow_mut(),
+            &mut self.last_clipboard_content,
+        );
     }
 
     #[allow(clippy::too_many_lines)]
