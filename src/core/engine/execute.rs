@@ -3222,15 +3222,16 @@ impl Engine {
     /// (`seq`) order — the same order `g-`/`g+`/`:earlier`/`:later` walk —
     /// marking the buffer's current position with `>`, like Vim's `:h
     /// :undolist` (columns simplified: Vim's `changes` count is the number
-    /// of *lines* touched, which vimcode doesn't track per-node, so this
-    /// shows the `seq` twice — once as the undo number, once standing in for
-    /// "how many edits deep" — rather than fabricate a lines-changed count).
+    /// of *lines* touched, which vimcode doesn't track per-node, so that
+    /// column is omitted here rather than fabricated — it would always be
+    /// identical to the `number` column next to it and read as meaningful
+    /// when it isn't).
     fn ex_undolist(&mut self) -> EngineAction {
         let bs = self.active_buffer_state();
         let current_seq = bs.undo_tree.current_seq();
         let nodes = bs.undo_tree.live_nodes_for_listing();
         let now = std::time::SystemTime::now();
-        let mut lines = vec!["    number  changes  seconds ago".to_string()];
+        let mut lines = vec!["    number  seconds ago".to_string()];
         for n in nodes {
             if n.seq == 0 {
                 continue; // root: the pre-edit state, Vim's :undolist omits it too
@@ -3240,10 +3241,7 @@ impl Engine {
                 .duration_since(n.timestamp)
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
-            lines.push(format!(
-                "{marker}   {:4}  {:7}  {:4}",
-                n.seq, n.seq, secs_ago
-            ));
+            lines.push(format!("{marker}   {:4}  {:4}", n.seq, secs_ago));
         }
         self.message = lines.join("\n");
         EngineAction::None

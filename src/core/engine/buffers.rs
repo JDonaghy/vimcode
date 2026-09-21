@@ -429,24 +429,33 @@ impl Engine {
             spec.parse()
                 .map_err(|_| format!("E475: Invalid argument: {spec}"))?
         };
-        let mut moved = 0;
+        // Step directly via `undo_older`/`undo_newer` rather than delegating
+        // to `g_earlier`/`g_later` — those hardcode the `"g-"`/`"g+"` label
+        // in their own `report_undo_nav` call, which would make `:earlier`/
+        // `:later` print a `g-`/`g+` status message instead of using
+        // `label` (computed above from the ex command actually invoked).
+        let mut last_cursor = None;
         for _ in 0..count {
+            let bs = self.active_buffer_state_mut();
             let stepped = if earlier {
-                self.g_earlier()
+                bs.undo_older()
             } else {
-                self.g_later()
+                bs.undo_newer()
             };
-            if !stepped {
-                break;
+            match stepped {
+                Some(cursor) => last_cursor = Some(cursor),
+                None => break,
             }
-            moved += 1;
         }
-        if moved == 0 {
-            self.message = if earlier {
-                "Already at oldest change".to_string()
-            } else {
-                "Already at newest change".to_string()
-            };
+        match last_cursor {
+            Some(cursor) => self.report_undo_nav(cursor, label),
+            None => {
+                self.message = if earlier {
+                    "Already at oldest change".to_string()
+                } else {
+                    "Already at newest change".to_string()
+                };
+            }
         }
         Ok(())
     }

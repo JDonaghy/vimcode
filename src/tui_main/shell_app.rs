@@ -20572,6 +20572,177 @@ mod tests {
         );
     }
 
+    /// #1156: undo used to be a single linear stack — `u` followed by a
+    /// *different* edit permanently discarded whatever branch `u` had left,
+    /// so no keystroke could ever get back to it. `g-`/`g+` now walk the
+    /// whole undo tree in chronological order, crossing into a branch a
+    /// plain `u` + new edit abandoned. End-to-end through the real
+    /// `driver_with_shell` harness (quadraui's `TuiDriver`), guarding
+    /// against exactly the class of bug #1160 found: a global key
+    /// (`<C-x><C-l>`) silently swallowed above the engine layer, invisible
+    /// to engine-only tests. `g`/`-`/`+` are equally global, so this proves
+    /// the keystrokes reach `Engine::g_earlier`/`g_later` and the crossing
+    /// paints correctly, not just that the engine method works in
+    /// isolation.
+    ///
+    /// **Verified RED against unfixed `develop`:** with the old
+    /// `undo_stack`/`redo_stack`/`undo_timeline` linear design, the second
+    /// edit (`ZQXW1156WORLD`) cleared `redo_stack` and `undo_timeline` was
+    /// `truncate`d, so neither `g-` nor any other keystroke could reach
+    /// `ZQXW1156HELLO` again — the first `g-` landed straight on the empty
+    /// root instead of the abandoned branch.
+    #[test]
+    fn g_minus_crosses_undo_branch_abandoned_by_u_then_edit_via_shell_app() {
+        let app = TuiShellApp::new_for_test();
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        driver.press_named(quadraui::NamedKey::Escape);
+        driver.render();
+
+        for c in "iZQXW1156HELLO".chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Escape);
+        driver.render();
+        let screen = driver.screen();
+        assert!(
+            screen.contains("ZQXW1156HELLO"),
+            "the first insert must have landed; screen:\n{screen}"
+        );
+
+        // `u` back to the empty root, then a *different* edit — the point
+        // at which a linear undo_stack design permanently discarded
+        // "ZQXW1156HELLO".
+        driver.type_char('u');
+        driver.render();
+        let screen = driver.screen();
+        assert!(
+            !screen.contains("ZQXW1156HELLO"),
+            "u must undo the first insert; screen:\n{screen}"
+        );
+
+        for c in "iZQXW1156WORLD".chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Escape);
+        driver.render();
+        let screen = driver.screen();
+        assert!(
+            screen.contains("ZQXW1156WORLD") && !screen.contains("ZQXW1156HELLO"),
+            "the second, different insert must have replaced the first; \
+             screen:\n{screen}"
+        );
+
+        // A single g- already crosses into the abandoned branch, since
+        // "ZQXW1156HELLO" was recorded before "ZQXW1156WORLD" regardless of
+        // which branch either sits on.
+        driver.type_char('g');
+        driver.type_char('-');
+        driver.render();
+        let screen = driver.screen();
+        assert!(
+            screen.contains("ZQXW1156HELLO") && !screen.contains("ZQXW1156WORLD"),
+            "g- must cross into the branch u + a new edit abandoned; \
+             screen:\n{screen}"
+        );
+
+        // A second g- continues past it to the shared empty root.
+        driver.type_char('g');
+        driver.type_char('-');
+        driver.render();
+        let screen = driver.screen();
+        assert!(
+            !screen.contains("ZQXW1156HELLO") && !screen.contains("ZQXW1156WORLD"),
+            "a second g- must reach the empty root past the abandoned \
+             branch; screen:\n{screen}"
+        );
+
+        // g+ retraces the same chronological path forward, landing back on
+        // the abandoned branch and then on "world".
+        driver.type_char('g');
+        driver.type_char('+');
+        driver.render();
+        let screen = driver.screen();
+        assert!(
+            screen.contains("ZQXW1156HELLO") && !screen.contains("ZQXW1156WORLD"),
+            "g+ must retrace back through the abandoned branch first; \
+             screen:\n{screen}"
+        );
+        driver.type_char('g');
+        driver.type_char('+');
+        driver.render();
+        let screen = driver.screen();
+        assert!(
+            screen.contains("ZQXW1156WORLD") && !screen.contains("ZQXW1156HELLO"),
+            "a second g+ must land back on world; screen:\n{screen}"
+        );
+    }
+
+    /// #1156: `:undolist`, `:earlier`, and `:later` are new ex commands with
+    /// no prior driver coverage. Exercises them through the real command
+    /// line (`:` + `Enter`, the same path a user types), checking both that
+    /// `:earlier`/`:later` actually move the buffer across the same
+    /// abandoned branch `g-`/`g+` cross above, and that the status message
+    /// they report says "earlier"/"later" rather than "g-"/"g+" (the
+    /// `ex_earlier_later` count path used to delegate to `g_earlier`/
+    /// `g_later`, which hardcode their own label into the reported
+    /// message).
+    #[test]
+    fn ex_earlier_later_and_undolist_via_shell_app() {
+        let app = TuiShellApp::new_for_test();
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        driver.press_named(quadraui::NamedKey::Escape);
+        driver.render();
+
+        for c in "iZQXW1156EARL".chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Escape);
+        driver.render();
+
+        for c in ":undolist".chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
+        driver.render();
+        let screen = driver.screen();
+        assert!(
+            screen.contains("number") && screen.contains("seconds ago"),
+            ":undolist must print its header; screen:\n{screen}"
+        );
+
+        for c in ":earlier 1".chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
+        driver.render();
+        let screen = driver.screen();
+        assert!(
+            !screen.contains("ZQXW1156EARL"),
+            ":earlier 1 must undo the only change; screen:\n{screen}"
+        );
+        assert!(
+            screen.contains("earlier") && !screen.contains("g-"),
+            ":earlier's status message must say \"earlier\", not \"g-\"; \
+             screen:\n{screen}"
+        );
+
+        for c in ":later 1".chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
+        driver.render();
+        let screen = driver.screen();
+        assert!(
+            screen.contains("ZQXW1156EARL"),
+            ":later 1 must redo the change :earlier 1 undid; screen:\n{screen}"
+        );
+        assert!(
+            screen.contains("later") && !screen.contains("g+"),
+            ":later's status message must say \"later\", not \"g+\"; \
+             screen:\n{screen}"
+        );
+    }
+
     /// #887: `ap`'s trailing-blank-block preference must fall back to the
     /// *leading* blank block when the cursor's paragraph is the last one in
     /// the buffer (no trailing blank exists to select instead). Verified
