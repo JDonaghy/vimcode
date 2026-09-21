@@ -1313,33 +1313,18 @@ pub(crate) fn assert_text_metrics_backend_applies_metrics<B: TextMetricsBackend>
 // meant to dismiss an open picker could be swallowed by a panel intercept
 // instead of ever reaching the picker's own dismiss routing. Folded into
 // the same `intercepts_blocked` gate every panel intercept already shares.
-pub(crate) const KNOWN_BUGS: &[&str] = &[
-    // ── #1090's plugin-panel scenarios, macOS arm only ──────────────────
-    //
-    // #1089 fixed the shared `crate::app::App` paint/click path
-    // (`src/app.rs`'s `ext:` arm + `try_route_sidebar_mouse_event`'s
-    // `ExtPanel` arm) that `gtk`, `macos`, `win` and the `tui` *control*
-    // arm all wrap — it now paints a `PanelRegistration`'s own sections via
-    // `render::ext_panel_to_tree_view` + `Backend::draw_tree`, the same
-    // adapter `tui_main::panels::render_ext_panel` (the `tui_prod` arm) was
-    // already using, instead of falling through to the extension
-    // marketplace (`render::populate_ext_sidebar_system`) for every
-    // `ext:<name>` id. The `gtk` and `tui` (shared `App`) arms below are
-    // confirmed green as of that fix — their entries are gone from this
-    // list.
-    //
-    // The `macos` arm is left gated: this fix was written and verified on
-    // Linux (no macOS runner in this environment — see `docs/RELEASING.md`'s
-    // per-backend lane notes), and while the paint/click code it exercises
-    // is the identical shared `App` path, `PROJECT_STATE.md`'s existing
-    // "needs macmini confirmation" pattern applies here too rather than
-    // assuming platform parity sight-unseen. The moment a macOS run finds
-    // one of these passing, `known_bug_gate` fails loudly with the exact
-    // entry to delete — this is not a silent bit to lose track of.
-    "plugin_panel_section_header_hit_band::macos", // #1089
-    "plugin_panel_item_row_hit_band::macos",       // #1089
-    "plugin_panel_hover_card_anchors::macos",      // #1089
-];
+///
+/// Empty as of #1276: #1089 fixed the shared `crate::app::App` paint/click
+/// path (`src/app.rs`'s `ext:` arm + `try_route_sidebar_mouse_event`'s
+/// `ExtPanel` arm) for all four backends, but its three `::macos`-suffixed
+/// plugin-panel scenarios were left gated here because there was no macOS
+/// runner available to confirm them at the time. The macOS native/AppKit CI
+/// lane has since confirmed all three pass, so `known_bug_gate` fired
+/// exactly as designed (see its doc comment) and those entries were
+/// deleted. Every scenario in this suite now takes the plain `Pass` /
+/// `Regression` arms of [`GateOutcome`] — there is currently no bug this
+/// table needs to track.
+pub(crate) const KNOWN_BUGS: &[&str] = &[];
 
 /// A saved `std::panic::set_hook`/`take_hook` closure — named so
 /// `known_bug_gate_outcome`'s suppress/restore `RestoreHook` doesn't need
