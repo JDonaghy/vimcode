@@ -2011,6 +2011,11 @@ const CASES_OP: &[Case] = &[
     c("op:3X", &["abcdef"], 1, 5, "3X"),
     c("op:5X beyond start", &["abcdef"], 1, 3, "5X"),
     c("op:dg_", &["  abc  "], 1, 1, "dg_"),
+    // Cursor starts past the last non-blank, mid-trailing-whitespace (not
+    // the line's very last column) — exercises the "swap the endpoints"
+    // branch, where the post-delete cursor must land on the (swapped) low
+    // end, not on the pre-motion column (#1279).
+    c("op:dg_ from trailing ws", &["  abc      "], 1, 6, "dg_"),
     c("op:dh at col1", &["abc", "def"], 2, 1, "dh"),
     c("op:dl at eol", &["abc"], 1, 3, "dl"),
     c("op:d3l beyond eol", &["abc"], 1, 2, "d3l"),
@@ -8476,22 +8481,25 @@ const COMMAND_PROBES: &[CommandProbe] = &[
 // itself reads "422/424, 100% — Remaining Missing Commands: None", which is a
 // claim about *existence*, and `COVERAGE_PHASE5.md` audits 2 of 6 areas.
 //
-// Where the gap is, at a glance (uncovered / in-scope, seeded 2026-09):
+// Where the gap is, at a glance (uncovered / in-scope, seeded 2026-09,
+// updated 2026-09 by #1279 which retired the text-object, operator-pending,
+// visual, movement, editing and `'<` rows below):
 //
 //     Core Vim ex commands       84/111  :w :q :bn :ls :marks :grep …
 //     Window commands (CTRL-W)   33/33   nothing in the corpus presses <C-w>
-//     g-commands                 22/50   gt gT gf gF ga g8 gx gR g@ g+ …
-//                                        (`g-` left this list in #1156)
-//     Bracket commands           17/26   ]c [c ]d [d [m ]m [* ]* [# ]# …
+//     g-commands                 19/50   gt gT gf gF ga g8 gx gR g@ g+ …
+//                                        (`g-` left this list in #1156,
+//                                        `g0`/`gm`/`gM` in #1279)
+//     Bracket commands           16/26   ]c [c ]d [d [m ]m [* ]* [# ]# …
 //     Normal — other             16/34   gt gT gf gF K ga g8 gx q: q/ q? …
-//     Text objects               10/32   every closing-bracket alias, a' a`
-//     Operator-pending           10/59   d{ d} d; d, dF dT and the o_ forces
 //     z-commands                 10/28   zA zF zv zx zh zl zH zL ze zs
-//     Normal — search & marks     4/31   // /<CR> aliases, `{A-Z}, '<, g' g`
-//     Normal — movement           4/48   l g0 gm gM
-//     Visual mode                 3/38   P, CTRL-X, g CTRL-X
+//     Normal — search & marks     3/31   // /<CR> aliases, `{A-Z}, g' g`
 //     Insert mode                 2/23   CTRL-@, CTRL-G j/k
-//     Normal — editing            1/50   [p
+//     Text objects                0/32   (all retired by #1279)
+//     Operator-pending            0/59   (all retired by #1279)
+//     Normal — movement           0/48   (all retired by #1279)
+//     Visual mode                 0/38   (all retired by #1279)
+//     Normal — editing            0/50   (all retired by #1279)
 //
 // Deleting an entry is how an oracle case proves itself: the gate fails if a
 // listed id's probe starts matching, and fails if an unlisted id's probe
