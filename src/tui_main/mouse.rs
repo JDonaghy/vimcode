@@ -2372,7 +2372,12 @@ pub(super) fn handle_mouse(
     // in one gesture rather than re-seeking against the strip's own
     // scroll-following window every move.
     if let Some(layout) = last_layout {
-        if let Some(press) = render::minimap_press(engine, layout, col as f64, row as f64) {
+        // #1271: Alt held at press time arms the fine-seek virtual track
+        // (`~MINIMAP_LINES_PER_ROW` lines/cell against the painted window)
+        // instead of the default file-wide one (#1187) — see
+        // `render::minimap_press`'s `fine` parameter doc.
+        let fine = ev.modifiers.contains(KeyModifiers::ALT);
+        if let Some(press) = render::minimap_press(engine, layout, col as f64, row as f64, fine) {
             if press.jump {
                 render::apply_minimap_click(engine, layout, col as f64, row as f64);
             } else {

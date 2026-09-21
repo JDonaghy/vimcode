@@ -2013,6 +2013,7 @@ impl App {
                     &self.cached_tab_bar_zones.borrow(),
                     true, // real click: focus/tab/gutter side effects are intended
                     &mut drag,
+                    false, // Ctrl+click has no Alt-fine-seek concept
                 ) {
                     engine.add_cursor_at_pos(line, col);
                 }
@@ -4470,6 +4471,7 @@ impl App {
             &self.cached_tab_bar_zones.borrow(),
             true, // resolving the original tab-bar mouse-down; switching tabs is intended
             &mut drag_rc.borrow_mut(),
+            false, // re-resolving a tab-bar press; the minimap rung cannot match here
         );
         if !matches!(target, ClickTarget::TabBar) {
             return None;
