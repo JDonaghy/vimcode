@@ -16152,3 +16152,2283 @@ fn ex_audit_gates_are_bidirectional() {
         "an exemption naming a ⏭️ row must be reported as stale"
     );
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// #1228 — Phase 5 audit slice 4/5: `:help visual-index`
+//
+// The fourth `:help`-area walk in the #26 audit, tagging every Visual-mode
+// command Implemented / Partial / NotImplemented / Skipped against the live
+// engine. Source: the **pinned fleet oracle's own** documentation — Neovim
+// v0.12.5's `runtime/doc/index.txt` §3, the same Vim every other gate in this
+// file compares against — walked end to end, all **84** rows:
+//
+//     ✅ Implemented       65
+//     🟡 Partial            6
+//     ❌ Not implemented   11
+//     ⏭️  Skipped            2   (each carrying a reason from SKIP_REASONS)
+//                          ──
+//                          84
+//
+// Unlike #1227's slice this one does *not* grow the denominator much —
+// `VIM_COMPATIBILITY.md`'s "Visual Mode" section and the operator/text-object
+// corpus already cover this ground well, and the tally above says so: 77% of
+// the area matches Neovim keystroke-for-keystroke. The value here is the 17
+// rows that do not, and in particular the four where vimcode does something
+// **destructive** rather than nothing (see the module-level findings in the
+// PR body): `CTRL-C`, `CTRL-\ CTRL-N`, `a>`/`i>` and `!{filter}`.
+//
+// ## Gate 1 — the recorded behaviour must match the live engine
+//
+// Every non-Skipped row carries a [`VisLive`] recording: real keystrokes over
+// a real buffer, plus the buffer, cursor, **mode indicator** and
+// `engine.message` vimcode produced when the slice ran.
+// [`visual_audit_matches_the_live_engine`] replays all 82 and diffs. That is
+// the bidirectional half — implementing `a<` or fixing `CTRL-C` changes its
+// recording and fails the gate until the row is re-tagged, and a row claiming
+// Implemented for something that regresses fails immediately.
+//
+// The recording is a black-box observation — keys in, rendered buffer +
+// cursor + the status line's own mode string (`Engine::mode_str`, what both
+// backends paint) + message out. Never an engine field: a gate that asserted
+// `engine.visual_start` was `Some` would have passed throughout every one of
+// the ❌ rows below, because vimcode *is* in Visual mode for all of them; what
+// is wrong is what the keystroke then does.
+//
+// Mode is recorded because most of this area is about mode transitions, and
+// buffer+cursor cannot see them. `v_v`'s whole content is "stop Visual mode";
+// without the mode column its recording is indistinguishable from a no-op.
+//
+// ## Why several recordings end in an operator
+//
+// A text object in Visual mode only *extends the selection* — the buffer does
+// not change, so a recording of `va(` alone would pin nothing. Each
+// text-object row therefore records `v{object}d`: the region the `d` removes
+// **is** the selection the object made, read back out of the rendered buffer.
+// Same reason `v_P`/`v_p` end in a second paste (it is the only way to see
+// whether the unnamed register was clobbered) and `v_V`/`v_CTRL-V` end in an
+// `x` (it is the only way to see that the *second* `V`/`CTRL-V` stopped
+// Visual mode rather than re-entering it).
+//
+// ## [`Touch`] — "silently mangles the buffer" is worse than "does nothing"
+//
+// Same role [`Report`] plays in #1226. For a ❌ row, a silent no-op leaves the
+// user's text intact; a row that *modifies the buffer* while doing the wrong
+// thing is strictly worse, because the user's next keystroke lands on text
+// they did not expect. Six of this slice's 11 ❌ rows are `Modified`, and
+// [`visual_audit_is_internally_consistent`] pins that count, so a future
+// change that quietly adds a seventh has to say so.
+//
+// ## Gate 2 — oracle coverage, same shrink-only shape as #1007
+//
+// Every non-Skipped row also carries a [`Probe`] naming the oracle case that
+// exercises it; [`VISUAL_COVERAGE_EXEMPT`] lists the 39 no case reaches
+// today. Both directions fail, exactly as in `COVERAGE_EXEMPT`. Writing the
+// missing cases is #1162's job, not this slice's.
+//
+// ## Out of scope, deliberately
+//
+// Select mode itself (`gH`, `gV`, `g CTRL-H`) belongs to the g-prefix slice
+// and is parked as **#1193**; the four visual-index rows that reach into it
+// (`CTRL-G`, `CTRL-O`, `<BS>`, `CTRL-H`) cite #1193 rather than filing a
+// duplicate. `:help visual-index`'s opening sentence — "most commands in
+// Visual mode are the same as in Normal mode" — means the motions are *not*
+// here: they are `:help motion.txt`, i.e. another slice.
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Whether the recorded run left the buffer changed.
+///
+/// A recorded, re-measured column rather than a derived bool, for the same
+/// reason [`Report`] is one: for a ❌ row, `Modified` means vimcode mangled
+/// the user's text on its way to doing the wrong thing, which is strictly
+/// worse than refusing. `Modified` on an ✅ row is just "the command edits" —
+/// the column describes the recording, the verdict is `status`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Touch {
+    /// The recorded run changed the buffer.
+    Modified,
+    /// The recorded run left the buffer byte-identical to the fixture.
+    Unchanged,
+}
+
+use crate::Touch::{Modified, Unchanged};
+
+fn measured_touch(lines: &[&str], buffer: &str) -> Touch {
+    if buffer == lines.join("|") {
+        Touch::Unchanged
+    } else {
+        Touch::Modified
+    }
+}
+
+/// One black-box observation of what vimcode does **today** in Visual mode:
+/// keys in, rendered buffer + cursor + painted mode string + message out.
+/// Replayed by gate 1.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct VisLive {
+    /// Starting buffer, one `&str` per line.
+    lines: &'static [&'static str],
+    /// Starting cursor, 1-indexed `(line, col)`.
+    at: (usize, usize),
+    /// Keys to send, in the corpus's `<C-v>`/`<Esc>`/`<CR>` notation.
+    keys: &'static str,
+    /// Resulting buffer, lines joined with `|`.
+    buffer: &'static str,
+    /// Resulting cursor, 1-indexed `(line, col)`.
+    cursor: (usize, usize),
+    /// `Engine::mode_str()` afterwards — the string both backends paint in
+    /// the status line ("NORMAL", "VISUAL", "VISUAL LINE", "VISUAL BLOCK",
+    /// "INSERT", …).
+    mode: &'static str,
+    /// `engine.message` afterwards, verbatim; `""` when vimcode said nothing.
+    message: &'static str,
+}
+
+const fn vlive(
+    lines: &'static [&'static str],
+    at: (usize, usize),
+    keys: &'static str,
+    buffer: &'static str,
+    cursor: (usize, usize),
+    mode: &'static str,
+    message: &'static str,
+) -> VisLive {
+    VisLive {
+        lines,
+        at,
+        keys,
+        buffer,
+        cursor,
+        mode,
+        message,
+    }
+}
+
+struct VisualAudit {
+    /// The command as `:help visual-index` writes it — the table's unique key.
+    item: &'static str,
+    /// The `:help` tag it is documented under (`v_…`).
+    help: &'static str,
+    status: OptStatus,
+    /// Whether the recording changed the buffer; re-measured by gate 1.
+    touch: Touch,
+    /// `Some` for every non-Skipped row.
+    live: Option<VisLive>,
+    /// Oracle probe; `Some` for every non-Skipped row.
+    probe: Option<Probe>,
+    /// For ❌: what Vim does, plus this slice's assessment of whether it is
+    /// worth implementing. For 🟡: exactly what is missing.
+    note: &'static str,
+}
+
+const fn vis(
+    item: &'static str,
+    help: &'static str,
+    status: OptStatus,
+    touch: Touch,
+    live: Option<VisLive>,
+    probe: Option<Probe>,
+    note: &'static str,
+) -> VisualAudit {
+    VisualAudit {
+        item,
+        help,
+        status,
+        touch,
+        live,
+        probe,
+        note,
+    }
+}
+
+const VA_TXT: &[&str] = &["alpha beta gamma", "delta epsilon zeta", "eta theta iota"];
+const VA_UP: &[&str] = &["ALPHA beta", "GAMMA delta"];
+const VA_NUM: &[&str] = &["count 7 here", "next 11 line"];
+const VA_NUMS: &[&str] = &["1 a", "1 b", "1 c"];
+const VA_Q: &[&str] = &[
+    "say \"hello there\" ok",
+    "it's 'a b' fine",
+    "run `cmd arg` now",
+];
+const VA_BR: &[&str] = &[
+    "foo(bar baz) qux",
+    "arr[one two] end",
+    "map{k v} tail",
+    "lt<a b> gt",
+];
+const VA_TAG: &[&str] = &["<div>hello there</div>"];
+const VA_PARA: &[&str] = &["alpha one", "beta two", "", "gamma three", "delta four"];
+const VA_SENT: &[&str] = &["One two. Three four. Five six."];
+const VA_IND: &[&str] = &["    alpha", "    beta", "    gamma"];
+
+/// Every command in `:help visual-index`, in `:help` order.
+///
+/// 84 rows, no "TODO" and no unreviewed row: adding one, deleting one, or
+/// leaving one without a note fails [`visual_audit_is_internally_consistent`].
+const VISUAL_AUDIT: &[VisualAudit] = &[
+    vis(
+        "CTRL-\\ CTRL-N",
+        "v_CTRL-\\_CTRL-N",
+        NotImplemented,
+        Modified,
+        Some(vlive(
+            VA_TXT,
+            (1, 1),
+            "vll<C-\\><C-n>d",
+            "ha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 1),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:<C-\\><C-n> stops visual")),
+        concat!(
+            "Vim leaves Visual mode for Normal; vimcode ignores both keys",
+            " and stays in Visual, so the recording's trailing `d` deletes",
+            " the selection the user believed was already cancelled. Worth",
+            " implementing: this is the canonical \"get me to Normal mode",
+            " from anywhere\" escape hatch.",
+        ),
+    ),
+    vis(
+        "CTRL-\\ CTRL-G",
+        "v_CTRL-\\_CTRL-G",
+        NotImplemented,
+        Unchanged,
+        Some(vlive(
+            VA_TXT,
+            (1, 1),
+            "vll<C-\\><C-g>d",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 3),
+            "VISUAL",
+            "",
+        )),
+        Some(Label("vis:<C-\\><C-g> goes to normal")),
+        concat!(
+            "Vim goes to Normal mode; vimcode ignores both keys and stays",
+            " in Visual (and swallows the following `d`). Low value on its",
+            " own, but it shares the `CTRL-\\` prefix with the escape hatch",
+            " above.",
+        ),
+    ),
+    vis(
+        "CTRL-A",
+        "v_CTRL-A",
+        Partial,
+        Modified,
+        Some(vlive(
+            VA_NUM,
+            (1, 1),
+            "v$<C-a>",
+            "count 8 here|next 11 line",
+            (1, 7),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("num:v C-a partial")),
+        concat!(
+            "the increment itself matches; the cursor is left on the last",
+            " digit of the number changed, where Vim puts it at the start",
+            " of the Visual area. The corpus cannot see this today —",
+            " `num:V C-a cursor`'s number is at column 1, so both answers",
+            " coincide there.",
+        ),
+    ),
+    vis(
+        "CTRL-C",
+        "v_CTRL-C",
+        NotImplemented,
+        Modified,
+        Some(vlive(
+            VA_TXT,
+            (1, 1),
+            "vll<C-c>d",
+            "dha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 2),
+            "INSERT",
+            "",
+        )),
+        Some(Label("vis:<C-c> stops visual")),
+        concat!(
+            "Vim stops Visual mode. vimcode treats `CTRL-C` as `c`: it",
+            " **deletes the selection and enters Insert mode**, so the one",
+            " key a user presses to cancel silently destroys the selected",
+            " text. Pinned by `ctrl_c_in_visual_mode_changes_the_selection",
+            " _instead_of_stopping_visual_mode`; the highest-severity",
+            " finding in this slice.",
+        ),
+    ),
+    vis(
+        "CTRL-G",
+        "v_CTRL-G",
+        NotImplemented,
+        Unchanged,
+        Some(vlive(
+            VA_TXT,
+            (1, 1),
+            "vll<C-g>d",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 3),
+            "VISUAL",
+            "",
+        )),
+        Some(Label("vis:<C-g> toggles select mode")),
+        concat!(
+            "toggles Visual <-> Select. vimcode has no Select mode",
+            " (parked as #1193), so `CTRL-G` is a silent no-op that also",
+            " swallows the next key — the recording's `d` never runs.",
+        ),
+    ),
+    vis(
+        "<BS>",
+        "v_<BS>",
+        Partial,
+        Modified,
+        Some(vlive(
+            VA_TXT,
+            (1, 6),
+            "vll<BS>d",
+            "alphaeta gamma|delta epsilon zeta|eta theta iota",
+            (1, 6),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:<BS> in select mode deletes")),
+        concat!(
+            "`:help` documents the Select-mode meaning (delete the",
+            " highlighted area). In *Visual* mode `<BS>` is the `h`",
+            " motion, which is exactly what vimcode does and what the",
+            " oracle does — the recording agrees with Neovim. Only the",
+            " Select-mode half is missing, with #1193.",
+        ),
+    ),
+    vis(
+        "CTRL-H",
+        "v_CTRL-H",
+        Partial,
+        Modified,
+        Some(vlive(
+            VA_TXT,
+            (1, 6),
+            "vll<C-h>d",
+            "alphaeta gamma|delta epsilon zeta|eta theta iota",
+            (1, 6),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:<C-h> in select mode deletes")),
+        concat!(
+            "same as `<BS>`: the Visual-mode `h` motion matches the",
+            " oracle, the Select-mode delete needs #1193.",
+        ),
+    ),
+    vis(
+        "CTRL-O",
+        "v_CTRL-O",
+        NotImplemented,
+        Modified,
+        Some(vlive(
+            VA_TXT,
+            (1, 1),
+            "vll<C-o>d",
+            "ha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 1),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:<C-o> select one visual command")),
+        concat!(
+            "Select -> Visual for one command. vimcode has no Select mode",
+            " (#1193), and `CTRL-O` in Visual instead runs the jumplist's",
+            " older-position jump, moving the cursor out of the selection.",
+        ),
+    ),
+    vis(
+        "CTRL-V",
+        "v_CTRL-V",
+        Implemented,
+        Modified,
+        Some(vlive(
+            VA_TXT,
+            (1, 1),
+            "v<C-v>jd<C-v>l<C-v>x",
+            "lha beta gamma|elta epsilon zeta|eta theta iota",
+            (1, 2),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vb:v then C-v switch")),
+        concat!(
+            "both halves recorded: `v<C-v>` switches a charwise selection",
+            " to blockwise (the block delete matches the oracle) and a",
+            " second `<C-v>` while already blockwise stops Visual mode, so",
+            " the trailing `x` deletes one character rather than a block.",
+        ),
+    ),
+    vis(
+        "CTRL-X",
+        "v_CTRL-X",
+        Partial,
+        Modified,
+        Some(vlive(
+            VA_NUM,
+            (1, 1),
+            "v$<C-x>",
+            "count 6 here|next 11 line",
+            (1, 7),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:v$<C-x> cursor")),
+        concat!(
+            "same cursor deviation as `CTRL-A`: the decrement is right,",
+            " the cursor ends on the last digit instead of at the start of",
+            " the Visual area.",
+        ),
+    ),
+    vis(
+        "<Esc>",
+        "v_<Esc>",
+        Implemented,
+        Unchanged,
+        Some(vlive(
+            VA_TXT,
+            (1, 1),
+            "vll<Esc>d",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 3),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:vll Esc cursor")),
+        concat!(
+            "stops Visual mode and leaves the cursor where Vim leaves it;",
+            " the trailing `d` is then an incomplete operator and changes",
+            " nothing.",
+        ),
+    ),
+    vis(
+        "CTRL-]",
+        "v_CTRL-]",
+        Skipped(CTAGS),
+        Unchanged,
+        None,
+        None,
+        concat!(
+            "jump to the highlighted tag. vimcode ships no tags file",
+            " support at all; go-to-definition is LSP (`gd`). Measured for",
+            " the record: `<C-]>` in Visual is a silent no-op that leaves",
+            " the selection up.",
+        ),
+    ),
+    vis(
+        "!{filter}",
+        "v_!",
+        NotImplemented,
+        Modified,
+        Some(vlive(
+            VA_TXT,
+            (1, 1),
+            "Vj!tr a-z A-Z<CR>",
+            " -z A-Z| |                  |eta theta iota",
+            (2, 2),
+            "INSERT",
+            "",
+        )),
+        Some(Label("vis:Vj! filters through an external command")),
+        concat!(
+            "filter the highlighted lines through an external command.",
+            " vimcode's `!` is a silent no-op in Visual mode, and —",
+            " because it does not open a command line — every character of",
+            " the filter the user then types is executed as a Visual-mode",
+            " command. The recording shows the damage: `Vj!tr a-z A-Z<CR>`",
+            " mangles the buffer and lands in Insert mode. Worth",
+            " implementing, or at minimum refusing.",
+        ),
+    ),
+    vis(
+        ":",
+        "v_:",
+        Implemented,
+        Modified,
+        Some(vlive(
+            VA_TXT,
+            (1, 1),
+            "Vj:d<CR>",
+            "eta theta iota",
+            (1, 1),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:vj: shows range")),
+        concat!(
+            "starts a command line pre-filled with `'<,'>`: the",
+            " recording's `:d<CR>` deletes both selected lines, not just",
+            " the cursor line.",
+        ),
+    ),
+    vis(
+        "<",
+        "v_<",
+        Implemented,
+        Modified,
+        Some(vlive(
+            VA_IND,
+            (1, 5),
+            "Vj<",
+            "alpha|beta|    gamma",
+            (1, 5),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:vj<")),
+        "shifts the selected lines one 'shiftwidth' left, cursor included.",
+    ),
+    vis(
+        "=",
+        "v_=",
+        Partial,
+        Modified,
+        Some(vlive(
+            VA_IND,
+            (1, 5),
+            "Vj=",
+            "alpha|beta|    gamma",
+            (1, 1),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:Vj=")),
+        concat!(
+            "the reindent matches the oracle, but the cursor is moved to",
+            " column 1 where Neovim (`nostartofline`, its default) keeps",
+            " the column — and vimcode's own `<` and `>` *do* keep it, so",
+            " this is an internal inconsistency as much as a Vim",
+            " deviation.",
+        ),
+    ),
+    vis(
+        ">",
+        "v_>",
+        Implemented,
+        Modified,
+        Some(vlive(
+            VA_TXT,
+            (1, 1),
+            "Vj>",
+            "    alpha beta gamma|    delta epsilon zeta|eta theta iota",
+            (1, 1),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:vj>")),
+        "shifts the selected lines one 'shiftwidth' right.",
+    ),
+    vis(
+        "A",
+        "v_b_A",
+        Implemented,
+        Modified,
+        Some(vlive(
+            VA_TXT,
+            (1, 1),
+            "<C-v>jjAX<Esc>",
+            "aXlpha beta gamma|dXelta epsilon zeta|eXta theta iota",
+            (1, 1),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vb:jjAx")),
+        concat!(
+            "blockwise append: the same text is inserted after the block",
+            " on every line.",
+        ),
+    ),
+    vis(
+        "C",
+        "v_C",
+        Implemented,
+        Modified,
+        Some(vlive(
+            VA_TXT,
+            (1, 1),
+            "vlCxy<Esc>",
+            "xy|delta epsilon zeta|eta theta iota",
+            (1, 2),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:vjC")),
+        concat!(
+            "deletes the selected lines and starts Insert, linewise even",
+            " from a charwise selection.",
+        ),
+    ),
+    vis(
+        "D",
+        "v_D",
+        Implemented,
+        Modified,
+        Some(vlive(
+            VA_TXT,
+            (1, 1),
+            "vlD",
+            "delta epsilon zeta|eta theta iota",
+            (1, 2),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:vjD")),
+        "deletes the selected lines linewise.",
+    ),
+    vis(
+        "I",
+        "v_b_I",
+        Implemented,
+        Modified,
+        Some(vlive(
+            VA_TXT,
+            (1, 2),
+            "<C-v>jjIX<Esc>",
+            "aXlpha beta gamma|dXelta epsilon zeta|eXta theta iota",
+            (1, 2),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vb:jjIx")),
+        concat!(
+            "blockwise insert: the same text is inserted before the block",
+            " on every line.",
+        ),
+    ),
+    vis(
+        "J",
+        "v_J",
+        Implemented,
+        Modified,
+        Some(vlive(
+            VA_TXT,
+            (1, 1),
+            "VjJ",
+            "alpha beta gamma delta epsilon zeta|eta theta iota",
+            (1, 17),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:vjJ")),
+        "joins the selected lines, inserting a space.",
+    ),
+    vis(
+        "K",
+        "v_K",
+        NotImplemented,
+        Unchanged,
+        Some(vlive(
+            VA_TXT,
+            (1, 1),
+            "veK",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 5),
+            "VISUAL",
+            "",
+        )),
+        Some(Label("vis:veK runs keywordprg")),
+        concat!(
+            "run 'keywordprg' on the highlighted area. vimcode has no",
+            " 'keywordprg' option and Visual `K` is a silent no-op. Low",
+            " value: LSP hover covers the same intent, and vimcode has no",
+            " `:Man`.",
+        ),
+    ),
+    vis(
+        "O",
+        "v_O",
+        Implemented,
+        Unchanged,
+        Some(vlive(
+            VA_TXT,
+            (1, 3),
+            "<C-v>jllO",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (2, 3),
+            "VISUAL BLOCK",
+            "",
+        )),
+        Some(Label("vb:O")),
+        concat!(
+            "moves the cursor horizontally to the other corner of a",
+            " blockwise selection.",
+        ),
+    ),
+    vis(
+        "P",
+        "v_P",
+        Partial,
+        Modified,
+        Some(vlive(
+            VA_TXT,
+            (1, 1),
+            "yiwwvePjp",
+            "alpha alpha gamma|delta epsilbetaon zeta|eta theta iota",
+            (2, 15),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:vly$P")),
+        concat!(
+            "the replacement itself is right, but vimcode clobbers the",
+            " unnamed register with the replaced text — `P` is a straight",
+            " alias of `p`. The recording proves it: after `veP` the",
+            " following `p` pastes `beta` (the text `P` replaced) where",
+            " Vim pastes `alpha` (the register, unchanged).",
+        ),
+    ),
+    vis(
+        "Q",
+        "v_Q",
+        Skipped(EXMODE),
+        Unchanged,
+        None,
+        None,
+        concat!(
+            "the row documents a *negative* — Vim's `Q` does not start Ex",
+            " mode from Visual. vimcode has no Ex mode at all (`gQ` was",
+            " tagged the same way by the g-prefix slice), so there is",
+            " nothing to not-start; `Q` in Visual is ignored.",
+        ),
+    ),
+    vis(
+        "R",
+        "v_R",
+        Implemented,
+        Modified,
+        Some(vlive(
+            VA_TXT,
+            (1, 1),
+            "vlRxy<Esc>",
+            "xy|delta epsilon zeta|eta theta iota",
+            (1, 2),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:vjR")),
+        "deletes the selected lines and starts Insert, like `S`/`C`.",
+    ),
+    vis(
+        "S",
+        "v_S",
+        Implemented,
+        Modified,
+        Some(vlive(
+            VA_TXT,
+            (1, 1),
+            "vlSxy<Esc>",
+            "xy|delta epsilon zeta|eta theta iota",
+            (1, 2),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:vjS")),
+        "deletes the selected lines and starts Insert.",
+    ),
+    vis(
+        "U",
+        "v_U",
+        Implemented,
+        Modified,
+        Some(vlive(
+            VA_TXT,
+            (1, 1),
+            "veU",
+            "ALPHA beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 1),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:vjU")),
+        "uppercases the highlighted area.",
+    ),
+    vis(
+        "V",
+        "v_V",
+        Implemented,
+        Modified,
+        Some(vlive(
+            VA_TXT,
+            (1, 1),
+            "vVdVVx",
+            "elta epsilon zeta|eta theta iota",
+            (1, 1),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vb:C-v then V")),
+        concat!(
+            "both halves recorded: `vV` promotes a charwise selection to",
+            " linewise (the delete takes the whole line) and a second `V`",
+            " while already linewise stops Visual mode, so the trailing",
+            " `x` deletes one character.",
+        ),
+    ),
+    vis(
+        "X",
+        "v_X",
+        Implemented,
+        Modified,
+        Some(vlive(
+            VA_TXT,
+            (1, 1),
+            "vlX",
+            "delta epsilon zeta|eta theta iota",
+            (1, 2),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:vjX")),
+        "deletes the selected lines linewise, like `D`.",
+    ),
+    vis(
+        "Y",
+        "v_Y",
+        Implemented,
+        Modified,
+        Some(vlive(
+            VA_TXT,
+            (1, 1),
+            "veYjp",
+            "alpha beta gamma|delta epsilon zeta|alpha beta gamma|eta theta iota",
+            (3, 1),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:vjY p")),
+        concat!(
+            "yanks the selected lines linewise; the recording's `p` puts",
+            " a whole line back.",
+        ),
+    ),
+    vis(
+        "a\"",
+        "v_aquote",
+        Implemented,
+        Modified,
+        Some(vlive(
+            VA_Q,
+            (1, 8),
+            "va\"d",
+            "say ok|it's 'a b' fine|run `cmd arg` now",
+            (1, 5),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:va\"d")),
+        "a double-quoted string including the quotes.",
+    ),
+    vis(
+        "a'",
+        "v_a'",
+        Implemented,
+        Modified,
+        Some(vlive(
+            VA_Q,
+            (2, 7),
+            "va'd",
+            "say \"hello there\" ok|it's fine|run `cmd arg` now",
+            (2, 6),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:va' extends with a quoted string")),
+        concat!(
+            "a single-quoted string including the quotes; the apostrophe",
+            " in `it's` is correctly not treated as an opening quote.",
+        ),
+    ),
+    vis(
+        "a(",
+        "v_a(",
+        Implemented,
+        Modified,
+        Some(vlive(
+            VA_BR,
+            (1, 6),
+            "va(d",
+            "foo qux|arr[one two] end|map{k v} tail|lt<a b> gt",
+            (1, 4),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:va(d")),
+        "a parenthesised block including the parentheses.",
+    ),
+    vis(
+        "a)",
+        "v_a)",
+        Implemented,
+        Modified,
+        Some(vlive(
+            VA_BR,
+            (1, 6),
+            "va)d",
+            "foo qux|arr[one two] end|map{k v} tail|lt<a b> gt",
+            (1, 4),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:va) same as ab")),
+        concat!(
+            "the `a)` spelling of `ab`; vimcode accepts it and produces",
+            " the same selection as `a(`.",
+        ),
+    ),
+    vis(
+        "a<",
+        "v_a<",
+        NotImplemented,
+        Unchanged,
+        Some(vlive(
+            VA_BR,
+            (4, 5),
+            "va<d",
+            "foo(bar baz) qux|arr[one two] end|map{k v} tail|lt<a b> gt",
+            (4, 5),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:va< extends with an angle block")),
+        concat!(
+            "extend with a `<>` block. vimcode does not recognise `a<` at",
+            " all — the recording is a silent no-op where Vim deletes `<a",
+            " b>`. Worth implementing: `<>` is the one bracket pair",
+            " missing from an otherwise complete text-object set, and it",
+            " is the common case in HTML/JSX and Rust generics.",
+        ),
+    ),
+    vis(
+        "a>",
+        "v_a>",
+        NotImplemented,
+        Modified,
+        Some(vlive(
+            VA_BR,
+            (4, 5),
+            "va>d",
+            "foo(bar baz) qux|arr[one two] end|map{k v} tail|    lt<a b> gt",
+            (4, 5),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:va> same as a<")),
+        concat!(
+            "the `a>` spelling of `a<`. Worse than `a<`: because `a` is",
+            " not consumed as a text-object prefix, the `>` runs as the",
+            " Visual shift command, so the recording **indents the line**",
+            " instead of selecting anything.",
+        ),
+    ),
+    vis(
+        "aB",
+        "v_aB",
+        Implemented,
+        Modified,
+        Some(vlive(
+            VA_BR,
+            (3, 6),
+            "vaBd",
+            "foo(bar baz) qux|arr[one two] end|map tail|lt<a b> gt",
+            (3, 4),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:vaB extends with a brace block")),
+        "a `{}` block including the braces.",
+    ),
+    vis(
+        "aW",
+        "v_aW",
+        Implemented,
+        Modified,
+        Some(vlive(
+            VA_Q,
+            (2, 4),
+            "vaWd",
+            "say \"hello there\" ok|'a b' fine|run `cmd arg` now",
+            (2, 1),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:vaW extends with a WORD")),
+        "a WORD plus its trailing whitespace.",
+    ),
+    vis(
+        "a[",
+        "v_a[",
+        Implemented,
+        Modified,
+        Some(vlive(
+            VA_BR,
+            (2, 6),
+            "va[d",
+            "foo(bar baz) qux|arr end|map{k v} tail|lt<a b> gt",
+            (2, 4),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:va[ extends with a bracket block")),
+        "a `[]` block including the brackets.",
+    ),
+    vis(
+        "a]",
+        "v_a]",
+        Implemented,
+        Modified,
+        Some(vlive(
+            VA_BR,
+            (2, 6),
+            "va]d",
+            "foo(bar baz) qux|arr end|map{k v} tail|lt<a b> gt",
+            (2, 4),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:va] same as a[")),
+        "the `a]` spelling of `a[`.",
+    ),
+    vis(
+        "a`",
+        "v_a`",
+        Implemented,
+        Modified,
+        Some(vlive(
+            VA_Q,
+            (3, 7),
+            "va`d",
+            "say \"hello there\" ok|it's 'a b' fine|run now",
+            (3, 5),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:va` extends with a backtick string")),
+        "a backtick-quoted string including the backticks.",
+    ),
+    vis(
+        "ab",
+        "v_ab",
+        Implemented,
+        Modified,
+        Some(vlive(
+            VA_BR,
+            (1, 6),
+            "vabd",
+            "foo qux|arr[one two] end|map{k v} tail|lt<a b> gt",
+            (1, 4),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:vab extends with a paren block")),
+        "the `ab` spelling of `a(`.",
+    ),
+    vis(
+        "ap",
+        "v_ap",
+        Implemented,
+        Modified,
+        Some(vlive(
+            VA_PARA,
+            (1, 1),
+            "vapd",
+            "gamma three|delta four",
+            (1, 1),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:vapd")),
+        "a paragraph plus its trailing blank lines.",
+    ),
+    vis(
+        "as",
+        "v_as",
+        Implemented,
+        Modified,
+        Some(vlive(
+            VA_SENT,
+            (1, 10),
+            "vasd",
+            "One two. Five six.",
+            (1, 10),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:vas extends with a sentence")),
+        "a sentence plus its trailing whitespace.",
+    ),
+    vis(
+        "at",
+        "v_at",
+        Implemented,
+        Modified,
+        Some(vlive(VA_TAG, (1, 7), "vatd", "", (1, 1), "NORMAL", "")),
+        Some(Label("vis:vat extends with a tag block")),
+        "a tag block including both tags.",
+    ),
+    vis(
+        "aw",
+        "v_aw",
+        Implemented,
+        Modified,
+        Some(vlive(
+            VA_TXT,
+            (1, 8),
+            "vawd",
+            "alpha gamma|delta epsilon zeta|eta theta iota",
+            (1, 7),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:v2awd")),
+        "a word plus its trailing whitespace.",
+    ),
+    vis(
+        "a{",
+        "v_a{",
+        Implemented,
+        Modified,
+        Some(vlive(
+            VA_BR,
+            (3, 6),
+            "va{d",
+            "foo(bar baz) qux|arr[one two] end|map tail|lt<a b> gt",
+            (3, 4),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:va{ same as aB")),
+        "the `a{` spelling of `aB`.",
+    ),
+    vis(
+        "a}",
+        "v_a}",
+        Implemented,
+        Modified,
+        Some(vlive(
+            VA_BR,
+            (3, 6),
+            "va}d",
+            "foo(bar baz) qux|arr[one two] end|map tail|lt<a b> gt",
+            (3, 4),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:va} same as aB")),
+        "the `a}` spelling of `aB`.",
+    ),
+    vis(
+        "c",
+        "v_c",
+        Implemented,
+        Modified,
+        Some(vlive(
+            VA_TXT,
+            (1, 1),
+            "vecXY<Esc>",
+            "XY beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 2),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:vec")),
+        "deletes the highlighted area and starts Insert.",
+    ),
+    vis(
+        "d",
+        "v_d",
+        Implemented,
+        Modified,
+        Some(vlive(
+            VA_TXT,
+            (1, 1),
+            "ved",
+            " beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 1),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:vjd")),
+        "deletes the highlighted area.",
+    ),
+    vis(
+        "g CTRL-A",
+        "v_g_CTRL-A",
+        Implemented,
+        Modified,
+        Some(vlive(
+            VA_NUMS,
+            (1, 1),
+            "Vjjg<C-a>",
+            "2 a|3 b|4 c",
+            (1, 1),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("num:V g C-a")),
+        concat!(
+            "progressively increments the numbers on the selected lines",
+            " (1/2/3, not 2/2/2).",
+        ),
+    ),
+    vis(
+        "g CTRL-X",
+        "v_g_CTRL-X",
+        Implemented,
+        Modified,
+        Some(vlive(
+            VA_NUMS,
+            (1, 1),
+            "Vjjg<C-x>",
+            "0 a|-1 b|-2 c",
+            (1, 1),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:V g C-x decrements progressively")),
+        "progressively decrements the numbers on the selected lines.",
+    ),
+    vis(
+        "gJ",
+        "v_gJ",
+        Implemented,
+        Modified,
+        Some(vlive(
+            VA_TXT,
+            (1, 1),
+            "VjgJ",
+            "alpha beta gammadelta epsilon zeta|eta theta iota",
+            (1, 17),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:v_gJ")),
+        "joins the selected lines without inserting a space.",
+    ),
+    vis(
+        "gq",
+        "v_gq",
+        Implemented,
+        Modified,
+        Some(vlive(
+            VA_TXT,
+            (1, 1),
+            "Vjgq",
+            "alpha beta gamma delta epsilon zeta|eta theta iota",
+            (1, 1),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:vjgq")),
+        "formats the selected lines to 'textwidth'.",
+    ),
+    vis(
+        "gv",
+        "v_gv",
+        Implemented,
+        Modified,
+        Some(vlive(
+            VA_TXT,
+            (1, 1),
+            "ve<Esc>gvd",
+            " beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 1),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:gv")),
+        "reselects the previous Visual area after it was left with `<Esc>`.",
+    ),
+    vis(
+        "i\"",
+        "v_iquote",
+        Implemented,
+        Modified,
+        Some(vlive(
+            VA_Q,
+            (1, 8),
+            "vi\"d",
+            "say \"\" ok|it's 'a b' fine|run `cmd arg` now",
+            (1, 6),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:vi\"d")),
+        "the inside of a double-quoted string, quotes excluded.",
+    ),
+    vis(
+        "i'",
+        "v_i'",
+        Implemented,
+        Modified,
+        Some(vlive(
+            VA_Q,
+            (2, 7),
+            "vi'd",
+            "say \"hello there\" ok|it's '' fine|run `cmd arg` now",
+            (2, 7),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:vi' extends with inner quoted string")),
+        "the inside of a single-quoted string.",
+    ),
+    vis(
+        "i(",
+        "v_i(",
+        Implemented,
+        Modified,
+        Some(vlive(
+            VA_BR,
+            (1, 6),
+            "vi(d",
+            "foo() qux|arr[one two] end|map{k v} tail|lt<a b> gt",
+            (1, 5),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:vi(d")),
+        "the inside of a parenthesised block.",
+    ),
+    vis(
+        "i)",
+        "v_i)",
+        Implemented,
+        Modified,
+        Some(vlive(
+            VA_BR,
+            (1, 6),
+            "vi)d",
+            "foo() qux|arr[one two] end|map{k v} tail|lt<a b> gt",
+            (1, 5),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:vi) same as ib")),
+        "the `i)` spelling of `ib`.",
+    ),
+    vis(
+        "i<",
+        "v_i<",
+        NotImplemented,
+        Unchanged,
+        Some(vlive(
+            VA_BR,
+            (4, 5),
+            "vi<d",
+            "foo(bar baz) qux|arr[one two] end|map{k v} tail|lt<a b> gt",
+            (4, 5),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:vi< extends with inner angle block")),
+        concat!(
+            "the inside of a `<>` block. Not recognised: a silent no-op,",
+            " same gap as `a<`.",
+        ),
+    ),
+    vis(
+        "i>",
+        "v_i>",
+        NotImplemented,
+        Modified,
+        Some(vlive(
+            VA_BR,
+            (4, 5),
+            "vi>d",
+            "foo(bar baz) qux|arr[one two] end|map{k v} tail|    lt<a b> gt",
+            (4, 5),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:vi> same as i<")),
+        concat!(
+            "the `i>` spelling of `i<`. Same damage as `a>`: the",
+            " unconsumed `>` runs as the Visual shift and indents the",
+            " line.",
+        ),
+    ),
+    vis(
+        "iB",
+        "v_iB",
+        Implemented,
+        Modified,
+        Some(vlive(
+            VA_BR,
+            (3, 6),
+            "viBd",
+            "foo(bar baz) qux|arr[one two] end|map{} tail|lt<a b> gt",
+            (3, 5),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:viB extends with inner brace block")),
+        "the inside of a `{}` block.",
+    ),
+    vis(
+        "iW",
+        "v_iW",
+        Implemented,
+        Modified,
+        Some(vlive(
+            VA_Q,
+            (2, 4),
+            "viWd",
+            "say \"hello there\" ok| 'a b' fine|run `cmd arg` now",
+            (2, 1),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:viW extends with inner WORD")),
+        "a WORD without surrounding whitespace.",
+    ),
+    vis(
+        "i[",
+        "v_i[",
+        Implemented,
+        Modified,
+        Some(vlive(
+            VA_BR,
+            (2, 6),
+            "vi[d",
+            "foo(bar baz) qux|arr[] end|map{k v} tail|lt<a b> gt",
+            (2, 5),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:vi[ extends with inner bracket block")),
+        "the inside of a `[]` block.",
+    ),
+    vis(
+        "i]",
+        "v_i]",
+        Implemented,
+        Modified,
+        Some(vlive(
+            VA_BR,
+            (2, 6),
+            "vi]d",
+            "foo(bar baz) qux|arr[] end|map{k v} tail|lt<a b> gt",
+            (2, 5),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:vi] same as i[")),
+        "the `i]` spelling of `i[`.",
+    ),
+    vis(
+        "i`",
+        "v_i`",
+        Implemented,
+        Modified,
+        Some(vlive(
+            VA_Q,
+            (3, 7),
+            "vi`d",
+            "say \"hello there\" ok|it's 'a b' fine|run `` now",
+            (3, 6),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:vi` extends with inner backtick string")),
+        "the inside of a backtick-quoted string.",
+    ),
+    vis(
+        "ib",
+        "v_ib",
+        Implemented,
+        Modified,
+        Some(vlive(
+            VA_BR,
+            (1, 6),
+            "vibd",
+            "foo() qux|arr[one two] end|map{k v} tail|lt<a b> gt",
+            (1, 5),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:vib extends with inner paren block")),
+        "the `ib` spelling of `i(`.",
+    ),
+    vis(
+        "ip",
+        "v_ip",
+        Implemented,
+        Modified,
+        Some(vlive(
+            VA_PARA,
+            (1, 1),
+            "vipd",
+            "|gamma three|delta four",
+            (1, 1),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:vipd")),
+        "a paragraph without its trailing blank lines.",
+    ),
+    vis(
+        "is",
+        "v_is",
+        Implemented,
+        Modified,
+        Some(vlive(
+            VA_SENT,
+            (1, 10),
+            "visd",
+            "One two.  Five six.",
+            (1, 10),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:vis extends with inner sentence")),
+        "a sentence without its trailing whitespace.",
+    ),
+    vis(
+        "it",
+        "v_it",
+        Implemented,
+        Modified,
+        Some(vlive(
+            VA_TAG,
+            (1, 7),
+            "vitd",
+            "<div></div>",
+            (1, 6),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:vit extends with inner tag block")),
+        "the contents of a tag block, tags excluded.",
+    ),
+    vis(
+        "iw",
+        "v_iw",
+        Implemented,
+        Modified,
+        Some(vlive(
+            VA_TXT,
+            (1, 8),
+            "viwd",
+            "alpha  gamma|delta epsilon zeta|eta theta iota",
+            (1, 7),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:viwiwiwd")),
+        "a word without surrounding whitespace.",
+    ),
+    vis(
+        "i{",
+        "v_i{",
+        Implemented,
+        Modified,
+        Some(vlive(
+            VA_BR,
+            (3, 6),
+            "vi{d",
+            "foo(bar baz) qux|arr[one two] end|map{} tail|lt<a b> gt",
+            (3, 5),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:vi{ same as iB")),
+        "the `i{` spelling of `iB`.",
+    ),
+    vis(
+        "i}",
+        "v_i}",
+        Implemented,
+        Modified,
+        Some(vlive(
+            VA_BR,
+            (3, 6),
+            "vi}d",
+            "foo(bar baz) qux|arr[one two] end|map{} tail|lt<a b> gt",
+            (3, 5),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:vi} same as iB")),
+        "the `i}` spelling of `iB`.",
+    ),
+    vis(
+        "o",
+        "v_o",
+        Implemented,
+        Unchanged,
+        Some(vlive(
+            VA_TXT,
+            (1, 3),
+            "vllo",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 3),
+            "VISUAL",
+            "",
+        )),
+        Some(Label("vis:vllohd")),
+        concat!(
+            "moves the cursor to the other end of the selection, leaving",
+            " Visual mode active.",
+        ),
+    ),
+    vis(
+        "p",
+        "v_p",
+        Implemented,
+        Modified,
+        Some(vlive(
+            VA_TXT,
+            (1, 1),
+            "yiwwvepjp",
+            "alpha alpha gamma|delta epsilbetaon zeta|eta theta iota",
+            (2, 15),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:vlp linewise reg")),
+        concat!(
+            "replaces the highlighted area with the register, and the",
+            " replaced text does land in the unnamed register — the",
+            " recording's second `p` pastes `beta`, matching the oracle.",
+            " It is `P` (above) that shares this behaviour and should not.",
+        ),
+    ),
+    vis(
+        "r",
+        "v_r",
+        Implemented,
+        Modified,
+        Some(vlive(
+            VA_TXT,
+            (1, 1),
+            "verX",
+            "XXXXX beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 1),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:vjr-")),
+        concat!(
+            "replaces every character of the highlighted area with the",
+            " typed character.",
+        ),
+    ),
+    vis(
+        "s",
+        "v_s",
+        Implemented,
+        Modified,
+        Some(vlive(
+            VA_TXT,
+            (1, 1),
+            "vesXY<Esc>",
+            "XY beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 2),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:v s")),
+        "deletes the highlighted area and starts Insert, like `c`.",
+    ),
+    vis(
+        "u",
+        "v_u",
+        Implemented,
+        Modified,
+        Some(vlive(
+            VA_UP,
+            (1, 1),
+            "veu",
+            "alpha beta|GAMMA delta",
+            (1, 1),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:Vju")),
+        "lowercases the highlighted area.",
+    ),
+    vis(
+        "v",
+        "v_v",
+        Implemented,
+        Unchanged,
+        Some(vlive(
+            VA_TXT,
+            (1, 1),
+            "vlvd",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 2),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vb:C-v then v switch")),
+        concat!(
+            "the recording covers the *stop* half — `v` pressed while",
+            " already charwise leaves Visual mode, so the trailing `d` is",
+            " an incomplete operator. The `make charwise` half is pinned",
+            " by the oracle case this row's probe names, which switches a",
+            " blockwise selection to charwise with `v`.",
+        ),
+    ),
+    vis(
+        "x",
+        "v_x",
+        Implemented,
+        Modified,
+        Some(vlive(
+            VA_TXT,
+            (1, 1),
+            "vex",
+            " beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 1),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:v x")),
+        "deletes the highlighted area, like `d`.",
+    ),
+    vis(
+        "y",
+        "v_y",
+        Implemented,
+        Modified,
+        Some(vlive(
+            VA_TXT,
+            (1, 1),
+            "veyjp",
+            "alpha beta gamma|dalphaelta epsilon zeta|eta theta iota",
+            (2, 6),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:vjy cursor")),
+        concat!(
+            "yanks the highlighted area charwise; the recording's `p`",
+            " puts it back inline.",
+        ),
+    ),
+    vis(
+        "~",
+        "v_~",
+        Implemented,
+        Modified,
+        Some(vlive(
+            VA_UP,
+            (1, 1),
+            "ve~",
+            "alpha beta|GAMMA delta",
+            (1, 1),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:vj~")),
+        "swaps the case of the highlighted area.",
+    ),
+];
+
+const VISUAL_COVERAGE_EXEMPT: &[&str] = &[
+    "CTRL-\\ CTRL-N",
+    "CTRL-\\ CTRL-G",
+    "CTRL-C",
+    "CTRL-G",
+    "<BS>",
+    "CTRL-H",
+    "CTRL-O",
+    "CTRL-X",
+    "!{filter}",
+    "K",
+    "a'",
+    "a)",
+    "a<",
+    "a>",
+    "aB",
+    "aW",
+    "a[",
+    "a]",
+    "a`",
+    "ab",
+    "as",
+    "at",
+    "a{",
+    "a}",
+    "g CTRL-X",
+    "i'",
+    "i)",
+    "i<",
+    "i>",
+    "iB",
+    "iW",
+    "i[",
+    "i]",
+    "i`",
+    "ib",
+    "is",
+    "it",
+    "i{",
+    "i}",
+];
+
+/// Replay one [`VisLive`] recording against a real engine. Black-box: keys
+/// in, rendered buffer + cursor + painted mode string + message out.
+fn replay_vis_live(p: &VisLive) -> (String, (usize, usize), String, String) {
+    let mut engine = engine_with(&p.lines.join("\n"));
+    // Same reason as `replay_live` (#1226): `Engine::new()` loads the *user's
+    // real* command history off disk, and `v_:`'s recording types at a `:`
+    // prompt. Leaving it populated would make that row replay whatever the
+    // developer last typed.
+    engine.history = Default::default();
+    engine.settings.shift_width = 4;
+    engine.settings.expand_tab = true;
+    engine.settings.tabstop = 4;
+    engine.set_viewport_lines(24);
+    engine.view_mut().cursor.line = p.at.0.saturating_sub(1);
+    engine.view_mut().cursor.col = p.at.1.saturating_sub(1);
+    engine.ensure_cursor_visible();
+    send_keys(&mut engine, p.keys);
+    (
+        engine.buffer().to_string().replace('\n', "|"),
+        (engine.view().cursor.line + 1, engine.view().cursor.col + 1),
+        engine.mode_str().to_string(),
+        engine.message.clone(),
+    )
+}
+
+/// Every row whose recorded behaviour no longer matches the live engine.
+fn visual_drift(audit: &[VisualAudit]) -> Vec<String> {
+    let mut drift: Vec<String> = Vec::new();
+    for e in audit {
+        let Some(p) = e.live.as_ref() else { continue };
+        let (buffer, cursor, mode, message) = replay_vis_live(p);
+        if buffer != p.buffer || cursor != p.cursor || mode != p.mode || message != p.message {
+            drift.push(format!(
+                "  {:?} ({}): recorded buffer={:?} cursor={:?} mode={:?} message={:?}\n\
+                 \x20  live     buffer={:?} cursor={:?} mode={:?} message={:?}",
+                e.item,
+                e.help,
+                p.buffer,
+                p.cursor,
+                p.mode,
+                p.message,
+                buffer,
+                cursor,
+                mode,
+                message
+            ));
+        }
+        let measured = measured_touch(p.lines, &buffer);
+        if measured != e.touch {
+            drift.push(format!(
+                "  {:?} ({}): table says {:?}, the live run is {:?}",
+                e.item, e.help, e.touch, measured
+            ));
+        }
+    }
+    drift
+}
+
+/// Gate 1 (#1228) — every row's recorded behaviour is a claim about live
+/// code, and this replays all 82 of them (the 84 rows minus the 2 ⏭️) against
+/// it. Pure: no `nvim`, no subprocess, so it runs on every lane.
+#[test]
+fn visual_audit_matches_the_live_engine() {
+    if let Ok(path) = std::env::var("CONFORMANCE_DUMP_VISUAL") {
+        let mut s = String::new();
+        for e in VISUAL_AUDIT {
+            let Some(p) = e.live.as_ref() else { continue };
+            let (buffer, cursor, mode, message) = replay_vis_live(p);
+            s.push_str(&format!(
+                "{}\t{:?}\t{}\t{}\t{}\t{:?}\n",
+                e.item, buffer, cursor.0, cursor.1, mode, message
+            ));
+        }
+        std::fs::write(&path, s).unwrap_or_else(|e| panic!("dump to {path}: {e}"));
+        return;
+    }
+
+    let drift = visual_drift(VISUAL_AUDIT);
+    assert!(
+        drift.is_empty(),
+        "\n\n== visual-mode audit drifted from the engine (#1228) ==\n\
+         Each row records what vimcode actually did when the slice ran.\n\
+         Implementing (or breaking) one of these changes that recording, so\n\
+         re-tag the row — that is how the audit stays true instead of rotting\n\
+         like a markdown checklist.\n\n{}\n\n\
+         A command that gained an implementation also needs its status changed\n\
+         from NotImplemented, and a VISUAL_COVERAGE_EXEMPT entry deleted once\n\
+         an oracle case pins it.\n",
+        drift.join("\n")
+    );
+}
+
+/// Gate 1b (#1228) — the table describes itself correctly: complete, unique,
+/// no unreviewed row, every ⏭️ carrying a reason from the shared vocabulary,
+/// and a live recording + probe on exactly the rows that can have one.
+#[test]
+fn visual_audit_is_internally_consistent() {
+    use std::collections::HashSet;
+    let mut problems: Vec<String> = Vec::new();
+
+    assert_eq!(
+        VISUAL_AUDIT.len(),
+        84,
+        "`:help visual-index` walked to 84 entries; the audit must tag all of them"
+    );
+
+    let mut seen: HashSet<&str> = HashSet::new();
+    let mut seen_help: HashSet<&str> = HashSet::new();
+    for e in VISUAL_AUDIT {
+        if !seen.insert(e.item) {
+            problems.push(format!("  {:?}: listed twice", e.item));
+        }
+        if !seen_help.insert(e.help) {
+            problems.push(format!(
+                "  {:?}: `:help` tag {:?} used twice",
+                e.item, e.help
+            ));
+        }
+        if e.note.trim().is_empty() {
+            problems.push(format!(
+                "  {:?}: empty note — every row is reviewed",
+                e.item
+            ));
+        }
+        if !e.help.starts_with("v_") {
+            problems.push(format!(
+                "  {:?}: `:help` tag {:?} is not a `v_…` Visual-mode tag",
+                e.item, e.help
+            ));
+        }
+
+        let in_scope = !matches!(e.status, OptStatus::Skipped(_));
+        if let OptStatus::Skipped(reason) = e.status {
+            if !SKIP_REASONS.contains(&reason) {
+                problems.push(format!(
+                    "  {:?}: skip reason {reason:?} is not in SKIP_REASONS",
+                    e.item
+                ));
+            }
+        }
+        if in_scope && e.live.is_none() {
+            problems.push(format!(
+                "  {:?}: not skipped, so it must carry a live recording",
+                e.item
+            ));
+        }
+        if in_scope && e.probe.is_none() {
+            problems.push(format!(
+                "  {:?}: not skipped, so it must carry an oracle probe",
+                e.item
+            ));
+        }
+        if !in_scope && (e.live.is_some() || e.probe.is_some()) {
+            problems.push(format!(
+                "  {:?}: skipped, so a live recording or probe can never fire",
+                e.item
+            ));
+        }
+    }
+
+    // The headline tally, pinned. The section doc quotes these numbers and a
+    // PR body quotes the section doc; without this they drift the moment a
+    // row is re-tagged, which is the exact rot a markdown checklist suffers.
+    let tally = |want: fn(&VisualAudit) -> bool| VISUAL_AUDIT.iter().filter(|e| want(e)).count();
+    assert_eq!(
+        (
+            tally(|e| matches!(e.status, OptStatus::Implemented)),
+            tally(|e| matches!(e.status, OptStatus::Partial)),
+            tally(|e| matches!(e.status, OptStatus::NotImplemented)),
+            tally(|e| matches!(e.status, OptStatus::Skipped(_))),
+            tally(|e| matches!(e.status, OptStatus::NotImplemented) && e.touch == Touch::Modified),
+        ),
+        (65, 6, 11, 2, 6),
+        "the audit tally moved: (implemented, partial, missing, skipped, \
+         missing-and-buffer-modified). Update the section doc's table in the \
+         same commit."
+    );
+
+    assert!(
+        problems.is_empty(),
+        "\n\n== visual-mode audit table is inconsistent (#1228) ==\n{}\n",
+        problems.join("\n")
+    );
+}
+
+/// `cases` is `(label, keys)` for the whole corpus — the same view
+/// [`classify_coverage`] takes.
+fn classify_visual_coverage(
+    audit: &[VisualAudit],
+    exempt: &[&'static str],
+    cases: &[(&'static str, &'static str)],
+) -> OptionCoverage {
+    use std::collections::HashSet;
+    let exempt_set: HashSet<&str> = exempt.iter().copied().collect();
+    let mut v = OptionCoverage::default();
+    for e in audit {
+        let Some(probe) = e.probe else { continue };
+        v.in_scope += 1;
+        let covered = cases.iter().any(|(label, keys)| probe.matches(label, keys));
+        match (covered, exempt_set.contains(e.item)) {
+            (false, false) => v.uncovered.push(e.item),
+            (true, true) => v.newly_covered.push(e.item),
+            _ => {}
+        }
+    }
+    v.stale = exempt
+        .iter()
+        .copied()
+        .filter(|n| !audit.iter().any(|e| e.item == *n && e.probe.is_some()))
+        .collect();
+    v
+}
+
+/// Gate 2 (#1228) — #1007's ratchet, applied to the audited commands: an
+/// in-scope row whose probe matches nothing must be exempt, and an exempt row
+/// whose probe now matches must lose its entry. Pure.
+#[test]
+fn visual_audit_oracle_coverage_is_shrink_only() {
+    use std::collections::HashSet;
+    let corpus = all_corpus_cases();
+    let exempt: HashSet<&str> = VISUAL_COVERAGE_EXEMPT.iter().copied().collect();
+    assert_eq!(
+        exempt.len(),
+        VISUAL_COVERAGE_EXEMPT.len(),
+        "VISUAL_COVERAGE_EXEMPT lists an item twice"
+    );
+
+    let v = classify_visual_coverage(VISUAL_AUDIT, VISUAL_COVERAGE_EXEMPT, &corpus);
+
+    if let Ok(path) = std::env::var("CONFORMANCE_DUMP_VISUAL_COVERAGE") {
+        let mut s = String::new();
+        for n in &v.uncovered {
+            s.push_str(&format!("UNCOVERED\t{n}\n"));
+        }
+        for n in &v.newly_covered {
+            s.push_str(&format!("NEWLY_COVERED\t{n}\n"));
+        }
+        for n in &v.stale {
+            s.push_str(&format!("STALE\t{n}\n"));
+        }
+        // Every credited row plus the case that credits it — the
+        // over-crediting check #1007's "deliberately dumb probe" note demands
+        // a human be able to do in one grep.
+        for e in VISUAL_AUDIT {
+            let Some(probe) = e.probe else { continue };
+            if let Some((label, _)) = corpus
+                .iter()
+                .find(|(label, keys)| probe.matches(label, keys))
+            {
+                s.push_str(&format!(
+                    "COVERED\t{}\t{:?}\t{}\n",
+                    e.item,
+                    probe.needle(),
+                    label
+                ));
+            }
+        }
+        std::fs::write(&path, s).unwrap_or_else(|e| panic!("dump to {path}: {e}"));
+        return;
+    }
+
+    let covered = v.in_scope - VISUAL_COVERAGE_EXEMPT.len();
+    println!(
+        "\n== visual-mode oracle coverage (#1228) ==\n\
+         {covered}/{} audited commands are pinned by an oracle case; {} exempt.\n",
+        v.in_scope,
+        VISUAL_COVERAGE_EXEMPT.len()
+    );
+
+    assert!(
+        v.uncovered.is_empty() && v.newly_covered.is_empty() && v.stale.is_empty(),
+        "\n\n== visual-mode oracle coverage moved (#1228) ==\n\
+         UNCOVERED (probe matches no case — add the case, or exempt it only when \
+         seeding a newly-tagged command):\n  {:?}\n\
+         NEWLY COVERED (a case now pins it — delete the VISUAL_COVERAGE_EXEMPT \
+         entry; that is how the list shrinks):\n  {:?}\n\
+         STALE (exempt but not an in-scope audited command):\n  {:?}\n",
+        v.uncovered,
+        v.newly_covered,
+        v.stale
+    );
+}
+
+/// The worst finding in this slice, pinned on its own rather than left as a
+/// status letter in the table: `CTRL-C` — the one key a user presses to
+/// *cancel* — is wired to `c` in Visual mode, so it deletes the highlighted
+/// text and drops into Insert. Black-box: it reads the rendered buffer and
+/// the status line's own mode string, not an engine flag.
+///
+/// Delete this test when `CTRL-C` is fixed; `v_CTRL-C`'s row and recording in
+/// [`VISUAL_AUDIT`] have to change in the same commit, and gate 1 enforces it.
+#[test]
+fn ctrl_c_in_visual_mode_deletes_the_selection_instead_of_stopping_visual_mode() {
+    let mut engine = engine_with("alpha beta gamma");
+    engine.history = Default::default();
+    engine.set_viewport_lines(24);
+    send_keys(&mut engine, "vll<C-c>");
+
+    assert_eq!(
+        engine.buffer().to_string(),
+        "ha beta gamma",
+        "CTRL-C deleted the three highlighted characters; Vim stops Visual \
+         mode and leaves the buffer alone"
+    );
+    assert_eq!(
+        engine.mode_str(),
+        "INSERT",
+        "CTRL-C also dropped into Insert mode, so the user's next keystroke \
+         is typed into the buffer"
+    );
+}
+
+/// Gate 3 (#1228) — the gates above are observed **RED**, so none of them is
+/// a test nobody has seen fail. Synthetic tables for the drift/consistency
+/// directions, and the real corpus for the coverage ones.
+#[test]
+fn visual_audit_gates_are_bidirectional() {
+    // ── Gate 1, direction A: a recording that no longer matches ──────────
+    let wrong_buffer = vec![vis(
+        "d",
+        "v_d",
+        Implemented,
+        Modified,
+        Some(vlive(
+            VA_TXT,
+            (1, 1),
+            "ved",
+            "this is not what vimcode does",
+            (1, 1),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:vjd")),
+        "synthetic",
+    )];
+    assert!(
+        !visual_drift(&wrong_buffer).is_empty(),
+        "a recording whose buffer no longer matches the engine must drift"
+    );
+
+    // ── Gate 1, direction B: a recording whose *mode* no longer matches ──
+    // The column the buffer/cursor pair cannot see, and the reason it exists.
+    let wrong_mode = vec![vis(
+        "v",
+        "v_v",
+        Implemented,
+        Unchanged,
+        Some(vlive(
+            VA_TXT,
+            (1, 1),
+            "vlvd",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 2),
+            "VISUAL",
+            "",
+        )),
+        Some(Label("vb:C-v then v switch")),
+        "synthetic",
+    )];
+    assert!(
+        !visual_drift(&wrong_mode).is_empty(),
+        "a recording that claims the engine stayed in VISUAL when it left \
+         must drift — otherwise the mode column is decoration"
+    );
+
+    // ── Gate 1, direction C: a mis-tagged [`Touch`] ──────────────────────
+    let wrong_touch = vec![vis(
+        "d",
+        "v_d",
+        Implemented,
+        Unchanged,
+        Some(vlive(
+            VA_TXT,
+            (1, 1),
+            "ved",
+            " beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 1),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:vjd")),
+        "synthetic",
+    )];
+    assert!(
+        !visual_drift(&wrong_touch).is_empty(),
+        "a row tagged Unchanged whose recording edits the buffer must drift"
+    );
+
+    // ── Gate 1, direction D: the unperturbed row is green ────────────────
+    let good = vec![vis(
+        "d",
+        "v_d",
+        Implemented,
+        Modified,
+        Some(vlive(
+            VA_TXT,
+            (1, 1),
+            "ved",
+            " beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 1),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:vjd")),
+        "synthetic",
+    )];
+    assert!(
+        visual_drift(&good).is_empty(),
+        "the unperturbed recording must be green, or the gate is red for an \
+         unrelated reason"
+    );
+
+    // ── Gate 2, against the REAL corpus and the REAL table ───────────────
+    let corpus = all_corpus_cases();
+
+    // A real exemption deleted must fail: the command is still uncovered.
+    let victim = "a<";
+    assert!(
+        VISUAL_COVERAGE_EXEMPT.contains(&victim),
+        "fixture drifted — {victim:?} is no longer exempt"
+    );
+    let without: Vec<&str> = VISUAL_COVERAGE_EXEMPT
+        .iter()
+        .copied()
+        .filter(|n| *n != victim)
+        .collect();
+    let deleted = classify_visual_coverage(VISUAL_AUDIT, &without, &corpus);
+    assert!(
+        deleted.uncovered.contains(&victim),
+        "deleting {victim:?} from VISUAL_COVERAGE_EXEMPT must fail the gate: {deleted:?}"
+    );
+
+    // A case that pins an exempt command must fail until the entry goes.
+    let mut plus = corpus.clone();
+    plus.push(("vis:va< extends with an angle block", "va<d"));
+    let improved = classify_visual_coverage(VISUAL_AUDIT, VISUAL_COVERAGE_EXEMPT, &plus);
+    assert!(
+        improved.newly_covered.contains(&victim),
+        "an oracle case for an exempt command must fail until its \
+         VISUAL_COVERAGE_EXEMPT entry is deleted: {improved:?}"
+    );
+
+    // A stale exemption — a name that is not an in-scope audited command.
+    let mut stale: Vec<&str> = VISUAL_COVERAGE_EXEMPT.to_vec();
+    stale.push("gH");
+    let with_stale = classify_visual_coverage(VISUAL_AUDIT, &stale, &corpus);
+    assert!(
+        with_stale.stale.contains(&"gH"),
+        "an exemption naming something outside the audit must be reported \
+         stale: {with_stale:?}"
+    );
+
+    // And the real pair is green, so the reds above are the perturbations.
+    let real = classify_visual_coverage(VISUAL_AUDIT, VISUAL_COVERAGE_EXEMPT, &corpus);
+    assert!(
+        real.uncovered.is_empty() && real.newly_covered.is_empty() && real.stale.is_empty(),
+        "the shipped table/exemption pair must be green: {real:?}"
+    );
+}
