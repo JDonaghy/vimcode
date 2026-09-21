@@ -1027,7 +1027,12 @@ impl BufferState {
                 let text_after = self.buffer.to_string();
                 self.undo_tree
                     .commit(group.cursor_before, text_after, cursor_after);
-                self.write_undofile_if_enabled();
+                // Deliberately *not* `write_undofile_if_enabled()` here: every
+                // `UndoNode` holds the buffer's full text, so writing on every
+                // commit would serialize up to `undolevels` full-buffer copies
+                // to disk on every single edit. `save()` already persists the
+                // undofile, matching real Vim's write-on-`:w` cadence (see
+                // `write_undofile_if_enabled`'s doc comment).
                 return true;
             }
         }

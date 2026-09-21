@@ -2572,6 +2572,20 @@ const CASES_UNDO: &[Case] = &[
         1,
         ":%normal Ax<CR>u",
     ),
+    // #1156: the issue's own gating scenario — `u` followed by a *different*
+    // edit must not permanently discard the branch `u` left; `g-` walks the
+    // whole undo tree in chronological order and can still reach it. This is
+    // real Vim/Neovim undo-tree behavior (`:h undo-tree`), not a vimcode
+    // invention, so it belongs in the oracle corpus rather than only as the
+    // engine-level `test_g_minus_reaches_branch_abandoned_by_undo_then_edit`
+    // self-check.
+    c(
+        "undo:g- crosses a branch abandoned by u then edit",
+        &["a"],
+        1,
+        1,
+        "ihello<Esc>uiworld<Esc>g-g-",
+    ),
 ];
 
 // ─────────────────────────── D. registers ───────────────────────────
