@@ -22392,14 +22392,15 @@ mod tests {
     /// longer take that path at all — the strip now holds a fixed-scale
     /// *window* onto the buffer (one buffer line per `lines` entry, VS
     /// Code's `minimap.size: proportional`) rather than the whole file
-    /// squeezed to fit, so `minimap_block_bounds` always takes its "never
-    /// upscales" branch once the window can never exceed `target_lines` —
-    /// true by construction on every call now. The aggregation mechanism
-    /// itself is unchanged and still covered, just no longer reachable from
-    /// a black-box driver test: see the render.rs-level
-    /// `a_stride_skipped_distinctive_line_still_shows_up`, which now drives
-    /// `minimap_block_bounds`/`minimap_block_sample_indices`/
-    /// `minimap_block_text` directly instead.
+    /// squeezed to fit, so `quadraui::primitives::minimap::block_bounds`
+    /// always takes its "never upscales" branch once the window can never
+    /// exceed `target_lines` — true by construction on every call now.
+    /// #1098 lifted the aggregation/dither arithmetic itself into
+    /// quadraui (quadraui#1012), which carries its own unit-level
+    /// coverage for that mechanism now — see
+    /// `quadraui::primitives::minimap::tests::sample_blocks_*` upstream —
+    /// so there is no vimcode-side white-box equivalent left to point to
+    /// here any more.
     ///
     /// This test instead covers what #1093 is actually about: the window
     /// slides to follow the editor's own scroll position. A distinctive
@@ -22408,8 +22409,9 @@ mod tests {
     /// editor scrolls down far enough to bring it into the window.
     ///
     /// **RED against unfixed `develop`:** confirmed by hand — reverting
-    /// `build_minimap_data`'s windowing (handing `minimap_block_bounds` the
-    /// whole `total_buffer_lines` again) makes the "must not paint yet"
+    /// `build_minimap_data`'s windowing (handing
+    /// `quadraui::primitives::minimap::block_bounds` the whole
+    /// `total_buffer_lines` again) makes the "must not paint yet"
     /// assertion fail: the old code squeezed the entire file into the
     /// strip on every frame regardless of scroll position, so the
     /// distinctive line (and the resulting off-first-cell dot) was already
@@ -22444,8 +22446,9 @@ mod tests {
         // inside the strip's window while the cursor is still at the top.
         //
         // #1186/#1211: a single distinctive line is no longer a reliable
-        // marker once `K > 1` — `minimap_block_sample_indices` only reads
-        // up to `MINIMAP_BLOCK_LINE_SAMPLE_CAP` (8) lines per block, spaced
+        // marker once `K > 1` —
+        // `quadraui::primitives::minimap::block_sample_indices` only reads
+        // up to `BLOCK_LINE_SAMPLE_CAP` (8) lines per block, spaced
         // across the block's real width, so a single marker line can land
         // in a gap that never gets sampled. A `DISTINCTIVE_BAND_WIDTH`-line
         // band, wider than that worst-case sampling gap, is guaranteed to

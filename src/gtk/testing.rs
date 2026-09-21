@@ -8001,8 +8001,8 @@ mod minimap {
     ///     file's last line — the EOF-jump bug this issue reports.
     ///
     /// RED-first: reverting `build_minimap_data`'s windowing (handing
-    /// `minimap_block_bounds` `total_buffer_lines` directly again, as
-    /// unfixed `develop` did) makes assertion (a) fail — the strip's last
+    /// `quadraui::primitives::minimap::block_bounds` `total_buffer_lines`
+    /// directly again, as unfixed `develop` did) makes assertion (a) fail — the strip's last
     /// painted row once again stands in for the file's actual last line —
     /// and pushes the bottom-of-strip click's resulting `scroll_top` up
     /// near `total_buffer_lines - 1` instead of inside roughly one
@@ -8854,6 +8854,146 @@ mod minimap {
              height, so the bottom of any sufficiently long file's minimap \
              goes unpainted again."
         );
+    }
+
+    /// #1098 lift equivalence: `build_minimap_data` no longer builds its
+    /// per-row text with vimcode's own `minimap_block_text` (deleted) —
+    /// it hands `quadraui::sample_blocks` a rope-backed line accessor and
+    /// keeps whatever text that returns. For an *uncompressed* block (the
+    /// common case: one real buffer line samples to one output row,
+    /// `indices.len() == 1`), quadraui's `aggregate_block_text` takes a
+    /// fast path and returns that line's real text verbatim — where the
+    /// deleted vimcode copy always ran every column through
+    /// `minimap_block_dither_threshold_met` first, turning every
+    /// non-whitespace character into a masked `'x'` regardless of what it
+    /// actually was.
+    ///
+    /// That representational change is invisible on GTK today only because
+    /// `ROW_PITCH_PX` (2px) sits below `LEGIBILITY_FLOOR_PX`, so GTK's
+    /// rasteriser always paints in `ColumnBlocks` mode — one 1px block per
+    /// *non-whitespace* column, real glyph or not
+    /// (`quadraui::gtk::minimap::paint_row_blocks` only ever calls
+    /// `ch.is_whitespace()`) — never `Characters` mode, which would shape
+    /// the text's real glyphs and so would visibly differ. A masked `'x'`
+    /// and a line's real character are equally non-whitespace at every
+    /// column, so the two representations paint byte-for-byte identical
+    /// pixels under `ColumnBlocks`; this test pins that equivalence
+    /// directly against the real GTK paint path, at the real per-column
+    /// resolution, so it would catch the day a future rasteriser change
+    /// (or a `ROW_PITCH_PX` bump past the legibility floor) makes the two
+    /// representations start to matter.
+    ///
+    /// Deliberately green on both the pre- and post-#1098 code (there is
+    /// no user-visible regression to be RED against — see this test's own
+    /// doc above for why the two representations are pixel-equivalent
+    /// under `ColumnBlocks`); it is an equivalence/regression guard for
+    /// the lift, not a bug-fix acceptance test.
+    #[test]
+    fn minimap_single_line_block_paints_the_real_columns_via_gtk_driver() {
+        const N_LINES: usize = 200;
+        // Well outside the harness's own editor viewport (~40 rows at
+        // 1400x900), so the translucent viewport-highlight band (painted
+        // *underneath* each row's opaque column blocks, but still worth
+        // avoiding for a clean background reading) never reaches it.
+        const DISTINCTIVE_LINE: usize = 150;
+        // Non-blank at columns 0, 3 and 7; blank everywhere else in
+        // between — a pattern no single dithered guess could reconstruct
+        // by accident.
+        const ROW_TEXT: &str = "a  b   c";
+
+        let mut engine = Engine::new_for_test();
+        let mut text = String::with_capacity(N_LINES * 2);
+        for i in 0..N_LINES {
+            if i == DISTINCTIVE_LINE {
+                text.push_str(ROW_TEXT);
+            }
+            text.push('\n');
+        }
+        engine.buffer_mut().insert(0, &text);
+
+        let mut h = harness(engine, 1400, 900);
+        let win = h.engine.borrow().active_window_id();
+        h.window_center(win).expect("editor pane must paint");
+        assert_eq!(
+            h.engine.borrow().scroll_top(),
+            0,
+            "fixture must start at the top of the file"
+        );
+
+        let (strip, window_len, total) = {
+            let layout = h.screen_layout.borrow();
+            let mm = layout
+                .as_ref()
+                .unwrap()
+                .minimap
+                .iter()
+                .find(|m| m.window_id == win)
+                .expect("minimap must be present for the active pane");
+            (
+                mm.rect,
+                mm.minimap.lines.len(),
+                mm.minimap.total_buffer_lines,
+            )
+        };
+        assert!(
+            (N_LINES..=N_LINES + 1).contains(&total),
+            "sanity: the fixture's own line count ({N_LINES}) must reach \
+             the painted layout (got total_buffer_lines={total})"
+        );
+        assert_eq!(
+            window_len, total,
+            "test setup sanity: this fixture must fit entirely inside one \
+             uncompressed window (one output row per real buffer line, \
+             K == 1) — a strip's own real GTK row capacity comfortably \
+             exceeding {N_LINES} lines, measured elsewhere in this module \
+             at ~375 rows for a 1400x900 harness — or this test cannot \
+             isolate the single-line-block fast path from multi-line \
+             aggregation (window_len={window_len}, total={total})"
+        );
+
+        let theme = crate::render::Theme::from_name(&h.engine.borrow().settings.colorscheme);
+        let fg = (theme.foreground.r, theme.foreground.g, theme.foreground.b);
+        let bg = (theme.background.r, theme.background.g, theme.background.b);
+        assert_ne!(
+            fg, bg,
+            "fixture sanity: the theme's foreground must differ from its \
+             background, or this test cannot distinguish painted columns \
+             from blank ones"
+        );
+
+        let row_px = quadraui::primitives::minimap::ROW_PITCH_PX;
+        let row_y = (strip.y + DISTINCTIVE_LINE as f64 * row_px + 1.0).round() as i32;
+        let non_blank_cols: Vec<usize> = ROW_TEXT
+            .char_indices()
+            .filter(|(_, c)| !c.is_whitespace())
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            non_blank_cols,
+            vec![0, 3, 7],
+            "fixture sanity: ROW_TEXT's non-blank columns must match this \
+             test's own expectations"
+        );
+
+        for col in 0..ROW_TEXT.chars().count() {
+            let x = (strip.x + col as f64).round() as i32;
+            let pixel = h.driver.pixel(x, row_y);
+            if non_blank_cols.contains(&col) {
+                assert_eq!(
+                    pixel, fg,
+                    "column {col} of the distinctive line ({ROW_TEXT:?}) is \
+                     non-whitespace and must paint the theme's foreground \
+                     colour at (x={x}, y={row_y}); strip={strip:?}"
+                );
+            } else {
+                assert_eq!(
+                    pixel, bg,
+                    "column {col} of the distinctive line ({ROW_TEXT:?}) is \
+                     whitespace and must stay the theme's background \
+                     colour at (x={x}, y={row_y}); strip={strip:?}"
+                );
+            }
+        }
     }
 
     #[test]
