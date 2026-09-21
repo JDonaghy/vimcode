@@ -8443,14 +8443,61 @@ const COMMAND_PROBES: &[CommandProbe] = &[
 // Deleting an entry is how an oracle case proves itself: the gate fails if a
 // listed id's probe starts matching, and fails if an unlisted id's probe
 // matches nothing. Never add an entry to paper over a deleted case.
+//
+// **A permanent entry carries a reason; an unannotated entry is debt (#1278).**
+// Most of this list is plain uncovered work — nobody has written the oracle
+// case yet, and the entry should read as a TODO. A minority of entries can
+// never gain a case no matter how much work goes in: the command diverges
+// from Neovim on purpose, the command ends the very session the probe is
+// running in, or the result depends on the host machine rather than on the
+// editor. Those, and only those, are annotated below under one of the four
+// "permanent" headings, each with the reason inline. If you are looking at
+// an entry with no comment above it, it is debt: pick it up, add a
+// `COMMAND_PROBES` entry and an oracle case, and delete it here. If you
+// believe an *annotated* entry is actually coverable, that is a finding for
+// whatever issue is doing that work, not license to just delete the
+// annotation — file it and let that slice make the case.
 // ---------------------------------------------------------------------------
 
 const COVERAGE_EXEMPT: &[&str] = &[
-    // --- Spell (#1163) ---
+    // --- Spell (#1163, deferred by #1278) ---
     // `src/core/spell.rs` implements all seven, so they are ✅ in the doc and
     // in scope here — but the oracle corpus contains no spell case whatsoever,
-    // so every probe above matches nothing. Exempt, and shrinkable: adding one
-    // real spell case forces its entry to be deleted from this list.
+    // so every probe above matches nothing. Exempt today, but — unlike the 46
+    // rows below this block — NOT permanent: these are deliberately left out
+    // of the "permanent" headings, because covering them is possible.
+    //
+    // #1278 looked at scoping that fixture and is deferring it rather than
+    // building it, for a concrete reason: `zg`/`zw`/`zG`/`zW` mutate word
+    // membership in a dictionary, and `z=`/`[s`/`]s` read the current
+    // dictionary's verdict — so every one of the seven is only comparable
+    // against the oracle if both sides agree on the same word list. They do
+    // not. `src/core/spell.rs` uses the `spellbook` crate (a Hunspell-format
+    // parser) against `dictionaries/en_US.dic`/`.aff`, compiled into the
+    // vimcode binary. The nvim oracle uses its own compiled `.spl` binary
+    // format, loaded at runtime from `$VIMRUNTIME/spell/en.utf-8.spl` —
+    // shipped with the Neovim *install*, not pinned by this repo, so it can
+    // silently change word list and suggestion ranking across a Neovim
+    // version bump. The two are unrelated implementations with unrelated
+    // word lists: confirmed empirically (2026-09, nvim 0.12.5) that
+    // `z=`-style suggestions for "helo" already differ in ranking between
+    // the two.
+    //
+    // That kills `z=` outright — its entire observable behavior *is* the
+    // suggestion list, so there is no dictionary-independent slice of it
+    // left to test. `zg`/`zw`/`zG`/`zW`/`[s`/`]s` are less broken: their
+    // effect is mechanical (does this word now report bad/good; does the
+    // cursor land on the next/prev bad word), which only needs both
+    // dictionaries to agree a *specific* word is bad — true for something
+    // like "helo", regardless of suggestion-list differences. A real fixture
+    // for those six would need to either (a) bundle a pinned nvim `.spl`
+    // fixture in this repo and point the oracle at it via `spellfile`, so
+    // the oracle's word list stops drifting with the host's Neovim install,
+    // or (b) hand-pick fixture words unambiguous enough (obvious nonsense vs.
+    // common real words) that both dictionaries' bad/good verdict is safe to
+    // assume without pinning. Either is scoped work for a future slice, not
+    // done here — this comment is that slice's starting point. `z=` itself
+    // stays exempt regardless of which path is taken.
     "z:z=",
     "z:zg",
     "z:zw",
@@ -8458,7 +8505,87 @@ const COVERAGE_EXEMPT: &[&str] = &[
     "z:zW",
     "bracket:[s",
     "bracket:]s",
-    // --- Insert Mode (ins) ---
+    // ===========================================================================
+    // Permanent exemptions (#1278) — the 46 ids below will never gain an
+    // oracle case, each for one of the four reasons grouped under the
+    // headings that follow. See the array's own doc comment above for the
+    // rule: a permanent entry carries a reason; an unannotated entry (every
+    // entry past this block) is plain debt.
+    // ===========================================================================
+
+    // --- Deliberate semantic divergence ---
+    // vimcode implements each of these, but on purpose differently from
+    // Neovim (see `VIM_COMPATIBILITY.md`, cited per row below), so a
+    // byte-for-byte oracle comparison is meaningless: a mismatch would be
+    // the intended behavior, not a bug.
+    //
+    // Next/prev git hunk (git integration), not Neovim's diff-mode hunk
+    // navigation (VIM_COMPATIBILITY.md:488).
+    "bracket:]c",
+    "bracket:[c",
+    // Next/prev LSP diagnostic — needs a live, attached LSP client, which
+    // the oracle (`-u NONE -i NONE`, no LSP) never has
+    // (VIM_COMPATIBILITY.md:489).
+    "bracket:]d",
+    "bracket:[d",
+    // LSP goto-definition, not a ctags-file jump (VIM_COMPATIBILITY.md:319).
+    "other:CTRL-]",
+    // LSP hover info, not `:help`/man-page lookup (VIM_COMPATIBILITY.md:310).
+    "other:K",
+    // vimcode's own diff engine, not Neovim's internal diff algorithm
+    // (VIM_COMPATIBILITY.md:322-323,657).
+    "other:do",
+    "other:dp",
+    "ex::diffsplit",
+    "ex::diffthis",
+    "ex::diffoff",
+    // Shells out to the host's default browser/opener — a side effect on
+    // the OS, not the buffer, that an oracle probe cannot observe
+    // (VIM_COMPATIBILITY.md:314,386).
+    "other:gx",
+    "g:gx",
+    // --- Ends or leaves the session ---
+    // Each of these exits, or would exit, the very vimcode process the probe
+    // is driving. There is no "after" state left for the probe to read —
+    // the harness cannot observe a command that tears down the thing it is
+    // observing.
+    "ex::q",
+    "ex::quit",
+    "ex::q!",
+    "ex::wq",
+    "ex::x",
+    "ex::qa",
+    "ex::qa!",
+    "ex::wqa",
+    "ex::xa",
+    "ex::cquit",
+    // `:version` prints build/version info to the message line, not buffer
+    // state — nothing here is a buffer diff. `:help`/`:h` open a help buffer
+    // whose *content* is Neovim's own bundled runtime docs, which vimcode
+    // does not reproduce and should not try to.
+    "ex::version",
+    "ex::help",
+    "ex::h",
+    // --- Environment-dependent ---
+    // The result depends on the machine running the test (an installed
+    // `grep`/`make`, the set of installed colorschemes, the filesystem
+    // layout under the cwd), not on the editor. Comparing against the
+    // oracle here would be comparing hosts, not implementations, and a case
+    // that happened to pass would be pinned to this machine's environment.
+    "ex::grep",
+    "ex::vimgrep",
+    "ex::lgrep",
+    "ex::lvimgrep",
+    "ex::make",
+    "ex::colorscheme",
+    "ex::cd {path}",
+    "ex::Explore",
+    "ex::Ex",
+    "ex::Sexplore",
+    "ex::Sex",
+    "ex::Vexplore",
+    "ex::Vex",
+    // --- Already decided into unit tests (#1160) ---
     "ins:CTRL-@",
     "ins:CTRL-G j/k",
     // #1160: source-dependent <C-x> sub-modes — oracle cases exist for
@@ -8473,6 +8600,12 @@ const COVERAGE_EXEMPT: &[&str] = &[
     "ins:CTRL-X CTRL-S",
     "ins:CTRL-X CTRL-O",
     "ins:CTRL-X CTRL-E/CTRL-Y",
+    // ===========================================================================
+    // Uncovered work — plain debt, no permanent reason. Every id below this
+    // line has no annotation because it needs none: pick one up, write a
+    // `COMMAND_PROBES` entry and an oracle case, and delete it.
+    // ===========================================================================
+
     // --- Normal Mode - Movement (move) ---
     "move:l",
     "move:g0",
@@ -8490,15 +8623,10 @@ const COVERAGE_EXEMPT: &[&str] = &[
     "other:gT",
     "other:gf",
     "other:gF",
-    "other:K",
     "other:ga",
     "other:g8",
-    "other:gx",
     "other:CTRL-^",
-    "other:CTRL-]",
     "other:CTRL-G",
-    "other:do",
-    "other:dp",
     "other:q:",
     "other:q/",
     "other:q?",
@@ -8525,7 +8653,6 @@ const COVERAGE_EXEMPT: &[&str] = &[
     "g:gT",
     "g:g<Tab>",
     "g:g.",
-    "g:gx",
     "g:ga",
     "g:g8",
     "g:gm",
@@ -8586,10 +8713,6 @@ const COVERAGE_EXEMPT: &[&str] = &[
     "win:CTRL-W f",
     "win:CTRL-W d",
     // --- Bracket Commands (bracket) ---
-    "bracket:]c",
-    "bracket:[c",
-    "bracket:]d",
-    "bracket:[d",
     "bracket:[p",
     "bracket:[]",
     "bracket:][",
@@ -8621,16 +8744,7 @@ const COVERAGE_EXEMPT: &[&str] = &[
     // --- Core Vim Ex Commands (ex) ---
     "ex::w",
     "ex::write",
-    "ex::q",
-    "ex::quit",
-    "ex::q!",
-    "ex::wq",
-    "ex::x",
-    "ex::qa",
-    "ex::qa!",
     "ex::wa",
-    "ex::wqa",
-    "ex::xa",
     "ex::edit",
     "ex::bn",
     "ex::bp",
@@ -8676,18 +8790,9 @@ const COVERAGE_EXEMPT: &[&str] = &[
     "ex::ma",
     "ex::saveas {file}",
     "ex::update",
-    "ex::cquit",
-    "ex::version",
-    "ex::help",
-    "ex::h",
     "ex::windo {cmd}",
     "ex::bufdo {cmd}",
     "ex::tabdo {cmd}",
-    "ex::diffsplit",
-    "ex::diffthis",
-    "ex::diffoff",
-    "ex::grep",
-    "ex::vimgrep",
     "ex::copen",
     "ex::cclose",
     "ex::cn",
@@ -8714,18 +8819,7 @@ const COVERAGE_EXEMPT: &[&str] = &[
     "ex::llist",
     "ex::ldo",
     "ex::lfdo",
-    "ex::lgrep",
-    "ex::lvimgrep",
-    "ex::cd {path}",
-    "ex::colorscheme",
-    "ex::make",
     "ex::b {name}",
-    "ex::Explore",
-    "ex::Ex",
-    "ex::Sexplore",
-    "ex::Sex",
-    "ex::Vexplore",
-    "ex::Vex",
 ];
 
 // ---------------------------------------------------------------------------
