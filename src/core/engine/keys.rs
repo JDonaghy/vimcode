@@ -3516,11 +3516,16 @@ impl Engine {
                         self.pending_operator = Some('Z');
                     }
                     Some('F') => {
-                        // zF: create fold for N lines from cursor
+                        // zF: create fold covering `count` lines total from
+                        // the cursor (default 1, i.e. no-op — there is
+                        // nothing to hide). #1280: this used to fold
+                        // `count + 1` lines (`line + count`, not
+                        // `line + count - 1`), off by one against Neovim —
+                        // `3zF` folded 4 lines instead of 3.
                         let count = self.take_count();
                         let line = self.view().cursor.line;
                         let total = self.buffer().len_lines();
-                        let end = (line + count).min(total.saturating_sub(1));
+                        let end = (line + count.saturating_sub(1)).min(total.saturating_sub(1));
                         if end > line {
                             self.cmd_fold_create(line, end);
                         }

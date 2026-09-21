@@ -288,6 +288,18 @@ impl UndoTree {
     /// `g-`/`:earlier`: move to the live node with the next-lower `seq`,
     /// globally — crossing branches, unlike a plain `u`. `None` if already
     /// at the oldest live state.
+    ///
+    /// #1280: returns the target node's `cursor_before` (where *its own*
+    /// edit started), not `cursor_after` (where it finished) — matching
+    /// `undo()` just above, and verified against Neovim: `g-`/`g+` restore
+    /// the cursor to the start of the change the same way plain `u` does,
+    /// regardless of which direction you're navigating from. Landing on a
+    /// state via `cursor_after` instead only coincidentally matched the one
+    /// case this had a corpus test for (`undo:g- crosses a branch abandoned
+    /// by u then edit`, #1156) — that case's final state is the tree root,
+    /// where `cursor_before == cursor_after` by construction — so a
+    /// non-root landing (as the new `g:g+` case here does) was never
+    /// exercised until now.
     pub fn older(&mut self) -> Option<(String, Cursor)> {
         let cur_seq = self.current_seq();
         let idx = self
@@ -296,11 +308,11 @@ impl UndoTree {
             .rfind(|&i| self.nodes[i].seq < cur_seq)?;
         self.current = idx;
         let n = &self.nodes[idx];
-        Some((n.text.clone(), n.cursor_after))
+        Some((n.text.clone(), n.cursor_before))
     }
 
     /// `g+`/`:later`: move to the live node with the next-higher `seq`,
-    /// globally.
+    /// globally. See `older`, just above, for why this reads `cursor_before`.
     pub fn newer(&mut self) -> Option<(String, Cursor)> {
         let cur_seq = self.current_seq();
         let idx = self
@@ -309,7 +321,7 @@ impl UndoTree {
             .find(|&i| self.nodes[i].seq > cur_seq)?;
         self.current = idx;
         let n = &self.nodes[idx];
-        Some((n.text.clone(), n.cursor_after))
+        Some((n.text.clone(), n.cursor_before))
     }
 
     /// Move to the live node with the largest `seq` whose `timestamp <=
