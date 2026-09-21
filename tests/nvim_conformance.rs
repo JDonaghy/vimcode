@@ -10537,10 +10537,22 @@ const PLATFORM: &str = "option of a Vim build for a platform vimcode does not ta
 /// prompt-buffer mark. vimcode has no `:h prompt-buffer` buffer type, so the
 /// mark has nothing to point at.
 const PROMPTBUF: &str = "no prompt buffers (:h prompt-buffer) in vimcode";
+/// Added by the ex-command slice (#1227) for the `:menu`/`:emenu`/`:popup`
+/// family. Distinct from [`VIMGUI`], which is about Vim *options* of a GUI
+/// build: vimcode does have menus, they are just quadraui widgets built from
+/// the accelerator registry, not entries a `:menu` command can define.
+const MENU: &str =
+    "Vim's GUI menu commands (:menu/:emenu/:popup); vimcode's menus are quadraui widgets";
+/// Added by #1227 for `:tag`/`:ptag`/`:dsearch`/`:ilist` and the rest of the
+/// tags and 'include'-search families.
+const CTAGS: &str =
+    "no ctags or 'include' file search planned; vimcode uses LSP definitions/references";
+/// Added by #1227 for `:rshada`/`:wshada`/`:rviminfo`/`:wviminfo`.
+const SHADA: &str = "no ShaDa/viminfo file; vimcode persists its own session state";
 
 const SKIP_REASONS: &[&str] = &[
     VIMSCRIPT, SCRIPTRT, BIDI, ENCODING, TERMCAP, VIMGUI, OBSOLETE, INTERP, PRINTING, CSCOPE, MAKE,
-    SELECT, VICOMPAT, EXMODE, SESSION, ARCH, PLATFORM, PROMPTBUF,
+    SELECT, VICOMPAT, EXMODE, SESSION, ARCH, PLATFORM, PROMPTBUF, MENU, CTAGS, SHADA,
 ];
 
 /// What `:set` actually does with an option name today — measured, never
@@ -14290,5 +14302,1853 @@ fn regmark_audit_gates_are_bidirectional() {
         classify_regmark_coverage(REGMARK_AUDIT, REGMARK_COVERAGE_EXEMPT, &plus).newly_covered,
         vec![victim],
         "a case pinning {victim:?} must force its exemption to be deleted"
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Phase 5 audit slice — ex commands (#1227)
+//
+// Slice 3 of 5, and the largest surface in the audit. Walks the pinned fleet
+// oracle's own `:help ex-cmd-index` (Neovim v0.12.5's `runtime/doc/index.txt`
+// §6, [`DEVIATIONS_ORACLE`]) end to end — **all 553 `:` commands, every one of
+// them** — and tags each Implemented / Partial / NotImplemented / Skipped
+// against `src/core/engine/execute.rs`, the same way #1225 walked
+// `:help option-list` and #1226 walked `:help registers`.
+//
+// The measurement, as of this slice:
+//
+//     ✅ Implemented      117
+//     🟡 Partial           53
+//     ❌ Not implemented  203
+//     ⏭️  Intentionally skipped  180   (each with a reason from SKIP_REASONS)
+//                         ────
+//                          553
+//
+// ## Why this slice was expected to grow the denominator, and did
+//
+// `VIM_COMPATIBILITY.md`'s "Core Vim Ex Commands" section lists ~70 rows and
+// reads 100%. `:help ex-cmd-index` lists 553. The gap is not that the doc is
+// wrong about the 70 — it is that "complete" was being measured against a
+// hand-written list of the commands vimcode already had, so a command that
+// was never considered could not show up as missing. 553 rows is the
+// denominator the ratchet can now count against, and 170 of them (✅ + 🟡)
+// are the numerator that oracle cases have to reach.
+//
+// ## Gate 1 — the recorded dispatch must match the live dispatcher
+//
+// Every row records [`ExDispatch`]: what `Engine::execute_command` does with
+// the **full** command name and with the **minimal abbreviation `:help`
+// documents**, measured, never asserted by hand. Both spellings matter
+// because they fail independently in vimcode: `normalize_ex_command`'s
+// `EX_ABBREVS` table is hand-maintained and first-match-wins, so a command
+// can be reachable as `:nmap` and rejected as `:nm` (43 rows), reachable as
+// `:tabe` and rejected as `:tabedit` (6 rows), or — twice — have its
+// documented abbreviation silently point at a *different* command.
+//
+// [`ex_audit_matches_the_live_dispatcher`] replays all 551 runnable rows
+// (553 minus the two that crash, below) through a real engine and diffs.
+// Bidirectional by construction: implementing `:lcd` flips its row from
+// `Neither` and fails until it is re-tagged, and a command that stops
+// dispatching fails immediately.
+//
+// It is a black-box observation — an ex line in, `engine.message` out —
+// never an engine field. A gate that asserted "`execute.rs` contains the
+// string `lgetfile`" would be green for `:lg`, which is precisely the row
+// where vimcode runs the wrong command.
+//
+// ## Gate 2 — oracle coverage, same shrink-only shape as #1007
+//
+// Every ✅/🟡 row carries a [`Probe`] naming the oracle case that exercises
+// it; [`EX_COVERAGE_EXEMPT`] lists the ones no case reaches today. Both
+// directions fail, exactly as in `COVERAGE_EXEMPT`. Writing the missing
+// cases is #1162's job, not this slice's — the exempt list is the
+// measurement it starts from.
+//
+// ❌ rows carry no probe, deliberately. #1226 gave one to every non-skipped
+// row because it had 32 of them; this slice has 203, and 203 permanently
+// exempt entries would drown the ~118 that describe a *real* gap in a
+// shrink-only list nobody can read. ❌ rows are already gated — harder — by
+// gate 1: a command that gains an implementation changes its `ExDispatch`.
+//
+// ## Findings that are worse than "missing"
+//
+//   * `:bdelete` and `:bwipeout` **panic** when they delete the last buffer
+//     (`active_buffer_state`'s `unwrap` on a buffer that no longer exists),
+//     where Vim falls back to an empty [No Name] buffer. Recorded as
+//     [`ExDispatch::Crashes`] and pinned by
+//     [`bdelete_on_the_last_buffer_panics_instead_of_refusing`].
+//   * `:!!` does not repeat the last `:!`; it passes the literal string `!`
+//     to the shell.
+//   * `:lg`, which `:help` documents as `:lg[etfile]`, runs `:lgrep`, and
+//     `:ln`, documented as `:ln[oremap]`, runs `:lnext` — first-match-wins
+//     abbreviations pointing at the wrong command.
+//   * `:continue`, `:debug`, `:stop` and `:restart` are bound to vimcode's
+//     DAP debugger, shadowing four Vim commands.
+//   * `:w {file}`, `:wq {file}`, `:x {file}` and `:update {file}` are all
+//     rejected — `:saveas` is the only way to write somewhere else.
+//   * `:1,2p` and `:1,2#` are rejected although bare `:p`/`:#` work: the
+//     print family takes no range.
+//   * pressing `:` then Enter answers `Not an editor command: `.
+//
+// ## Out of scope, deliberately
+//
+// VimScript (`:let`, `:if`, `:function`, `:autocmd`, `:source`, `:execute`,
+// `:call` and the rest of the ⏭️ block) is tagged Skipped per the standing
+// decision that vimcode implements Vim *keybindings and editing*, not a
+// VimScript runtime. Nothing here implements, fixes or changes any command:
+// this slice audits, tags and files. `COVERAGE_PHASE5.md` and
+// `VIM_COMPATIBILITY.md` were read, never written.
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// What `Engine::execute_command` does with an ex command's two documented
+/// spellings — measured by [`measured_ex_dispatch`], never asserted by hand.
+///
+/// Two spellings rather than one because they fail independently: vimcode's
+/// `EX_ABBREVS` table is separate from its dispatch, so "vimcode has this
+/// command" and "vimcode has this command under the name `:help` says you can
+/// type" are different questions, and 49 of the 553 rows answer them
+/// differently.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExDispatch {
+    /// Both the full name and `:help`'s minimal abbreviation reach a handler.
+    Both,
+    /// The full name reaches a handler; the documented minimal abbreviation
+    /// is answered with "Not an editor command" (vimcode's E492).
+    FullOnly,
+    /// The abbreviation reaches a handler but the full spelling does not.
+    AbbrevOnly,
+    /// Both spellings are answered with "Not an editor command".
+    Neither,
+    /// Running it **panics**. Not executed by gate 1 — a panicking probe
+    /// would take the whole test binary down rather than report a row — so
+    /// the crash is pinned separately, and precisely, by
+    /// [`bdelete_on_the_last_buffer_panics_instead_of_refusing`].
+    Crashes,
+}
+
+/// One `:help ex-cmd-index` entry.
+struct ExAudit {
+    /// The command exactly as `:help ex-cmd-index` writes it, brackets and
+    /// all (`":ab[breviate]"`) — the table's unique key.
+    cmd: &'static str,
+    /// The `:help` tag it is documented under (`":abbreviate"`).
+    help: &'static str,
+    status: OptStatus,
+    /// Re-measured by gate 1 from `probe_full` / `probe_abbr`.
+    dispatch: ExDispatch,
+    /// The exact ex line driven for the **full** name. Usually just the name;
+    /// commands that need an argument to reach their handler carry one (and
+    /// it is always an argument with no side effect — `:make -f /dev/null -q`
+    /// reads no Makefile, `:read foo` reads a file that does not exist).
+    probe_full: &'static str,
+    /// The same, for `:help`'s minimal abbreviation.
+    probe_abbr: &'static str,
+    /// Oracle probe — `Some` exactly for Implemented/Partial rows; see the
+    /// section doc for why ❌ rows carry none.
+    probe: Option<Probe>,
+    /// For ❌: what Vim does, plus this slice's assessment of whether it is
+    /// worth implementing. For 🟡: exactly what is missing.
+    note: &'static str,
+}
+
+#[allow(clippy::too_many_arguments)]
+const fn ex(
+    cmd: &'static str,
+    help: &'static str,
+    status: OptStatus,
+    dispatch: ExDispatch,
+    probe_full: &'static str,
+    probe_abbr: &'static str,
+    probe: Option<Probe>,
+    note: &'static str,
+) -> ExAudit {
+    ExAudit {
+        cmd,
+        help,
+        status,
+        dispatch,
+        probe_full,
+        probe_abbr,
+        probe,
+        note,
+    }
+}
+
+use crate::ExDispatch::{AbbrevOnly, Both, Crashes, FullOnly, Neither};
+
+/// Every command in `:help ex-cmd-index`, in `:help` order.
+///
+/// 553 rows, no "TODO" and no unreviewed row: adding one, deleting one,
+/// reordering one or leaving one without a note fails
+/// [`ex_audit_is_internally_consistent`].
+const EX_AUDIT: &[ExAudit] = &[
+    ex(":", ":", NotImplemented, Neither, "", "", None,
+       "an empty `:` line — Vim does nothing; vimcode answers `Not an editor command: `, which a user sees by pressing `:` then Enter. Worth fixing: one early return"),
+    ex(":{range}", ":range", Implemented, Both, "5", "5", Some(Label("ex:5")),
+       "`:{N}`, `:{range}{cmd}` and the `.$%'m/pat/?pat?+N;` address grammar all parse"),
+    ex(":!", ":!", Implemented, Both, "!", "!", Some(Label("ex:%!sort")),
+       "`:!{cmd}` shells out and reports the first output line; `:{range}!{cmd}` filters"),
+    ex(":!!", ":!!", NotImplemented, Both, "!!", "!!", None,
+       "repeat the last `:!` — vimcode instead passes the literal string `!` to the shell and prints `(no output)`, so the command silently runs garbage; worth implementing (the last command is already stored for `@:`)"),
+    ex(":#", ":#", Partial, Both, "#", "#", Some(Keys(":#<CR>")),
+       "prints the current line with its number, but only bare: `:1,2#` is rejected, so `:#` has no range"),
+    ex(":&", ":&", Implemented, Both, "&", "&", Some(Label("sub:& cmd")),
+       "repeats the last `:substitute` on the current line"),
+    ex(":*", ":star", Implemented, Neither, "*d", "*d", Some(Label("ex:*d after visual")),
+       "`:*` resolves to `'<,'>`, the last Visual area"),
+    ex(":<", ":<", Implemented, Both, "<", "<", Some(Label("ex:<")),
+       "shifts left, with a count and a range"),
+    ex(":=", ":=", Implemented, Both, "=", "=", Some(Keys(":=<CR>")),
+       "prints the last line number"),
+    ex(":>", ":>", Implemented, Both, ">", ">", Some(Label("ex:>")),
+       "shifts right, with a count and a range"),
+    ex(":@", ":@", NotImplemented, Neither, "@", "@", None,
+       "execute the contents of a register — Normal-mode `@a`/`@:` exist, but the ex form is rejected; cheap to wire to the same code path"),
+    ex(":@@", ":@@", NotImplemented, Neither, "@@", "@@", None,
+       "repeat the previous `:@`; blocked on `:@`"),
+    ex(":2mat[ch]", ":2match", NotImplemented, Neither, "2match", "2mat", None,
+       "define a second match to highlight — tree-sitter plus the theme registry replace Vim's syntax/highlight files; low value"),
+    ex(":3mat[ch]", ":3match", NotImplemented, Neither, "3match", "3mat", None,
+       "define a third match to highlight — tree-sitter plus the theme registry replace Vim's syntax/highlight files; low value"),
+    ex(":N[ext]", ":Next", NotImplemented, Neither, "Next", "N", None,
+       "go to previous file in the argument list — vimcode has no argument list, and splits+`:buffer` cover the `:s…`/`:sb…` family; moderate value for `:argdo` alone"),
+    ex(":a[ppend]", ":append", Skipped(EXMODE), Neither, "append", "a", None,
+       "Ex/Open mode line editing is out of scope"),
+    ex(":ab[breviate]", ":abbreviate", Implemented, Both, "abbreviate", "ab", Some(Label("abbrev:expands on CR")),
+       "defines and lists abbreviations for both Insert and Command-line mode"),
+    ex(":abc[lear]", ":abclear", Implemented, Both, "abclear", "abc", Some(Keys(":abclear<CR>")),
+       "clears every abbreviation"),
+    ex(":abo[veleft]", ":aboveleft", NotImplemented, Neither, "aboveleft", "abo", None,
+       "make split window appear left or above — `:wincmd` and `:split`/`:vsplit` cover the resize and split axes, but the `:{mod} {cmd}` modifier grammar is not parsed at all; moderate value"),
+    ex(":al[l]", ":all", NotImplemented, Neither, "all", "al", None,
+       "open a window for each file in the argument list — vimcode has no argument list, and splits+`:buffer` cover the `:s…`/`:sb…` family; moderate value for `:argdo` alone"),
+    ex(":am[enu]", ":amenu", Skipped(MENU), Neither, "amenu", "am", None,
+       "Vim's GUI menu/toolkit surface; vimcode's menus are quadraui widgets, not `:menu` entries"),
+    ex(":an[oremenu]", ":anoremenu", Skipped(MENU), Neither, "anoremenu", "an", None,
+       "Vim's GUI menu/toolkit surface; vimcode's menus are quadraui widgets, not `:menu` entries"),
+    ex(":ar[gs]", ":args", NotImplemented, Neither, "args", "ar", None,
+       "print the argument list — vimcode has no argument list, and splits+`:buffer` cover the `:s…`/`:sb…` family; moderate value for `:argdo` alone"),
+    ex(":arga[dd]", ":argadd", NotImplemented, Neither, "argadd", "arga", None,
+       "add items to the argument list — vimcode has no argument list, and splits+`:buffer` cover the `:s…`/`:sb…` family; moderate value for `:argdo` alone"),
+    ex(":argded[upe]", ":argdedupe", NotImplemented, Neither, "argdedupe", "argded", None,
+       "remove duplicates from the argument list — vimcode has no argument list, and splits+`:buffer` cover the `:s…`/`:sb…` family; moderate value for `:argdo` alone"),
+    ex(":argd[elete]", ":argdelete", NotImplemented, Neither, "argdelete", "argd", None,
+       "delete items from the argument list — vimcode has no argument list, and splits+`:buffer` cover the `:s…`/`:sb…` family; moderate value for `:argdo` alone"),
+    ex(":arge[dit]", ":argedit", NotImplemented, Neither, "argedit", "arge", None,
+       "add item to the argument list and edit it — vimcode has no argument list, and splits+`:buffer` cover the `:s…`/`:sb…` family; moderate value for `:argdo` alone"),
+    ex(":argdo", ":argdo", NotImplemented, Neither, "argdo", "argdo", None,
+       "do a command on all items in the argument list — vimcode has no argument list, and splits+`:buffer` cover the `:s…`/`:sb…` family; moderate value for `:argdo` alone"),
+    ex(":argg[lobal]", ":argglobal", NotImplemented, Neither, "argglobal", "argg", None,
+       "define the global argument list — vimcode has no argument list, and splits+`:buffer` cover the `:s…`/`:sb…` family; moderate value for `:argdo` alone"),
+    ex(":argl[ocal]", ":arglocal", NotImplemented, Neither, "arglocal", "argl", None,
+       "define a local argument list — vimcode has no argument list, and splits+`:buffer` cover the `:s…`/`:sb…` family; moderate value for `:argdo` alone"),
+    ex(":argu[ment]", ":argument", NotImplemented, Neither, "argument", "argu", None,
+       "go to specific file in the argument list — vimcode has no argument list, and splits+`:buffer` cover the `:s…`/`:sb…` family; moderate value for `:argdo` alone"),
+    ex(":as[cii]", ":ascii", NotImplemented, Neither, "ascii", "as", None,
+       "print ascii value of character under the cursor — one-off commands with no vimcode equivalent; `:z`, `:list`, `:lcd`, `:view`, `:uniq` and the `:keep*`/`:lockmarks` modifiers are the ones a Vim user would actually miss"),
+    ex(":au[tocmd]", ":autocmd", Skipped(SCRIPTRT), Neither, "autocmd", "au", None,
+       "needs a script/plugin runtime vimcode does not have"),
+    ex(":aug[roup]", ":augroup", Skipped(SCRIPTRT), Neither, "augroup", "aug", None,
+       "needs a script/plugin runtime vimcode does not have"),
+    ex(":aun[menu]", ":aunmenu", Skipped(MENU), Neither, "aunmenu", "aun", None,
+       "Vim's GUI menu/toolkit surface; vimcode's menus are quadraui widgets, not `:menu` entries"),
+    ex(":b[uffer]", ":buffer", Implemented, Both, "buffer 1", "b 1", Some(Keys(":buffer ")),
+       "switches to a buffer by number or name"),
+    ex(":bN[ext]", ":bNext", NotImplemented, Neither, "bNext", "bN", None,
+       "go to previous buffer in the buffer list — vimcode has no argument list, and splits+`:buffer` cover the `:s…`/`:sb…` family; moderate value for `:argdo` alone"),
+    ex(":ba[ll]", ":ball", NotImplemented, Neither, "ball", "ba", None,
+       "open a window for each buffer in the buffer list — vimcode has no argument list, and splits+`:buffer` cover the `:s…`/`:sb…` family; moderate value for `:argdo` alone"),
+    ex(":bad[d]", ":badd", NotImplemented, Neither, "badd", "bad", None,
+       "add buffer to the buffer list — vimcode has no argument list, and splits+`:buffer` cover the `:s…`/`:sb…` family; moderate value for `:argdo` alone"),
+    ex(":balt", ":balt", NotImplemented, Neither, "balt", "balt", None,
+       "like \":badd\" but also set the alternate file — vimcode has no argument list, and splits+`:buffer` cover the `:s…`/`:sb…` family; moderate value for `:argdo` alone"),
+    ex(":bd[elete]", ":bdelete", Partial, Crashes, "bdelete", "bd", Some(Keys(":bd<CR>")),
+       "unloads a buffer, but **panics** (`active_buffer_state`'s `unwrap`) when it deletes the last one instead of falling back to an empty [No Name] buffer — see `bdelete_on_the_last_buffer_panics_instead_of_refusing`"),
+    ex(":bel[owright]", ":belowright", NotImplemented, Neither, "belowright", "bel", None,
+       "make split window appear right or below — `:wincmd` and `:split`/`:vsplit` cover the resize and split axes, but the `:{mod} {cmd}` modifier grammar is not parsed at all; moderate value"),
+    ex(":bf[irst]", ":bfirst", Implemented, Both, "bfirst", "bf", Some(Label("ex:bfirst noop with one buffer")),
+       "jumps to the first buffer"),
+    ex(":bl[ast]", ":blast", Implemented, Both, "blast", "bl", Some(Label("ex:blast noop with one buffer")),
+       "jumps to the last buffer"),
+    ex(":bm[odified]", ":bmodified", NotImplemented, Neither, "bmodified", "bm", None,
+       "go to next buffer in the buffer list that has been modified — vimcode has no argument list, and splits+`:buffer` cover the `:s…`/`:sb…` family; moderate value for `:argdo` alone"),
+    ex(":bn[ext]", ":bnext", Implemented, Both, "bnext", "bn", Some(Keys(":bnext<CR>")),
+       "cycles to the next buffer"),
+    ex(":bo[tright]", ":botright", NotImplemented, Neither, "botright", "bo", None,
+       "make split window appear at bottom or far right — `:wincmd` and `:split`/`:vsplit` cover the resize and split axes, but the `:{mod} {cmd}` modifier grammar is not parsed at all; moderate value"),
+    ex(":bp[revious]", ":bprevious", Implemented, Both, "bprevious", "bp", Some(Keys(":bprevious<CR>")),
+       "cycles to the previous buffer"),
+    ex(":br[ewind]", ":brewind", NotImplemented, Neither, "brewind", "br", None,
+       "go to first buffer in the buffer list — vimcode has no argument list, and splits+`:buffer` cover the `:s…`/`:sb…` family; moderate value for `:argdo` alone"),
+    ex(":brea[k]", ":break", Skipped(VIMSCRIPT), Neither, "break", "brea", None,
+       "VimScript: out of scope per the standing decision (vimcode implements Vim keybindings and editing, not a VimScript runtime)"),
+    ex(":breaka[dd]", ":breakadd", Skipped(VIMSCRIPT), Neither, "breakadd", "breaka", None,
+       "VimScript: out of scope per the standing decision (vimcode implements Vim keybindings and editing, not a VimScript runtime)"),
+    ex(":breakd[el]", ":breakdel", Skipped(VIMSCRIPT), Neither, "breakdel", "breakd", None,
+       "VimScript: out of scope per the standing decision (vimcode implements Vim keybindings and editing, not a VimScript runtime)"),
+    ex(":breakl[ist]", ":breaklist", Skipped(VIMSCRIPT), Neither, "breaklist", "breakl", None,
+       "VimScript: out of scope per the standing decision (vimcode implements Vim keybindings and editing, not a VimScript runtime)"),
+    ex(":bro[wse]", ":browse", NotImplemented, Neither, "browse", "bro", None,
+       "use file selection dialog — one-off commands with no vimcode equivalent; `:z`, `:list`, `:lcd`, `:view`, `:uniq` and the `:keep*`/`:lockmarks` modifiers are the ones a Vim user would actually miss"),
+    ex(":bufd[o]", ":bufdo", Implemented, Both, "bufdo s/a/b/", "bufdo s/a/b/", Some(Keys(":bufdo ")),
+       "runs a command in every buffer"),
+    ex(":buffers", ":buffers", Implemented, Both, "buffers", "buffers", Some(Keys(":buffers<CR>")),
+       "lists buffers with the `%a` flags"),
+    ex(":bun[load]", ":bunload", NotImplemented, Neither, "bunload", "bun", None,
+       "unload a specific buffer — vimcode has no argument list, and splits+`:buffer` cover the `:s…`/`:sb…` family; moderate value for `:argdo` alone"),
+    ex(":bw[ipeout]", ":bwipeout", Partial, Crashes, "bwipeout", "bw", Some(Label("ex:bwipeout refuses on a dirty buffer without a bang")),
+       "same code path, and the same last-buffer panic as `:bdelete`"),
+    ex(":c[hange]", ":change", Skipped(EXMODE), Neither, "change", "c", None,
+       "Ex/Open mode line editing is out of scope"),
+    ex(":cN[ext]", ":cNext", Partial, AbbrevOnly, "cNext", "cN", Some(Keys(":cN<CR>")),
+       "`:cN` works (it is `:cprevious`), but the full spelling `:cNext` is rejected"),
+    ex(":cNf[ile]", ":cNfile", NotImplemented, Neither, "cNfile", "cNf", None,
+       "go to last error in previous file — vimcode's quickfix list is filled by `:grep`/`:make` and LSP diagnostics, never from an error file or expression; low value"),
+    ex(":ca[bbrev]", ":cabbrev", Implemented, Both, "cabbrev", "ca", Some(Label("abbrev:cabbrev on the command line runs the expanded command")),
+       "command-line abbreviations"),
+    ex(":cabc[lear]", ":cabclear", NotImplemented, Neither, "cabclear", "cabc", None,
+       "clear all abbreviations for Command-line mode — one-off commands with no vimcode equivalent; `:z`, `:list`, `:lcd`, `:view`, `:uniq` and the `:keep*`/`:lockmarks` modifiers are the ones a Vim user would actually miss"),
+    ex(":cabo[ve]", ":cabove", NotImplemented, Neither, "cabove", "cabo", None,
+       "go to error above current line — vimcode's quickfix list is filled by `:grep`/`:make` and LSP diagnostics, never from an error file or expression; low value"),
+    ex(":cad[dbuffer]", ":caddbuffer", NotImplemented, Neither, "caddbuffer", "cad", None,
+       "add errors from buffer — vimcode's quickfix list is filled by `:grep`/`:make` and LSP diagnostics, never from an error file or expression; low value"),
+    ex(":cadde[xpr]", ":caddexpr", NotImplemented, Neither, "caddexpr", "cadde", None,
+       "add errors from expr — vimcode's quickfix list is filled by `:grep`/`:make` and LSP diagnostics, never from an error file or expression; low value"),
+    ex(":caddf[ile]", ":caddfile", NotImplemented, Neither, "caddfile", "caddf", None,
+       "add error message to current quickfix list — vimcode's quickfix list is filled by `:grep`/`:make` and LSP diagnostics, never from an error file or expression; low value"),
+    ex(":caf[ter]", ":cafter", NotImplemented, Neither, "cafter", "caf", None,
+       "go to error after current cursor — vimcode's quickfix list is filled by `:grep`/`:make` and LSP diagnostics, never from an error file or expression; low value"),
+    ex(":cal[l]", ":call", Skipped(VIMSCRIPT), Neither, "call", "cal", None,
+       "VimScript: out of scope per the standing decision (vimcode implements Vim keybindings and editing, not a VimScript runtime)"),
+    ex(":cat[ch]", ":catch", Skipped(VIMSCRIPT), Neither, "catch", "cat", None,
+       "VimScript: out of scope per the standing decision (vimcode implements Vim keybindings and editing, not a VimScript runtime)"),
+    ex(":cbe[fore]", ":cbefore", NotImplemented, Neither, "cbefore", "cbe", None,
+       "go to error before current cursor — vimcode's quickfix list is filled by `:grep`/`:make` and LSP diagnostics, never from an error file or expression; low value"),
+    ex(":cbel[ow]", ":cbelow", NotImplemented, Neither, "cbelow", "cbel", None,
+       "go to error below current line — vimcode's quickfix list is filled by `:grep`/`:make` and LSP diagnostics, never from an error file or expression; low value"),
+    ex(":cbo[ttom]", ":cbottom", NotImplemented, Neither, "cbottom", "cbo", None,
+       "scroll to the bottom of the quickfix window — vimcode's quickfix list is filled by `:grep`/`:make` and LSP diagnostics, never from an error file or expression; low value"),
+    ex(":cb[uffer]", ":cbuffer", NotImplemented, Neither, "cbuffer", "cb", None,
+       "parse error messages and jump to first error — vimcode's quickfix list is filled by `:grep`/`:make` and LSP diagnostics, never from an error file or expression; low value"),
+    ex(":cc", ":cc", Implemented, Both, "cc", "cc", Some(Label("ex:cc on empty quickfix list")),
+       "jumps to quickfix error N, or re-jumps to the current one"),
+    ex(":ccl[ose]", ":cclose", Implemented, Both, "cclose", "ccl", Some(Keys(":cclose<CR>")),
+       "closes the quickfix window"),
+    ex(":cd", ":cd", Partial, Both, "cd .", "cd .", Some(Keys(":cd ")),
+       "changes vimcode's *workspace folder* (and the explorer root), not the process/window working directory; bare `:cd` does not go to $HOME, and `:lcd`/`:tcd` are absent"),
+    ex(":cdo", ":cdo", Implemented, Both, "cdo", "cdo", Some(Keys(":cdo ")),
+       "runs a command on each quickfix entry"),
+    ex(":cfd[o]", ":cfdo", Partial, FullOnly, "cfdo", "cfd", Some(Keys(":cfdo ")),
+       "works, but `:cfd` — Vim's documented minimum abbreviation — is rejected (vimcode's table requires 4 characters)"),
+    ex(":ce[nter]", ":center", Implemented, Both, "center", "ce", Some(Label("ex:ce 10")),
+       "centres lines within 'textwidth' or an explicit width"),
+    ex(":cex[pr]", ":cexpr", NotImplemented, Neither, "cexpr", "cex", None,
+       "read errors from expr and jump to first — vimcode's quickfix list is filled by `:grep`/`:make` and LSP diagnostics, never from an error file or expression; low value"),
+    ex(":cf[ile]", ":cfile", NotImplemented, Neither, "cfile", "cf", None,
+       "read file with error messages and jump to first — vimcode's quickfix list is filled by `:grep`/`:make` and LSP diagnostics, never from an error file or expression; low value"),
+    ex(":cfir[st]", ":cfirst", Implemented, Both, "cfirst", "cfir", Some(Keys(":cfirst<CR>")),
+       "first quickfix entry"),
+    ex(":cgetb[uffer]", ":cgetbuffer", NotImplemented, Neither, "cgetbuffer", "cgetb", None,
+       "get errors from buffer — vimcode's quickfix list is filled by `:grep`/`:make` and LSP diagnostics, never from an error file or expression; low value"),
+    ex(":cgete[xpr]", ":cgetexpr", NotImplemented, Neither, "cgetexpr", "cgete", None,
+       "get errors from expr — vimcode's quickfix list is filled by `:grep`/`:make` and LSP diagnostics, never from an error file or expression; low value"),
+    ex(":cg[etfile]", ":cgetfile", NotImplemented, Neither, "cgetfile", "cg", None,
+       "read file with error messages — vimcode's quickfix list is filled by `:grep`/`:make` and LSP diagnostics, never from an error file or expression; low value"),
+    ex(":changes", ":changes", Implemented, Both, "changes", "changes", Some(Keys(":changes<CR>")),
+       "prints the change list"),
+    ex(":chd[ir]", ":chdir", NotImplemented, Neither, "chdir", "chd", None,
+       "change directory — one-off commands with no vimcode equivalent; `:z`, `:list`, `:lcd`, `:view`, `:uniq` and the `:keep*`/`:lockmarks` modifiers are the ones a Vim user would actually miss"),
+    ex(":che[ckhealth]", ":checkhealth", NotImplemented, Neither, "checkhealth", "che", None,
+       "run healthchecks — informational commands with no vimcode surface; `:messages` and `:oldfiles` (vimcode already has a recent-files picker) are the two worth adding"),
+    ex(":checkp[ath]", ":checkpath", Skipped(CTAGS), Neither, "checkpath", "checkp", None,
+       "tags/'include' file search; vimcode uses LSP go-to-definition and references instead"),
+    ex(":checkt[ime]", ":checktime", NotImplemented, Neither, "checktime", "checkt", None,
+       "check timestamp of loaded buffers — one-off commands with no vimcode equivalent; `:z`, `:list`, `:lcd`, `:view`, `:uniq` and the `:keep*`/`:lockmarks` modifiers are the ones a Vim user would actually miss"),
+    ex(":chi[story]", ":chistory", NotImplemented, Neither, "chistory", "chi", None,
+       "list the error lists — vimcode's quickfix list is filled by `:grep`/`:make` and LSP diagnostics, never from an error file or expression; low value"),
+    ex(":cla[st]", ":clast", Implemented, Both, "clast", "cla", Some(Keys(":clast<CR>")),
+       "last quickfix entry"),
+    ex(":cle[arjumps]", ":clearjumps", NotImplemented, Neither, "clearjumps", "cle", None,
+       "clear the jump list — one-off commands with no vimcode equivalent; `:z`, `:list`, `:lcd`, `:view`, `:uniq` and the `:keep*`/`:lockmarks` modifiers are the ones a Vim user would actually miss"),
+    ex(":cl[ist]", ":clist", Implemented, Both, "clist", "cl", Some(Keys(":clist<CR>")),
+       "lists quickfix entries"),
+    ex(":clo[se]", ":close", Implemented, Both, "close", "clo", Some(Keys(":close<CR>")),
+       "closes the window, refusing on the last one"),
+    ex(":cm[ap]", ":cmap", Partial, FullOnly, "cmap", "cm", Some(Keys(":cmap ")),
+       "works, but `:cm` is rejected"),
+    ex(":cmapc[lear]", ":cmapclear", Partial, FullOnly, "cmapclear", "cmapc", Some(Keys(":cmapclear")),
+       "works, but `:cmapc` is rejected"),
+    ex(":cme[nu]", ":cmenu", Skipped(MENU), Neither, "cmenu", "cme", None,
+       "Vim's GUI menu/toolkit surface; vimcode's menus are quadraui widgets, not `:menu` entries"),
+    ex(":cn[ext]", ":cnext", Implemented, Both, "cnext", "cn", Some(Keys(":cnext<CR>")),
+       "next quickfix entry"),
+    ex(":cnew[er]", ":cnewer", Implemented, Both, "cnewer", "cnew", Some(Keys(":cnewer<CR>")),
+       "newer quickfix list"),
+    ex(":cnf[ile]", ":cnfile", NotImplemented, Neither, "cnfile", "cnf", None,
+       "go to first error in next file — vimcode's quickfix list is filled by `:grep`/`:make` and LSP diagnostics, never from an error file or expression; low value"),
+    ex(":cno[remap]", ":cnoremap", Partial, FullOnly, "cnoremap", "cno", Some(Keys(":cnoremap ")),
+       "works, but `:cno` is rejected"),
+    ex(":cnorea[bbrev]", ":cnoreabbrev", Implemented, Both, "cnoreabbrev foo bar", "cnorea foo bar", Some(Keys(":cnoreabbrev ")),
+       "defined, and stored alongside `:cabbrev`"),
+    ex(":cnoreme[nu]", ":cnoremenu", Skipped(MENU), Neither, "cnoremenu", "cnoreme", None,
+       "Vim's GUI menu/toolkit surface; vimcode's menus are quadraui widgets, not `:menu` entries"),
+    ex(":co[py]", ":copy", Implemented, Both, "copy 0", "co 0", Some(Label("ex:1co$")),
+       "copies a range below an address"),
+    ex(":col[der]", ":colder", Implemented, Both, "colder", "col", Some(Keys(":colder<CR>")),
+       "older quickfix list"),
+    ex(":colo[rscheme]", ":colorscheme", Implemented, Both, "colorscheme", "colo", Some(Keys(":colorscheme ")),
+       "switches themes, and lists them when called bare"),
+    ex(":com[mand]", ":command", Skipped(SCRIPTRT), Neither, "command", "com", None,
+       "needs a script/plugin runtime vimcode does not have"),
+    ex(":comc[lear]", ":comclear", Skipped(SCRIPTRT), Neither, "comclear", "comc", None,
+       "needs a script/plugin runtime vimcode does not have"),
+    ex(":comp[iler]", ":compiler", Skipped(SCRIPTRT), Neither, "compiler", "comp", None,
+       "needs a script/plugin runtime vimcode does not have"),
+    ex(":con[tinue]", ":continue", Skipped(VIMSCRIPT), FullOnly, "continue", "con", None,
+       "VimScript loop control — and vimcode has taken the name for its DAP debugger's continue, so the two collide"),
+    ex(":conf[irm]", ":confirm", NotImplemented, Neither, "confirm", "conf", None,
+       "prompt user when confirmation required — one-off commands with no vimcode equivalent; `:z`, `:list`, `:lcd`, `:view`, `:uniq` and the `:keep*`/`:lockmarks` modifiers are the ones a Vim user would actually miss"),
+    ex(":cons[t]", ":const", Skipped(VIMSCRIPT), Neither, "const", "cons", None,
+       "VimScript: out of scope per the standing decision (vimcode implements Vim keybindings and editing, not a VimScript runtime)"),
+    ex(":cope[n]", ":copen", Implemented, Both, "copen", "cope", Some(Keys(":copen<CR>")),
+       "opens the quickfix window"),
+    ex(":cp[revious]", ":cprevious", Implemented, Both, "cprevious", "cp", Some(Keys(":cprevious<CR>")),
+       "previous quickfix entry"),
+    ex(":cpf[ile]", ":cpfile", NotImplemented, Neither, "cpfile", "cpf", None,
+       "go to last error in previous file — vimcode's quickfix list is filled by `:grep`/`:make` and LSP diagnostics, never from an error file or expression; low value"),
+    ex(":cq[uit]", ":cquit", Implemented, Both, "cquit", "cq", Some(Keys(":cquit<CR>")),
+       "quits with a non-zero exit code"),
+    ex(":cr[ewind]", ":crewind", NotImplemented, Neither, "crewind", "cr", None,
+       "go to the specified error, default first one — vimcode's quickfix list is filled by `:grep`/`:make` and LSP diagnostics, never from an error file or expression; low value"),
+    ex(":cu[nmap]", ":cunmap", Partial, FullOnly, "cunmap", "cu", Some(Keys(":cunmap ")),
+       "works, but `:cu` is rejected"),
+    ex(":cuna[bbrev]", ":cunabbrev", NotImplemented, Neither, "cunabbrev", "cuna", None,
+       "like \":unabbrev\" but for Command-line mode — one-off commands with no vimcode equivalent; `:z`, `:list`, `:lcd`, `:view`, `:uniq` and the `:keep*`/`:lockmarks` modifiers are the ones a Vim user would actually miss"),
+    ex(":cunme[nu]", ":cunmenu", Skipped(MENU), Neither, "cunmenu", "cunme", None,
+       "Vim's GUI menu/toolkit surface; vimcode's menus are quadraui widgets, not `:menu` entries"),
+    ex(":cw[indow]", ":cwindow", Implemented, Both, "cwindow", "cw", Some(Keys(":cwindow<CR>")),
+       "opens the quickfix window only when it is non-empty"),
+    ex(":d[elete]", ":delete", Implemented, Both, "delete", "d", Some(Label("ex:2d")),
+       "deletes a range into a register, with a count"),
+    ex(":deb[ug]", ":debug", Skipped(VIMSCRIPT), FullOnly, "debug", "deb", None,
+       "the VimScript debugger — vimcode has taken the name for starting a DAP session"),
+    ex(":debugg[reedy]", ":debuggreedy", Skipped(VIMSCRIPT), Neither, "debuggreedy", "debugg", None,
+       "VimScript: out of scope per the standing decision (vimcode implements Vim keybindings and editing, not a VimScript runtime)"),
+    ex(":defe[r]", ":defer", Skipped(VIMSCRIPT), Neither, "defer", "defe", None,
+       "VimScript: out of scope per the standing decision (vimcode implements Vim keybindings and editing, not a VimScript runtime)"),
+    ex(":delc[ommand]", ":delcommand", Skipped(SCRIPTRT), Neither, "delcommand", "delc", None,
+       "needs a script/plugin runtime vimcode does not have"),
+    ex(":delf[unction]", ":delfunction", Skipped(VIMSCRIPT), Neither, "delfunction", "delf", None,
+       "VimScript: out of scope per the standing decision (vimcode implements Vim keybindings and editing, not a VimScript runtime)"),
+    ex(":delm[arks]", ":delmarks", Implemented, Both, "delmarks", "delm", Some(Label("ex:delmarks a")),
+       "deletes marks by name and range"),
+    ex(":detach", ":detach", Skipped(PLATFORM), Neither, "detach", "detach", None,
+       "command of a Vim/Neovim build feature vimcode does not target"),
+    ex(":dif[fupdate]", ":diffupdate", NotImplemented, Neither, "diffupdate", "dif", None,
+       "update 'diff' buffers — `:diffsplit`/`:diffthis` exist but no hunk transfer or refresh; `:diffget`/`:diffput` are worth implementing"),
+    ex(":diffg[et]", ":diffget", NotImplemented, Neither, "diffget", "diffg", None,
+       "remove differences in current buffer — `:diffsplit`/`:diffthis` exist but no hunk transfer or refresh; `:diffget`/`:diffput` are worth implementing"),
+    ex(":diffo[ff]", ":diffoff", Partial, FullOnly, "diffoff", "diffo", Some(Keys(":diffoff")),
+       "turns diff mode off, but `:diffo` is rejected"),
+    ex(":diffp[atch]", ":diffpatch", NotImplemented, Neither, "diffpatch", "diffp", None,
+       "apply a patch and show differences — `:diffsplit`/`:diffthis` exist but no hunk transfer or refresh; `:diffget`/`:diffput` are worth implementing"),
+    ex(":diffpu[t]", ":diffput", NotImplemented, Neither, "diffput", "diffpu", None,
+       "remove differences in other buffer — `:diffsplit`/`:diffthis` exist but no hunk transfer or refresh; `:diffget`/`:diffput` are worth implementing"),
+    ex(":diffs[plit]", ":diffsplit", Partial, FullOnly, "diffsplit", "diffs", Some(Keys(":diffsplit ")),
+       "opens the diff split, but `:diffs` — Vim's documented minimum — is rejected"),
+    ex(":difft[his]", ":diffthis", Partial, FullOnly, "diffthis", "difft", Some(Keys(":diffthis")),
+       "marks a window for diffing, but `:difft` is rejected"),
+    ex(":dig[raphs]", ":digraphs", Implemented, Both, "digraphs", "dig", Some(Keys(":digraphs<CR>")),
+       "lists the digraph table and defines user digraphs"),
+    ex(":di[splay]", ":display", Implemented, Both, "display", "di", Some(Keys(":display<CR>")),
+       "alias of `:registers`"),
+    ex(":dj[ump]", ":djump", Skipped(CTAGS), Neither, "djump", "dj", None,
+       "tags/'include' file search; vimcode uses LSP go-to-definition and references instead"),
+    ex(":dl", ":dl", NotImplemented, Neither, "dl", "dl", None,
+       "`:d` with the `l` list flag — same gap as `:dp`; low value"),
+    ex(":dli[st]", ":dlist", Skipped(CTAGS), Neither, "dlist", "dli", None,
+       "tags/'include' file search; vimcode uses LSP go-to-definition and references instead"),
+    ex(":do[autocmd]", ":doautocmd", Skipped(SCRIPTRT), Neither, "doautocmd", "do", None,
+       "needs a script/plugin runtime vimcode does not have"),
+    ex(":doautoa[ll]", ":doautoall", Skipped(SCRIPTRT), Neither, "doautoall", "doautoa", None,
+       "needs a script/plugin runtime vimcode does not have"),
+    ex(":d[elete]p", ":dp", NotImplemented, Neither, "dp", "dp", None,
+       "`:d` with the `p` print flag — vimcode's `:delete` takes a register and a count but no print flags; low value"),
+    ex(":dr[op]", ":drop", NotImplemented, Neither, "drop", "dr", None,
+       "jump to window editing file or edit file in current window — one-off commands with no vimcode equivalent; `:z`, `:list`, `:lcd`, `:view`, `:uniq` and the `:keep*`/`:lockmarks` modifiers are the ones a Vim user would actually miss"),
+    ex(":ds[earch]", ":dsearch", Skipped(CTAGS), Neither, "dsearch", "ds", None,
+       "tags/'include' file search; vimcode uses LSP go-to-definition and references instead"),
+    ex(":dsp[lit]", ":dsplit", Skipped(CTAGS), Neither, "dsplit", "dsp", None,
+       "tags/'include' file search; vimcode uses LSP go-to-definition and references instead"),
+    ex(":e[dit]", ":edit", Implemented, Both, "edit foo", "e foo", Some(Keys(":edit ")),
+       "opens a file, with `!` to discard changes"),
+    ex(":ea[rlier]", ":earlier", NotImplemented, Neither, "earlier", "ea", None,
+       "go to older change, undo — the undo-tree surface; tracked by #1156, which is implementing persistent undo and the tree"),
+    ex(":ec[ho]", ":echo", Skipped(VIMSCRIPT), Both, "echo", "ec", None,
+       "vimcode accepts `:echo {text}` and echoes it back verbatim, which looks like support but evaluates nothing — the expression half is the VimScript half"),
+    ex(":echoe[rr]", ":echoerr", Skipped(VIMSCRIPT), Neither, "echoerr", "echoe", None,
+       "VimScript: out of scope per the standing decision (vimcode implements Vim keybindings and editing, not a VimScript runtime)"),
+    ex(":echoh[l]", ":echohl", Skipped(VIMSCRIPT), Neither, "echohl", "echoh", None,
+       "VimScript: out of scope per the standing decision (vimcode implements Vim keybindings and editing, not a VimScript runtime)"),
+    ex(":echom[sg]", ":echomsg", Skipped(VIMSCRIPT), Neither, "echomsg", "echom", None,
+       "VimScript: out of scope per the standing decision (vimcode implements Vim keybindings and editing, not a VimScript runtime)"),
+    ex(":echon", ":echon", Skipped(VIMSCRIPT), Neither, "echon", "echon", None,
+       "VimScript: out of scope per the standing decision (vimcode implements Vim keybindings and editing, not a VimScript runtime)"),
+    ex(":el[se]", ":else", Skipped(VIMSCRIPT), Neither, "else", "el", None,
+       "VimScript: out of scope per the standing decision (vimcode implements Vim keybindings and editing, not a VimScript runtime)"),
+    ex(":elsei[f]", ":elseif", Skipped(VIMSCRIPT), Neither, "elseif", "elsei", None,
+       "VimScript: out of scope per the standing decision (vimcode implements Vim keybindings and editing, not a VimScript runtime)"),
+    ex(":em[enu]", ":emenu", Skipped(MENU), Neither, "emenu", "em", None,
+       "Vim's GUI menu/toolkit surface; vimcode's menus are quadraui widgets, not `:menu` entries"),
+    ex(":en[dif]", ":endif", Skipped(VIMSCRIPT), Neither, "endif", "en", None,
+       "VimScript: out of scope per the standing decision (vimcode implements Vim keybindings and editing, not a VimScript runtime)"),
+    ex(":endfo[r]", ":endfor", Skipped(VIMSCRIPT), Neither, "endfor", "endfo", None,
+       "VimScript: out of scope per the standing decision (vimcode implements Vim keybindings and editing, not a VimScript runtime)"),
+    ex(":endf[unction]", ":endfunction", Skipped(VIMSCRIPT), Neither, "endfunction", "endf", None,
+       "VimScript: out of scope per the standing decision (vimcode implements Vim keybindings and editing, not a VimScript runtime)"),
+    ex(":endt[ry]", ":endtry", Skipped(VIMSCRIPT), Neither, "endtry", "endt", None,
+       "VimScript: out of scope per the standing decision (vimcode implements Vim keybindings and editing, not a VimScript runtime)"),
+    ex(":endw[hile]", ":endwhile", Skipped(VIMSCRIPT), Neither, "endwhile", "endw", None,
+       "VimScript: out of scope per the standing decision (vimcode implements Vim keybindings and editing, not a VimScript runtime)"),
+    ex(":ene[w]", ":enew", Implemented, Both, "enew", "ene", Some(Label("ex:enew abandons a dirty buffer by default ('hidden' is on)")),
+       "opens an empty buffer, with `!` to abandon a dirty one"),
+    ex(":ev[al]", ":eval", Skipped(VIMSCRIPT), Neither, "eval", "ev", None,
+       "VimScript: out of scope per the standing decision (vimcode implements Vim keybindings and editing, not a VimScript runtime)"),
+    ex(":ex", ":ex", Skipped(EXMODE), Neither, "ex", "ex", None,
+       "Ex/Open mode line editing is out of scope"),
+    ex(":exe[cute]", ":execute", Skipped(VIMSCRIPT), Neither, "execute", "exe", None,
+       "VimScript: out of scope per the standing decision (vimcode implements Vim keybindings and editing, not a VimScript runtime)"),
+    ex(":exi[t]", ":exit", NotImplemented, Neither, "exit", "exi", None,
+       "same as \":xit\" — no vimcode equivalent; low value"),
+    ex(":exu[sage]", ":exusage", NotImplemented, Neither, "exusage", "exu", None,
+       "overview of Ex commands — informational commands with no vimcode surface; `:messages` and `:oldfiles` (vimcode already has a recent-files picker) are the two worth adding"),
+    ex(":fc[lose]", ":fclose", NotImplemented, Neither, "fclose", "fc", None,
+       "close floating window — one-off commands with no vimcode equivalent; `:z`, `:list`, `:lcd`, `:view`, `:uniq` and the `:keep*`/`:lockmarks` modifiers are the ones a Vim user would actually miss"),
+    ex(":f[ile]", ":file", Partial, Both, "file", "f", Some(Keys(":file<CR>")),
+       "`:file` reports the name/line count/percentage, but `:file {name}` (rename the buffer) is rejected"),
+    ex(":files", ":files", Implemented, Both, "files", "files", Some(Keys(":files<CR>")),
+       "alias of `:buffers`"),
+    ex(":filet[ype]", ":filetype", NotImplemented, Neither, "filetype", "filet", None,
+       "switch file type detection on/off — `:set` exists but has no local/global split (vimcode's settings are global), and `:setfiletype`/`:filetype` are absent; `:setfiletype` is worth implementing"),
+    ex(":filt[er]", ":filter", Skipped(VIMSCRIPT), Neither, "filter", "filt", None,
+       "VimScript: out of scope per the standing decision (vimcode implements Vim keybindings and editing, not a VimScript runtime)"),
+    ex(":fin[d]", ":find", NotImplemented, FullOnly, "find", "fin", None,
+       "find a file in 'path' and edit it — `:find` bare opens vimcode's Ctrl+F find/replace overlay instead, and `:find {file}` is rejected, so the Vim command is absent behind a name that looks taken; worth implementing"),
+    ex(":fina[lly]", ":finally", Skipped(VIMSCRIPT), Neither, "finally", "fina", None,
+       "VimScript: out of scope per the standing decision (vimcode implements Vim keybindings and editing, not a VimScript runtime)"),
+    ex(":fini[sh]", ":finish", Skipped(SCRIPTRT), Neither, "finish", "fini", None,
+       "needs a script/plugin runtime vimcode does not have"),
+    ex(":fir[st]", ":first", NotImplemented, Neither, "first", "fir", None,
+       "go to the first file in the argument list — vimcode has no argument list, and splits+`:buffer` cover the `:s…`/`:sb…` family; moderate value for `:argdo` alone"),
+    ex(":fo[ld]", ":fold", Partial, FullOnly, "fold", "fo", Some(Label("fold:ex::fold creates and closes a manual fold")),
+       "creates a fold over a range, but `:fo` — Vim's documented minimum — is rejected"),
+    ex(":foldc[lose]", ":foldclose", Implemented, Both, "foldclose", "foldc", Some(Label("fold:ex::foldclose! on a nested range closes every level")),
+       "closes folds in a range, with `!` for recursive"),
+    ex(":foldd[oopen]", ":folddoopen", Implemented, Both, "folddoopen d", "foldd d", Some(Label("fold:ex::folddoopen only touches lines outside the closed fold")),
+       "runs a command on every non-folded line"),
+    ex(":folddoc[losed]", ":folddoclosed", Implemented, Both, "folddoclosed d", "folddoc d", Some(Label("fold:ex::folddoclosed only touches lines inside the closed fold")),
+       "runs a command on every folded line"),
+    ex(":foldo[pen]", ":foldopen", Implemented, Both, "foldopen", "foldo", Some(Label("fold:ex::foldopen with a matching range reopens it")),
+       "opens folds in a range, with `!` for recursive"),
+    ex(":for", ":for", Skipped(VIMSCRIPT), Neither, "for", "for", None,
+       "VimScript: out of scope per the standing decision (vimcode implements Vim keybindings and editing, not a VimScript runtime)"),
+    ex(":fu[nction]", ":function", Skipped(VIMSCRIPT), Neither, "function", "fu", None,
+       "VimScript: out of scope per the standing decision (vimcode implements Vim keybindings and editing, not a VimScript runtime)"),
+    ex(":g[lobal]", ":global", Implemented, Both, "global/beta/d", "g/beta/d", Some(Label("ex:cursor after :g/d")),
+       "`:g/pat/cmd`, with `:g!` and `:v` for the inverse"),
+    ex(":go[to]", ":goto", NotImplemented, FullOnly, "goto", "go", None,
+       "go to byte N in the buffer — vimcode recognises the name only to answer \"Use :N to go to line N\"; low value"),
+    ex(":gr[ep]", ":grep", Implemented, Both, "grep", "gr", Some(Keys(":grep ")),
+       "runs the external grep and fills the quickfix list"),
+    ex(":grepa[dd]", ":grepadd", NotImplemented, Neither, "grepadd", "grepa", None,
+       "like :grep, but append to current list — vimcode's quickfix list is filled by `:grep`/`:make` and LSP diagnostics, never from an error file or expression; low value"),
+    ex(":gu[i]", ":gui", Skipped(MENU), Neither, "gui", "gu", None,
+       "Vim's GUI menu/toolkit surface; vimcode's menus are quadraui widgets, not `:menu` entries"),
+    ex(":gv[im]", ":gvim", Skipped(MENU), Neither, "gvim", "gv", None,
+       "Vim's GUI menu/toolkit surface; vimcode's menus are quadraui widgets, not `:menu` entries"),
+    ex(":h[elp]", ":help", Partial, Both, "help", "h", Some(Keys(":help<CR>")),
+       "opens vimcode's own three-topic help buffer; `:help {tag}` into Vim's documentation does not exist"),
+    ex(":helpc[lose]", ":helpclose", NotImplemented, Neither, "helpclose", "helpc", None,
+       "close one help window — informational commands with no vimcode surface; `:messages` and `:oldfiles` (vimcode already has a recent-files picker) are the two worth adding"),
+    ex(":helpg[rep]", ":helpgrep", NotImplemented, Neither, "helpgrep", "helpg", None,
+       "like \":grep\" but searches help files — vimcode's quickfix list is filled by `:grep`/`:make` and LSP diagnostics, never from an error file or expression; low value"),
+    ex(":helpt[ags]", ":helptags", NotImplemented, Neither, "helptags", "helpt", None,
+       "generate help tags for a directory — informational commands with no vimcode surface; `:messages` and `:oldfiles` (vimcode already has a recent-files picker) are the two worth adding"),
+    ex(":hi[ghlight]", ":highlight", NotImplemented, Neither, "highlight", "hi", None,
+       "specify highlighting methods — tree-sitter plus the theme registry replace Vim's syntax/highlight files; low value"),
+    ex(":hid[e]", ":hide", Implemented, Both, "hide", "hid", Some(Label("ex:hide refuses to close the last window")),
+       "closes the window, keeping the buffer loaded"),
+    ex(":his[tory]", ":history", Implemented, Both, "history", "his", Some(Keys(":history<CR>")),
+       "prints the command history"),
+    ex(":hor[izontal]", ":horizontal", NotImplemented, Neither, "horizontal", "hor", None,
+       "following window command work horizontally — `:wincmd` and `:split`/`:vsplit` cover the resize and split axes, but the `:{mod} {cmd}` modifier grammar is not parsed at all; moderate value"),
+    ex(":i[nsert]", ":insert", Skipped(EXMODE), Neither, "insert", "i", None,
+       "Ex/Open mode line editing is out of scope"),
+    ex(":ia[bbrev]", ":iabbrev", Implemented, Both, "iabbrev", "ia", Some(Label("abbrev:iabbrev does not apply on the command line")),
+       "insert-mode abbreviations"),
+    ex(":iabc[lear]", ":iabclear", NotImplemented, Neither, "iabclear", "iabc", None,
+       "like \":abclear\" but for Insert mode — one-off commands with no vimcode equivalent; `:z`, `:list`, `:lcd`, `:view`, `:uniq` and the `:keep*`/`:lockmarks` modifiers are the ones a Vim user would actually miss"),
+    ex(":if", ":if", Skipped(VIMSCRIPT), Neither, "if", "if", None,
+       "VimScript: out of scope per the standing decision (vimcode implements Vim keybindings and editing, not a VimScript runtime)"),
+    ex(":ij[ump]", ":ijump", Skipped(CTAGS), Neither, "ijump", "ij", None,
+       "tags/'include' file search; vimcode uses LSP go-to-definition and references instead"),
+    ex(":il[ist]", ":ilist", Skipped(CTAGS), Neither, "ilist", "il", None,
+       "tags/'include' file search; vimcode uses LSP go-to-definition and references instead"),
+    ex(":im[ap]", ":imap", Partial, FullOnly, "imap", "im", Some(Keys(":imap ")),
+       "works, but `:im` is rejected"),
+    ex(":imapc[lear]", ":imapclear", Partial, FullOnly, "imapclear", "imapc", Some(Keys(":imapclear")),
+       "works, but `:imapc` is rejected"),
+    ex(":ime[nu]", ":imenu", Skipped(MENU), Neither, "imenu", "ime", None,
+       "Vim's GUI menu/toolkit surface; vimcode's menus are quadraui widgets, not `:menu` entries"),
+    ex(":ino[remap]", ":inoremap", Partial, FullOnly, "inoremap", "ino", Some(Label("map:inoremap_jk_to_escape")),
+       "works, but `:ino` is rejected"),
+    ex(":inorea[bbrev]", ":inoreabbrev", Implemented, Both, "inoreabbrev foo bar", "inorea foo bar", Some(Keys(":inoreabbrev ")),
+       "defined, and stored alongside `:iabbrev`"),
+    ex(":inoreme[nu]", ":inoremenu", Skipped(MENU), Neither, "inoremenu", "inoreme", None,
+       "Vim's GUI menu/toolkit surface; vimcode's menus are quadraui widgets, not `:menu` entries"),
+    ex(":int[ro]", ":intro", NotImplemented, Neither, "intro", "int", None,
+       "print the introductory message — informational commands with no vimcode surface; `:messages` and `:oldfiles` (vimcode already has a recent-files picker) are the two worth adding"),
+    ex(":ip[ut]", ":iput", NotImplemented, Neither, "iput", "ip", None,
+       "like |:put|, but adjust the indent to the current line — no vimcode equivalent; low value"),
+    ex(":is[earch]", ":isearch", Skipped(CTAGS), Neither, "isearch", "is", None,
+       "tags/'include' file search; vimcode uses LSP go-to-definition and references instead"),
+    ex(":isp[lit]", ":isplit", Skipped(CTAGS), Neither, "isplit", "isp", None,
+       "tags/'include' file search; vimcode uses LSP go-to-definition and references instead"),
+    ex(":iu[nmap]", ":iunmap", Partial, FullOnly, "iunmap", "iu", Some(Keys(":iunmap ")),
+       "works, but `:iu` is rejected"),
+    ex(":iuna[bbrev]", ":iunabbrev", NotImplemented, Neither, "iunabbrev", "iuna", None,
+       "like \":unabbrev\" but for Insert mode — one-off commands with no vimcode equivalent; `:z`, `:list`, `:lcd`, `:view`, `:uniq` and the `:keep*`/`:lockmarks` modifiers are the ones a Vim user would actually miss"),
+    ex(":iunme[nu]", ":iunmenu", Skipped(MENU), Neither, "iunmenu", "iunme", None,
+       "Vim's GUI menu/toolkit surface; vimcode's menus are quadraui widgets, not `:menu` entries"),
+    ex(":j[oin]", ":join", Implemented, Both, "join", "j", Some(Label("ex:1,3j")),
+       "joins a range, with `!` and a count"),
+    ex(":ju[mps]", ":jumps", Implemented, Both, "jumps", "ju", Some(Keys(":jumps<CR>")),
+       "prints the jump list"),
+    ex(":k", ":k", Partial, Both, "2ka", "2ka", Some(Label("ex:2ka 'a")),
+       "only the concatenated form with a range works (`:2ka`); Vim's `:k a` and `:1k a` are both rejected"),
+    ex(":keepa[lt]", ":keepalt", NotImplemented, Neither, "keepalt", "keepa", None,
+       "following command keeps the alternate file — one-off commands with no vimcode equivalent; `:z`, `:list`, `:lcd`, `:view`, `:uniq` and the `:keep*`/`:lockmarks` modifiers are the ones a Vim user would actually miss"),
+    ex(":kee[pmarks]", ":keepmarks", NotImplemented, Neither, "keepmarks", "kee", None,
+       "following command keeps marks where they are — one-off commands with no vimcode equivalent; `:z`, `:list`, `:lcd`, `:view`, `:uniq` and the `:keep*`/`:lockmarks` modifiers are the ones a Vim user would actually miss"),
+    ex(":keepj[umps]", ":keepjumps", NotImplemented, Neither, "keepjumps", "keepj", None,
+       "following command keeps jumplist and marks — one-off commands with no vimcode equivalent; `:z`, `:list`, `:lcd`, `:view`, `:uniq` and the `:keep*`/`:lockmarks` modifiers are the ones a Vim user would actually miss"),
+    ex(":keepp[atterns]", ":keeppatterns", NotImplemented, Neither, "keeppatterns", "keepp", None,
+       "following command keeps search pattern history — one-off commands with no vimcode equivalent; `:z`, `:list`, `:lcd`, `:view`, `:uniq` and the `:keep*`/`:lockmarks` modifiers are the ones a Vim user would actually miss"),
+    ex(":lN[ext]", ":lNext", Partial, AbbrevOnly, "lNext", "lN", Some(Keys(":lN<CR>")),
+       "`:lN` works (it is `:lprevious`), but the full spelling `:lNext` is rejected"),
+    ex(":lNf[ile]", ":lNfile", NotImplemented, Neither, "lNfile", "lNf", None,
+       "go to last entry in previous file — vimcode's quickfix list is filled by `:grep`/`:make` and LSP diagnostics, never from an error file or expression; low value"),
+    ex(":l[ist]", ":list", NotImplemented, Neither, "list", "l", None,
+       "print lines — one-off commands with no vimcode equivalent; `:z`, `:list`, `:lcd`, `:view`, `:uniq` and the `:keep*`/`:lockmarks` modifiers are the ones a Vim user would actually miss"),
+    ex(":lab[ove]", ":labove", NotImplemented, Neither, "labove", "lab", None,
+       "go to location above current line — vimcode's quickfix list is filled by `:grep`/`:make` and LSP diagnostics, never from an error file or expression; low value"),
+    ex(":lad[dexpr]", ":laddexpr", NotImplemented, Neither, "laddexpr", "lad", None,
+       "add locations from expr — vimcode's quickfix list is filled by `:grep`/`:make` and LSP diagnostics, never from an error file or expression; low value"),
+    ex(":laddb[uffer]", ":laddbuffer", NotImplemented, Neither, "laddbuffer", "laddb", None,
+       "add locations from buffer — vimcode's quickfix list is filled by `:grep`/`:make` and LSP diagnostics, never from an error file or expression; low value"),
+    ex(":laddf[ile]", ":laddfile", NotImplemented, Neither, "laddfile", "laddf", None,
+       "add locations to current location list — vimcode's quickfix list is filled by `:grep`/`:make` and LSP diagnostics, never from an error file or expression; low value"),
+    ex(":laf[ter]", ":lafter", NotImplemented, Neither, "lafter", "laf", None,
+       "go to location after current cursor — vimcode's quickfix list is filled by `:grep`/`:make` and LSP diagnostics, never from an error file or expression; low value"),
+    ex(":la[st]", ":last", NotImplemented, Neither, "last", "la", None,
+       "go to the last file in the argument list — vimcode has no argument list, and splits+`:buffer` cover the `:s…`/`:sb…` family; moderate value for `:argdo` alone"),
+    ex(":lan[guage]", ":language", Skipped(ENCODING), Neither, "language", "lan", None,
+       "vimcode is UTF-8 only; no encoding-conversion layer"),
+    ex(":lat[er]", ":later", NotImplemented, Neither, "later", "lat", None,
+       "go to newer change, redo — the undo-tree surface; tracked by #1156, which is implementing persistent undo and the tree"),
+    ex(":lbe[fore]", ":lbefore", NotImplemented, Neither, "lbefore", "lbe", None,
+       "go to location before current cursor — vimcode's quickfix list is filled by `:grep`/`:make` and LSP diagnostics, never from an error file or expression; low value"),
+    ex(":lbel[ow]", ":lbelow", NotImplemented, Neither, "lbelow", "lbel", None,
+       "go to location below current line — vimcode's quickfix list is filled by `:grep`/`:make` and LSP diagnostics, never from an error file or expression; low value"),
+    ex(":lbo[ttom]", ":lbottom", NotImplemented, Neither, "lbottom", "lbo", None,
+       "scroll to the bottom of the location window — vimcode's quickfix list is filled by `:grep`/`:make` and LSP diagnostics, never from an error file or expression; low value"),
+    ex(":lb[uffer]", ":lbuffer", NotImplemented, Neither, "lbuffer", "lb", None,
+       "parse locations and jump to first location — vimcode's quickfix list is filled by `:grep`/`:make` and LSP diagnostics, never from an error file or expression; low value"),
+    ex(":lc[d]", ":lcd", NotImplemented, Neither, "lcd", "lc", None,
+       "change directory locally — one-off commands with no vimcode equivalent; `:z`, `:list`, `:lcd`, `:view`, `:uniq` and the `:keep*`/`:lockmarks` modifiers are the ones a Vim user would actually miss"),
+    ex(":lch[dir]", ":lchdir", NotImplemented, Neither, "lchdir", "lch", None,
+       "change directory locally — one-off commands with no vimcode equivalent; `:z`, `:list`, `:lcd`, `:view`, `:uniq` and the `:keep*`/`:lockmarks` modifiers are the ones a Vim user would actually miss"),
+    ex(":lcl[ose]", ":lclose", Implemented, Both, "lclose", "lcl", Some(Keys(":lclose<CR>")),
+       "closes the location-list window"),
+    ex(":ld[o]", ":ldo", Partial, FullOnly, "ldo", "ld", Some(Keys(":ldo ")),
+       "works, but `:ld` — Vim's documented minimum — is rejected"),
+    ex(":lfd[o]", ":lfdo", Partial, FullOnly, "lfdo", "lfd", Some(Keys(":lfdo ")),
+       "works, but `:lfd` — Vim's documented minimum — is rejected"),
+    ex(":le[ft]", ":left", Implemented, Both, "left", "le", Some(Label("ex:le 4")),
+       "left-aligns with an optional indent"),
+    ex(":lefta[bove]", ":leftabove", NotImplemented, Neither, "leftabove", "lefta", None,
+       "make split window appear left or above — `:wincmd` and `:split`/`:vsplit` cover the resize and split axes, but the `:{mod} {cmd}` modifier grammar is not parsed at all; moderate value"),
+    ex(":let", ":let", Skipped(VIMSCRIPT), Neither, "let", "let", None,
+       "VimScript: out of scope per the standing decision (vimcode implements Vim keybindings and editing, not a VimScript runtime)"),
+    ex(":lex[pr]", ":lexpr", NotImplemented, Neither, "lexpr", "lex", None,
+       "read locations from expr and jump to first — vimcode's quickfix list is filled by `:grep`/`:make` and LSP diagnostics, never from an error file or expression; low value"),
+    ex(":lf[ile]", ":lfile", NotImplemented, Neither, "lfile", "lf", None,
+       "read file with locations and jump to first — vimcode's quickfix list is filled by `:grep`/`:make` and LSP diagnostics, never from an error file or expression; low value"),
+    ex(":lfir[st]", ":lfirst", Implemented, Both, "lfirst", "lfir", Some(Keys(":lfirst<CR>")),
+       "first location-list entry"),
+    ex(":lgetb[uffer]", ":lgetbuffer", NotImplemented, Neither, "lgetbuffer", "lgetb", None,
+       "get locations from buffer — vimcode's quickfix list is filled by `:grep`/`:make` and LSP diagnostics, never from an error file or expression; low value"),
+    ex(":lgete[xpr]", ":lgetexpr", NotImplemented, Neither, "lgetexpr", "lgete", None,
+       "get locations from expr — vimcode's quickfix list is filled by `:grep`/`:make` and LSP diagnostics, never from an error file or expression; low value"),
+    ex(":lg[etfile]", ":lgetfile", NotImplemented, AbbrevOnly, "lgetfile", "lg", None,
+       "read an error file into the location list — and vimcode's abbreviation table gives `:lg` to `:lgrep`, so Vim's documented `:lg[etfile]` silently runs a different command"),
+    ex(":lgr[ep]", ":lgrep", Implemented, Both, "lgrep", "lgr", Some(Keys(":lgrep ")),
+       "location-list grep"),
+    ex(":lgrepa[dd]", ":lgrepadd", NotImplemented, Neither, "lgrepadd", "lgrepa", None,
+       "like :grep, but append to current list — vimcode's quickfix list is filled by `:grep`/`:make` and LSP diagnostics, never from an error file or expression; low value"),
+    ex(":lh[elpgrep]", ":lhelpgrep", NotImplemented, Neither, "lhelpgrep", "lh", None,
+       "like \":helpgrep\" but uses location list — vimcode's quickfix list is filled by `:grep`/`:make` and LSP diagnostics, never from an error file or expression; low value"),
+    ex(":lhi[story]", ":lhistory", NotImplemented, Neither, "lhistory", "lhi", None,
+       "list the location lists — vimcode's quickfix list is filled by `:grep`/`:make` and LSP diagnostics, never from an error file or expression; low value"),
+    ex(":ll", ":ll", Implemented, Both, "ll", "ll", Some(Keys(":ll<CR>")),
+       "jumps to location-list entry N"),
+    ex(":lla[st]", ":llast", Implemented, Both, "llast", "lla", Some(Keys(":llast<CR>")),
+       "last location-list entry"),
+    ex(":lli[st]", ":llist", Implemented, Both, "llist", "lli", Some(Keys(":llist<CR>")),
+       "lists location-list entries"),
+    ex(":lmak[e]", ":lmake", NotImplemented, Neither, "lmake", "lmak", None,
+       "execute external command 'makeprg' and parse error messages — vimcode's quickfix list is filled by `:grep`/`:make` and LSP diagnostics, never from an error file or expression; low value"),
+    ex(":lm[ap]", ":lmap", Skipped(BIDI), Neither, "lmap", "lm", None,
+       "'langmap'/input-method mappings; no right-to-left or IME support planned"),
+    ex(":lmapc[lear]", ":lmapclear", Skipped(BIDI), Neither, "lmapclear", "lmapc", None,
+       "'langmap'/input-method mappings; no right-to-left or IME support planned"),
+    ex(":lne[xt]", ":lnext", Implemented, Both, "lnext", "lne", Some(Keys(":lnext<CR>")),
+       "next location-list entry"),
+    ex(":lnew[er]", ":lnewer", NotImplemented, Neither, "lnewer", "lnew", None,
+       "go to newer location list — vimcode's quickfix list is filled by `:grep`/`:make` and LSP diagnostics, never from an error file or expression; low value"),
+    ex(":lnf[ile]", ":lnfile", NotImplemented, Neither, "lnfile", "lnf", None,
+       "go to first location in next file — vimcode's quickfix list is filled by `:grep`/`:make` and LSP diagnostics, never from an error file or expression; low value"),
+    ex(":ln[oremap]", ":lnoremap", Skipped(BIDI), AbbrevOnly, "lnoremap", "ln", None,
+       "'langmap' mapping — and vimcode's abbreviation table gives `:ln` to `:lnext`, so Vim's documented `:ln[oremap]` runs a different command"),
+    ex(":loadk[eymap]", ":loadkeymap", Skipped(BIDI), Neither, "loadkeymap", "loadk", None,
+       "'langmap'/input-method mappings; no right-to-left or IME support planned"),
+    ex(":lo[adview]", ":loadview", Skipped(SESSION), Neither, "loadview", "lo", None,
+       "no :mksession/:mkview support planned"),
+    ex(":loc[kmarks]", ":lockmarks", NotImplemented, Neither, "lockmarks", "loc", None,
+       "following command keeps marks where they are — one-off commands with no vimcode equivalent; `:z`, `:list`, `:lcd`, `:view`, `:uniq` and the `:keep*`/`:lockmarks` modifiers are the ones a Vim user would actually miss"),
+    ex(":lockv[ar]", ":lockvar", Skipped(VIMSCRIPT), Neither, "lockvar", "lockv", None,
+       "VimScript: out of scope per the standing decision (vimcode implements Vim keybindings and editing, not a VimScript runtime)"),
+    ex(":lol[der]", ":lolder", NotImplemented, Neither, "lolder", "lol", None,
+       "go to older location list — vimcode's quickfix list is filled by `:grep`/`:make` and LSP diagnostics, never from an error file or expression; low value"),
+    ex(":lop[en]", ":lopen", Implemented, Both, "lopen", "lop", Some(Keys(":lopen<CR>")),
+       "opens the location-list window"),
+    ex(":lp[revious]", ":lprevious", Implemented, Both, "lprevious", "lp", Some(Keys(":lprevious<CR>")),
+       "previous location-list entry"),
+    ex(":lpf[ile]", ":lpfile", NotImplemented, Neither, "lpfile", "lpf", None,
+       "go to last location in previous file — vimcode's quickfix list is filled by `:grep`/`:make` and LSP diagnostics, never from an error file or expression; low value"),
+    ex(":lr[ewind]", ":lrewind", NotImplemented, Neither, "lrewind", "lr", None,
+       "go to the specified location, default first one — vimcode's quickfix list is filled by `:grep`/`:make` and LSP diagnostics, never from an error file or expression; low value"),
+    ex(":ls", ":ls", Implemented, Both, "ls", "ls", Some(Keys(":ls<CR>")),
+       "alias of `:buffers`"),
+    ex(":lsp", ":lsp", NotImplemented, Neither, "lsp", "lsp", None,
+       "language server protocol — no vimcode equivalent; low value"),
+    ex(":lt[ag]", ":ltag", Skipped(CTAGS), Neither, "ltag", "lt", None,
+       "tags/'include' file search; vimcode uses LSP go-to-definition and references instead"),
+    ex(":lu[nmap]", ":lunmap", Skipped(BIDI), Neither, "lunmap", "lu", None,
+       "'langmap'/input-method mappings; no right-to-left or IME support planned"),
+    ex(":lua", ":lua", Skipped(INTERP), Neither, "lua", "lua", None,
+       "language-binding ex command; vimcode's Lua runtime is the extension API, not a `:` command"),
+    ex(":luad[o]", ":luado", Skipped(INTERP), Neither, "luado", "luad", None,
+       "language-binding ex command; vimcode's Lua runtime is the extension API, not a `:` command"),
+    ex(":luaf[ile]", ":luafile", Skipped(INTERP), Neither, "luafile", "luaf", None,
+       "language-binding ex command; vimcode's Lua runtime is the extension API, not a `:` command"),
+    ex(":lv[imgrep]", ":lvimgrep", Partial, FullOnly, "lvimgrep", "lv", Some(Keys(":lvimgrep ")),
+       "works, but `:lv` — Vim's documented minimum — is rejected"),
+    ex(":lvimgrepa[dd]", ":lvimgrepadd", NotImplemented, Neither, "lvimgrepadd", "lvimgrepa", None,
+       "like :vimgrep, but append to current list — vimcode's quickfix list is filled by `:grep`/`:make` and LSP diagnostics, never from an error file or expression; low value"),
+    ex(":lw[indow]", ":lwindow", Implemented, Both, "lwindow", "lw", Some(Keys(":lwindow<CR>")),
+       "opens the location-list window only when non-empty"),
+    ex(":m[ove]", ":move", Implemented, Both, "move 0", "m 0", Some(Label("ex:2,3m$")),
+       "moves a range"),
+    ex(":ma[rk]", ":mark", Implemented, Both, "mark a", "ma a", Some(Label("ex:2mark a")),
+       "sets a mark on a line"),
+    ex(":mak[e]", ":make", Implemented, Both, "make -f /dev/null -q", "mak -f /dev/null -q", Some(Keys(":make")),
+       "shells out to make and reports the first output line"),
+    ex(":map", ":map", Implemented, Both, "map", "map", Some(Keys(":map ")),
+       "lists and defines mappings"),
+    ex(":mapc[lear]", ":mapclear", Partial, FullOnly, "mapclear", "mapc", Some(Keys(":mapclear")),
+       "works, but `:mapc` is rejected"),
+    ex(":marks", ":marks", Implemented, Both, "marks", "marks", Some(Keys(":marks<CR>")),
+       "lists marks (see #1226 for what it omits)"),
+    ex(":mat[ch]", ":match", NotImplemented, Neither, "match", "mat", None,
+       "define a match to highlight — tree-sitter plus the theme registry replace Vim's syntax/highlight files; low value"),
+    ex(":me[nu]", ":menu", Skipped(MENU), Neither, "menu", "me", None,
+       "Vim's GUI menu/toolkit surface; vimcode's menus are quadraui widgets, not `:menu` entries"),
+    ex(":mes[sages]", ":messages", NotImplemented, Neither, "messages", "mes", None,
+       "view previously displayed messages — informational commands with no vimcode surface; `:messages` and `:oldfiles` (vimcode already has a recent-files picker) are the two worth adding"),
+    ex(":mk[exrc]", ":mkexrc", Skipped(SESSION), Neither, "mkexrc", "mk", None,
+       "no :mksession/:mkview support planned"),
+    ex(":mks[ession]", ":mksession", Skipped(SESSION), Neither, "mksession", "mks", None,
+       "no :mksession/:mkview support planned"),
+    ex(":mksp[ell]", ":mkspell", NotImplemented, Neither, "mkspell", "mksp", None,
+       "produce .spl spell file — vimcode ships a real spell checker (`src/core/spell.rs`, #1163) but exposes no `:spell*` ex command for it — the cheapest ❌ family in this slice to close"),
+    ex(":mkv[imrc]", ":mkvimrc", Skipped(SESSION), Neither, "mkvimrc", "mkv", None,
+       "no :mksession/:mkview support planned"),
+    ex(":mkvie[w]", ":mkview", Skipped(SESSION), Neither, "mkview", "mkvie", None,
+       "no :mksession/:mkview support planned"),
+    ex(":mod[e]", ":mode", Skipped(TERMCAP), Neither, "mode", "mod", None,
+       "terminal/redraw control belongs to quadraui; vimcode's backends repaint on their own"),
+    ex(":n[ext]", ":next", NotImplemented, Neither, "next", "n", None,
+       "go to next file in the argument list — vimcode has no argument list, and splits+`:buffer` cover the `:s…`/`:sb…` family; moderate value for `:argdo` alone"),
+    ex(":new", ":new", Implemented, Both, "new", "new", Some(Keys(":new<CR>")),
+       "splits with a new empty buffer"),
+    ex(":nm[ap]", ":nmap", Partial, FullOnly, "nmap", "nm", Some(Label("map:nmap_chases_recursively")),
+       "works, but `:nm` — Vim's documented minimum — is rejected"),
+    ex(":nmapc[lear]", ":nmapclear", Partial, FullOnly, "nmapclear", "nmapc", Some(Keys(":nmapclear")),
+       "works, but `:nmapc` is rejected"),
+    ex(":nme[nu]", ":nmenu", Skipped(MENU), Neither, "nmenu", "nme", None,
+       "Vim's GUI menu/toolkit surface; vimcode's menus are quadraui widgets, not `:menu` entries"),
+    ex(":nn[oremap]", ":nnoremap", Partial, FullOnly, "nnoremap", "nn", Some(Label("map:nnoremap_does_not_chase")),
+       "works, but `:nn` is rejected"),
+    ex(":nnoreme[nu]", ":nnoremenu", Skipped(MENU), Neither, "nnoremenu", "nnoreme", None,
+       "Vim's GUI menu/toolkit surface; vimcode's menus are quadraui widgets, not `:menu` entries"),
+    ex(":noa[utocmd]", ":noautocmd", NotImplemented, Neither, "noautocmd", "noa", None,
+       "following commands don't trigger autocommands — one-off commands with no vimcode equivalent; `:z`, `:list`, `:lcd`, `:view`, `:uniq` and the `:keep*`/`:lockmarks` modifiers are the ones a Vim user would actually miss"),
+    ex(":no[remap]", ":noremap", Partial, FullOnly, "noremap", "no", Some(Keys(":noremap ")),
+       "works, but `:no` is rejected"),
+    ex(":noh[lsearch]", ":nohlsearch", Implemented, Both, "nohlsearch", "noh", Some(Label("ex:noh no effect")),
+       "clears search highlighting"),
+    ex(":norea[bbrev]", ":noreabbrev", Implemented, Both, "noreabbrev", "norea", Some(Keys(":noreabbrev ")),
+       "non-recursive abbreviation"),
+    ex(":noreme[nu]", ":noremenu", Skipped(MENU), Neither, "noremenu", "noreme", None,
+       "Vim's GUI menu/toolkit surface; vimcode's menus are quadraui widgets, not `:menu` entries"),
+    ex(":norm[al]", ":normal", Implemented, Both, "normal x", "norm x", Some(Label("ex:normal Ax")),
+       "`:normal`/`:normal!` with a range, replaying real keystrokes"),
+    ex(":nos[wapfile]", ":noswapfile", NotImplemented, Neither, "noswapfile", "nos", None,
+       "following commands don't create a swap file — vimcode has swap files and recovery (`tests/swap_recovery.rs`) but no ex commands for them; `:recover` is worth implementing"),
+    ex(":nu[mber]", ":number", Partial, Both, "number", "nu", Some(Keys(":number<CR>")),
+       "prints the current line numbered, but `:1,2#`/`:1,2number` is rejected — no range"),
+    ex(":nun[map]", ":nunmap", Partial, FullOnly, "nunmap", "nun", Some(Keys(":nunmap ")),
+       "works, but `:nun` is rejected"),
+    ex(":nunme[nu]", ":nunmenu", Skipped(MENU), Neither, "nunmenu", "nunme", None,
+       "Vim's GUI menu/toolkit surface; vimcode's menus are quadraui widgets, not `:menu` entries"),
+    ex(":ol[dfiles]", ":oldfiles", NotImplemented, Neither, "oldfiles", "ol", None,
+       "list files that have marks in the |shada| file — informational commands with no vimcode surface; `:messages` and `:oldfiles` (vimcode already has a recent-files picker) are the two worth adding"),
+    ex(":om[ap]", ":omap", Partial, FullOnly, "omap", "om", Some(Keys(":omap ")),
+       "works, but `:om` is rejected"),
+    ex(":omapc[lear]", ":omapclear", Partial, FullOnly, "omapclear", "omapc", Some(Keys(":omapclear")),
+       "works, but `:omapc` is rejected"),
+    ex(":ome[nu]", ":omenu", Skipped(MENU), Neither, "omenu", "ome", None,
+       "Vim's GUI menu/toolkit surface; vimcode's menus are quadraui widgets, not `:menu` entries"),
+    ex(":on[ly]", ":only", Implemented, Both, "only", "on", Some(Keys(":only<CR>")),
+       "closes every other window"),
+    ex(":ono[remap]", ":onoremap", Partial, FullOnly, "onoremap", "ono", Some(Label("map:onoremap_extends_a_motion")),
+       "works, but `:ono` is rejected"),
+    ex(":onoreme[nu]", ":onoremenu", Skipped(MENU), Neither, "onoremenu", "onoreme", None,
+       "Vim's GUI menu/toolkit surface; vimcode's menus are quadraui widgets, not `:menu` entries"),
+    ex(":opt[ions]", ":options", Skipped(SCRIPTRT), Neither, "options", "opt", None,
+       "needs a script/plugin runtime vimcode does not have"),
+    ex(":ou[nmap]", ":ounmap", Partial, FullOnly, "ounmap", "ou", Some(Keys(":ounmap ")),
+       "works, but `:ou` is rejected"),
+    ex(":ounme[nu]", ":ounmenu", Skipped(MENU), Neither, "ounmenu", "ounme", None,
+       "Vim's GUI menu/toolkit surface; vimcode's menus are quadraui widgets, not `:menu` entries"),
+    ex(":pa[ckadd]", ":packadd", Skipped(SCRIPTRT), Neither, "packadd", "pa", None,
+       "needs a script/plugin runtime vimcode does not have"),
+    ex(":packl[oadall]", ":packloadall", Skipped(SCRIPTRT), Neither, "packloadall", "packl", None,
+       "needs a script/plugin runtime vimcode does not have"),
+    ex(":pb[uffer]", ":pbuffer", NotImplemented, Neither, "pbuffer", "pb", None,
+       "edit buffer in the preview window — no preview window; LSP hover and the peek panel cover the same ground; low value"),
+    ex(":pc[lose]", ":pclose", NotImplemented, Neither, "pclose", "pc", None,
+       "close preview window — no preview window; LSP hover and the peek panel cover the same ground; low value"),
+    ex(":ped[it]", ":pedit", NotImplemented, Neither, "pedit", "ped", None,
+       "edit file in the preview window — no preview window; LSP hover and the peek panel cover the same ground; low value"),
+    ex(":pe[rl]", ":perl", Skipped(INTERP), Neither, "perl", "pe", None,
+       "language-binding ex command; vimcode's Lua runtime is the extension API, not a `:` command"),
+    ex(":perld[o]", ":perldo", Skipped(INTERP), Neither, "perldo", "perld", None,
+       "language-binding ex command; vimcode's Lua runtime is the extension API, not a `:` command"),
+    ex(":perlf[ile]", ":perlfile", Skipped(INTERP), Neither, "perlfile", "perlf", None,
+       "language-binding ex command; vimcode's Lua runtime is the extension API, not a `:` command"),
+    ex(":p[rint]", ":print", Partial, Both, "print", "p", Some(Keys(":print<CR>")),
+       "prints the current line, but `:1,2p` is rejected — no range, and no `l`/`#` flags"),
+    ex(":profd[el]", ":profdel", Skipped(VIMSCRIPT), Neither, "profdel", "profd", None,
+       "VimScript: out of scope per the standing decision (vimcode implements Vim keybindings and editing, not a VimScript runtime)"),
+    ex(":prof[ile]", ":profile", Skipped(VIMSCRIPT), Neither, "profile", "prof", None,
+       "VimScript: out of scope per the standing decision (vimcode implements Vim keybindings and editing, not a VimScript runtime)"),
+    ex(":po[p]", ":pop", Skipped(CTAGS), Neither, "pop", "po", None,
+       "tags/'include' file search; vimcode uses LSP go-to-definition and references instead"),
+    ex(":popu[p]", ":popup", Skipped(MENU), Neither, "popup", "popu", None,
+       "Vim's GUI menu/toolkit surface; vimcode's menus are quadraui widgets, not `:menu` entries"),
+    ex(":pp[op]", ":ppop", Skipped(CTAGS), Neither, "ppop", "pp", None,
+       "tags/'include' file search; vimcode uses LSP go-to-definition and references instead"),
+    ex(":pre[serve]", ":preserve", NotImplemented, Neither, "preserve", "pre", None,
+       "write all text to swap file — vimcode has swap files and recovery (`tests/swap_recovery.rs`) but no ex commands for them; `:recover` is worth implementing"),
+    ex(":prev[ious]", ":previous", NotImplemented, Neither, "previous", "prev", None,
+       "go to previous file in argument list — vimcode has no argument list, and splits+`:buffer` cover the `:s…`/`:sb…` family; moderate value for `:argdo` alone"),
+    ex(":ps[earch]", ":psearch", Skipped(CTAGS), Neither, "psearch", "ps", None,
+       "tags/'include' file search; vimcode uses LSP go-to-definition and references instead"),
+    ex(":pt[ag]", ":ptag", Skipped(CTAGS), Neither, "ptag", "pt", None,
+       "tags/'include' file search; vimcode uses LSP go-to-definition and references instead"),
+    ex(":ptN[ext]", ":ptNext", Skipped(CTAGS), Neither, "ptNext", "ptN", None,
+       "tags/'include' file search; vimcode uses LSP go-to-definition and references instead"),
+    ex(":ptf[irst]", ":ptfirst", Skipped(CTAGS), Neither, "ptfirst", "ptf", None,
+       "tags/'include' file search; vimcode uses LSP go-to-definition and references instead"),
+    ex(":ptj[ump]", ":ptjump", Skipped(CTAGS), Neither, "ptjump", "ptj", None,
+       "tags/'include' file search; vimcode uses LSP go-to-definition and references instead"),
+    ex(":ptl[ast]", ":ptlast", Skipped(CTAGS), Neither, "ptlast", "ptl", None,
+       "tags/'include' file search; vimcode uses LSP go-to-definition and references instead"),
+    ex(":ptn[ext]", ":ptnext", Skipped(CTAGS), Neither, "ptnext", "ptn", None,
+       "tags/'include' file search; vimcode uses LSP go-to-definition and references instead"),
+    ex(":ptp[revious]", ":ptprevious", Skipped(CTAGS), Neither, "ptprevious", "ptp", None,
+       "tags/'include' file search; vimcode uses LSP go-to-definition and references instead"),
+    ex(":ptr[ewind]", ":ptrewind", Skipped(CTAGS), Neither, "ptrewind", "ptr", None,
+       "tags/'include' file search; vimcode uses LSP go-to-definition and references instead"),
+    ex(":pts[elect]", ":ptselect", Skipped(CTAGS), Neither, "ptselect", "pts", None,
+       "tags/'include' file search; vimcode uses LSP go-to-definition and references instead"),
+    ex(":pu[t]", ":put", Implemented, Both, "put", "pu", Some(Label("ex:put a")),
+       "puts a register after a line, with `!` and `:0put`"),
+    ex(":pw[d]", ":pwd", Implemented, Both, "pwd", "pw", Some(Keys(":pwd<CR>")),
+       "prints the working directory"),
+    ex(":py3", ":py3", Skipped(INTERP), Neither, "py3", "py3", None,
+       "language-binding ex command; vimcode's Lua runtime is the extension API, not a `:` command"),
+    ex(":python3", ":python3", Skipped(INTERP), Neither, "python3", "python3", None,
+       "language-binding ex command; vimcode's Lua runtime is the extension API, not a `:` command"),
+    ex(":py3d[o]", ":py3do", Skipped(INTERP), Neither, "py3do", "py3d", None,
+       "language-binding ex command; vimcode's Lua runtime is the extension API, not a `:` command"),
+    ex(":py3f[ile]", ":py3file", Skipped(INTERP), Neither, "py3file", "py3f", None,
+       "language-binding ex command; vimcode's Lua runtime is the extension API, not a `:` command"),
+    ex(":py[thon]", ":python", Skipped(INTERP), Neither, "python", "py", None,
+       "language-binding ex command; vimcode's Lua runtime is the extension API, not a `:` command"),
+    ex(":pyd[o]", ":pydo", Skipped(INTERP), Neither, "pydo", "pyd", None,
+       "language-binding ex command; vimcode's Lua runtime is the extension API, not a `:` command"),
+    ex(":pyf[ile]", ":pyfile", Skipped(INTERP), Neither, "pyfile", "pyf", None,
+       "language-binding ex command; vimcode's Lua runtime is the extension API, not a `:` command"),
+    ex(":pyx", ":pyx", Skipped(INTERP), Neither, "pyx", "pyx", None,
+       "language-binding ex command; vimcode's Lua runtime is the extension API, not a `:` command"),
+    ex(":pythonx", ":pythonx", Skipped(INTERP), Neither, "pythonx", "pythonx", None,
+       "language-binding ex command; vimcode's Lua runtime is the extension API, not a `:` command"),
+    ex(":pyxd[o]", ":pyxdo", Skipped(INTERP), Neither, "pyxdo", "pyxd", None,
+       "language-binding ex command; vimcode's Lua runtime is the extension API, not a `:` command"),
+    ex(":pyxf[ile]", ":pyxfile", Skipped(INTERP), Neither, "pyxfile", "pyxf", None,
+       "language-binding ex command; vimcode's Lua runtime is the extension API, not a `:` command"),
+    ex(":q[uit]", ":quit", Implemented, Both, "quit", "q", Some(Keys(":quit<CR>")),
+       "closes the window, refusing on unsaved changes without `!`"),
+    ex(":quita[ll]", ":quitall", NotImplemented, Neither, "quitall", "quita", None,
+       "quit Vim — no vimcode equivalent; low value"),
+    ex(":qa[ll]", ":qall", Implemented, Both, "qall", "qa", Some(Keys(":qall<CR>")),
+       "quits everything"),
+    ex(":r[ead]", ":read", Implemented, Both, "read foo", "r foo", Some(Label("ex:r !echo")),
+       "`:r {file}` inserts a file and `:r !{cmd}` inserts a command's stdout"),
+    ex(":rec[over]", ":recover", NotImplemented, Neither, "recover", "rec", None,
+       "recover a file from a swap file — vimcode has swap files and recovery (`tests/swap_recovery.rs`) but no ex commands for them; `:recover` is worth implementing"),
+    ex(":red[o]", ":redo", Implemented, Both, "redo", "red", Some(Label("ex:undo redo")),
+       "redo"),
+    ex(":redi[r]", ":redir", Skipped(VIMSCRIPT), Neither, "redir", "redi", None,
+       "VimScript: out of scope per the standing decision (vimcode implements Vim keybindings and editing, not a VimScript runtime)"),
+    ex(":redr[aw]", ":redraw", Skipped(TERMCAP), Neither, "redraw", "redr", None,
+       "terminal/redraw control belongs to quadraui; vimcode's backends repaint on their own"),
+    ex(":redraws[tatus]", ":redrawstatus", Skipped(TERMCAP), Neither, "redrawstatus", "redraws", None,
+       "terminal/redraw control belongs to quadraui; vimcode's backends repaint on their own"),
+    ex(":reg[isters]", ":registers", Implemented, Both, "registers", "reg", Some(Keys(":registers<CR>")),
+       "lists registers"),
+    ex(":res[ize]", ":resize", NotImplemented, Neither, "resize", "res", None,
+       "change current window height — `:wincmd` and `:split`/`:vsplit` cover the resize and split axes, but the `:{mod} {cmd}` modifier grammar is not parsed at all; moderate value"),
+    ex(":restart", ":restart", NotImplemented, Both, "restart", "restart", None,
+       "Vim's restart — vimcode binds the name to its DAP debugger's restart-session, so the Vim command is shadowed rather than missing; low value, but the collision is worth a rename"),
+    ex(":ret[ab]", ":retab", Implemented, Both, "retab", "ret", Some(Label("ex:retab")),
+       "retabs a range, honouring 'expandtab' and `!`"),
+    ex(":retu[rn]", ":return", Skipped(VIMSCRIPT), Neither, "return", "retu", None,
+       "VimScript: out of scope per the standing decision (vimcode implements Vim keybindings and editing, not a VimScript runtime)"),
+    ex(":rew[ind]", ":rewind", NotImplemented, Neither, "rewind", "rew", None,
+       "go to the first file in the argument list — vimcode has no argument list, and splits+`:buffer` cover the `:s…`/`:sb…` family; moderate value for `:argdo` alone"),
+    ex(":ri[ght]", ":right", Implemented, Both, "right", "ri", Some(Label("ex:ri 10")),
+       "right-aligns within a width"),
+    ex(":rightb[elow]", ":rightbelow", NotImplemented, Neither, "rightbelow", "rightb", None,
+       "make split window appear right or below — `:wincmd` and `:split`/`:vsplit` cover the resize and split axes, but the `:{mod} {cmd}` modifier grammar is not parsed at all; moderate value"),
+    ex(":rsh[ada]", ":rshada", Skipped(SHADA), Neither, "rshada", "rsh", None,
+       "no ShaDa/viminfo file; vimcode persists its own session state (src/core/session.rs)"),
+    ex(":rub[y]", ":ruby", Skipped(INTERP), Neither, "ruby", "rub", None,
+       "language-binding ex command; vimcode's Lua runtime is the extension API, not a `:` command"),
+    ex(":rubyd[o]", ":rubydo", Skipped(INTERP), Neither, "rubydo", "rubyd", None,
+       "language-binding ex command; vimcode's Lua runtime is the extension API, not a `:` command"),
+    ex(":rubyf[ile]", ":rubyfile", Skipped(INTERP), Neither, "rubyfile", "rubyf", None,
+       "language-binding ex command; vimcode's Lua runtime is the extension API, not a `:` command"),
+    ex(":rund[o]", ":rundo", NotImplemented, Neither, "rundo", "rund", None,
+       "read undo information from a file — the undo-tree surface; tracked by #1156, which is implementing persistent undo and the tree"),
+    ex(":ru[ntime]", ":runtime", Skipped(SCRIPTRT), Neither, "runtime", "ru", None,
+       "needs a script/plugin runtime vimcode does not have"),
+    ex(":s[ubstitute]", ":substitute", Implemented, Both, "s/alpha/A/", "s/alpha/A/", Some(Label("sub:basic")),
+       "the full `:s` surface: flags, ranges, `\\\\v`, `\\\\zs`, `c` confirm, 'gdefault'"),
+    ex(":sN[ext]", ":sNext", NotImplemented, Neither, "sNext", "sN", None,
+       "split window and go to previous file in argument list — vimcode has no argument list, and splits+`:buffer` cover the `:s…`/`:sb…` family; moderate value for `:argdo` alone"),
+    ex(":san[dbox]", ":sandbox", Skipped(VIMSCRIPT), Neither, "sandbox", "san", None,
+       "VimScript: out of scope per the standing decision (vimcode implements Vim keybindings and editing, not a VimScript runtime)"),
+    ex(":sa[rgument]", ":sargument", NotImplemented, Neither, "sargument", "sa", None,
+       "split window and go to specific file in argument list — vimcode has no argument list, and splits+`:buffer` cover the `:s…`/`:sb…` family; moderate value for `:argdo` alone"),
+    ex(":sal[l]", ":sall", NotImplemented, Neither, "sall", "sal", None,
+       "open a window for each file in argument list — vimcode has no argument list, and splits+`:buffer` cover the `:s…`/`:sb…` family; moderate value for `:argdo` alone"),
+    ex(":sav[eas]", ":saveas", Partial, Both, "saveas", "sav", Some(Keys(":saveas ")),
+       "`:saveas {file}` writes and renames, but bare `:saveas` is a silent no-op where Vim reports E471"),
+    ex(":sb[uffer]", ":sbuffer", NotImplemented, Neither, "sbuffer", "sb", None,
+       "split window and go to specific file in the buffer list — vimcode has no argument list, and splits+`:buffer` cover the `:s…`/`:sb…` family; moderate value for `:argdo` alone"),
+    ex(":sbN[ext]", ":sbNext", NotImplemented, Neither, "sbNext", "sbN", None,
+       "split window and go to previous file in the buffer list — vimcode has no argument list, and splits+`:buffer` cover the `:s…`/`:sb…` family; moderate value for `:argdo` alone"),
+    ex(":sba[ll]", ":sball", NotImplemented, Neither, "sball", "sba", None,
+       "open a window for each file in the buffer list — vimcode has no argument list, and splits+`:buffer` cover the `:s…`/`:sb…` family; moderate value for `:argdo` alone"),
+    ex(":sbf[irst]", ":sbfirst", NotImplemented, Neither, "sbfirst", "sbf", None,
+       "split window and go to first file in the buffer list — vimcode has no argument list, and splits+`:buffer` cover the `:s…`/`:sb…` family; moderate value for `:argdo` alone"),
+    ex(":sbl[ast]", ":sblast", NotImplemented, Neither, "sblast", "sbl", None,
+       "split window and go to last file in buffer list — vimcode has no argument list, and splits+`:buffer` cover the `:s…`/`:sb…` family; moderate value for `:argdo` alone"),
+    ex(":sbm[odified]", ":sbmodified", NotImplemented, Neither, "sbmodified", "sbm", None,
+       "split window and go to modified file in the buffer list — vimcode has no argument list, and splits+`:buffer` cover the `:s…`/`:sb…` family; moderate value for `:argdo` alone"),
+    ex(":sbn[ext]", ":sbnext", NotImplemented, Neither, "sbnext", "sbn", None,
+       "split window and go to next file in the buffer list — vimcode has no argument list, and splits+`:buffer` cover the `:s…`/`:sb…` family; moderate value for `:argdo` alone"),
+    ex(":sbp[revious]", ":sbprevious", NotImplemented, Neither, "sbprevious", "sbp", None,
+       "split window and go to previous file in the buffer list — vimcode has no argument list, and splits+`:buffer` cover the `:s…`/`:sb…` family; moderate value for `:argdo` alone"),
+    ex(":sbr[ewind]", ":sbrewind", NotImplemented, Neither, "sbrewind", "sbr", None,
+       "split window and go to first file in the buffer list — vimcode has no argument list, and splits+`:buffer` cover the `:s…`/`:sb…` family; moderate value for `:argdo` alone"),
+    ex(":scr[iptnames]", ":scriptnames", Skipped(SCRIPTRT), Neither, "scriptnames", "scr", None,
+       "needs a script/plugin runtime vimcode does not have"),
+    ex(":se[t]", ":set", Implemented, Both, "set", "se", Some(Keys(":set ")),
+       "the option surface audited in full by #1225"),
+    ex(":setf[iletype]", ":setfiletype", NotImplemented, Neither, "setfiletype", "setf", None,
+       "set 'filetype', unless it was set already — `:set` exists but has no local/global split (vimcode's settings are global), and `:setfiletype`/`:filetype` are absent; `:setfiletype` is worth implementing"),
+    ex(":setg[lobal]", ":setglobal", NotImplemented, Neither, "setglobal", "setg", None,
+       "show global values of options — `:set` exists but has no local/global split (vimcode's settings are global), and `:setfiletype`/`:filetype` are absent; `:setfiletype` is worth implementing"),
+    ex(":setl[ocal]", ":setlocal", NotImplemented, Neither, "setlocal", "setl", None,
+       "show or set options locally — `:set` exists but has no local/global split (vimcode's settings are global), and `:setfiletype`/`:filetype` are absent; `:setfiletype` is worth implementing"),
+    ex(":sf[ind]", ":sfind", NotImplemented, Neither, "sfind", "sf", None,
+       "split current window and edit file in 'path' — no vimcode equivalent; low value"),
+    ex(":sfir[st]", ":sfirst", NotImplemented, Neither, "sfirst", "sfir", None,
+       "split window and go to first file in the argument list — vimcode has no argument list, and splits+`:buffer` cover the `:s…`/`:sb…` family; moderate value for `:argdo` alone"),
+    ex(":sig[n]", ":sign", NotImplemented, Neither, "sign", "sig", None,
+       "manipulate signs — vimcode paints LSP diagnostics in the gutter but exposes no `:sign` API; low value"),
+    ex(":sil[ent]", ":silent", Skipped(VIMSCRIPT), Neither, "silent", "sil", None,
+       "VimScript: out of scope per the standing decision (vimcode implements Vim keybindings and editing, not a VimScript runtime)"),
+    ex(":sl[eep]", ":sleep", NotImplemented, Neither, "sleep", "sl", None,
+       "do nothing for a few seconds — only useful inside scripts; low value"),
+    ex(":sl[eep]!", ":sleep!", NotImplemented, Neither, "sleep!", "sl!", None,
+       "`:sleep` without a visible cursor; blocked on `:sleep`"),
+    ex(":sla[st]", ":slast", NotImplemented, Neither, "slast", "sla", None,
+       "split window and go to last file in the argument list — vimcode has no argument list, and splits+`:buffer` cover the `:s…`/`:sb…` family; moderate value for `:argdo` alone"),
+    ex(":sm[agic]", ":smagic", NotImplemented, Neither, "smagic/alpha/A/", "sm/alpha/A/", None,
+       ":substitute with 'magic' — no vimcode equivalent; low value"),
+    ex(":smap", ":smap", Skipped(SELECT), Both, "smap", "smap", None,
+       "recognised and stored, but vimcode has no Select mode, so the mapping can never fire"),
+    ex(":smapc[lear]", ":smapclear", Skipped(SELECT), FullOnly, "smapclear", "smapc", None,
+       "recognised, but there is no Select mode for it to apply to"),
+    ex(":sme[nu]", ":smenu", Skipped(MENU), Neither, "smenu", "sme", None,
+       "Vim's GUI menu/toolkit surface; vimcode's menus are quadraui widgets, not `:menu` entries"),
+    ex(":sn[ext]", ":snext", NotImplemented, Neither, "snext", "sn", None,
+       "split window and go to next file in the argument list — vimcode has no argument list, and splits+`:buffer` cover the `:s…`/`:sb…` family; moderate value for `:argdo` alone"),
+    ex(":sno[magic]", ":snomagic", NotImplemented, Neither, "snomagic/alpha/A/", "sno/alpha/A/", None,
+       ":substitute with 'nomagic' — no vimcode equivalent; low value"),
+    ex(":snor[emap]", ":snoremap", Skipped(SELECT), FullOnly, "snoremap", "snor", None,
+       "recognised and stored, but there is no Select mode for it to apply to"),
+    ex(":snoreme[nu]", ":snoremenu", Skipped(MENU), Neither, "snoremenu", "snoreme", None,
+       "Vim's GUI menu/toolkit surface; vimcode's menus are quadraui widgets, not `:menu` entries"),
+    ex(":sor[t]", ":sort", Implemented, Both, "sort", "sor", Some(Label("ex:sort")),
+       "sorts with `n`, `i`, `u`, `r`, `!` and a `/pat/`"),
+    ex(":so[urce]", ":source", Skipped(SCRIPTRT), Neither, "source", "so", None,
+       "needs a script/plugin runtime vimcode does not have"),
+    ex(":spelld[ump]", ":spelldump", NotImplemented, Neither, "spelldump", "spelld", None,
+       "split window and fill with all correct words — vimcode ships a real spell checker (`src/core/spell.rs`, #1163) but exposes no `:spell*` ex command for it — the cheapest ❌ family in this slice to close"),
+    ex(":spe[llgood]", ":spellgood", NotImplemented, Neither, "spellgood", "spe", None,
+       "add good word for spelling — vimcode ships a real spell checker (`src/core/spell.rs`, #1163) but exposes no `:spell*` ex command for it — the cheapest ❌ family in this slice to close"),
+    ex(":spelli[nfo]", ":spellinfo", NotImplemented, Neither, "spellinfo", "spelli", None,
+       "show info about loaded spell files — vimcode ships a real spell checker (`src/core/spell.rs`, #1163) but exposes no `:spell*` ex command for it — the cheapest ❌ family in this slice to close"),
+    ex(":spellra[re]", ":spellrare", NotImplemented, Neither, "spellrare", "spellra", None,
+       "add rare word for spelling — vimcode ships a real spell checker (`src/core/spell.rs`, #1163) but exposes no `:spell*` ex command for it — the cheapest ❌ family in this slice to close"),
+    ex(":spellr[epall]", ":spellrepall", NotImplemented, Neither, "spellrepall", "spellr", None,
+       "replace all bad words like last |z=| — vimcode ships a real spell checker (`src/core/spell.rs`, #1163) but exposes no `:spell*` ex command for it — the cheapest ❌ family in this slice to close"),
+    ex(":spellu[ndo]", ":spellundo", NotImplemented, Neither, "spellundo", "spellu", None,
+       "remove good or bad word — vimcode ships a real spell checker (`src/core/spell.rs`, #1163) but exposes no `:spell*` ex command for it — the cheapest ❌ family in this slice to close"),
+    ex(":spellw[rong]", ":spellwrong", NotImplemented, Neither, "spellwrong", "spellw", None,
+       "add spelling mistake — vimcode ships a real spell checker (`src/core/spell.rs`, #1163) but exposes no `:spell*` ex command for it — the cheapest ❌ family in this slice to close"),
+    ex(":sp[lit]", ":split", Implemented, Both, "split", "sp", Some(Keys(":split<CR>")),
+       "horizontal split"),
+    ex(":spr[evious]", ":sprevious", NotImplemented, Neither, "sprevious", "spr", None,
+       "split window and go to previous file in the argument list — vimcode has no argument list, and splits+`:buffer` cover the `:s…`/`:sb…` family; moderate value for `:argdo` alone"),
+    ex(":sre[wind]", ":srewind", NotImplemented, Neither, "srewind", "sre", None,
+       "split window and go to first file in the argument list — vimcode has no argument list, and splits+`:buffer` cover the `:s…`/`:sb…` family; moderate value for `:argdo` alone"),
+    ex(":st[op]", ":stop", NotImplemented, FullOnly, "stop", "st", None,
+       "suspend the editor — vimcode binds `:stop` to its DAP debugger instead, so `CTRL-Z`'s ex spelling does nothing a TUI user expects; worth implementing in the TUI backend and renaming the DAP command"),
+    ex(":sta[g]", ":stag", Skipped(CTAGS), Neither, "stag", "sta", None,
+       "tags/'include' file search; vimcode uses LSP go-to-definition and references instead"),
+    ex(":star[tinsert]", ":startinsert", Implemented, Both, "startinsert", "star", Some(Label("ex:startinsert then type")),
+       "enters Insert mode, with `!` for end-of-line"),
+    ex(":startr[eplace]", ":startreplace", NotImplemented, Neither, "startreplace", "startr", None,
+       "start Replace mode — one-off commands with no vimcode equivalent; `:z`, `:list`, `:lcd`, `:view`, `:uniq` and the `:keep*`/`:lockmarks` modifiers are the ones a Vim user would actually miss"),
+    ex(":stopi[nsert]", ":stopinsert", Implemented, Both, "stopinsert", "stopi", Some(Label("ex:stopinsert noop when already Normal")),
+       "leaves Insert mode"),
+    ex(":stj[ump]", ":stjump", Skipped(CTAGS), Neither, "stjump", "stj", None,
+       "tags/'include' file search; vimcode uses LSP go-to-definition and references instead"),
+    ex(":sts[elect]", ":stselect", Skipped(CTAGS), Neither, "stselect", "sts", None,
+       "tags/'include' file search; vimcode uses LSP go-to-definition and references instead"),
+    ex(":sun[hide]", ":sunhide", NotImplemented, Neither, "sunhide", "sun", None,
+       "same as \":unhide\" — vimcode has no argument list, and splits+`:buffer` cover the `:s…`/`:sb…` family; moderate value for `:argdo` alone"),
+    ex(":sunm[ap]", ":sunmap", Skipped(SELECT), FullOnly, "sunmap", "sunm", None,
+       "recognised, but there is no Select mode for it to apply to"),
+    ex(":sunme[nu]", ":sunmenu", Skipped(MENU), Neither, "sunmenu", "sunme", None,
+       "Vim's GUI menu/toolkit surface; vimcode's menus are quadraui widgets, not `:menu` entries"),
+    ex(":sus[pend]", ":suspend", NotImplemented, Neither, "suspend", "sus", None,
+       "same as \":stop\" — no vimcode equivalent; low value"),
+    ex(":sv[iew]", ":sview", NotImplemented, Neither, "sview", "sv", None,
+       "split window and edit file read-only — no vimcode equivalent; low value"),
+    ex(":sw[apname]", ":swapname", NotImplemented, Neither, "swapname", "sw", None,
+       "show the name of the current swap file — vimcode has swap files and recovery (`tests/swap_recovery.rs`) but no ex commands for them; `:recover` is worth implementing"),
+    ex(":sy[ntax]", ":syntax", NotImplemented, Neither, "syntax", "sy", None,
+       "syntax highlighting — tree-sitter plus the theme registry replace Vim's syntax/highlight files; low value"),
+    ex(":synti[me]", ":syntime", Skipped(VIMSCRIPT), Neither, "syntime", "synti", None,
+       "VimScript: out of scope per the standing decision (vimcode implements Vim keybindings and editing, not a VimScript runtime)"),
+    ex(":sync[bind]", ":syncbind", NotImplemented, Neither, "syncbind", "sync", None,
+       "sync scroll binding — one-off commands with no vimcode equivalent; `:z`, `:list`, `:lcd`, `:view`, `:uniq` and the `:keep*`/`:lockmarks` modifiers are the ones a Vim user would actually miss"),
+    ex(":t", ":t", Implemented, Both, "t 0", "t 0", Some(Label("ex:1,2t$")),
+       "the short form of `:copy`"),
+    ex(":tN[ext]", ":tNext", Skipped(CTAGS), Neither, "tNext", "tN", None,
+       "tags/'include' file search; vimcode uses LSP go-to-definition and references instead"),
+    ex(":tabN[ext]", ":tabNext", NotImplemented, Neither, "tabNext", "tabN", None,
+       "go to previous tabpage — no vimcode equivalent; low value"),
+    ex(":tabc[lose]", ":tabclose", Implemented, Both, "tabclose", "tabc", Some(Keys(":tabclose<CR>")),
+       "closes a tab, refusing on the last one"),
+    ex(":tabd[o]", ":tabdo", Implemented, Both, "tabdo s/a/b/", "tabdo s/a/b/", Some(Keys(":tabdo ")),
+       "runs a command in every tab"),
+    ex(":tabe[dit]", ":tabedit", Partial, AbbrevOnly, "tabedit", "tabe", Some(Keys(":tabe ")),
+       "`:tabe`/`:tabnew` work; the full spelling `:tabedit` is rejected"),
+    ex(":tabf[ind]", ":tabfind", NotImplemented, Neither, "tabfind", "tabf", None,
+       "find file in 'path', edit it in a new tabpage — no vimcode equivalent; low value"),
+    ex(":tabfir[st]", ":tabfirst", Implemented, Both, "tabfirst", "tabfir", Some(Label("ex:tabfirst noop with one tab")),
+       "first tab"),
+    ex(":tabl[ast]", ":tablast", Implemented, Both, "tablast", "tabl", Some(Label("ex:tablast noop with one tab")),
+       "last tab"),
+    ex(":tabm[ove]", ":tabmove", Implemented, Both, "tabmove", "tabm", Some(Keys(":tabmove")),
+       "moves the tab"),
+    ex(":tabnew", ":tabnew", Implemented, Both, "tabnew", "tabnew", Some(Keys(":tabnew")),
+       "new tab"),
+    ex(":tabn[ext]", ":tabnext", Implemented, Both, "tabnext", "tabn", Some(Keys(":tabnext<CR>")),
+       "next tab"),
+    ex(":tabo[nly]", ":tabonly", Implemented, Both, "tabonly", "tabo", Some(Label("ex:tabonly noop with one tab")),
+       "closes every other tab"),
+    ex(":tabp[revious]", ":tabprevious", Implemented, Both, "tabprevious", "tabp", Some(Keys(":tabprevious<CR>")),
+       "previous tab"),
+    ex(":tabr[ewind]", ":tabrewind", NotImplemented, Neither, "tabrewind", "tabr", None,
+       "go to first tabpage — no vimcode equivalent; low value"),
+    ex(":tabs", ":tabs", Implemented, Both, "tabs", "tabs", Some(Keys(":tabs<CR>")),
+       "lists tabs"),
+    ex(":tab", ":tab", NotImplemented, Neither, "tab", "tab", None,
+       "create new tab when opening new window — `:wincmd` and `:split`/`:vsplit` cover the resize and split axes, but the `:{mod} {cmd}` modifier grammar is not parsed at all; moderate value"),
+    ex(":ta[g]", ":tag", Skipped(CTAGS), Neither, "tag", "ta", None,
+       "tags/'include' file search; vimcode uses LSP go-to-definition and references instead"),
+    ex(":tags", ":tags", Skipped(CTAGS), Neither, "tags", "tags", None,
+       "tags/'include' file search; vimcode uses LSP go-to-definition and references instead"),
+    ex(":tc[d]", ":tcd", NotImplemented, Neither, "tcd", "tc", None,
+       "change directory for tabpage — one-off commands with no vimcode equivalent; `:z`, `:list`, `:lcd`, `:view`, `:uniq` and the `:keep*`/`:lockmarks` modifiers are the ones a Vim user would actually miss"),
+    ex(":tch[dir]", ":tchdir", NotImplemented, Neither, "tchdir", "tch", None,
+       "change directory for tabpage — one-off commands with no vimcode equivalent; `:z`, `:list`, `:lcd`, `:view`, `:uniq` and the `:keep*`/`:lockmarks` modifiers are the ones a Vim user would actually miss"),
+    ex(":te[rminal]", ":terminal", Implemented, Both, "terminal", "te", Some(Keys(":terminal<CR>")),
+       "opens the terminal panel"),
+    ex(":tf[irst]", ":tfirst", Skipped(CTAGS), Neither, "tfirst", "tf", None,
+       "tags/'include' file search; vimcode uses LSP go-to-definition and references instead"),
+    ex(":th[row]", ":throw", Skipped(VIMSCRIPT), Neither, "throw", "th", None,
+       "VimScript: out of scope per the standing decision (vimcode implements Vim keybindings and editing, not a VimScript runtime)"),
+    ex(":tj[ump]", ":tjump", Skipped(CTAGS), Neither, "tjump", "tj", None,
+       "tags/'include' file search; vimcode uses LSP go-to-definition and references instead"),
+    ex(":tl[ast]", ":tlast", Skipped(CTAGS), Neither, "tlast", "tl", None,
+       "tags/'include' file search; vimcode uses LSP go-to-definition and references instead"),
+    ex(":tlm[enu]", ":tlmenu", Skipped(MENU), Neither, "tlmenu", "tlm", None,
+       "Vim's GUI menu/toolkit surface; vimcode's menus are quadraui widgets, not `:menu` entries"),
+    ex(":tln[oremenu]", ":tlnoremenu", Skipped(MENU), Neither, "tlnoremenu", "tln", None,
+       "Vim's GUI menu/toolkit surface; vimcode's menus are quadraui widgets, not `:menu` entries"),
+    ex(":tlu[nmenu]", ":tlunmenu", Skipped(MENU), Neither, "tlunmenu", "tlu", None,
+       "Vim's GUI menu/toolkit surface; vimcode's menus are quadraui widgets, not `:menu` entries"),
+    ex(":tmapc[lear]", ":tmapclear", NotImplemented, Neither, "tmapclear", "tmapc", None,
+       "remove all mappings for |Terminal-mode| — one-off commands with no vimcode equivalent; `:z`, `:list`, `:lcd`, `:view`, `:uniq` and the `:keep*`/`:lockmarks` modifiers are the ones a Vim user would actually miss"),
+    ex(":tma[p]", ":tmap", NotImplemented, Neither, "tmap", "tma", None,
+       "like \":map\" but for |Terminal-mode| — one-off commands with no vimcode equivalent; `:z`, `:list`, `:lcd`, `:view`, `:uniq` and the `:keep*`/`:lockmarks` modifiers are the ones a Vim user would actually miss"),
+    ex(":tm[enu]", ":tmenu", Skipped(MENU), Neither, "tmenu", "tm", None,
+       "Vim's GUI menu/toolkit surface; vimcode's menus are quadraui widgets, not `:menu` entries"),
+    ex(":tn[ext]", ":tnext", Skipped(CTAGS), Neither, "tnext", "tn", None,
+       "tags/'include' file search; vimcode uses LSP go-to-definition and references instead"),
+    ex(":tno[remap]", ":tnoremap", NotImplemented, Neither, "tnoremap", "tno", None,
+       "like \":noremap\" but for |Terminal-mode| — one-off commands with no vimcode equivalent; `:z`, `:list`, `:lcd`, `:view`, `:uniq` and the `:keep*`/`:lockmarks` modifiers are the ones a Vim user would actually miss"),
+    ex(":to[pleft]", ":topleft", NotImplemented, Neither, "topleft", "to", None,
+       "make split window appear at top or far left — `:wincmd` and `:split`/`:vsplit` cover the resize and split axes, but the `:{mod} {cmd}` modifier grammar is not parsed at all; moderate value"),
+    ex(":tp[revious]", ":tprevious", Skipped(CTAGS), Neither, "tprevious", "tp", None,
+       "tags/'include' file search; vimcode uses LSP go-to-definition and references instead"),
+    ex(":tr[ewind]", ":trewind", Skipped(CTAGS), Neither, "trewind", "tr", None,
+       "tags/'include' file search; vimcode uses LSP go-to-definition and references instead"),
+    ex(":trust", ":trust", Skipped(SCRIPTRT), Neither, "trust", "trust", None,
+       "needs a script/plugin runtime vimcode does not have"),
+    ex(":try", ":try", Skipped(VIMSCRIPT), Neither, "try", "try", None,
+       "VimScript: out of scope per the standing decision (vimcode implements Vim keybindings and editing, not a VimScript runtime)"),
+    ex(":ts[elect]", ":tselect", Skipped(CTAGS), Neither, "tselect", "ts", None,
+       "tags/'include' file search; vimcode uses LSP go-to-definition and references instead"),
+    ex(":tunma[p]", ":tunmap", NotImplemented, Neither, "tunmap", "tunma", None,
+       "like \":unmap\" but for |Terminal-mode| — one-off commands with no vimcode equivalent; `:z`, `:list`, `:lcd`, `:view`, `:uniq` and the `:keep*`/`:lockmarks` modifiers are the ones a Vim user would actually miss"),
+    ex(":tu[nmenu]", ":tunmenu", NotImplemented, Neither, "tunmenu", "tu", None,
+       "remove menu tooltip — no vimcode equivalent; low value"),
+    ex(":u[ndo]", ":undo", Implemented, Both, "undo", "u", Some(Label("ex:undo")),
+       "undo (linear — see #1156 for the undo-tree gap)"),
+    ex(":undoj[oin]", ":undojoin", NotImplemented, Neither, "undojoin", "undoj", None,
+       "join next change with previous undo block — the undo-tree surface; tracked by #1156, which is implementing persistent undo and the tree"),
+    ex(":undol[ist]", ":undolist", NotImplemented, Neither, "undolist", "undol", None,
+       "list leafs of the undo tree — the undo-tree surface; tracked by #1156, which is implementing persistent undo and the tree"),
+    ex(":una[bbreviate]", ":unabbreviate", Implemented, Both, "unabbreviate", "una", Some(Keys(":unabbreviate ")),
+       "removes an abbreviation"),
+    ex(":unh[ide]", ":unhide", NotImplemented, Neither, "unhide", "unh", None,
+       "open a window for each loaded file in the buffer list — vimcode has no argument list, and splits+`:buffer` cover the `:s…`/`:sb…` family; moderate value for `:argdo` alone"),
+    ex(":uni[q]", ":uniq", NotImplemented, Neither, "uniq", "uni", None,
+       "uniq lines — one-off commands with no vimcode equivalent; `:z`, `:list`, `:lcd`, `:view`, `:uniq` and the `:keep*`/`:lockmarks` modifiers are the ones a Vim user would actually miss"),
+    ex(":unl[et]", ":unlet", Skipped(VIMSCRIPT), Neither, "unlet", "unl", None,
+       "VimScript: out of scope per the standing decision (vimcode implements Vim keybindings and editing, not a VimScript runtime)"),
+    ex(":unlo[ckvar]", ":unlockvar", Skipped(VIMSCRIPT), Neither, "unlockvar", "unlo", None,
+       "VimScript: out of scope per the standing decision (vimcode implements Vim keybindings and editing, not a VimScript runtime)"),
+    ex(":unm[ap]", ":unmap", Partial, FullOnly, "unmap", "unm", Some(Keys(":unmap ")),
+       "works, but `:unm` is rejected"),
+    ex(":unme[nu]", ":unmenu", Skipped(MENU), Neither, "unmenu", "unme", None,
+       "Vim's GUI menu/toolkit surface; vimcode's menus are quadraui widgets, not `:menu` entries"),
+    ex(":uns[ilent]", ":unsilent", Skipped(VIMSCRIPT), Neither, "unsilent", "uns", None,
+       "VimScript: out of scope per the standing decision (vimcode implements Vim keybindings and editing, not a VimScript runtime)"),
+    ex(":up[date]", ":update", Partial, Both, "update", "up", Some(Keys(":update<CR>")),
+       "writes only when modified, but `:update {file}` is rejected"),
+    ex(":v[global]", ":vglobal", Implemented, Both, "vglobal/beta/d", "v/beta/d", Some(Keys(":v/")),
+       "the inverse of `:global`"),
+    ex(":ve[rsion]", ":version", Implemented, Both, "version", "ve", Some(Keys(":version<CR>")),
+       "prints the version"),
+    ex(":verb[ose]", ":verbose", NotImplemented, Neither, "verbose", "verb", None,
+       "execute command with 'verbose' set — one-off commands with no vimcode equivalent; `:z`, `:list`, `:lcd`, `:view`, `:uniq` and the `:keep*`/`:lockmarks` modifiers are the ones a Vim user would actually miss"),
+    ex(":vert[ical]", ":vertical", NotImplemented, Neither, "vertical", "vert", None,
+       "make following command split vertically — `:wincmd` and `:split`/`:vsplit` cover the resize and split axes, but the `:{mod} {cmd}` modifier grammar is not parsed at all; moderate value"),
+    ex(":vim[grep]", ":vimgrep", Implemented, Both, "vimgrep", "vim", Some(Keys(":vimgrep ")),
+       "shares `:grep`'s implementation"),
+    ex(":vimgrepa[dd]", ":vimgrepadd", NotImplemented, Neither, "vimgrepadd", "vimgrepa", None,
+       "like :vimgrep, but append to current list — vimcode's quickfix list is filled by `:grep`/`:make` and LSP diagnostics, never from an error file or expression; low value"),
+    ex(":vi[sual]", ":visual", Skipped(EXMODE), Neither, "visual", "vi", None,
+       "Ex/Open mode line editing is out of scope"),
+    ex(":viu[sage]", ":viusage", NotImplemented, Neither, "viusage", "viu", None,
+       "overview of Normal mode commands — informational commands with no vimcode surface; `:messages` and `:oldfiles` (vimcode already has a recent-files picker) are the two worth adding"),
+    ex(":vie[w]", ":view", NotImplemented, Neither, "view", "vie", None,
+       "edit a file read-only — one-off commands with no vimcode equivalent; `:z`, `:list`, `:lcd`, `:view`, `:uniq` and the `:keep*`/`:lockmarks` modifiers are the ones a Vim user would actually miss"),
+    ex(":vm[ap]", ":vmap", Partial, FullOnly, "vmap", "vm", Some(Keys(":vmap ")),
+       "works, but `:vm` is rejected"),
+    ex(":vmapc[lear]", ":vmapclear", Partial, FullOnly, "vmapclear", "vmapc", Some(Keys(":vmapclear")),
+       "works, but `:vmapc` is rejected"),
+    ex(":vme[nu]", ":vmenu", Skipped(MENU), Neither, "vmenu", "vme", None,
+       "Vim's GUI menu/toolkit surface; vimcode's menus are quadraui widgets, not `:menu` entries"),
+    ex(":vne[w]", ":vnew", Implemented, Both, "vnew", "vne", Some(Keys(":vnew<CR>")),
+       "vertical split with a new empty buffer"),
+    ex(":vn[oremap]", ":vnoremap", Partial, FullOnly, "vnoremap", "vn", Some(Keys(":vnoremap ")),
+       "works, but `:vn` is rejected"),
+    ex(":vnoreme[nu]", ":vnoremenu", Skipped(MENU), Neither, "vnoremenu", "vnoreme", None,
+       "Vim's GUI menu/toolkit surface; vimcode's menus are quadraui widgets, not `:menu` entries"),
+    ex(":vs[plit]", ":vsplit", Implemented, Both, "vsplit", "vs", Some(Keys(":vsplit<CR>")),
+       "vertical split"),
+    ex(":vu[nmap]", ":vunmap", Partial, FullOnly, "vunmap", "vu", Some(Keys(":vunmap ")),
+       "works, but `:vu` is rejected"),
+    ex(":vunme[nu]", ":vunmenu", Skipped(MENU), Neither, "vunmenu", "vunme", None,
+       "Vim's GUI menu/toolkit surface; vimcode's menus are quadraui widgets, not `:menu` entries"),
+    ex(":wind[o]", ":windo", Implemented, Both, "windo s/a/b/", "windo s/a/b/", Some(Keys(":windo ")),
+       "runs a command in every window"),
+    ex(":w[rite]", ":write", Partial, Both, "write", "w", Some(Keys(":write<CR>")),
+       "writes the current buffer, but `:w {file}`, `:w >>{file}` and `:w !{cmd}` are all rejected — `:saveas` is the only way to write elsewhere"),
+    ex(":wN[ext]", ":wNext", NotImplemented, Neither, "wNext", "wN", None,
+       "write to a file and go to previous file in argument list — vimcode has no argument list, and splits+`:buffer` cover the `:s…`/`:sb…` family; moderate value for `:argdo` alone"),
+    ex(":wa[ll]", ":wall", Implemented, Both, "wall", "wa", Some(Keys(":wall<CR>")),
+       "writes every modified buffer"),
+    ex(":wh[ile]", ":while", Skipped(VIMSCRIPT), Neither, "while", "wh", None,
+       "VimScript: out of scope per the standing decision (vimcode implements Vim keybindings and editing, not a VimScript runtime)"),
+    ex(":wi[nsize]", ":winsize", Skipped(MENU), Neither, "winsize", "wi", None,
+       "Vim's GUI menu/toolkit surface; vimcode's menus are quadraui widgets, not `:menu` entries"),
+    ex(":winc[md]", ":wincmd", Implemented, Both, "wincmd", "winc", Some(Keys(":wincmd ")),
+       "the ex form of CTRL-W"),
+    ex(":winp[os]", ":winpos", Skipped(MENU), Neither, "winpos", "winp", None,
+       "Vim's GUI menu/toolkit surface; vimcode's menus are quadraui widgets, not `:menu` entries"),
+    ex(":wn[ext]", ":wnext", NotImplemented, Neither, "wnext", "wn", None,
+       "write to a file and go to next file in argument list — vimcode has no argument list, and splits+`:buffer` cover the `:s…`/`:sb…` family; moderate value for `:argdo` alone"),
+    ex(":wp[revious]", ":wprevious", NotImplemented, Neither, "wprevious", "wp", None,
+       "write to a file and go to previous file in argument list — vimcode has no argument list, and splits+`:buffer` cover the `:s…`/`:sb…` family; moderate value for `:argdo` alone"),
+    ex(":wq", ":wq", Partial, Both, "wq", "wq", Some(Keys(":wq<CR>")),
+       "writes and quits, but `:wq {file}` is rejected"),
+    ex(":wqa[ll]", ":wqall", Implemented, Both, "wqall", "wqa", Some(Keys(":wqall<CR>")),
+       "writes everything and quits"),
+    ex(":wsh[ada]", ":wshada", Skipped(SHADA), Neither, "wshada", "wsh", None,
+       "no ShaDa/viminfo file; vimcode persists its own session state (src/core/session.rs)"),
+    ex(":wu[ndo]", ":wundo", NotImplemented, Neither, "wundo", "wu", None,
+       "write undo information to a file — the undo-tree surface; tracked by #1156, which is implementing persistent undo and the tree"),
+    ex(":x[it]", ":xit", Partial, AbbrevOnly, "xit", "x", Some(Keys(":x<CR>")),
+       "`:x` works; the full spelling `:xit` is rejected, and `:x {file}` too"),
+    ex(":xa[ll]", ":xall", Implemented, Both, "xall", "xa", Some(Keys(":xall<CR>")),
+       "writes the modified buffers and quits"),
+    ex(":xmapc[lear]", ":xmapclear", Partial, FullOnly, "xmapclear", "xmapc", Some(Keys(":xmapclear")),
+       "works, but `:xmapc` is rejected"),
+    ex(":xm[ap]", ":xmap", Partial, FullOnly, "xmap", "xm", Some(Keys(":xmap ")),
+       "works, but `:xm` is rejected"),
+    ex(":xme[nu]", ":xmenu", Skipped(MENU), Neither, "xmenu", "xme", None,
+       "Vim's GUI menu/toolkit surface; vimcode's menus are quadraui widgets, not `:menu` entries"),
+    ex(":xn[oremap]", ":xnoremap", Partial, FullOnly, "xnoremap", "xn", Some(Keys(":xnoremap ")),
+       "works, but `:xn` is rejected"),
+    ex(":xnoreme[nu]", ":xnoremenu", Skipped(MENU), Neither, "xnoremenu", "xnoreme", None,
+       "Vim's GUI menu/toolkit surface; vimcode's menus are quadraui widgets, not `:menu` entries"),
+    ex(":xu[nmap]", ":xunmap", Partial, FullOnly, "xunmap", "xu", Some(Keys(":xunmap ")),
+       "works, but `:xu` is rejected"),
+    ex(":xunme[nu]", ":xunmenu", Skipped(MENU), Neither, "xunmenu", "xunme", None,
+       "Vim's GUI menu/toolkit surface; vimcode's menus are quadraui widgets, not `:menu` entries"),
+    ex(":y[ank]", ":yank", Implemented, Both, "yank", "y", Some(Label("ex:y a")),
+       "yanks a range into a register, with a count"),
+    ex(":z", ":z", NotImplemented, Neither, "z", "z", None,
+       "print some lines — one-off commands with no vimcode equivalent; `:z`, `:list`, `:lcd`, `:view`, `:uniq` and the `:keep*`/`:lockmarks` modifiers are the ones a Vim user would actually miss"),
+    ex(":~", ":~", Partial, Both, "~", "~", Some(Keys(":~<CR>")),
+       "recognised, but it is a straight alias of `:&`: Vim's `:~` reuses the last *replacement string* from any `:s`, which vimcode does not track separately"),
+];
+
+/// ✅/🟡 rows that **no** oracle case reaches today. Shrink-only, exactly
+/// like `COVERAGE_EXEMPT` and `REGMARK_COVERAGE_EXEMPT`: deleting an entry
+/// requires a case that pins it, and a case that starts pinning one forces
+/// its entry to be deleted. Writing those cases is #1162.
+const EX_COVERAGE_EXEMPT: &[&str] = &[
+    ":#",
+    ":=",
+    ":abc[lear]",
+    ":b[uffer]",
+    ":bd[elete]",
+    ":bn[ext]",
+    ":bp[revious]",
+    ":bufd[o]",
+    ":buffers",
+    ":cN[ext]",
+    ":ccl[ose]",
+    ":cd",
+    ":cdo",
+    ":cfd[o]",
+    ":cfir[st]",
+    ":changes",
+    ":cla[st]",
+    ":cl[ist]",
+    ":clo[se]",
+    ":cm[ap]",
+    ":cmapc[lear]",
+    ":cn[ext]",
+    ":cnew[er]",
+    ":cno[remap]",
+    ":cnorea[bbrev]",
+    ":col[der]",
+    ":colo[rscheme]",
+    ":cope[n]",
+    ":cp[revious]",
+    ":cq[uit]",
+    ":cu[nmap]",
+    ":cw[indow]",
+    ":diffo[ff]",
+    ":diffs[plit]",
+    ":difft[his]",
+    ":dig[raphs]",
+    ":di[splay]",
+    ":e[dit]",
+    ":f[ile]",
+    ":files",
+    ":gr[ep]",
+    ":h[elp]",
+    ":his[tory]",
+    ":im[ap]",
+    ":imapc[lear]",
+    ":inorea[bbrev]",
+    ":iu[nmap]",
+    ":ju[mps]",
+    ":lN[ext]",
+    ":lcl[ose]",
+    ":ld[o]",
+    ":lfd[o]",
+    ":lfir[st]",
+    ":lgr[ep]",
+    ":ll",
+    ":lla[st]",
+    ":lli[st]",
+    ":lne[xt]",
+    ":lop[en]",
+    ":lp[revious]",
+    ":ls",
+    ":lv[imgrep]",
+    ":lw[indow]",
+    ":mak[e]",
+    ":map",
+    ":mapc[lear]",
+    ":marks",
+    ":new",
+    ":nmapc[lear]",
+    ":no[remap]",
+    ":norea[bbrev]",
+    ":nu[mber]",
+    ":nun[map]",
+    ":om[ap]",
+    ":omapc[lear]",
+    ":on[ly]",
+    ":ou[nmap]",
+    ":p[rint]",
+    ":pw[d]",
+    ":q[uit]",
+    ":qa[ll]",
+    ":reg[isters]",
+    ":sav[eas]",
+    ":sp[lit]",
+    ":tabc[lose]",
+    ":tabd[o]",
+    ":tabe[dit]",
+    ":tabm[ove]",
+    ":tabn[ext]",
+    ":tabp[revious]",
+    ":tabs",
+    ":te[rminal]",
+    ":una[bbreviate]",
+    ":unm[ap]",
+    ":up[date]",
+    ":ve[rsion]",
+    ":vim[grep]",
+    ":vm[ap]",
+    ":vmapc[lear]",
+    ":vne[w]",
+    ":vn[oremap]",
+    ":vs[plit]",
+    ":vu[nmap]",
+    ":wind[o]",
+    ":w[rite]",
+    ":wa[ll]",
+    ":winc[md]",
+    ":wq",
+    ":wqa[ll]",
+    ":x[it]",
+    ":xa[ll]",
+    ":xmapc[lear]",
+    ":xm[ap]",
+    ":xn[oremap]",
+    ":xu[nmap]",
+    ":~",
+];
+
+/// Rows whose `status` and `dispatch` disagree for a reason gate 1b must be
+/// told about, rather than silently tolerating the shape.
+///
+/// `(cmd, reason)`. Kept tiny on purpose: every entry is a place where the
+/// cross-check would otherwise fire, so an unexplained one is a bug in the
+/// table, not in the rule.
+const EX_STATUS_DISPATCH_EXCEPTIONS: &[(&str, &str)] = &[(
+    ":*",
+    "`:*` is the `'<,'>` range, so the probe — an ex line run with no prior \
+     Visual selection — hits unset `'<`/`'>` marks and is refused. The corpus \
+     case `ex:*d after visual` selects first and passes, which is what makes \
+     the row ✅ despite a `Neither` measurement.",
+)];
+
+/// Drive one ex line through a real engine and report whether the dispatcher
+/// recognised it. Black-box: an ex line in, `engine.message` out.
+fn ex_line_is_recognised(line: &str) -> bool {
+    let mut engine = engine_with("alpha\nbeta\ngamma\ndelta\n");
+    // Same hermeticity fix as `replay_live` (#1226): `Engine::new()` loads
+    // the user's real command history off disk.
+    engine.history = Default::default();
+    engine.set_viewport_lines(24);
+    engine.execute_command(line);
+    !engine.message.contains("Not an editor command")
+}
+
+/// Re-measure one row's [`ExDispatch`].
+fn measured_ex_dispatch(probe_full: &str, probe_abbr: &str) -> ExDispatch {
+    match (
+        ex_line_is_recognised(probe_full),
+        ex_line_is_recognised(probe_abbr),
+    ) {
+        (true, true) => ExDispatch::Both,
+        (true, false) => ExDispatch::FullOnly,
+        (false, true) => ExDispatch::AbbrevOnly,
+        (false, false) => ExDispatch::Neither,
+    }
+}
+
+/// Every row whose recorded dispatch no longer matches the live dispatcher.
+fn ex_dispatch_drift(audit: &'static [ExAudit]) -> Vec<String> {
+    let mut drift: Vec<String> = Vec::new();
+    for e in audit {
+        if e.dispatch == ExDispatch::Crashes {
+            continue;
+        }
+        let measured = measured_ex_dispatch(e.probe_full, e.probe_abbr);
+        if measured != e.dispatch {
+            drift.push(format!(
+                "  {} ({}): table says {:?}, driving {:?} / {:?} measures {:?}",
+                e.cmd, e.help, e.dispatch, e.probe_full, e.probe_abbr, measured
+            ));
+        }
+    }
+    drift
+}
+
+/// Gate 1 (#1227) — every row's `ExDispatch` is a claim about live code, and
+/// this replays all 551 runnable rows against it. Pure: no `nvim`, no
+/// subprocess except the one `:make` probe, so it runs on every lane.
+#[test]
+fn ex_audit_matches_the_live_dispatcher() {
+    if let Ok(path) = std::env::var("CONFORMANCE_DUMP_EX") {
+        let mut s = String::new();
+        for e in EX_AUDIT {
+            if e.dispatch == ExDispatch::Crashes {
+                s.push_str(&format!("{}\tCrashes\n", e.cmd));
+                continue;
+            }
+            s.push_str(&format!(
+                "{}\t{:?}\n",
+                e.cmd,
+                measured_ex_dispatch(e.probe_full, e.probe_abbr)
+            ));
+        }
+        std::fs::write(&path, s).unwrap_or_else(|e| panic!("dump to {path}: {e}"));
+        return;
+    }
+
+    let drift = ex_dispatch_drift(EX_AUDIT);
+    assert!(
+        drift.is_empty(),
+        "\n\n== ex-command audit drifted from execute.rs (#1227) ==\n\
+         Each row records what `Engine::execute_command` actually did with the\n\
+         full name and with `:help`'s minimal abbreviation when the slice ran.\n\
+         Implementing (or breaking) one of these changes that measurement, so\n\
+         re-tag the row — that is how the audit stays true instead of rotting\n\
+         like a markdown checklist.\n\n{}\n\n\
+         A command that gained an implementation also needs its status changed\n\
+         from NotImplemented, a probe added, and an EX_COVERAGE_EXEMPT entry\n\
+         until an oracle case pins it.\n",
+        drift.join("\n")
+    );
+}
+
+/// Gate 1b (#1227) — the table describes itself correctly: complete, in
+/// `:help` order, unique, no unreviewed row, every ⏭️ carrying a reason from
+/// the shared vocabulary, and a probe on exactly the rows that can have one.
+#[test]
+fn ex_audit_is_internally_consistent() {
+    use std::collections::HashSet;
+    let mut problems: Vec<String> = Vec::new();
+
+    assert_eq!(
+        EX_AUDIT.len(),
+        553,
+        "`:help ex-cmd-index` walked to 553 entries; the audit must tag all of them"
+    );
+
+    let excepted: HashSet<&str> = EX_STATUS_DISPATCH_EXCEPTIONS
+        .iter()
+        .map(|(c, _)| *c)
+        .collect();
+    let mut seen: HashSet<&str> = HashSet::new();
+    for e in EX_AUDIT {
+        if !seen.insert(e.cmd) {
+            problems.push(format!("  {}: listed twice", e.cmd));
+        }
+        if e.note.trim().is_empty() {
+            problems.push(format!("  {}: empty note — every row is reviewed", e.cmd));
+        }
+        if e.help.trim().is_empty() {
+            problems.push(format!("  {}: no `:help` tag", e.cmd));
+        }
+        if e.note.contains("TODO") {
+            problems.push(format!("  {}: TODO note — every row is reviewed", e.cmd));
+        }
+
+        if let OptStatus::Skipped(reason) = e.status {
+            if !SKIP_REASONS.contains(&reason) {
+                problems.push(format!(
+                    "  {}: skip reason {reason:?} is not in SKIP_REASONS",
+                    e.cmd
+                ));
+            }
+        }
+
+        let in_scope = matches!(e.status, OptStatus::Implemented | OptStatus::Partial);
+        if in_scope && e.probe.is_none() {
+            problems.push(format!(
+                "  {}: Implemented/Partial, so it must name the oracle case that covers it",
+                e.cmd
+            ));
+        }
+        if !in_scope && e.probe.is_some() {
+            problems.push(format!(
+                "  {}: only Implemented/Partial rows carry an oracle probe",
+                e.cmd
+            ));
+        }
+        if in_scope && e.dispatch == ExDispatch::Neither && !excepted.contains(e.cmd) {
+            problems.push(format!(
+                "  {}: tagged {:?} but the dispatcher rejects both spellings — \
+                 either the tag is wrong or it needs an EX_STATUS_DISPATCH_EXCEPTIONS entry",
+                e.cmd, e.status
+            ));
+        }
+        if e.probe_full.is_empty() && e.probe_abbr.is_empty() && e.cmd != ":" {
+            problems.push(format!("  {}: no probe line to re-measure", e.cmd));
+        }
+    }
+
+    for (cmd, reason) in EX_STATUS_DISPATCH_EXCEPTIONS {
+        if !EX_AUDIT.iter().any(|e| e.cmd == *cmd) {
+            problems.push(format!("  {cmd}: exception names no audited command"));
+        }
+        if reason.trim().is_empty() {
+            problems.push(format!("  {cmd}: exception with no reason is a shrug"));
+        }
+    }
+
+    // The headline tally, pinned. The module doc quotes these numbers and a
+    // PR body quotes the module doc; without this they drift the moment a row
+    // is re-tagged, which is the exact rot a markdown checklist suffers from.
+    let tally = |want: fn(&ExAudit) -> bool| EX_AUDIT.iter().filter(|e| want(e)).count();
+    assert_eq!(
+        (
+            tally(|e| matches!(e.status, OptStatus::Implemented)),
+            tally(|e| matches!(e.status, OptStatus::Partial)),
+            tally(|e| matches!(e.status, OptStatus::NotImplemented)),
+            tally(|e| matches!(e.status, OptStatus::Skipped(_))),
+        ),
+        (117, 53, 203, 180),
+        "the audit tally moved: (implemented, partial, missing, skipped). \
+         Update the module doc's table in the same commit."
+    );
+
+    // The two shapes the findings section calls out, pinned so they cannot
+    // regress silently: commands vimcode *recognises* while not implementing
+    // them, and commands reachable under only one of their two documented
+    // spellings.
+    assert_eq!(
+        (
+            tally(|e| matches!(e.status, OptStatus::NotImplemented)
+                && e.dispatch != ExDispatch::Neither),
+            tally(
+                |e| matches!(e.status, OptStatus::Skipped(_)) && e.dispatch != ExDispatch::Neither
+            ),
+            tally(|e| e.dispatch == ExDispatch::FullOnly),
+            tally(|e| e.dispatch == ExDispatch::AbbrevOnly),
+            tally(|e| e.dispatch == ExDispatch::Crashes),
+        ),
+        (6, 8, 43, 6, 2),
+        "the (recognised-but-❌, recognised-but-⏭️, full-name-only, \
+         abbreviation-only, crashing) shape moved"
+    );
+
+    assert!(
+        problems.is_empty(),
+        "\n\n== ex-command audit table is inconsistent (#1227) ==\n{}\n",
+        problems.join("\n")
+    );
+}
+
+/// `cases` is `(label, keys)` for the whole corpus — the same view
+/// [`classify_coverage`] takes.
+fn classify_ex_coverage(
+    audit: &'static [ExAudit],
+    exempt: &[&'static str],
+    cases: &[(&'static str, &'static str)],
+) -> OptionCoverage {
+    use std::collections::HashSet;
+    let exempt_set: HashSet<&str> = exempt.iter().copied().collect();
+    let mut v = OptionCoverage::default();
+    for e in audit {
+        let Some(probe) = e.probe else { continue };
+        v.in_scope += 1;
+        let covered = cases.iter().any(|(label, keys)| probe.matches(label, keys));
+        match (covered, exempt_set.contains(e.cmd)) {
+            (false, false) => v.uncovered.push(e.cmd),
+            (true, true) => v.newly_covered.push(e.cmd),
+            _ => {}
+        }
+    }
+    v.stale = exempt
+        .iter()
+        .copied()
+        .filter(|n| !audit.iter().any(|e| e.cmd == *n && e.probe.is_some()))
+        .collect();
+    v
+}
+
+/// Gate 2 (#1227) — #1007's ratchet, applied to the audited ex commands: an
+/// in-scope row whose probe matches nothing must be exempt, and an exempt row
+/// whose probe now matches must lose its entry. Pure.
+#[test]
+fn ex_audit_oracle_coverage_is_shrink_only() {
+    use std::collections::HashSet;
+    let corpus = all_corpus_cases();
+    let exempt: HashSet<&str> = EX_COVERAGE_EXEMPT.iter().copied().collect();
+    assert_eq!(
+        exempt.len(),
+        EX_COVERAGE_EXEMPT.len(),
+        "EX_COVERAGE_EXEMPT lists a command twice"
+    );
+
+    let v = classify_ex_coverage(EX_AUDIT, EX_COVERAGE_EXEMPT, &corpus);
+
+    if let Ok(path) = std::env::var("CONFORMANCE_DUMP_EX_COVERAGE") {
+        let mut s = String::new();
+        for n in &v.uncovered {
+            s.push_str(&format!("UNCOVERED\t{n}\n"));
+        }
+        for n in &v.newly_covered {
+            s.push_str(&format!("NEWLY_COVERED\t{n}\n"));
+        }
+        for n in &v.stale {
+            s.push_str(&format!("STALE\t{n}\n"));
+        }
+        // Every credited row plus the case that credits it — the
+        // over-crediting check #1007's "deliberately dumb probe" note demands
+        // a human be able to do in one grep.
+        for e in EX_AUDIT {
+            let Some(probe) = e.probe else { continue };
+            if let Some((label, _)) = corpus
+                .iter()
+                .find(|(label, keys)| probe.matches(label, keys))
+            {
+                s.push_str(&format!(
+                    "COVERED\t{}\t{:?}\t{}\n",
+                    e.cmd,
+                    probe.needle(),
+                    label
+                ));
+            }
+        }
+        std::fs::write(&path, s).unwrap_or_else(|e| panic!("dump to {path}: {e}"));
+        return;
+    }
+
+    let covered = v.in_scope - EX_COVERAGE_EXEMPT.len();
+    println!(
+        "\n== ex-command oracle coverage (#1227) ==\n\
+         {covered}/{} audited commands are pinned by an oracle case; {} exempt.\n",
+        v.in_scope,
+        EX_COVERAGE_EXEMPT.len()
+    );
+
+    assert!(
+        v.uncovered.is_empty() && v.newly_covered.is_empty() && v.stale.is_empty(),
+        "\n\n== ex-command oracle coverage moved (#1227) ==\n\
+         UNCOVERED (probe matches no case — add the case, or exempt it only when \
+         seeding a newly-tagged command):\n  {:?}\n\
+         NEWLY COVERED (a case now pins it — delete the EX_COVERAGE_EXEMPT \
+         entry; that is how the list shrinks):\n  {:?}\n\
+         STALE (exempt but not an in-scope audited command):\n  {:?}\n",
+        v.uncovered,
+        v.newly_covered,
+        v.stale
+    );
+}
+
+/// The finding behind [`ExDispatch::Crashes`], pinned precisely rather than
+/// left as a status letter: `:bdelete` on the **last** buffer panics.
+///
+/// Vim replaces it with an empty [No Name] buffer; vimcode unloads it and
+/// then dereferences the window's now-dangling `buffer_id` in
+/// `Engine::active_buffer_state`. Black-box — an ex line in, a crash out —
+/// and it is a live user path: a one-file session plus `:bd` takes the editor
+/// down. `:bwipeout` shares the code path and the crash.
+///
+/// `#[should_panic]`, not `#[ignore]`, so it is the *fix* that has to touch
+/// this test: whoever makes `:bd` fall back to an empty buffer will see this
+/// go red and rewrite it into the assertion the behaviour deserves.
+#[test]
+#[should_panic(expected = "called `Option::unwrap()` on a `None` value")]
+fn bdelete_on_the_last_buffer_panics_instead_of_refusing() {
+    let mut engine = engine_with("alpha\nbeta\n");
+    engine.history = Default::default();
+    engine.execute_command("bdelete");
+    // Unreachable today. When `:bd` learns Vim's fallback this line runs, the
+    // `should_panic` fails, and the row's `ExDispatch::Crashes` has to change.
+    let _ = engine.buffer().to_string();
+}
+
+/// Neither ex-audit gate is one nobody has seen fail. Drives all three RED on
+/// synthetic input and on the real table/corpus.
+#[test]
+fn ex_audit_gates_are_bidirectional() {
+    // ── gate 1: a perturbed dispatch is caught ──────────────────────────────
+    const FAKE: &[ExAudit] = &[
+        ex(
+            ":se[t]",
+            ":set",
+            OptStatus::Implemented,
+            // The lie: `:set` plainly dispatches.
+            ExDispatch::Neither,
+            "set",
+            "se",
+            Some(Keys(":set ")),
+            "perturbed on purpose",
+        ),
+        ex(
+            ":lcd",
+            ":lcd",
+            OptStatus::NotImplemented,
+            // The other lie: `:lcd` plainly does not.
+            ExDispatch::Both,
+            "lcd foo",
+            "lcd foo",
+            None,
+            "perturbed on purpose",
+        ),
+    ];
+    let drift = ex_dispatch_drift(FAKE);
+    assert_eq!(
+        drift.len(),
+        2,
+        "both perturbed rows must be reported, got:\n{}",
+        drift.join("\n")
+    );
+    assert!(drift[0].contains(":se[t]") && drift[0].contains("Both"));
+    assert!(drift[1].contains(":lcd") && drift[1].contains("Neither"));
+
+    // The real table must, of course, be clean.
+    assert!(
+        ex_dispatch_drift(EX_AUDIT).is_empty(),
+        "the real EX_AUDIT must match the live dispatcher"
+    );
+
+    // ── gate 2: both directions, against the real corpus ────────────────────
+    let corpus = all_corpus_cases();
+    let victim = ":ret[ab]";
+    assert!(
+        EX_AUDIT
+            .iter()
+            .any(|e| e.cmd == victim && e.probe.is_some()),
+        "fixture drifted — {victim} is no longer an in-scope audited command"
+    );
+    assert!(
+        !EX_COVERAGE_EXEMPT.contains(&victim),
+        "fixture drifted — {victim} is covered, so it must not be exempt"
+    );
+    let plus_exempt: Vec<&str> = EX_COVERAGE_EXEMPT
+        .iter()
+        .copied()
+        .chain(std::iter::once(victim))
+        .collect();
+    assert_eq!(
+        classify_ex_coverage(EX_AUDIT, &plus_exempt, &corpus).newly_covered,
+        vec![victim],
+        "exempting a covered command must fail the gate"
+    );
+
+    let exempt_victim = ":lgr[ep]";
+    assert!(
+        EX_COVERAGE_EXEMPT.contains(&exempt_victim),
+        "fixture drifted — {exempt_victim} is no longer exempt"
+    );
+    let without: Vec<&str> = EX_COVERAGE_EXEMPT
+        .iter()
+        .copied()
+        .filter(|n| *n != exempt_victim)
+        .collect();
+    assert_eq!(
+        classify_ex_coverage(EX_AUDIT, &without, &corpus).uncovered,
+        vec![exempt_victim],
+        "deleting {exempt_victim:?} from EX_COVERAGE_EXEMPT must fail the gate"
+    );
+    let mut plus_case = corpus.clone();
+    plus_case.push(("ex:lgrep fills the location list", ":lgrep foo<CR>"));
+    assert_eq!(
+        classify_ex_coverage(EX_AUDIT, EX_COVERAGE_EXEMPT, &plus_case).newly_covered,
+        vec![exempt_victim],
+        "a case pinning {exempt_victim:?} must force its exemption to be deleted"
+    );
+
+    // A stale exemption — one naming no in-scope row — is reported too.
+    let stale: Vec<&str> = EX_COVERAGE_EXEMPT
+        .iter()
+        .copied()
+        .chain(std::iter::once(":let"))
+        .collect();
+    assert_eq!(
+        classify_ex_coverage(EX_AUDIT, &stale, &corpus).stale,
+        vec![":let"],
+        "an exemption naming a ⏭️ row must be reported as stale"
     );
 }
