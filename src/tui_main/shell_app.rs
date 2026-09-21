@@ -11521,6 +11521,153 @@ mod tests {
         );
     }
 
+    /// #1237 review: the completion test above only covers the popup TUI
+    /// already anchored correctly pre-fix; this covers the LSP hover
+    /// popup (`ScreenLayout::hover`), which — like GTK's completion popup
+    /// — used the raw char column with **no** `char_col_to_visual` call at
+    /// all before #1237 (see `render::editor_popup_anchors`'s doc). Same
+    /// `"\t\tZZQ\n"` / char-col-5 fixture as the completion test (tabstop
+    /// defaults to 4, so display column 11).
+    ///
+    /// Ground truth is the buffer's own rendered `"ZZQ"` text, found via
+    /// `find_bounds` rather than `terminal_cursor_position` (normal mode's
+    /// Block cursor doesn't report a terminal cursor position the way
+    /// Insert mode's Bar cursor does — see `TuiDriver::terminal_cursor_
+    /// position`'s doc — and hover doesn't require Insert mode). The
+    /// popup's own left border sits exactly at `"ZZQ"`'s end (display col
+    /// 11), and `quadraui::tui::tooltip::draw_tooltip`'s `Sides` chrome
+    /// puts one border + one pad column before content, so the hover
+    /// text itself starts 2 cells past that.
+    ///
+    /// **Verified RED against unfixed `develop`:** reverting
+    /// `render::editor_popup_anchors`'s `anchor_xy` closure to
+    /// `char_col.saturating_sub(scroll_left)` (dropping the
+    /// `char_col_to_visual` call) fails this assertion — the popup lands 6
+    /// columns left of `"ZZQ"` instead.
+    #[test]
+    fn hover_popup_anchors_at_the_visual_column_on_tab_indented_line_via_shell_app() {
+        let mut app = TuiShellApp::new_for_test();
+        app.engine.settings.expand_tab = false;
+        app.engine.buffer_mut().insert(0, "\t\tZZQ\n");
+        app.engine.view_mut().cursor.col = 5;
+        app.engine.lsp_hover_text = Some("QXZZYHVR".to_string());
+
+        let mut driver = driver_with_shell(app, config(), 80, 24);
+        driver.render();
+        let screen = driver.screen();
+
+        let zzq_bounds = driver
+            .find_bounds("ZZQ")
+            .expect("the tab-indented buffer line must be visible");
+        let hover_bounds = driver
+            .find_bounds("QXZZYHVR")
+            .expect("hover popup must be visible on screen");
+
+        // display col 11 (right after "ZZQ") + 2 cells (border + pad) that
+        // `draw_tooltip`'s `Sides` chrome always puts before content.
+        let expected_x = zzq_bounds.x + zzq_bounds.width + 2.0;
+        let buggy_x = expected_x - 6.0; // raw char col 5, 6 cols left for two tabstop-4 tabs
+        assert!(
+            (hover_bounds.x - expected_x).abs() <= 1.0,
+            "hover popup (x={}) must anchor at the tab-expanded display \
+             column (x≈{expected_x}, right after \"ZZQ\"), not the raw \
+             character column (x≈{buggy_x}); screen:\n{screen}",
+            hover_bounds.x,
+        );
+    }
+
+    /// #1237 review: same bug, the signature-help popup
+    /// (`ScreenLayout::signature_help`). See the hover test above for the
+    /// fixture and RED-verification method — identical here, just a
+    /// different popup sharing the same `anchor_xy` closure in
+    /// `render::editor_popup_anchors`. `signature_help_to_quadraui_
+    /// tooltip` puts one extra leading space inside the border (see its
+    /// "Leading space inside the border" comment) versus hover's plain
+    /// text, so the label text itself starts 3 cells past the border
+    /// (border + pad + leading space) — one further right than hover's 2.
+    #[test]
+    fn signature_help_popup_anchors_at_the_visual_column_on_tab_indented_line_via_shell_app() {
+        let mut app = TuiShellApp::new_for_test();
+        app.engine.settings.expand_tab = false;
+        app.engine.buffer_mut().insert(0, "\t\tZZQ\n");
+        app.engine.view_mut().cursor.col = 5;
+        app.engine.lsp_signature_help = Some(crate::core::lsp::SignatureHelpData {
+            label: "fn bar(x: i32)".to_string(),
+            params: vec![(7, 13)],
+            active_param: Some(0),
+        });
+
+        let mut driver = driver_with_shell(app, config(), 80, 24);
+        driver.render();
+        let screen = driver.screen();
+
+        let zzq_bounds = driver
+            .find_bounds("ZZQ")
+            .expect("the tab-indented buffer line must be visible");
+        let sig_bounds = driver
+            .find_bounds("fn bar(x: i32)")
+            .expect("signature-help popup must be visible on screen");
+
+        // border + pad (as hover's +2) + the label's own leading-space span.
+        let expected_x = zzq_bounds.x + zzq_bounds.width + 3.0;
+        let buggy_x = expected_x - 6.0; // raw char col 5, 6 cols left for two tabstop-4 tabs
+        assert!(
+            (sig_bounds.x - expected_x).abs() <= 1.0,
+            "signature-help popup (x={}) must anchor at the tab-expanded \
+             display column (x≈{expected_x}), not the raw character column \
+             (x≈{buggy_x}); screen:\n{screen}",
+            sig_bounds.x,
+        );
+    }
+
+    /// #1237 review: same bug, the rich-markdown editor-hover popup
+    /// (`ScreenLayout::editor_hover`, `gh`/dwell-triggered). Its own
+    /// content box (a different rasteriser than the plain-text tooltip
+    /// hover/signature-help share) puts content directly one cell past
+    /// its left border, no extra pad column.
+    #[test]
+    fn editor_hover_popup_anchors_at_the_visual_column_on_tab_indented_line_via_shell_app() {
+        let mut app = TuiShellApp::new_for_test();
+        app.engine.settings.expand_tab = false;
+        app.engine.buffer_mut().insert(0, "\t\tZZQ\n");
+        app.engine.editor_hover = Some(crate::core::engine::EditorHoverPopup {
+            markdown: "helloworld".to_string(),
+            line_text: vec!["helloworld".to_string()],
+            code_highlights: vec![vec![]],
+            links: vec![],
+            anchor_line: 0,
+            anchor_col: 5,
+            source: crate::core::engine::EditorHoverSource::Lsp,
+            scroll_top: 0,
+            focused_link: None,
+            popup_width: 10,
+            frozen_scroll_top: 0,
+            frozen_scroll_left: 0,
+            selection: None,
+        });
+
+        let mut driver = driver_with_shell(app, config(), 80, 24);
+        driver.render();
+        let screen = driver.screen();
+
+        let zzq_bounds = driver
+            .find_bounds("ZZQ")
+            .expect("the tab-indented buffer line must be visible");
+        let eh_bounds = driver
+            .find_bounds("helloworld")
+            .expect("editor-hover popup must be visible on screen");
+
+        let expected_x = zzq_bounds.x + zzq_bounds.width + 1.0; // "ZZQ" end + 1-cell border, no pad
+        let buggy_x = expected_x - 6.0; // raw char col 5, 6 cols left for two tabstop-4 tabs
+        assert!(
+            (eh_bounds.x - expected_x).abs() <= 1.0,
+            "editor-hover popup (x={}) must anchor at the tab-expanded \
+             display column (x≈{expected_x}), not the raw character column \
+             (x≈{buggy_x}); screen:\n{screen}",
+            eh_bounds.x,
+        );
+    }
+
     /// #420: the completion popup, anchored in the right-hand split of a
     /// `:vnew`, must never render past that split's own left edge — not
     /// even after the "shift left to avoid right-edge overflow" placement

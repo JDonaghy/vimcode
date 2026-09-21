@@ -4920,6 +4920,193 @@ mod editor_popups {
         );
     }
 
+    /// Renders the `"\t\tfoo\n"` / cursor-col-5 fixture twice — once with
+    /// `configure` applied (opening a popup), once without — and returns
+    /// the leftmost on-screen x where a pixel differs, scanning a band of
+    /// rows around the active window's top edge wide enough to catch
+    /// either the `Top` or the `Bottom` placement fallback
+    /// (`quadraui::Tooltip::layout`'s own choice, not this test's).
+    ///
+    /// Reads *painted pixels*, not cached layout state — hover and
+    /// signature-help have no `App`-side rect cache (unlike
+    /// `completion_layout` / `editor_hover_popup_rect`), so pixel-diffing
+    /// is the only route to their real on-screen position (#1237 review).
+    /// Diffing against an otherwise-identical "closed" render (rather than
+    /// matching a hardcoded theme colour) isolates exactly the popup's own
+    /// paint, the same technique `popup_region_pixels` above uses to prove
+    /// *that* something painted; this walks it far enough to prove *where*.
+    fn popup_left_edge_x(configure: impl FnOnce(&mut Engine)) -> (f64, f64, usize, f64) {
+        let base = || {
+            let mut engine = Engine::new();
+            engine.buffer_mut().insert(0, "\t\tfoo\n");
+            engine.view_mut().cursor.col = 5;
+            engine
+        };
+        let mut with_engine = base();
+        configure(&mut with_engine);
+        let mut h_with = harness(with_engine, 1400, 900);
+        let mut h_without = harness(base(), 1400, 900);
+        h_with.driver.render();
+        h_without.driver.render();
+
+        let win_id = h_with.engine.borrow().active_window_id();
+        let (win_x, win_y, gutter_w) = {
+            let sl = h_with.screen_layout.borrow();
+            let rw = sl
+                .as_ref()
+                .expect("render_content must have painted a ScreenLayout")
+                .windows
+                .iter()
+                .find(|w| w.window_id == win_id)
+                .expect("the active window must have painted");
+            (rw.rect.x, rw.rect.y, rw.gutter_char_width)
+        };
+        let cw = h_with
+            .painted_char_width
+            .get()
+            .expect("must have painted with a char width");
+        let lh = h_with
+            .painted_line_height
+            .get()
+            .expect("must have painted with a line height");
+
+        let mut left_edge = None;
+        for row in -3..6 {
+            let y = (win_y + (row as f64) * lh + lh / 2.0) as i32;
+            for x in (win_x as i32)..(win_x as i32 + 400) {
+                if h_with.driver.pixel(x, y) != h_without.driver.pixel(x, y) {
+                    left_edge = Some(left_edge.map_or(x, |m: i32| m.min(x)));
+                    break;
+                }
+            }
+        }
+        let left_edge = left_edge.expect(
+            "the popup must paint at least one pixel differently from the \
+             closed-popup render somewhere in the scanned band",
+        );
+        (win_x, cw, gutter_w, left_edge as f64)
+    }
+
+    /// #1237: the LSP hover popup (`ScreenLayout::hover`, plain-text
+    /// tooltip) anchored `App::paint_editor_popups_rung`'s cursor column
+    /// as a raw char index, not a tab-expanded display column — same root
+    /// cause as the completion popup above, but never covered by a test
+    /// (review finding on #1237's first fix). With `"\t\tfoo\n"`
+    /// (`tabstop` defaults to 4) and the cursor at char column 5 (display
+    /// column 11), the popup must land 6 cells right of where the raw
+    /// char column would put it.
+    ///
+    /// **Verified RED against unfixed `develop`:** reverting
+    /// `render::editor_popup_anchors`'s `anchor_xy` closure to
+    /// `char_col.saturating_sub(scroll_left)` (dropping the
+    /// `char_col_to_visual` call) reproduces the pre-#1237 formula and
+    /// fails this assertion — the painted left edge lands at the raw-
+    /// column x instead.
+    #[test]
+    fn hover_popup_anchors_at_visual_column_on_tab_indented_line() {
+        let (win_x, cw, gutter_w, left_edge) = popup_left_edge_x(|e| {
+            e.lsp_hover_text = Some("QXZZYHVR".to_string());
+        });
+
+        let expected_x = win_x + gutter_w as f64 * cw + 11.0 * cw; // display col 11
+        let buggy_x = win_x + gutter_w as f64 * cw + 5.0 * cw; // raw char col 5
+        assert!(
+            (left_edge - expected_x).abs() < cw,
+            "hover popup's painted left edge (x={left_edge}) must land at the \
+             tab-expanded display column (x≈{expected_x}), not the raw char \
+             column (x≈{buggy_x})"
+        );
+    }
+
+    /// #1237: same bug, the signature-help popup
+    /// (`ScreenLayout::signature_help`). See
+    /// `hover_popup_anchors_at_visual_column_on_tab_indented_line`'s doc for
+    /// the fixture and RED-verification method — identical here, just a
+    /// different popup sharing the same `anchor_xy` closure in
+    /// `render::editor_popup_anchors`.
+    #[test]
+    fn signature_help_popup_anchors_at_visual_column_on_tab_indented_line() {
+        let (win_x, cw, gutter_w, left_edge) = popup_left_edge_x(|e| {
+            e.lsp_signature_help = Some(crate::core::lsp::SignatureHelpData {
+                label: "fn foo(x: i32)".to_string(),
+                params: vec![(7, 13)],
+                active_param: Some(0),
+            });
+        });
+
+        let expected_x = win_x + gutter_w as f64 * cw + 11.0 * cw; // display col 11
+        let buggy_x = win_x + gutter_w as f64 * cw + 5.0 * cw; // raw char col 5
+        assert!(
+            (left_edge - expected_x).abs() < cw,
+            "signature-help popup's painted left edge (x={left_edge}) must land \
+             at the tab-expanded display column (x≈{expected_x}), not the raw \
+             char column (x≈{buggy_x})"
+        );
+    }
+
+    /// #1237: same bug, the rich-markdown editor-hover popup
+    /// (`ScreenLayout::editor_hover`, `gh`/dwell-triggered). Unlike hover
+    /// and signature-help, `App::editor_hover_popup_rect` caches the
+    /// resolved rect that directly drives its own paint call (same
+    /// precedent as `completion_layout` above), so this reads that cache
+    /// rather than pixel-diffing.
+    ///
+    /// **Verified RED against unfixed `develop`:** same revert as the
+    /// hover test's doc comment reproduces the pre-#1237 formula and fails
+    /// this assertion.
+    #[test]
+    fn editor_hover_popup_anchors_at_visual_column_on_tab_indented_line() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "\t\tfoo\n");
+        engine.editor_hover = Some(crate::core::engine::EditorHoverPopup {
+            markdown: "hello".to_string(),
+            line_text: vec!["hello".to_string()],
+            code_highlights: vec![vec![]],
+            links: vec![],
+            anchor_line: 0,
+            anchor_col: 5,
+            source: crate::core::engine::EditorHoverSource::Lsp,
+            scroll_top: 0,
+            focused_link: None,
+            popup_width: 10,
+            frozen_scroll_top: 0,
+            frozen_scroll_left: 0,
+            selection: None,
+        });
+
+        let h = harness(engine, 1400, 900);
+        let win_id = h.engine.borrow().active_window_id();
+        let (win_x, gutter_w) = {
+            let sl = h.screen_layout.borrow();
+            let rw = sl
+                .as_ref()
+                .expect("render_content must have painted a ScreenLayout")
+                .windows
+                .iter()
+                .find(|w| w.window_id == win_id)
+                .expect("the active window must have painted");
+            (rw.rect.x, rw.gutter_char_width)
+        };
+        let cw = h
+            .painted_char_width
+            .get()
+            .expect("must have painted with a char width");
+        let rect = h
+            .editor_hover_popup_rect
+            .get()
+            .expect("editor hover popup must have painted a cached rect");
+
+        let expected_x = win_x + gutter_w as f64 * cw + 11.0 * cw; // display col 11
+        let buggy_x = win_x + gutter_w as f64 * cw + 5.0 * cw; // raw char col 5
+        assert!(
+            (rect.x as f64 - expected_x).abs() < 0.5,
+            "editor-hover popup must anchor at the tab-expanded display \
+             column (x≈{expected_x}), not the raw char column (x≈{buggy_x}); \
+             got x={}",
+            rect.x
+        );
+    }
+
     // #420 note: an earlier version of this fix capped `popup_w` in
     // `app.rs` to the active window's own viewport width, with a
     // corresponding `completion_popup_bounds_stay_within_its_own_split`
