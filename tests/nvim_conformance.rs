@@ -3861,10 +3861,23 @@ const CASES_EX: &[Case] = &[
         1,
         ":s/,/\\r/g<CR>",
     ),
+    // `:noh[lsearch]` clears the `'hlsearch'` highlight, which this harness
+    // cannot observe at all — it only ever diffs buffer text and cursor
+    // position, never highlight state. So, like `ex:cc on empty quickfix
+    // list` (#1154) and its own doc comment above, this is a no-op case: it
+    // guards nothing on its own (a build where `:noh` silently did nothing,
+    // or wasn't recognised at all and fell through to the unknown-ex-command
+    // fallback, would pass this case too) but is still what retires the id
+    // from `COVERAGE_EXEMPT` per this repo's "one real passing case" bar.
     c("ex:noh no effect", &["a"], 1, 1, "/a<CR>:noh<CR>"),
     // #1280: full-word spellings, same reasoning as the `:delete`/`:move`/
     // `:copy`/`:join`/`:yank` block above.
     c("ex:norm Ax", &["a", "b"], 1, 1, ":norm Ax<CR>"),
+    // Same no-op reasoning as `ex:noh no effect` just above — `:nohlsearch`
+    // is the long spelling of the same command and needs its own case as a
+    // distinct doc id (see the `:delete`/etc. block's comment), but it is
+    // exactly as unobservable to this harness and just as much a no-op
+    // guarding nothing on its own.
     c(
         "ex:nohlsearch no effect",
         &["a"],
@@ -7500,9 +7513,11 @@ const KNOWN_DEVIATIONS: &[&str] = &[
     // it means porting `scrolloff` into the wrap path's visual-row-counting
     // loop, which is a real feature addition (scrolloff needs to be
     // expressed in *visual* rows there, not buffer lines) rather than a
-    // small in-scope fix — left here rather than attempted blind. Needs a
-    // filed follow-up issue (number TBD — flagged to the coordinator in this
-    // PR rather than filed directly, since this session cannot run `gh`).
+    // small in-scope fix — left here rather than attempted blind. Full
+    // issue text is drafted verbatim in
+    // `docs/PENDING_VIMCODE_ISSUES.md` (this worker session cannot run
+    // `gh`); coordinator/human action is to file it on `JDonaghy/vimcode`
+    // and replace this comment with the resulting issue number.
     "scroll:so=5 30G H",
     "scroll:so=5 30G L",
 ];

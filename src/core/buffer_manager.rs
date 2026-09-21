@@ -327,6 +327,13 @@ impl UndoTree {
     /// Move to the live node with the largest `seq` whose `timestamp <=
     /// cutoff` (`:earlier {N}[smhd]`). Falls back to the oldest live node if
     /// every one postdates `cutoff`.
+    ///
+    /// #1280 follow-up (not yet fixed here — see `docs/
+    /// PENDING_VIMCODE_ISSUES.md`): this reads `cursor_after`, the same
+    /// bug `older`/`newer` had before #1280 fixed them to read
+    /// `cursor_before`. No corpus case exercises the time-spec form of
+    /// `:earlier`/`:later` landing on a non-root node yet, so nothing
+    /// regresses today, but this is likely wrong for the same reason.
     pub fn at_or_before(&mut self, cutoff: SystemTime) -> Option<(String, Cursor)> {
         let live = self.live_indices_sorted();
         let idx = live
@@ -1026,7 +1033,9 @@ impl BufferState {
     /// if it actually changed anything. Call this after a Normal mode
     /// command completes, or when leaving Insert mode. `cursor_after` is the
     /// cursor position once the group's edits are done — restored by a later
-    /// `<C-r>`/`g+`/`:later` landing on this node.
+    /// `<C-r>` (redo) or a time-spec `:later {N}[smhd]` landing on this node.
+    /// (#1280: `g+`/count-based `:later N` land on `cursor_before` instead —
+    /// see `newer`'s doc comment, just below `older`'s, for why.)
     ///
     /// Returns `true` if a node was actually committed — callers use this to
     /// skip work that's only meaningful when something actually changed
