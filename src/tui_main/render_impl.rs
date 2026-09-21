@@ -427,23 +427,25 @@ pub(super) fn paint_editor_popups(
         .windows
         .iter()
         .find(|w| w.window_id == screen.active_window_id);
+    // #1237: the char→display column arithmetic (tab expansion, scroll
+    // offset) for every one of the five anchors below now lives once in
+    // `render::editor_popup_anchors`, shared with GTK's
+    // `App::paint_editor_popups_rung`. Per D6/#669 TUI's unit scale is
+    // 1.0/1.0 (already cell-native). `win_origin` snaps to the same
+    // whole-cell grid `tui_window_paint_rect` gives the completion
+    // viewport below (#1040) — TUI's five anchors have always been
+    // computed from truncated `u16` window coordinates, not the raw
+    // (possibly fractional) `RenderedWindow::rect`.
+    let win_origin = active_win.map(|w| {
+        let r = render::tui_window_paint_rect(&w.rect);
+        (r.x as f32, r.y as f32)
+    });
+    let anchor_points = render::editor_popup_anchors(screen, win_origin, 1.0, 1.0);
 
     // ── Completion popup anchor ─────────────────────────────────────────────
     let completion = active_win.and_then(|active_win| {
         let menu = screen.completion.as_ref()?;
-        let (cursor_pos, _) = active_win.cursor.as_ref()?;
-        let gutter_w = active_win.gutter_char_width as u16;
-        let win_x = active_win.rect.x as u16;
-        let win_y = active_win.rect.y as u16;
-        let raw = active_win
-            .lines
-            .get(cursor_pos.view_line)
-            .map(|l| l.raw_text.as_str())
-            .unwrap_or("");
-        let vis_col = char_col_to_visual(raw, cursor_pos.col, active_win.tabstop)
-            .saturating_sub(active_win.scroll_left) as u16;
-        let popup_x = win_x + gutter_w + vis_col;
-        let popup_y = win_y + cursor_pos.view_line as u16;
+        let (popup_x, popup_y) = anchor_points.completion?;
         // #420: clamp the popup into the *active window's own* rect, not
         // the shared `viewport` above (which spans every split in the
         // editor band, plus the gap the sidebar already leaves for the
@@ -482,8 +484,8 @@ pub(super) fn paint_editor_popups(
         let max_popup_height = 10.0;
         Some((
             render::PopupAnchor {
-                x: popup_x as f32,
-                y: popup_y as f32,
+                x: popup_x,
+                y: popup_y,
                 viewport: win_viewport,
             },
             popup_width,
@@ -492,67 +494,29 @@ pub(super) fn paint_editor_popups(
     });
 
     // ── Hover popup anchor ───────────────────────────────────────────────────
-    let hover = active_win.and_then(|active_win| {
-        let hover = screen.hover.as_ref()?;
-        let gutter_w = active_win.gutter_char_width as u16;
-        let win_x = active_win.rect.x as u16;
-        let win_y = active_win.rect.y as u16;
-        let anchor_view = hover.anchor_line.saturating_sub(active_win.scroll_top) as u16;
-        let vis_col = hover.anchor_col.saturating_sub(active_win.scroll_left) as u16;
-        Some(render::PopupAnchor {
-            x: (win_x + gutter_w + vis_col) as f32,
-            y: (win_y + anchor_view) as f32,
-            viewport,
-        })
-    });
+    let hover = anchor_points
+        .hover
+        .map(|(x, y)| render::PopupAnchor { x, y, viewport });
 
     // ── Editor hover popup anchor (rich markdown, gh key or mouse dwell) ────
-    // Frozen scroll offsets so the popup stays fixed on screen.
-    let editor_hover = active_win.and_then(|active_win| {
-        let eh = screen.editor_hover.as_ref()?;
-        let gutter_w = active_win.gutter_char_width as u16;
-        let win_x = active_win.rect.x as u16;
-        let win_y = active_win.rect.y as u16;
-        let anchor_view = eh.anchor_line.saturating_sub(eh.frozen_scroll_top) as u16;
-        let vis_col = eh.anchor_col.saturating_sub(eh.frozen_scroll_left) as u16;
-        Some(render::PopupAnchor {
-            x: (win_x + gutter_w + vis_col) as f32,
-            y: (win_y + anchor_view) as f32,
-            viewport,
-        })
-    });
+    // Frozen scroll offsets (baked in by `editor_popup_anchors`) so the
+    // popup stays fixed on screen.
+    let editor_hover = anchor_points
+        .editor_hover
+        .map(|(x, y)| render::PopupAnchor { x, y, viewport });
 
     // ── Diff peek popup anchor (inline git hunk preview) ────────────────────
-    let diff_peek = active_win.and_then(|active_win| {
-        let peek = screen.diff_peek.as_ref()?;
-        let gutter_w = active_win.gutter_char_width as u16;
-        let win_x = active_win.rect.x as u16;
-        let win_y = active_win.rect.y as u16;
-        let anchor_view = peek.anchor_line.saturating_sub(active_win.scroll_top) as u16;
-        // Anchor at the cursor's own row, left edge (no column offset);
-        // placement=Bottom (with primitive fallback to Top) puts the
-        // popup just below it.
-        Some(render::PopupAnchor {
-            x: (win_x + gutter_w) as f32,
-            y: (win_y + anchor_view) as f32,
-            viewport,
-        })
-    });
+    // Anchors at the cursor's own row, left edge (no column offset);
+    // placement=Bottom (with primitive fallback to Top) puts the popup
+    // just below it.
+    let diff_peek = anchor_points
+        .diff_peek
+        .map(|(x, y)| render::PopupAnchor { x, y, viewport });
 
     // ── Signature-help popup anchor (insert mode, cursor inside a call) ─────
-    let signature_help = active_win.and_then(|active_win| {
-        let sig = screen.signature_help.as_ref()?;
-        let gutter_w = active_win.gutter_char_width as u16;
-        let win_x = active_win.rect.x as u16;
-        let win_y = active_win.rect.y as u16;
-        let anchor_view = sig.anchor_line.saturating_sub(active_win.scroll_top) as u16;
-        let vis_col = sig.anchor_col.saturating_sub(active_win.scroll_left) as u16;
-        Some(render::PopupAnchor {
-            x: (win_x + gutter_w + vis_col) as f32,
-            y: (win_y + anchor_view) as f32,
-            viewport,
-        })
-    });
+    let signature_help = anchor_points
+        .signature_help
+        .map(|(x, y)| render::PopupAnchor { x, y, viewport });
 
     // The deleted per-popup `render_editor_hover_popup` wrapper used to
     // re-sync the theme right before painting the rich-markdown editor-hover
@@ -1011,29 +975,6 @@ pub(super) fn render_window_status_line(
     let q_rect = quadraui::Rect::new(x as f32, y as f32, width as f32, 1.0);
     backend.set_theme(super::quadraui_tui::q_theme(theme));
     let _ = backend.draw_status_bar(q_rect, &bar, None, None);
-}
-
-/// Convert a character-index column to a visual column, expanding tabs.
-/// Used by mouse hit-tests outside the editor paint path; the
-/// in-rasteriser callers were lifted to `quadraui::tui::editor` in
-/// Stage 1C of #276.
-pub(super) fn char_col_to_visual(raw_text: &str, char_col: usize, tabstop: usize) -> usize {
-    let tabstop = tabstop.max(1);
-    let mut vis = 0usize;
-    for (i, ch) in raw_text.chars().enumerate() {
-        if ch == '\n' || ch == '\r' {
-            break;
-        }
-        if i >= char_col {
-            break;
-        }
-        if ch == '\t' {
-            vis = ((vis / tabstop) + 1) * tabstop;
-        } else {
-            vis += 1;
-        }
-    }
-    vis
 }
 
 /// True when `w`'s own `Backend::draw_editor` scrollbar occupies its last

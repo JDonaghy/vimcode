@@ -11445,6 +11445,82 @@ mod tests {
         );
     }
 
+    /// #1237: the completion popup must anchor at the cursor's real
+    /// *display* column, not its raw character column — on a
+    /// tab-indented line the two disagree, and GTK's own anchor used to
+    /// compute the latter directly (`cursor_pos.col as f64 * cw`, see
+    /// `render::editor_popup_anchors`'s doc). TUI already got this right
+    /// pre-#1237, via its own (now-shared) `char_col_to_visual`; this
+    /// locks that in as a shared-function regression guard, and is the
+    /// TUI half of the both-backends pair #1237 asks for — GTK's half is
+    /// `gtk::testing::editor_popups::
+    /// completion_popup_anchors_at_visual_column_on_tab_indented_line`,
+    /// RED-verified there against the raw-char-column formula.
+    ///
+    /// Ground truth is the real terminal cursor position quadraui's own
+    /// `tui::editor::draw_editor` reports via `Frame::set_cursor_position`
+    /// (`TuiDriver::terminal_cursor_position`) — computed by quadraui's
+    /// *own* `char_col_to_visual` from the identical `(gutter_w, vis_col,
+    /// scroll_left)` inputs, entirely independent of the popup-anchor code
+    /// under test. Two tabs (tabstop defaults to 4) then `"ZQXWFOO"` put
+    /// the cursor at char column 9 but display column 15 — anchoring the
+    /// popup on the raw char column would land it 6 columns left of the
+    /// caret; `expand_tab = false` keeps the typed `<Tab>`s literal so the
+    /// line actually has tabs to expand.
+    #[test]
+    fn completion_popup_anchors_at_the_real_cursor_column_on_tab_indented_line_via_shell_app() {
+        let mut app = TuiShellApp::new_for_test();
+        app.engine.settings.expand_tab = false;
+        app.engine.buffer_mut().insert(0, "ZQXWFOOBAR\n");
+
+        let mut driver = driver_with_shell(app, config(), 80, 24);
+        driver.render();
+        // Go to the last line, open a new line below, indent it with two
+        // literal tabs, then type a prefix that matches the dictionary
+        // word above — triggers the real word-completion auto-popup (not
+        // hand-set engine state).
+        driver.type_char('G');
+        driver.type_char('o');
+        driver.type_char('\t');
+        driver.type_char('\t');
+        for c in "ZQXWFOO".chars() {
+            driver.type_char(c);
+        }
+        driver.render();
+
+        let screen = driver.screen();
+        assert_eq!(
+            screen.matches("ZQXWFOOBAR").count(),
+            2,
+            "precondition: the popup must be showing the \"ZQXWFOOBAR\" \
+             candidate (once in the dictionary line, once in the popup); \
+             screen:\n{screen}"
+        );
+
+        let (cursor_x, _) = driver
+            .terminal_cursor_position()
+            .expect("insert-mode cursor must be visible after typing");
+        let popup_bounds = driver
+            // The candidate text also appears verbatim as plain buffer
+            // content (the dictionary line above), and this fixture's own
+            // window chrome puts a `│` at column 0 of *every* row (so a
+            // leading-border-only prefix isn't unique either) — bracketing
+            // with *both* the popup's own left and right borders (see
+            // quadraui's `tui::completions::draw_completions`, which pads
+            // the label with exactly one leading space before the closing
+            // border) picks out the popup's rendering specifically.
+            .find_bounds("│ ZQXWFOOBAR │")
+            .expect("completion popup must be visible on screen");
+
+        assert!(
+            (popup_bounds.x - cursor_x as f32).abs() <= 1.0,
+            "completion popup (x={}) must anchor at the real cursor's \
+             display column (x={cursor_x}), not the raw character column \
+             (6 columns left of it, for two tabstop-4 tabs); screen:\n{screen}",
+            popup_bounds.x,
+        );
+    }
+
     /// #420: the completion popup, anchored in the right-hand split of a
     /// `:vnew`, must never render past that split's own left edge — not
     /// even after the "shift left to avoid right-edge overflow" placement

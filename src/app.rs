@@ -3662,11 +3662,14 @@ impl App {
     /// #1167: the build-adapter → `.layout()` → `backend.draw_*` → cache-
     /// output part (identical to TUI's `render_impl::paint_editor_popups`,
     /// modulo coordinate units) now lives once in `render::paint_editor_popups`.
-    /// This method's own job shrank to exactly what stays genuinely
-    /// per-backend: finding the active window and resolving each popup's
-    /// on-screen anchor point from it (gutter width, scroll offsets) in GTK's
-    /// native pixel units (`lh`/`cw`) — cell math instead in TUI's
-    /// `render_impl.rs`.
+    /// #1237 folded the anchor-point arithmetic itself into
+    /// `render::editor_popup_anchors` too (see its doc — GTK's completion
+    /// anchor, and all four non-completion anchors on *both* backends, used
+    /// the raw character column as a tab-expanded display column, drifting
+    /// left of the cursor on tab-indented lines). This method's own job
+    /// shrank to exactly what stays genuinely per-backend: finding the
+    /// active window, scaling into GTK's native pixel units (`lh`/`cw`),
+    /// and picking each popup's clip viewport.
     ///
     /// `main` is `AppShellLayout::main_content_bounds` — the clip viewport
     /// every popup but the completion menu and editor-hover popup is placed
@@ -3695,18 +3698,20 @@ impl App {
             )
         });
 
+        // #1237: the char→display column arithmetic (tab expansion, scroll
+        // offset) for every one of the five anchors below now lives once in
+        // `render::editor_popup_anchors`, shared with TUI's
+        // `render_impl::paint_editor_popups`. GTK uses its raw sub-pixel
+        // float window origin as-is (no whole-cell snapping — that's a
+        // TUI-only concern).
+        let win_origin = active_win.map(|w| (w.rect.x as f32, w.rect.y as f32));
+        let anchor_points = render::editor_popup_anchors(screen, win_origin, cw as f32, lh as f32);
+
         // Completion popup anchor — cache the layout so the click handler
         // (B.5b Stage 5) can hit-test items and register the popup on the
         // modal stack.
-        let completion = active_win.and_then(|active_win| {
-            let menu = screen.completion.as_ref()?;
-            let (cursor_pos, _) = active_win.cursor.as_ref()?;
-            let gutter_w = active_win.gutter_char_width as f64 * cw;
-            let h_scroll = active_win.scroll_left as f64 * cw;
-            let win_x = active_win.rect.x;
-            let win_y = active_win.rect.y;
-            let cursor_x = win_x + gutter_w + cursor_pos.col as f64 * cw - h_scroll;
-            let cursor_y = win_y + cursor_pos.view_line as f64 * lh;
+        let completion = screen.completion.as_ref().and_then(|menu| {
+            let (cursor_x, cursor_y) = anchor_points.completion?;
             // Longest candidate + 2 cells of padding/border, floored at
             // 100px.
             //
@@ -3725,8 +3730,8 @@ impl App {
             let max_popup_h = 10.0 * lh;
             Some((
                 render::PopupAnchor {
-                    x: cursor_x as f32,
-                    y: cursor_y as f32,
+                    x: cursor_x,
+                    y: cursor_y,
                     viewport: win_viewport?,
                 },
                 popup_w as f32,
@@ -3735,71 +3740,36 @@ impl App {
         });
 
         // Simple LSP hover popup anchor (plain text, non-interactive).
-        let hover = active_win.and_then(|active_win| {
-            let hover = screen.hover.as_ref()?;
-            let gutter_w = active_win.gutter_char_width as f64 * cw;
-            let h_scroll = active_win.scroll_left as f64 * cw;
-            let win_x = active_win.rect.x;
-            let win_y = active_win.rect.y;
-            let anchor_view = hover.anchor_line.saturating_sub(active_win.scroll_top) as f64;
-            let anchor_x = win_x + gutter_w + hover.anchor_col as f64 * cw - h_scroll;
-            let anchor_y = win_y + anchor_view * lh;
-            Some(render::PopupAnchor {
-                x: anchor_x as f32,
-                y: anchor_y as f32,
-                viewport: main,
-            })
+        let hover = anchor_points.hover.map(|(x, y)| render::PopupAnchor {
+            x,
+            y,
+            viewport: main,
         });
 
         // Signature-help popup anchor (insert mode, cursor inside a call).
-        let signature_help = active_win.and_then(|active_win| {
-            let sig = screen.signature_help.as_ref()?;
-            let gutter_w = active_win.gutter_char_width as f64 * cw;
-            let h_scroll = active_win.scroll_left as f64 * cw;
-            let win_x = active_win.rect.x;
-            let win_y = active_win.rect.y;
-            let anchor_view = sig.anchor_line.saturating_sub(active_win.scroll_top) as f64;
-            let anchor_x = win_x + gutter_w + sig.anchor_col as f64 * cw - h_scroll;
-            let anchor_y = win_y + anchor_view * lh;
-            Some(render::PopupAnchor {
-                x: anchor_x as f32,
-                y: anchor_y as f32,
+        let signature_help = anchor_points
+            .signature_help
+            .map(|(x, y)| render::PopupAnchor {
+                x,
+                y,
                 viewport: main,
-            })
-        });
+            });
 
         // Diff-peek popup anchor (inline git hunk preview).
-        let diff_peek = active_win.and_then(|active_win| {
-            let peek = screen.diff_peek.as_ref()?;
-            let gutter_w = active_win.gutter_char_width as f64 * cw;
-            let win_x = active_win.rect.x;
-            let win_y = active_win.rect.y;
-            let anchor_view = peek.anchor_line.saturating_sub(active_win.scroll_top) as f64;
-            let anchor_x = win_x + gutter_w;
-            let anchor_y = win_y + anchor_view * lh;
-            Some(render::PopupAnchor {
-                x: anchor_x as f32,
-                y: anchor_y as f32,
-                viewport: main,
-            })
+        let diff_peek = anchor_points.diff_peek.map(|(x, y)| render::PopupAnchor {
+            x,
+            y,
+            viewport: main,
         });
 
         // Editor hover popup anchor (rich markdown; `gh` key, diagnostic/
         // annotation/plugin hovers, or mouse dwell). Bounds/link rects/
         // scrollbar geometry are cached for the click + drag handlers
         // (#215), same as `draw.rs::draw_editor_hover_popup` did.
-        let editor_hover = active_win.and_then(|active_win| {
-            let eh = screen.editor_hover.as_ref()?;
-            let gutter_w = active_win.gutter_char_width as f64 * cw;
-            let win_x = active_win.rect.x;
-            let win_y = active_win.rect.y;
-            let anchor_view = eh.anchor_line.saturating_sub(eh.frozen_scroll_top) as f64;
-            let vis_col = eh.anchor_col.saturating_sub(eh.frozen_scroll_left) as f64;
-            let anchor_x = win_x + gutter_w + vis_col * cw;
-            let anchor_y = win_y + anchor_view * lh;
+        let editor_hover = anchor_points.editor_hover.and_then(|(x, y)| {
             Some(render::PopupAnchor {
-                x: anchor_x as f32,
-                y: anchor_y as f32,
+                x,
+                y,
                 viewport: win_viewport?,
             })
         });
