@@ -3704,6 +3704,18 @@ impl App {
         // `render_impl::paint_editor_popups`. GTK uses its raw sub-pixel
         // float window origin as-is (no whole-cell snapping — that's a
         // TUI-only concern).
+        //
+        // Note the precision drop: `win_origin`/`cw`/`lh` are cast to `f32`
+        // *here*, before the anchor arithmetic runs, whereas pre-#1237 each
+        // anchor's arithmetic ran entirely in `f64` and only cast to `f32`
+        // at the very end for `PopupAnchor`. `editor_popup_anchors` is
+        // shared with TUI, whose native units are already `f32` cell
+        // columns, so it takes `f32` throughout — GTK pays for that sharing
+        // with one extra rounding step. Immaterial at realistic screen-pixel
+        // magnitudes (`f32` keeps ~7 significant decimal digits, far more
+        // than any on-screen coordinate needs), and reviewed as acceptable
+        // in #1237's follow-up round rather than threading `f64` generics
+        // through a function TUI also calls.
         let win_origin = active_win.map(|w| (w.rect.x as f32, w.rect.y as f32));
         let anchor_points = render::editor_popup_anchors(screen, win_origin, cw as f32, lh as f32);
 
