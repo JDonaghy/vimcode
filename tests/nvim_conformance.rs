@@ -8427,7 +8427,8 @@ const COMMAND_PROBES: &[CommandProbe] = &[
 //
 //     Core Vim ex commands       84/111  :w :q :bn :ls :marks :grep …
 //     Window commands (CTRL-W)   33/33   nothing in the corpus presses <C-w>
-//     g-commands                 23/50   gt gT gf gF ga g8 gx gR g@ g+ g- …
+//     g-commands                 22/50   gt gT gf gF ga g8 gx gR g@ g+ …
+//                                        (`g-` left this list in #1156)
 //     Bracket commands           17/26   ]c [c ]d [d [m ]m [* ]* [# ]# …
 //     Normal — other             16/34   gt gT gf gF K ga g8 gx q: q/ q? …
 //     Text objects               10/32   every closing-bracket alias, a' a`
@@ -8531,7 +8532,10 @@ const COVERAGE_EXEMPT: &[&str] = &[
     "g:gM",
     "g:g@{motion}",
     "g:g+",
-    "g:g-",
+    // `g:g-` was here until #1156: the new
+    // `undo:g- crosses a branch abandoned by u then edit` case presses `g-`,
+    // so the probe matches and the ratchet demands the entry be deleted.
+    // That is the list shrinking as designed — do not re-add it.
     "g:gR",
     "g:g'",
     "g:g`",
