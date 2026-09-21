@@ -65,7 +65,6 @@ fn text_drag_origin_window(region: &quadraui::WidgetId) -> Option<crate::core::W
 struct SidebarBodyDragGeometry {
     ab_width: u16,
     sidebar_width: u16,
-    term_height: u16,
     menu_rows: u16,
     sb_visible: bool,
 }
@@ -129,22 +128,12 @@ fn apply_tui_sidebar_body_drag(
     if engine.active_panel_is(PANEL_SEARCH) {
         engine.handle_search_sidebar_ui_event(move_ev);
     } else if engine.active_panel_is(PANEL_SETTINGS) {
-        let content_start = 2_u16;
-        let content_height = geo.term_height.saturating_sub(4);
-        let q_rect = quadraui::Rect::new(
-            geo.ab_width as f32,
-            content_start as f32,
-            geo.sidebar_width as f32,
-            content_height as f32,
-        );
-        render::populate_settings_form_controller(engine);
-        let result = engine
-            .settings_form_controller
-            .borrow_mut()
-            .handle_cached(&move_ev, q_rect);
-        if !matches!(result, quadraui::FormControllerEvent::Ignored) {
-            engine.settings_scroll_top = engine.settings_form_controller.borrow().scroll_offset();
-        }
+        // #1238: route through the shared router, against the rect
+        // `render_settings_panel` actually painted into last frame
+        // (`engine.settings_form_rect`), not a hand-derived `y = 2` rect
+        // that drifts whenever the sidebar's own origin isn't `y == 0`.
+        let rect = engine.settings_form_rect.get();
+        render::handle_settings_form_ui_event(engine, &move_ev, rect);
     }
 }
 
@@ -839,7 +828,6 @@ pub(super) fn handle_mouse(
                         SidebarBodyDragGeometry {
                             ab_width,
                             sidebar_width,
-                            term_height,
                             menu_rows,
                             sb_visible,
                         },
@@ -1089,28 +1077,16 @@ pub(super) fn handle_mouse(
                 && !ext_panel_showing
                 && engine.active_panel_is(PANEL_SETTINGS)
             {
-                let content_start = 2_u16;
-                let content_height = term_height.saturating_sub(4);
-                let q_rect = quadraui::Rect::new(
-                    ab_width as f32,
-                    content_start as f32,
-                    sidebar_width as f32,
-                    content_height as f32,
-                );
                 let scroll_ev = quadraui::UiEvent::Scroll {
                     widget: None,
                     delta: quadraui::ScrollDelta::new(0.0, if scroll_up { 3.0 } else { -3.0 }),
                     position: quadraui::Point::new(col as f32, row as f32),
                 };
-                render::populate_settings_form_controller(engine);
-                let result = engine
-                    .settings_form_controller
-                    .borrow_mut()
-                    .handle_cached(&scroll_ev, q_rect);
-                if !matches!(result, quadraui::FormControllerEvent::Ignored) {
-                    engine.settings_scroll_top =
-                        engine.settings_form_controller.borrow().scroll_offset();
-                }
+                // #1238: hit-test against the rect actually painted last
+                // frame (`engine.settings_form_rect`), not a hand-derived
+                // `y = 2` rect — see `apply_tui_sidebar_body_drag`'s twin.
+                let rect = engine.settings_form_rect.get();
+                render::handle_settings_form_ui_event(engine, &scroll_ev, rect);
                 return sidebar_width;
             }
             // Terminal panel scroll now routes through dispatch_scroll
@@ -2091,51 +2067,41 @@ pub(super) fn handle_mouse(
         } else if owner == render::SidebarOwner::Settings {
             sidebar.has_focus = true;
             engine.settings_has_focus = true;
-            let flat_total = engine.settings_flat_list().len();
 
-            // Route scrollbar clicks through FormController.
-            let sb_col = ab_width + sidebar_width - 1;
-            if col == sb_col && sidebar_row >= 2 {
-                let content_start = 2_u16;
-                let content_height = term_height.saturating_sub(4);
-                let q_rect = quadraui::Rect::new(
-                    ab_width as f32,
-                    content_start as f32,
-                    sidebar_width as f32,
-                    content_height as f32,
-                );
-                let click_ev = quadraui::UiEvent::MouseDown {
-                    button: quadraui::MouseButton::Left,
-                    position: quadraui::Point::new(col as f32, row as f32),
-                    modifiers: Default::default(),
-                    widget: None,
-                };
-                render::populate_settings_form_controller(engine);
-                let result = engine
-                    .settings_form_controller
-                    .borrow_mut()
-                    .handle_cached(&click_ev, q_rect);
-                if !matches!(result, quadraui::FormControllerEvent::Ignored) {
-                    engine.settings_scroll_top =
-                        engine.settings_form_controller.borrow().scroll_offset();
-                }
-            } else if sidebar_row == 0 {
+            if sidebar_row == 0 {
                 // Header — no-op
             } else if sidebar_row == 1 {
                 // Search box — activate search input
                 engine.settings_input_active = true;
             } else {
-                let content_row = sidebar_row.saturating_sub(2) as usize;
-                let fi = engine.settings_scroll_top + content_row;
-                if fi < flat_total {
-                    engine.settings_selected = fi;
-                    // #817: double-click toggles bools / expands categories —
-                    // verdict from the backend's `DoubleClickDetector`.
-                    let is_double = is_double_click;
-                    if is_double {
-                        engine.handle_settings_key("Return", false, None);
+                // #1238: one call through the shared router handles row
+                // selection/toggle/activation *and* the scrollbar column —
+                // GTK's `App::try_route_sidebar_mouse_event` (`app.rs`) does
+                // the same single dispatch. Hit-test against the rect
+                // `render_settings_panel` actually painted into last frame
+                // (`engine.settings_form_rect`), not a hand-derived `y = 2`
+                // rect that drifts whenever the sidebar's own origin isn't
+                // `y == 0` (e.g. the menu bar visible).
+                let position = quadraui::Point::new(col as f32, row as f32);
+                // #817: double-click verdict from the backend's
+                // `DoubleClickDetector`, folded into the same
+                // `UiEvent::DoubleClick` -> activation mapping
+                // `handle_settings_form_ui_event` documents.
+                let click_ev = if is_double_click {
+                    quadraui::UiEvent::DoubleClick {
+                        widget: None,
+                        position,
                     }
-                }
+                } else {
+                    quadraui::UiEvent::MouseDown {
+                        button: quadraui::MouseButton::Left,
+                        position,
+                        modifiers: Default::default(),
+                        widget: None,
+                    }
+                };
+                let rect = engine.settings_form_rect.get();
+                render::handle_settings_form_ui_event(engine, &click_ev, rect);
             }
         }
         return sidebar_width;

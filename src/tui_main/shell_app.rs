@@ -9761,16 +9761,17 @@ mod tests {
     /// flipping to `"[ ]"` (quadraui's TUI `Form` renderer's literal
     /// checkbox glyphs) is the rendered-output assertion.
     ///
-    /// The click's row is derived from `engine.settings_flat_list()` — the
-    /// same list `mouse.rs`'s `SidebarOwner::Settings` arm indexes into via
-    /// `fi = settings_scroll_top + content_row` — rather than from
-    /// `find_bounds("Cursor Line")`'s painted position: the two disagree by
-    /// one row in this fixture (a pre-existing mismatch between where
-    /// `render_settings_panel` paints row N and where the click router's
-    /// `content_row = sidebar_row - 2` resolves row N, unrelated to #817 —
-    /// tracked separately). Computing the target row from the same list the
-    /// click router consults keeps this test about the double-click verdict,
-    /// not that separate off-by-one.
+    /// #1238: the click's row used to be derived from
+    /// `engine.settings_flat_list()` via the same `content_row = sidebar_row
+    /// - 2` formula `mouse.rs`'s `SidebarOwner::Settings` arm hand-derived —
+    /// this test's own doc comment used to record that it disagreed with
+    /// `find_bounds("Cursor Line")`'s painted position by one row, "unrelated
+    /// to #817 — tracked separately". #1238 *is* that tracked fix: the click
+    /// router now hit-tests against the rect `render_settings_panel` actually
+    /// painted into (`engine.settings_form_rect`), so this test now clicks
+    /// the real painted position too — the two can no longer disagree by
+    /// construction, and a future divergence would fail here rather than
+    /// silently relying on this test not looking where it should.
     #[test]
     fn tui_settings_double_click_toggles_a_boolean_row_via_shared_dispatch() {
         let mut app = TuiShellApp::new_for_test();
@@ -9782,23 +9783,6 @@ mod tests {
             "setup sanity: `cursorline` must default to true so the test can \
              observe a true -> false double-click toggle"
         );
-        let flat = app.engine.settings_flat_list();
-        let flat_idx = flat
-            .iter()
-            .position(|row| {
-                matches!(
-                    row,
-                    crate::core::engine::SettingsRow::CoreSetting(idx)
-                        if crate::core::settings::SETTING_DEFS[*idx].key == "cursorline"
-                )
-            })
-            .expect("the flat settings list must contain the `cursorline` row");
-        // Mirrors `mouse.rs`'s `SidebarOwner::Settings` arm: `sidebar_row =
-        // row - menu_rows` (menu bar hidden here, so `menu_rows == 0`), then
-        // `content_row = sidebar_row - 2` (header + search rows), then
-        // `fi = settings_scroll_top + content_row` (scrolled to the top).
-        let row = flat_idx as u16 + 2;
-        let col = ACTIVITY_BAR_WIDTH + 2;
 
         let mut driver = driver_with_shell(app, config(), 100, 24);
 
@@ -9813,7 +9797,10 @@ mod tests {
              it defaults to true; line: {before_line:?}"
         );
 
-        driver.double_click(col as f32, row as f32 + 0.5);
+        let bounds = driver
+            .find_bounds("Cursor Line")
+            .expect("the Cursor Line row must paint");
+        driver.double_click(bounds.x + 2.0, bounds.y);
 
         let after = driver.screen();
         let after_line = after
@@ -12700,6 +12687,60 @@ mod tests {
         assert!(
             screen.contains("SETTINGS"),
             "settings panel chrome should paint via TuiShellApp::render_content; screen:\n{screen}"
+        );
+    }
+
+    /// #1238: TUI hit-tested the Settings panel against a hand-derived
+    /// `(ab_width, y = 2, sidebar_width, term_height - 4)` rect in three
+    /// places in `mouse.rs`, while `render_settings_panel` (`panels.rs`)
+    /// painted the form at `sidebar_content_bounds.y + 2` — the *real*
+    /// painted origin, which is not `y == 2` once the menu bar (or any
+    /// other chrome above the sidebar) shifts `sidebar_content_bounds`.
+    /// Fixed by caching the exact rect `render_settings_panel` painted
+    /// into (`engine.settings_form_rect`) and hit-testing against it
+    /// through the shared `render::handle_settings_form_ui_event` — the
+    /// same router GTK's `App::try_route_sidebar_mouse_event` (`app.rs`)
+    /// already used.
+    ///
+    /// With the menu bar visible, `sidebar_content_bounds.y` is no longer
+    /// `0`, so the old `y = 2` rect silently landed one (or more) rows
+    /// away from what was actually drawn. This test clicks squarely on
+    /// the "Cursor Line" toggle's own painted row and asserts *that* row's
+    /// glyph flips — RED-verified: reverting the `mouse.rs`/`panels.rs`/
+    /// `engine/mod.rs` side of #1238 while keeping this test fails here,
+    /// because the stale rect resolves the click to the neighbouring row
+    /// instead.
+    #[test]
+    fn driver_click_on_settings_toggle_with_menu_bar_visible_flips_its_own_row_via_shell_app() {
+        let mut app = TuiShellApp::new(None);
+        app.engine.menu_bar_visible = true;
+        app.engine
+            .app_shell
+            .show_panel(&quadraui::WidgetId::new(PANEL_SETTINGS));
+        // `cursorline` defaults on (`default_cursorline`) — assert it so a
+        // future default flip can't silently defang this test.
+        assert!(
+            app.engine.settings.cursorline,
+            "fixture assumes cursorline defaults to true"
+        );
+
+        let mut driver = driver_with_shell(app, TuiShellApp::build_shell_config(true), 80, 24);
+        let before = driver
+            .find_bounds("Cursor Line")
+            .expect("the \"Cursor Line\" toggle row must paint");
+
+        // Click mid-row (not on the label's own first cell) — the whole
+        // row is the control's hit target (`form_click_event`), so this
+        // still proves the click resolved to *this* row's control, not a
+        // fluke hit on the label glyph itself.
+        driver.click(before.x + 2.0, before.y);
+
+        let screen = driver.screen();
+        let clicked_row = screen.lines().nth(before.y as usize).unwrap_or_default();
+        assert!(
+            clicked_row.contains("[ ]"),
+            "clicking the \"Cursor Line\" row should flip its own toggle off (was \"[x]\"); \
+             row:\n{clicked_row}\nfull screen:\n{screen}"
         );
     }
 
