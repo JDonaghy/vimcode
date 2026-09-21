@@ -61,6 +61,9 @@
 //! every lane it runs is a `cargo test` invocation over this crate's lib
 //! tests.
 
+use std::cell::RefCell;
+use std::rc::Rc;
+
 use quadraui::testing::{ConformanceDriver, DriverInput};
 
 use crate::core::plugin::{ExtPanelBadge, ExtPanelItem, PanelRegistration};
@@ -630,6 +633,117 @@ pub fn reveal_selects_the_revealed_row<D: ConformanceDriver>(
         "panel.reveal must highlight only the revealed row, but the \
          unrelated row {unrelated:?} (painted at y={}) is highlighted too",
         other.y
+    );
+}
+
+/// Scenario 7 (#1236) — hovering a row near a section-header/item pitch
+/// boundary resolves the hover card to the row **actually painted under the
+/// pointer**, not one a uniform-row-height formula guesses at.
+///
+/// `route_sidebar_hover`'s `ExtPanel` arm used to hit-test through
+/// `SidebarBodyGeometry::content_row`, which divides by one `row_h` for the
+/// whole body. GTK/macOS/Win pitch a tree's `Decoration::Header` rows at
+/// `line_height * 1.2` and every other row at `line_height * 1.4`
+/// (`quadraui::gtk::tree`'s own doc; `Engine::ext_panel_tree_layout`'s doc
+/// restates it) — both taller than `content_row`'s assumed `row_h ==
+/// line_height` — so the per-row error compounds with every row above the
+/// probe point. By the time it reaches `target` (well below `SEC_COMMITS`'
+/// own header, past `FILLER_ROWS` other rows), the accumulated drift is
+/// large enough that the formula's row no longer matches the row painted at
+/// that pixel.
+///
+/// Drives a **real** `UiEvent::MouseMoved` at `target`'s own painted centre
+/// (never a hand-derived y) so the row-resolution logic under test —
+/// [`ext_panel_hit_flat_index`](crate::render::ext_panel_hit_flat_index) —
+/// runs for real. The 350ms dwell-to-paint delay itself is bypassed by
+/// backdating `Engine::panel_hover_dwell`'s own `Instant` (rather than
+/// hand-picking a flat index) and calling `Engine::poll_panel_hover`
+/// directly — the same "no wall clock on `ConformanceDriver`" constraint
+/// [`PluginPanelFixture::hover`] documents, applied without pre-seeding the
+/// *routed* row, so the row the dwell fires on is still whatever the real
+/// dispatch resolved. A second identical `MouseMoved` repaints — every
+/// `MouseMoved` inside the sidebar body sets `draw_needed` regardless of
+/// which row it lands on — so the assertions below read the frame that
+/// `poll_panel_hover` actually populated.
+///
+/// Asserts only painted text (`screen_has`), never `engine.panel_hover`
+/// itself — the CLAUDE.md "rendered output, not state" rule (#587/#592):
+/// `panel_hover_dwell`/`poll_panel_hover`'s return value are read only to
+/// drive the popup into existence without a real sleep, not as the proof.
+pub fn hover_resolves_to_the_row_under_the_pointer<D: ConformanceDriver + DriverInput>(
+    driver: &mut D,
+    engine: &Rc<RefCell<Engine>>,
+    target: &str,
+    target_flat_idx: usize,
+) {
+    // Single short word, not `format!("... {target}")`: the popup's own
+    // content column is narrow enough that a longer, multi-word body wraps
+    // (or gets column-clipped) onto more than one painted text run —
+    // `screen_has` matches within one run only, the same column-budget trap
+    // this module's own header doc describes for `ROW_BRANCH`.
+    let target_md = "HOVER1236OK";
+    {
+        let mut e = engine.borrow_mut();
+        let target_id = e.resolve_panel_hover_item_id(PANEL, target_flat_idx);
+        e.panel_hover_registry
+            .insert((PANEL.to_string(), target_id), target_md.to_string());
+        // A real, if tiny, delay — `poll_panel_hover` no-ops entirely when
+        // this is 0 (`Engine::poll_panel_hover`'s own early return).
+        e.settings.hover_delay = 1;
+    }
+
+    let centre = painted_bounds(driver, target);
+    let move_to_target = || quadraui::UiEvent::MouseMoved {
+        position: quadraui::Point::new(
+            centre.x + centre.width / 2.0,
+            centre.y + centre.height / 2.0,
+        ),
+        buttons: quadraui::ButtonMask::default(),
+    };
+    driver.dispatch(move_to_target());
+
+    assert!(
+        engine.borrow().panel_hover_dwell.is_some(),
+        "hovering {target:?} (painted at y={}) must start dwell tracking on \
+         some row — panel_hover_dwell is still None after the MouseMoved",
+        centre.y
+    );
+
+    // Backdate the dwell instant the real dispatch just set, in place —
+    // keeps whatever row `route_sidebar_hover` actually resolved, only
+    // fast-forwarding past the wait.
+    {
+        let mut e = engine.borrow_mut();
+        if let Some((panel, idx, _)) = e.panel_hover_dwell.take() {
+            e.panel_hover_dwell = Some((
+                panel,
+                idx,
+                std::time::Instant::now() - std::time::Duration::from_secs(1),
+            ));
+        }
+    }
+    let shown = engine.borrow_mut().poll_panel_hover();
+    assert!(
+        shown,
+        "poll_panel_hover found no registered markdown for the row \
+         hovering {target:?} (painted at y={}) actually resolved to — a \
+         uniform-row-height formula would have drifted onto a row with no \
+         (or a mismatched) id here (#1236)",
+        centre.y
+    );
+
+    driver.dispatch(move_to_target());
+
+    assert!(
+        driver.screen_has(target_md),
+        "hovering {target:?} must show *its own* hover card; painted texts \
+         were {:?}",
+        driver
+            .inventory()
+            .text_runs()
+            .iter()
+            .map(|r| r.text.clone())
+            .collect::<Vec<_>>()
     );
 }
 

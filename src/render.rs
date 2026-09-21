@@ -7004,14 +7004,16 @@ pub fn apply_activity_panel_switch(engine: &mut Engine, panel_id: &str) -> Activ
     }
 }
 
-/// The painted sidebar body, in the caller's own units, plus the row pitch a
-/// list panel inside it uses.
+/// The painted sidebar body, in the caller's own units.
 ///
-/// TUI passes cells (`row_h == 1.0`); GTK passes the pixel
-/// `ShellContext::layout.sidebar_content_bounds` and its line height. Both
-/// numbers come from the frame that was actually painted — never re-derived —
-/// which is the rule that keeps hover highlight and hover *content* on the same
-/// row (CLAUDE.md rule 1's failure mode, one frame earlier).
+/// `row_h`/`header_rows` used to back a uniform-row-height hit-test
+/// (`content_row`, removed by #1236) for the `ExtPanel` owner; that arm now
+/// routes through [`ext_panel_hit_flat_index`]'s cached `Backend::tree_layout`
+/// instead, since a real multi-section panel has no single row height a
+/// linear formula can hit-test against (see `Engine::ext_panel_tree_layout`'s
+/// doc). The fields stay — both backends still compute them from the frame
+/// that was actually painted, and a future uniform-pitch owner can reuse them
+/// — but only `bounds` (via [`Self::contains_x`]) is read today.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SidebarBodyGeometry {
     pub bounds: quadraui::Rect,
@@ -7024,16 +7026,6 @@ pub struct SidebarBodyGeometry {
 }
 
 impl SidebarBodyGeometry {
-    /// Content-row index under `y`, or `None` when `y` is in the chrome above
-    /// the first content row (or outside the body entirely).
-    pub(crate) fn content_row(&self, y: f32) -> Option<usize> {
-        if self.row_h <= 0.0 || y < self.bounds.y || y >= self.bounds.y + self.bounds.height {
-            return None;
-        }
-        let rel = ((y - self.bounds.y) / self.row_h).floor() - self.header_rows;
-        (rel >= 0.0).then_some(rel as usize)
-    }
-
     fn contains_x(&self, x: f32) -> bool {
         x >= self.bounds.x && x < self.bounds.x + self.bounds.width
     }
@@ -7155,12 +7147,25 @@ pub fn route_sidebar_hover(
         }
         SidebarOwner::ExtPanel(name) if inside => {
             let name = name.clone();
-            match geometry.content_row(y) {
-                Some(row) => {
-                    let flat_idx = engine.ext_panel_scroll_top + row;
+            // Route through the same `Backend::tree_layout`-cached hit-test
+            // `route_ext_panel_click` uses, not `SidebarBodyGeometry::
+            // content_row`'s uniform-row-height formula: a real multi-section
+            // panel pitches header rows and item rows differently on
+            // GTK/macOS/Win (`Engine::ext_panel_tree_layout`'s own doc), so a
+            // linear formula resolves the wrong row near a section boundary
+            // (#1236). `ext_panel_hit_flat_index` already returns an absolute
+            // flat index (matching `ext_panel_to_tree_view`'s own numbering),
+            // so no `ext_panel_scroll_top` offset is added here — adding one
+            // would double-count the scroll the cached layout already baked
+            // in.
+            let flat_idx = ext_panel_hit_flat_index(engine, quadraui::Point { x, y })
+                .filter(|&i| i < engine.ext_panel_flat_len());
+            match flat_idx {
+                Some(flat_idx) => {
                     engine.panel_hover_mouse_move(&name, "", flat_idx);
                 }
-                // Header row: nothing to hover.
+                // Chrome above the body, past the last row, or a stale cache:
+                // nothing to hover.
                 None if !mouse_on_popup => engine.dismiss_panel_hover(),
                 None => {}
             }

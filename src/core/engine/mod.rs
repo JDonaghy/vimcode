@@ -4026,14 +4026,17 @@ pub struct Engine {
     /// The `AppShellLayout::sidebar_content_bounds` rect `render_ext_panel`
     /// was last painted into — i.e. its own `area` parameter, verbatim,
     /// *before* subtracting the panel's own header/search chrome. #1086:
-    /// click routing (`mouse.rs`'s `SidebarOwner::ExtPanel` arm) derives its
-    /// row index from this cached, painter-used rect via
-    /// `render::SidebarBodyGeometry::content_row`, instead of re-deriving
-    /// the sidebar content's top row from the menu-bar row count by hand —
-    /// that hand-rolled arithmetic never budgeted for `AppShellLayout`'s own
-    /// one-row sidebar header *above* `sidebar_content_bounds`, landing
-    /// every click one row low. Mirrors `explorer_tree_rect` /
-    /// `dap_sidebar_body_rect`'s "cache what was actually painted" pattern.
+    /// originally read by click routing to avoid re-deriving the sidebar
+    /// content's top row from the menu-bar row count by hand — that
+    /// hand-rolled arithmetic never budgeted for `AppShellLayout`'s own
+    /// one-row sidebar header *above* `sidebar_content_bounds`, landing every
+    /// click one row low. #1089/#1236 moved both click and hover routing onto
+    /// `ext_panel_tree_layout` below (a real multi-section panel has no
+    /// single row height for this field's rect to divide by), so this is now
+    /// unread; kept in case a future rung wants "the exact rect that was
+    /// painted" without the tree-layout hit-test machinery. Mirrors
+    /// `explorer_tree_rect` / `dap_sidebar_body_rect`'s "cache what was
+    /// actually painted" pattern.
     pub ext_panel_content_rect: std::cell::Cell<quadraui::Rect>,
     /// The `Backend::tree_layout` result for the plugin panel's tree body,
     /// paired with the body rect (chrome excluded) it was computed

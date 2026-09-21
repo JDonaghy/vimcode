@@ -183,6 +183,16 @@ fn plugin_panel_reveal_selects_the_revealed_row_on_tui_prod() {
     });
 }
 
+// #1236's own `hover_resolves_to_the_row_under_the_pointer` needs a *live*
+// `ConformanceHarness::engine` (it backdates `panel_hover_dwell` and calls
+// `poll_panel_hover` directly, in place of a real wall-clock wait) — the one
+// thing `conformance_harness_prod`'s own doc says its `engine` field cannot
+// give a scenario (`TuiShellApp` owns its `Engine` directly, not behind an
+// `Rc<RefCell<_>>`; see that function's "not live here" doc). So this
+// scenario is not registered on `tui_prod` at all — see the `tui shared app`
+// arm below, which uses `conformance_harness` (a live `Rc<RefCell<Engine>>`)
+// instead.
+
 // ── gtk / tui (shared `App`) / macos: red until #1089 ───────────────────
 //
 // See this module's parent doc. These are `known_bug_gate`d, not
@@ -292,6 +302,32 @@ fn plugin_panel_reveal_selects_the_revealed_row_on_gtk() {
     });
 }
 
+/// #1236: `route_sidebar_hover`'s `ExtPanel` arm hit-tested through
+/// `SidebarBodyGeometry::content_row`'s uniform-row-height formula, which
+/// GTK's own tree paints against (`Decoration::Header` rows at
+/// `line_height * 1.2`, every other row at `line_height * 1.4` —
+/// `quadraui::gtk::tree`'s doc) — so the formula's per-row error compounds
+/// with every row above the probe point and, by `ROW_COMMIT_A` (past
+/// `SEC_SUMMARY`'s header, `FILLER_ROWS` filler rows, and `SEC_COMMITS`' own
+/// header), drifts onto a row with no matching hover markdown. Not
+/// `known_bug_gate`d: the fix and this regression guard land in the same
+/// change, so there is no red-until-later-issue window for a label to gate.
+#[cfg(feature = "gui")]
+#[test]
+fn plugin_panel_hover_resolves_to_the_row_under_the_pointer_on_gtk() {
+    let mut h = crate::gtk::testing::conformance_harness(
+        engine_with_plugin_panel(&PluginPanelFixture::new()),
+        W as i32,
+        H as i32,
+    );
+    hover_resolves_to_the_row_under_the_pointer(
+        &mut h.driver,
+        &h.engine,
+        ROW_COMMIT_A,
+        FLAT_COMMIT_A,
+    );
+}
+
 // The `tui` control arm wraps the same shared `App` GTK does, so it fails
 // for the identical #1089 reason — kept so the shared shell's own regression
 // is visible on a lane that needs no GTK dev libs.
@@ -317,6 +353,32 @@ fn plugin_panel_item_row_hit_band_on_tui_shared_app() {
         );
         item_row_hit_band(&mut h.driver);
     });
+}
+
+/// #1236, the `tui` control-arm twin of `plugin_panel_hover_resolves_to_
+/// the_row_under_the_pointer_on_gtk`. Not `known_bug_gate`d and not red pre-
+/// fix (TUI's tree rows are uniformly one cell each — `quadraui::tui::tree`'s
+/// module doc — so `content_row`'s uniform-row-height formula never drifted
+/// here); registered because this arm, unlike `tui_prod`, wraps the same
+/// shared `App` GTK does and its `ConformanceHarness::engine` is a *live*
+/// `Rc<RefCell<Engine>>` (`conformance_harness`, not `conformance_harness_
+/// prod` — see that function's own "not live here" doc for why the scenario
+/// cannot run on `tui_prod` at all), so it is a real regression guard that
+/// the shared route still resolves correctly on the one backend that was
+/// never broken.
+#[test]
+fn plugin_panel_hover_resolves_to_the_row_under_the_pointer_on_tui_shared_app() {
+    let mut h = crate::tui_main::testing::conformance_harness(
+        engine_with_plugin_panel(&PluginPanelFixture::new()),
+        TUI_W,
+        TUI_H,
+    );
+    hover_resolves_to_the_row_under_the_pointer(
+        &mut h.driver,
+        &h.engine,
+        ROW_COMMIT_A,
+        FLAT_COMMIT_A,
+    );
 }
 
 #[cfg(all(feature = "macos", target_os = "macos"))]
