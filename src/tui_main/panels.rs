@@ -274,6 +274,12 @@ pub(super) fn render_settings_panel(
         area.width as f32,
         content_height as f32,
     );
+    // Cache the exact rect this frame painted into (#1238) — mirrors
+    // `explorer_tree_rect` / `ext_panel_content_rect`. `mouse.rs`'s hit-tests
+    // read this back instead of re-deriving `y = area.y + 2` by hand, which
+    // drifted the moment the sidebar's own origin was not `y == 0` (e.g. the
+    // menu bar visible).
+    engine.settings_form_rect.set(q_rect);
     backend.set_theme(super::quadraui_tui::q_theme(theme));
     engine
         .settings_form_controller

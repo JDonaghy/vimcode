@@ -3890,6 +3890,14 @@ pub struct Engine {
     pub settings_scroll_top: usize,
     /// Form scroll/scrollbar controller for the settings panel.
     pub settings_form_controller: std::cell::RefCell<quadraui::FormController>,
+    /// Cached content rect from the last render frame — the same rect
+    /// `render_settings_panel` (TUI) / the GTK `PANEL_SETTINGS` arm passed to
+    /// `FormController::render_and_cache`. Hit-testing must reuse this exact
+    /// rect (mirrors `explorer_tree_rect` / `dap_sidebar_body_rect`) rather
+    /// than re-deriving it by hand — see #1238, where a hand-derived
+    /// `y = 2` TUI rect drifted from the real painted origin the moment the
+    /// menu bar (or any other chrome above the sidebar) shifted it.
+    pub settings_form_rect: std::cell::Cell<quadraui::Rect>,
     /// Search/filter query typed in the settings panel.
     pub settings_query: String,
     /// Whether the search input is active (user typing a filter).
@@ -4657,6 +4665,7 @@ impl Engine {
             settings_form_controller: std::cell::RefCell::new(quadraui::FormController::new(
                 "settings".to_string(),
             )),
+            settings_form_rect: std::cell::Cell::new(quadraui::Rect::new(0.0, 0.0, 0.0, 0.0)),
             settings_query: String::new(),
             settings_input_active: false,
             settings_editing: None,
