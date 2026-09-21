@@ -10533,10 +10533,14 @@ const EXMODE: &str = "Ex mode / legacy pager is out of scope (see gQ in the g-pr
 const SESSION: &str = "no :mksession/:mkview support planned";
 const ARCH: &str = "no counterpart in vimcode's architecture (Ropey buffers, no line cache)";
 const PLATFORM: &str = "option of a Vim build for a platform vimcode does not target";
+/// Added by the registers/marks slice (#1226) for `':` — Neovim's
+/// prompt-buffer mark. vimcode has no `:h prompt-buffer` buffer type, so the
+/// mark has nothing to point at.
+const PROMPTBUF: &str = "no prompt buffers (:h prompt-buffer) in vimcode";
 
 const SKIP_REASONS: &[&str] = &[
     VIMSCRIPT, SCRIPTRT, BIDI, ENCODING, TERMCAP, VIMGUI, OBSOLETE, INTERP, PRINTING, CSCOPE, MAKE,
-    SELECT, VICOMPAT, EXMODE, SESSION, ARCH, PLATFORM,
+    SELECT, VICOMPAT, EXMODE, SESSION, ARCH, PLATFORM, PROMPTBUF,
 ];
 
 /// What `:set` actually does with an option name today — measured, never
@@ -11990,6 +11994,2300 @@ fn option_audit_gates_are_bidirectional() {
     plus.push(("", "vim.o.listchars='eol:$'".to_string()));
     assert_eq!(
         classify_option_coverage(OPTION_AUDIT, OPTION_COVERAGE_EXEMPT, &plus).newly_covered,
+        vec![victim],
+        "a case pinning {victim:?} must force its exemption to be deleted"
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Phase 5 audit slice — registers and marks (#1226)
+//
+// Slice 2 of 5. Walks two `:help` areas end to end and tags every command in
+// them Implemented / Partial / NotImplemented / Skipped, the same way #1225
+// walked `:help option-list`:
+//
+//   * `:help registers` — `runtime/doc/change.txt`, "Registers", the ten
+//     register *types* plus the commands that address them (`["x]`, `:reg`,
+//     `:display`, `:put`, `i_CTRL-R`, `c_CTRL-R`, `:let @x`);
+//   * `:help mark-motions` — `runtime/doc/motion.txt` §7, every `m…`, `'…`,
+//     `` `… ``, `:mark`/`:k`, `:marks`, `:delmarks`, the mark-relative
+//     `]'`/`` ]` ``/`['`/`` [` `` motions and the `:lockmarks` family.
+//
+// Both were read from the **pinned fleet oracle's own runtime docs** (Neovim
+// v0.12.5, [`DEVIATIONS_ORACLE`]) rather than from memory, so "what Vim does"
+// here is the same Vim every other gate in this file compares against.
+//
+// The measurement, as of this slice:
+//
+//     ✅ Implemented       42
+//     🟡 Partial           12
+//     ❌ Not implemented   32
+//     ⏭️  Intentionally skipped   3   (each with a reason from SKIP_REASONS)
+//                         ────
+//                          89   (34 registers, 55 marks)
+//
+// ## Why this slice is about *missing*, not *wrong*
+//
+// #1226 predicted it: the corpus already carries 44 `reg:` and 55
+// `mark:`/`jump:` cases and **none** of them is in [`KNOWN_DEVIATIONS`], so
+// the ground already entered is solid. What the walk finds is ground never
+// entered — 32 commands with no implementation at all, and 47 of the 86
+// in-scope rows that no oracle case names. That is exactly the blind spot
+// #1007 exists to measure, and the reason the deliverable is a table rather
+// than a report.
+//
+// Two findings are worse than "missing", and are the reason [`Report`] is a
+// recorded column rather than a bool:
+//
+//   * `` `[ ``/`` `] `` are set by yanks and by `>>`, but **not** by `c`, `d`
+//     or `p` — so `mark:`[ after p` in the corpus passes while the mark is
+//     unset, because Vim's answer and vimcode's cursor happen to coincide.
+//   * Command-line `<C-r>` is bound to a readline-style reverse-i-search over
+//     command history, so `:s/bar/<C-r>a/` never pastes register `a` — it
+//     runs a *different* substitute (and, before [`replay_live`] started
+//     clearing it, whatever the developer last typed at a `:` prompt).
+//
+// ## Gate 1 — the recorded behaviour must match the live engine
+//
+// Every non-Skipped row carries a [`Live`] recording: real keystrokes over a
+// real buffer, plus the buffer, cursor and `engine.message` vimcode produced
+// when the slice ran. [`regmark_audit_matches_the_live_engine`] replays all
+// of them and diffs. That is the bidirectional half — implementing `m[` or
+// `:marks {arg}` changes its recording and fails the gate until the row is
+// re-tagged, and a row claiming Implemented for something that starts
+// refusing fails immediately.
+//
+// The recording is a black-box observation (keys in, rendered buffer +
+// cursor + message out), never an engine field: a gate that asserted
+// `engine.marks` was populated would have passed throughout the `` `[ ``
+// finding above, since the field is written — just not by `p`.
+//
+// ## Gate 2 — oracle coverage, same shrink-only shape as #1007
+//
+// Every non-Skipped row also carries a [`Probe`] naming the oracle case that
+// exercises it; [`REGMARK_COVERAGE_EXEMPT`] lists the ones no case reaches
+// today. Both directions fail, exactly as in `COVERAGE_EXEMPT`. Writing the
+// missing cases is #1162's job, not this slice's.
+//
+// ## Out of scope, deliberately
+//
+// `q{reg}` / `@{reg}` macro recording and playback read and write registers,
+// but they are documented under `:help complex-repeat`, a different `:help`
+// area, and the corpus covers them under its own `mac:` prefix. `:help
+// jump-motions` (`<C-o>`/`<C-i>`/`g;`/`g,`/`:jumps`) likewise belongs to
+// motion.txt §8, not §7, even though the corpus files its cases under
+// `jump:` alongside the mark ones.
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Which `:help` area a row was walked from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RmArea {
+    /// `:help registers` — change.txt, "Registers".
+    Registers,
+    /// `:help mark-motions` — motion.txt §7, "Marks".
+    Marks,
+}
+
+/// Whether the recorded run ended with vimcode printing a refusal.
+///
+/// A recorded, re-measured column rather than a derived bool, because for a
+/// ❌ row "silent" is a strictly worse failure than "says so": a refusal
+/// sends the user to `:help`, a silent no-op looks like the command worked.
+/// Eight of this slice's 32 ❌ rows are silent — see
+/// [`regmark_audit_is_internally_consistent`], which pins that count.
+///
+/// Note a few ✅ rows are `Refuses` too, because their recording ends with a
+/// deliberate probe for absence (`:delmarks a` … `'a` → "Mark 'a' not set").
+/// The column describes the recording, not the verdict; the verdict is
+/// `status`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Report {
+    /// vimcode printed a refusal — an `E…` code, "Not an editor command",
+    /// "Mark … not set", "Marks must be …", "No previous …", "… is not
+    /// implemented", "E471: Argument required".
+    Refuses,
+    /// vimcode printed nothing, or printed an ordinary informational message
+    /// (`:marks`' listing, "3 lines yanked").
+    Silent,
+}
+
+/// The needles that make a `self.message` a refusal rather than a status
+/// line. Explicit and greppable: [`measured_report`] must not be allowed to
+/// quietly reclassify a row because a message was reworded.
+const REFUSAL_NEEDLES: &[&str] = &[
+    "Not an editor command",
+    "not set",
+    "Marks must be",
+    "No previous",
+    "is not implemented",
+    "Argument required",
+    "Invalid argument",
+    "no match for",
+    "Unknown option",
+    "E20",
+    "E29",
+    "E30",
+    "E471",
+    "E475",
+    "E486",
+];
+
+fn measured_report(message: &str) -> Report {
+    if REFUSAL_NEEDLES.iter().any(|n| message.contains(n)) {
+        Report::Refuses
+    } else {
+        Report::Silent
+    }
+}
+
+/// One black-box observation of what vimcode does **today**: keys in,
+/// rendered buffer + cursor + message out. Replayed by gate 1.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Live {
+    /// Starting buffer, one `&str` per line.
+    lines: &'static [&'static str],
+    /// Starting cursor, 1-indexed `(line, col)`.
+    at: (usize, usize),
+    /// Keys to send, in the corpus's `<C-r>`/`<Esc>`/`<CR>` notation.
+    keys: &'static str,
+    /// Resulting buffer, lines joined with `|`.
+    buffer: &'static str,
+    /// Resulting cursor, 1-indexed `(line, col)`.
+    cursor: (usize, usize),
+    /// `engine.message` afterwards, verbatim; `""` when vimcode said nothing.
+    message: &'static str,
+}
+
+const fn live(
+    lines: &'static [&'static str],
+    at: (usize, usize),
+    keys: &'static str,
+    buffer: &'static str,
+    cursor: (usize, usize),
+    message: &'static str,
+) -> Live {
+    Live {
+        lines,
+        at,
+        keys,
+        buffer,
+        cursor,
+        message,
+    }
+}
+
+struct RegMarkAudit {
+    area: RmArea,
+    /// The command/register as `:help` writes it — the table's unique key.
+    item: &'static str,
+    /// The `:help` tag it is documented under.
+    help: &'static str,
+    status: OptStatus,
+    /// Whether vimcode reports a refusal; re-measured by gate 1 from `live`.
+    report: Report,
+    /// `Some` for every non-Skipped row.
+    live: Option<Live>,
+    /// Oracle probe; `Some` for every non-Skipped row.
+    probe: Option<Probe>,
+    /// For ❌: what Vim does, plus this slice's assessment of whether it is
+    /// worth implementing. For 🟡: exactly what is missing.
+    note: &'static str,
+}
+
+#[allow(clippy::too_many_arguments)]
+const fn rm(
+    area: RmArea,
+    item: &'static str,
+    help: &'static str,
+    status: OptStatus,
+    report: Report,
+    live: Option<Live>,
+    probe: Option<Probe>,
+    note: &'static str,
+) -> RegMarkAudit {
+    RegMarkAudit {
+        area,
+        item,
+        help,
+        status,
+        report,
+        live,
+        probe,
+        note,
+    }
+}
+
+use crate::Report::{Refuses, Silent};
+use crate::RmArea::{Marks, Registers};
+
+/// Every command in `:help registers` and `:help mark-motions`, in `:help`
+/// order, registers first.
+///
+/// 89 rows, no "TODO" and no unreviewed row: adding one, deleting one, or
+/// leaving one without a note fails [`regmark_audit_is_internally_consistent`].
+const REGMARK_AUDIT: &[RegMarkAudit] = &[
+    // ── 1. The unnamed register ───────────────────────────────────────────
+    rm(
+        Registers,
+        "\"\"",
+        "quotequote",
+        Implemented,
+        Silent,
+        Some(live(
+            &["alpha", "beta"],
+            (1, 1),
+            "yyj\"\"p",
+            "alpha|beta|alpha|",
+            (3, 1),
+            "",
+        )),
+        Some(Label("reg:yiw viwp swaps")),
+        "filled by every yank/delete; `p` with no register reads it",
+    ),
+    // ── 2. Numbered registers "0 to "9 ────────────────────────────────────
+    rm(
+        Registers,
+        "\"0",
+        "quote0",
+        Implemented,
+        Silent,
+        Some(live(
+            &["alpha", "beta"],
+            (1, 1),
+            "yyjdd\"0p",
+            "alpha|alpha|",
+            (2, 1),
+            "",
+        )),
+        Some(Label("reg:yy dd \"0p")),
+        "most recent yank; untouched by deletes and by yanks to a named register",
+    ),
+    rm(
+        Registers,
+        "\"1",
+        "quote1",
+        Implemented,
+        Silent,
+        Some(live(
+            &["a", "b", "c"],
+            (1, 1),
+            "ddj\"1p",
+            "b|c|a|",
+            (3, 1),
+            "",
+        )),
+        Some(Label("reg:dd \"1p")),
+        "most recent delete/change of at least one line",
+    ),
+    rm(
+        Registers,
+        "\"1 (special-motion exception)",
+        "quote_number",
+        Implemented,
+        Silent,
+        Some(live(&["(ab) cd"], (1, 1), "d%$\"1p", " cd(ab)", (1, 7), "")),
+        Some(Label("reg:d% goes to \"1")),
+        "`d%`/`d/`/`dn` use \"1 even when the deleted text is under one line \
+        (Engine::set_delete_register_special_motion)",
+    ),
+    rm(
+        Registers,
+        "\"2 to \"9",
+        "quote_number",
+        Implemented,
+        Silent,
+        Some(live(
+            &["a", "b", "c"],
+            (1, 1),
+            "dddd\"2p",
+            "c|a|",
+            (2, 1),
+            "",
+        )),
+        Some(Label("reg:dd dd \"2p")),
+        "the shift chain: each new line-delete pushes \"1 into \"2, \"8 into \"9",
+    ),
+    // ── 3. The small delete register ──────────────────────────────────────
+    rm(
+        Registers,
+        "\"-",
+        "quote-",
+        Implemented,
+        Silent,
+        Some(live(&["foo bar"], (1, 1), "dw$\"-p", "barfoo ", (1, 7), "")),
+        Some(Label("reg:dw goes to \"-")),
+        "sub-line deletes, and only for an unnamed delete",
+    ),
+    // ── 4. Named registers ────────────────────────────────────────────────
+    rm(
+        Registers,
+        "\"a to \"z",
+        "quotea",
+        Implemented,
+        Silent,
+        Some(live(
+            &["alpha", "beta"],
+            (1, 1),
+            "\"ayyj\"ap",
+            "alpha|beta|alpha|",
+            (3, 1),
+            "",
+        )),
+        Some(Label("reg:\"ayy \"ap")),
+        "explicit named register, replacing its contents",
+    ),
+    rm(
+        Registers,
+        "\"A to \"Z",
+        "quote_alpha",
+        Implemented,
+        Silent,
+        Some(live(
+            &["a", "b"],
+            (1, 1),
+            "\"ayyj\"Ayy\"ap",
+            "a|b|a|b|",
+            (3, 1),
+            "",
+        )),
+        Some(Label("reg:\"Ayy linewise append")),
+        "uppercase appends; a linewise append widens a charwise register to linewise",
+    ),
+    // ── 5. Read-only registers ":, "., "% ────────────────────────────────
+    rm(
+        Registers,
+        "\":",
+        "quote:",
+        Implemented,
+        Silent,
+        Some(live(
+            &["a a"],
+            (1, 1),
+            ":s/a/b/<CR>\":p",
+            "bs/a/b/ a",
+            (1, 7),
+            "",
+        )),
+        Some(Label("reg:\": last cmd")),
+        "most recent command-line, stored without its leading `:`",
+    ),
+    rm(
+        Registers,
+        "\".",
+        "quote.",
+        Implemented,
+        Silent,
+        Some(live(
+            &["ab"],
+            (1, 1),
+            "ifoo<Esc>\".p",
+            "foofooab",
+            (1, 6),
+            "",
+        )),
+        Some(Label("reg:\". insert register")),
+        "last inserted text",
+    ),
+    rm(
+        Registers,
+        "\"%",
+        "quote%",
+        Partial,
+        Silent,
+        Some(live(&["a"], (1, 1), "\"%p", "a", (1, 1), "")),
+        Some(Label("reg:\"% file name empty")),
+        "returns the file's BASENAME; Vim returns the name of the file as typed \
+        (`src/main.rs`, not `main.rs`) — see \
+        register_percent_and_hash_paste_basenames_not_paths",
+    ),
+    // ── 6. Alternate buffer register "# ──────────────────────────────────
+    rm(
+        Registers,
+        "\"#",
+        "quote#",
+        Partial,
+        Silent,
+        Some(live(&["a"], (1, 1), "\"#p", "a", (1, 1), "")),
+        Some(Label("reg:\"# alternate file")),
+        "#1161 added the read path, but it yields the basename rather than the \
+        name as typed, and \"# is read-only here (Vim allows `:let @# = bufnr`, \
+        which is VimScript and out of scope anyway)",
+    ),
+    // ── 7. The expression register ────────────────────────────────────────
+    rm(
+        Registers,
+        "\"=",
+        "quote=",
+        Partial,
+        Refuses,
+        Some(live(
+            &["a"],
+            (1, 1),
+            "\"='hi'<CR>p",
+            "a",
+            (1, 1),
+            "\"=\" register (expression evaluation) is not implemented",
+        )),
+        Some(Label("reg:\"= expr")),
+        "integer arithmetic only (`\"=1+1`); strings, functions and variables \
+        report \"not implemented\" — a full one needs VimScript eval",
+    ),
+    // ── 8. The selection registers ────────────────────────────────────────
+    rm(
+        Registers,
+        "\"*",
+        "quotestar",
+        Implemented,
+        Silent,
+        Some(live(&["abc"], (1, 1), "\"*yl$\"*p", "abca", (1, 4), "")),
+        Some(Label("reg:\"* clipboard round trip")),
+        "writes through Engine::clipboard_write when a backend supplied one, \
+        falling back to the internal register otherwise",
+    ),
+    rm(
+        Registers,
+        "\"+",
+        "quoteplus",
+        Implemented,
+        Silent,
+        Some(live(&["abc"], (1, 1), "\"+yl$\"+p", "abca", (1, 4), "")),
+        Some(Label("reg:\"+ clipboard round trip")),
+        "same path as \"*",
+    ),
+    // ── 9. The black hole register ────────────────────────────────────────
+    rm(
+        Registers,
+        "\"_",
+        "quote_",
+        Implemented,
+        Silent,
+        Some(live(
+            &["a", "b", "c"],
+            (1, 1),
+            "yyj\"_ddp",
+            "a|c|a|",
+            (3, 1),
+            "",
+        )),
+        Some(Label("reg:\"_dd then p")),
+        "writes vanish and do not fall through to \"\" / \"1 / \"-",
+    ),
+    // ── 10. Last search pattern register ──────────────────────────────────
+    rm(
+        Registers,
+        "\"/",
+        "quote/",
+        Implemented,
+        Silent,
+        Some(live(
+            &["foo bar"],
+            (1, 1),
+            "/bar<CR>\"/P",
+            "foo barbar",
+            (1, 7),
+            "",
+        )),
+        Some(Label("reg:\"/ last search")),
+        "read path only; Vim's `:let @/ = \"the\"` write is VimScript",
+    ),
+    rm(
+        Registers,
+        "\"~",
+        "quote_~",
+        Skipped(VIMGUI),
+        Silent,
+        None,
+        None,
+        "Vim's drag-and-drop register (not in Neovim's help at all); there is no \
+        text-drop path in either vimcode backend",
+    ),
+    // ── Commands that address a register ──────────────────────────────────
+    rm(
+        Registers,
+        "[\"x]{operator}",
+        "{register}",
+        Implemented,
+        Silent,
+        Some(live(
+            &["a", "b", "c"],
+            (1, 1),
+            "\"add\"bdd\"ap\"bp",
+            "c|a|b|",
+            (3, 1),
+            "",
+        )),
+        Some(Label("reg:\"add \"bdd \"ap \"bp")),
+        "the `\"x` prefix in front of y/d/c/s/x/p/P",
+    ),
+    rm(
+        Registers,
+        ":reg[isters]",
+        ":registers",
+        Implemented,
+        Silent,
+        Some(live(
+            &["a"],
+            (1, 1),
+            "yy:registers<CR>",
+            "a",
+            (1, 1),
+            "--- Registers ---\n\"\"  l  a\\n\n\"0  l  a\\n",
+        )),
+        Some(Keys(":registers")),
+        "lists every non-empty register with Vim's c/l/b type column",
+    ),
+    rm(
+        Registers,
+        ":reg[isters] {arg}",
+        ":registers",
+        NotImplemented,
+        Refuses,
+        Some(live(
+            &["a"],
+            (1, 1),
+            "\"ayy:reg a<CR>",
+            "a",
+            (1, 1),
+            "Not an editor command: registers a",
+        )),
+        Some(Keys(":reg a")),
+        "Vim filters the listing to the named registers (`:reg 1a`); vimcode \
+        rejects any argument outright — worth implementing, it is a filter over \
+        a list execute.rs already builds",
+    ),
+    rm(
+        Registers,
+        ":di[splay]",
+        ":display",
+        Implemented,
+        Silent,
+        Some(live(
+            &["a"],
+            (1, 1),
+            "yy:display<CR>",
+            "a",
+            (1, 1),
+            "--- Registers ---\n\"\"  l  a\\n\n\"0  l  a\\n",
+        )),
+        Some(Keys(":display")),
+        "synonym for :registers, same listing",
+    ),
+    rm(
+        Registers,
+        ":di[splay] {arg}",
+        ":display",
+        NotImplemented,
+        Refuses,
+        Some(live(
+            &["a"],
+            (1, 1),
+            "\"ayy:di a<CR>",
+            "a",
+            (1, 1),
+            "Not an editor command: display a",
+        )),
+        Some(Keys(":di a")),
+        "same gap as `:reg {arg}` and the same one-line fix",
+    ),
+    rm(
+        Registers,
+        ":[range]pu[t] [x]",
+        ":put",
+        Implemented,
+        Silent,
+        Some(live(
+            &["a", "b"],
+            (1, 1),
+            "\"ayyj:put a<CR>",
+            "a|b|a|",
+            (3, 1),
+            "",
+        )),
+        Some(Label("ex:put a")),
+        "linewise put below the addressed line, with an optional register name",
+    ),
+    rm(
+        Registers,
+        ":[range]pu[t]!",
+        ":put!",
+        Implemented,
+        Silent,
+        Some(live(
+            &["a", "b"],
+            (2, 1),
+            "yy:put!<CR>",
+            "a|b|b",
+            (2, 1),
+            "",
+        )),
+        Some(Keys(":put!")),
+        "the `!` variant puts above the addressed line",
+    ),
+    rm(
+        Registers,
+        ":put ={expr}",
+        ":put_=",
+        NotImplemented,
+        Refuses,
+        Some(live(
+            &["a"],
+            (1, 1),
+            ":put =1+1<CR>",
+            "a",
+            (1, 1),
+            "Not an editor command: put =1+1",
+        )),
+        Some(Keys(":put =")),
+        "Vim evaluates the expression and puts the result; vimcode rejects the \
+        whole command — worth implementing, `Engine::eval_expr_register` already \
+        evaluates exactly what `\"=` accepts",
+    ),
+    rm(
+        Registers,
+        "i_CTRL-R {register}",
+        "i_CTRL-R",
+        Implemented,
+        Silent,
+        Some(live(
+            &["foo bar"],
+            (1, 1),
+            "\"aywA<C-r>a<Esc>",
+            "foo barfoo ",
+            (1, 11),
+            "",
+        )),
+        Some(Label("reg:i C-r a")),
+        "inserts the register at the cursor, \"as if typed\"",
+    ),
+    rm(
+        Registers,
+        "i_CTRL-R =",
+        "i_CTRL-R_=",
+        Partial,
+        Silent,
+        Some(live(
+            &["a"],
+            (1, 1),
+            "A<C-r>=2*3<CR><Esc>",
+            "a6",
+            (1, 2),
+            "",
+        )),
+        Some(Label("reg:C-r = in insert")),
+        "opens the expression prompt, but shares `\"=`'s arithmetic-only evaluator",
+    ),
+    rm(
+        Registers,
+        "i_CTRL-R CTRL-R {register}",
+        "i_CTRL-R_CTRL-R",
+        NotImplemented,
+        Silent,
+        Some(live(
+            &["foo bar"],
+            (1, 1),
+            "ywA<C-r><C-r>\"<Esc>",
+            "foo barfoo ",
+            (1, 11),
+            "",
+        )),
+        Some(Keys("<C-r><C-r>")),
+        "Vim inserts the register LITERALLY (no 'textwidth'/abbreviation/indent \
+        processing); vimcode re-arms the pending <C-r> and inserts normally, so \
+        the distinction is silently lost — low value while vimcode's plain \
+        i_CTRL-R already inserts unprocessed",
+    ),
+    rm(
+        Registers,
+        "i_CTRL-R CTRL-O {register}",
+        "i_CTRL-R_CTRL-O",
+        NotImplemented,
+        Silent,
+        Some(live(
+            &["foo bar"],
+            (1, 1),
+            "ywA<C-r><C-o>\"<Esc>",
+            "foo bar\"",
+            (1, 8),
+            "",
+        )),
+        Some(Keys("<C-r><C-o>")),
+        "Vim inserts literally and without auto-indent; vimcode reads a register \
+        literally NAMED `o` (empty), silently swallows the keystroke and then \
+        types the register name as text — silently wrong, not just missing",
+    ),
+    rm(
+        Registers,
+        "i_CTRL-R CTRL-P {register}",
+        "i_CTRL-R_CTRL-P",
+        NotImplemented,
+        Silent,
+        Some(live(
+            &["foo bar"],
+            (1, 1),
+            "ywA<C-r><C-p>\"<Esc>",
+            "foo barfoo ",
+            (1, 11),
+            "",
+        )),
+        Some(Keys("<C-r><C-p>")),
+        "Vim inserts literally and fixes the indent; vimcode's <C-p> is consumed \
+        by the completion handler, leaving the pending <C-r> armed — silently wrong",
+    ),
+    rm(
+        Registers,
+        "c_CTRL-R {register}",
+        "c_CTRL-R",
+        NotImplemented,
+        Refuses,
+        Some(live(
+            &["foo", "bar"],
+            (1, 1),
+            "\"ayw:s/bar/<C-r>a/<CR>",
+            "foo|bar",
+            (1, 1),
+            "E486: Pattern not found: bar",
+        )),
+        Some(Keys(":s/bar/<C-r>a/")),
+        "the single biggest gap in this slice: vimcode binds command-line <C-r> to \
+        a readline-style reverse-i-search over command history, so `:s/x/<C-r>a/` \
+        never pastes register a. Worth implementing, and it needs the existing \
+        binding moved or dropped",
+    ),
+    rm(
+        Registers,
+        "c_CTRL-R CTRL-W",
+        "c_CTRL-R_CTRL-W",
+        NotImplemented,
+        Refuses,
+        Some(live(
+            &["foo", "bar"],
+            (1, 1),
+            ":s/bar/<C-r><C-w>/<CR>",
+            "foo|bar",
+            (1, 1),
+            "E486: Pattern not found: bar",
+        )),
+        Some(Keys("<C-r><C-w>")),
+        "insert the word under the cursor on the command line — blocked behind the \
+        same c_CTRL-R binding conflict; very commonly used with `:s`",
+    ),
+    rm(
+        Registers,
+        ":let @{register} = {expr}",
+        ":let-@",
+        Skipped(VIMSCRIPT),
+        Silent,
+        None,
+        None,
+        "the register write path is a `:let` assignment — VimScript, per the \
+        standing decision that vimcode implements Vim keybindings and editing",
+    ),
+    // ── mark-motions: setting marks ───────────────────────────────────────
+    rm(
+        Marks,
+        "m{a-zA-Z}",
+        "m",
+        Implemented,
+        Silent,
+        Some(live(
+            &["  a", "b", "c"],
+            (1, 3),
+            "majj'a",
+            "  a|b|c",
+            (1, 3),
+            "",
+        )),
+        Some(Label("mark:'a first nonblank")),
+        "a-z per buffer (Engine::marks), A-Z global with a file path",
+    ),
+    rm(
+        Marks,
+        "m' and m`",
+        "m'",
+        NotImplemented,
+        Refuses,
+        Some(live(
+            &["a", "b", "c", "d", "e"],
+            (3, 1),
+            "m'jj''",
+            "a|b|c|d|e",
+            (5, 1),
+            "No previous jump position",
+        )),
+        Some(Label("mark:m'")),
+        "set the previous-context mark without moving. vimcode answers \"Marks \
+        must be a letter (a-z or A-Z)\" — worth implementing, it is one `'`/`` ` `` \
+        arm writing `last_jump_pos`",
+    ),
+    rm(
+        Marks,
+        "m[ and m]",
+        "m[",
+        NotImplemented,
+        Refuses,
+        Some(live(
+            &["abc", "def"],
+            (2, 2),
+            "m[gg'[",
+            "abc|def",
+            (1, 2),
+            "No previous change",
+        )),
+        Some(Label("mark:m[")),
+        "set `'[`/`']` by hand, for simulating an operator with several commands \
+        — niche, but it is the same two fields the `'[` gap below already needs",
+    ),
+    rm(
+        Marks,
+        "m< and m>",
+        "m<",
+        NotImplemented,
+        Refuses,
+        Some(live(
+            &["abc", "def"],
+            (2, 2),
+            "m<gg'<",
+            "abc|def",
+            (1, 2),
+            "No previous visual selection",
+        )),
+        Some(Label("mark:m<")),
+        "set `'<`/`'>` to change what `gv` reselects — worth implementing; \
+        visual_mark_start/end already exist and `gv` already reads them",
+    ),
+    rm(
+        Marks,
+        ":[range]ma[rk] {a-zA-Z'}",
+        ":mark",
+        Implemented,
+        Silent,
+        Some(live(
+            &["a", "b", "c"],
+            (1, 1),
+            ":2mark t<CR>gg't",
+            "a|b|c",
+            (2, 1),
+            "",
+        )),
+        Some(Label("ex:2mark a")),
+        "range-addressed mark, column 0, default cursor line",
+    ),
+    rm(
+        Marks,
+        ":[range]k{a-zA-Z'}",
+        ":k",
+        Implemented,
+        Silent,
+        Some(live(
+            &["a", "b", "c"],
+            (1, 1),
+            ":2kt<CR>gg't",
+            "a|b|c",
+            (2, 1),
+            "",
+        )),
+        Some(Keys(":2kt")),
+        "the no-space spelling of :mark",
+    ),
+    // ── mark-motions: jumping to a mark ───────────────────────────────────
+    rm(
+        Marks,
+        "'{a-z}",
+        "'a",
+        Implemented,
+        Silent,
+        Some(live(
+            &["  a", "b", "c"],
+            (1, 3),
+            "majj'a",
+            "  a|b|c",
+            (1, 3),
+            "",
+        )),
+        Some(Label("mark:'a first nonblank")),
+        "linewise, lands on the first non-blank, records a jumplist entry",
+    ),
+    rm(
+        Marks,
+        "`{a-z}",
+        "`a",
+        Implemented,
+        Silent,
+        Some(live(
+            &["abc", "def", "ghi"],
+            (1, 3),
+            "majj`a",
+            "abc|def|ghi",
+            (1, 3),
+            "",
+        )),
+        Some(Label("mark:`a exact")),
+        "exclusive, lands on the exact column",
+    ),
+    rm(
+        Marks,
+        "'{A-Z}",
+        "'A",
+        Implemented,
+        Silent,
+        Some(live(
+            &["a", "b", "c"],
+            (3, 1),
+            "mAgg'A",
+            "a|b|c",
+            (3, 1),
+            "",
+        )),
+        Some(Label("mark:mA global")),
+        "global file mark, linewise",
+    ),
+    rm(
+        Marks,
+        "`{A-Z}",
+        "`A",
+        Implemented,
+        Silent,
+        Some(live(
+            &["abc", "def"],
+            (2, 3),
+            "mAgg`A",
+            "abc|def",
+            (2, 3),
+            "",
+        )),
+        Some(Label("mark:`A")),
+        "global file mark, exact column",
+    ),
+    rm(
+        Marks,
+        "'{0-9} and `{0-9}",
+        "'0",
+        NotImplemented,
+        Refuses,
+        Some(live(
+            &["a", "b"],
+            (1, 1),
+            "'0",
+            "a|b",
+            (1, 1),
+            "Marks must be a letter or special char",
+        )),
+        Some(Label("mark:'0")),
+        "the shada/viminfo marks — where the cursor was when Vim last exited. \
+        vimcode has no shada file, so there is nothing to restore; not worth \
+        implementing before a persistent-mark store exists",
+    ),
+    rm(
+        Marks,
+        "lowercase marks restored by undo/redo",
+        "mark-motions",
+        NotImplemented,
+        Silent,
+        Some(live(
+            &["a", "b", "c"],
+            (2, 1),
+            "maggddu3G'a",
+            "a|b|c",
+            (1, 1),
+            "",
+        )),
+        Some(Label("mark:undo restores mark")),
+        "`:help mark-motions`: \"Lowercase marks are restored when using undo and \
+        redo.\" vimcode leaves the mark where the delete shifted it. The offset \
+        snapshot/restore machinery exists (Engine::snapshot_marks_as_offsets) but \
+        is wired only to join_lines — worth implementing",
+    ),
+    rm(
+        Marks,
+        "mark erased when its line is deleted",
+        "mark-motions",
+        Implemented,
+        Refuses,
+        Some(live(
+            &["a", "b", "c"],
+            (2, 1),
+            "maddgg'a",
+            "a|c",
+            (1, 1),
+            "Mark 'a' not set",
+        )),
+        Some(Label("mark:mark on deleted line")),
+        "\"If you delete a line that contains a mark, that mark is erased.\"",
+    ),
+    rm(
+        Marks,
+        "g'{mark}",
+        "g'",
+        Partial,
+        Silent,
+        Some(live(
+            &["a", "    bcd", "e"],
+            (2, 5),
+            "maggg'a",
+            "a|    bcd|e",
+            (2, 1),
+            "",
+        )),
+        Some(Label("mark:g'")),
+        "keeps the jumplist untouched (correct), but lands on COLUMN 0 instead of \
+        the first non-blank `'{mark}` uses, and accepts only a-zA-Z — Vim's \
+        `` g`\" `` / `g'.` take any mark",
+    ),
+    rm(
+        Marks,
+        "g`{mark}",
+        "g`",
+        Partial,
+        Silent,
+        Some(live(
+            &["abc", "def"],
+            (2, 2),
+            "maggg`a",
+            "abc|def",
+            (2, 2),
+            "",
+        )),
+        Some(Label("mark:g`")),
+        "correct for a-zA-Z; silently does nothing for the special marks \
+        (`` g`\" `` is the canonical last-position-jump idiom)",
+    ),
+    rm(
+        Marks,
+        ":marks",
+        ":marks",
+        Partial,
+        Silent,
+        Some(live(
+            &["a", "b"],
+            (1, 1),
+            "ma:marks<CR>",
+            "a|b",
+            (1, 1),
+            "mark line  col  file/text\n a      1    0",
+        )),
+        Some(Keys(":marks")),
+        "lists only the letter marks; Vim also lists `' \" [ ] < > . ^` and a \
+        file/text column, and numbers the first column from zero",
+    ),
+    rm(
+        Marks,
+        ":marks {arg}",
+        ":marks",
+        NotImplemented,
+        Refuses,
+        Some(live(
+            &["a", "b"],
+            (1, 1),
+            "ma:marks a<CR>",
+            "a|b",
+            (1, 1),
+            "Not an editor command: marks a",
+        )),
+        Some(Keys(":marks a")),
+        "Vim filters the listing to the named marks (`:marks aB`); vimcode rejects \
+        any argument — same shape and same one-line fix as `:reg {arg}`",
+    ),
+    rm(
+        Marks,
+        ":delm[arks] {marks}",
+        ":delmarks",
+        Implemented,
+        Refuses,
+        Some(live(
+            &["a", "b", "c"],
+            (2, 1),
+            "ma:delmarks a<CR>gg'a",
+            "a|b|c",
+            (1, 1),
+            "Mark 'a' not set",
+        )),
+        Some(Label("ex:delmarks a")),
+        "#1154; handles space-separated names and `a-c` ranges, with E475 on an \
+        inverted or mixed-category range",
+    ),
+    rm(
+        Marks,
+        ":delm[arks]!",
+        ":delmarks",
+        Implemented,
+        Refuses,
+        Some(live(
+            &["a", "b", "c"],
+            (2, 1),
+            "ma:delmarks!<CR>gg'a",
+            "a|b|c",
+            (1, 1),
+            "Mark 'a' not set",
+        )),
+        Some(Keys(":delmarks!")),
+        "#1154; clears the buffer's lowercase marks, leaving A-Z and 0-9",
+    ),
+    // ── mark-motions: the special marks ───────────────────────────────────
+    rm(
+        Marks,
+        "'[",
+        "'[",
+        Partial,
+        Refuses,
+        Some(live(
+            &["abc", "def"],
+            (2, 1),
+            "yygg'[",
+            "abc|def",
+            (1, 1),
+            "No previous change",
+        )),
+        Some(Label("mark:'[ after >>")),
+        "set by `>>`/`<<` and by charwise yanks, but NOT by `c`, `d`, `p` or a \
+        linewise `yy` — after any of those vimcode answers \"No previous change\"",
+    ),
+    rm(
+        Marks,
+        "`[",
+        "`[",
+        Partial,
+        Refuses,
+        Some(live(
+            &["abc def"],
+            (1, 1),
+            "ciwXY<Esc>$`[",
+            "XY def",
+            (1, 6),
+            "No previous change",
+        )),
+        Some(Label("mark:`[ after p")),
+        "same gap. Note `mark:`[ after p` in the corpus passes only by \
+        coincidence — the mark is unset and the cursor happens to already be \
+        where Vim would put it",
+    ),
+    rm(
+        Marks,
+        "']",
+        "']",
+        Partial,
+        Refuses,
+        Some(live(
+            &["abc", "def"],
+            (1, 1),
+            "yjG']",
+            "abc|def",
+            (2, 1),
+            "No previous change",
+        )),
+        Some(Label("mark:']")),
+        "same gap as `'[`",
+    ),
+    rm(
+        Marks,
+        "`]",
+        "`]",
+        Partial,
+        Refuses,
+        Some(live(
+            &["abc def"],
+            (1, 1),
+            "ciwXY<Esc>0`]",
+            "XY def",
+            (1, 1),
+            "No previous change",
+        )),
+        Some(Label("mark:`] after yank")),
+        "correct after a yank; unset after `c`/`d`/`p`",
+    ),
+    rm(
+        Marks,
+        "'<",
+        "'<",
+        Implemented,
+        Silent,
+        Some(live(
+            &["a", "b", "c", "d"],
+            (2, 1),
+            "Vj<Esc>gg'<",
+            "a|b|c|d",
+            (2, 1),
+            "",
+        )),
+        Some(Label("mark:'<")),
+        "start of the last visual area, linewise",
+    ),
+    rm(
+        Marks,
+        "`<",
+        "`<",
+        Implemented,
+        Silent,
+        Some(live(
+            &["abc", "def"],
+            (1, 2),
+            "vjl<Esc>gg`<",
+            "abc|def",
+            (1, 2),
+            "",
+        )),
+        Some(Label("mark:`< after v")),
+        "start of the last visual area, exact",
+    ),
+    rm(
+        Marks,
+        "'>",
+        "'>",
+        Implemented,
+        Silent,
+        Some(live(
+            &["a", "b", "c", "d"],
+            (2, 1),
+            "Vj<Esc>gg'>",
+            "a|b|c|d",
+            (3, 1),
+            "",
+        )),
+        Some(Label("mark:'> after V")),
+        "end of the last visual area, linewise",
+    ),
+    rm(
+        Marks,
+        "`>",
+        "`>",
+        Implemented,
+        Silent,
+        Some(live(
+            &["abc"],
+            (1, 1),
+            "vl<Esc>0gv<Esc>`>",
+            "abc",
+            (1, 2),
+            "",
+        )),
+        Some(Label("mark:`> after gv")),
+        "end of the last visual area, exact; survives a `gv` round trip",
+    ),
+    rm(
+        Marks,
+        "''",
+        "''",
+        Implemented,
+        Silent,
+        Some(live(
+            &["a", "b", "c", "d"],
+            (2, 1),
+            "G''",
+            "a|b|c|d",
+            (2, 1),
+            "",
+        )),
+        Some(Label("mark:'' after G")),
+        "position before the latest jump, and itself a jump, so it toggles",
+    ),
+    rm(
+        Marks,
+        "``",
+        "``",
+        Implemented,
+        Silent,
+        Some(live(
+            &["abc", "def", "ghi"],
+            (2, 2),
+            "gg``",
+            "abc|def|ghi",
+            (2, 2),
+            "",
+        )),
+        Some(Label("mark:`` after gg")),
+        "exact-column sibling of `''`, toggles the same way",
+    ),
+    rm(
+        Marks,
+        "'\"",
+        "'quote",
+        NotImplemented,
+        Refuses,
+        Some(live(
+            &["a", "b", "c"],
+            (2, 1),
+            "'\"",
+            "a|b|c",
+            (2, 1),
+            "Marks must be a letter or special char",
+        )),
+        Some(Label("mark:'\"")),
+        "cursor position when the buffer was last exited, defaulting to line 1. \
+        Worth implementing: it is the mark behind the near-universal \
+        last-position-jump idiom, and it is per-buffer state vimcode already keeps",
+    ),
+    rm(
+        Marks,
+        "`\"",
+        "`quote",
+        NotImplemented,
+        Refuses,
+        Some(live(
+            &["a", "b", "c"],
+            (2, 1),
+            "`\"",
+            "a|b|c",
+            (2, 1),
+            "Marks must be a letter or special char",
+        )),
+        Some(Label("mark:`\"")),
+        "exact-column sibling of `'\"`, and the one `` g`\" `` needs",
+    ),
+    rm(
+        Marks,
+        "'^",
+        "'^",
+        Partial,
+        Silent,
+        Some(live(
+            &["x", "    yz"],
+            (1, 1),
+            "jA!<Esc>gg'^",
+            "x|    yz!",
+            (2, 7),
+            "",
+        )),
+        Some(Label("mark:'^")),
+        "jumps to the right LINE but keeps the exact column; Vim's `'^` is \
+        linewise and lands on the first non-blank (verified against the pinned \
+        oracle: col 5 vs vimcode's col 7 on `    yz!`)",
+    ),
+    rm(
+        Marks,
+        "`^",
+        "`^",
+        Implemented,
+        Silent,
+        Some(live(
+            &["ab", "cd"],
+            (1, 1),
+            "jAx<Esc>gg`^",
+            "ab|cdx",
+            (2, 3),
+            "",
+        )),
+        Some(Label("mark:`^")),
+        "where Insert mode was last left, raw column — what `gi` uses",
+    ),
+    rm(
+        Marks,
+        "'.",
+        "'.",
+        Implemented,
+        Silent,
+        Some(live(&["a", "b", "c"], (2, 1), "xgg'.", "a||c", (2, 1), "")),
+        Some(Label("mark:'.")),
+        "line of the last change, first non-blank",
+    ),
+    rm(
+        Marks,
+        "`.",
+        "`.",
+        Implemented,
+        Silent,
+        Some(live(&["abc", "def"], (2, 2), "xgg`.", "abc|df", (2, 2), "")),
+        Some(Label("mark:`.")),
+        "exact position of the last change",
+    ),
+    rm(
+        Marks,
+        "':",
+        "':",
+        Skipped(PROMPTBUF),
+        Silent,
+        None,
+        None,
+        "Neovim-only: the start of the current user input in a prompt buffer",
+    ),
+    rm(
+        Marks,
+        "'(",
+        "'(",
+        NotImplemented,
+        Refuses,
+        Some(live(
+            &["One two. Three four."],
+            (1, 12),
+            "'(",
+            "One two. Three four.",
+            (1, 12),
+            "Marks must be a letter or special char",
+        )),
+        Some(Label("mark:'(")),
+        "start of the current sentence, like `(`. Worth implementing — the whole \
+        family below is a thin alias layer over motions vimcode already has",
+    ),
+    rm(
+        Marks,
+        "`(",
+        "`(",
+        NotImplemented,
+        Refuses,
+        Some(live(
+            &["One two. Three four."],
+            (1, 12),
+            "`(",
+            "One two. Three four.",
+            (1, 12),
+            "Marks must be a letter or special char",
+        )),
+        Some(Label("mark:`(")),
+        "exact-column form of `'(`",
+    ),
+    rm(
+        Marks,
+        "')",
+        "')",
+        NotImplemented,
+        Refuses,
+        Some(live(
+            &["One two. Three four."],
+            (1, 3),
+            "')",
+            "One two. Three four.",
+            (1, 3),
+            "Marks must be a letter or special char",
+        )),
+        Some(Label("mark:')")),
+        "end of the current sentence, like `)`",
+    ),
+    rm(
+        Marks,
+        "`)",
+        "`)",
+        NotImplemented,
+        Refuses,
+        Some(live(
+            &["One two. Three four."],
+            (1, 3),
+            "`)",
+            "One two. Three four.",
+            (1, 3),
+            "Marks must be a letter or special char",
+        )),
+        Some(Label("mark:`)")),
+        "exact-column form of `')`",
+    ),
+    rm(
+        Marks,
+        "'{",
+        "'{",
+        NotImplemented,
+        Refuses,
+        Some(live(
+            &["a", "b", "", "c"],
+            (2, 1),
+            "'{",
+            "a|b||c",
+            (2, 1),
+            "Marks must be a letter or special char",
+        )),
+        Some(Label("mark:'{")),
+        "start of the current paragraph, like `{`",
+    ),
+    rm(
+        Marks,
+        "`{",
+        "`{",
+        NotImplemented,
+        Refuses,
+        Some(live(
+            &["a", "b", "", "c"],
+            (2, 1),
+            "`{",
+            "a|b||c",
+            (2, 1),
+            "Marks must be a letter or special char",
+        )),
+        Some(Label("mark:`{")),
+        "exact-column form of `'{`",
+    ),
+    rm(
+        Marks,
+        "'}",
+        "'}",
+        NotImplemented,
+        Refuses,
+        Some(live(
+            &["a", "b", "", "c"],
+            (1, 1),
+            "'}",
+            "a|b||c",
+            (1, 1),
+            "Marks must be a letter or special char",
+        )),
+        Some(Label("mark:'}")),
+        "end of the current paragraph, like `}`",
+    ),
+    rm(
+        Marks,
+        "`}",
+        "`}",
+        NotImplemented,
+        Refuses,
+        Some(live(
+            &["a", "b", "", "c"],
+            (1, 1),
+            "`}",
+            "a|b||c",
+            (1, 1),
+            "Marks must be a letter or special char",
+        )),
+        Some(Label("mark:`}")),
+        "exact-column form of `'}`",
+    ),
+    // ── mark-motions: commands that jump BETWEEN marks ────────────────────
+    rm(
+        Marks,
+        "]'",
+        "]'",
+        NotImplemented,
+        Silent,
+        Some(live(
+            &["a", "b", "  c", "d"],
+            (1, 1),
+            "3Gmagg]'",
+            "a|b|  c|d",
+            (1, 1),
+            "",
+        )),
+        Some(Label("mark:]'")),
+        "[count] times to the next line with a lowercase mark, first non-blank. \
+        Silent no-op today — worth implementing as a set with the three below",
+    ),
+    rm(
+        Marks,
+        "]`",
+        "]`",
+        NotImplemented,
+        Silent,
+        Some(live(
+            &["a", "b", "cde", "d"],
+            (1, 1),
+            "3Gllmagg]`",
+            "a|b|cde|d",
+            (1, 1),
+            "",
+        )),
+        Some(Label("mark:]`")),
+        "[count] times to the next lowercase mark, exact column — silent no-op",
+    ),
+    rm(
+        Marks,
+        "['",
+        "['",
+        NotImplemented,
+        Silent,
+        Some(live(
+            &["a", "  b", "c", "d"],
+            (1, 1),
+            "2GmaG['",
+            "a|  b|c|d",
+            (4, 1),
+            "",
+        )),
+        Some(Label("mark:['")),
+        "backwards form of `]'` — silent no-op",
+    ),
+    rm(
+        Marks,
+        "[`",
+        "[`",
+        NotImplemented,
+        Silent,
+        Some(live(
+            &["a", "bcd", "e"],
+            (1, 1),
+            "2GllmaG[`",
+            "a|bcd|e",
+            (3, 1),
+            "",
+        )),
+        Some(Label("mark:[`")),
+        "backwards form of `` ]` `` — silent no-op",
+    ),
+    // ── mark-motions: command modifiers and the mark view ─────────────────
+    rm(
+        Marks,
+        ":loc[kmarks] {command}",
+        ":lockmarks",
+        NotImplemented,
+        Refuses,
+        Some(live(
+            &["a", "b"],
+            (1, 1),
+            ":lockmarks normal x<CR>",
+            "a|b",
+            (1, 1),
+            "Not an editor command: lockmarks normal x",
+        )),
+        Some(Keys(":lockmarks")),
+        "run a command without adjusting marks. Low value without a VimScript \
+        runtime — its users are plugins doing line-count-preserving rewrites",
+    ),
+    rm(
+        Marks,
+        ":kee[pmarks] {command}",
+        ":keepmarks",
+        NotImplemented,
+        Refuses,
+        Some(live(
+            &["a", "b"],
+            (1, 1),
+            ":keepmarks normal x<CR>",
+            "a|b",
+            (1, 1),
+            "Not an editor command: keepmarks normal x",
+        )),
+        Some(Keys(":keepmarks")),
+        "only affects `:range!` filtering, which vimcode does not have either — \
+        low value",
+    ),
+    rm(
+        Marks,
+        ":keepj[umps] {command}",
+        ":keepjumps",
+        NotImplemented,
+        Refuses,
+        Some(live(
+            &["a", "b", "c"],
+            (1, 1),
+            ":keepjumps normal G<CR>''",
+            "a|b|c",
+            (1, 1),
+            "No previous jump position",
+        )),
+        Some(Keys(":keepjumps")),
+        "run a command without touching `''`/the jumplist/the changelist — same \
+        plugin-facing audience as :lockmarks, low value here",
+    ),
+    rm(
+        Marks,
+        "mark-view ('jumpoptions' \"view\")",
+        "mark-view",
+        NotImplemented,
+        Refuses,
+        Some(live(
+            &["a", "b"],
+            (1, 1),
+            ":set jumpoptions=view<CR>",
+            "a|b",
+            (1, 1),
+            "Unknown option: jumpoptions",
+        )),
+        Some(Keys("jumpoptions")),
+        "restore the window's topline as well as the cursor when jumping to a \
+        mark. Gated on the 'jumpoptions' option, tagged ❌ by the #1225 option \
+        slice — low value",
+    ),
+    // ── mark-motions: marks as operator targets ───────────────────────────
+    rm(
+        Marks,
+        "{operator}'{mark}",
+        "mark-motions",
+        Implemented,
+        Silent,
+        Some(live(&["abc", "def"], (2, 2), "magg0d'a", "", (1, 1), "")),
+        Some(Label("mark:d'a linewise")),
+        "\"Lowercase marks can be used in combination with operators\" — linewise",
+    ),
+    rm(
+        Marks,
+        "{operator}`{mark}",
+        "mark-motions",
+        Implemented,
+        Silent,
+        Some(live(
+            &["abc def"],
+            (1, 5),
+            "ma0c`aX<Esc>",
+            "Xdef",
+            (1, 1),
+            "",
+        )),
+        Some(Label("mark:c`a")),
+        "the backtick form is exclusive-charwise",
+    ),
+    rm(
+        Marks,
+        "y'{mark} cursor placement",
+        "mark-motions",
+        Implemented,
+        Silent,
+        Some(live(
+            &["a", "b", "c"],
+            (3, 1),
+            "maggy'a",
+            "a|b|c",
+            (1, 1),
+            "3 lines yanked",
+        )),
+        Some(Label("mark:y'a cursor")),
+        "after a linewise yank to a mark the cursor lands at the start of the range",
+    ),
+];
+
+/// Oracle cases this slice's rows are not (yet) pinned by — the measurement
+/// #1162 starts from. Shrink-only, exactly like [`COVERAGE_EXEMPT`]: adding a
+/// case for one of these fails [`regmark_audit_oracle_coverage_is_shrink_only`]
+/// until its entry is deleted.
+const REGMARK_COVERAGE_EXEMPT: &[&str] = &[
+    "\"#",
+    "\"*",
+    "\"+",
+    ":reg[isters]",
+    ":reg[isters] {arg}",
+    ":di[splay]",
+    ":di[splay] {arg}",
+    ":[range]pu[t]!",
+    ":put ={expr}",
+    "i_CTRL-R CTRL-R {register}",
+    "i_CTRL-R CTRL-O {register}",
+    "i_CTRL-R CTRL-P {register}",
+    "c_CTRL-R {register}",
+    "c_CTRL-R CTRL-W",
+    "m' and m`",
+    "m[ and m]",
+    "m< and m>",
+    ":[range]k{a-zA-Z'}",
+    "`{A-Z}",
+    "'{0-9} and `{0-9}",
+    "lowercase marks restored by undo/redo",
+    "g'{mark}",
+    "g`{mark}",
+    ":marks",
+    ":marks {arg}",
+    ":delm[arks]!",
+    "']",
+    "'<",
+    "'\"",
+    "`\"",
+    "'^",
+    "'(",
+    "`(",
+    "')",
+    "`)",
+    "'{",
+    "`{",
+    "'}",
+    "`}",
+    "]'",
+    "]`",
+    "['",
+    "[`",
+    ":loc[kmarks] {command}",
+    ":kee[pmarks] {command}",
+    ":keepj[umps] {command}",
+    "mark-view ('jumpoptions' \"view\")",
+];
+
+/// Replay one [`Live`] recording against a real engine. Black-box: keys in,
+/// rendered buffer + cursor + message out.
+fn replay_live(p: &Live) -> (String, (usize, usize), String) {
+    let mut engine = engine_with(&p.lines.join("\n"));
+    // `Engine::new()` loads the *user's real* command history off disk, and
+    // command-line `<C-r>` searches it (that binding conflict is one of this
+    // slice's findings). Leaving it populated would make the `c_CTRL-R` rows
+    // replay whatever the developer last typed at a `:` prompt — a recording
+    // that passes on one machine and executes a random history entry on the
+    // next. `engine_with` already resets settings and extension state for the
+    // same reason; history is the one it misses.
+    engine.history = Default::default();
+    engine.settings.shift_width = 4;
+    engine.settings.expand_tab = true;
+    engine.settings.tabstop = 4;
+    engine.set_viewport_lines(24);
+    engine.view_mut().cursor.line = p.at.0.saturating_sub(1);
+    engine.view_mut().cursor.col = p.at.1.saturating_sub(1);
+    engine.ensure_cursor_visible();
+    send_keys(&mut engine, p.keys);
+    (
+        engine.buffer().to_string().replace('\n', "|"),
+        (engine.view().cursor.line + 1, engine.view().cursor.col + 1),
+        engine.message.clone(),
+    )
+}
+
+/// Every row whose recorded behaviour no longer matches the live engine.
+fn regmark_drift(audit: &'static [RegMarkAudit]) -> Vec<String> {
+    let mut drift: Vec<String> = Vec::new();
+    for e in audit {
+        let Some(p) = e.live.as_ref() else { continue };
+        let (buffer, cursor, message) = replay_live(p);
+        if buffer != p.buffer || cursor != p.cursor || message != p.message {
+            drift.push(format!(
+                "  {:?} ({}): recorded buffer={:?} cursor={:?} message={:?}\n\
+                 {:width$}   live     buffer={:?} cursor={:?} message={:?}",
+                e.item,
+                e.help,
+                p.buffer,
+                p.cursor,
+                p.message,
+                "",
+                buffer,
+                cursor,
+                message,
+                width = 2
+            ));
+        }
+        let measured = measured_report(&message);
+        if measured != e.report {
+            drift.push(format!(
+                "  {:?} ({}): table says {:?}, the live message {:?} is {:?}",
+                e.item, e.help, e.report, message, measured
+            ));
+        }
+    }
+    drift
+}
+
+/// Gate 1 (#1226) — every row's recorded behaviour is a claim about live
+/// code, and this replays all 86 of them (the 89 rows minus the 3 ⏭️) against
+/// it. Pure: no `nvim`, no subprocess, so it runs on every lane.
+#[test]
+fn regmark_audit_matches_the_live_engine() {
+    if let Ok(path) = std::env::var("CONFORMANCE_DUMP_REGMARK") {
+        let mut s = String::new();
+        for e in REGMARK_AUDIT {
+            let Some(p) = e.live.as_ref() else { continue };
+            let (buffer, cursor, message) = replay_live(p);
+            // `{:?}` on a `&str` emits a valid Rust string literal, so a
+            // message containing a real newline round-trips into the table
+            // verbatim instead of being flattened into an ambiguous `\n`.
+            s.push_str(&format!(
+                "{}\t{:?}\t{}\t{}\t{:?}\n",
+                e.item, buffer, cursor.0, cursor.1, message
+            ));
+        }
+        std::fs::write(&path, s).unwrap_or_else(|e| panic!("dump to {path}: {e}"));
+        return;
+    }
+
+    let drift = regmark_drift(REGMARK_AUDIT);
+    assert!(
+        drift.is_empty(),
+        "\n\n== registers/marks audit drifted from the engine (#1226) ==\n\
+         Each row records what vimcode actually did when the slice ran.\n\
+         Implementing (or breaking) one of these changes that recording, so\n\
+         re-tag the row — that is how the audit stays true instead of rotting\n\
+         like a markdown checklist.\n\n{}\n\n\
+         A command that gained an implementation also needs its status changed\n\
+         from NotImplemented, and a REGMARK_COVERAGE_EXEMPT entry deleted once\n\
+         an oracle case pins it.\n",
+        drift.join("\n")
+    );
+}
+
+/// Gate 1b (#1226) — the table describes itself correctly: complete, grouped
+/// by `:help` area, unique, no unreviewed row, every ⏭️ carrying a reason from
+/// the shared vocabulary, and a live recording + probe on exactly the rows
+/// that can have one.
+#[test]
+fn regmark_audit_is_internally_consistent() {
+    use std::collections::HashSet;
+    let mut problems: Vec<String> = Vec::new();
+
+    assert_eq!(
+        REGMARK_AUDIT.len(),
+        89,
+        "`:help registers` + `:help mark-motions` walked to 89 entries; the \
+         audit must tag all of them"
+    );
+
+    let mut seen: HashSet<&str> = HashSet::new();
+    let mut in_marks = false;
+    for e in REGMARK_AUDIT {
+        if !seen.insert(e.item) {
+            problems.push(format!("  {:?}: listed twice", e.item));
+        }
+        match e.area {
+            RmArea::Registers if in_marks => problems.push(format!(
+                "  {:?}: a `:help registers` row after the marks rows — the table \
+                 is grouped by area, in `:help` order within each",
+                e.item
+            )),
+            RmArea::Marks => in_marks = true,
+            _ => {}
+        }
+        if e.note.trim().is_empty() {
+            problems.push(format!(
+                "  {:?}: empty note — every row is reviewed",
+                e.item
+            ));
+        }
+        if e.help.trim().is_empty() {
+            problems.push(format!("  {:?}: no `:help` tag", e.item));
+        }
+
+        let in_scope = !matches!(e.status, OptStatus::Skipped(_));
+        if let OptStatus::Skipped(reason) = e.status {
+            if !SKIP_REASONS.contains(&reason) {
+                problems.push(format!(
+                    "  {:?}: skip reason {reason:?} is not in SKIP_REASONS",
+                    e.item
+                ));
+            }
+        }
+        if in_scope && e.live.is_none() {
+            problems.push(format!(
+                "  {:?}: not skipped, so it must carry a live recording",
+                e.item
+            ));
+        }
+        if in_scope && e.probe.is_none() {
+            problems.push(format!(
+                "  {:?}: not skipped, so it must carry an oracle probe",
+                e.item
+            ));
+        }
+        if !in_scope && (e.live.is_some() || e.probe.is_some()) {
+            problems.push(format!(
+                "  {:?}: skipped, so a live recording or probe can never fire",
+                e.item
+            ));
+        }
+    }
+
+    // The headline tally, pinned. The module doc quotes these numbers and a
+    // PR body quotes the module doc; without this they drift the moment a row
+    // is re-tagged, which is the exact rot a markdown checklist suffers from.
+    let tally = |want: fn(&RegMarkAudit) -> bool| REGMARK_AUDIT.iter().filter(|e| want(e)).count();
+    assert_eq!(
+        (
+            tally(|e| matches!(e.status, OptStatus::Implemented)),
+            tally(|e| matches!(e.status, OptStatus::Partial)),
+            tally(|e| matches!(e.status, OptStatus::NotImplemented)),
+            tally(|e| matches!(e.status, OptStatus::Skipped(_))),
+            tally(|e| matches!(e.area, RmArea::Registers)),
+            tally(|e| matches!(e.area, RmArea::Marks)),
+            tally(|e| matches!(e.status, OptStatus::NotImplemented) && e.report == Report::Silent),
+        ),
+        (42, 12, 32, 3, 34, 55, 8),
+        "the audit tally moved: (implemented, partial, missing, skipped, \
+         registers, marks, missing-and-silent). Update the module doc's table \
+         in the same commit."
+    );
+
+    assert!(
+        problems.is_empty(),
+        "\n\n== registers/marks audit table is inconsistent (#1226) ==\n{}\n",
+        problems.join("\n")
+    );
+}
+
+/// `cases` is `(label, keys)` for the whole corpus — the same view
+/// [`classify_coverage`] takes.
+fn classify_regmark_coverage(
+    audit: &'static [RegMarkAudit],
+    exempt: &[&'static str],
+    cases: &[(&'static str, &'static str)],
+) -> OptionCoverage {
+    use std::collections::HashSet;
+    let exempt_set: HashSet<&str> = exempt.iter().copied().collect();
+    let mut v = OptionCoverage::default();
+    for e in audit {
+        let Some(probe) = e.probe else { continue };
+        v.in_scope += 1;
+        let covered = cases.iter().any(|(label, keys)| probe.matches(label, keys));
+        match (covered, exempt_set.contains(e.item)) {
+            (false, false) => v.uncovered.push(e.item),
+            (true, true) => v.newly_covered.push(e.item),
+            _ => {}
+        }
+    }
+    v.stale = exempt
+        .iter()
+        .copied()
+        .filter(|n| !audit.iter().any(|e| e.item == *n && e.probe.is_some()))
+        .collect();
+    v
+}
+
+/// Gate 2 (#1226) — #1007's ratchet, applied to the audited commands: an
+/// in-scope row whose probe matches nothing must be exempt, and an exempt row
+/// whose probe now matches must lose its entry. Pure.
+#[test]
+fn regmark_audit_oracle_coverage_is_shrink_only() {
+    use std::collections::HashSet;
+    let corpus = all_corpus_cases();
+    let exempt: HashSet<&str> = REGMARK_COVERAGE_EXEMPT.iter().copied().collect();
+    assert_eq!(
+        exempt.len(),
+        REGMARK_COVERAGE_EXEMPT.len(),
+        "REGMARK_COVERAGE_EXEMPT lists an item twice"
+    );
+
+    let v = classify_regmark_coverage(REGMARK_AUDIT, REGMARK_COVERAGE_EXEMPT, &corpus);
+
+    if let Ok(path) = std::env::var("CONFORMANCE_DUMP_REGMARK_COVERAGE") {
+        let mut s = String::new();
+        for n in &v.uncovered {
+            s.push_str(&format!("UNCOVERED\t{n}\n"));
+        }
+        for n in &v.newly_covered {
+            s.push_str(&format!("NEWLY_COVERED\t{n}\n"));
+        }
+        for n in &v.stale {
+            s.push_str(&format!("STALE\t{n}\n"));
+        }
+        // Every credited row plus the case that credits it — the
+        // over-crediting check the section doc demands a human be able to do
+        // in one grep (`Keys("g'")` silently matching `magg'a` is exactly
+        // the failure mode #1007's "deliberately dumb probe" note warns of).
+        for e in REGMARK_AUDIT {
+            let Some(probe) = e.probe else { continue };
+            if let Some((label, _)) = corpus
+                .iter()
+                .find(|(label, keys)| probe.matches(label, keys))
+            {
+                s.push_str(&format!(
+                    "COVERED\t{}\t{:?}\t{}\n",
+                    e.item,
+                    probe.needle(),
+                    label
+                ));
+            }
+        }
+        std::fs::write(&path, s).unwrap_or_else(|e| panic!("dump to {path}: {e}"));
+        return;
+    }
+
+    let covered = v.in_scope - REGMARK_COVERAGE_EXEMPT.len();
+    println!(
+        "\n== registers/marks oracle coverage (#1226) ==\n\
+         {covered}/{} audited commands are pinned by an oracle case; {} exempt.\n",
+        v.in_scope,
+        REGMARK_COVERAGE_EXEMPT.len()
+    );
+
+    assert!(
+        v.uncovered.is_empty() && v.newly_covered.is_empty() && v.stale.is_empty(),
+        "\n\n== registers/marks oracle coverage moved (#1226) ==\n\
+         UNCOVERED (probe matches no case — add the case, or exempt it only when \
+         seeding a newly-tagged command):\n  {:?}\n\
+         NEWLY COVERED (a case now pins it — delete the REGMARK_COVERAGE_EXEMPT \
+         entry; that is how the list shrinks):\n  {:?}\n\
+         STALE (exempt but not an in-scope audited command):\n  {:?}\n",
+        v.uncovered,
+        v.newly_covered,
+        v.stale
+    );
+}
+
+/// `"%` and `"#` hold the file name, and this pins the finding the `Live`
+/// recordings above cannot reach: with a real file open, both registers paste
+/// the **basename**, where Vim pastes the name as it was typed. Black-box —
+/// it drives `"%p` and reads the rendered buffer, not `Engine::registers`.
+#[test]
+fn register_percent_and_hash_paste_basenames_not_paths() {
+    // Same temp-dir convention as the multi-file harness above: an explicit
+    // `probe_id()`-suffixed directory, canonicalized once, no new dependency.
+    let dir = std::env::temp_dir().join(format!("vimcode_regmark_{}", probe_id()));
+    let nested = dir.join("src");
+    std::fs::create_dir_all(&nested).expect("create temp dir for the \"% probe");
+    let nested = nested.canonicalize().unwrap_or(nested);
+    let alpha = nested.join("alpha.txt");
+    let beta = nested.join("beta.txt");
+    std::fs::write(&alpha, "one\n").expect("write alpha");
+    std::fs::write(&beta, "two\n").expect("write beta");
+
+    let mut engine = engine_with("");
+    engine
+        .open_file_with_mode(&alpha, OpenMode::Permanent)
+        .expect("open alpha");
+    engine
+        .open_file_with_mode(&beta, OpenMode::Permanent)
+        .expect("open beta");
+
+    // `"%p` on the current buffer, then `"#p` for the alternate one (#1161).
+    send_keys(&mut engine, "\"%p");
+    let after_percent = engine.buffer().to_string();
+    assert!(
+        after_percent.contains("beta.txt"),
+        "`\"%p` must paste the current file name, got {after_percent:?}"
+    );
+    assert!(
+        !after_percent.contains("src/beta.txt") && !after_percent.contains("src\\beta.txt"),
+        "documented divergence (#1226): vimcode pastes the BASENAME, Vim pastes \
+         the name as typed. If this now pastes a path, the `\"%` row is no longer \
+         Partial — re-tag it. Got {after_percent:?}"
+    );
+
+    send_keys(&mut engine, "u\"#p");
+    let after_hash = engine.buffer().to_string();
+    assert!(
+        after_hash.contains("alpha.txt"),
+        "`\"#p` must paste the alternate file name, got {after_hash:?}"
+    );
+    assert!(
+        !after_hash.contains("src/alpha.txt") && !after_hash.contains("src\\alpha.txt"),
+        "documented divergence (#1226): `\"#` pastes the BASENAME too. Got {after_hash:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// All three gates, observed **failing** — on synthetic input for the shapes
+/// a human would otherwise take on trust, and on the **real** table and
+/// corpus for the two that matter most. #553 shipped black-box tests that
+/// stayed green with the bug reinstated; an audit whose gate cannot go red is
+/// the same mistake in table form.
+#[test]
+fn regmark_audit_gates_are_bidirectional() {
+    // ── Gate 1, direction A: a row that under-claims. `'a` works, so
+    // recording it as a no-op must be caught.
+    static MIS_NOOP: &[RegMarkAudit] = &[rm(
+        Marks,
+        "'{a-z}",
+        "'a",
+        Implemented,
+        Silent,
+        Some(live(
+            &["  a", "b", "c"],
+            (1, 3),
+            "majj'a",
+            "  a|b|c",
+            (3, 1),
+            "",
+        )),
+        Some(Label("mark:'a first nonblank")),
+        "deliberately mis-recorded fixture: the real cursor lands on (1, 3)",
+    )];
+    assert_eq!(
+        regmark_drift(MIS_NOOP).len(),
+        1,
+        "mis-recording a working command must be caught"
+    );
+
+    // ── Gate 1, direction B: a row that over-claims. This is the direction
+    // that fires when a NotImplemented row *gains* an implementation: record
+    // `'(` as working and the replay must disagree.
+    static MIS_WORKS: &[RegMarkAudit] = &[rm(
+        Marks,
+        "'(",
+        "'(",
+        Implemented,
+        Silent,
+        Some(live(
+            &["One two. Three four."],
+            (1, 12),
+            "'(",
+            "One two. Three four.",
+            (1, 10),
+            "",
+        )),
+        Some(Label("mark:'(")),
+        "deliberately mis-recorded fixture: `'(` is not implemented",
+    )];
+    let drift = regmark_drift(MIS_WORKS);
+    assert_eq!(
+        drift.len(),
+        2,
+        "claiming an unimplemented command works must be caught for BOTH the \
+         recording and the Report column: {drift:?}"
+    );
+
+    // ── Gate 1, direction C: the Report column on its own. `:marks {arg}`
+    // really is refused, so tagging it Silent must fail even though the
+    // buffer/cursor/message recording is correct.
+    static MIS_SILENT: &[RegMarkAudit] = &[rm(
+        Marks,
+        ":marks {arg}",
+        ":marks",
+        NotImplemented,
+        Silent,
+        Some(live(
+            &["a", "b"],
+            (1, 1),
+            "ma:marks a<CR>",
+            "a|b",
+            (1, 1),
+            "Not an editor command: marks a",
+        )),
+        Some(Label("mark::marks a")),
+        "deliberately mis-tagged fixture: vimcode refuses this loudly",
+    )];
+    assert_eq!(
+        regmark_drift(MIS_SILENT)
+            .iter()
+            .filter(|d| d.contains("table says Silent"))
+            .count(),
+        1,
+        "calling a loud refusal Silent must be caught"
+    );
+
+    // ── Gate 1 against the REAL table: every recording is load-bearing, so
+    // perturbing one must fail. (Cheap proof that the 86 replays are really
+    // compared, not collected and dropped.)
+    let victim = REGMARK_AUDIT
+        .iter()
+        .find(|e| e.item == "]'")
+        .expect("fixture drifted — the `]'` row is gone");
+    let mut perturbed = *victim.live.as_ref().expect("`]'` has a recording");
+    perturbed.cursor = (perturbed.cursor.0 + 1, perturbed.cursor.1);
+    let (_, cursor, _) = replay_live(&perturbed);
+    assert_ne!(
+        cursor, perturbed.cursor,
+        "a perturbed recording must disagree with the live engine"
+    );
+
+    // ── Gate 2, direction A (synthetic): an in-scope row nothing pins, and
+    // nothing exempts.
+    static UNPINNED: &[RegMarkAudit] = &[rm(
+        Marks,
+        "'{a-z}",
+        "'a",
+        Implemented,
+        Silent,
+        None,
+        Some(Label("mark:'a first nonblank")),
+        "fixture",
+    )];
+    let empty: Vec<(&str, &str)> = Vec::new();
+    assert_eq!(
+        classify_regmark_coverage(UNPINNED, &[], &empty).uncovered,
+        vec!["'{a-z}"]
+    );
+    // …and exempting it makes the same table clean.
+    assert!(classify_regmark_coverage(UNPINNED, &["'{a-z}"], &empty)
+        .uncovered
+        .is_empty());
+
+    // ── Gate 2, direction B (synthetic): an exempt row a case now pins.
+    let pinned = vec![("mark:'a first nonblank", "majj'a")];
+    assert_eq!(
+        classify_regmark_coverage(UNPINNED, &["'{a-z}"], &pinned).newly_covered,
+        vec!["'{a-z}"]
+    );
+
+    // ── Gate 2, direction C (synthetic): a stale exemption.
+    assert_eq!(
+        classify_regmark_coverage(UNPINNED, &["'{a-z}", "`{a-z}"], &pinned).stale,
+        vec!["`{a-z}"]
+    );
+
+    // ── Gate 2 against the REAL table and corpus: deleting an exempt entry
+    // must fail, and adding a case that pins an exempt command must fail.
+    // Anything less and the list could grow silently.
+    let corpus = all_corpus_cases();
+    let victim = "'\"";
+    assert!(
+        REGMARK_COVERAGE_EXEMPT.contains(&victim),
+        "fixture drifted — {victim} is no longer exempt"
+    );
+    let without: Vec<&str> = REGMARK_COVERAGE_EXEMPT
+        .iter()
+        .copied()
+        .filter(|n| *n != victim)
+        .collect();
+    assert_eq!(
+        classify_regmark_coverage(REGMARK_AUDIT, &without, &corpus).uncovered,
+        vec![victim],
+        "deleting {victim:?} from REGMARK_COVERAGE_EXEMPT must fail the gate"
+    );
+    let mut plus = corpus.clone();
+    plus.push(("mark:'\" last exit position", "'\""));
+    assert_eq!(
+        classify_regmark_coverage(REGMARK_AUDIT, REGMARK_COVERAGE_EXEMPT, &plus).newly_covered,
         vec![victim],
         "a case pinning {victim:?} must force its exemption to be deleted"
     );
