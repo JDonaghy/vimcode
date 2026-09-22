@@ -2309,11 +2309,20 @@ impl Engine {
 
     /// The "list is empty" message for the target, matching Vim's distinct
     /// quickfix (`E42`) vs location-list (`E776`) wording.
-    fn qf_empty_msg(win: Option<WindowId>) -> String {
+    ///
+    /// #1283: confirmed by hand against `nvim --headless -u NONE` — the
+    /// global-list message is `E42: No Errors` verbatim (capital `E` in
+    /// `Errors`), not the "Quickfix list is empty" prose this used to read.
+    /// The wrong casing/wording was invisible before #1283 because nothing
+    /// in the oracle corpus compared it: the buffer/cursor-only `Case`
+    /// harness `ex:cc on empty quickfix list` (#1154) can't see `message` at
+    /// all, and its paired engine-level test asserted the same wrong text
+    /// back (`.contains("No errors")`) — see that test's #1283 update.
+    pub(super) fn qf_empty_msg(win: Option<WindowId>) -> String {
         if win.is_some() {
             "E776: No location list".to_string()
         } else {
-            "Quickfix list is empty".to_string()
+            "E42: No Errors".to_string()
         }
     }
 
@@ -2390,8 +2399,20 @@ impl Engine {
     }
 
     /// Open the target panel and give it focus.
+    ///
+    /// #1283 finding, confirmed by hand against `nvim --headless -u NONE`:
+    /// `:copen` opens the quickfix window **unconditionally** — even on a
+    /// totally empty list (`winnr('$')` goes 1 -> 2, no error) — so the
+    /// global list (`win == None`, which always exists per `qf_get`) must
+    /// never refuse here. `:lopen` only refuses when the *window has never
+    /// had a location list at all* (`E776: No location list`); once one
+    /// exists — even populated with zero items via `setloclist(0, [])` —
+    /// `:lopen` opens it exactly like `:copen`. `qf_get` (read-only, no
+    /// autovivify) is what distinguishes "never created" from "empty",
+    /// unlike `qf_get_mut`'s `entry(..).or_default()` this used to check
+    /// against, which collapsed both into the same wrong refusal.
     pub fn qf_open(&mut self, win: Option<WindowId>) -> EngineAction {
-        if self.qf_get_mut(win).items.is_empty() {
+        if win.is_some() && self.qf_get(win).is_none() {
             self.message = Self::qf_empty_msg(win);
             return EngineAction::None;
         }
@@ -2410,8 +2431,21 @@ impl Engine {
     }
 
     /// `:cwindow`/`:lwindow` — open the panel only if the target list is
-    /// non-empty; close it (if open) otherwise. Never errors.
+    /// non-empty; close it (if open) otherwise.
+    ///
+    /// #1283 finding: `:cwindow` never errors (the global list always
+    /// exists), matching the pre-existing behaviour below. But `:lwindow`
+    /// on a window with **no location list at all** does error (`E776: No
+    /// location list`, confirmed against a live oracle) rather than silently
+    /// no-op like it does once a list exists (even an empty one, via
+    /// `setloclist(0, [])`) — the same "never created" vs "empty" split as
+    /// `qf_open` above, so it needs the same `qf_get` (not `qf_get_mut`)
+    /// existence check first.
     pub fn qf_window(&mut self, win: Option<WindowId>) -> EngineAction {
+        if win.is_some() && self.qf_get(win).is_none() {
+            self.message = Self::qf_empty_msg(win);
+            return EngineAction::None;
+        }
         let empty = self.qf_get_mut(win).items.is_empty();
         let list = self.qf_get_mut(win);
         if empty {
@@ -2425,15 +2459,34 @@ impl Engine {
     }
 
     /// Move to the next entry and jump to it.
+    ///
+    /// #1283 finding: on an empty (or, for a location list, altogether
+    /// absent) target, real Neovim's `:cnext`/`:lnext` refuse with an
+    /// explicit error (`E42: No Errors` / `E776: No location list`) rather
+    /// than silently doing nothing. Before this fix `qf_jump` still declined
+    /// to move (there is no item at index 0 of an empty `Vec`), so the
+    /// buffer/cursor-only oracle `Case` harness could not see the gap — only
+    /// `engine.message` can, which is why this is paired with an
+    /// engine-level test rather than relying on a `Case` alone (same
+    /// precedent as `ex:cc on empty quickfix list`, #1154).
     pub fn qf_next(&mut self, win: Option<WindowId>) -> EngineAction {
+        if self.qf_get(win).is_none_or(|l| l.items.is_empty()) {
+            self.message = Self::qf_empty_msg(win);
+            return EngineAction::None;
+        }
         let list = self.qf_get_mut(win);
         let max = list.items.len().saturating_sub(1);
         list.selected = (list.selected + 1).min(max);
         self.qf_jump(win)
     }
 
-    /// Move to the previous entry and jump to it.
+    /// Move to the previous entry and jump to it. See [`Engine::qf_next`]'s
+    /// #1283 doc comment — same empty/absent-list refusal.
     pub fn qf_prev(&mut self, win: Option<WindowId>) -> EngineAction {
+        if self.qf_get(win).is_none_or(|l| l.items.is_empty()) {
+            self.message = Self::qf_empty_msg(win);
+            return EngineAction::None;
+        }
         let list = self.qf_get_mut(win);
         list.selected = list.selected.saturating_sub(1);
         self.qf_jump(win)

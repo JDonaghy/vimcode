@@ -1690,9 +1690,15 @@ impl Engine {
             }
         }
         // Handle bare :cc / :ll — (re-)jump to the current entry.
+        //
+        // #1283: these used to hardcode "E42: No errors" (lowercase
+        // "errors") — real Neovim's message is "E42: No Errors" (confirmed
+        // against a live oracle). Routing through `Engine::qf_empty_msg`
+        // fixes the casing once instead of three times and keeps it from
+        // drifting again.
         if cmd == "cc" {
             if self.quickfix.items.is_empty() {
-                self.message = "E42: No errors".to_string();
+                self.message = Self::qf_empty_msg(None);
                 return EngineAction::None;
             }
             return self.qf_jump(None);
@@ -1700,7 +1706,7 @@ impl Engine {
         if cmd == "ll" {
             let win = self.active_window_id();
             if self.qf_get(Some(win)).is_none_or(|l| l.items.is_empty()) {
-                self.message = "E776: No location list".to_string();
+                self.message = Self::qf_empty_msg(Some(win));
                 return EngineAction::None;
             }
             return self.qf_jump(Some(win));
@@ -1708,7 +1714,7 @@ impl Engine {
         // Handle :cfirst / :lfirst — jump to the first entry.
         if cmd == "cfirst" {
             if self.quickfix.items.is_empty() {
-                self.message = "E42: No errors".to_string();
+                self.message = Self::qf_empty_msg(None);
                 return EngineAction::None;
             }
             return self.qf_go(None, 0);
@@ -1716,7 +1722,7 @@ impl Engine {
         if cmd == "lfirst" {
             let win = self.active_window_id();
             if self.qf_get(Some(win)).is_none_or(|l| l.items.is_empty()) {
-                self.message = "E776: No location list".to_string();
+                self.message = Self::qf_empty_msg(Some(win));
                 return EngineAction::None;
             }
             return self.qf_go(Some(win), 0);
@@ -1724,7 +1730,7 @@ impl Engine {
         // Handle :clast / :llast — jump to the last entry.
         if cmd == "clast" {
             if self.quickfix.items.is_empty() {
-                self.message = "E42: No errors".to_string();
+                self.message = Self::qf_empty_msg(None);
                 return EngineAction::None;
             }
             return self.qf_go(None, self.quickfix.items.len() - 1);
@@ -1736,7 +1742,7 @@ impl Engine {
                 .map(|l| l.items.len())
                 .filter(|&n| n > 0)
             else {
-                self.message = "E776: No location list".to_string();
+                self.message = Self::qf_empty_msg(Some(win));
                 return EngineAction::None;
             };
             return self.qf_go(Some(win), len - 1);
