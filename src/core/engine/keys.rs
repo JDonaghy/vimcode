@@ -1072,8 +1072,14 @@ impl Engine {
                     self.increment_number_at_cursor(-(count as i64), &mut false);
                     return EngineAction::None;
                 }
-                "6" => {
-                    // Ctrl-^ (Ctrl-6): edit alternate file
+                "6" | "^" => {
+                    // Ctrl-^ (Ctrl-6): edit alternate file. #1281: some
+                    // backends report this combo as the base key ("6",
+                    // physical Ctrl+6) and some as the shifted glyph
+                    // Ctrl+Shift+6 actually types ("^") — Neovim's own
+                    // `<C-^>` termcode decodes to the same control byte
+                    // either way (`:h CTRL-^`), so both spellings dispatch
+                    // here rather than only one silently doing nothing.
                     // Takes priority over Ctrl+6 focus group
                     self.alternate_buffer();
                     return EngineAction::None;
@@ -3387,14 +3393,21 @@ impl Engine {
                             }
                         }
                         _ if ch.is_ascii_uppercase() => {
-                            if let Some(&(_, line, col)) = self.global_marks.get(&ch) {
-                                let max_line = self.buffer().len_lines().saturating_sub(1);
-                                let target_line = line.min(max_line);
-                                let pre_cursor = self.view().cursor;
+                            // `` `A ``: exact position, across files if the
+                            // mark was set in a different one (#1281 —
+                            // `resolve_global_mark`'s own doc comment has the
+                            // full history of why this used to be a same-
+                            // buffer-only no-op for a cross-file mark).
+                            let pre_cursor = self.view().cursor;
+                            if let Some(((target_line, target_col), switched)) =
+                                self.resolve_global_mark(ch, true)
+                            {
                                 self.view_mut().cursor.line = target_line;
-                                self.view_mut().cursor.col = col;
+                                self.view_mut().cursor.col = target_col;
                                 self.clamp_cursor_col();
-                                self.record_jump_from(pre_cursor);
+                                if !switched {
+                                    self.record_jump_from(pre_cursor);
+                                }
                             } else {
                                 self.message = format!("Mark `{}` not set", ch);
                             }
@@ -3406,26 +3419,32 @@ impl Engine {
                 }
             }
             '\x07' => {
-                // g': jump to mark line WITHOUT adding to jump list
+                // g': jump to mark line WITHOUT adding to jump list. Like
+                // `'{mark}`, lands on the first non-blank — #1281 fixed this
+                // from a hardcoded column 0 (already documented as a
+                // `Partial` row in REGMARK_AUDIT's `g'{mark}` entry).
                 if let Some(ch) = unicode {
                     if ch.is_ascii_lowercase() {
                         let buffer_id = self.active_window().buffer_id;
-                        if let Some(buffer_marks) = self.marks.get(&buffer_id) {
-                            if let Some(mark_cursor) = buffer_marks.get(&ch) {
-                                self.view_mut().cursor.line = mark_cursor.line;
-                                self.view_mut().cursor.col = 0;
-                                self.clamp_cursor_col();
-                            } else {
-                                self.message = format!("Mark '{}' not set", ch);
-                            }
+                        let target_line = self
+                            .marks
+                            .get(&buffer_id)
+                            .and_then(|m| m.get(&ch))
+                            .map(|c| c.line);
+                        if let Some(target_line) = target_line {
+                            self.view_mut().cursor.line = target_line;
+                            self.view_mut().cursor.col = self.first_non_blank_col(target_line);
+                            self.clamp_cursor_col();
                         } else {
                             self.message = format!("Mark '{}' not set", ch);
                         }
                     } else if ch.is_ascii_uppercase() {
-                        if let Some(&(_, line, _)) = self.global_marks.get(&ch) {
-                            let max_line = self.buffer().len_lines().saturating_sub(1);
-                            self.view_mut().cursor.line = line.min(max_line);
-                            self.view_mut().cursor.col = 0;
+                        // g'A: across files if the mark was set in a
+                        // different one, same fix as `` `A `` above but
+                        // never recording a jump (#1281).
+                        if let Some(((target_line, _), _)) = self.resolve_global_mark(ch, false) {
+                            self.view_mut().cursor.line = target_line;
+                            self.view_mut().cursor.col = self.first_non_blank_col(target_line);
                             self.clamp_cursor_col();
                         } else {
                             self.message = format!("Mark '{}' not set", ch);
@@ -3449,10 +3468,13 @@ impl Engine {
                             self.message = format!("Mark `{}` not set", ch);
                         }
                     } else if ch.is_ascii_uppercase() {
-                        if let Some(&(_, line, col)) = self.global_marks.get(&ch) {
-                            let max_line = self.buffer().len_lines().saturating_sub(1);
-                            self.view_mut().cursor.line = line.min(max_line);
-                            self.view_mut().cursor.col = col;
+                        // g`A: across files if the mark was set in a
+                        // different one, never recording a jump (#1281).
+                        if let Some(((target_line, target_col), _)) =
+                            self.resolve_global_mark(ch, false)
+                        {
+                            self.view_mut().cursor.line = target_line;
+                            self.view_mut().cursor.col = target_col;
                             self.clamp_cursor_col();
                         } else {
                             self.message = format!("Mark `{}` not set", ch);
