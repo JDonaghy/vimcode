@@ -3,6 +3,7 @@ use vimcode_core::core::engine::Engine;
 
 fn engine() -> Engine {
     vimcode_core::core::session::suppress_disk_saves();
+    vimcode_core::core::session::suppress_disk_loads();
     let mut e = Engine::new();
     e.settings = vimcode_core::core::settings::Settings::default();
     e
