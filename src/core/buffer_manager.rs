@@ -1315,37 +1315,73 @@ impl BufferManager {
         }
     }
 
-    /// Create a buffer from a file. Reuses existing buffer if file is already open.
-    pub fn open_file(&mut self, path: &Path) -> Result<BufferId, io::Error> {
-        // Check if file is already open
+    /// True if `path` (canonicalized) is already open under some `BufferId`.
+    /// Mirrors the dedup check `open_file` does internally, exposed so
+    /// callers can decide reuse-vs-create *before* calling it (#1298: `:edit`
+    /// reusing the pristine scratch buffer must lose to an already-open
+    /// buffer for the same path, matching Neovim).
+    pub fn is_path_open(&self, path: &Path) -> bool {
         let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-        for (id, state) in &self.buffers {
-            if let Some(ref existing_path) = state.file_path {
+        self.buffers.values().any(|state| {
+            state.file_path.as_ref().is_some_and(|existing_path| {
                 let existing_canonical = existing_path
                     .canonicalize()
                     .unwrap_or_else(|_| existing_path.clone());
-                if existing_canonical == canonical {
-                    return Ok(*id);
-                }
-            }
+                existing_canonical == canonical
+            })
+        })
+    }
+
+    /// Build the `BufferState` for opening `path` into buffer `id` — shared
+    /// by [`open_file`](Self::open_file) (fresh id) and
+    /// [`reopen_buffer`](Self::reopen_buffer) (reused id).
+    fn load_buffer_state(id: BufferId, path: &Path) -> Result<BufferState, io::Error> {
+        if path.exists() {
+            let buffer = Buffer::from_file(id, path)?;
+            Ok(BufferState::with_file(buffer, path.to_path_buf()))
+        } else {
+            // New file (doesn't exist yet)
+            let buffer = Buffer::new(id);
+            Ok(BufferState::with_file(buffer, path.to_path_buf()))
+        }
+    }
+
+    /// Create a buffer from a file. Reuses existing buffer if file is already open.
+    pub fn open_file(&mut self, path: &Path) -> Result<BufferId, io::Error> {
+        // Check if file is already open
+        if let Some(id) = self.buffers.iter().find_map(|(id, state)| {
+            let existing_path = state.file_path.as_ref()?;
+            let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+            let existing_canonical = existing_path
+                .canonicalize()
+                .unwrap_or_else(|_| existing_path.clone());
+            (existing_canonical == canonical).then_some(*id)
+        }) {
+            return Ok(id);
         }
 
         // Create new buffer
         let id = BufferId(self.next_id);
         self.next_id += 1;
 
-        let buffer_state = if path.exists() {
-            let buffer = Buffer::from_file(id, path)?;
-            BufferState::with_file(buffer, path.to_path_buf())
-        } else {
-            // New file (doesn't exist yet)
-            let buffer = Buffer::new(id);
-            BufferState::with_file(buffer, path.to_path_buf())
-        };
-
+        let buffer_state = Self::load_buffer_state(id, path)?;
         self.buffers.insert(id, buffer_state);
         self.add_recent_file(path);
         Ok(id)
+    }
+
+    /// Rewrite `id`'s buffer in place to open `path`, keeping the same
+    /// `BufferId` instead of allocating a new one — Neovim's `:edit` reuses
+    /// the still-pristine startup scratch buffer this way rather than
+    /// leaving it behind as a numbered phantom (#1298). Caller
+    /// (`Engine::open_file_with_mode_impl`) is responsible for checking that
+    /// `id` is actually still-pristine and that `path` isn't already open
+    /// under a different id; this just performs the in-place replace.
+    pub fn reopen_buffer(&mut self, id: BufferId, path: &Path) -> Result<(), io::Error> {
+        let buffer_state = Self::load_buffer_state(id, path)?;
+        self.buffers.insert(id, buffer_state);
+        self.add_recent_file(path);
+        Ok(())
     }
 
     /// Get a reference to a buffer state.

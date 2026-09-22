@@ -3090,6 +3090,11 @@ impl Engine {
         let initial_id = self.active_buffer_id();
         let mut any_opened = false;
         let mut first = true;
+        // `open_file_with_mode` may itself reuse `initial_id` in place for
+        // the first file if it's still the pristine startup scratch buffer
+        // (#1298) -- in which case it's no longer an empty scratch buffer to
+        // clean up below, it *is* one of the restored file buffers.
+        let mut initial_id_reused = false;
 
         for path in &paths {
             if !path.exists() {
@@ -3100,6 +3105,7 @@ impl Engine {
                 if self.open_file_with_mode(path, OpenMode::Permanent).is_ok() {
                     any_opened = true;
                     first = false;
+                    initial_id_reused = self.active_buffer_id() == initial_id;
                 }
             } else {
                 // Each subsequent file gets its own tab.
@@ -3118,8 +3124,13 @@ impl Engine {
             return;
         }
 
-        // Remove the initial empty scratch buffer now that real files are open.
-        let _ = self.delete_buffer(initial_id, true);
+        // Remove the initial empty scratch buffer now that real files are
+        // open -- unless `open_file_with_mode` already renamed it in place
+        // for the first file (#1298), in which case deleting it here would
+        // delete that file's buffer too.
+        if !initial_id_reused {
+            let _ = self.delete_buffer(initial_id, true);
+        }
 
         // Switch focus to the tab showing the previously-active file.
         if let Some(ref ap) = active {

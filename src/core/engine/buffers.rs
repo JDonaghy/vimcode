@@ -3338,15 +3338,34 @@ impl Engine {
     ) -> Result<(), String> {
         // Check which buffers exist before opening (to detect reuse vs creation)
         let existing_ids: Vec<_> = self.buffer_manager.list();
+        let current = self.active_buffer_id();
 
-        let buffer_id = self
-            .buffer_manager
-            .open_file(path)
-            .map_err(|e| format!("Error: {}", e))?;
+        // Neovim's `:edit` (and anything else routed through this fn — gf,
+        // jumplist navigation, panel/git/DAP opens, CLI startup) renames the
+        // still-pristine startup scratch buffer in place instead of leaving
+        // it behind as a numbered phantom (#1298) -- but only when this
+        // would otherwise *create* a brand-new buffer. If `path` is already
+        // open under a different id, switching to that existing buffer wins
+        // and the pristine buffer is left untouched (verified against real
+        // Neovim: `:new` then `:edit <already-open-file>` leaves the fresh
+        // scratch buffer behind as an orphaned "[No Name]").
+        let reuse_pristine =
+            self.is_pristine_scratch_buffer(current) && !self.buffer_manager.is_path_open(path);
+
+        let buffer_id = if reuse_pristine {
+            self.buffer_manager
+                .reopen_buffer(current, path)
+                .map_err(|e| format!("Error: {}", e))?;
+            current
+        } else {
+            self.buffer_manager
+                .open_file(path)
+                .map_err(|e| format!("Error: {}", e))?
+        };
         self.buffer_manager
             .apply_language_map(buffer_id, &self.settings.language_map);
 
-        let already_existed = existing_ids.contains(&buffer_id);
+        let already_existed = !reuse_pristine && existing_ids.contains(&buffer_id);
         let is_already_permanent = already_existed
             && self
                 .buffer_manager
@@ -3360,8 +3379,11 @@ impl Engine {
         // `append_jump_list_entry`'s top-entry check anyway, but not before
         // stamping a possibly-stale `''` mark). Also skip when leaving a
         // still-pristine scratch buffer -- real Neovim doesn't record that
-        // either (`is_pristine_scratch_buffer`'s doc comment).
-        let current = self.active_buffer_id();
+        // either (`is_pristine_scratch_buffer`'s doc comment). `reuse_pristine`
+        // implies `current == buffer_id`, so this condition is already false
+        // in that case; spelled out via `is_pristine_scratch_buffer` (not
+        // `reuse_pristine`) so the jump-skip still applies when `path` was
+        // already open elsewhere and we didn't reuse.
         if record_jump && current != buffer_id && !self.is_pristine_scratch_buffer(current) {
             self.push_jump_location();
         }
