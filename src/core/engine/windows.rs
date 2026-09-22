@@ -3381,7 +3381,12 @@ impl Engine {
             'j' => self.focus_window_direction(SplitDirection::Horizontal, true),
             'k' => self.focus_window_direction(SplitDirection::Horizontal, false),
             'l' => self.focus_window_direction(SplitDirection::Vertical, true),
-            'w' | 'W' => self.focus_next_window(),
+            // #1162: `w` and `W` used to both call `focus_next_window` — `W`
+            // (cycle *backward*, per `:h CTRL-W_W` and this repo's own
+            // VIM_COMPATIBILITY.md row) was silently aliased to `w`. Caught by
+            // the oracle-backed `win:CTRL-W W` case.
+            'w' => self.focus_next_window(),
+            'W' => self.focus_prev_window(),
             'p' => {
                 if let Some(prev) = self.prev_active_group {
                     if self.editor_groups.contains_key(&prev) {
@@ -3391,21 +3396,24 @@ impl Engine {
                     }
                 }
             }
+            // #1162: `t`/`b` ("go to top-left"/"bottom-right window", `:h
+            // CTRL-W_t`/`:h CTRL-W_b`) used to walk `self.group_layout` — the
+            // VSCode-style editor-group tree — which is a no-op whenever
+            // there is exactly one editor group, the common case a plain
+            // `<C-w>s`/`<C-w>v` split lives in. Real Vim's `t`/`b` operate on
+            // the *window* layout within the current tab; `activate_window`
+            // is the same "make this window current" primitive
+            // `set_cursor_for_window`/mouse click already route through.
             't' => {
-                if let Some(first) = self.group_layout.nth_leaf(0) {
-                    if first != self.active_group {
-                        self.prev_active_group = Some(self.active_group);
-                    }
-                    self.active_group = first;
+                let win_ids = self.active_tab().window_ids();
+                if let Some(&first) = win_ids.first() {
+                    self.activate_window(first);
                 }
             }
             'b' => {
-                let ids = self.group_layout.group_ids();
-                if let Some(&last) = ids.last() {
-                    if last != self.active_group {
-                        self.prev_active_group = Some(self.active_group);
-                    }
-                    self.active_group = last;
+                let win_ids = self.active_tab().window_ids();
+                if let Some(&last) = win_ids.last() {
+                    self.activate_window(last);
                 }
             }
             // Move
