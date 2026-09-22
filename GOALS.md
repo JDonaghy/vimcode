@@ -138,10 +138,10 @@ gap, counted once):
 
 | Verdict | Count |
 |---|---:|
-| Already-shared | 40 |
-| Convergeable (incl. 5 pending a product decision) | 26 |
+| Already-shared | 41 |
+| Convergeable (incl. 5 pending a product decision) | 25 |
 | Irreducible | 31 — reduces to 3 facts, see `docs/IRREDUCIBLE_SURFACE.md` §1/§7 |
-| quadraui-gap | 0 — was 1 (the command-line selection-highlight paint). **Shipped upstream as `Backend::draw_command_line_selection` + `CommandLineLayout::selection_bounds` (quadraui#1001) and live at the current pin `d907a06`.** vimcode consumes `selection_bounds` in `render.rs`; the *paint* call is not adopted yet — a consume-side task, not an upstream gap |
+| quadraui-gap | 0 — was 1 (the command-line selection-highlight paint). **Shipped upstream as `Backend::draw_command_line_selection` + `CommandLineLayout::selection_bounds` (quadraui#1001) and live at the current pin `d907a06`.** vimcode adopted the paint call too, via #1185 (`src/app.rs:8482`, `src/tui_main/panels.rs:362`) — the old host-side `render::command_line_selection_rect` helper is deleted, so this rung is already-shared, not just consume-side |
 | **Total rungs** | **98** |
 
 **The headline finding: the mouse-router "epic" #950 flagged is smaller than
@@ -163,7 +163,7 @@ materially smaller and more tractable backlog than #950's framing implied.
 | `render_content`: 12 of 14 `FrameOp` arms | already-shared | #824. |
 | `FrameOp::CommandLine` base paint | irreducible | px/cell paint substrate. |
 | `FrameOp::CommandLine` click→offset hit-test | already-shared | `render::command_line_click_char_idx`, quadraui#705 — corrects `IRREDUCIBLE_SURFACE.md` §2a, see §2c. |
-| `FrameOp::CommandLine` selection-highlight paint | ~~**quadraui-gap**~~ → **convergeable** | quadraui#1001 shipped `Backend::draw_command_line_selection`; pinned at `d907a06`. `render::command_line_selection_rect`'s doc comment still says no such API exists — stale, and the host-side rect helper is now deletable in favour of the upstream call. |
+| `FrameOp::CommandLine` selection-highlight paint | ~~**quadraui-gap**~~ → **already-shared** | quadraui#1001 shipped `Backend::draw_command_line_selection`; pinned at `d907a06`. vimcode adopted it via #1185 — both backends now call it directly (`src/app.rs:8482`, `src/tui_main/panels.rs:362`) and the old host-side `render::command_line_selection_rect` helper is deleted. |
 | `FrameOp::TabSwitcher` | convergeable | `max_visible` vs `visible_rows` field mixup — looks like a live bug, not intentional (wave 1, item 4 below). |
 | Menu system / Command Center click / sidebar hover / panel-key accelerators / `ClipboardPaste` | already-shared | Each already calls one `render::` router (#752/#754/#755). |
 | Window-control buttons, CSD drag/resize, outer-edge resize cursor, native menu/context menu, `CharTyped` IME, `WindowClose`, native-menu `setup`, initial CSS load | irreducible | All one fact — "TUI has no OS window," new row in `IRREDUCIBLE_SURFACE.md` §1. |
@@ -706,10 +706,11 @@ oracle-authored test, rather than re-litigating the sequencing.
   landed in the 09-16→09-19 window were projected to take 400–900 lines off
   `src/tui_main/`; it **grew 566** (10,471 → 11,037). See the Δ column in the
   sizing table. Plan #1169 by cumulative line delta, not by issues closed.
-- ✅ **The last quadraui-gap rung is closed upstream and pinned.** quadraui#1001's
-  `draw_command_line_selection` is live at `d907a06` (#1133). vimcode's consume
-  side is adopted for `selection_bounds` only — the paint call is a convergeable
-  host-side task now, not a supply blocker.
+- ✅ **The last quadraui-gap rung is closed upstream, pinned, and adopted.**
+  quadraui#1001's `draw_command_line_selection` is live at `d907a06` (#1133).
+  vimcode consumes `selection_bounds` and calls `draw_command_line_selection`
+  itself, via #1185 (`src/app.rs:8482`, `src/tui_main/panels.rs:362`) — this
+  rung is already-shared now, not a remaining host-side task.
 - ✅ **The oracle loop is live here** (#657) and `draw_frame` is gone (#766).
 - 📉 **The audit is run and the chain missed by ~12×.** Measured over its own range
   (`6875315`→`eedebf8`), convergence took **−728** off the backends against a
@@ -753,3 +754,12 @@ oracle-authored test, rather than re-litigating the sequencing.
   `JDonaghy/quadraui` and re-open **quadraui milestone #9 "vimcode Platform-Neutral
   blockers"**. **A #7 issue that turns out to be supply-blocked must be left open
   behind that blocker, not closed** — #47 is the cautionary example.
+- **Rung-audit issue bodies cite the audit *commit's* measured baseline, not a
+  number frozen at issue-filing time.** A line count written into an issue body
+  goes stale the moment another commit lands on the file it measures — cite the
+  commit the number was measured against (`N @ <sha>`) and regenerate before
+  quoting it in a new issue, the way `docs/SHELLAPP_AUDIT_R3.md` §0 does. The
+  3968-vs-4459 discrepancy in #1192's own body (a number frozen at filing time,
+  already stale by the time the audit ran) cost a full audit round to reconcile
+  (`docs/SHELLAPP_AUDIT_R3.md` §0, §7 item 3) — a one-line convention fix that
+  prevents it recurring.

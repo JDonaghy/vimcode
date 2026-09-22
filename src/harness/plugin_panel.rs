@@ -29,26 +29,31 @@
 //! step was wrong (CLAUDE.md's "rendered output, not state" rule, learned
 //! via #587/#592).
 //!
-//! # `KNOWN_BUGS`-gated GUI arms (#1089)
+//! # `KNOWN_BUGS`-gated GUI arms (#1089, resolved)
 //!
-//! `crate::app::App` — the cross-backend-shared shell `gtk`, `macos`,
-//! `win` **and** the `tui` control arm all wrap — paints every `ext:<name>`
-//! panel through `render::populate_ext_sidebar_system`, which builds its
-//! rows from the marketplace manifest list regardless of which plugin id is
-//! active (`src/app.rs`, the `id if id.starts_with("ext:")` arm). Only
-//! `crate::tui_main::panels::render_ext_panel` — reached via
-//! `TuiShellApp`, i.e. the `tui_prod` arm — paints a `PanelRegistration`'s
-//! own sections through `render::ext_panel_to_tree_view`.
+//! Before #1089, `crate::app::App` — the cross-backend-shared shell `gtk`,
+//! `macos`, `win` **and** the `tui` control arm all wrap — painted every
+//! `ext:<name>` panel through `render::populate_ext_sidebar_system`, which
+//! built its rows from the marketplace manifest list regardless of which
+//! plugin id was active (`src/app.rs`, the `id if id.starts_with("ext:")`
+//! arm), while only `crate::tui_main::panels::render_ext_panel` — reached
+//! via `TuiShellApp`, i.e. the `tui_prod` arm — painted a
+//! `PanelRegistration`'s own sections through `render::ext_panel_to_tree_view`.
 //!
-//! So the scenarios here are **green on `tui_prod` and red everywhere
-//! else, today**, exactly as #1090 predicts. They are *not* `#[cfg]`-gated
-//! per backend — that would make them vacuously pass, the failure mode
-//! `scripts/platform-conformance.sh` exists to prevent (#645). They are
-//! wrapped in [`crate::harness::known_bug_gate`] with their labels listed
-//! in [`crate::harness::KNOWN_BUGS`] against #1089, which is the *opposite*
-//! of vacuous: that gate fails the build the moment a listed body starts
-//! passing, so #1089's fix cannot land without deleting the entries and
-//! turning these into ordinary, enforced conformance tests.
+//! So the scenarios here used to be green on `tui_prod` and red everywhere
+//! else, exactly as #1090 predicted. They are *not* `#[cfg]`-gated per
+//! backend — that would make them vacuously pass, the failure mode
+//! `scripts/platform-conformance.sh` exists to prevent (#645) — they were
+//! instead wrapped in [`crate::harness::known_bug_gate`] with their labels
+//! listed in [`crate::harness::KNOWN_BUGS`], which is the *opposite* of
+//! vacuous: that gate fails the build the moment a listed body starts
+//! passing, so a fix can't land without deleting the entry and turning the
+//! scenario into an ordinary, enforced conformance test. #1089 fixed the
+//! shared `gtk`/`tui`/`win` paint path; its three `::macos`-suffixed
+//! entries stayed gated only because no macOS runner existed yet to confirm
+//! them, and #1276 confirmed and deleted them once one did. `KNOWN_BUGS` is
+//! therefore empty today — every arm below takes the plain `Pass` path, not
+//! `ExpectedFail`.
 //!
 //! # Where the arms live
 //!

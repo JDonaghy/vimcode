@@ -9549,11 +9549,12 @@ const CASES_XFILE: &[WinCase] = &[
 //
 // ## Follow-up issue status (read before editing any entry below)
 //
-// Same policy as KNOWN_DEVIATIONS_WIN: no `gh` access from a worker session,
-// so nothing here is "filed as #NNNN" yet. Each entry names the exact gap so
-// the coordinator can file it verbatim.
+// Same policy as KNOWN_DEVIATIONS_WIN: no `gh` access from a worker session.
+// Follow-ups #1 and #2 below are now filed, as #1297 and #1298 respectively
+// (filed 2026-09-22); #3 and #4 remain unfiled and each entry still names the
+// exact gap so the coordinator can file it verbatim.
 //
-//   1. "win:q: opens the command-line window" / "win:q/ ..." / "win:q? ..."
+//   1. (#1297) "win:q: opens the command-line window" / "win:q/ ..." / "win:q? ..."
 //      — title: "cmdwin: open the command-line window as a split in the
 //      current tab, not a new tab". `Engine::open_cmdline_window`
 //      (src/core/engine/ext_panel.rs) pushes a whole new `Tab` for the
@@ -9564,7 +9565,7 @@ const CASES_XFILE: &[WinCase] = &[
 //      window (not tab) pushed into the active tab's layout, plus
 //      `cmdline_window_execute`'s `self.close_tab()` changed to close the
 //      window it actually opened.
-//   2. "ex:b by number returns to buffer 1" / "ex:bn cycles forward
+//   2. (#1298) "ex:b by number returns to buffer 1" / "ex:bn cycles forward
 //      through the buffer list" / "ex:bd ..." / "ex:bdelete ..." — title:
 //      "buffers: :edit should reuse a still-pristine unnamed buffer instead
 //      of always creating a new one". `Engine::open_file_with_mode_impl`
@@ -9635,12 +9636,13 @@ const CASES_XFILE: &[WinCase] = &[
 // ---------------------------------------------------------------------------
 
 const KNOWN_DEVIATIONS_XFILE: &[&str] = &[
-    // Follow-up #1 above ("cmdwin as a split, not a new tab") — not yet filed.
+    // Follow-up #1 above ("cmdwin as a split, not a new tab") — filed as
+    // #1297.
     "win:q: opens the command-line window",
     "win:q/ opens the search-history command-line window",
     "win:q? opens the reverse-search-history command-line window",
-    // Follow-up #2 above ("reuse the pristine scratch buffer") — not yet
-    // filed.
+    // Follow-up #2 above ("reuse the pristine scratch buffer") — filed as
+    // #1298.
     "ex:bn cycles forward through the buffer list",
     "ex:b by number returns to buffer 1",
     "ex:bd deletes the current buffer and falls back to the previous one",
@@ -9790,9 +9792,9 @@ fn nvim_conformance_cross_file_ex() {
 // ## Follow-up issue status (read before editing any entry below)
 //
 // Same policy as KNOWN_DEVIATIONS_WIN/KNOWN_DEVIATIONS_XFILE: no `gh` access
-// from a worker session, so nothing here is "filed as #NNNN" yet. Each entry
-// below names the exact gap so the coordinator can file it verbatim. All
-// seven are the same shape: vimcode's message-listing ex-commands were
+// from a worker session. All six follow-ups below are now filed, as #1299
+// through #1304 respectively (filed 2026-09-22). All seven entries below are
+// the same shape: vimcode's message-listing ex-commands were
 // implemented against a hand-remembered idea of the classic-Vim format
 // rather than checked against a live Neovim, so every one of them differs —
 // sometimes by a column, sometimes by the whole table being a different
@@ -9804,7 +9806,7 @@ fn nvim_conformance_cross_file_ex() {
 // unreviewable. Every entry's live-oracle output is in this file's own git
 // history (the case, run once with `PROBE_VERBOSE=1`, printed it).
 //
-//   1. "msg:ex::reg shows one named register's content" / "msg:ex::registers
+//   1. (#1299) "msg:ex::reg shows one named register's content" / "msg:ex::registers
 //      shows one named register's content" — title: "`:reg`/`:registers`:
 //      support a register-name argument and match Neovim's `Type Name
 //      Content` table". `execute_command`'s `"registers" | "display"` arm
@@ -9812,30 +9814,30 @@ fn nvim_conformance_cross_file_ex() {
 //      trailing argument falls through to "not an editor command" — and
 //      even bare `:reg` prints a vimcode-invented `--- Registers ---`
 //      header/column layout instead of Neovim's real one.
-//   2. "msg:ex::marks lists a set mark" — title: "`:marks`: emit the three
+//   2. (#1300) "msg:ex::marks lists a set mark" — title: "`:marks`: emit the three
 //      auto marks (`'`, `\"`, `.`) alongside user marks". `"marks"`'s arm
 //      only iterates `self.marks` (user-set marks); Neovim's `:marks`
 //      output always also lists the previous-context, last-cursor-before-
 //      leaving-buffer and last-change positions.
-//   3. "msg:ex::jumps lists a jump" — title: "`:jumps`: drop the
+//   3. (#1301) "msg:ex::jumps lists a jump" — title: "`:jumps`: drop the
 //      vimcode-only `tab` column, add the `file/text` preview column
 //      Neovim has instead". `"jumps"`'s arm prints a header/column vimcode
 //      added on its own (`" jump line  col  tab  file/text"`) — Neovim's is
 //      `" jump line  col file/text"`, no tab column, but *with* a preview
 //      of the target line's text that vimcode's version omits entirely.
-//   4. "msg:ex::digraphs lists the digraph table" — title: "`:digraphs`:
+//   4. (#1302) "msg:ex::digraphs lists the digraph table" — title: "`:digraphs`:
 //      match Neovim's default digraph table and its column-wrapped grid
 //      layout". `src/core/digraphs.rs`'s table (#1160) was built against
 //      the *Vim* digraph list, and `ex_digraphs`'s no-argument listing
 //      formats it as one-per-line rather than Neovim's fixed-width grid —
 //      both dimensions differ from the live oracle's ~240KB dump.
-//   5. "msg:ex::changes lists a change" — title: "`:changes`: add the
+//   5. (#1303) "msg:ex::changes lists a change" — title: "`:changes`: add the
 //      `text` column, fix `change_list`'s 0- vs 1-based numbering and the
 //      marker row". `"changes"`'s arm's header has no `text` column, and
 //      the body loop's `i` (the *index*, starting at 0) is printed as the
 //      change number instead of `i + 1`; Neovim's marker (`>`) also lands
 //      on a real entry, not a trailing empty row.
-//   6. "msg:ex::history lists prior ex commands" — title: "hermeticity:
+//   6. (#1304) "msg:ex::history lists prior ex commands" — title: "hermeticity:
 //      `Engine::new()` must not load the real `~/.config/vimcode/
 //      history.json` in a test process". This is not a message-formatting
 //      gap at all: `HistoryState::load()` (src/core/session.rs) reads that
@@ -10330,11 +10332,10 @@ const KNOWN_DEVIATIONS: &[&str] = &[
     // it means porting `scrolloff` into the wrap path's visual-row-counting
     // loop, which is a real feature addition (scrolloff needs to be
     // expressed in *visual* rows there, not buffer lines) rather than a
-    // small in-scope fix — left here rather than attempted blind. Full
-    // issue text is drafted verbatim in
-    // `docs/PENDING_VIMCODE_ISSUES.md` (this worker session cannot run
-    // `gh`); coordinator/human action is to file it on `JDonaghy/vimcode`
-    // and replace this comment with the resulting issue number.
+    // small in-scope fix — left here rather than attempted blind. Filed as
+    // #1293; the full issue text that was drafted verbatim lived in
+    // `docs/PENDING_VIMCODE_ISSUES.md` and has been removed now that it's
+    // filed.
     "scroll:so=5 30G H",
     "scroll:so=5 30G L",
 ];
@@ -12874,38 +12875,36 @@ fn nvim_conformance_jumplist_multi_file() {
 //
 // ## Follow-up issue status (read before editing any entry below)
 //
-// None of the 5 fixes below has a filed GitHub issue yet: the worker session
-// that wrote this harness runs under a policy that forbids it from running
-// `gh` — issue filing is reserved for the coordinator, not individual work
-// sessions. So instead of the usual "filed as #NNNN" pointer, each entry
-// below is deliberately worded as "not yet filed" and the exact
-// title/body to file is spelled out here so the coordinator (or whoever
-// picks this up next) can paste it straight into `gh issue create` without
-// re-deriving the diagnosis:
+// All 5 fixes below now have filed GitHub issues: #1288, #1289, #1290,
+// #1291, #1292 respectively (filed 2026-09-22). The worker session that
+// wrote this harness ran under a policy that forbids it from running `gh` —
+// issue filing is reserved for the coordinator, not individual work
+// sessions — so the title/body to file was spelled out here first; it is
+// kept below verbatim as the diagnosis record for each filed issue:
 //
-//   1. "win:CTRL-W -/</> resize by absolute count, not a fixed ratio step"
+//   1. (#1288) "win:CTRL-W -/</> resize by absolute count, not a fixed ratio step"
 //      — resize_window_split moves the split ratio by a fixed 5% per count
 //      step; Neovim moves the window boundary by an absolute [count]
 //      lines/columns. Fix: convert the absolute delta into a ratio delta
 //      against WindowLayout::dividers's axis_size.
-//   2. "win:CTRL-W | give the current window a true winminwidth maximize"
+//   2. (#1289) "win:CTRL-W | give the current window a true winminwidth maximize"
 //      — maximize_window_split's 0.9/0.1 ratio happens to match Neovim's
 //      real "shrink the other window to its 'winminheight' minimum"
 //      behaviour for height (CTRL-W _) but not width (CTRL-W |), where 10%
 //      of 80 columns is well above Neovim's 'winminwidth' floor.
-//   3. "win:CTRL-W = fix off-by-one rect rounding on odd-sized splits"
+//   3. (#1290) "win:CTRL-W = fix off-by-one rect rounding on odd-sized splits"
 //      — WindowLayout::calculate_rects (SplitTreeMeasure::new(0.0)) rounds
 //      each child's share of a split independently instead of giving one
 //      side the exact remainder, so an odd-sized 50/50 split lands 11/11
 //      instead of Neovim's 11/10. calculate_rects is shared by every other
 //      split-rect consumer in render.rs, so this needs care.
-//   4. "win:CTRL-W r/R rotate window identity, not just content"
+//   4. (#1291) "win:CTRL-W r/R rotate window identity, not just content"
 //      — rotate_windows swaps buffer_id/view across fixed WindowId tree
 //      slots, leaving Tab::active_window pinned to the same screen
 //      position. Neovim rotates which window (identity + focus) occupies
 //      which position. Needs rotate_windows to reorder WindowIds in the
 //      WindowLayout tree instead of swapping fields across static slots.
-//   5. "win:CTRL-W p track Tab::prev_window for real previous-window recall"
+//   5. (#1292) "win:CTRL-W p track Tab::prev_window for real previous-window recall"
 //      — execute_wincmd's 'p' arm only restores prev_active_group (the
 //      VSCode-style editor-group tree); there is no Tab-level "previously
 //      active window" at all, so CTRL-W p is a no-op with a single editor
@@ -12924,7 +12923,7 @@ fn nvim_conformance_jumplist_multi_file() {
 
 const KNOWN_DEVIATIONS_WIN: &[&str] = &[
     // Follow-up #1 above ("resize by absolute count, not a fixed ratio
-    // step") — not yet filed. `CTRL-W +`/`_` actually *do* coincide with
+    // step") — filed as #1288. `CTRL-W +`/`_` actually *do* coincide with
     // Neovim for [count]=5 on this harness's fixed 80x24, 2-window 50/50
     // starting split (kept as real passes in `CASES_WIN`, not vacuous —
     // real, matching numbers on both sides), which is exactly the kind of
@@ -12934,22 +12933,22 @@ const KNOWN_DEVIATIONS_WIN: &[&str] = &[
     "win:CTRL-W - decreases the active window's height",
     "win:CTRL-W < decreases the active window's width",
     "win:CTRL-W > increases the active window's width",
-    // Follow-up #2 above ("true winminwidth maximize") — not yet filed.
+    // Follow-up #2 above ("true winminwidth maximize") — filed as #1289.
     // `CTRL-W _` is kept as a real, non-coincidental-looking pass (both
     // land the other window at exactly 1 content row); `CTRL-W \|` still
     // visibly diverges for the reason in follow-up #2.
     "win:CTRL-W | maximizes the active window's width",
     // Follow-up #3 above ("off-by-one rect rounding on odd-sized splits")
-    // — not yet filed. Distinct from follow-up #1/#2: `equalize_splits`
+    // — filed as #1290. Distinct from follow-up #1/#2: `equalize_splits`
     // sets every ratio to exactly 0.5, matching Neovim's own default, so
     // the *ratio* math is right — only the rect-rounding on top of it is
     // off by one row on an odd-sized split.
     "win:CTRL-W = re-equalizes windows after a resize",
     // Follow-up #4 above ("rotate window identity, not just content") —
-    // not yet filed.
+    // filed as #1291.
     "win:CTRL-W r rotates windows downward/rightward",
     "win:CTRL-W R rotates windows upward/leftward",
-    // Follow-up #5 above ("track Tab::prev_window") — not yet filed.
+    // Follow-up #5 above ("track Tab::prev_window") — filed as #1292.
     "win:CTRL-W p returns to the previously active window",
 ];
 

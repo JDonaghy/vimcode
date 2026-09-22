@@ -328,12 +328,12 @@ impl UndoTree {
     /// cutoff` (`:earlier {N}[smhd]`). Falls back to the oldest live node if
     /// every one postdates `cutoff`.
     ///
-    /// #1280 follow-up (not yet fixed here — see `docs/
-    /// PENDING_VIMCODE_ISSUES.md`): this reads `cursor_after`, the same
-    /// bug `older`/`newer` had before #1280 fixed them to read
-    /// `cursor_before`. No corpus case exercises the time-spec form of
-    /// `:earlier`/`:later` landing on a non-root node yet, so nothing
-    /// regresses today, but this is likely wrong for the same reason.
+    /// #1280 follow-up, filed as #1294 (not yet fixed here): this reads
+    /// `cursor_after`, the same bug `older`/`newer` had before #1280 fixed
+    /// them to read `cursor_before`. No corpus case exercises the time-spec
+    /// form of `:earlier`/`:later` landing on a non-root node yet, so
+    /// nothing regresses today, but this is likely wrong for the same
+    /// reason.
     pub fn at_or_before(&mut self, cutoff: SystemTime) -> Option<(String, Cursor)> {
         let live = self.live_indices_sorted();
         let idx = live

@@ -253,11 +253,14 @@ surfaces are bookkeeping/verification, not new production code in
    "#1043 and #1053–#1067 landed" claim should not be taken as covering
    files this audit didn't read. Belongs to `#1068`/`#1108`'s scope, not a
    new issue — flagging so it isn't silently assumed done.
-3. **Documentation fix, trivial:** future rung-audit issues should cite the
-   audit *commit's* measured baseline (as this document does in §0), not a
-   number frozen at issue-filing time — the 3968-vs-4459 gap in #1192's own
-   body cost real analysis time here for a discrepancy that a one-line
-   convention fix prevents recurring.
+3. **Documentation fix, trivial — done (#1259):** future rung-audit issues
+   should cite the audit *commit's* measured baseline (as this document does
+   in §0), not a number frozen at issue-filing time — the 3968-vs-4459 gap in
+   #1192's own body cost real analysis time here for a discrepancy that a
+   one-line convention fix prevents recurring. Recorded in `GOALS.md`'s "How
+   to use this doc" section (the "Milestone discipline" bullets audit-issue
+   authors already read) so it's visible before the next rung-audit issue is
+   filed, not just here.
 4. **No `shell_app.rs`-specific convergence issue is filed by this audit** —
    the highest-risk item found (§4) belongs to a file this audit does not
    own, and every other finding closes clean.

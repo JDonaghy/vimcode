@@ -458,10 +458,16 @@ impl TextMetricsBackend for win_backend::WinBackend {
 
 /// Narrow seam over the OS top-level window handle (#862) for the window
 /// queries quadraui's `Backend::window()` (`WindowControl`, quadraui#950)
-/// still has no portable answer for: reading back the last-requested
-/// (non-maximized) size for session-restore, `is_maximized()`, and
+/// used to have no portable answer for at all. `is_maximized()` and
 /// `set_decorated()` (#552 CSD — dropping the server-side titlebar in
-/// favour of the drawn one). Method names are prefixed `win_*` to avoid
+/// favour of the drawn one) both shipped upstream (`f352462`) and are
+/// present at this crate's pinned rev, so `win_is_maximized`/
+/// `win_set_decorated` below are today un-migrated GTK-only duplicates of
+/// that now-shared surface, not a workaround for a genuine gap. What
+/// quadraui's `WindowControl` still has no portable answer for is reading
+/// back the last-requested (non-maximized) size for session-restore —
+/// `win_default_width`/`win_default_height` below are that gap's actual,
+/// still-needed workaround. Method names are prefixed `win_*` to avoid
 /// colliding with the `gtk4::prelude` extension-trait methods of the same
 /// name on the one concrete impl below (both would otherwise be applicable
 /// to `&gtk4::Window` inside that impl, which is an ambiguous call, not a
