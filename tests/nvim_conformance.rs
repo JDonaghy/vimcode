@@ -8487,6 +8487,24 @@ const CASES_XFILE: &[WinCase] = &[
         1,
         ":tabe {F1}<CR>:tabmove 0<CR>",
     ),
+    // #1281 review: `:tabmove 0` above only exercises the special-cased
+    // `N=0` branch (handled the same before and after the fix). This case
+    // exercises the general `N > 0` arithmetic that the review found broken:
+    // 3 tabs main.txt/b.txt/c.txt, current = main.txt (original index 0),
+    // `:tabmove 2` lands main.txt at index 1 (not index 2) — verified
+    // against the live oracle (`nvim v0.12.5 --headless -u NONE -i NONE`):
+    // `N`(2) is greater than current's original index(0), so the tab that
+    // was originally at index 2 (c.txt) shifts back to index 1 once main.txt
+    // is removed, and main.txt is inserted right after it, landing at
+    // index 1 — i.e. `dest = N - 1`, not `dest = N`.
+    wc_files(
+        "ex:tabmove N moves the current tab to a non-edge position",
+        XFILE_MAIN,
+        &[("b.txt", XFILE_B), ("c.txt", XFILE_C)],
+        1,
+        1,
+        ":tabnew {F1}<CR>:tabnew {F2}<CR>1gt:tabmove 2<CR>",
+    ),
     // --- {win,buf,tab}do (ex::) — #1281's own callout: bufdo in particular
     // "runs a command in every buffer and will surface any ordering
     // difference immediately." It did: `:windo` iterated
@@ -10556,7 +10574,10 @@ const COVERAGE_EXEMPT: &[&str] = &[
     // "Deliberate semantic divergence" permanent heading above.
     // --- Core Vim Ex Commands (ex) --- #1281 backfilled the 22 buffer/tab/
     // window rows below, plus 18 more (gf/gt/CTRL-^/marks/etc. — CASES_XFILE
-    // is 34 cases total, 27 pass, 7 tracked red in KNOWN_DEVIATIONS_XFILE);
+    // is 35 cases total, 28 pass, 7 tracked red in KNOWN_DEVIATIONS_XFILE —
+    // the 35th, "ex:tabmove N moves the current tab to a non-edge position",
+    // was added in review to cover the general-N `:tabmove` arithmetic the
+    // original `:tabmove 0` case didn't reach);
     // the rest of this family (quickfix, registers, etc.) is unrelated debt,
     // still uncovered. (`ex::w`'s `Keys(":w")` probe is a loose needle that
     // also matches ":windo" — retired here as an honest side effect of that
