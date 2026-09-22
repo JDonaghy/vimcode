@@ -13208,16 +13208,20 @@ fn make_qf_item(path: &str) -> ProjectMatch {
     }
 }
 
-#[test]
-fn test_copen_requires_items() {
-    let mut engine = Engine::new();
-    engine.execute_command("copen");
-    assert!(
-        !engine.quickfix.open,
-        "copen should not open with empty list"
-    );
-    assert!(engine.message.contains("empty"));
-}
+// #1283: `test_copen_requires_items` used to live here, asserting `:copen`
+// *refuses* on an empty quickfix list ("copen should not open with empty
+// list" + a message containing "empty"). Both halves were vimcode-only
+// invention: re-probed against a live `nvim --headless -u NONE`, `:copen`
+// on a totally empty list opens the quickfix window unconditionally —
+// `winnr('$')` goes 1 -> 2 with no error and an empty `v:errmsg` — and the
+// global list always exists so there is nothing for it to refuse about.
+// The oracle-true behaviour is asserted by
+// `test_ex_copen_opens_even_on_empty_quickfix_list_1283` below (with
+// `test_ex_cwindow_stays_closed_on_empty_quickfix_list_1283` pinning the
+// contrast against `:cwindow`, which *does* stay closed when empty), so
+// this test is not renamed-in-place but deleted: keeping a second copy of
+// the same claim under the old name would only invite reinstating the old
+// expectation.
 
 #[test]
 fn test_copen_cclose() {
@@ -15002,7 +15006,17 @@ fn test_clist_llist_print_every_entry() {
 
     engine.quickfix.items.clear();
     engine.execute_command("clist");
-    assert!(engine.message.contains("empty"));
+    // #1283: this used to assert `.contains("empty")`, matching vimcode's own
+    // invented "Quickfix list is empty" prose. Re-probed against a live
+    // `nvim --headless -u NONE`, `:clist` on an empty quickfix list raises
+    // `Vim(clist):E42: No Errors` — the same `E42` every other `:c*` command
+    // uses on an empty list, which is why `Engine::qf_empty_msg` is now the
+    // single place that spelling lives.
+    assert!(
+        engine.message.contains("E42: No Errors"),
+        "clist on an empty quickfix list must report Neovim's E42, got {:?}",
+        engine.message
+    );
 
     let win = engine.active_window_id();
     engine
@@ -15123,7 +15137,26 @@ fn test_cdo_runs_command_once_per_entry_cfdo_once_per_file() {
 fn test_cdo_on_empty_list_errors_without_running_anything() {
     let mut engine = Engine::new();
     engine.execute_command("cdo normal! Ax");
-    assert!(engine.message.contains("empty"));
+    // #1283: was `.contains("empty")` against vimcode's invented "Quickfix
+    // list is empty"; now the shared `Engine::qf_empty_msg` spelling, which a
+    // live oracle pins as `E42: No Errors`.
+    //
+    // Known, deliberate divergence re-confirmed here against `nvim --headless
+    // -u NONE`: real Neovim's `:cdo`/`:cfdo`/`:ldo` on an empty list are
+    // *silent* no-ops (`pcall` succeeds, `v:errmsg` stays empty) rather than
+    // erroring — only the `:cc`/`:cnext`/`:clist`/`:cfirst`/`:clast` family
+    // raises `E42`. vimcode keeps a message because "nothing happened" with
+    // no feedback reads as a broken command, and the invariant the test name
+    // claims — *nothing ran* — matches Neovim either way. The message text is
+    // not part of the conformance corpus: the oracle `Case` harness compares
+    // buffer and cursor only, so no `tests/nvim_conformance.rs` row asserts
+    // it. Narrowing this to a silent no-op is a separate behaviour decision,
+    // not a casing fix, so it is deliberately out of #1283's scope.
+    assert!(
+        engine.message.contains("E42: No Errors"),
+        "cdo on an empty quickfix list should use the shared E42 wording, got {:?}",
+        engine.message
+    );
 
     engine.execute_command("cdo");
     assert!(engine.message.contains("E471"));
