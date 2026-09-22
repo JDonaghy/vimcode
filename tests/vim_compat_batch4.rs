@@ -6,9 +6,25 @@ use vimcode_core::Mode;
 // Ctrl-G: show file info
 // =============================================================================
 
+// #1282: Neovim's default `'ruler'` is on (`Settings::ruler`'s own doc
+// comment), and with it on CTRL-G omits the cursor position — `:h CTRL-G`,
+// "the cursor position (unless the 'ruler' option is set)". Two cases, one
+// per setting, mirroring `src/core/engine/tests.rs`'s
+// `test_ctrl_g_shows_file_info_ruler_{on,off}`.
 #[test]
-fn test_ctrl_g_shows_file_info() {
+fn test_ctrl_g_shows_file_info_ruler_on() {
     let mut e = engine_with("line one\nline two\nline three\n");
+    assert!(e.settings.ruler, "precondition: ruler defaults on");
+    ctrl(&mut e, 'g');
+    assert!(e.message.contains("3 lines"), "msg: {}", e.message);
+    assert!(e.message.contains("--33%--"), "msg: {}", e.message);
+    assert!(!e.message.contains("col "), "msg: {}", e.message);
+}
+
+#[test]
+fn test_ctrl_g_shows_file_info_ruler_off() {
+    let mut e = engine_with("line one\nline two\nline three\n");
+    e.settings.ruler = false;
     ctrl(&mut e, 'g');
     assert!(e.message.contains("line 1 of 3"), "msg: {}", e.message);
     assert!(e.message.contains("--33%--"), "msg: {}", e.message);

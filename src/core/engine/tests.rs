@@ -13161,9 +13161,31 @@ fn test_grep_word_command_no_word() {
     assert!(engine.message.contains("No word"));
 }
 
+// #1282: Neovim's default `'ruler'` is on (`Settings::ruler`'s own doc
+// comment), and with it on CTRL-G omits the cursor position — `:h CTRL-G`,
+// "the cursor position (unless the 'ruler' option is set)" — printing just
+// the line count instead. Two cases, one per setting, so a future change to
+// either branch has to keep both true rather than only the one someone
+// happened to be looking at.
 #[test]
-fn test_ctrl_g_shows_file_info() {
+fn test_ctrl_g_shows_file_info_ruler_on() {
     let mut engine = Engine::new();
+    assert!(engine.settings.ruler, "precondition: ruler defaults on");
+    engine.buffer_mut().insert(0, "hello\nworld\n");
+
+    press_ctrl(&mut engine, 'g');
+
+    assert!(
+        engine.message.contains("2 lines") && !engine.message.contains("col "),
+        "msg: {}",
+        engine.message
+    );
+}
+
+#[test]
+fn test_ctrl_g_shows_file_info_ruler_off() {
+    let mut engine = Engine::new();
+    engine.settings.ruler = false;
     engine.buffer_mut().insert(0, "hello\nworld\n");
 
     press_ctrl(&mut engine, 'g');

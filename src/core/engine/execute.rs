@@ -2058,8 +2058,20 @@ impl Engine {
             return EngineAction::None;
         }
 
-        // Handle :sav[eas] {file} — save buffer to a new file
-        if let Some(path_str) = cmd.strip_prefix("saveas ") {
+        // Handle :sav[eas][!] {file} — save buffer to a new file. `!` is
+        // required by Neovim whenever `{file}` already exists (confirmed
+        // against a live `nvim --headless -u NONE`: `E13: File exists (add
+        // ! to override)` without it) — vimcode doesn't refuse an existing
+        // target either way (#1282 found this while adding the on-disk
+        // probe; a bare `:saveas` clobbering silently is a separate,
+        // narrower gap than the one being fixed here, which is just that
+        // `:saveas!` used to normalize to a string this `strip_prefix`
+        // could never match — `cmd` is `"saveas!" + rest`, not
+        // `"saveas" + rest`, per `split_ex_command`).
+        if let Some(path_str) = cmd
+            .strip_prefix("saveas! ")
+            .or_else(|| cmd.strip_prefix("saveas "))
+        {
             let path_str = path_str.trim();
             if path_str.is_empty() {
                 self.message = "Usage: :saveas {file}".to_string();
@@ -2878,9 +2890,14 @@ impl Engine {
                 EngineAction::None
             }
             "number" => {
+                // #1282: verified against a live `nvim --headless -u NONE`
+                // `msg_show` event — a single space after a **minimum**
+                // 3-wide right-justified line number (it grows past 3 for a
+                // 4+-digit line, never shrinks below it), not the 6-wide/
+                // double-space field this used to print.
                 let line = self.view().cursor.line;
                 let text = self.buffer().content.line(line).chars().collect::<String>();
-                self.message = format!("{:>6}  {}", line + 1, text.trim_end_matches('\n'));
+                self.message = format!("{:>3} {}", line + 1, text.trim_end_matches('\n'));
                 EngineAction::None
             }
             "new" => {
@@ -3578,7 +3595,22 @@ impl Engine {
         self.start_undo_group();
         let first_new_line = if line + 1 < num_lines {
             let insert_pos = self.buffer().line_to_char(line + 1);
-            self.insert_with_undo(insert_pos, content);
+            // #1282: `content` is the on-disk file verbatim, which has no
+            // trailing newline whenever the source file itself doesn't end
+            // with one (`std::fs::read_to_string` doesn't add one) — insert
+            // it as-is here and it silently merges into the following
+            // line's text instead of landing on its own line(s), confirmed
+            // against a live `nvim --headless -u NONE` `:read`. Neovim reads
+            // a file as a sequence of *lines* regardless of whether the
+            // file's own last line was newline-terminated, so this needs
+            // the same guarantee the "insert at end of buffer" branch below
+            // already has.
+            if content.ends_with('\n') {
+                self.insert_with_undo(insert_pos, content);
+            } else {
+                self.insert_with_undo(insert_pos, content);
+                self.insert_with_undo(insert_pos + content.chars().count(), "\n");
+            }
             line + 1
         } else {
             let end = self.buffer().len_chars();

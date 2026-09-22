@@ -1031,7 +1031,18 @@ impl Engine {
                     return EngineAction::None;
                 }
                 "g" => {
-                    // Ctrl-G: show file info (Vim compat)
+                    // Ctrl-G: show file info (Vim compat).
+                    //
+                    // #1282: verified against a live `nvim --headless -u
+                    // NONE` `msg_show` event that Neovim's default
+                    // `'ruler'` — on, unlike classic Vim's `'noruler'`
+                    // default (`settings.ruler`'s own doc comment) — makes
+                    // CTRL-G print `"name" [flags] N line(s) --pct%--`
+                    // instead of this command's un-conditional `line L of N
+                    // ... col C` form. `:h CTRL-G`: "the cursor position
+                    // (unless the 'ruler' option is set)" — with 'ruler' on,
+                    // the position is already in the ruler, so CTRL-G leaves
+                    // it out.
                     let name = self
                         .file_path()
                         .map(|p| p.to_string_lossy().into_owned())
@@ -1041,9 +1052,14 @@ impl Engine {
                     let cur_line = self.view().cursor.line + 1;
                     let col = self.view().cursor.col + 1;
                     let pct = (cur_line * 100).checked_div(total).unwrap_or(0);
-                    self.message = format!(
-                        "\"{name}\"{modified} line {cur_line} of {total} --{pct}%-- col {col}"
-                    );
+                    self.message = if self.settings.ruler {
+                        let noun = if total == 1 { "line" } else { "lines" };
+                        format!("\"{name}\"{modified} {total} {noun} --{pct}%--")
+                    } else {
+                        format!(
+                            "\"{name}\"{modified} line {cur_line} of {total} --{pct}%-- col {col}"
+                        )
+                    };
                     return EngineAction::None;
                 }
                 "e" => {
@@ -2579,8 +2595,13 @@ impl Engine {
                     if char_idx < self.buffer().content.len_chars() {
                         let ch = self.buffer().content.char(char_idx);
                         let code = ch as u32;
-                        self.message =
-                            format!("<{}>  {},  Hex {:02x},  Oct {:03o}", ch, code, code, code);
+                        // #1282: Neovim spells this "Octal", not "Oct" —
+                        // verified against a live `nvim --headless -u NONE`
+                        // `msg_show` event for `ga`.
+                        self.message = format!(
+                            "<{}>  {},  Hex {:02x},  Octal {:03o}",
+                            ch, code, code, code
+                        );
                     }
                 }
                 Some('8') => {
