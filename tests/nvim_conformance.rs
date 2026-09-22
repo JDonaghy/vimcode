@@ -9792,8 +9792,11 @@ fn nvim_conformance_cross_file_ex() {
 // ## Follow-up issue status (read before editing any entry below)
 //
 // Same policy as KNOWN_DEVIATIONS_WIN/KNOWN_DEVIATIONS_XFILE: no `gh` access
-// from a worker session. All six follow-ups below are now filed, as #1299
-// through #1304 respectively (filed 2026-09-22). All seven entries below are
+// from a worker session. Five of the six follow-ups below (items 1-5) are
+// filed, as #1299 through #1303 respectively (filed 2026-09-22). Item 6
+// (#1304) was itself a hermeticity bug rather than a formatting one; it is
+// now fixed (see item 6 below), and the formatting gap it had been masking
+// is not yet filed as its own issue. All seven entries below are
 // the same shape: vimcode's message-listing ex-commands were
 // implemented against a hand-remembered idea of the classic-Vim format
 // rather than checked against a live Neovim, so every one of them differs —
@@ -9837,24 +9840,28 @@ fn nvim_conformance_cross_file_ex() {
 //      the body loop's `i` (the *index*, starting at 0) is printed as the
 //      change number instead of `i + 1`; Neovim's marker (`>`) also lands
 //      on a real entry, not a trailing empty row.
-//   6. (#1304) "msg:ex::history lists prior ex commands" — title: "hermeticity:
-//      `Engine::new()` must not load the real `~/.config/vimcode/
-//      history.json` in a test process". This is not a message-formatting
-//      gap at all: `HistoryState::load()` (src/core/session.rs) reads that
-//      file unconditionally, and `tests/common::engine_with`'s
-//      `suppress_disk_saves()` only suppresses *writes* — so every
-//      `Engine::new()` in this whole test binary starts with whatever
-//      command history is sitting in the *developer machine's* real config
-//      directory (confirmed: this repo's own dev machine had ~100 stale
-//      entries from earlier interactive/test sessions, which is what
-//      `:history` printed instead of the three commands this case actually
-//      typed). Likely affects any other test that touches `:history`, the
-//      up/down command-line recall, or anything else keyed off
-//      `self.history` — a real hermeticity bug independent of #1282, filed
-//      as its own follow-up rather than folded into a message-formatting
-//      fix because the right repair (a test-only "don't load either" flag
-//      alongside `suppress_disk_saves`) touches `Engine::new()`'s own
-//      construction path, not `src/core/engine/execute.rs`.
+//   6. (#1304, hermeticity — FIXED, formatting gap it was masking — not yet
+//      filed) "msg:ex::history lists prior ex commands". #1304 was a
+//      hermeticity bug, not a message-formatting one: `HistoryState::load()`
+//      (src/core/session.rs) read `~/.config/vimcode/history.json`
+//      unconditionally, so every `Engine::new()` in this test binary
+//      started with whatever command history was sitting in the *developer
+//      machine's* real config directory (confirmed: ~100 stale entries on
+//      this repo's own dev machine). Fixed by a `suppress_disk_loads()`
+//      flag (`src/core/session.rs`, checked by `HistoryState::load()`)
+//      alongside the existing `suppress_disk_saves()`, called from
+//      `tests/common::engine_with` before `Engine::new()`. With the
+//      developer's real history no longer leaking in, this case now runs
+//      hermetically — three real entries in, three real entries out — and
+//      it *still* fails, on a genuine formatting gap the hermeticity bug
+//      was hiding: Neovim's `:history` prints a `      #  cmd history`
+//      header and marks the current entry's row with a leading `>` (e.g.
+//      `>     3  history`); vimcode instead prints a vimcode-invented
+//      `--- Command History ---` header with no current-entry marker, the
+//      same shape as #1299/#1303's deviations. Left in
+//      `KNOWN_DEVIATIONS_MESSAGE` below — the case still fails — pending a
+//      follow-up formatting-fix issue (same non-trivial-rewrite reasoning
+//      as the other six).
 const KNOWN_DEVIATIONS_MESSAGE: &[&str] = &[
     "msg:ex::reg shows one named register's content",
     "msg:ex::registers shows one named register's content",
@@ -17400,14 +17407,9 @@ const REGMARK_COVERAGE_EXEMPT: &[&str] = &[
 /// rendered buffer + cursor + message out.
 fn replay_live(p: &Live) -> (String, (usize, usize), String) {
     let mut engine = engine_with(&p.lines.join("\n"));
-    // `Engine::new()` loads the *user's real* command history off disk, and
-    // command-line `<C-r>` searches it (that binding conflict is one of this
-    // slice's findings). Leaving it populated would make the `c_CTRL-R` rows
-    // replay whatever the developer last typed at a `:` prompt — a recording
-    // that passes on one machine and executes a random history entry on the
-    // next. `engine_with` already resets settings and extension state for the
-    // same reason; history is the one it misses.
-    engine.history = Default::default();
+    // `engine_with` suppresses `HistoryState::load()`'s real-disk read
+    // (#1304), so `engine.history` already starts empty here — no manual
+    // reset needed for the `c_CTRL-R` rows this replay covers.
     engine.settings.shift_width = 4;
     engine.settings.expand_tab = true;
     engine.settings.tabstop = 4;
@@ -19304,9 +19306,6 @@ const EX_STATUS_DISPATCH_EXCEPTIONS: &[(&str, &str)] = &[(
 /// recognised it. Black-box: an ex line in, `engine.message` out.
 fn ex_line_is_recognised(line: &str) -> bool {
     let mut engine = engine_with("alpha\nbeta\ngamma\ndelta\n");
-    // Same hermeticity fix as `replay_live` (#1226): `Engine::new()` loads
-    // the user's real command history off disk.
-    engine.history = Default::default();
     engine.set_viewport_lines(24);
     engine.execute_command(line);
     !engine.message.contains("Not an editor command")
@@ -19614,7 +19613,6 @@ fn ex_audit_oracle_coverage_is_shrink_only() {
 #[should_panic(expected = "called `Option::unwrap()` on a `None` value")]
 fn bdelete_on_the_last_buffer_panics_instead_of_refusing() {
     let mut engine = engine_with("alpha\nbeta\n");
-    engine.history = Default::default();
     engine.execute_command("bdelete");
     // Unreachable today. When `:bd` learns Vim's fallback this line runs, the
     // `should_panic` fails, and the row's `ExDispatch::Crashes` has to change.
@@ -21550,11 +21548,6 @@ const VISUAL_COVERAGE_EXEMPT: &[&str] = &[
 /// in, rendered buffer + cursor + painted mode string + message out.
 fn replay_vis_live(p: &VisLive) -> (String, (usize, usize), String, String) {
     let mut engine = engine_with(&p.lines.join("\n"));
-    // Same reason as `replay_live` (#1226): `Engine::new()` loads the *user's
-    // real* command history off disk, and `v_:`'s recording types at a `:`
-    // prompt. Leaving it populated would make that row replay whatever the
-    // developer last typed.
-    engine.history = Default::default();
     engine.settings.shift_width = 4;
     engine.settings.expand_tab = true;
     engine.settings.tabstop = 4;
@@ -21840,7 +21833,6 @@ fn visual_audit_oracle_coverage_is_shrink_only() {
 #[test]
 fn ctrl_c_in_visual_mode_deletes_the_selection_instead_of_stopping_visual_mode() {
     let mut engine = engine_with("alpha beta gamma");
-    engine.history = Default::default();
     engine.set_viewport_lines(24);
     send_keys(&mut engine, "vll<C-c>");
 
@@ -30541,9 +30533,6 @@ type NormSeen = (
 /// rendered output out.
 fn replay_norm_live(p: &NormLive) -> NormSeen {
     let mut engine = engine_with(&p.lines.join("\n"));
-    // Same reason as #1226/#1228: `Engine::new()` loads the *user's real*
-    // command history off disk, and several rows here type at a `:` prompt.
-    engine.history = Default::default();
     engine.settings.shift_width = 4;
     engine.settings.expand_tab = true;
     engine.settings.tabstop = 4;
