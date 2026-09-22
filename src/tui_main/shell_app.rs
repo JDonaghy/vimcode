@@ -10884,6 +10884,117 @@ mod tests {
         );
     }
 
+    /// #1283: the empty-list refusals in the quickfix/location-list family
+    /// are only *user-visible* through the painted command-line row, so
+    /// that is where they have to be asserted.
+    ///
+    /// `:cnext` on an empty quickfix list is the sharpest case: before #1283
+    /// `Engine::qf_next` had no empty-list guard at all — `qf_jump` merely
+    /// declined to move (there is no item at index 0 of an empty `Vec`) and
+    /// `engine.message` was left untouched, so the row painted *nothing*.
+    /// Real Neovim raises `Vim(cnext):E42: No Errors` (re-confirmed against a
+    /// live `nvim --headless -u NONE`). Driven through the real command line
+    /// rather than by calling `qf_next` directly, so the claim is "the user
+    /// sees the error", not "a field got set" — the state-only trap this
+    /// repo's testing guidance calls out (#587/#592).
+    ///
+    /// RED against unfixed `develop`: with the `qf_next` guard removed the
+    /// message is empty and `E42: No Errors` never reaches the screen.
+    #[test]
+    fn cnext_on_empty_quickfix_list_paints_e42_via_shell_app() {
+        let app = TuiShellApp::new(None);
+        assert!(
+            app.engine.quickfix.items.is_empty(),
+            "precondition: a fresh engine has an empty quickfix list"
+        );
+
+        let mut driver = driver_with_shell(app, config(), 80, 24);
+        driver.press_named(quadraui::NamedKey::Escape);
+        for c in ":cnext".chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
+        driver.render();
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("E42: No Errors"),
+            ":cnext on an empty quickfix list must paint Neovim's E42 on the \
+             command line; screen:\n{screen}"
+        );
+    }
+
+    /// #1283: the flip side of the test above — `:copen` on an empty
+    /// quickfix list must paint *no* error at all.
+    ///
+    /// Before #1283 `Engine::qf_open` refused whenever the target list had
+    /// zero items and painted the invented prose "Quickfix list is empty" on
+    /// the command-line row. A live oracle opens the quickfix window
+    /// unconditionally instead (`winnr('$')` 1 -> 2, empty `v:errmsg`), so
+    /// the row must stay clean. Asserted on painted text for the same reason
+    /// as above; the panel body itself is deliberately not asserted here
+    /// because `quickfix_panel_rows` reserves no rows for a zero-item list
+    /// (see its doc comment — that height rule is #754's, not #1283's).
+    ///
+    /// RED against unfixed `develop`: "Quickfix list is empty" is painted.
+    #[test]
+    fn copen_on_empty_quickfix_list_paints_no_error_via_shell_app() {
+        let app = TuiShellApp::new(None);
+        let mut driver = driver_with_shell(app, config(), 80, 24);
+        driver.press_named(quadraui::NamedKey::Escape);
+        for c in ":copen".chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
+        driver.render();
+
+        let screen = driver.screen();
+        assert!(
+            !screen.contains("empty"),
+            ":copen on an empty quickfix list must not paint a refusal; \
+             screen:\n{screen}"
+        );
+        assert!(
+            !screen.contains("E42"),
+            ":copen never errors in Neovim, empty list or not; screen:\n{screen}"
+        );
+    }
+
+    /// #1283: `:lwindow` on a window that has *never* had a location list
+    /// must paint `E776: No location list`.
+    ///
+    /// Before #1283 `Engine::qf_window` read the list through `qf_get_mut`,
+    /// whose `entry(..).or_default()` autovivified an empty list and made
+    /// "never created" indistinguishable from "created but empty" — so the
+    /// command silently stayed closed and painted nothing. A live oracle
+    /// errors for the never-created case and is a silent no-op only once a
+    /// list exists (`setloclist(0, [])`).
+    ///
+    /// RED against unfixed `develop`: nothing is painted on the command line.
+    #[test]
+    fn lwindow_without_location_list_paints_e776_via_shell_app() {
+        let app = TuiShellApp::new(None);
+        assert!(
+            app.engine.location_lists.is_empty(),
+            "precondition: a fresh engine has no location list at all"
+        );
+
+        let mut driver = driver_with_shell(app, config(), 80, 24);
+        driver.press_named(quadraui::NamedKey::Escape);
+        for c in ":lwindow".chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
+        driver.render();
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("E776: No location list"),
+            ":lwindow with no location list must paint Neovim's E776; \
+             screen:\n{screen}"
+        );
+    }
+
     /// #608: `render_content` must also paint the *bottom panel* (terminal
     /// tab bar + Debug Output content) via
     /// `bottom_chrome_rects_for_shell_content` + `render_bottom_panel_tabs`
