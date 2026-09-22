@@ -15410,6 +15410,121 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// #1162 acceptance, painted-output tier: `CTRL-W t` / `CTRL-W b` name
+    /// the corner window of the **screen**, so with two editor groups open
+    /// they must cross the group boundary — `t` into the left group, `b`
+    /// into the right one.
+    ///
+    /// Asserts on painted text rather than on `active_group`: each group
+    /// shows a *different* file, so typing a marker in insert mode and then
+    /// reading the marker back fused to that file's own first line
+    /// (`"<mark>left file"` vs `"<mark>right file"`) proves which pane the
+    /// keystrokes actually reached, with no coordinate arithmetic.
+    ///
+    /// RED against the window-layout-only first cut of the #1162 fix
+    /// (`'t' => { … self.active_tab().window_ids().first() … }`): the
+    /// fixture leaves the right group focused and each group holds a single
+    /// window, so `<C-w>t` was a no-op and `LEFT_MARK` landed in
+    /// `right file` instead. Green on develop for this case and RED there
+    /// for the single-group case covered by
+    /// `ctrl_w_t_and_b_move_the_caret_between_split_panes_via_shell_app`
+    /// below — together they pin both levels of the layout.
+    #[test]
+    fn ctrl_w_t_and_b_cross_editor_groups_via_shell_app() {
+        const LEFT_MARK: &str = "ZQXWT1162";
+        const RIGHT_MARK: &str = "ZQXWB1162";
+
+        let (app, dir) = app_with_two_file_groups("ctrlw_tb");
+        // `app_with_two_file_groups` leaves the *right* group focused.
+        let mut driver = driver_with_shell(app, config(), 160, 30);
+
+        driver.ctrl_char('w');
+        driver.type_char('t');
+        driver.type_char('i');
+        for c in LEFT_MARK.chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Escape);
+
+        assert!(
+            driver.screen().contains(&format!("{LEFT_MARK}left file")),
+            "CTRL-W t must focus the left editor group, so the typed marker \
+             should be painted fused to the left file's own text; screen:\n{}",
+            driver.screen()
+        );
+
+        driver.ctrl_char('w');
+        driver.type_char('b');
+        driver.type_char('i');
+        for c in RIGHT_MARK.chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Escape);
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains(&format!("{RIGHT_MARK}right file")),
+            "CTRL-W b must focus the right editor group; screen:\n{screen}"
+        );
+        assert!(
+            screen.contains(&format!("{LEFT_MARK}left file")),
+            "the left pane's earlier marker must still be painted — `b` \
+             moves focus, it does not retype into the left buffer; \
+             screen:\n{screen}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1162 acceptance, painted-output tier, single-group half: with one
+    /// editor group split into two vim windows (`:vsplit`), `CTRL-W t` /
+    /// `CTRL-W b` must move the caret between the two panes.
+    ///
+    /// Both panes show the same buffer, so the marker trick used by
+    /// `ctrl_w_t_and_b_cross_editor_groups_via_shell_app` cannot tell them
+    /// apart — this reads the real terminal caret instead (the same painted
+    /// signal the #1039 tests above use) and checks which half of the
+    /// 160-column frame it lands in. The fixture hides the sidebar, so the
+    /// two panes split the full width and the midpoint is the divider.
+    ///
+    /// RED against unfixed develop: `t`/`b` walked `group_layout` only, and
+    /// a `:vsplit` leaves a single editor group — both were no-ops, so the
+    /// caret never left the pane `split_window` made active and the two
+    /// recorded positions were identical.
+    #[test]
+    fn ctrl_w_t_and_b_move_the_caret_between_split_panes_via_shell_app() {
+        let mut driver = driver_with_shell(app_with_split_shaped_buffer(), config(), 160, 30);
+
+        driver.ctrl_char('w');
+        driver.type_char('t');
+        driver.type_char('i');
+        let top_left = driver
+            .terminal_cursor_position()
+            .expect("insert-mode caret should reach the frame after CTRL-W t");
+        driver.press_named(quadraui::NamedKey::Escape);
+
+        driver.ctrl_char('w');
+        driver.type_char('b');
+        driver.type_char('i');
+        let bottom_right = driver
+            .terminal_cursor_position()
+            .expect("insert-mode caret should reach the frame after CTRL-W b");
+        driver.press_named(quadraui::NamedKey::Escape);
+
+        assert!(
+            top_left.0 < 80,
+            "CTRL-W t must put the caret in the left pane, got {top_left:?}; \
+             screen:\n{}",
+            driver.screen()
+        );
+        assert!(
+            bottom_right.0 >= 80,
+            "CTRL-W b must put the caret in the right pane, got \
+             {bottom_right:?}; screen:\n{}",
+            driver.screen()
+        );
+    }
+
     /// #603 acceptance: once the command palette is open
     /// (`engine.picker_open`), `Engine::handle_key` resolves it internally
     /// (`keys.rs:152`) — the same "i" + marker keystrokes that insert text

@@ -2097,6 +2097,64 @@ fn test_ctrl_w_t_and_b_use_the_window_layout_1162() {
     );
 }
 
+/// #1162 follow-up: `CTRL-W t`/`b` must descend **both** layout levels.
+///
+/// The first cut of the fix above replaced the old `group_layout` walk with
+/// an active-tab window walk — which fixed the single-group split case but
+/// regressed the multi-group one (`tests/vim_compat_batch2.rs::
+/// test_ctrl_w_t_first_group` went red): focus could no longer leave the
+/// current editor group at all. `Engine::corner_window` now picks the
+/// first/last *group* in `group_layout` order and then the first/last
+/// *window* inside that group's active tab, which is what "the window in
+/// the screen's corner" means when the screen nests a vim split layout
+/// inside each VSCode-style editor group.
+///
+/// RED against the window-layout-only version: both assertions below stay
+/// on the second group, since each group's own tab is walked in isolation.
+#[test]
+fn test_ctrl_w_t_and_b_span_groups_and_windows_1162() {
+    use crate::core::window::SplitDirection;
+
+    let mut engine = Engine::new();
+    let g0 = engine.active_group;
+    // Group 0: two windows (`<C-w>s`), new-first layout order.
+    press_ctrl(&mut engine, 'w');
+    press_char(&mut engine, 's');
+    let g0_first = engine.active_tab().window_ids()[0];
+
+    // Group 1: its own tab, split into two windows as well.
+    engine.open_editor_group(SplitDirection::Vertical);
+    let g1 = engine.active_group;
+    assert_ne!(g0, g1);
+    press_ctrl(&mut engine, 'w');
+    press_char(&mut engine, 's');
+    let g1_last = *engine.active_tab().window_ids().last().unwrap();
+
+    press_ctrl(&mut engine, 'w');
+    press_char(&mut engine, 't');
+    assert_eq!(
+        engine.active_group, g0,
+        "CTRL-W t must cross back into the first editor group"
+    );
+    assert_eq!(
+        engine.active_window_id(),
+        g0_first,
+        "CTRL-W t must land on the first group's own top-left window"
+    );
+
+    press_ctrl(&mut engine, 'w');
+    press_char(&mut engine, 'b');
+    assert_eq!(
+        engine.active_group, g1,
+        "CTRL-W b must cross into the last editor group"
+    );
+    assert_eq!(
+        engine.active_window_id(),
+        g1_last,
+        "CTRL-W b must land on the last group's own bottom-right window"
+    );
+}
+
 #[test]
 fn test_ex_hide_closes_window_without_dirty_check_1154() {
     let mut engine = Engine::new();
