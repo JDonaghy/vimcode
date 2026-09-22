@@ -11681,7 +11681,7 @@ pub(crate) fn scroll_gutter_width(scrollbar_reserve: f64, char_width: f64) -> f6
 ///
 /// Returns `None` when the setting is off (the caller passes a zero-width
 /// strip in that case), when the strip cannot hold a single row, or when the
-/// window/buffer has gone away. All sampling (`sample_lines`) and colour
+/// window/buffer has gone away. All sampling (`sample_blocks`) and colour
 /// reduction (`aggregate_spans`) is quadraui's — this function only maps
 /// vimcode's tree-sitter byte-offset highlights into quadraui's
 /// `SyntaxSpan` input type.
