@@ -84,6 +84,43 @@
 //! comment explains why both entries it ever held are gone and what the bar
 //! is for adding another.
 //!
+//! ## #1283 population seam (quickfix / location-list family)
+//!
+//! #1155 shipped the whole quickfix/location-list ex-command surface (23
+//! ids, `:copen`..`:lfdo`) with no oracle case at all. Before writing any of
+//! them, #1283 first asked whether this harness can seed both sides with an
+//! identical *populated* quickfix list — the obvious route is `:vimgrep` (or
+//! `:cexpr`) over the multi-file fixture's real files. It cannot, for two
+//! independent reasons, each confirmed against a live oracle rather than
+//! assumed:
+//!
+//! 1. Real Neovim's `:vimgrep {pattern}` with no file argument **errors**:
+//!    `E683: File name missing or invalid pattern`. Vim's grammar is
+//!    `:vimgrep /pat/ {files}` — a required file-glob argument, not merely an
+//!    optional one.
+//! 2. VimCode's `:vimgrep`/`:grep` (`Engine::qf_run_grep`,
+//!    `src/core/engine/execute.rs`) take **no file argument at all** — the
+//!    entire trailing string is the search pattern, applied via
+//!    `project_search::search_in_project` to a recursive walk of the whole
+//!    `cwd`. `:cexpr` is a second dead end on the vimcode side: `NotImplemented`
+//!    (this file's own `ex(":cex[pr]", ...)` NORM_AUDIT row), matching the
+//!    permanent expression-evaluator exemption `#1170` already carries.
+//!
+//! These are two incompatible command grammars, not two implementations of
+//! the same one — no single key sequence typed identically on both sides
+//! (the contract every harness in this file relies on) can populate an
+//! identical list. That is deliverable 1's finding: **no populated-list seam
+//! exists**, so none of the 23 ids retire via a populated list.
+//!
+//! What *is* real, reachable, comparable Neovim behaviour — the same
+//! precedent `ex:cc on empty quickfix list` (#1154) already set — is every
+//! one of these commands' empty-list (global) or absent-location-list
+//! (per-window) refusal/no-op path. 19 of the 23 ids retire via a plain
+//! buffer/cursor `Case` exercising that path (`CASES_EX`'s "#1283" block);
+//! the other 4 (`:copen`/`:cwindow`/`:lopen`/`:lwindow`) open a window, so
+//! they retire via `CASES_XFILE`'s `WinCase` layout-probe harness instead,
+//! chained after #1162 per this issue's own instruction.
+//!
 //! ## Debugging a single area
 //!
 //! `PROBE_FILTER=<label-substring>` restricts the run; `PROBE_VERBOSE=1` prints
@@ -5465,6 +5502,167 @@ const CASES_EX: &[Case] = &[
         1,
         ":cc<CR>",
     ),
+    // #1283: the quickfix/location-list family (23 ids: `ex::copen`..
+    // `ex::lfdo`) — see the module doc's "#1283 population seam" section for
+    // the deliverable-1 finding: no key sequence can populate an *identical*
+    // list on both sides through this shared single-buffer harness. Real
+    // Neovim's `:vimgrep pattern` with no file argument errors `E683: File
+    // name missing or invalid pattern` (confirmed against a live oracle);
+    // vimcode's `:vimgrep`/`:grep` take no file argument at all and instead
+    // recursively search the whole `cwd` for the trailing text as a plain
+    // pattern (`Engine::qf_run_grep` → `project_search::search_in_project`)
+    // — two incompatible command grammars, not two implementations of the
+    // same one, so there is no populated-list seam here (`:cexpr` is a
+    // second dead end: `NotImplemented` on the vimcode side per this file's
+    // own `ex(":cex[pr]", ...)` NORM_AUDIT row, matching the permanent
+    // expression-evaluator exemption).
+    //
+    // What *is* real, comparable, oracle-backed Neovim behaviour — same
+    // precedent as `ex:cc on empty quickfix list` right above (#1154) — is
+    // every one of these commands' empty-list (global) or absent-location-
+    // list refusal/no-op path, each confirmed by hand against a live
+    // `nvim --headless -u NONE` session before being encoded below. Four of
+    // the 23 ids (`ex::copen`/`ex::cwindow`/`ex::lopen`/`ex::lwindow`) open a
+    // window and are covered by `CASES_XFILE`'s `WinCase`/`run_win_case`
+    // layout-probe harness instead (chained after #1162 per this issue's own
+    // instruction) — see that array below.
+    c(
+        "ex:cnext on empty quickfix list errors",
+        &["a", "b", "c"],
+        2,
+        1,
+        ":cn<CR>",
+    ),
+    c(
+        "ex:cprevious on empty quickfix list errors",
+        &["a", "b", "c"],
+        2,
+        1,
+        ":cp<CR>",
+    ),
+    c(
+        "ex:cfirst on empty quickfix list errors",
+        &["a", "b", "c"],
+        2,
+        1,
+        ":cfirst<CR>",
+    ),
+    c(
+        "ex:clast on empty quickfix list errors",
+        &["a", "b", "c"],
+        2,
+        1,
+        ":clast<CR>",
+    ),
+    c(
+        "ex:clist on empty quickfix list errors",
+        &["a", "b", "c"],
+        2,
+        1,
+        ":clist<CR>",
+    ),
+    c(
+        "ex:colder at the bottom of an empty quickfix stack errors",
+        &["a", "b", "c"],
+        2,
+        1,
+        ":colder<CR>",
+    ),
+    c(
+        "ex:cnewer at the top of an empty quickfix stack errors",
+        &["a", "b", "c"],
+        2,
+        1,
+        ":cnewer<CR>",
+    ),
+    c(
+        "ex:cdo with no argument errors",
+        &["a", "b", "c"],
+        2,
+        1,
+        ":cdo<CR>",
+    ),
+    c(
+        "ex:cfdo with no argument errors",
+        &["a", "b", "c"],
+        2,
+        1,
+        ":cfdo<CR>",
+    ),
+    c(
+        "ex:cclose noop with no quickfix window open",
+        &["a", "b", "c"],
+        2,
+        1,
+        ":cclose<CR>",
+    ),
+    c(
+        "ex:lnext without a location list errors",
+        &["a", "b", "c"],
+        2,
+        1,
+        ":lnext<CR>",
+    ),
+    c(
+        "ex:lprevious without a location list errors",
+        &["a", "b", "c"],
+        2,
+        1,
+        ":lprevious<CR>",
+    ),
+    c(
+        "ex:lfirst without a location list errors",
+        &["a", "b", "c"],
+        2,
+        1,
+        ":lfirst<CR>",
+    ),
+    // `ex::ll`'s case must come before `ex:llast`/`ex:llist` below: all three
+    // keys start with the literal substring `:ll`, and `Keys(":ll")`
+    // (`ex::ll`'s probe) matches whichever comes first in corpus order —
+    // same "loose needle" hazard the module doc calls out for `:h`/`:hide`.
+    c(
+        "ex:ll without a location list errors",
+        &["a", "b", "c"],
+        2,
+        1,
+        ":ll<CR>",
+    ),
+    c(
+        "ex:llast without a location list errors",
+        &["a", "b", "c"],
+        2,
+        1,
+        ":llast<CR>",
+    ),
+    c(
+        "ex:llist without a location list errors",
+        &["a", "b", "c"],
+        2,
+        1,
+        ":llist<CR>",
+    ),
+    c(
+        "ex:ldo with no argument errors",
+        &["a", "b", "c"],
+        2,
+        1,
+        ":ldo<CR>",
+    ),
+    c(
+        "ex:lfdo with no argument errors",
+        &["a", "b", "c"],
+        2,
+        1,
+        ":lfdo<CR>",
+    ),
+    c(
+        "ex:lclose noop with no location-list window open",
+        &["a", "b", "c"],
+        2,
+        1,
+        ":lclose<CR>",
+    ),
     // #1154: the rest of this PR's backfilled ex commands. Each of these was
     // confirmed by hand against `nvim --headless -u NONE` — a fresh
     // single-tab/single-window/single-buffer session leaves every one of
@@ -9282,6 +9480,61 @@ const CASES_XFILE: &[WinCase] = &[
         1,
         ":e {F1}<CR>:e {F2}<CR>:b b.txt<CR>",
     ),
+    // #1283: `ex::copen`/`ex::cwindow`/`ex::lopen`/`ex::lwindow` — the four
+    // of the quickfix/location-list family's 23 ids that open a window, so
+    // per this issue's own instruction they're chained after #1162 onto this
+    // same `WinCase`/`run_win_case` layout-probe harness instead of the
+    // plain buffer/cursor `Case` harness the other 19 ids use (see
+    // `CASES_EX`'s "#1283" block above). Every one of these starts from a
+    // single window with no quickfix items and no location list at all —
+    // same "no populated-list seam" reasoning as that block.
+    //
+    // Three of the four are genuine, non-vacuous PASSes: `:cwindow` and
+    // `:lwindow` never open (confirmed against a live oracle: `winnr('$')`
+    // is unchanged either side, since the list is empty/absent) and `:lopen`
+    // refuses outright (`E776: No location list`, also confirmed live) — so
+    // the window layout is identical (one leaf, untouched) on both sides.
+    // `:copen` is the one RED entry — see KNOWN_DEVIATIONS_XFILE.
+    wc(
+        "qf:cwindow stays closed on an empty quickfix list",
+        XFILE_MAIN,
+        1,
+        1,
+        ":cwindow<CR>",
+    ),
+    wc(
+        "qf:lopen errors without a location list",
+        XFILE_MAIN,
+        1,
+        1,
+        ":lopen<CR>",
+    ),
+    wc(
+        "qf:lwindow errors without a location list",
+        XFILE_MAIN,
+        1,
+        1,
+        ":lwindow<CR>",
+    ),
+    // #1283 finding, RED: confirmed against a live oracle that `:copen`
+    // opens the quickfix window *unconditionally* — even empty, `winnr('$')`
+    // goes from 1 to 2 with no error — and vimcode's `qf_open` was fixed
+    // in this same PR to match that (see `Engine::qf_open`'s #1283 doc
+    // comment). But vimcode's quickfix panel is not a real split window at
+    // all: `qf_open` only flips `QuickfixList::open`/`has_focus`, never
+    // touching `WindowLayout` (`src/tui_main/panels.rs`,
+    // `src/tui_main/render_impl.rs` render it as a separate overlay panel,
+    // the same architecture as the sidebar/terminal panels) — so Neovim's
+    // `winlayout()` grows a second leaf and vimcode's does not, a structural
+    // mismatch no message- or cursor-level fix can close. See
+    // KNOWN_DEVIATIONS_XFILE for the follow-up-issue writeup.
+    wc(
+        "qf:copen opens the quickfix window even on an empty list",
+        XFILE_MAIN,
+        1,
+        1,
+        ":copen<CR>",
+    ),
 ];
 
 // KNOWN_DEVIATIONS_XFILE — same bidirectional-gate idiom as
@@ -9330,11 +9583,30 @@ const CASES_XFILE: &[WinCase] = &[
 //      creating a new one. Broad blast radius (every `:b {N}`, `:bfirst`,
 //      `:blast`, `:ls`/`:buffers` numbering) is exactly why this is left as
 //      a finding rather than attempted inline here.
+//   3. "qf:copen opens the quickfix window even on an empty list" (#1283) —
+//      title: "quickfix/location-list panels should be real split windows,
+//      not overlay panels". `Engine::qf_open`/`qf_close`/`qf_window`
+//      (src/core/engine/picker.rs) only ever flip `QuickfixList::open`/
+//      `has_focus`; nothing inserts or removes a leaf from `WindowLayout`.
+//      Real Neovim's `:copen` opens the quickfix list as a genuine
+//      horizontal split — `winlayout()` grows a leaf, `winnr("$")` goes up
+//      by one, `CTRL-W` navigation reaches it like any other window.
+//      vimcode's quickfix panel is architecturally the same kind of overlay
+//      as the sidebar/terminal panels (`src/tui_main/panels.rs`), rendered
+//      alongside the window layout rather than inside it. Fixing this means
+//      `qf_open`/`qf_close` inserting/removing an actual split — a
+//      `WindowLayout` change with both-backend rendering fallout (GTK panel
+//      placement, TUI panel placement, mouse/click regions for the
+//      quickfix list, `CTRL-W` focus-cycling reaching it) — not something to
+//      attempt inline alongside backfilling the other 22 ids in this same
+//      issue's slice, same reasoning as follow-ups #1/#2 above.
 //
-// Neither was attempted in #1281 itself for the same reason #1162 gave for
-// its own 5: each is a bigger, more failure-prone change (a real split-based
-// command-line window; renumbering every buffer-open call site) than
-// "backfill the 40 rows" should carry in the same slice.
+// Neither #1 nor #2 was attempted in #1281 itself for the same reason #1162
+// gave for its own 5, and #3 was not attempted in #1283 for the same reason
+// again: each is a bigger, more failure-prone change (a real split-based
+// command-line window; renumbering every buffer-open call site; quickfix
+// panels becoming real split windows) than "backfill N rows" should carry in
+// the same slice.
 // ---------------------------------------------------------------------------
 
 const KNOWN_DEVIATIONS_XFILE: &[&str] = &[
@@ -9348,6 +9620,9 @@ const KNOWN_DEVIATIONS_XFILE: &[&str] = &[
     "ex:b by number returns to buffer 1",
     "ex:bd deletes the current buffer and falls back to the previous one",
     "ex:bdelete deletes the current buffer and falls back to the previous one",
+    // Follow-up #3 above ("quickfix panels as real split windows") — not yet
+    // filed.
+    "qf:copen opens the quickfix window even on an empty list",
 ];
 
 #[test]
@@ -11401,7 +11676,13 @@ const COMMAND_PROBES: &[CommandProbe] = &[
     p("ex::lfdo", Keys(":lfdo")),
     p("ex::lgrep", Keys(":lgrep")),
     p("ex::lvimgrep", Keys(":lvimgrep")),
-    p("ex::cd {path}", Keys(":cd")),
+    // #1283: tightened from a bare `Keys(":cd")` — that needle is a prefix
+    // of `:cdo` too, and would have silently (and wrongly) "covered" this
+    // still-uncovered id off the back of `ex:cdo with no argument errors`'s
+    // case the moment #1283 added one. The audit table's own row for `:cd`
+    // (`ex(":cd", ..., Some(Keys(":cd ")), ...)` below) already uses the
+    // trailing-space form — this probe just never matched it.
+    p("ex::cd {path}", Keys(":cd ")),
     p("ex::colorscheme", Keys(":colorscheme")),
     // #1151
     p("ex::map", Label("map:nmap_chases_recursively")),
@@ -11675,37 +11956,23 @@ const COVERAGE_EXEMPT: &[&str] = &[
     // 6 pass — `ex::w` already had a vacuous case via the `:windo` needle
     // collision below, so it gained a real one too even though there was
     // nothing to delete here);
-    // the rest of this family (quickfix, etc.) is unrelated debt, still
-    // uncovered. (`ex::w`'s `Keys(":w")` probe is a loose needle that also
-    // matches ":windo" — retired before #1282 as an honest side effect of
-    // that needle, not because `:w` itself had gained a dedicated case at
-    // the time.)
-    "ex::copen",
-    "ex::cclose",
-    "ex::cn",
-    "ex::cp",
-    // --- #1155: quickfix completion + the location-list family — no oracle
-    // case exercises any of these yet, same gap as the rest of "Core Vim ex
-    // commands" above.
-    "ex::cfirst",
-    "ex::clast",
-    "ex::cwindow",
-    "ex::clist",
-    "ex::colder",
-    "ex::cnewer",
-    "ex::cdo",
-    "ex::cfdo",
-    "ex::lopen",
-    "ex::lclose",
-    "ex::lwindow",
-    "ex::lnext",
-    "ex::lprevious",
-    "ex::lfirst",
-    "ex::llast",
-    "ex::ll",
-    "ex::llist",
-    "ex::ldo",
-    "ex::lfdo",
+    // (`ex::w`'s `Keys(":w")` probe is a loose needle that also matches
+    // ":windo" — retired before #1282 as an honest side effect of that
+    // needle, not because `:w` itself had gained a dedicated case at the
+    // time.) #1283 backfilled the whole quickfix/location-list family (23
+    // ids, `ex::copen`..`ex::lfdo`, #1155's leftover debt) — 19 via real,
+    // passing empty-list/no-location-list refusal or no-op cases in
+    // `CASES_EX` (same precedent as `ex:cc on empty quickfix list`, #1154),
+    // and 4 (`ex::copen`/`ex::cwindow`/`ex::lopen`/`ex::lwindow`, which open
+    // a window) via `CASES_XFILE`'s `WinCase` layout-probe harness per this
+    // issue's own chaining instruction — `ex::copen` is real but currently
+    // RED, tracked in `KNOWN_DEVIATIONS_XFILE`. See that block's "#1283
+    // population seam" comment in `CASES_EX` for why every one of these
+    // drives an empty/absent list rather than a populated one: no key
+    // sequence can populate an identical quickfix list on both sides
+    // through this harness (confirmed against a live oracle — `:vimgrep`
+    // with no file argument errors `E683`, and vimcode's own
+    // `:vimgrep`/`:grep` don't take a file argument at all).
 ];
 
 // ---------------------------------------------------------------------------
@@ -13467,11 +13734,17 @@ fn coverage_ratchet_is_bidirectional_against_the_real_corpus() {
     // case for it, so it is no longer in COVERAGE_EXEMPT at all and this
     // fixture would read "fixture drifted" (the assertion below) rather
     // than test anything. #1281 did the same to `other:gt` (its own
-    // previous victim, backfilled by CASES_XFILE), and #1282 did it again to
-    // `other:ga` (CASES_MESSAGE) — `ex::copen` is still plain uncovered
-    // quickfix debt (see the header comment's tally), so it stands in as the
-    // victim now.
-    let victim = "ex::copen";
+    // previous victim, backfilled by CASES_XFILE), #1282 did it again to
+    // `other:ga` (CASES_MESSAGE), and #1283 backfilled the quickfix family
+    // that included the next victim, `ex::copen` — which exhausted the
+    // "Uncovered work — plain debt" heading entirely (every id under it is
+    // now covered). `ex::grep` steps in from the permanent "Environment-
+    // dependent" heading instead: the mechanics below only need *some*
+    // currently-exempt id with zero matching cases, not one about to be
+    // backfilled, and `ex::grep` cannot ever pick up a case here (no
+    // installed `grep`/`rg` is deterministic across hosts) so it will not
+    // need yet another swap once this lands.
+    let victim = "ex::grep";
     assert!(COVERAGE_EXEMPT.contains(&victim), "fixture drifted");
     let without: Vec<&str> = COVERAGE_EXEMPT
         .iter()
@@ -13486,7 +13759,7 @@ fn coverage_ratchet_is_bidirectional_against_the_real_corpus() {
 
     // Direction 2 — add a case for an exempt command, leave the entry alone.
     let mut plus = cases.clone();
-    plus.push(("ex::copen opens the quickfix window", ":copen"));
+    plus.push(("ex::grep populates the quickfix list", ":grep"));
     let improved = classify_coverage(&commands, COMMAND_PROBES, COVERAGE_EXEMPT, &plus);
     assert!(
         improved.newly_covered.iter().any(|u| u.starts_with(victim)),
@@ -18912,26 +19185,25 @@ const EX_COVERAGE_EXEMPT: &[&str] = &[
     ":bn[ext]",
     ":bp[revious]",
     ":cN[ext]",
-    ":ccl[ose]",
+    // #1283: `:cclose`/`:cfirst`/`:clast`/`:clist`/`:cnewer`/`:colder`
+    // retire here — same real, oracle-backed empty-quickfix-list cases as
+    // `ex::cclose`/etc. in `COVERAGE_EXEMPT` above (`CASES_EX`'s "#1283"
+    // block). `:copen`/`:cwindow` retire via `CASES_XFILE`'s `WinCase`
+    // entries instead (they open a window) — `:copen`'s is currently RED,
+    // tracked in `KNOWN_DEVIATIONS_XFILE`, same as its `COVERAGE_EXEMPT`
+    // sibling.
     ":cd",
     ":cdo",
     ":cfd[o]",
-    ":cfir[st]",
-    ":cla[st]",
-    ":cl[ist]",
     ":cm[ap]",
     ":cmapc[lear]",
     ":cn[ext]",
-    ":cnew[er]",
     ":cno[remap]",
     ":cnorea[bbrev]",
-    ":col[der]",
     ":colo[rscheme]",
-    ":cope[n]",
     ":cp[revious]",
     ":cq[uit]",
     ":cu[nmap]",
-    ":cw[indow]",
     ":diffo[ff]",
     ":diffs[plit]",
     ":difft[his]",
@@ -18944,19 +19216,13 @@ const EX_COVERAGE_EXEMPT: &[&str] = &[
     ":inorea[bbrev]",
     ":iu[nmap]",
     ":lN[ext]",
-    ":lcl[ose]",
+    // #1283: `:lclose`/`:lfirst`/`:ll`/`:llast`/`:llist`/`:lnext`/
+    // `:lprevious` retire the same way as their `:c*` siblings above.
+    // `:lopen`/`:lwindow` retire via `CASES_XFILE`'s `WinCase` entries.
     ":ld[o]",
     ":lfd[o]",
-    ":lfir[st]",
     ":lgr[ep]",
-    ":ll",
-    ":lla[st]",
-    ":lli[st]",
-    ":lne[xt]",
-    ":lop[en]",
-    ":lp[revious]",
     ":lv[imgrep]",
-    ":lw[indow]",
     ":mak[e]",
     ":map",
     ":mapc[lear]",

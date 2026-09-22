@@ -13301,7 +13301,212 @@ fn test_ex_bare_cc_jumps_to_current_entry_1154() {
 fn test_ex_cc_on_empty_quickfix_list_errors_1154() {
     let mut engine = Engine::new();
     engine.execute_command("cc");
-    assert!(engine.message.contains("No errors"));
+    // #1283: real Neovim's message is "E42: No Errors" (capital `E` in
+    // `Errors`) — confirmed against a live `nvim --headless -u NONE`. This
+    // assertion used to read `.contains("No errors")` (lowercase), which
+    // passed against vimcode's own wrong casing without ever comparing it to
+    // the oracle; nothing in the buffer/cursor-only `Case` harness that
+    // retired `ex::cc` from `COVERAGE_EXEMPT` looks at `message` at all.
+    assert!(engine.message.contains("No Errors"));
+}
+
+// ─── #1283: quickfix/location-list family (`ex::cn`..`ex::lfdo`, 23 ids) ───
+//
+// See the `tests/nvim_conformance.rs` module doc's "#1283 population seam"
+// section for why every case below drives an *empty* (or, for the location
+// list, altogether absent) list rather than a populated one: no key sequence
+// can populate an identical list on both sides through the shared harness
+// (`:vimgrep` requires real file arguments Neovim errors without, `E683`,
+// while vimcode's `:vimgrep`/`:grep` take no file argument at all and search
+// the whole cwd instead — two incompatible command grammars, not two
+// implementations of the same one). The empty/absent-list refusal and no-op
+// paths below are the real, comparable behaviour that *is* reachable, same
+// precedent as `ex:cc on empty quickfix list` above (#1154).
+
+#[test]
+fn test_ex_cnext_cprevious_on_empty_quickfix_list_error_1283() {
+    // #1283 finding: before this fix, `qf_next`/`qf_prev` had no empty-list
+    // guard at all — `qf_jump` silently declined to move (no item at index 0
+    // of an empty `Vec`), so `:cnext`/`:cprevious` left `engine.message`
+    // untouched instead of setting Neovim's real `E42: No Errors` (confirmed
+    // against a live oracle). The buffer/cursor-only oracle `Case` harness
+    // can't see this gap — cursor position matches either way — which is
+    // exactly why this needs an engine-level pairing.
+    let mut engine = Engine::new();
+    engine.execute_command("cnext");
+    assert!(
+        engine.message.contains("No Errors"),
+        "cnext on an empty quickfix list should error like Neovim, got {:?}",
+        engine.message
+    );
+
+    engine.message.clear();
+    engine.execute_command("cprevious");
+    assert!(
+        engine.message.contains("No Errors"),
+        "cprevious on an empty quickfix list should error like Neovim, got {:?}",
+        engine.message
+    );
+}
+
+#[test]
+fn test_ex_lnext_lprevious_without_location_list_error_1283() {
+    let mut engine = Engine::new();
+    engine.execute_command("lnext");
+    assert!(engine.message.contains("No location list"));
+
+    engine.message.clear();
+    engine.execute_command("lprevious");
+    assert!(engine.message.contains("No location list"));
+}
+
+#[test]
+fn test_ex_ll_llist_without_location_list_error_1283() {
+    let mut engine = Engine::new();
+    engine.execute_command("ll");
+    assert!(engine.message.contains("No location list"));
+
+    engine.message.clear();
+    engine.execute_command("llist");
+    assert!(engine.message.contains("No location list"));
+}
+
+#[test]
+fn test_ex_clist_on_empty_quickfix_list_errors_1283() {
+    let mut engine = Engine::new();
+    engine.execute_command("clist");
+    assert!(engine.message.contains("No Errors"));
+}
+
+#[test]
+fn test_ex_colder_cnewer_at_stack_ends_error_1283() {
+    // Confirmed against a live oracle: `:colder` on a fresh (empty-history)
+    // quickfix stack is "E380: At bottom of quickfix stack"; `:cnewer` is
+    // "E381: At top of quickfix stack". Neither moves the stack position.
+    let mut engine = Engine::new();
+    engine.execute_command("colder");
+    assert!(engine.message.contains("E380"));
+
+    engine.message.clear();
+    engine.execute_command("cnewer");
+    assert!(engine.message.contains("E381"));
+}
+
+#[test]
+fn test_ex_cdo_cfdo_ldo_lfdo_without_argument_error_1283() {
+    // Confirmed against a live oracle: all four require an argument
+    // ("E471: Argument required: {cmd}") and touch neither list nor buffer
+    // when bare.
+    for cmd in ["cdo", "cfdo", "ldo", "lfdo"] {
+        let mut engine = Engine::new();
+        engine.execute_command(cmd);
+        assert!(
+            engine.message.contains("E471"),
+            "{cmd} with no argument should require one, got {:?}",
+            engine.message
+        );
+    }
+}
+
+#[test]
+fn test_ex_cclose_lclose_are_silent_noops_1283() {
+    // Confirmed against a live oracle: `:cclose`/`:lclose` never error,
+    // window-count or not — real Neovim's are a no-op when nothing is open.
+    let mut engine = Engine::new();
+    engine.message.clear();
+    engine.execute_command("cclose");
+    assert!(engine.message.is_empty());
+
+    engine.execute_command("lclose");
+    assert!(engine.message.is_empty());
+}
+
+#[test]
+fn test_ex_copen_opens_even_on_empty_quickfix_list_1283() {
+    // #1283 finding: before this fix, `qf_open` refused (like `qf_get_mut`'s
+    // `entry(..).or_default()` made "no location list" and "empty list"
+    // indistinguishable) whenever the target list had zero items — but real
+    // Neovim's `:copen` opens the quickfix window unconditionally, even
+    // empty (confirmed against a live oracle: `winnr('$')` goes from 1 to 2
+    // with no error). The global list always exists, so `win == None` must
+    // never refuse.
+    let mut engine = Engine::new();
+    assert!(engine.quickfix.items.is_empty());
+    engine.execute_command("copen");
+    assert!(engine.quickfix.open, "copen must open even an empty list");
+    assert!(engine.quickfix.has_focus);
+    assert!(engine.message.is_empty());
+}
+
+#[test]
+fn test_ex_lopen_errors_only_when_no_location_list_exists_1283() {
+    // Confirmed against a live oracle: `:lopen` errors `E776: No location
+    // list` only when the window has *never* had one; once a location list
+    // exists — even with zero items (`setloclist(0, [])` on the Neovim side)
+    // — `:lopen` opens it exactly like `:copen`.
+    let mut engine = Engine::new();
+    let win = engine.active_window_id();
+
+    engine.execute_command("lopen");
+    assert!(
+        engine.message.contains("No location list"),
+        "lopen must refuse when the window has never had a location list"
+    );
+    assert!(engine.qf_get(Some(win)).is_none());
+
+    // Give the window an empty-but-existing location list, the same way
+    // `qf_set_list` would after a zero-match `:lvimgrep`.
+    engine.qf_set_list(Some(win), Vec::new());
+    engine.qf_get_mut(Some(win)).open = false;
+    engine.qf_get_mut(Some(win)).has_focus = false;
+    engine.message.clear();
+
+    engine.execute_command("lopen");
+    assert!(
+        engine.message.is_empty(),
+        "lopen must open an existing-but-empty location list without erroring, got {:?}",
+        engine.message
+    );
+    assert!(engine.qf_get(Some(win)).unwrap().open);
+}
+
+#[test]
+fn test_ex_cwindow_stays_closed_on_empty_quickfix_list_1283() {
+    // Confirmed against a live oracle: `:cwindow` never errors and never
+    // opens when the list is empty — unlike `:copen` above.
+    let mut engine = Engine::new();
+    engine.execute_command("cwindow");
+    assert!(!engine.quickfix.open);
+    assert!(engine.message.is_empty());
+}
+
+#[test]
+fn test_ex_lwindow_errors_only_when_no_location_list_exists_1283() {
+    // #1283 finding: before this fix, `qf_window` never set an error message
+    // at all — `:lwindow` on a window with no location list silently stayed
+    // closed instead of the real `E776: No location list` refusal (confirmed
+    // against a live oracle). Once a location list exists (even empty),
+    // `:lwindow` goes back to its ordinary silent-no-op-when-empty behaviour.
+    let mut engine = Engine::new();
+    let win = engine.active_window_id();
+
+    engine.execute_command("lwindow");
+    assert!(
+        engine.message.contains("No location list"),
+        "lwindow must refuse when the window has never had a location list"
+    );
+
+    engine.qf_set_list(Some(win), Vec::new());
+    engine.qf_get_mut(Some(win)).open = false;
+    engine.message.clear();
+
+    engine.execute_command("lwindow");
+    assert!(
+        engine.message.is_empty(),
+        "lwindow on an existing-but-empty location list must be a silent no-op, got {:?}",
+        engine.message
+    );
+    assert!(!engine.qf_get(Some(win)).unwrap().open);
 }
 
 #[test]
