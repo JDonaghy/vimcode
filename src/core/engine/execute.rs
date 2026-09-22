@@ -1999,10 +1999,29 @@ impl Engine {
         // first one. Without N the current tab page is made the last one."
         // #1281 finding: `:tabmove 0` used to be treated the same as bare
         // `:tabmove` (both landed at the end) — Vim's own wording makes `0`
-        // and "no argument" opposite ends, not synonyms. `N` is a direct
-        // 0-based destination index (`:tabmove 0` → index 0 = first;
-        // `:tabmove 3` → right after the old tab 3 = index 3), no `n - 1`
-        // conversion needed.
+        // and "no argument" opposite ends, not synonyms.
+        //
+        // #1281 review: the *previous* fix's formula (`dest = n.min(num_tabs
+        // - 1)`, treating `N` as a direct 0-based destination index) is
+        // wrong in general. Verified against the live oracle
+        // (`nvim v0.12.5 --headless -u NONE -i NONE`) with 5 tabs and every
+        // starting position: `N` is a 1-based reference to a tab in the
+        // *original* (pre-move) ordering — "after tab page N" — so where the
+        // current tab lands depends on whether N falls before, at, or after
+        // the current tab's own original position:
+        //   - N <= current's original 0-based index: dest = N
+        //     (the target tab N hasn't shifted yet, so N is already the
+        //     right 0-based slot to land in)
+        //   - N >  current's original 0-based index: dest = N - 1
+        //     (removing the current tab from earlier in the list shifts
+        //     every later tab back by one, so tab N's new index is N - 1)
+        //   - N == current's original 0-based index, or N == that + 1: both
+        //     resolve to the current tab's own original slot, i.e. a no-op
+        //     — confirmed against the oracle (5 tabs, current at index 2:
+        //     both `:tabmove 2` and `:tabmove 3` leave the order unchanged).
+        // Example: 5 tabs `a,b,c,d,e`, current = `a` (original index 0),
+        // `:tabmove 3` → oracle result `b,c,a,d,e` (a lands at index 2 =
+        // N - 1, since N(3) > current's original index(0)).
         if cmd == "tabmove" || cmd.starts_with("tabmove ") {
             let arg = cmd.strip_prefix("tabmove").unwrap_or("").trim();
             let num_tabs = self.active_group().tabs.len();
@@ -2010,7 +2029,12 @@ impl Engine {
             let dest = if arg.is_empty() {
                 num_tabs.saturating_sub(1) // no arg: move to end
             } else if let Ok(n) = arg.parse::<usize>() {
-                n.min(num_tabs.saturating_sub(1))
+                let n = n.min(num_tabs);
+                if n <= current {
+                    n
+                } else {
+                    n - 1
+                }
             } else {
                 self.message = "Usage: :tabmove [N]".to_string();
                 return EngineAction::None;
