@@ -9763,7 +9763,7 @@ const COMMAND_PROBES: &[CommandProbe] = &[
 // Where the gap is, at a glance (uncovered / in-scope, seeded 2026-09,
 // updated 2026-09 by #1279 which retired the text-object, operator-pending,
 // visual, movement, editing and `'<` rows below, and by #1162 which
-// backfilled all 33 CTRL-W rows — 26 now have a real oracle case (7 of those
+// backfilled all 33 CTRL-W rows — 26 now have a real oracle case (8 of those
 // tracked red in KNOWN_DEVIATIONS_WIN, not vacuously exempt) and the other 7
 // (`H`/`J`/`K`/`L`/`T`/`e`/`E`/`d`) moved to the permanent
 // "Deliberate semantic divergence" heading below):
@@ -10014,7 +10014,7 @@ const COVERAGE_EXEMPT: &[&str] = &[
     "g:g'",
     "g:g`",
     // --- Window Commands (CTRL-W) (win) --- #1162 backfilled all 33: 26 now
-    // have a real oracle case (CASES_WIN — 19 pass, 7 tracked red in
+    // have a real oracle case (CASES_WIN — 18 pass, 8 tracked red in
     // KNOWN_DEVIATIONS_WIN), and the other 7 (H/J/K/L/T/e/E/d) moved to the
     // "Deliberate semantic divergence" permanent heading above.
     // --- Core Vim Ex Commands (ex) ---
@@ -10961,75 +10961,85 @@ fn nvim_conformance_jumplist_multi_file() {
 // ---------------------------------------------------------------------------
 // KNOWN_DEVIATIONS_WIN — same bidirectional-gate idiom as KNOWN_DEVIATIONS_MULTI
 // above, applied to CASES_WIN (#1162). May only ever SHRINK.
+//
+// ## Follow-up issue status (read before editing any entry below)
+//
+// None of the 5 fixes below has a filed GitHub issue yet: the worker session
+// that wrote this harness runs under a policy that forbids it from running
+// `gh` — issue filing is reserved for the coordinator, not individual work
+// sessions. So instead of the usual "filed as #NNNN" pointer, each entry
+// below is deliberately worded as "not yet filed" and the exact
+// title/body to file is spelled out here so the coordinator (or whoever
+// picks this up next) can paste it straight into `gh issue create` without
+// re-deriving the diagnosis:
+//
+//   1. "win:CTRL-W -/</> resize by absolute count, not a fixed ratio step"
+//      — resize_window_split moves the split ratio by a fixed 5% per count
+//      step; Neovim moves the window boundary by an absolute [count]
+//      lines/columns. Fix: convert the absolute delta into a ratio delta
+//      against WindowLayout::dividers's axis_size.
+//   2. "win:CTRL-W | give the current window a true winminwidth maximize"
+//      — maximize_window_split's 0.9/0.1 ratio happens to match Neovim's
+//      real "shrink the other window to its 'winminheight' minimum"
+//      behaviour for height (CTRL-W _) but not width (CTRL-W |), where 10%
+//      of 80 columns is well above Neovim's 'winminwidth' floor.
+//   3. "win:CTRL-W = fix off-by-one rect rounding on odd-sized splits"
+//      — WindowLayout::calculate_rects (SplitTreeMeasure::new(0.0)) rounds
+//      each child's share of a split independently instead of giving one
+//      side the exact remainder, so an odd-sized 50/50 split lands 11/11
+//      instead of Neovim's 11/10. calculate_rects is shared by every other
+//      split-rect consumer in render.rs, so this needs care.
+//   4. "win:CTRL-W r/R rotate window identity, not just content"
+//      — rotate_windows swaps buffer_id/view across fixed WindowId tree
+//      slots, leaving Tab::active_window pinned to the same screen
+//      position. Neovim rotates which window (identity + focus) occupies
+//      which position. Needs rotate_windows to reorder WindowIds in the
+//      WindowLayout tree instead of swapping fields across static slots.
+//   5. "win:CTRL-W p track Tab::prev_window for real previous-window recall"
+//      — execute_wincmd's 'p' arm only restores prev_active_group (the
+//      VSCode-style editor-group tree); there is no Tab-level "previously
+//      active window" at all, so CTRL-W p is a no-op with a single editor
+//      group. Needs a Tab::prev_window field updated at every
+//      window-focus-changing call site (cycle_next_window/cycle_prev_window/
+//      activate_window/set_cursor_for_window/mouse click — ~20 sites per a
+//      #1162 audit).
+//
+// None of the 5 was attempted in #1162 itself: each is a bigger, more
+// failure-prone change (rewriting window resize math, reworking a shared
+// rect-rounding routine, restructuring rotate's identity model, or adding
+// focus-tracking to ~20 call sites) than "generalise the harness" should
+// carry in the same slice. Kept as real, non-vacuous KNOWN_DEVIATIONS_WIN
+// findings rather than silently dropped or mis-classified as passing.
 // ---------------------------------------------------------------------------
 
 const KNOWN_DEVIATIONS_WIN: &[&str] = &[
-    // `resize_window_split` moves the split ratio by a fixed 5% *per count
-    // step*; Neovim's `CTRL-W -`/`<`/`>` move the window boundary by an
-    // absolute [count] lines/columns. The two are different units and only
-    // coincide by chance — measured against this harness's fixed 80x24
-    // screen and a 2-window 50/50 starting split, `CTRL-W +`/`_` actually
-    // *do* coincide for [count]=5 (kept as real passes in `CASES_WIN`, not
-    // vacuous — real, matching numbers on both sides), which is exactly
-    // the kind of accidental agreement that makes this bug easy to miss by
-    // hand-testing a couple of keystrokes. `-`/`<`/`>` do not coincide for
-    // the counts this harness happens to use. Fixing this for real needs
-    // `resize_window_split` to convert an absolute line/column delta into
-    // a ratio delta against that split's actual axis size
-    // (`WindowLayout::dividers`'s `axis_size` already carries exactly that
-    // number) — filed as a follow-up, not attempted here to keep this
-    // slice to "generalise the harness", not "rewrite window resize".
+    // Follow-up #1 above ("resize by absolute count, not a fixed ratio
+    // step") — not yet filed. `CTRL-W +`/`_` actually *do* coincide with
+    // Neovim for [count]=5 on this harness's fixed 80x24, 2-window 50/50
+    // starting split (kept as real passes in `CASES_WIN`, not vacuous —
+    // real, matching numbers on both sides), which is exactly the kind of
+    // accidental agreement that makes this bug easy to miss by hand-testing
+    // a couple of keystrokes. `-`/`<`/`>` do not coincide for the counts
+    // this harness happens to use.
     "win:CTRL-W - decreases the active window's height",
     "win:CTRL-W < decreases the active window's width",
     "win:CTRL-W > increases the active window's width",
-    // `maximize_window_split`'s 0.9/0.1 ratio happens to match Neovim's
-    // real "give the current window everything, shrink the other to its
-    // `'winminheight'`/`'winminwidth'` minimum" behaviour on THIS harness's
-    // 80x24 screen for height (`CTRL-W _`, kept as a real, non-coincidental-
-    // looking pass — both land the other window at exactly 1 content row)
-    // but not for width: 10% of 80 columns (~8, after the vertical-divider
-    // column) is well above Neovim's `'winminwidth'` floor, so `CTRL-W \|`
-    // still visibly diverges. Not attempting a real "true maximize" fix
-    // here for the same reason as the resize cluster above — filed as a
-    // follow-up alongside it.
+    // Follow-up #2 above ("true winminwidth maximize") — not yet filed.
+    // `CTRL-W _` is kept as a real, non-coincidental-looking pass (both
+    // land the other window at exactly 1 content row); `CTRL-W \|` still
+    // visibly diverges for the reason in follow-up #2.
     "win:CTRL-W | maximizes the active window's width",
-    // #1162 finding, distinct from the two above: `WindowLayout::
-    // calculate_rects` (`SplitTreeMeasure::new(0.0)` — see `src/core/
-    // window.rs`) rounds each child's share of a split *independently*
-    // (both children of a 50/50 split on an odd budget round the *same*
-    // direction), rather than giving one side the exact remainder the way
-    // Neovim's own window-height accounting does. `equalize_splits` sets
-    // every ratio to exactly 0.5 — matching Neovim's own default — so the
-    // *ratio* math is right; only the rect-rounding on top of it is off by
-    // one row on an odd-sized split (11/11 vs Neovim's 11/10). Not the
-    // window-resize bug above, and not attempted here: `calculate_rects` is
-    // shared by every other split-rect consumer in `render.rs`, so
-    // reworking its rounding convention is a bigger, more failure-prone
-    // change than this harness-generalisation slice should carry.
+    // Follow-up #3 above ("off-by-one rect rounding on odd-sized splits")
+    // — not yet filed. Distinct from follow-up #1/#2: `equalize_splits`
+    // sets every ratio to exactly 0.5, matching Neovim's own default, so
+    // the *ratio* math is right — only the rect-rounding on top of it is
+    // off by one row on an odd-sized split.
     "win:CTRL-W = re-equalizes windows after a resize",
-    // `rotate_windows` rotates *content* (buffer_id + view) across a set of
-    // fixed `WindowId` tree slots, leaving `Tab::active_window` (a
-    // `WindowId`) unchanged — so "current" stays pinned to the same screen
-    // position through a rotate. Neovim instead rotates which *window*
-    // (identity, including its own focus) occupies which position, so its
-    // focus moves to wherever that window's content ends up. Fixing this
-    // needs `rotate_windows` to actually reorder `WindowId`s in the
-    // `WindowLayout` tree (so each window keeps its own identity/cursor and
-    // only its tree position changes) rather than swapping fields across
-    // static slots — a structural rework of the rotate implementation, not
-    // attempted here. Filed as a follow-up.
+    // Follow-up #4 above ("rotate window identity, not just content") —
+    // not yet filed.
     "win:CTRL-W r rotates windows downward/rightward",
     "win:CTRL-W R rotates windows upward/leftward",
-    // `execute_wincmd`'s `'p'` arm only restores `prev_active_group` (the
-    // VSCode-style editor-group tree) — there is no `Tab`-level "previously
-    // active window" tracked at all, so `CTRL-W p` is a no-op whenever
-    // there is a single editor group, the common case every other
-    // CASES_WIN entry lives in. A real fix needs a `Tab::prev_window`
-    // field updated at every window-focus-changing call site (`cycle_next_
-    // window`/`cycle_prev_window`/`activate_window`/`set_cursor_for_window`/
-    // mouse click — roughly 20 sites per a #1162 audit), which is a bigger,
-    // more failure-prone change than this harness-generalisation slice
-    // should carry. Filed as a follow-up.
+    // Follow-up #5 above ("track Tab::prev_window") — not yet filed.
     "win:CTRL-W p returns to the previously active window",
 ];
 
