@@ -376,6 +376,66 @@ impl WindowLayout {
         }
     }
 
+    /// Find the Nth split node in pre-order and return its current ratio.
+    /// Used by `Engine::resize_window_split` (#1288) to recover a split's
+    /// current share of its axis before converting an absolute-line/column
+    /// `[count]` into a ratio delta — `adjust_ratio_at_index` alone can't do
+    /// that conversion since it only ever sees the delta, never the ratio it
+    /// is about to be applied to.
+    pub fn ratio_at_index(&self, split_index: usize) -> Option<f64> {
+        self.ratio_at_index_impl(split_index, &mut 0)
+    }
+
+    fn ratio_at_index_impl(&self, target: usize, counter: &mut usize) -> Option<f64> {
+        match self {
+            WindowLayout::Leaf(_) => None,
+            WindowLayout::Split {
+                ratio,
+                first,
+                second,
+                ..
+            } => {
+                let idx = *counter;
+                *counter += 1;
+                if idx == target {
+                    return Some(*ratio);
+                }
+                first
+                    .ratio_at_index_impl(target, counter)
+                    .or_else(|| second.ratio_at_index_impl(target, counter))
+            }
+        }
+    }
+
+    /// Find the Nth split node in pre-order and return references to its two
+    /// child subtrees. Used by `Engine::resize_window_split` (#1288) to sum
+    /// each child's own current axis size directly, rather than recovering
+    /// the split's total from one already-rounded leaf size and an
+    /// idealized ratio (see that function's doc for why the two disagree).
+    pub fn children_at_index(&self, split_index: usize) -> Option<(&WindowLayout, &WindowLayout)> {
+        self.children_at_index_impl(split_index, &mut 0)
+    }
+
+    fn children_at_index_impl(
+        &self,
+        target: usize,
+        counter: &mut usize,
+    ) -> Option<(&WindowLayout, &WindowLayout)> {
+        match self {
+            WindowLayout::Leaf(_) => None,
+            WindowLayout::Split { first, second, .. } => {
+                let idx = *counter;
+                *counter += 1;
+                if idx == target {
+                    return Some((first, second));
+                }
+                first
+                    .children_at_index_impl(target, counter)
+                    .or_else(|| second.children_at_index_impl(target, counter))
+            }
+        }
+    }
+
     /// Find the Nth split node in pre-order and adjust its ratio by delta.
     pub fn adjust_ratio_at_index(&mut self, split_index: usize, delta: f64) {
         self.adjust_ratio_at_index_impl(split_index, delta, &mut 0);
@@ -777,6 +837,33 @@ impl GroupLayout {
                 }
                 first.set_ratio_at_index_impl(target, ratio, counter)
                     || second.set_ratio_at_index_impl(target, ratio, counter)
+            }
+        }
+    }
+
+    /// See `WindowLayout::ratio_at_index` — same role for editor-group splits
+    /// (#1288's `resize_window_split` group-layout fallback).
+    pub fn ratio_at_index(&self, split_index: usize) -> Option<f64> {
+        self.ratio_at_index_impl(split_index, &mut 0)
+    }
+
+    fn ratio_at_index_impl(&self, target: usize, counter: &mut usize) -> Option<f64> {
+        match self {
+            GroupLayout::Leaf(_) => None,
+            GroupLayout::Split {
+                ratio,
+                first,
+                second,
+                ..
+            } => {
+                let idx = *counter;
+                *counter += 1;
+                if idx == target {
+                    return Some(*ratio);
+                }
+                first
+                    .ratio_at_index_impl(target, counter)
+                    .or_else(|| second.ratio_at_index_impl(target, counter))
             }
         }
     }

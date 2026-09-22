@@ -1,5 +1,120 @@
 use super::*;
 
+/// A window's own `View::viewport_lines`/`viewport_cols` are content-space —
+/// chrome (each window's own status line) already subtracted, per
+/// `Engine::set_viewport_lines`'s doc. `WindowLayout`/`GroupLayout`'s ratio
+/// tree, by contrast, divides *raw* axis space (`SplitTreeMeasure::new(0.0)`
+/// reserves no chrome at all) — a Horizontal split's two windows' raw row
+/// counts sum to the tree's full axis size, each then losing one row to its
+/// own status line for display. Vertical splits have no equivalent per-window
+/// row/column chrome column here (see `resize_window_split`'s `#1288` doc),
+/// so columns round-trip unchanged. Used by `split_window_with_new_first` and
+/// `resize_window_split` to convert between the two spaces when recovering or
+/// redistributing a split's axis size (#1288).
+fn raw_axis_extent(view: &View, direction: SplitDirection) -> f64 {
+    match direction {
+        SplitDirection::Horizontal => view.viewport_lines as f64 + 1.0,
+        SplitDirection::Vertical => view.viewport_cols as f64,
+    }
+}
+
+/// Inverse of [`raw_axis_extent`] — writes a raw axis size back into a
+/// window's content-space viewport field.
+fn set_raw_axis_extent(view: &mut View, direction: SplitDirection, raw: f64) {
+    let raw_rounded = raw.round().max(1.0) as usize;
+    match direction {
+        SplitDirection::Horizontal => view.viewport_lines = raw_rounded.saturating_sub(1),
+        SplitDirection::Vertical => view.viewport_cols = raw_rounded,
+    }
+}
+
+/// The current raw axis size (see [`raw_axis_extent`]) a `WindowLayout`
+/// subtree occupies along `direction`, read straight from the leaf
+/// windows' own currently-tracked content sizes — used by
+/// `Engine::resize_window_split` (#1288) to recover a split's total axis
+/// size without reintroducing integer-rounding error (see that function's
+/// doc for why `leaf_size / share` can't be trusted for this).
+fn subtree_raw_extent(
+    layout: &WindowLayout,
+    direction: SplitDirection,
+    windows: &std::collections::HashMap<WindowId, Window>,
+) -> f64 {
+    match layout {
+        WindowLayout::Leaf(id) => windows
+            .get(id)
+            .map(|w| raw_axis_extent(&w.view, direction))
+            .unwrap_or(0.0),
+        WindowLayout::Split {
+            direction: split_dir,
+            first,
+            second,
+            ..
+        } => {
+            if *split_dir == direction {
+                // Stacked along the resize axis: the two children's own
+                // extents add up to the whole.
+                subtree_raw_extent(first, direction, windows)
+                    + subtree_raw_extent(second, direction, windows)
+            } else {
+                // Side-by-side relative to `direction`: both children share
+                // the same extent along it, so either one is representative
+                // (fall back to the other if the first subtree is somehow
+                // empty, e.g. a window not yet in `windows`).
+                let f = subtree_raw_extent(first, direction, windows);
+                if f > 0.0 {
+                    f
+                } else {
+                    subtree_raw_extent(second, direction, windows)
+                }
+            }
+        }
+    }
+}
+
+/// Compute the split's new first-child raw size after an absolute
+/// `[count]` lines/columns resize, given that split's *current* first-child
+/// raw size (see [`subtree_raw_extent`]) and whether the active window is
+/// the first or second child (#1288). Stays entirely in integer-valued raw
+/// space — see `resize_window_split`'s doc for why converting through a
+/// continuous ratio delta instead reintroduces a rounding tie.
+fn resize_new_first_raw(first_raw: f64, is_first: bool, increase: bool, count: usize) -> f64 {
+    let signed_count = if increase {
+        count as f64
+    } else {
+        -(count as f64)
+    };
+    // Active window is the first child → growing it grows `first_raw`
+    // directly; the second child → growing it *shrinks* `first_raw` (the
+    // axis size is fixed, so the second child eats into the first's share).
+    if is_first {
+        first_raw + signed_count
+    } else {
+        first_raw - signed_count
+    }
+}
+
+/// Convert an absolute `[count]` lines/columns resize into the ratio delta
+/// to apply to a split, given that split's current total `axis_size` (see
+/// [`subtree_raw_extent`]) and whether the active window is the split's
+/// first child (#1288 — Neovim moves the window *boundary* by `[count]`
+/// screen lines/columns, not by some fraction of the split). Used only by
+/// the editor-group fallback in `resize_window_split`, whose `axis_size` is
+/// itself already approximate — see that function's doc.
+fn resize_delta_ratio(is_first: bool, increase: bool, count: usize, axis_size: f64) -> f64 {
+    if count == 0 || axis_size <= 0.0 {
+        return 0.0;
+    }
+    let magnitude = count as f64 / axis_size;
+    let signed = if increase { magnitude } else { -magnitude };
+    // Active window is the first child → increasing its share makes it
+    // bigger; the second child → the opposite.
+    if is_first {
+        signed
+    } else {
+        -signed
+    }
+}
+
 impl Engine {
     // =======================================================================
     // Window operations
@@ -88,6 +203,37 @@ impl Engine {
         tab.layout
             .split_at(current_window_id, direction, new_window_id, new_first);
         tab.active_window = new_window_id;
+
+        // #1288: `WindowLayout::split_at` always starts a fresh split at an
+        // exact 0.5 ratio; give both new sibling windows an immediately
+        // accurate viewport size for the split axis (round-tripped through
+        // `raw_axis_extent`/`set_raw_axis_extent`, mirroring the rounding
+        // `calculate_rects` — via quadraui's `SplitTree` — uses) rather than
+        // leaving both holding the old, undivided size until the next
+        // repaint's `set_viewport_for_window` sync corrects it.
+        // `resize_window_split` needs an accurate *current* size the moment
+        // a resize follows a split in the same breath (e.g.
+        // `<C-w>s5<C-w>-`), and nothing else refreshes it in between.
+        let total_raw = self
+            .windows
+            .get(&current_window_id)
+            .map(|w| raw_axis_extent(&w.view, direction))
+            .unwrap_or(0.0);
+        if total_raw > 0.0 {
+            let first_raw = (total_raw * 0.5).round();
+            let second_raw = (total_raw - first_raw).max(0.0);
+            let (new_raw, old_raw) = if new_first {
+                (first_raw, second_raw)
+            } else {
+                (second_raw, first_raw)
+            };
+            if let Some(w) = self.windows.get_mut(&current_window_id) {
+                set_raw_axis_extent(&mut w.view, direction, old_raw);
+            }
+            if let Some(w) = self.windows.get_mut(&new_window_id) {
+                set_raw_axis_extent(&mut w.view, direction, new_raw);
+            }
+        }
 
         if file_path.is_some() {
             self.message = String::new();
@@ -3354,9 +3500,38 @@ impl Engine {
     // Window resize (CTRL-W +/-/</>=/|/_)
     // =======================================================================
 
-    /// Resize the active window's parent split by delta steps.
+    /// Resize the active window's parent split by an absolute `[count]`
+    /// lines (Horizontal) or columns (Vertical) — matching Neovim's own
+    /// `CTRL-W -`/`+`/`<`/`>`, which move the window *boundary* by
+    /// `[count]` screen lines/columns, not by some fraction of the split.
     /// `direction`: which split direction to look for (Horizontal for +/-, Vertical for </>).
     /// `increase`: true = make active window/group bigger, false = smaller.
+    ///
+    /// #1288: vimcode used to move the split *ratio* by a fixed 5% per
+    /// count step (`delta_per_step = 0.05`) — the two only ever agreed by
+    /// accident (`CTRL-W +`/`_` happen to land on the same cell as
+    /// Neovim's absolute-count resize for `[count]=5` on a fixed 80x24
+    /// two-window 50/50 split; `-`/`<`/`>` do not).
+    ///
+    /// The window-split branch below instead works entirely in the same
+    /// *integer* raw-line/column space Neovim's own window-frame model
+    /// uses: it reads both child subtrees' current sizes
+    /// (`subtree_raw_extent`), adds or subtracts `count` from whichever
+    /// side the active window is on, and only converts back to a ratio at
+    /// the very end. This — not `ratio + count / axis_size`, which looked
+    /// algebraically equivalent — is required to avoid landing back on a
+    /// fresh `.5`-line rounding tie: `WindowLayout`'s `ratio` field is a
+    /// continuous ideal fraction (a fresh 50/50 split is `ratio = 0.5`
+    /// exactly), but the two windows' *actual* rendered sizes are already
+    /// integers rounded away from that ideal (an odd 23-row split's two
+    /// sides are 12/11 raw, not 11.5/11.5). Computing the delta against the
+    /// idealized `ratio` and only rounding at render time re-derives a new
+    /// idealized ratio that, for plenty of `[count]`s, is *itself* exactly
+    /// on a `.5` tie (verified against #1290's independent-per-side
+    /// rounding for this exact fixture) — reproducing #1290's bug on a
+    /// resize it was never filed against. Anchoring the arithmetic on the
+    /// already-integer current sizes instead means the result is only ever
+    /// `count` away from an already-resolved integer, never a fresh tie.
     ///
     /// #582: tries the active *window*'s split within its tab's
     /// `WindowLayout` first (vim `:split`/`:vsplit` panes) — this was
@@ -3368,29 +3543,45 @@ impl Engine {
     /// `tests/vim_compat_batch.rs::test_ctrl_w_plus_resize`) when the active
     /// tab has no window split in the requested direction, matching vim's
     /// "operate on the current window, or whatever's locally splittable"
-    /// convention.
+    /// convention. The group-layout fallback keeps the simpler (and, for
+    /// the reason above, occasionally imprecise) continuous `ratio +
+    /// count / axis_size` conversion — no test pins its exact resulting
+    /// numbers (only that the ratio changes at all), and giving it the
+    /// same integer-anchored treatment would need walking `GroupLayout`
+    /// subtrees down into each group's *own* `WindowLayout`, a bigger
+    /// change than this fallback's existing test coverage asks for.
     pub(crate) fn resize_window_split(
         &mut self,
         direction: SplitDirection,
         increase: bool,
         count: usize,
     ) {
-        let delta_per_step = 0.05;
-        let delta = if increase {
-            delta_per_step * count as f64
-        } else {
-            -(delta_per_step * count as f64)
-        };
         let active_window = self.active_window_id();
         if let Some((split_idx, split_dir, is_first)) =
             self.active_tab().layout.parent_split_of(active_window)
         {
             if split_dir == direction {
-                // Active window is in first child → increasing ratio makes it bigger
-                let delta = if is_first { delta } else { -delta };
-                self.active_tab_mut()
-                    .layout
-                    .adjust_ratio_at_index(split_idx, delta);
+                let sizes =
+                    self.active_tab()
+                        .layout
+                        .children_at_index(split_idx)
+                        .map(|(first, second)| {
+                            (
+                                subtree_raw_extent(first, direction, &self.windows),
+                                subtree_raw_extent(second, direction, &self.windows),
+                            )
+                        });
+                if let Some((first_raw, second_raw)) = sizes {
+                    let axis_size = first_raw + second_raw;
+                    if axis_size > 0.0 {
+                        let new_first_raw =
+                            resize_new_first_raw(first_raw, is_first, increase, count);
+                        let new_ratio = (new_first_raw / axis_size).clamp(0.1, 0.9);
+                        self.active_tab_mut()
+                            .layout
+                            .set_ratio_at_index(split_idx, new_ratio);
+                    }
+                }
                 return;
             }
         }
@@ -3398,8 +3589,16 @@ impl Engine {
             self.group_layout.parent_split_of(self.active_group)
         {
             if split_dir == direction {
-                let delta = if is_first { delta } else { -delta };
-                self.group_layout.adjust_ratio_at_index(split_idx, delta);
+                if let Some(ratio) = self.group_layout.ratio_at_index(split_idx) {
+                    let share = if is_first { ratio } else { 1.0 - ratio };
+                    let axis_size = if share > 0.0 {
+                        raw_axis_extent(self.view(), direction) / share
+                    } else {
+                        0.0
+                    };
+                    let delta = resize_delta_ratio(is_first, increase, count, axis_size);
+                    self.group_layout.adjust_ratio_at_index(split_idx, delta);
+                }
             }
         }
     }
