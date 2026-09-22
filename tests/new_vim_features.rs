@@ -667,6 +667,29 @@ fn test_history_shows_command_history() {
     assert!(e.message.contains("History") || e.message.contains("echo"));
 }
 
+/// Hermeticity regression for #1304: `Engine::new()` used to read the real
+/// `~/.config/vimcode/history.json` unconditionally, so `:history` printed
+/// whatever the developer machine's config had lying around (confirmed:
+/// this repo's own dev machine had ~100 stale entries) instead of only the
+/// commands this test itself typed. `engine_with` now calls
+/// `suppress_disk_loads()` before `Engine::new()`, so `HistoryState::load()`
+/// returns `Default` instead of touching disk. Assert the exact rendered
+/// `:history` output — not just that *a* history entry is present, which
+/// would pass just as well with real disk history leaked in ahead of it.
+#[test]
+fn test_history_is_hermetic_and_shows_only_this_tests_commands() {
+    let mut e = engine_with("hello\n");
+    run_cmd(&mut e, "echo one");
+    run_cmd(&mut e, "echo two");
+    exec(&mut e, "history");
+    assert_eq!(
+        e.message, "--- Command History ---\n   1  echo one\n   2  echo two",
+        "message should contain exactly this test's two commands, not any \
+         real ~/.config/vimcode/history.json entries from the machine \
+         running the test"
+    );
+}
+
 // ── :reg ─────────────────────────────────────────────────────────────────────
 
 #[test]
