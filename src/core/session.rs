@@ -86,7 +86,7 @@ impl HistoryState {
     /// Load history from history.json.
     /// If history.json is absent, attempts a one-time migration from session.json.
     pub fn load() -> Self {
-        if SUPPRESS_LOADS.load(Ordering::Relaxed) {
+        if loads_suppressed() {
             return Self::default();
         }
         let path = Self::history_path();
