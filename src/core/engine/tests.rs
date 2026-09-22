@@ -2029,6 +2029,74 @@ fn test_ctrl_w_commands() {
     assert_eq!(engine.windows.len(), 2);
 }
 
+/// #1162: `CTRL-W W` ("focus previous window", `:h CTRL-W_W`) used to be
+/// aliased to `CTRL-W w` (`'w' | 'W' => self.focus_next_window()` in
+/// `execute_wincmd`) — pressing it cycled *forward* like `w`, same as
+/// pressing `w` twice, instead of cycling back to where `w` started.
+/// RED against the pre-fix alias: with only two windows, `w` then `w` again
+/// (what the bug made `W` do) lands back on the *same* window `w` started
+/// from, which happens to equal the correct `W` answer here — so this uses
+/// three windows, where forward-twice and backward-once land on different
+/// windows, to actually distinguish the two.
+#[test]
+fn test_ctrl_w_shift_w_cycles_backward_1162() {
+    let mut engine = Engine::new();
+    let w0 = engine.active_window_id();
+    press_ctrl(&mut engine, 'w');
+    press_char(&mut engine, 's');
+    let w1 = engine.active_window_id();
+    press_ctrl(&mut engine, 'w');
+    press_char(&mut engine, 's');
+    let w2 = engine.active_window_id();
+    assert_eq!(engine.windows.len(), 3);
+    assert_ne!(w0, w1);
+    assert_ne!(w1, w2);
+
+    // Layout order (most-recently-split-first): w2, w1, w0. `W` from w2
+    // must cycle *backward* to w0, not forward to w1.
+    press_ctrl(&mut engine, 'w');
+    press_char(&mut engine, 'W');
+    assert_eq!(
+        engine.active_window_id(),
+        w0,
+        "CTRL-W W must cycle backward, landing on the window before the current one"
+    );
+}
+
+/// #1162: `CTRL-W t`/`CTRL-W b` ("go to top-left"/"bottom-right window",
+/// `:h CTRL-W_t`/`:h CTRL-W_b`) used to walk `self.group_layout` — the
+/// VSCode-style editor-group tree — which is a no-op whenever there is a
+/// single editor group, the common case a plain `<C-w>s`/`<C-w>v` split
+/// lives in. RED against the pre-fix version: focus never left the
+/// most-recently-split window (`group_layout` is a single leaf, so `t`/`b`
+/// always "went to" the already-active group).
+#[test]
+fn test_ctrl_w_t_and_b_use_the_window_layout_1162() {
+    let mut engine = Engine::new();
+    let w0 = engine.active_window_id();
+    press_ctrl(&mut engine, 'w');
+    press_char(&mut engine, 's');
+    let w1 = engine.active_window_id();
+    assert_ne!(w0, w1);
+    assert_eq!(engine.windows.len(), 2);
+
+    // Layout order (new-first): w1 (top-left), w0 (bottom-right).
+    press_ctrl(&mut engine, 'w');
+    press_char(&mut engine, 'b');
+    assert_eq!(
+        engine.active_window_id(),
+        w0,
+        "CTRL-W b must go to the bottom-right window in the current tab's layout"
+    );
+    press_ctrl(&mut engine, 'w');
+    press_char(&mut engine, 't');
+    assert_eq!(
+        engine.active_window_id(),
+        w1,
+        "CTRL-W t must go to the top-left window in the current tab's layout"
+    );
+}
+
 #[test]
 fn test_ex_hide_closes_window_without_dirty_check_1154() {
     let mut engine = Engine::new();

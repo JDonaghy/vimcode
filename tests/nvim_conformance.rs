@@ -183,6 +183,7 @@ use std::io::{BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use vimcode_core::core::window::{SplitDirection, WindowId, WindowLayout, WindowRect};
 use vimcode_core::core::OpenMode;
 use vimcode_core::{Engine, EngineAction, Settings};
 
@@ -1831,6 +1832,615 @@ fn run_jumps_case(case: &MultiJumpsCase) -> Outcome {
         case.keys,
         fmt(&nvim_entries, nvim_current),
         fmt(&vc_entries, vc_current)
+    ))
+}
+
+// ---------------------------------------------------------------------------
+// Multi-window / multi-tab layout harness (#1162) — generalises the
+// single-buffer harness above (buffer text + one cursor) and the multi-file
+// harness above that (which file is current + one cursor) to a third
+// dimension neither can see: the *window tree* — split orientation, nesting,
+// which window is current, and each window's own (file, cursor). This is
+// what the 33 `CTRL-W` rows need and what `VIM_COMPATIBILITY.md` has never
+// had an oracle case for (`win:CTRL-W *`, 33 of 33 uncovered as of #1162).
+//
+// ## Comparing trees, not raw geometry
+//
+// The oracle side calls Neovim's own `winlayout()` — a builtin that already
+// returns exactly this shape (`{"row"|"col"|"leaf", ...}`, recursively) — via
+// a small Lua snapshot ([`WIN_SNAPSHOT_LUA`]) that resolves each `winid` leaf
+// into (file, cursor, current-window flag, height, width) so the whole
+// tabpage/window tree comes back as one JSON blob. The vimcode side walks
+// `Tab::layout` (a strict *binary* tree — every `Split` has exactly two
+// children) and **flattens runs of same-direction nested splits into one
+// N-ary group** ([`flatten_vc`]) before comparing, because Neovim's own
+// frame tree does the same thing: three side-by-side `:vsplit`s come back as
+// one `"row"` with three children, not two nested binary pairs (verified
+// empirically against nvim 0.12.5 — see the PR this landed in). Comparing
+// the flattened shapes means a case is not sensitive to *how* vimcode's
+// binary tree happens to nest a same-direction sequence of splits, only to
+// what a human (or Neovim) would actually see on screen.
+//
+// ## Size is opt-in per case (`WinCase::check_size`)
+//
+// Every leaf carries `rows`/`cols` (Neovim's `nvim_win_get_height`/`_width`,
+// vimcode's own `WindowLayout::calculate_rects` against the same pinned
+// 80x24 screen), but the comparison only *looks* at them when
+// `check_size` is set — see the [`KNOWN_DEVIATIONS_WIN`] entries for the
+// real, distinct behavioural gaps this surfaced (a resize-unit mismatch, a
+// partial vs full maximize, a rect-rounding artifact, and a rotate that
+// doesn't move window identity). Two of the size-checked ids, `CTRL-W +`
+// and `_`, genuinely pass — not vacuously: both land on the *same* rows/cols
+// as Neovim on this harness's fixed 80x24 screen, which is worth noting
+// precisely because it means a couple of quick hand-tests of this family
+// would not have caught the `-`/`<`/`>`/`\|` siblings' real divergence.
+//
+// ## What's deliberately out of scope here
+//
+// `CTRL-W H`/`J`/`K`/`L`/`T`/`e`/`E`/`d` are not covered by any
+// [`CASES_WIN`] entry — see the "Deliberate semantic divergence" block in
+// [`COVERAGE_EXEMPT`] for why each is permanent, not debt. Every other id
+// with a case in [`KNOWN_DEVIATIONS_WIN`] (`-`/`<`/`>`/`\|`/`=`/`r`/`R`/`p`)
+// is a real, non-vacuous finding, not a permanent divergence — each one's
+// own comment there names the fix it's waiting on. Cross-file/cross-tab
+// commands (`gf`, `gt`, `CTRL-^`, buffer/tab/window ex commands) that could
+// reuse this same harness are #1281, chained after this one.
+// ---------------------------------------------------------------------------
+
+/// One scenario for the window-layout harness: `lines` is written to
+/// `main.txt` in a fresh temp dir (the file the case starts on);
+/// `extra_files` are written alongside it for scenarios that need a second
+/// real file (`CTRL-W f`, which opens whatever path is under the cursor —
+/// nothing else in this array needs it, so it's empty everywhere else).
+struct WinCase {
+    label: &'static str,
+    lines: &'static [&'static str],
+    extra_files: &'static [(&'static str, &'static [&'static str])],
+    start_line: usize,
+    start_col: usize,
+    keys: &'static str,
+    /// Whether the comparison also checks each leaf's (rows, cols). See the
+    /// module doc above — off for every id except `CTRL-W =` and the
+    /// [`KNOWN_DEVIATIONS_WIN`] resize/maximize/previous-window entries,
+    /// where the size (or lack of previous-window tracking) *is* the finding.
+    check_size: bool,
+}
+
+const fn wc(
+    label: &'static str,
+    lines: &'static [&'static str],
+    start_line: usize,
+    start_col: usize,
+    keys: &'static str,
+) -> WinCase {
+    WinCase {
+        label,
+        lines,
+        extra_files: &[],
+        start_line,
+        start_col,
+        keys,
+        check_size: false,
+    }
+}
+
+/// Like [`wc`], but the comparison also checks each leaf's (rows, cols) —
+/// see [`WinCase::check_size`].
+const fn wc_sized(
+    label: &'static str,
+    lines: &'static [&'static str],
+    start_line: usize,
+    start_col: usize,
+    keys: &'static str,
+) -> WinCase {
+    WinCase {
+        label,
+        lines,
+        extra_files: &[],
+        start_line,
+        start_col,
+        keys,
+        check_size: true,
+    }
+}
+
+/// Like [`wc`], but with extra files written alongside `main.txt` — only
+/// `CTRL-W f` needs this (opens whatever file path is under the cursor).
+const fn wc_files(
+    label: &'static str,
+    lines: &'static [&'static str],
+    extra_files: &'static [(&'static str, &'static [&'static str])],
+    start_line: usize,
+    start_col: usize,
+    keys: &'static str,
+) -> WinCase {
+    WinCase {
+        label,
+        lines,
+        extra_files,
+        start_line,
+        start_col,
+        keys,
+        check_size: false,
+    }
+}
+
+/// Write `case.lines` to `main.txt` and `case.extra_files` alongside it, in a
+/// fresh, canonicalized temp dir (see `write_multi_fixture`'s doc for why
+/// canonicalizing here, not at comparison time, is load-bearing on macOS).
+fn write_win_fixture(case: &WinCase) -> (PathBuf, PathBuf, Vec<PathBuf>) {
+    let dir = std::env::temp_dir().join(format!("vimcode_win_probe_{}", probe_id()));
+    std::fs::create_dir_all(&dir).expect("create temp dir for win probe");
+    let dir = dir.canonicalize().unwrap_or(dir);
+    let main_path = dir.join("main.txt");
+    std::fs::write(&main_path, case.lines.join("\n")).expect("write win fixture main file");
+    let extra_paths = case
+        .extra_files
+        .iter()
+        .map(|(name, lines)| {
+            let path = dir.join(name);
+            std::fs::write(&path, lines.join("\n")).expect("write win fixture extra file");
+            path
+        })
+        .collect();
+    (dir, main_path, extra_paths)
+}
+
+/// Resolves an absolute path (from either oracle) to which fixture file it
+/// is, so the two sides' leaves can be compared without caring that they ran
+/// in different temp dirs. `None` (neither `main` nor a known extra) reads
+/// as [`FileTag::Unnamed`] — the same bucket a real unnamed scratch buffer
+/// (`:new`/`:vnew`) falls into, since neither side names a nonexistent file.
+struct FixturePaths {
+    main: PathBuf,
+    extra: Vec<PathBuf>,
+}
+
+impl FixturePaths {
+    fn tag_for(&self, path: &Path) -> FileTag {
+        let canon = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        if canon
+            == self
+                .main
+                .canonicalize()
+                .unwrap_or_else(|_| self.main.clone())
+        {
+            return FileTag::Main;
+        }
+        for (i, extra) in self.extra.iter().enumerate() {
+            if canon == extra.canonicalize().unwrap_or_else(|_| extra.clone()) {
+                return FileTag::Extra(i);
+            }
+        }
+        FileTag::Unnamed
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FileTag {
+    /// No file backs this window's buffer (`:new`/`:vnew`'s fresh scratch
+    /// buffer, or a name neither oracle's fixture recognises).
+    Unnamed,
+    /// `main.txt` — the file every case starts on.
+    Main,
+    /// `extra_files[i]` — only reachable via `CTRL-W f`.
+    Extra(usize),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct WinLeaf {
+    file: FileTag,
+    /// 1-indexed, matching Neovim's own `nvim_win_get_cursor`/`line()`.
+    line: usize,
+    col: usize,
+    current: bool,
+    /// `Some((rows, cols))` only when `WinCase::check_size` is set — see the
+    /// module doc for why most ids leave this `None`.
+    size: Option<(usize, usize)>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum WinNode {
+    Leaf(WinLeaf),
+    /// `row` = side-by-side (Neovim's `"row"`, vimcode's
+    /// `SplitDirection::Vertical`); `false` = stacked (Neovim's `"col"`,
+    /// vimcode's `SplitDirection::Horizontal`) — see `to_quadraui_direction`'s
+    /// doc comment in `src/core/window.rs` for why the two crates name this
+    /// axis oppositely, which this harness deliberately does not inherit.
+    Group {
+        row: bool,
+        children: Vec<WinNode>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct WinTab {
+    current: bool,
+    layout: WinNode,
+}
+
+/// The recursive Lua snapshot: resolves Neovim's own `winlayout()` (already
+/// exactly this shape — see the module doc) per tabpage into one JSON blob
+/// with each leaf's file/cursor/current/size resolved, so no further nvim
+/// round-trips are needed after the keys are fed.
+const WIN_SNAPSHOT_LUA: &str = "\
+local function resolve(node)\n\
+  if node[1] == \"leaf\" then\n\
+    local winid = node[2]\n\
+    local bufid = vim.api.nvim_win_get_buf(winid)\n\
+    local name = vim.api.nvim_buf_get_name(bufid)\n\
+    local pos = vim.api.nvim_win_get_cursor(winid)\n\
+    return {\n\
+      kind = \"leaf\",\n\
+      file = name,\n\
+      line = pos[1],\n\
+      col = pos[2] + 1,\n\
+      current = (winid == vim.api.nvim_get_current_win()),\n\
+      rows = vim.api.nvim_win_get_height(winid),\n\
+      cols = vim.api.nvim_win_get_width(winid),\n\
+    }\n\
+  else\n\
+    local children = {}\n\
+    for i, child in ipairs(node[2]) do\n\
+      children[i] = resolve(child)\n\
+    end\n\
+    return { kind = \"group\", row = (node[1] == \"row\"), children = children }\n\
+  end\n\
+end\n\
+local tabs = {}\n\
+for i, tabid in ipairs(vim.api.nvim_list_tabpages()) do\n\
+  tabs[i] = {\n\
+    current = (tabid == vim.api.nvim_get_current_tabpage()),\n\
+    layout = resolve(vim.fn.winlayout(vim.api.nvim_tabpage_get_number(tabid))),\n\
+  }\n\
+end\n\
+local result = { tabs = tabs }\n\
+";
+
+fn run_win_in_neovim(
+    main_path: &Path,
+    start_line: usize,
+    start_col: usize,
+    keys: &str,
+    cwd: &Path,
+) -> Option<serde_json::Value> {
+    let id = probe_id();
+    let mut lua = String::new();
+    lua.push_str("vim.o.compatible = false\n");
+    lua.push_str("vim.o.hidden = true\n");
+    // #1162: pin the screen size explicitly rather than relying on nvim's
+    // own default (also 80x24 today, per the single-buffer harness's
+    // UI_WIDTH/UI_HEIGHT) — CTRL-W resize/maximize/equalize are meaningless
+    // without an agreed total size, and pinning here means a future nvim
+    // changing its own default cannot silently drift this harness.
+    lua.push_str("vim.o.lines = 24\n");
+    lua.push_str("vim.o.columns = 80\n");
+    let escaped_start = main_path
+        .to_string_lossy()
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"");
+    lua.push_str(&format!(
+        "vim.cmd(\"edit \" .. vim.fn.fnameescape(\"{escaped_start}\"))\n"
+    ));
+    lua.push_str(&format!(
+        "vim.api.nvim_win_set_cursor(0, {{{}, {}}})\n",
+        start_line,
+        start_col.saturating_sub(1)
+    ));
+    let escaped_keys = keys.replace('\\', "\\\\").replace('"', "\\\"");
+    lua.push_str(&format!(
+        "pcall(function() vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes(\"{escaped_keys}\", true, false, true), \"ntx\", false) end)\n"
+    ));
+    lua.push_str(WIN_SNAPSHOT_LUA);
+    let result_path = std::env::temp_dir().join(format!("vimcode_win_nvim_probe_{id}.json"));
+    let result_path_str = result_path.to_string_lossy().replace('\\', "/");
+    lua.push_str(&format!(
+        "local f = io.open(\"{result_path_str}\", \"w\")\n\
+         f:write(vim.fn.json_encode(result))\n\
+         f:close()\n\
+         vim.cmd(\"qa!\")\n"
+    ));
+    let script_path = std::env::temp_dir().join(format!("vimcode_win_nvim_probe_{id}.lua"));
+    {
+        let mut f = std::fs::File::create(&script_path).ok()?;
+        f.write_all(lua.as_bytes()).ok()?;
+    }
+    let _ = std::fs::remove_file(&result_path);
+    let output = std::process::Command::new("nvim")
+        .arg("--headless")
+        .arg("-u")
+        .arg("NONE")
+        .arg("-i")
+        .arg("NONE")
+        .arg("-l")
+        .arg(script_path.to_string_lossy().as_ref())
+        .current_dir(cwd)
+        .output()
+        .ok();
+    let raw: Option<serde_json::Value> = match &output {
+        Some(o) => {
+            let raw: Option<serde_json::Value> = std::fs::read_to_string(&result_path)
+                .ok()
+                .and_then(|json| serde_json::from_str(&json).ok());
+            if raw.is_none() && !o.status.success() {
+                eprintln!(
+                    "nvim stderr (window-layout probe): {}",
+                    String::from_utf8_lossy(&o.stderr)
+                );
+            }
+            raw
+        }
+        None => None,
+    };
+    let _ = std::fs::remove_file(&script_path);
+    let _ = std::fs::remove_file(&result_path);
+    raw
+}
+
+fn node_from_json(v: &serde_json::Value, paths: &FixturePaths, check_size: bool) -> WinNode {
+    if v.get("kind").and_then(|k| k.as_str()) == Some("leaf") {
+        let file_str = v.get("file").and_then(|f| f.as_str()).unwrap_or("");
+        let file = if file_str.is_empty() {
+            FileTag::Unnamed
+        } else {
+            paths.tag_for(Path::new(file_str))
+        };
+        WinNode::Leaf(WinLeaf {
+            file,
+            line: v.get("line").and_then(|x| x.as_u64()).unwrap_or(0) as usize,
+            col: v.get("col").and_then(|x| x.as_u64()).unwrap_or(0) as usize,
+            current: v.get("current").and_then(|x| x.as_bool()).unwrap_or(false),
+            size: check_size.then(|| {
+                (
+                    v.get("rows").and_then(|x| x.as_u64()).unwrap_or(0) as usize,
+                    v.get("cols").and_then(|x| x.as_u64()).unwrap_or(0) as usize,
+                )
+            }),
+        })
+    } else {
+        let row = v.get("row").and_then(|x| x.as_bool()).unwrap_or(false);
+        let children = v
+            .get("children")
+            .and_then(|c| c.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .map(|c| node_from_json(c, paths, check_size))
+                    .collect()
+            })
+            .unwrap_or_default();
+        WinNode::Group { row, children }
+    }
+}
+
+fn win_snapshot_from_json(
+    v: &serde_json::Value,
+    paths: &FixturePaths,
+    check_size: bool,
+) -> Vec<WinTab> {
+    v.get("tabs")
+        .and_then(|t| t.as_array())
+        .map(|tabs| {
+            tabs.iter()
+                .map(|t| WinTab {
+                    current: t.get("current").and_then(|c| c.as_bool()).unwrap_or(false),
+                    layout: node_from_json(
+                        t.get("layout").unwrap_or(&serde_json::Value::Null),
+                        paths,
+                        check_size,
+                    ),
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn win_leaf_from_vimcode(
+    id: WindowId,
+    engine: &Engine,
+    current_win: WindowId,
+    paths: &FixturePaths,
+    rects: &std::collections::HashMap<WindowId, (usize, usize)>,
+    check_size: bool,
+) -> WinLeaf {
+    let window = &engine.windows[&id];
+    let file = engine
+        .buffer_manager
+        .get(window.buffer_id)
+        .and_then(|b| b.file_path.clone())
+        .map(|p| paths.tag_for(&p))
+        .unwrap_or(FileTag::Unnamed);
+    WinLeaf {
+        file,
+        line: window.view.cursor.line + 1,
+        col: window.view.cursor.col + 1,
+        current: id == current_win,
+        size: check_size.then(|| rects.get(&id).copied().unwrap_or((0, 0))),
+    }
+}
+
+/// Walk `layout`, flattening a run of nested same-direction `Split`s into one
+/// `WinNode::Group` — see the module doc for why this, not the raw binary
+/// tree, is what's compared against Neovim's own (already N-ary) `winlayout()`.
+fn win_node_from_vimcode(
+    layout: &WindowLayout,
+    engine: &Engine,
+    current_win: WindowId,
+    paths: &FixturePaths,
+    rects: &std::collections::HashMap<WindowId, (usize, usize)>,
+    check_size: bool,
+) -> WinNode {
+    match layout {
+        WindowLayout::Leaf(id) => WinNode::Leaf(win_leaf_from_vimcode(
+            *id,
+            engine,
+            current_win,
+            paths,
+            rects,
+            check_size,
+        )),
+        WindowLayout::Split { direction, .. } => {
+            let mut children = Vec::new();
+            flatten_vc(
+                *direction,
+                layout,
+                engine,
+                current_win,
+                paths,
+                rects,
+                check_size,
+                &mut children,
+            );
+            WinNode::Group {
+                row: matches!(direction, SplitDirection::Vertical),
+                children,
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn flatten_vc(
+    dir: SplitDirection,
+    node: &WindowLayout,
+    engine: &Engine,
+    current_win: WindowId,
+    paths: &FixturePaths,
+    rects: &std::collections::HashMap<WindowId, (usize, usize)>,
+    check_size: bool,
+    out: &mut Vec<WinNode>,
+) {
+    match node {
+        WindowLayout::Split {
+            direction,
+            first,
+            second,
+            ..
+        } if *direction == dir => {
+            flatten_vc(
+                dir,
+                first,
+                engine,
+                current_win,
+                paths,
+                rects,
+                check_size,
+                out,
+            );
+            flatten_vc(
+                dir,
+                second,
+                engine,
+                current_win,
+                paths,
+                rects,
+                check_size,
+                out,
+            );
+        }
+        other => out.push(win_node_from_vimcode(
+            other,
+            engine,
+            current_win,
+            paths,
+            rects,
+            check_size,
+        )),
+    }
+}
+
+fn win_snapshot_from_vimcode(
+    engine: &Engine,
+    paths: &FixturePaths,
+    check_size: bool,
+) -> Vec<WinTab> {
+    let group = engine.active_group();
+    group
+        .tabs
+        .iter()
+        .enumerate()
+        .map(|(i, tab)| {
+            let rects: std::collections::HashMap<WindowId, (usize, usize)> = if check_size {
+                // Same pinned 80x24 screen as the oracle, minus one row for
+                // the command line — matching UI_HEIGHT/UI_WIDTH above.
+                // `calculate_rects` is pure ratio division with no notion of
+                // chrome (`SplitTreeMeasure::new(0.0)` — see its call site in
+                // `src/core/window.rs`), so every leaf's own statusline row
+                // (Neovim's default `'laststatus'=2`, confirmed empirically:
+                // `nvim_win_get_height` on a *lone* window is already screen
+                // rows minus 1) has to be subtracted here, once per leaf,
+                // same as Neovim's own accounting.
+                tab.layout
+                    .calculate_rects(WindowRect::new(
+                        0.0,
+                        0.0,
+                        UI_WIDTH as f64,
+                        (UI_HEIGHT - 1) as f64,
+                    ))
+                    .into_iter()
+                    .map(|(id, r)| {
+                        (
+                            id,
+                            (
+                                (r.height.round() as usize).saturating_sub(1),
+                                r.width.round() as usize,
+                            ),
+                        )
+                    })
+                    .collect()
+            } else {
+                std::collections::HashMap::new()
+            };
+            WinTab {
+                current: i == group.active_tab,
+                layout: win_node_from_vimcode(
+                    &tab.layout,
+                    engine,
+                    tab.active_window,
+                    paths,
+                    &rects,
+                    check_size,
+                ),
+            }
+        })
+        .collect()
+}
+
+fn run_win_case(case: &WinCase) -> Outcome {
+    let (dir, main_path, extra_paths) = write_win_fixture(case);
+    let paths = FixturePaths {
+        main: main_path.clone(),
+        extra: extra_paths,
+    };
+
+    let nvim_json =
+        match run_win_in_neovim(&main_path, case.start_line, case.start_col, case.keys, &dir) {
+            Some(v) => v,
+            None => {
+                let _ = std::fs::remove_dir_all(&dir);
+                return Outcome::NvimBroke;
+            }
+        };
+    let nvim_tabs = win_snapshot_from_json(&nvim_json, &paths, case.check_size);
+
+    let mut engine = engine_with("");
+    engine
+        .open_file_with_mode(&main_path, OpenMode::Permanent)
+        .expect("open main file for window-layout probe");
+    engine.cwd = dir.clone();
+    engine.view_mut().cursor.line = case.start_line.saturating_sub(1);
+    engine.view_mut().cursor.col = case.start_col.saturating_sub(1);
+    engine.ensure_cursor_visible();
+    send_keys_multi(&mut engine, case.keys);
+    let vc_tabs = win_snapshot_from_vimcode(&engine, &paths, case.check_size);
+
+    let _ = std::fs::remove_dir_all(&dir);
+
+    if nvim_tabs == vc_tabs {
+        return Outcome::Pass;
+    }
+    Outcome::Fail(format!(
+        "[{}] keys={:?} start=({},{})\n  nvim tabs:\n{:#?}\n  vimcode tabs:\n{:#?}",
+        case.label, case.keys, case.start_line, case.start_col, nvim_tabs, vc_tabs
     ))
 }
 
@@ -7321,6 +7931,250 @@ const CASES_MULTI_JUMPS_LIST: &[MultiJumpsCase] = &[
     ),
 ];
 
+// ─────────────── I. window-layout tree (#1162) — the 33 CTRL-W rows ───────────────
+//
+// See the harness's own module doc above (`WinCase`/`run_win_case`) for the
+// comparison model. `CTRL-W H`/`J`/`K`/`L`/`T`/`e`/`E`/`d` have no entry here
+// at all — permanently exempt, see `COVERAGE_EXEMPT`. `CTRL-W p`/`+`/`-`/`<`/
+// `>`/`_`/`\|` do have real cases below but are listed in
+// `KNOWN_DEVIATIONS_WIN`, not expected to pass — each case's own comment
+// explains the finding.
+
+const WIN_TWO_LINES: &[&str] = &["first line", "second line", "third line"];
+
+const CASES_WIN: &[WinCase] = &[
+    // --- Focus (h/j/k/l/w/W/p/t/b) ---
+    wc(
+        "win:CTRL-W h focuses the window to the left",
+        WIN_TWO_LINES,
+        1,
+        1,
+        "<C-w>v<C-w>l<C-w>h",
+    ),
+    wc(
+        "win:CTRL-W j focuses the window below",
+        WIN_TWO_LINES,
+        1,
+        1,
+        "<C-w>s<C-w>j",
+    ),
+    wc(
+        "win:CTRL-W k focuses the window above",
+        WIN_TWO_LINES,
+        1,
+        1,
+        "<C-w>s<C-w>j<C-w>k",
+    ),
+    wc(
+        "win:CTRL-W l focuses the window to the right",
+        WIN_TWO_LINES,
+        1,
+        1,
+        "<C-w>v<C-w>l",
+    ),
+    wc(
+        "win:CTRL-W w cycles to the next window",
+        WIN_TWO_LINES,
+        1,
+        1,
+        "<C-w>s<C-w>w",
+    ),
+    // #1162 fix: `W` used to be aliased to `w` (both called
+    // `focus_next_window`) — this case is RED against the unfixed alias
+    // (both cursors land in the same, most-recently-split window instead of
+    // cycling backward to the original).
+    wc(
+        "win:CTRL-W W cycles to the previous window",
+        WIN_TWO_LINES,
+        1,
+        1,
+        "<C-w>s<C-w>w<C-w>W",
+    ),
+    // #1162 fix: `t`/`b` used to walk the VSCode-style editor-group tree
+    // (`self.group_layout`), a no-op with the single editor group every one
+    // of these cases has — RED against the unfixed version (focus never
+    // leaves the window `<C-w>s<C-w>s` left active).
+    wc(
+        "win:CTRL-W t goes to the top-left window",
+        WIN_TWO_LINES,
+        1,
+        1,
+        "<C-w>s<C-w>s<C-w>t",
+    ),
+    wc(
+        "win:CTRL-W b goes to the bottom-right window",
+        WIN_TWO_LINES,
+        1,
+        1,
+        "<C-w>s<C-w>s<C-w>b",
+    ),
+    // --- Split / close ---
+    wc(
+        "win:CTRL-W s splits horizontally",
+        WIN_TWO_LINES,
+        2,
+        1,
+        "<C-w>s",
+    ),
+    wc(
+        "win:CTRL-W v splits vertically",
+        WIN_TWO_LINES,
+        2,
+        1,
+        "<C-w>v",
+    ),
+    wc(
+        "win:CTRL-W c closes the current window",
+        WIN_TWO_LINES,
+        1,
+        1,
+        "<C-w>s<C-w>c",
+    ),
+    wc(
+        "win:CTRL-W o closes every other window",
+        WIN_TWO_LINES,
+        1,
+        1,
+        "<C-w>s<C-w>v<C-w>o",
+    ),
+    wc(
+        "win:CTRL-W n opens :new above",
+        WIN_TWO_LINES,
+        2,
+        1,
+        "<C-w>n",
+    ),
+    wc(
+        "win:CTRL-W q closes the current window",
+        WIN_TWO_LINES,
+        1,
+        1,
+        "<C-w>s<C-w>q",
+    ),
+    // --- Rearrange (x/r/R) ---
+    wc(
+        "win:CTRL-W x exchanges with the next window",
+        WIN_TWO_LINES,
+        2,
+        1,
+        "<C-w>s<C-w>x",
+    ),
+    // #1162 finding: `rotate_windows` rotates *content* across fixed
+    // `WindowId` tree slots rather than reordering window identity in the
+    // tree, so "current" stays pinned to the same screen position instead
+    // of following the window that was focused before the rotate (every
+    // leaf shows the same file/cursor here on purpose — `current` is the
+    // only signal that can distinguish the two models). See
+    // KNOWN_DEVIATIONS_WIN.
+    wc(
+        "win:CTRL-W r rotates windows downward/rightward",
+        WIN_TWO_LINES,
+        2,
+        1,
+        "<C-w>s<C-w>s<C-w>r",
+    ),
+    wc(
+        "win:CTRL-W R rotates windows upward/leftward",
+        WIN_TWO_LINES,
+        2,
+        1,
+        "<C-w>s<C-w>s<C-w>R",
+    ),
+    // --- CTRL-W f: split + open the file under the cursor ---
+    wc_files(
+        "win:CTRL-W f opens the file under the cursor in a split",
+        &["see target.txt for the rest"],
+        &[("target.txt", &["target file line one", "line two"])],
+        1,
+        6,
+        "<C-w>f",
+    ),
+    // --- Resize / maximize / equalize ---
+    // #1162 finding: `equalize_splits` does set every ratio to exactly 0.5
+    // (Neovim's own default too, so this still converges to the same
+    // layout as `CASES_WIN`'s plain `s`/`v` cases regardless of the
+    // percentage-vs-line-resize that ran first) — but `WindowLayout::
+    // calculate_rects`'s rect-rounding is off by one row on this odd-sized
+    // split (11/11 vs Neovim's 11/10). See KNOWN_DEVIATIONS_WIN.
+    wc_sized(
+        "win:CTRL-W = re-equalizes windows after a resize",
+        WIN_TWO_LINES,
+        2,
+        1,
+        "<C-w>s5<C-w>+<C-w>=",
+    ),
+    // `CTRL-W +`: a real, non-vacuous PASS — percentage-based resize
+    // (`resize_window_split`'s `delta_per_step = 0.05`) happens to land on
+    // the exact same (rows, cols) as Neovim's absolute-line resize for
+    // [count]=5 on this harness's fixed 80x24, 2-window starting split. See
+    // the module doc and KNOWN_DEVIATIONS_WIN's `-`/`<`/`>` entries, where
+    // the same percentage-vs-line mismatch does NOT coincidentally cancel
+    // out.
+    wc_sized(
+        "win:CTRL-W + increases the active window's height",
+        WIN_TWO_LINES,
+        2,
+        1,
+        "<C-w>s5<C-w>+",
+    ),
+    // #1162 finding: same percentage-vs-line mismatch as `+` above, but
+    // this starting size/count does NOT coincidentally agree. See
+    // KNOWN_DEVIATIONS_WIN.
+    wc_sized(
+        "win:CTRL-W - decreases the active window's height",
+        WIN_TWO_LINES,
+        2,
+        1,
+        "<C-w>s5<C-w>-",
+    ),
+    wc_sized(
+        "win:CTRL-W < decreases the active window's width",
+        WIN_TWO_LINES,
+        2,
+        1,
+        "<C-w>v10<C-w><",
+    ),
+    wc_sized(
+        "win:CTRL-W > increases the active window's width",
+        WIN_TWO_LINES,
+        2,
+        1,
+        "<C-w>v10<C-w>>",
+    ),
+    // `CTRL-W _`: also a real, non-vacuous PASS — `maximize_window_split`'s
+    // 0.9/0.1 ratio happens to shrink the other window to exactly Neovim's
+    // own `'winminheight'` floor (1 content row) on this harness's fixed
+    // 23-row budget. `CTRL-W \|` does NOT coincidentally agree (10% of 80
+    // columns is well above `'winminwidth'`'s floor) — see
+    // KNOWN_DEVIATIONS_WIN.
+    wc_sized(
+        "win:CTRL-W _ maximizes the active window's height",
+        WIN_TWO_LINES,
+        2,
+        1,
+        "<C-w>s<C-w>_",
+    ),
+    wc_sized(
+        "win:CTRL-W | maximizes the active window's width",
+        WIN_TWO_LINES,
+        2,
+        1,
+        "<C-w>v<C-w>|",
+    ),
+    // #1162 finding: `CTRL-W p` only tracks "previously active editor
+    // group", never "previously active window within one group" — the
+    // common single-group case every other CASES_WIN entry lives in. RED:
+    // Neovim returns to the first window, vimcode stays on the second (`p`
+    // is a no-op with a single editor group). See KNOWN_DEVIATIONS_WIN.
+    wc(
+        "win:CTRL-W p returns to the previously active window",
+        WIN_TWO_LINES,
+        1,
+        1,
+        "<C-w>s<C-w>w<C-w>p",
+    ),
+];
+
 // ---------------------------------------------------------------------------
 // Categories — the runner flattens these; the split is for editability only.
 // ---------------------------------------------------------------------------
@@ -8160,7 +9014,8 @@ fn classify_coverage(
 }
 
 /// Every `(label, keys)` in the corpus — the single-buffer cases plus the
-/// multi-file jumplist ones, which are oracle-backed the same way.
+/// multi-file jumplist ones and the window-layout ones (#1162), all of which
+/// are oracle-backed the same way.
 fn all_corpus_cases() -> Vec<(&'static str, &'static str)> {
     let mut out: Vec<(&str, &str)> = CATEGORIES
         .iter()
@@ -8169,6 +9024,7 @@ fn all_corpus_cases() -> Vec<(&'static str, &'static str)> {
         .collect();
     out.extend(CASES_MULTI_JUMP.iter().map(|c| (c.label, c.keys)));
     out.extend(CASES_MULTI_JUMPS_LIST.iter().map(|c| (c.label, c.keys)));
+    out.extend(CASES_WIN.iter().map(|c| (c.label, c.keys)));
     out
 }
 
@@ -8569,11 +9425,14 @@ const COMMAND_PROBES: &[CommandProbe] = &[
     p("win:CTRL-W e/E", Keys("<C-w>e/E")),
     p("win:CTRL-W +", Keys("<C-w>+")),
     p("win:CTRL-W -", Keys("<C-w>-")),
-    p("win:CTRL-W <", Label("win:C-w <")),
+    p(
+        "win:CTRL-W <",
+        Label("win:CTRL-W < decreases the active window's width"),
+    ),
     p("win:CTRL-W >", Keys("<C-w>>")),
     p("win:CTRL-W =", Keys("<C-w>=")),
     p("win:CTRL-W _", Keys("<C-w>_")),
-    p("win:CTRL-W \\|", Keys("<C-w>\\|")),
+    p("win:CTRL-W \\|", Keys("<C-w>|")),
     p("win:CTRL-W H", Keys("<C-w>H")),
     p("win:CTRL-W J", Keys("<C-w>J")),
     p("win:CTRL-W K", Keys("<C-w>K")),
@@ -8903,10 +9762,14 @@ const COMMAND_PROBES: &[CommandProbe] = &[
 //
 // Where the gap is, at a glance (uncovered / in-scope, seeded 2026-09,
 // updated 2026-09 by #1279 which retired the text-object, operator-pending,
-// visual, movement, editing and `'<` rows below):
+// visual, movement, editing and `'<` rows below, and by #1162 which
+// backfilled all 33 CTRL-W rows — 26 now have a real oracle case (7 of those
+// tracked red in KNOWN_DEVIATIONS_WIN, not vacuously exempt) and the other 7
+// (`H`/`J`/`K`/`L`/`T`/`e`/`E`/`d`) moved to the permanent
+// "Deliberate semantic divergence" heading below):
 //
 //     Core Vim ex commands       84/111  :w :q :bn :ls :marks :grep …
-//     Window commands (CTRL-W)   33/33   nothing in the corpus presses <C-w>
+//     Window commands (CTRL-W)    7/33   H J K L T e/E d — all permanent
 //     g-commands                 19/50   gt gT gf gF ga g8 gx gR g@ g+ …
 //                                        (`g-` left this list in #1156,
 //                                        `g0`/`gm`/`gM` in #1279)
@@ -9032,6 +9895,32 @@ const COVERAGE_EXEMPT: &[&str] = &[
     // byte-for-byte comparison would be comparing two unrelated features,
     // not checking one.
     "g:gh",
+    // #1162: `CTRL-W H`/`J`/`K`/`L` ("move current window to far
+    // left/bottom/top/right") and `CTRL-W T` ("move window to new tab")
+    // close the window and open a brand-new VSCode-style *editor group*
+    // at the layout edge instead of restructuring the window tree within
+    // the current tab the way Neovim does (`move_window_to_edge`/
+    // `move_window_to_new_group` in `src/core/engine/windows.rs`) — already
+    // documented as such in VIM_COMPATIBILITY.md:463-467 ("Creates new
+    // group at layout edge" / "Moves to new editor group"), not something
+    // #1162 introduced. A byte-for-byte comparison against Neovim's
+    // single-tab window tree would be comparing two different features.
+    "win:CTRL-W H",
+    "win:CTRL-W J",
+    "win:CTRL-W K",
+    "win:CTRL-W L",
+    "win:CTRL-W T",
+    // #1162: `CTRL-W e`/`E` ("split editor group right/down") is a VimCode
+    // extension bolted onto a keystroke Neovim leaves unbound — confirmed
+    // empirically (`nvim --headless -u NONE -i NONE`: `<C-w>e` opens no
+    // window and changes no state) — already documented as such in
+    // VIM_COMPATIBILITY.md:455.
+    "win:CTRL-W e/E",
+    // #1162: `CTRL-W d` ("split + go to definition") routes to LSP
+    // goto-definition — same divergence class as `other:CTRL-]` above, and
+    // for the same reason (VIM_COMPATIBILITY.md:478, "LSP-based"; the
+    // oracle's `-u NONE -i NONE` has no LSP client to compare against).
+    "win:CTRL-W d",
     // --- Ends or leaves the session ---
     // Each of these exits, or would exit, the very vimcode process the probe
     // is driving. There is no "after" state left for the probe to read —
@@ -9124,40 +10013,10 @@ const COVERAGE_EXEMPT: &[&str] = &[
     // That is the list shrinking as designed — do not re-add it.
     "g:g'",
     "g:g`",
-    // --- Window Commands (CTRL-W) (win) ---
-    "win:CTRL-W h",
-    "win:CTRL-W j",
-    "win:CTRL-W k",
-    "win:CTRL-W l",
-    "win:CTRL-W w",
-    "win:CTRL-W W",
-    "win:CTRL-W c",
-    "win:CTRL-W o",
-    "win:CTRL-W s",
-    "win:CTRL-W v",
-    "win:CTRL-W e/E",
-    "win:CTRL-W +",
-    "win:CTRL-W -",
-    "win:CTRL-W <",
-    "win:CTRL-W >",
-    "win:CTRL-W =",
-    "win:CTRL-W _",
-    "win:CTRL-W \\|",
-    "win:CTRL-W H",
-    "win:CTRL-W J",
-    "win:CTRL-W K",
-    "win:CTRL-W L",
-    "win:CTRL-W T",
-    "win:CTRL-W x",
-    "win:CTRL-W r",
-    "win:CTRL-W R",
-    "win:CTRL-W p",
-    "win:CTRL-W n",
-    "win:CTRL-W t",
-    "win:CTRL-W b",
-    "win:CTRL-W q",
-    "win:CTRL-W f",
-    "win:CTRL-W d",
+    // --- Window Commands (CTRL-W) (win) --- #1162 backfilled all 33: 26 now
+    // have a real oracle case (CASES_WIN — 19 pass, 7 tracked red in
+    // KNOWN_DEVIATIONS_WIN), and the other 7 (H/J/K/L/T/e/E/d) moved to the
+    // "Deliberate semantic divergence" permanent heading above.
     // --- Core Vim Ex Commands (ex) ---
     "ex::w",
     "ex::write",
@@ -10100,6 +10959,214 @@ fn nvim_conformance_jumplist_multi_file() {
 }
 
 // ---------------------------------------------------------------------------
+// KNOWN_DEVIATIONS_WIN — same bidirectional-gate idiom as KNOWN_DEVIATIONS_MULTI
+// above, applied to CASES_WIN (#1162). May only ever SHRINK.
+// ---------------------------------------------------------------------------
+
+const KNOWN_DEVIATIONS_WIN: &[&str] = &[
+    // `resize_window_split` moves the split ratio by a fixed 5% *per count
+    // step*; Neovim's `CTRL-W -`/`<`/`>` move the window boundary by an
+    // absolute [count] lines/columns. The two are different units and only
+    // coincide by chance — measured against this harness's fixed 80x24
+    // screen and a 2-window 50/50 starting split, `CTRL-W +`/`_` actually
+    // *do* coincide for [count]=5 (kept as real passes in `CASES_WIN`, not
+    // vacuous — real, matching numbers on both sides), which is exactly
+    // the kind of accidental agreement that makes this bug easy to miss by
+    // hand-testing a couple of keystrokes. `-`/`<`/`>` do not coincide for
+    // the counts this harness happens to use. Fixing this for real needs
+    // `resize_window_split` to convert an absolute line/column delta into
+    // a ratio delta against that split's actual axis size
+    // (`WindowLayout::dividers`'s `axis_size` already carries exactly that
+    // number) — filed as a follow-up, not attempted here to keep this
+    // slice to "generalise the harness", not "rewrite window resize".
+    "win:CTRL-W - decreases the active window's height",
+    "win:CTRL-W < decreases the active window's width",
+    "win:CTRL-W > increases the active window's width",
+    // `maximize_window_split`'s 0.9/0.1 ratio happens to match Neovim's
+    // real "give the current window everything, shrink the other to its
+    // `'winminheight'`/`'winminwidth'` minimum" behaviour on THIS harness's
+    // 80x24 screen for height (`CTRL-W _`, kept as a real, non-coincidental-
+    // looking pass — both land the other window at exactly 1 content row)
+    // but not for width: 10% of 80 columns (~8, after the vertical-divider
+    // column) is well above Neovim's `'winminwidth'` floor, so `CTRL-W \|`
+    // still visibly diverges. Not attempting a real "true maximize" fix
+    // here for the same reason as the resize cluster above — filed as a
+    // follow-up alongside it.
+    "win:CTRL-W | maximizes the active window's width",
+    // #1162 finding, distinct from the two above: `WindowLayout::
+    // calculate_rects` (`SplitTreeMeasure::new(0.0)` — see `src/core/
+    // window.rs`) rounds each child's share of a split *independently*
+    // (both children of a 50/50 split on an odd budget round the *same*
+    // direction), rather than giving one side the exact remainder the way
+    // Neovim's own window-height accounting does. `equalize_splits` sets
+    // every ratio to exactly 0.5 — matching Neovim's own default — so the
+    // *ratio* math is right; only the rect-rounding on top of it is off by
+    // one row on an odd-sized split (11/11 vs Neovim's 11/10). Not the
+    // window-resize bug above, and not attempted here: `calculate_rects` is
+    // shared by every other split-rect consumer in `render.rs`, so
+    // reworking its rounding convention is a bigger, more failure-prone
+    // change than this harness-generalisation slice should carry.
+    "win:CTRL-W = re-equalizes windows after a resize",
+    // `rotate_windows` rotates *content* (buffer_id + view) across a set of
+    // fixed `WindowId` tree slots, leaving `Tab::active_window` (a
+    // `WindowId`) unchanged — so "current" stays pinned to the same screen
+    // position through a rotate. Neovim instead rotates which *window*
+    // (identity, including its own focus) occupies which position, so its
+    // focus moves to wherever that window's content ends up. Fixing this
+    // needs `rotate_windows` to actually reorder `WindowId`s in the
+    // `WindowLayout` tree (so each window keeps its own identity/cursor and
+    // only its tree position changes) rather than swapping fields across
+    // static slots — a structural rework of the rotate implementation, not
+    // attempted here. Filed as a follow-up.
+    "win:CTRL-W r rotates windows downward/rightward",
+    "win:CTRL-W R rotates windows upward/leftward",
+    // `execute_wincmd`'s `'p'` arm only restores `prev_active_group` (the
+    // VSCode-style editor-group tree) — there is no `Tab`-level "previously
+    // active window" tracked at all, so `CTRL-W p` is a no-op whenever
+    // there is a single editor group, the common case every other
+    // CASES_WIN entry lives in. A real fix needs a `Tab::prev_window`
+    // field updated at every window-focus-changing call site (`cycle_next_
+    // window`/`cycle_prev_window`/`activate_window`/`set_cursor_for_window`/
+    // mouse click — roughly 20 sites per a #1162 audit), which is a bigger,
+    // more failure-prone change than this harness-generalisation slice
+    // should carry. Filed as a follow-up.
+    "win:CTRL-W p returns to the previously active window",
+];
+
+#[test]
+fn nvim_conformance_windows() {
+    let version_output = std::process::Command::new("nvim")
+        .arg("--version")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned());
+    let resolved = resolve_on_path("nvim");
+    let resolved_display = resolved
+        .as_deref()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "nvim (resolved by PATH lookup)".to_string());
+    let probe = version_output
+        .as_deref()
+        .map(|out| (resolved_display.as_str(), out));
+
+    let allow_skip = std::env::var_os(ALLOW_SKIP_VAR).is_some();
+    let nvim_version = match preflight(probe, allow_skip) {
+        Preflight::Refuse { reason } => panic!("\n\n{reason}\n"),
+        Preflight::Skip { reason } => {
+            eprintln!("SKIP ({ALLOW_SKIP_VAR} set): {reason}");
+            return;
+        }
+        Preflight::Run { banner, version } => {
+            print_unmissable(&banner);
+            Some(version)
+        }
+    };
+
+    let filter = std::env::var("PROBE_FILTER").ok();
+    let verbose = std::env::var_os("PROBE_VERBOSE").is_some();
+
+    let mut outcomes: Vec<(&str, bool)> = Vec::new();
+    let mut detail: std::collections::HashMap<&str, String> = std::collections::HashMap::new();
+    let mut nvim_broke: Vec<&str> = Vec::new();
+
+    for case in CASES_WIN
+        .iter()
+        .filter(|c| filter.as_deref().is_none_or(|f| c.label.contains(f)))
+    {
+        match run_win_case(case) {
+            Outcome::NvimBroke => nvim_broke.push(case.label),
+            Outcome::Pass => {
+                outcomes.push((case.label, true));
+                if verbose {
+                    println!("PASS [{}]", case.label);
+                }
+            }
+            Outcome::Fail(msg) => {
+                outcomes.push((case.label, false));
+                if verbose {
+                    println!("FAIL {msg}");
+                }
+                detail.insert(case.label, msg);
+            }
+        }
+    }
+
+    println!("\n=== Neovim Conformance Results: window layout (#1162) ===");
+    println!(
+        "cases run: {}  pass: {}  known-fail: {}",
+        outcomes.len(),
+        outcomes.iter().filter(|(_, p)| *p).count(),
+        outcomes
+            .iter()
+            .filter(|(l, p)| !*p && KNOWN_DEVIATIONS_WIN.contains(l))
+            .count(),
+    );
+    if !nvim_broke.is_empty() {
+        println!(
+            "\nnvim execution failed for {} case(s): {:?}",
+            nvim_broke.len(),
+            nvim_broke
+        );
+    }
+
+    let all_labels: Vec<&str> = CASES_WIN.iter().map(|c| c.label).collect();
+    let mut verdict = classify(
+        &outcomes,
+        KNOWN_DEVIATIONS_WIN,
+        filter.is_none().then_some(all_labels.as_slice()),
+    );
+
+    if !verdict.fixed.is_empty() && !fixes_are_enforced(nvim_version) {
+        println!(
+            "\nNOTE: {} KNOWN_DEVIATIONS_WIN entr(y/ies) pass against this run's \
+             Neovim but the list was captured against {}.{}.x, so this is oracle-version \
+             skew, not a landed fix — do NOT delete them. Not failing the run:\n{}",
+            verdict.fixed.len(),
+            DEVIATIONS_ORACLE.0,
+            DEVIATIONS_ORACLE.1,
+            bullet_list(&verdict.fixed)
+        );
+        verdict.fixed.clear();
+    }
+
+    if verdict.is_clean() {
+        return;
+    }
+
+    let mut problems: Vec<String> = Vec::new();
+    if !verdict.stale.is_empty() {
+        problems.push(format!(
+            "{} KNOWN_DEVIATIONS_WIN entr(y/ies) match no case label — delete them:\n{}",
+            verdict.stale.len(),
+            bullet_list(&verdict.stale)
+        ));
+    }
+    if !verdict.regressions.is_empty() {
+        problems.push(format!(
+            "{} window-layout REGRESSION(S) — cases not in KNOWN_DEVIATIONS_WIN \
+             that do not match Neovim:\n\n{}",
+            verdict.regressions.len(),
+            verdict
+                .regressions
+                .iter()
+                .map(|l| detail.get(l).cloned().unwrap_or_else(|| (*l).to_string()))
+                .collect::<Vec<_>>()
+                .join("\n\n")
+        ));
+    }
+    if !verdict.fixed.is_empty() {
+        problems.push(format!(
+            "{} case(s) listed in KNOWN_DEVIATIONS_WIN now PASS. \
+             Good — delete these entries so the list keeps shrinking:\n{}",
+            verdict.fixed.len(),
+            bullet_list(&verdict.fixed)
+        ));
+    }
+    panic!("\n\n{}\n", problems.join("\n\n"));
+}
+
+// ---------------------------------------------------------------------------
 // #1002: `setup` must actually reach the vimcode side.
 //
 // These need no nvim — they drive `run_in_vimcode` directly, which is the
@@ -10766,7 +11833,14 @@ fn coverage_ratchet_is_bidirectional_against_the_real_corpus() {
     let cases = all_corpus_cases();
 
     // Direction 1 — delete a real entry without adding cases.
-    let victim = "win:CTRL-W h";
+    //
+    // #1162: this used to be "win:CTRL-W h", which is exactly the kind of
+    // entry the ratchet is meant to force out — CASES_WIN backfilled a real
+    // case for it, so it is no longer in COVERAGE_EXEMPT at all and this
+    // fixture would read "fixture drifted" (the assertion below) rather
+    // than test anything. `other:gt` is still plain uncovered debt (see the
+    // header comment's tally), so it stands in as the victim now.
+    let victim = "other:gt";
     assert!(COVERAGE_EXEMPT.contains(&victim), "fixture drifted");
     let without: Vec<&str> = COVERAGE_EXEMPT
         .iter()
@@ -10781,7 +11855,7 @@ fn coverage_ratchet_is_bidirectional_against_the_real_corpus() {
 
     // Direction 2 — add a case for an exempt command, leave the entry alone.
     let mut plus = cases.clone();
-    plus.push(("win:C-w h focuses the window to the left", "<C-w>hx"));
+    plus.push(("other:gt jumps to the next tab", "gt"));
     let improved = classify_coverage(&commands, COMMAND_PROBES, COVERAGE_EXEMPT, &plus);
     assert!(
         improved.newly_covered.iter().any(|u| u.starts_with(victim)),
@@ -19065,9 +20139,9 @@ fn visual_audit_gates_are_bidirectional() {
 //                                      ───
 //                                      376 index rows, tagged as 370 entries
 //
-//     ✅ Implemented       211
+//     ✅ Implemented       214
 //     🟡 Partial            17
-//     ❌ Not implemented   118
+//     ❌ Not implemented   115
 //     ⏭️  Skipped            24   (each carrying a reason from SKIP_REASONS)
 //                          ───
 //                          370
@@ -19120,11 +20194,14 @@ fn visual_audit_gates_are_bidirectional() {
 // ## Gate 2 — oracle coverage, same shrink-only shape as #1007
 //
 // Every replayable, non-Skipped row carries a [`Probe`] naming the oracle
-// case that exercises it; [`NORM_COVERAGE_EXEMPT`] lists the 230 that no case
-// reaches today (93 of 323 are covered). Both directions fail, exactly as in
-// `COVERAGE_EXEMPT`. Writing the missing cases — including all 75 CTRL-W
-// rows, which no case in the corpus presses — is **#1162's** job, not this
-// slice's.
+// case that exercises it; [`NORM_COVERAGE_EXEMPT`] lists the ones no case
+// reaches today (98 of 323 covered as of #1162, up from 93 — `CTRL-W b`/`t`
+// and their `CTRL-W CTRL-T` alias now point at real [`CASES_WIN`] cases).
+// Both directions fail, exactly as in `COVERAGE_EXEMPT`. #1162 scoped itself
+// to the 33 `win:` ids `VIM_COMPATIBILITY.md`/`COMMAND_PROBES` track (its own
+// issue text), not this index's full 75-row CTRL-W surface — most of that
+// gap (aliases, uppercase synonyms, the preview-window family) is still
+// open, tracked here rather than re-litigated in the other gate.
 //
 // ## What the pinned oracle could and could not settle
 //
@@ -23728,7 +24805,7 @@ const NORMAL_AUDIT: &[NormAudit] = &[
     na(
         "CTRL-W CTRL-T",
         "CTRL-W_CTRL-T",
-        NotImplemented,
+        Implemented,
         Some(nlive(
             NA_TXT,
             (1, 1),
@@ -23741,12 +24818,15 @@ const NORMAL_AUDIT: &[NormAudit] = &[
             1,
             1,
             "",
-            "(h0.50 2 1*) tabs=1/1",
+            "(h0.50 2* 1) tabs=1/1",
         )),
-        Some(Label("win:C-w C-t goes to the top window")),
+        Some(Label("win:CTRL-W t goes to the top-left window")),
         concat!(
-            "Vim's alias for \"CTRL-W t\". Focus unchanged; the unprefixed ",
-            "`CTRL-W t` is broken too.",
+            "Vim's alias for \"CTRL-W t\", and correctly so as of #1162: the ",
+            "Ctrl-W prefix dispatch reads the raw key regardless of whether ",
+            "the following press was itself Ctrl-modified, so `<C-w><C-t>` ",
+            "reaches the exact same fixed `execute_wincmd('t', ..)` as plain ",
+            "`CTRL-W t` (see that row).",
         ),
     ),
     na(
@@ -24273,7 +25353,7 @@ const NORMAL_AUDIT: &[NormAudit] = &[
     na(
         "CTRL-W b",
         "CTRL-W_b",
-        NotImplemented,
+        Implemented,
         Some(nlive(
             NA_TXT,
             (1, 1),
@@ -24286,13 +25366,15 @@ const NORMAL_AUDIT: &[NormAudit] = &[
             1,
             1,
             "",
-            "(h0.50 2* 1) tabs=1/1",
+            "(h0.50 2 1*) tabs=1/1",
         )),
-        Some(Label("win:C-w b goes to the bottom window")),
+        Some(Label("win:CTRL-W b goes to the bottom-right window")),
         concat!(
-            "Vim goes to the bottom window; vimcode leaves the focus on the ",
-            "top one. Worth implementing with `CTRL-W t` — one pair, one ",
-            "traversal helper.",
+            "Fixed by #1162: `execute_wincmd`'s `'t'`/`'b'` arms used to walk ",
+            "the VSCode-style editor-group tree (a no-op with the single ",
+            "editor group this recording has), now they use the current ",
+            "tab's own window layout — matches Vim: goes to the bottom ",
+            "window.",
         ),
     ),
     na(
@@ -24785,7 +25867,7 @@ const NORMAL_AUDIT: &[NormAudit] = &[
     na(
         "CTRL-W t",
         "CTRL-W_t",
-        NotImplemented,
+        Implemented,
         Some(nlive(
             NA_TXT,
             (1, 1),
@@ -24798,12 +25880,12 @@ const NORMAL_AUDIT: &[NormAudit] = &[
             1,
             1,
             "",
-            "(h0.50 2 1*) tabs=1/1",
+            "(h0.50 2* 1) tabs=1/1",
         )),
-        Some(Label("win:C-w t goes to the top window")),
+        Some(Label("win:CTRL-W t goes to the top-left window")),
         concat!(
-            "Vim goes to the top window; vimcode leaves the focus on the ",
-            "bottom one (see `CTRL-W b`).",
+            "Fixed by #1162 (see `CTRL-W b`): matches Vim, goes to the top ",
+            "window.",
         ),
     ),
     na(
@@ -27288,7 +28370,6 @@ const NORM_COVERAGE_EXEMPT: &[&str] = &[
     "CTRL-W CTRL-Q",
     "CTRL-W CTRL-R",
     "CTRL-W CTRL-S",
-    "CTRL-W CTRL-T",
     "CTRL-W CTRL-V",
     "CTRL-W CTRL-W",
     "CTRL-W CTRL-X",
@@ -27310,7 +28391,6 @@ const NORM_COVERAGE_EXEMPT: &[&str] = &[
     "CTRL-W W",
     "CTRL-W ^",
     "CTRL-W _",
-    "CTRL-W b",
     "CTRL-W c",
     "CTRL-W d",
     "CTRL-W f",
@@ -27331,7 +28411,6 @@ const NORM_COVERAGE_EXEMPT: &[&str] = &[
     "CTRL-W q",
     "CTRL-W r",
     "CTRL-W s",
-    "CTRL-W t",
     "CTRL-W v",
     "CTRL-W w",
     "CTRL-W x",
@@ -27738,7 +28817,7 @@ fn normal_audit_is_internally_consistent() {
             tally(|e| matches!(e.status, OptStatus::Skipped(_))),
             tally(|e| e.live.is_some()),
         ),
-        (211, 17, 118, 24, 323),
+        (214, 17, 115, 24, 323),
         "the audit tally moved: (implemented, partial, missing, skipped, \
          replayed). Update the section doc's table in the same commit."
     );
