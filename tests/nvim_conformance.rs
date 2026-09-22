@@ -285,6 +285,24 @@ struct NvimRpc {
     /// `win_viewport` event — the value nvim computed *during a redraw*, which
     /// is a number a `-l` script could never observe.
     topline: i64,
+    /// The text of the most recent `msg_show` UI event, cleared on
+    /// `msg_clear` — only populated when [`NvimRpc::spawn`] requested the
+    /// `ext_messages` capability (#1282, [`oracle_probe_message`]).
+    ///
+    /// `msg_show`'s wire shape (batched the same way `win_viewport` is, see
+    /// [`NvimRpc::absorb_notification`]) is `[kind, content, replace_last,
+    /// history, append, ...]`, where `content` is an array of `[attr_id,
+    /// text, hl_id]` triples — one per highlight run, **not** one per line
+    /// (a `:marks`-style multi-line listing arrives as a handful of triples
+    /// whose own text already contains `\n`). Concatenating every triple's
+    /// text in order, replacing the whole thing on each new event, mirrors
+    /// `engine.message`'s own "last write wins, no highlight spans" model on
+    /// the vimcode side exactly — confirmed against a live
+    /// `nvim --headless -u NONE -i NONE` for `ga`, `g8`, `<C-g>`, `:ls`,
+    /// `:marks`, `:number`, `:reg` and more (see the git history of this
+    /// comment for the raw msgpack dumps that were read to confirm the
+    /// shape).
+    last_message: String,
 }
 
 impl NvimRpc {
@@ -300,7 +318,13 @@ impl NvimRpc {
     /// as scrolled message output, so the first buffer modification hits a
     /// `hit-enter` prompt — is deterministic rather than intermittent, and is
     /// handled by [`NvimRpc::wait_until_ready`].
-    fn spawn() -> Option<Self> {
+    ///
+    /// `capture_messages` requests the `ext_messages` UI capability on top of
+    /// the `ext_linegrid` every case already needs (#1282). Opt-in, not
+    /// unconditional: none of the buffer/cursor-comparing cases read
+    /// `last_message`, so there is no reason to widen what every one of
+    /// those 1,400+ spawns has to negotiate and this harness has to decode.
+    fn spawn(capture_messages: bool) -> Option<Self> {
         let mut child = Command::new("nvim")
             .arg("--headless")
             .arg("--embed")
@@ -348,13 +372,18 @@ impl NvimRpc {
             next_id: 0,
             responses: std::collections::HashMap::new(),
             topline: 1,
+            last_message: String::new(),
         };
+        let mut caps = vec![(Value::from("ext_linegrid"), Value::Boolean(true))];
+        if capture_messages {
+            caps.push((Value::from("ext_messages"), Value::Boolean(true)));
+        }
         rpc.request(
             "nvim_ui_attach",
             vec![
                 Value::from(UI_WIDTH),
                 Value::from(UI_HEIGHT),
-                Value::Map(vec![(Value::from("ext_linegrid"), Value::Boolean(true))]),
+                Value::Map(caps),
             ],
         )
         .ok()?;
@@ -396,6 +425,30 @@ impl NvimRpc {
                         self.topline = top + 1; // the event is 0-indexed
                     }
                 }
+            }
+            // `msg_show`/`msg_clear` only ever arrive when `spawn` requested
+            // the `ext_messages` capability (#1282) — see `last_message`'s
+            // own doc comment for the wire shape and why this concatenation
+            // is right.
+            match parts.first().and_then(Value::as_str) {
+                Some("msg_show") => {
+                    for call in parts.iter().skip(1) {
+                        let Value::Array(args) = call else { continue };
+                        let Some(Value::Array(content)) = args.get(1) else {
+                            continue;
+                        };
+                        let mut text = String::new();
+                        for chunk in content {
+                            let Value::Array(chunk) = chunk else { continue };
+                            if let Some(t) = chunk.get(1).and_then(Value::as_str) {
+                                text.push_str(t);
+                            }
+                        }
+                        self.last_message = text;
+                    }
+                }
+                Some("msg_clear") => self.last_message.clear(),
+                _ => {}
             }
         }
     }
@@ -648,7 +701,8 @@ fn oracle_probe(
     keys: &str,
     setup: &str,
 ) -> Result<NvimResult, String> {
-    let mut nvim = NvimRpc::spawn().ok_or_else(|| "could not spawn `nvim --embed`".to_string())?;
+    let mut nvim =
+        NvimRpc::spawn(false).ok_or_else(|| "could not spawn `nvim --embed`".to_string())?;
     let mut lua = String::new();
     // Neovim ships *default mappings* (`:h default-mappings`) that redefine
     // keys this corpus probes — `Y` is `y$`, `&` is `:&&<CR>`. The `-l` oracle
@@ -751,6 +805,94 @@ fn run_in_neovim(
         Ok(result) => Some(result),
         Err(why) => {
             eprintln!("oracle failed for keys={keys:?}: {why}");
+            None
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Echo-area / message-list probe (#1282) — a second shape the buffer+cursor
+// harness above structurally cannot see: `:reg`, `:marks`, `ga`, `<C-g>` and
+// the rest of `CASES_MESSAGE` below leave the buffer and cursor untouched, so
+// the only observable is whatever landed in the echo area. `oracle_probe`
+// itself is untouched; this is a sibling that spawns with `ext_messages`
+// (see `NvimRpc::last_message`) instead of trying to bolt message capture
+// onto the hot path every other one of the ~1,400 buffer/cursor cases runs.
+// ---------------------------------------------------------------------------
+
+/// Same fixture preamble as [`oracle_probe`] (kept in sync by hand — see that
+/// function's own comments for why each line is there), but returns the
+/// **message** the key sequence produced rather than the buffer/cursor.
+fn oracle_probe_message(
+    lines: &[&str],
+    cursor_line_1: usize,
+    cursor_col_1: usize,
+    keys: &str,
+    setup: &str,
+) -> Result<String, String> {
+    let mut nvim =
+        NvimRpc::spawn(true).ok_or_else(|| "could not spawn `nvim --embed`".to_string())?;
+    let mut lua = String::new();
+    lua.push_str("vim.cmd('mapclear')\nvim.cmd('mapclear!')\n");
+    lua.push_str("vim.o.inccommand = ''\n");
+    lua.push_str("vim.o.compatible = false\n");
+    lua.push_str("vim.o.shiftwidth = 4\n");
+    lua.push_str("vim.o.expandtab = true\n");
+    lua.push_str("vim.o.tabstop = 4\n");
+    lua.push_str("vim.o.wrap = true\n");
+    lua.push_str(setup);
+    lua.push('\n');
+    lua.push_str("vim.o.undolevels = -1\n");
+    lua.push_str("vim.api.nvim_buf_set_lines(0, 0, -1, false, {");
+    for (i, line) in lines.iter().enumerate() {
+        if i > 0 {
+            lua.push_str(", ");
+        }
+        let escaped = line
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('\t', "\\t");
+        lua.push('"');
+        lua.push_str(&escaped);
+        lua.push('"');
+    }
+    lua.push_str("})\n");
+    lua.push_str("vim.o.undolevels = 1000\n");
+    lua.push_str(&format!(
+        "vim.api.nvim_win_set_cursor(0, {{{}, {}}})\n",
+        cursor_line_1,
+        cursor_col_1.saturating_sub(1)
+    ));
+    nvim.request_pumped(
+        "nvim_exec_lua",
+        vec![Value::from(lua.as_str()), Value::Array(Vec::new())],
+    )?;
+
+    // The fixture install above can itself produce a `msg_show` (e.g. the
+    // startup intro screen's hit-enter dismissal) — clear it so `keys` below
+    // is the only thing that can leave a message behind.
+    nvim.last_message.clear();
+    for key in nvim_key_tokens(keys) {
+        nvim.type_key(&key)?;
+    }
+    // `type_key`'s barrier (`nvim_eval "line('w0')"`) already proves the
+    // redraw that would carry a `msg_show` for the last key has happened, so
+    // no extra wait is needed here the way `request_pumped`'s hit-enter
+    // dismissal needs one elsewhere.
+    Ok(nvim.last_message.clone())
+}
+
+fn run_in_neovim_message(
+    lines: &[&str],
+    cursor_line_1: usize,
+    cursor_col_1: usize,
+    keys: &str,
+    setup: &str,
+) -> Option<String> {
+    match oracle_probe_message(lines, cursor_line_1, cursor_col_1, keys, setup) {
+        Ok(msg) => Some(msg),
+        Err(why) => {
+            eprintln!("oracle (message probe) failed for keys={keys:?}: {why}");
             None
         }
     }
@@ -1200,6 +1342,332 @@ fn run_in_vimcode(
     (buf, line, col)
 }
 
+/// [`run_in_vimcode`]'s sibling for the message probe (#1282): same fixture
+/// preamble, but reads back `engine.message` instead of buffer/cursor. The
+/// window dims are the fixed 80x22 every other case reads dynamically off
+/// the oracle ([`UI_WIDTH`]/[`UI_HEIGHT`], minus the status+cmd lines) —
+/// fixed rather than threaded through is fine here because none of
+/// `CASES_MESSAGE` probes anything viewport-relative.
+fn run_in_vimcode_message(
+    label: &str,
+    lines: &[&str],
+    cursor_line_1: usize,
+    cursor_col_1: usize,
+    keys: &str,
+    setup: &str,
+) -> String {
+    let text = lines.join("\n");
+    let mut engine = engine_with(&text);
+    // Mirrors a real asymmetry between the two fixture-install paths, not a
+    // vimcode behaviour gap: `oracle_probe_message` seeds the buffer via
+    // `nvim_buf_set_lines` on Neovim's already-existing unnamed buffer,
+    // which Neovim always counts as a modification (confirmed against a
+    // live oracle — `<C-g>`/`:file` both print `[Modified]` even though
+    // `keys` never touched the buffer). `engine_with`'s direct
+    // `buffer_mut().insert` bypasses the edit path that would set this, so
+    // without it every message that reports dirty status would read
+    // "unmodified" purely because of *how the fixture got the text in*, not
+    // because of anything Neovim and vimcode actually disagree on.
+    if !text.is_empty() {
+        engine.set_dirty(true);
+    }
+    engine.settings.shift_width = 4;
+    engine.settings.expand_tab = true;
+    engine.settings.tabstop = 4;
+    engine.settings.wrap = true;
+    if let Err(why) = apply_setup(&mut engine.settings, setup) {
+        panic!("conformance case {label:?}: bad `setup` — {why}");
+    }
+    engine.rebuild_user_keymaps();
+    engine.set_viewport_lines(UI_HEIGHT as usize - 2);
+    engine.set_viewport_cols(UI_WIDTH as usize);
+    engine.view_mut().cursor.line = cursor_line_1.saturating_sub(1);
+    engine.view_mut().cursor.col = cursor_col_1.saturating_sub(1);
+    engine.ensure_cursor_visible();
+    // The `keys` sequence itself is the only thing allowed to leave a
+    // message behind, same discipline as `oracle_probe_message`'s
+    // `last_message.clear()`.
+    engine.message.clear();
+    send_keys(&mut engine, keys);
+    engine.message.clone()
+}
+
+/// Minimal, explicit normalization for comparing a message-probe pair — kept
+/// deliberately small so it cannot quietly swallow a real deviation (the
+/// module doc's warning about a vacuous normalizer). Each strip is named so
+/// a failing case says exactly what was and wasn't discounted:
+///
+/// * trailing whitespace on every line, and any run of interior spaces
+///   collapsed to one — column-padding differences between the two sides'
+///   independently-written table formatters are not a Vim-compat deviation;
+/// * this repo's own absolute path (the fixture's cwd, which `:pwd` prints
+///   verbatim) replaced with a fixed placeholder, since the raw path is a
+///   property of the machine running the test, not of either editor.
+fn normalize_message(msg: &str) -> String {
+    let cwd = std::env::current_dir()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let mut out = msg.to_string();
+    if !cwd.is_empty() {
+        out = out.replace(&cwd, "{CWD}");
+    }
+    out.lines()
+        .map(|line| line.trim_end())
+        .map(|line| {
+            let mut collapsed = String::with_capacity(line.len());
+            let mut last_was_space = false;
+            for ch in line.chars() {
+                if ch == ' ' {
+                    if !last_was_space {
+                        collapsed.push(' ');
+                    }
+                    last_was_space = true;
+                } else {
+                    collapsed.push(ch);
+                    last_was_space = false;
+                }
+            }
+            collapsed
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+struct MessageCase {
+    label: &'static str,
+    lines: &'static [&'static str],
+    cursor_line: usize,
+    cursor_col: usize,
+    keys: &'static str,
+    setup: &'static str,
+}
+
+const fn mc(
+    label: &'static str,
+    lines: &'static [&'static str],
+    cursor_line: usize,
+    cursor_col: usize,
+    keys: &'static str,
+) -> MessageCase {
+    MessageCase {
+        label,
+        lines,
+        cursor_line,
+        cursor_col,
+        keys,
+        setup: "",
+    }
+}
+
+fn run_message_case(case: &MessageCase) -> Outcome {
+    let nvim_msg = match run_in_neovim_message(
+        case.lines,
+        case.cursor_line,
+        case.cursor_col,
+        case.keys,
+        case.setup,
+    ) {
+        Some(m) => m,
+        None => return Outcome::NvimBroke,
+    };
+    let vc_msg = run_in_vimcode_message(
+        case.label,
+        case.lines,
+        case.cursor_line,
+        case.cursor_col,
+        case.keys,
+        case.setup,
+    );
+    let nvim_norm = normalize_message(&nvim_msg);
+    let vc_norm = normalize_message(&vc_msg);
+    if nvim_norm == vc_norm {
+        return Outcome::Pass;
+    }
+    Outcome::Fail(format!(
+        "[{}] keys={:?} start={:?}@({},{})\n  message: nvim={:?} vimcode={:?}\n  normalized: nvim={:?} vimcode={:?}",
+        case.label,
+        case.keys,
+        case.lines,
+        case.cursor_line,
+        case.cursor_col,
+        nvim_msg,
+        vc_msg,
+        nvim_norm,
+        vc_norm,
+    ))
+}
+
+// One real case per id from #1282's echo-area/message-list list. Each `keys`
+// literally contains the [`CommandProbe`] needle that id's `p(..)` entry in
+// `COMMAND_PROBES` matches on — that is what retires the id from
+// `COVERAGE_EXEMPT`, same convention `CASES_XFILE`/`CASES_WIN` use.
+const CASES_MESSAGE: &[MessageCase] = &[
+    // other:ga, g:ga — `Keys("ga")`.
+    mc(
+        "msg:ga shows ascii/hex/octal value under cursor",
+        &["hello"],
+        1,
+        1,
+        "ga",
+    ),
+    // other:g8, g:g8 — `Keys("g8")`. A multi-byte character so the probe
+    // actually exercises the UTF-8-byte-sequence path, not just a 1-byte
+    // ASCII shortcut.
+    mc(
+        "msg:g8 shows utf-8 byte sequence under cursor",
+        &["h\u{65e5}llo"],
+        1,
+        2,
+        "g8",
+    ),
+    // other:CTRL-G — `Label("misc:C-g")`. `'ruler'` is on by default
+    // (Neovim's, matching this suite's default), so this is the "N lines"
+    // form — see the paired `line X of Y col C` engine-level tests in
+    // `src/core/engine/tests.rs`.
+    mc(
+        "msg:misc:C-g shows file info",
+        &["one", "two", "three"],
+        2,
+        1,
+        "<C-g>",
+    ),
+    // ex::ls, ex::buffers — `Keys(":ls")` / `Keys(":buffers")`.
+    mc("msg:ex::ls lists the buffer", &["hello"], 1, 1, ":ls<CR>"),
+    mc(
+        "msg:ex::buffers lists the buffer",
+        &["hello"],
+        1,
+        1,
+        ":buffers<CR>",
+    ),
+    // ex::reg, ex::registers — `Keys(":reg")` / `Keys(":registers")`. Named
+    // register only (`"reg a`, not bare `:reg`) so the probe's own message
+    // doesn't depend on whether the *machine* running the test has a
+    // clipboard provider — bare `:reg`/`:registers` iterates the `*`/`+`
+    // registers too, and Neovim prints a `clipboard: No provider...` line
+    // for those the instant it's asked, independent of whether anything was
+    // ever yanked.
+    mc(
+        "msg:ex::reg shows one named register's content",
+        &["hello world"],
+        1,
+        1,
+        "\"ayy:reg a<CR>",
+    ),
+    mc(
+        "msg:ex::registers shows one named register's content",
+        &["hello world"],
+        1,
+        1,
+        "\"byy:registers b<CR>",
+    ),
+    // ex::marks — `Keys(":marks")`.
+    mc(
+        "msg:ex::marks lists a set mark",
+        &["one", "two", "three"],
+        2,
+        1,
+        "maG:marks<CR>",
+    ),
+    // ex::jumps — `Keys(":jumps")`.
+    mc(
+        "msg:ex::jumps lists a jump",
+        &["one", "two", "three", "four", "five"],
+        1,
+        1,
+        "G<C-o>:jumps<CR>",
+    ),
+    // ex::digraphs — `Keys(":digraphs")`. #1160 already implements the
+    // table (`src/core/digraphs.rs`); this is that table's own listing
+    // command, not a custom `{char1}{char2} {number}` definition — Neovim
+    // emits no message at all for the definition form (confirmed against a
+    // live oracle), which would make a case built on it vacuous per this
+    // repo's #1154 bar.
+    mc(
+        "msg:ex::digraphs lists the digraph table",
+        &["hello"],
+        1,
+        1,
+        ":digraphs<CR>",
+    ),
+    // ex::changes — `Keys(":changes")`.
+    mc(
+        "msg:ex::changes lists a change",
+        &["hello"],
+        1,
+        1,
+        "ceHELLO<Esc>:changes<CR>",
+    ),
+    // ex::history — `Keys(":history")`. Two prior ex commands give it
+    // something to list.
+    mc(
+        "msg:ex::history lists prior ex commands",
+        &["hello"],
+        1,
+        1,
+        ":ls<CR>:marks<CR>:history<CR>",
+    ),
+    // ex::echo {text} — `Keys(":echo")`.
+    mc(
+        "msg:ex::echo prints its argument",
+        &["hello"],
+        1,
+        1,
+        ":echo 'hi'<CR>",
+    ),
+    // ex::pwd — `Keys(":pwd")`. No `setup` needed: both the oracle child
+    // process and this test process inherit the same cwd, so
+    // `normalize_message`'s `{CWD}` substitution applies identically to
+    // both sides even though neither is told the path explicitly.
+    mc(
+        "msg:ex::pwd prints the current directory",
+        &["hello"],
+        1,
+        1,
+        ":pwd<CR>",
+    ),
+    // ex::file — `Keys(":file")`.
+    mc(
+        "msg:ex::file prints name and status",
+        &["one", "two"],
+        1,
+        1,
+        ":file<CR>",
+    ),
+    // ex::= — `Keys(":=")`.
+    mc(
+        "msg:ex::= prints the last line number",
+        &["one", "two", "three"],
+        1,
+        1,
+        ":=<CR>",
+    ),
+    // ex::# — `Keys(":#")`, alias for `:number`.
+    mc(
+        "msg:ex::# prints the current line with its number",
+        &["one", "two", "three"],
+        2,
+        1,
+        ":#<CR>",
+    ),
+    // ex::number — `Keys(":number")`.
+    mc(
+        "msg:ex::number prints the current line with its number",
+        &["one", "two", "three"],
+        2,
+        1,
+        ":number<CR>",
+    ),
+    // ex::print — `Keys(":print")`.
+    mc(
+        "msg:ex::print prints the current line",
+        &["one", "two", "three"],
+        2,
+        1,
+        ":print<CR>",
+    ),
+];
+
 // ---------------------------------------------------------------------------
 // Multi-file harness (#985) — the single-buffer harness above compares only
 // buffer text + cursor within *one* buffer, so it structurally cannot express
@@ -1566,6 +2034,273 @@ fn run_multi_case(case: &MultiFileCase) -> Outcome {
         vc_col
     ))
 }
+
+// ---------------------------------------------------------------------------
+// On-disk probe (#1282) — a third multi-file shape. `:w`/`:write`/`:wa`/
+// `:update`/`:saveas {file}`/`:read` leave the position harness above
+// nothing to compare (an already-open, already-correctly-positioned file
+// staying open is not what any of these commands are *for*) — the only
+// observable is bytes on disk (or, for `:read`, the buffer the bytes were
+// read *into*). Reuses [`MultiFileCase`]/[`write_multi_fixture`]/
+// [`resolve_multi_keys`] for the fixture shape, but — unlike
+// [`run_multi_case`] — gives nvim and vimcode **separate** fixture
+// directories: both sides genuinely write real files here, and running them
+// against one shared directory would let whichever side runs first feed its
+// own write into the other side's starting content.
+// ---------------------------------------------------------------------------
+
+/// Observed state after `keys` ran: the active buffer's own text, plus each
+/// fixture file's on-disk content in `case.files` order (`None` if the file
+/// no longer exists — none of `CASES_DISK` deletes one, but a real deviation
+/// that did should show up as a mismatch, not a panic).
+struct DiskObserved {
+    buf: String,
+    files: Vec<Option<String>>,
+}
+
+fn read_fixture_files(paths: &[PathBuf]) -> Vec<Option<String>> {
+    paths
+        .iter()
+        .map(|p| std::fs::read_to_string(p).ok())
+        .collect()
+}
+
+fn run_disk_in_neovim(
+    start_path: &Path,
+    start_line: usize,
+    start_col: usize,
+    resolved_keys: &str,
+    cwd: &Path,
+    fixture_paths: &[PathBuf],
+) -> Option<DiskObserved> {
+    #[derive(Deserialize)]
+    struct Raw {
+        buf: Vec<String>,
+    }
+
+    let id = probe_id();
+    let mut lua = String::new();
+    lua.push_str("vim.o.compatible = false\n");
+    lua.push_str("vim.o.hidden = true\n");
+    let escaped_start = start_path
+        .to_string_lossy()
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"");
+    lua.push_str(&format!(
+        "vim.cmd(\"edit \" .. vim.fn.fnameescape(\"{escaped_start}\"))\n"
+    ));
+    lua.push_str(&format!(
+        "vim.api.nvim_win_set_cursor(0, {{{}, {}}})\n",
+        start_line,
+        start_col.saturating_sub(1)
+    ));
+    let escaped_keys = resolved_keys.replace('\\', "\\\\").replace('"', "\\\"");
+    lua.push_str(&format!(
+        "pcall(function() vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes(\"{escaped_keys}\", true, false, true), \"ntx\", false) end)\n"
+    ));
+    let result_path = std::env::temp_dir().join(format!("vimcode_disk_nvim_probe_{id}.json"));
+    let result_path_str = result_path.to_string_lossy().replace('\\', "/");
+    lua.push_str(&format!(
+        "local buf = vim.api.nvim_buf_get_lines(0, 0, -1, false)\n\
+         local result = vim.fn.json_encode({{buf = buf}})\n\
+         local f = io.open(\"{result_path_str}\", \"w\")\n\
+         f:write(result)\n\
+         f:close()\n\
+         vim.cmd(\"qa!\")\n"
+    ));
+    let script_path = std::env::temp_dir().join(format!("vimcode_disk_nvim_probe_{id}.lua"));
+    {
+        let mut f = std::fs::File::create(&script_path).ok()?;
+        f.write_all(lua.as_bytes()).ok()?;
+    }
+    let _ = std::fs::remove_file(&result_path);
+    let output = std::process::Command::new("nvim")
+        .arg("--headless")
+        .arg("-u")
+        .arg("NONE")
+        .arg("-i")
+        .arg("NONE")
+        .arg("-l")
+        .arg(script_path.to_string_lossy().as_ref())
+        .current_dir(cwd)
+        .output()
+        .ok();
+    let raw: Option<Raw> = match &output {
+        Some(o) => {
+            let raw: Option<Raw> = std::fs::read_to_string(&result_path)
+                .ok()
+                .and_then(|json| serde_json::from_str(&json).ok());
+            if raw.is_none() && !o.status.success() {
+                eprintln!(
+                    "nvim stderr (disk probe): {}",
+                    String::from_utf8_lossy(&o.stderr)
+                );
+            }
+            raw
+        }
+        None => None,
+    };
+    let _ = std::fs::remove_file(&script_path);
+    let _ = std::fs::remove_file(&result_path);
+    // Deliberately read the fixture files back from Rust rather than having
+    // the Lua script report their content: nvim's own write already landed
+    // on disk by the time `qa!` runs, so this is a plain filesystem read,
+    // not a second thing that could disagree with what `:w` actually did.
+    raw.map(|r| DiskObserved {
+        buf: r.buf.join("\n"),
+        files: read_fixture_files(fixture_paths),
+    })
+}
+
+fn run_disk_in_vimcode(
+    start_path: &Path,
+    start_line: usize,
+    start_col: usize,
+    resolved_keys: &str,
+    fixture_paths: &[PathBuf],
+) -> DiskObserved {
+    let mut engine = engine_with("");
+    engine
+        .open_file_with_mode(start_path, OpenMode::Permanent)
+        .expect("open start file for disk probe");
+    engine.view_mut().cursor.line = start_line.saturating_sub(1);
+    engine.view_mut().cursor.col = start_col.saturating_sub(1);
+    engine.ensure_cursor_visible();
+    send_keys_multi(&mut engine, resolved_keys);
+    let buf = engine.buffer().to_string();
+    DiskObserved {
+        buf,
+        files: read_fixture_files(fixture_paths),
+    }
+}
+
+/// Unlike [`run_multi_case`], this calls [`write_multi_fixture`] **twice** —
+/// see the section doc above for why the two sides cannot share one
+/// directory here.
+fn run_disk_case(case: &MultiFileCase) -> Outcome {
+    let (nvim_dir, nvim_paths) = write_multi_fixture(case);
+    let nvim_keys = resolve_multi_keys(case.keys, &nvim_paths);
+    let nvim_start = nvim_paths[case.start_file].clone();
+    let nvim_observed = match run_disk_in_neovim(
+        &nvim_start,
+        case.start_line,
+        case.start_col,
+        &nvim_keys,
+        &nvim_dir,
+        &nvim_paths,
+    ) {
+        Some(o) => o,
+        None => {
+            let _ = std::fs::remove_dir_all(&nvim_dir);
+            return Outcome::NvimBroke;
+        }
+    };
+    let _ = std::fs::remove_dir_all(&nvim_dir);
+
+    let (vc_dir, vc_paths) = write_multi_fixture(case);
+    let vc_keys = resolve_multi_keys(case.keys, &vc_paths);
+    let vc_start = vc_paths[case.start_file].clone();
+    let vc_observed = run_disk_in_vimcode(
+        &vc_start,
+        case.start_line,
+        case.start_col,
+        &vc_keys,
+        &vc_paths,
+    );
+    let _ = std::fs::remove_dir_all(&vc_dir);
+
+    let norm = |s: &str| s.trim_end_matches('\n').to_string();
+    let buf_match = norm(&nvim_observed.buf) == norm(&vc_observed.buf);
+    let files_match = nvim_observed.files.len() == vc_observed.files.len()
+        && nvim_observed
+            .files
+            .iter()
+            .zip(vc_observed.files.iter())
+            .all(|(a, b)| a.as_deref().map(norm) == b.as_deref().map(norm));
+    if buf_match && files_match {
+        return Outcome::Pass;
+    }
+    Outcome::Fail(format!(
+        "[{}] keys={:?} start={:?}@({},{})\n  buffer: nvim={:?} vimcode={:?}\n  files: nvim={:?} vimcode={:?}",
+        case.label,
+        case.keys,
+        case.files.get(case.start_file).map(|(name, _)| *name),
+        case.start_line,
+        case.start_col,
+        nvim_observed.buf,
+        vc_observed.buf,
+        nvim_observed.files,
+        vc_observed.files,
+    ))
+}
+
+const CASES_DISK: &[MultiFileCase] = &[
+    // ex::w — `Keys(":w")`.
+    mfc(
+        "disk:ex::w writes the modified buffer to its file",
+        &[("main.txt", &["hello"])],
+        0,
+        1,
+        1,
+        "A world<Esc>:w<CR>",
+    ),
+    // ex::write — `Keys(":write")`.
+    mfc(
+        "disk:ex::write writes the modified buffer to its file",
+        &[("main.txt", &["hello"])],
+        0,
+        1,
+        1,
+        "A world<Esc>:write<CR>",
+    ),
+    // ex::wa — `Keys(":wa")`. Two modified buffers so "all" is actually
+    // exercised, not indistinguishable from plain `:w`.
+    mfc(
+        "disk:ex::wa writes every modified buffer",
+        &[("a.txt", &["foo"]), ("b.txt", &["bar"])],
+        0,
+        1,
+        1,
+        "Ax<Esc>:e {F1}<CR>Ay<Esc>:wa<CR>",
+    ),
+    // ex::update — `Keys(":update")`.
+    mfc(
+        "disk:ex::update writes a modified buffer",
+        &[("main.txt", &["hello"])],
+        0,
+        1,
+        1,
+        "A world<Esc>:update<CR>",
+    ),
+    // ex::saveas {file} — `Keys(":saveas")`. Asserts both halves: the new
+    // path gets the modified content, and the old path is left exactly as
+    // the fixture wrote it (`:saveas` renames the buffer, it does not also
+    // write the name being abandoned). Bang required: `new.txt` already
+    // exists (the fixture pre-seeds it so there's something to assert stays
+    // untouched only where the case's own edit *didn't* land), and Neovim's
+    // `:saveas` refuses an existing target without `!` — confirmed against a
+    // live `nvim --headless -u NONE` (`E13: File exists`).
+    mfc(
+        "disk:ex::saveas {file} writes to the new path, leaves the old one untouched",
+        &[("orig.txt", &["hello"]), ("new.txt", &["placeholder"])],
+        0,
+        1,
+        1,
+        "A world<Esc>:saveas! {F1}<CR>",
+    ),
+    // ex::read — `Keys(":read")`. Buffer-visible (the read file's content
+    // lands after the cursor line), which is exactly why this harness reads
+    // `buf` too, not only `files` — and `other.txt` staying byte-identical
+    // on disk is itself part of the assertion: `:read` never writes.
+    mfc(
+        "disk:ex::read inserts a file's content after the cursor line",
+        &[("main.txt", &["one", "two"]), ("other.txt", &["OTHER"])],
+        0,
+        1,
+        1,
+        ":read {F1}<CR>",
+    ),
+];
 
 // ---------------------------------------------------------------------------
 // `:jumps` list-content harness (#985) — a second multi-file shape: instead
@@ -8748,6 +9483,361 @@ fn nvim_conformance_cross_file_ex() {
     panic!("\n\n{}\n", problems.join("\n\n"));
 }
 
+// KNOWN_DEVIATIONS_MESSAGE — same bidirectional-gate idiom as
+// KNOWN_DEVIATIONS_XFILE above, applied to CASES_MESSAGE (#1282). May only
+// ever SHRINK.
+//
+// ## Follow-up issue status (read before editing any entry below)
+//
+// Same policy as KNOWN_DEVIATIONS_WIN/KNOWN_DEVIATIONS_XFILE: no `gh` access
+// from a worker session, so nothing here is "filed as #NNNN" yet. Each entry
+// below names the exact gap so the coordinator can file it verbatim. All
+// seven are the same shape: vimcode's message-listing ex-commands were
+// implemented against a hand-remembered idea of the classic-Vim format
+// rather than checked against a live Neovim, so every one of them differs —
+// sometimes by a column, sometimes by the whole table being a different
+// shape. None was attempted inline here because each is its own
+// non-trivial formatter rewrite (exact column widths, which rows Neovim
+// includes at all, in one case an entirely different feature — auto marks —
+// that does not exist in vimcode yet), not a one-line fix, and mixing seven
+// such rewrites into the slice that *adds the probe* would make this diff
+// unreviewable. Every entry's live-oracle output is in this file's own git
+// history (the case, run once with `PROBE_VERBOSE=1`, printed it).
+//
+//   1. "msg:ex::reg shows one named register's content" / "msg:ex::registers
+//      shows one named register's content" — title: "`:reg`/`:registers`:
+//      support a register-name argument and match Neovim's `Type Name
+//      Content` table". `execute_command`'s `"registers" | "display"` arm
+//      (src/core/engine/execute.rs) matches only the bare command — any
+//      trailing argument falls through to "not an editor command" — and
+//      even bare `:reg` prints a vimcode-invented `--- Registers ---`
+//      header/column layout instead of Neovim's real one.
+//   2. "msg:ex::marks lists a set mark" — title: "`:marks`: emit the three
+//      auto marks (`'`, `\"`, `.`) alongside user marks". `"marks"`'s arm
+//      only iterates `self.marks` (user-set marks); Neovim's `:marks`
+//      output always also lists the previous-context, last-cursor-before-
+//      leaving-buffer and last-change positions.
+//   3. "msg:ex::jumps lists a jump" — title: "`:jumps`: drop the
+//      vimcode-only `tab` column, add the `file/text` preview column
+//      Neovim has instead". `"jumps"`'s arm prints a header/column vimcode
+//      added on its own (`" jump line  col  tab  file/text"`) — Neovim's is
+//      `" jump line  col file/text"`, no tab column, but *with* a preview
+//      of the target line's text that vimcode's version omits entirely.
+//   4. "msg:ex::digraphs lists the digraph table" — title: "`:digraphs`:
+//      match Neovim's default digraph table and its column-wrapped grid
+//      layout". `src/core/digraphs.rs`'s table (#1160) was built against
+//      the *Vim* digraph list, and `ex_digraphs`'s no-argument listing
+//      formats it as one-per-line rather than Neovim's fixed-width grid —
+//      both dimensions differ from the live oracle's ~240KB dump.
+//   5. "msg:ex::changes lists a change" — title: "`:changes`: add the
+//      `text` column, fix `change_list`'s 0- vs 1-based numbering and the
+//      marker row". `"changes"`'s arm's header has no `text` column, and
+//      the body loop's `i` (the *index*, starting at 0) is printed as the
+//      change number instead of `i + 1`; Neovim's marker (`>`) also lands
+//      on a real entry, not a trailing empty row.
+//   6. "msg:ex::history lists prior ex commands" — title: "hermeticity:
+//      `Engine::new()` must not load the real `~/.config/vimcode/
+//      history.json` in a test process". This is not a message-formatting
+//      gap at all: `HistoryState::load()` (src/core/session.rs) reads that
+//      file unconditionally, and `tests/common::engine_with`'s
+//      `suppress_disk_saves()` only suppresses *writes* — so every
+//      `Engine::new()` in this whole test binary starts with whatever
+//      command history is sitting in the *developer machine's* real config
+//      directory (confirmed: this repo's own dev machine had ~100 stale
+//      entries from earlier interactive/test sessions, which is what
+//      `:history` printed instead of the three commands this case actually
+//      typed). Likely affects any other test that touches `:history`, the
+//      up/down command-line recall, or anything else keyed off
+//      `self.history` — a real hermeticity bug independent of #1282, filed
+//      as its own follow-up rather than folded into a message-formatting
+//      fix because the right repair (a test-only "don't load either" flag
+//      alongside `suppress_disk_saves`) touches `Engine::new()`'s own
+//      construction path, not `src/core/engine/execute.rs`.
+const KNOWN_DEVIATIONS_MESSAGE: &[&str] = &[
+    "msg:ex::reg shows one named register's content",
+    "msg:ex::registers shows one named register's content",
+    "msg:ex::marks lists a set mark",
+    "msg:ex::jumps lists a jump",
+    "msg:ex::digraphs lists the digraph table",
+    "msg:ex::changes lists a change",
+    "msg:ex::history lists prior ex commands",
+];
+
+#[test]
+fn nvim_conformance_messages() {
+    let version_output = std::process::Command::new("nvim")
+        .arg("--version")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned());
+    let resolved = resolve_on_path("nvim");
+    let resolved_display = resolved
+        .as_deref()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "nvim (resolved by PATH lookup)".to_string());
+    let probe = version_output
+        .as_deref()
+        .map(|out| (resolved_display.as_str(), out));
+
+    let allow_skip = std::env::var_os(ALLOW_SKIP_VAR).is_some();
+    let nvim_version = match preflight(probe, allow_skip) {
+        Preflight::Refuse { reason } => panic!("\n\n{reason}\n"),
+        Preflight::Skip { reason } => {
+            eprintln!("SKIP ({ALLOW_SKIP_VAR} set): {reason}");
+            return;
+        }
+        Preflight::Run { banner, version } => {
+            print_unmissable(&banner);
+            Some(version)
+        }
+    };
+
+    let filter = std::env::var("PROBE_FILTER").ok();
+    let verbose = std::env::var_os("PROBE_VERBOSE").is_some();
+
+    let mut outcomes: Vec<(&str, bool)> = Vec::new();
+    let mut detail: std::collections::HashMap<&str, String> = std::collections::HashMap::new();
+    let mut nvim_broke: Vec<&str> = Vec::new();
+
+    for case in CASES_MESSAGE
+        .iter()
+        .filter(|c| filter.as_deref().is_none_or(|f| c.label.contains(f)))
+    {
+        match run_message_case(case) {
+            Outcome::NvimBroke => nvim_broke.push(case.label),
+            Outcome::Pass => {
+                outcomes.push((case.label, true));
+                if verbose {
+                    println!("PASS [{}]", case.label);
+                }
+            }
+            Outcome::Fail(msg) => {
+                outcomes.push((case.label, false));
+                if verbose {
+                    println!("FAIL {msg}");
+                }
+                detail.insert(case.label, msg);
+            }
+        }
+    }
+
+    println!("\n=== Neovim Conformance Results: echo-area/message probe (#1282) ===");
+    println!(
+        "cases run: {}  pass: {}  known-fail: {}",
+        outcomes.len(),
+        outcomes.iter().filter(|(_, p)| *p).count(),
+        outcomes
+            .iter()
+            .filter(|(l, p)| !*p && KNOWN_DEVIATIONS_MESSAGE.contains(l))
+            .count(),
+    );
+    if !nvim_broke.is_empty() {
+        println!(
+            "\nnvim execution failed for {} case(s): {:?}",
+            nvim_broke.len(),
+            nvim_broke
+        );
+    }
+
+    let all_labels: Vec<&str> = CASES_MESSAGE.iter().map(|c| c.label).collect();
+    let mut verdict = classify(
+        &outcomes,
+        KNOWN_DEVIATIONS_MESSAGE,
+        filter.is_none().then_some(all_labels.as_slice()),
+    );
+
+    if !verdict.fixed.is_empty() && !fixes_are_enforced(nvim_version) {
+        println!(
+            "\nNOTE: {} KNOWN_DEVIATIONS_MESSAGE entr(y/ies) pass against this run's \
+             Neovim but the list was captured against {}.{}.x, so this is oracle-version \
+             skew, not a landed fix — do NOT delete them. Not failing the run:\n{}",
+            verdict.fixed.len(),
+            DEVIATIONS_ORACLE.0,
+            DEVIATIONS_ORACLE.1,
+            bullet_list(&verdict.fixed)
+        );
+        verdict.fixed.clear();
+    }
+
+    if verdict.is_clean() {
+        return;
+    }
+
+    let mut problems: Vec<String> = Vec::new();
+    if !verdict.stale.is_empty() {
+        problems.push(format!(
+            "{} KNOWN_DEVIATIONS_MESSAGE entr(y/ies) match no case label — delete them:\n{}",
+            verdict.stale.len(),
+            bullet_list(&verdict.stale)
+        ));
+    }
+    if !verdict.regressions.is_empty() {
+        problems.push(format!(
+            "{} message-probe REGRESSION(S) — cases not in KNOWN_DEVIATIONS_MESSAGE \
+             that do not match Neovim:\n\n{}",
+            verdict.regressions.len(),
+            verdict
+                .regressions
+                .iter()
+                .map(|l| detail.get(l).cloned().unwrap_or_else(|| (*l).to_string()))
+                .collect::<Vec<_>>()
+                .join("\n\n")
+        ));
+    }
+    if !verdict.fixed.is_empty() {
+        problems.push(format!(
+            "{} case(s) listed in KNOWN_DEVIATIONS_MESSAGE now PASS. \
+             Good — delete these entries so the list keeps shrinking:\n{}",
+            verdict.fixed.len(),
+            bullet_list(&verdict.fixed)
+        ));
+    }
+    panic!("\n\n{}\n", problems.join("\n\n"));
+}
+
+// KNOWN_DEVIATIONS_DISK — same bidirectional-gate idiom, applied to
+// CASES_DISK (#1282). May only ever SHRINK.
+//
+// No `gh` access from a worker session (see KNOWN_DEVIATIONS_XFILE's own
+// header for the policy this follows), so nothing here is "filed as #NNNN"
+// yet — each entry names the exact gap so the coordinator can file it
+// verbatim.
+const KNOWN_DEVIATIONS_DISK: &[&str] = &[];
+
+#[test]
+fn nvim_conformance_disk() {
+    let version_output = std::process::Command::new("nvim")
+        .arg("--version")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned());
+    let resolved = resolve_on_path("nvim");
+    let resolved_display = resolved
+        .as_deref()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "nvim (resolved by PATH lookup)".to_string());
+    let probe = version_output
+        .as_deref()
+        .map(|out| (resolved_display.as_str(), out));
+
+    let allow_skip = std::env::var_os(ALLOW_SKIP_VAR).is_some();
+    let nvim_version = match preflight(probe, allow_skip) {
+        Preflight::Refuse { reason } => panic!("\n\n{reason}\n"),
+        Preflight::Skip { reason } => {
+            eprintln!("SKIP ({ALLOW_SKIP_VAR} set): {reason}");
+            return;
+        }
+        Preflight::Run { banner, version } => {
+            print_unmissable(&banner);
+            Some(version)
+        }
+    };
+
+    let filter = std::env::var("PROBE_FILTER").ok();
+    let verbose = std::env::var_os("PROBE_VERBOSE").is_some();
+
+    let mut outcomes: Vec<(&str, bool)> = Vec::new();
+    let mut detail: std::collections::HashMap<&str, String> = std::collections::HashMap::new();
+    let mut nvim_broke: Vec<&str> = Vec::new();
+
+    for case in CASES_DISK
+        .iter()
+        .filter(|c| filter.as_deref().is_none_or(|f| c.label.contains(f)))
+    {
+        match run_disk_case(case) {
+            Outcome::NvimBroke => nvim_broke.push(case.label),
+            Outcome::Pass => {
+                outcomes.push((case.label, true));
+                if verbose {
+                    println!("PASS [{}]", case.label);
+                }
+            }
+            Outcome::Fail(msg) => {
+                outcomes.push((case.label, false));
+                if verbose {
+                    println!("FAIL {msg}");
+                }
+                detail.insert(case.label, msg);
+            }
+        }
+    }
+
+    println!("\n=== Neovim Conformance Results: on-disk probe (#1282) ===");
+    println!(
+        "cases run: {}  pass: {}  known-fail: {}",
+        outcomes.len(),
+        outcomes.iter().filter(|(_, p)| *p).count(),
+        outcomes
+            .iter()
+            .filter(|(l, p)| !*p && KNOWN_DEVIATIONS_DISK.contains(l))
+            .count(),
+    );
+    if !nvim_broke.is_empty() {
+        println!(
+            "\nnvim execution failed for {} case(s): {:?}",
+            nvim_broke.len(),
+            nvim_broke
+        );
+    }
+
+    let all_labels: Vec<&str> = CASES_DISK.iter().map(|c| c.label).collect();
+    let mut verdict = classify(
+        &outcomes,
+        KNOWN_DEVIATIONS_DISK,
+        filter.is_none().then_some(all_labels.as_slice()),
+    );
+
+    if !verdict.fixed.is_empty() && !fixes_are_enforced(nvim_version) {
+        println!(
+            "\nNOTE: {} KNOWN_DEVIATIONS_DISK entr(y/ies) pass against this run's \
+             Neovim but the list was captured against {}.{}.x, so this is oracle-version \
+             skew, not a landed fix — do NOT delete them. Not failing the run:\n{}",
+            verdict.fixed.len(),
+            DEVIATIONS_ORACLE.0,
+            DEVIATIONS_ORACLE.1,
+            bullet_list(&verdict.fixed)
+        );
+        verdict.fixed.clear();
+    }
+
+    if verdict.is_clean() {
+        return;
+    }
+
+    let mut problems: Vec<String> = Vec::new();
+    if !verdict.stale.is_empty() {
+        problems.push(format!(
+            "{} KNOWN_DEVIATIONS_DISK entr(y/ies) match no case label — delete them:\n{}",
+            verdict.stale.len(),
+            bullet_list(&verdict.stale)
+        ));
+    }
+    if !verdict.regressions.is_empty() {
+        problems.push(format!(
+            "{} on-disk REGRESSION(S) — cases not in KNOWN_DEVIATIONS_DISK \
+             that do not match Neovim:\n\n{}",
+            verdict.regressions.len(),
+            verdict
+                .regressions
+                .iter()
+                .map(|l| detail.get(l).cloned().unwrap_or_else(|| (*l).to_string()))
+                .collect::<Vec<_>>()
+                .join("\n\n")
+        ));
+    }
+    if !verdict.fixed.is_empty() {
+        problems.push(format!(
+            "{} case(s) listed in KNOWN_DEVIATIONS_DISK now PASS. \
+             Good — delete these entries so the list keeps shrinking:\n{}",
+            verdict.fixed.len(),
+            bullet_list(&verdict.fixed)
+        ));
+    }
+    panic!("\n\n{}\n", problems.join("\n\n"));
+}
+
 // ---------------------------------------------------------------------------
 // Categories — the runner flattens these; the split is for editability only.
 // ---------------------------------------------------------------------------
@@ -9599,6 +10689,8 @@ fn all_corpus_cases() -> Vec<(&'static str, &'static str)> {
     out.extend(CASES_MULTI_JUMPS_LIST.iter().map(|c| (c.label, c.keys)));
     out.extend(CASES_WIN.iter().map(|c| (c.label, c.keys)));
     out.extend(CASES_XFILE.iter().map(|c| (c.label, c.keys)));
+    out.extend(CASES_MESSAGE.iter().map(|c| (c.label, c.keys)));
+    out.extend(CASES_DISK.iter().map(|c| (c.label, c.keys)));
     out
 }
 
@@ -10328,27 +11420,32 @@ const COMMAND_PROBES: &[CommandProbe] = &[
 // ---------------------------------------------------------------------------
 // COVERAGE_EXEMPT — this list may only ever SHRINK.
 //
-// **217 of the 563 commands `VIM_COMPATIBILITY.md` marks ✅/⚠️ have no oracle
-// case at all** (38.5%; 346 are covered). That number is the measurement this
-// gate exists to produce, and it is the first one anybody has taken: the doc
-// itself reads "422/424, 100% — Remaining Missing Commands: None", which is a
-// claim about *existence*, and `COVERAGE_PHASE5.md` audits 2 of 6 areas.
+// **84 of the 619 commands `VIM_COMPATIBILITY.md` marks ✅/⚠️ have no oracle
+// case at all** (13.6%; 535 are covered — both numbers straight off this
+// test's own printed banner, not hand-derived). That number is the
+// measurement this gate exists to produce, and it is the first one anybody
+// has taken: the doc itself reads "422/424, 100% — Remaining Missing
+// Commands: None", which is a claim about *existence*, and
+// `COVERAGE_PHASE5.md` audits 2 of 6 areas.
 //
 // Where the gap is, at a glance (uncovered / in-scope, seeded 2026-09,
 // updated 2026-09 by #1279 which retired the text-object, operator-pending,
-// visual, movement, editing and `'<` rows below, and by #1162 which
-// backfilled all 33 CTRL-W rows — 26 now have a real oracle case (8 of those
-// tracked red in KNOWN_DEVIATIONS_WIN, not vacuously exempt) and the other 7
+// visual, movement, editing and `'<` rows below, by #1162 which backfilled
+// all 33 CTRL-W rows — 26 now have a real oracle case (8 of those tracked red
+// in KNOWN_DEVIATIONS_WIN, not vacuously exempt) and the other 7
 // (`H`/`J`/`K`/`L`/`T`/`e`/`E`/`d`) moved to the permanent
-// "Deliberate semantic divergence" heading below):
+// "Deliberate semantic divergence" heading below — and by #1282, which
+// backfilled `ga`/`g8`/`<C-g>` (in both their `other:` and `g:` doc rows) and
+// the 21 echo-area/message ex-commands plus 6 on-disk ones):
 //
-//     Core Vim ex commands       84/111  :w :q :bn :ls :marks :grep …
+//     Core Vim ex commands      105/111  :w :q :bn :ls :marks :grep …
 //     Window commands (CTRL-W)    7/33   H J K L T e/E d — all permanent
-//     g-commands                 19/50   gt gT gf gF ga g8 gx gR g@ g+ …
+//     g-commands                 21/50   gt gT gf gF gx gR g@ g+ …
 //                                        (`g-` left this list in #1156,
-//                                        `g0`/`gm`/`gM` in #1279)
+//                                        `g0`/`gm`/`gM` in #1279,
+//                                        `ga`/`g8` in #1282)
 //     Bracket commands           16/26   ]c [c ]d [d [m ]m [* ]* [# ]# …
-//     Normal — other             16/34   gt gT gf gF K ga g8 gx q: q/ q? …
+//     Normal — other             19/34   gt gT gf gF K gx q: q/ q? …
 //     z-commands                 10/28   zA zF zv zx zh zl zH zL ze zs
 //     Normal — search & marks     3/31   // /<CR> aliases, `{A-Z}, g' g`
 //     Insert mode                 2/23   CTRL-@, CTRL-G j/k
@@ -10557,13 +11654,7 @@ const COVERAGE_EXEMPT: &[&str] = &[
     // `COMMAND_PROBES` entry and an oracle case, and delete it.
     // ===========================================================================
 
-    // --- Normal Mode - Other (other) ---
-    "other:ga",
-    "other:g8",
-    "other:CTRL-G",
     // --- g-Commands (g) ---
-    "g:ga",
-    "g:g8",
     // `g:g-` was here until #1156: the new
     // `undo:g- crosses a branch abandoned by u then edit` case presses `g-`,
     // so the probe matches and the ratchet demands the entry be deleted.
@@ -10577,32 +11668,18 @@ const COVERAGE_EXEMPT: &[&str] = &[
     // is 35 cases total, 28 pass, 7 tracked red in KNOWN_DEVIATIONS_XFILE —
     // the 35th, "ex:tabmove N moves the current tab to a non-edge position",
     // was added in review to cover the general-N `:tabmove` arithmetic the
-    // original `:tabmove 0` case didn't reach);
-    // the rest of this family (quickfix, registers, etc.) is unrelated debt,
-    // still uncovered. (`ex::w`'s `Keys(":w")` probe is a loose needle that
-    // also matches ":windo" — retired here as an honest side effect of that
-    // needle, not because `:w` itself gained a dedicated case.)
-    "ex::write",
-    "ex::wa",
-    "ex::ls",
-    "ex::buffers",
-    "ex::read",
-    "ex::reg",
-    "ex::registers",
-    "ex::marks",
-    "ex::jumps",
-    "ex::digraphs",
-    "ex::changes",
-    "ex::history",
-    "ex::echo {text}",
-    "ex::pwd",
-    "ex::file",
-    "ex::=",
-    "ex::#",
-    "ex::number",
-    "ex::print",
-    "ex::saveas {file}",
-    "ex::update",
+    // original `:tabmove 0` case didn't reach); #1282 backfilled
+    // `other:ga`/`other:g8`/`other:CTRL-G`/`g:ga`/`g:g8` and the 21
+    // echo-area/message ex-commands (CASES_MESSAGE — 12 pass, 7 tracked red
+    // in KNOWN_DEVIATIONS_MESSAGE) plus the 6 on-disk ones (CASES_DISK, all
+    // 6 pass — `ex::w` already had a vacuous case via the `:windo` needle
+    // collision below, so it gained a real one too even though there was
+    // nothing to delete here);
+    // the rest of this family (quickfix, etc.) is unrelated debt, still
+    // uncovered. (`ex::w`'s `Keys(":w")` probe is a loose needle that also
+    // matches ":windo" — retired before #1282 as an honest side effect of
+    // that needle, not because `:w` itself had gained a dedicated case at
+    // the time.)
     "ex::copen",
     "ex::cclose",
     "ex::cn",
@@ -12390,10 +13467,11 @@ fn coverage_ratchet_is_bidirectional_against_the_real_corpus() {
     // case for it, so it is no longer in COVERAGE_EXEMPT at all and this
     // fixture would read "fixture drifted" (the assertion below) rather
     // than test anything. #1281 did the same to `other:gt` (its own
-    // previous victim, backfilled by CASES_XFILE) — `other:ga` is still
-    // plain uncovered debt (see the header comment's tally), so it stands
-    // in as the victim now.
-    let victim = "other:ga";
+    // previous victim, backfilled by CASES_XFILE), and #1282 did it again to
+    // `other:ga` (CASES_MESSAGE) — `ex::copen` is still plain uncovered
+    // quickfix debt (see the header comment's tally), so it stands in as the
+    // victim now.
+    let victim = "ex::copen";
     assert!(COVERAGE_EXEMPT.contains(&victim), "fixture drifted");
     let without: Vec<&str> = COVERAGE_EXEMPT
         .iter()
@@ -12408,7 +13486,7 @@ fn coverage_ratchet_is_bidirectional_against_the_real_corpus() {
 
     // Direction 2 — add a case for an exempt command, leave the entry alone.
     let mut plus = cases.clone();
-    plus.push(("other:ga shows character info", "ga"));
+    plus.push(("ex::copen opens the quickfix window", ":copen"));
     let improved = classify_coverage(&commands, COMMAND_PROBES, COVERAGE_EXEMPT, &plus);
     assert!(
         improved.newly_covered.iter().any(|u| u.starts_with(victim)),
@@ -15982,8 +17060,6 @@ const REGMARK_COVERAGE_EXEMPT: &[&str] = &[
     "\"#",
     "\"*",
     "\"+",
-    ":reg[isters]",
-    ":reg[isters] {arg}",
     ":di[splay]",
     ":di[splay] {arg}",
     ":[range]pu[t]!",
@@ -15999,7 +17075,6 @@ const REGMARK_COVERAGE_EXEMPT: &[&str] = &[
     ":[range]k{a-zA-Z'}",
     "'{0-9} and `{0-9}",
     "lowercase marks restored by undo/redo",
-    ":marks",
     ":marks {arg}",
     ":delm[arks]!",
     "']",
@@ -17832,20 +18907,16 @@ const EX_AUDIT: &[ExAudit] = &[
 /// requires a case that pins it, and a case that starts pinning one forces
 /// its entry to be deleted. Writing those cases is #1162.
 const EX_COVERAGE_EXEMPT: &[&str] = &[
-    ":#",
-    ":=",
     ":abc[lear]",
     ":b[uffer]",
     ":bn[ext]",
     ":bp[revious]",
-    ":buffers",
     ":cN[ext]",
     ":ccl[ose]",
     ":cd",
     ":cdo",
     ":cfd[o]",
     ":cfir[st]",
-    ":changes",
     ":cla[st]",
     ":cl[ist]",
     ":cm[ap]",
@@ -17864,18 +18935,14 @@ const EX_COVERAGE_EXEMPT: &[&str] = &[
     ":diffo[ff]",
     ":diffs[plit]",
     ":difft[his]",
-    ":dig[raphs]",
     ":di[splay]",
-    ":f[ile]",
     ":files",
     ":gr[ep]",
     ":h[elp]",
-    ":his[tory]",
     ":im[ap]",
     ":imapc[lear]",
     ":inorea[bbrev]",
     ":iu[nmap]",
-    ":ju[mps]",
     ":lN[ext]",
     ":lcl[ose]",
     ":ld[o]",
@@ -17888,23 +18955,18 @@ const EX_COVERAGE_EXEMPT: &[&str] = &[
     ":lne[xt]",
     ":lop[en]",
     ":lp[revious]",
-    ":ls",
     ":lv[imgrep]",
     ":lw[indow]",
     ":mak[e]",
     ":map",
     ":mapc[lear]",
-    ":marks",
     ":nmapc[lear]",
     ":no[remap]",
     ":norea[bbrev]",
-    ":nu[mber]",
     ":nun[map]",
     ":om[ap]",
     ":omapc[lear]",
     ":ou[nmap]",
-    ":p[rint]",
-    ":pw[d]",
     ":q[uit]",
     ":qa[ll]",
     ":reg[isters]",
@@ -17914,7 +18976,6 @@ const EX_COVERAGE_EXEMPT: &[&str] = &[
     ":te[rminal]",
     ":una[bbreviate]",
     ":unm[ap]",
-    ":up[date]",
     ":ve[rsion]",
     ":vim[grep]",
     ":vm[ap]",
@@ -17922,7 +18983,6 @@ const EX_COVERAGE_EXEMPT: &[&str] = &[
     ":vn[oremap]",
     ":vs[plit]",
     ":vu[nmap]",
-    ":w[rite]",
     ":wa[ll]",
     ":winc[md]",
     ":wq",
@@ -21051,7 +22111,7 @@ const NORMAL_AUDIT: &[NormAudit] = &[
             "alpha beta gamma|delta epsilon zeta|eta theta iota",
             (1, 1),
             "NORMAL",
-            "\"[No Name]\" line 1 of 3 --33%-- col 1",
+            "\"[No Name]\" 3 lines --33%--",
             1,
             1,
             "",
@@ -21059,8 +22119,9 @@ const NORMAL_AUDIT: &[NormAudit] = &[
         )),
         Some(Label("misc:C-g file info")),
         concat!(
-            "matches Vim's shape: prints name, line, percentage and column — ",
-            "recorded as `\"[No Name]\" line 1 of 3 --33%-- col 1`.",
+            "matches Neovim's default-'ruler' shape (#1282: 'ruler' is on by ",
+            "default, so CTRL-G omits the cursor position it would otherwise ",
+            "have shown) — recorded as `\"[No Name]\" 3 lines --33%--`.",
         ),
     ),
     na(

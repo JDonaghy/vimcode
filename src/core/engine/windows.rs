@@ -3290,6 +3290,7 @@ impl Engine {
     pub fn list_buffers(&self) -> String {
         let active = self.active_buffer_id();
         let alternate = self.buffer_manager.alternate_buffer;
+        let active_window = self.active_window_id();
 
         let mut lines = Vec::new();
         for (i, id) in self.buffer_manager.list().iter().enumerate() {
@@ -3300,10 +3301,36 @@ impl Engine {
             let dirty_flag = if state.dirty { "+" } else { " " };
             let name = state.display_name();
             let preview_flag = if state.preview { " [Preview]" } else { "" };
-            lines.push(format!(
-                "{:3} {}{}{} \"{}\"{}",
-                num, active_flag, alt_flag, dirty_flag, name, preview_flag
-            ));
+            // #1282: Neovim's `:ls`/`:buffers` appends `line N` (the cursor
+            // line of whichever window is showing this buffer) for every
+            // buffer that's currently in a window — verified against a live
+            // `nvim --headless -u NONE` `msg_show` event. Not shown for a
+            // buffer with no window at all. Prefer the active window's own
+            // cursor when it's showing this buffer (the common case, and
+            // what a single-window fixture always hits); otherwise fall
+            // back to the first window found displaying it.
+            let line_suffix = self
+                .windows
+                .get(&active_window)
+                .filter(|w| w.buffer_id == *id)
+                .or_else(|| self.windows.values().find(|w| w.buffer_id == *id))
+                .map(|w| format!("line {}", w.view.cursor.line + 1))
+                .unwrap_or_default();
+            lines.push(
+                format!(
+                    "{:3} {}{}{} \"{}\"{}{}{}",
+                    num,
+                    active_flag,
+                    alt_flag,
+                    dirty_flag,
+                    name,
+                    preview_flag,
+                    if line_suffix.is_empty() { "" } else { "  " },
+                    line_suffix,
+                )
+                .trim_end()
+                .to_string(),
+            );
         }
         lines.join("\n")
     }
