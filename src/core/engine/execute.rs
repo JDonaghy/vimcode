@@ -1994,19 +1994,23 @@ impl Engine {
             return EngineAction::None;
         }
 
-        // Handle :tabmove [N] — move current tab to position N (1-based, 0 = move to end)
+        // Handle :tabmove [N] — `:h :tabmove`: "Move the current tab page
+        // to after tab page N. Use 0 to make the current tab page the
+        // first one. Without N the current tab page is made the last one."
+        // #1281 finding: `:tabmove 0` used to be treated the same as bare
+        // `:tabmove` (both landed at the end) — Vim's own wording makes `0`
+        // and "no argument" opposite ends, not synonyms. `N` is a direct
+        // 0-based destination index (`:tabmove 0` → index 0 = first;
+        // `:tabmove 3` → right after the old tab 3 = index 3), no `n - 1`
+        // conversion needed.
         if cmd == "tabmove" || cmd.starts_with("tabmove ") {
             let arg = cmd.strip_prefix("tabmove").unwrap_or("").trim();
             let num_tabs = self.active_group().tabs.len();
             let current = self.active_group().active_tab;
             let dest = if arg.is_empty() {
-                num_tabs.saturating_sub(1) // move to end
+                num_tabs.saturating_sub(1) // no arg: move to end
             } else if let Ok(n) = arg.parse::<usize>() {
-                if n == 0 {
-                    num_tabs.saturating_sub(1) // 0 also means end
-                } else {
-                    (n - 1).min(num_tabs.saturating_sub(1)) // 1-based to 0-based
-                }
+                n.min(num_tabs.saturating_sub(1))
             } else {
                 self.message = "Usage: :tabmove [N]".to_string();
                 return EngineAction::None;
@@ -2099,10 +2103,18 @@ impl Engine {
             return self.execute_command("number");
         }
 
-        // Handle :windo {cmd}
+        // Handle :windo {cmd} — #1281 finding: this used to iterate
+        // `self.windows.keys()`, which is (a) every window in the *whole
+        // engine*, not just the current tabpage (`:h :windo` is explicitly
+        // tab-scoped), and (b) `HashMap` order, so which window is left
+        // active when the loop ends was nondeterministic across runs, not
+        // just wrong. `Tab::layout.window_ids()` is deterministic
+        // left-to-right/top-to-bottom layout order, matching Neovim's own
+        // window-number order — and lands on the same "last one wins"
+        // window Neovim does.
         if let Some(subcmd) = cmd.strip_prefix("windo ") {
             let subcmd = subcmd.trim().to_string();
-            let win_ids: Vec<WindowId> = self.windows.keys().copied().collect();
+            let win_ids: Vec<WindowId> = self.active_tab().layout.window_ids();
             for wid in win_ids {
                 self.active_tab_mut().active_window = wid;
                 self.execute_command(&subcmd);

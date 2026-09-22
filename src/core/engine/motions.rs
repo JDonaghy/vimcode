@@ -447,6 +447,49 @@ impl Engine {
         last
     }
 
+    /// Resolve global (`A`-`Z`) mark `ch` for a `` ` ``/`g'`/`` g` `` jump,
+    /// switching the active window to the mark's file first when it names a
+    /// *different* file than the one currently open. Uppercase marks are
+    /// Vim's cross-*file* marks (`:h mark-motions`) — before #1281 this
+    /// never happened: every call site destructured `global_marks`' file
+    /// component with `_` and only ever moved the cursor within whatever
+    /// buffer was already active, so `` `A ``/`g'A`/`` g`A `` were silent
+    /// no-ops across files (finding, not by design — nothing in `:h` or
+    /// `VIM_COMPATIBILITY.md` describes that as intentional).
+    ///
+    /// `record_jump` mirrors `open_file_with_mode`'s own jump recording:
+    /// `true` for `` ` `` (which appends to the jumplist — the file switch
+    /// itself becomes that jump, so callers must NOT also call
+    /// `record_jump_from`/`push_jump_location` when this returns
+    /// `Some((_, true))`); `false` for `g'`/`` g` ``, documented to leave the
+    /// jumplist untouched (`open_file_for_jump_recovery` skips the push).
+    ///
+    /// Returns `((line, col), switched_file)`, `line`/`col` already clamped
+    /// to whichever buffer ends up active, or `None` when the mark isn't set
+    /// or its file could not be opened.
+    pub(crate) fn resolve_global_mark(
+        &mut self,
+        ch: char,
+        record_jump: bool,
+    ) -> Option<((usize, usize), bool)> {
+        let (file, line, col) = self.global_marks.get(&ch)?.clone();
+        let mut switched = false;
+        if let Some(path) = &file {
+            let same_file = self.active_buffer_state().file_path.as_deref() == Some(path.as_path());
+            if !same_file {
+                let opened = if record_jump {
+                    self.open_file_with_mode(path, super::OpenMode::Permanent)
+                } else {
+                    self.open_file_for_jump_recovery(path)
+                };
+                opened.ok()?;
+                switched = true;
+            }
+        }
+        let max_line = self.buffer().len_lines().saturating_sub(1);
+        Some(((line.min(max_line), col), switched))
+    }
+
     // --- Sentence motions ---
 
     pub(crate) fn move_sentence_forward(&mut self) {

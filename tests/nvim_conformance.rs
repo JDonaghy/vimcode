@@ -2390,12 +2390,29 @@ fn win_snapshot_from_vimcode(
             } else {
                 std::collections::HashMap::new()
             };
+            // #1281 finding: "current window" is a single, process-global
+            // notion in both Neovim (`nvim_get_current_win()`, which the
+            // oracle's own snapshot compares every leaf against — see
+            // `WIN_SNAPSHOT_LUA`) and vimcode (`Tab::active_window` is only
+            // meaningful *while that tab is the focused one* — switching
+            // tabs doesn't clear it, it's what a `gt`/`gT` back into that
+            // tab restores). Comparing every tab's `active_window` against
+            // itself — the bug this WindowId(usize::MAX) sentinel fixes —
+            // marked EVERY tab's own remembered window "current" instead of
+            // only the actually-focused tab's, so a background tab's window
+            // always disagreed with Neovim (which correctly reports `false`
+            // for every window outside the tab you're actually on).
+            let current_win = if i == group.active_tab {
+                tab.active_window
+            } else {
+                WindowId(usize::MAX)
+            };
             WinTab {
                 current: i == group.active_tab,
                 layout: win_node_from_vimcode(
                     &tab.layout,
                     engine,
-                    tab.active_window,
+                    current_win,
                     paths,
                     &rects,
                     check_size,
@@ -2409,17 +2426,42 @@ fn run_win_case(case: &WinCase) -> Outcome {
     let (dir, main_path, extra_paths) = write_win_fixture(case);
     let paths = FixturePaths {
         main: main_path.clone(),
-        extra: extra_paths,
+        extra: extra_paths.clone(),
     };
 
-    let nvim_json =
-        match run_win_in_neovim(&main_path, case.start_line, case.start_col, case.keys, &dir) {
-            Some(v) => v,
-            None => {
-                let _ = std::fs::remove_dir_all(&dir);
-                return Outcome::NvimBroke;
-            }
-        };
+    // #1281: `{F0}`/`{F1}`/... substitution (same mechanism `resolve_multi_
+    // keys` uses for CASES_MULTI_JUMP/CASES_MULTI_JUMPS_LIST), not a bare
+    // relative filename like `:e b.txt<CR>` — `Engine::cwd` is pure
+    // bookkeeping, unrelated to `Path::canonicalize`'s only notion of
+    // "current directory" (the *process's* CWD), so a relative filename
+    // typed into `:e`/`:split`/`:tabedit` would only resolve correctly by
+    // coincidence. An earlier version of this fix instead resolved relative
+    // ex-command paths against `Engine::cwd` inside the engine itself
+    // (`open_file_with_mode_impl` et al) — reverted: besides needing the
+    // process CWD to move too (a real hazard in a multithreaded test binary,
+    // see `src/test_cwd.rs`), it broke `test_lsp_flush_clears_diagnostics_
+    // by_canonical_path`'s deliberate #208 behaviour — a buffer's
+    // `file_path` keeps exactly the (possibly relative) string the user
+    // opened it with, not a resolved absolute one. Absolute paths in the
+    // corpus itself sidestep the question instead of relying on either
+    // side's CWD, and touch no engine code.
+    let mut all_paths = vec![main_path.clone()];
+    all_paths.extend(extra_paths.iter().cloned());
+    let resolved_keys = resolve_multi_keys(case.keys, &all_paths);
+
+    let nvim_json = match run_win_in_neovim(
+        &main_path,
+        case.start_line,
+        case.start_col,
+        &resolved_keys,
+        &dir,
+    ) {
+        Some(v) => v,
+        None => {
+            let _ = std::fs::remove_dir_all(&dir);
+            return Outcome::NvimBroke;
+        }
+    };
     let nvim_tabs = win_snapshot_from_json(&nvim_json, &paths, case.check_size);
 
     let mut engine = engine_with("");
@@ -2430,7 +2472,7 @@ fn run_win_case(case: &WinCase) -> Outcome {
     engine.view_mut().cursor.line = case.start_line.saturating_sub(1);
     engine.view_mut().cursor.col = case.start_col.saturating_sub(1);
     engine.ensure_cursor_visible();
-    send_keys_multi(&mut engine, case.keys);
+    send_keys_multi(&mut engine, &resolved_keys);
     let vc_tabs = win_snapshot_from_vimcode(&engine, &paths, case.check_size);
 
     let _ = std::fs::remove_dir_all(&dir);
@@ -2440,7 +2482,7 @@ fn run_win_case(case: &WinCase) -> Outcome {
     }
     Outcome::Fail(format!(
         "[{}] keys={:?} start=({},{})\n  nvim tabs:\n{:#?}\n  vimcode tabs:\n{:#?}",
-        case.label, case.keys, case.start_line, case.start_col, nvim_tabs, vc_tabs
+        case.label, resolved_keys, case.start_line, case.start_col, nvim_tabs, vc_tabs
     ))
 }
 
@@ -8175,6 +8217,519 @@ const CASES_WIN: &[WinCase] = &[
     ),
 ];
 
+// ─────── J. cross-file/cross-tab jumps and buffer/tab/window ex commands (#1281) ───────
+//
+// The 40 rows #1162 deliberately left for this issue: `gf`/`gt`/`CTRL-^`/
+// `g<Tab>`, the cross-file marks (`` `{A-Z} ``, `g'`, `` g` ``), and the
+// buffer/tab/window ex commands. Same [`WinCase`]/[`run_win_case`] harness as
+// [`CASES_WIN`] — nothing new to build, per the issue's own instruction not
+// to start a second harness. Kept as a separate array (not appended to
+// `CASES_WIN`) purely so the "33 CTRL-W rows" and "40 cross-file rows" stay
+// two countable units instead of one blurred one; [`run_win_case`] and
+// [`KNOWN_DEVIATIONS_XFILE`] work identically either way.
+const XFILE_MAIN: &[&str] = &["main one", "main two", "main three"];
+const XFILE_B: &[&str] = &["b one", "b two", "b three"];
+const XFILE_C: &[&str] = &["c one", "c two", "c three"];
+
+const CASES_XFILE: &[WinCase] = &[
+    // --- Cross-file marks (search:, g:) ---
+    wc_files(
+        "mark:`A jumps to the exact position across files",
+        XFILE_MAIN,
+        &[("b.txt", &["b one", "b two here", "b three"])],
+        1,
+        1,
+        ":e {F1}<CR>2G4lmA:e {F0}<CR>`A",
+    ),
+    // First-non-blank, not the exact column the mark was set at — proves
+    // both the cross-file switch and #1281's `first_non_blank_col` fix
+    // (`g'` used to hardcode column 0, see KNOWN_DEVIATIONS_XFILE history
+    // in the commit that landed this).
+    wc_files(
+        "mark:g' jumps to the first non-blank across files",
+        XFILE_MAIN,
+        &[("b.txt", &["   indented b one", "b two", "b three"])],
+        1,
+        1,
+        ":e {F1}<CR>1G1lmA:e {F0}<CR>g'A",
+    ),
+    wc_files(
+        "mark:g` jumps to the exact position across files",
+        XFILE_MAIN,
+        &[("b.txt", &["b one", "b two here", "b three"])],
+        1,
+        1,
+        ":e {F1}<CR>2G3lmA:e {F0}<CR>g`A",
+    ),
+    // --- Tab navigation (other:, g:) ---
+    wc_files(
+        "win:gt wraps from the last tab to the first",
+        XFILE_MAIN,
+        &[("b.txt", XFILE_B)],
+        1,
+        1,
+        ":tabnew {F1}<CR>gt",
+    ),
+    wc_files(
+        "win:gT wraps from the first tab to the last",
+        XFILE_MAIN,
+        &[("b.txt", XFILE_B), ("c.txt", XFILE_C)],
+        1,
+        1,
+        ":tabnew {F1}<CR>:tabnew {F2}<CR>gT",
+    ),
+    wc_files(
+        "win:g<Tab> returns to the last-accessed tab",
+        XFILE_MAIN,
+        &[("b.txt", XFILE_B), ("c.txt", XFILE_C)],
+        1,
+        1,
+        ":tabnew {F1}<CR>:tabnew {F2}<CR>1gtg<Tab>",
+    ),
+    // --- gf/gF (other:, g:) ---
+    wc_files(
+        "win:gf opens the file path under the cursor",
+        &["see b.txt for details", "second line"],
+        &[("b.txt", XFILE_B)],
+        1,
+        5,
+        "gf",
+    ),
+    wc_files(
+        "win:gF opens file:line under the cursor and jumps to the line",
+        &["see b.txt:2 for details", "second line"],
+        &[("b.txt", XFILE_B)],
+        1,
+        5,
+        "gF",
+    ),
+    // --- Alternate file (other:) ---
+    wc_files(
+        "win:CTRL-^ toggles the alternate file",
+        XFILE_MAIN,
+        &[("b.txt", XFILE_B)],
+        1,
+        1,
+        ":e {F1}<CR><C-^>",
+    ),
+    // --- Command-line window (other:) — #1162-style finding, not a pass:
+    // Vim opens this in the current tab as a small split (`:h cmdwin`);
+    // vimcode's `open_cmdline_window` opens it in a brand-new TAB instead
+    // (already documented as a Partial row in NORM_AUDIT/`na("q:", ...)`
+    // above). See KNOWN_DEVIATIONS_XFILE.
+    wc(
+        "win:q: opens the command-line window",
+        XFILE_MAIN,
+        1,
+        1,
+        "q:",
+    ),
+    wc(
+        "win:q/ opens the search-history command-line window",
+        XFILE_MAIN,
+        1,
+        1,
+        "q/",
+    ),
+    wc(
+        "win:q? opens the reverse-search-history command-line window",
+        XFILE_MAIN,
+        1,
+        1,
+        "q?",
+    ),
+    // --- Core buffer ex commands (ex::) ---
+    wc_files(
+        "ex:edit switches to a different file in the current window",
+        XFILE_MAIN,
+        &[("b.txt", XFILE_B)],
+        1,
+        1,
+        ":edit {F1}<CR>",
+    ),
+    wc_files(
+        "ex:bn cycles forward through the buffer list",
+        XFILE_MAIN,
+        &[("b.txt", XFILE_B)],
+        1,
+        1,
+        ":e {F1}<CR>:bn<CR>",
+    ),
+    wc_files(
+        "ex:bp cycles backward through the buffer list",
+        XFILE_MAIN,
+        &[("b.txt", XFILE_B)],
+        1,
+        1,
+        ":e {F1}<CR>:bp<CR>",
+    ),
+    wc_files(
+        "ex:b# returns to the alternate buffer",
+        XFILE_MAIN,
+        &[("b.txt", XFILE_B)],
+        1,
+        1,
+        ":e {F1}<CR>:b#<CR>",
+    ),
+    // #1281 finding: `open_file_with_mode` always creates a brand-new
+    // buffer, even when the current one is still the pristine unnamed
+    // scratch buffer Engine::new() seeds — Neovim's `:edit` reuses that
+    // buffer's number instead. So vimcode's `main.txt` is buffer 2, not
+    // buffer 1 like Neovim's, and `:b 1` lands on two different files. See
+    // KNOWN_DEVIATIONS_XFILE.
+    wc_files(
+        "ex:b by number returns to buffer 1",
+        XFILE_MAIN,
+        &[("b.txt", XFILE_B)],
+        1,
+        1,
+        ":e {F1}<CR>:b 1<CR>",
+    ),
+    wc_files(
+        "ex:bd deletes the current buffer and falls back to the previous one",
+        XFILE_MAIN,
+        &[("b.txt", XFILE_B)],
+        1,
+        1,
+        ":e {F1}<CR>:bd<CR>",
+    ),
+    wc_files(
+        "ex:bdelete deletes the current buffer and falls back to the previous one",
+        XFILE_MAIN,
+        &[("b.txt", XFILE_B)],
+        1,
+        1,
+        ":e {F1}<CR>:bdelete<CR>",
+    ),
+    // --- Split/close/only ex commands (ex::) ---
+    wc_files(
+        "ex:sp opens a file in a new horizontal split",
+        XFILE_MAIN,
+        &[("b.txt", XFILE_B)],
+        1,
+        1,
+        ":sp {F1}<CR>",
+    ),
+    wc_files(
+        "ex:vs opens a file in a new vertical split",
+        XFILE_MAIN,
+        &[("b.txt", XFILE_B)],
+        1,
+        1,
+        ":vs {F1}<CR>",
+    ),
+    wc(
+        "ex:close closes the current split, leaving the other window",
+        XFILE_MAIN,
+        1,
+        1,
+        ":sp<CR>:close<CR>",
+    ),
+    wc(
+        "ex:only closes every window but the current one",
+        XFILE_MAIN,
+        1,
+        1,
+        ":sp<CR>:vs<CR>:only<CR>",
+    ),
+    wc(
+        "ex:new opens a scratch buffer in a new horizontal split",
+        XFILE_MAIN,
+        1,
+        1,
+        ":new<CR>",
+    ),
+    wc(
+        "ex:vnew opens a scratch buffer in a new vertical split",
+        XFILE_MAIN,
+        1,
+        1,
+        ":vnew<CR>",
+    ),
+    // --- Tab ex commands (ex::) ---
+    wc_files(
+        "ex:tabe opens a file in a new tab",
+        XFILE_MAIN,
+        &[("b.txt", XFILE_B)],
+        1,
+        1,
+        ":tabe {F1}<CR>",
+    ),
+    wc_files(
+        "ex:tabclose closes the current tab, returning to the original",
+        XFILE_MAIN,
+        &[("b.txt", XFILE_B)],
+        1,
+        1,
+        ":tabe {F1}<CR>:tabclose<CR>",
+    ),
+    wc_files(
+        "ex:tabnext wraps from the last tab to the first",
+        XFILE_MAIN,
+        &[("b.txt", XFILE_B)],
+        1,
+        1,
+        ":tabe {F1}<CR>:tabnext<CR>",
+    ),
+    wc_files(
+        "ex:tabprevious wraps from the last tab to the first",
+        XFILE_MAIN,
+        &[("b.txt", XFILE_B)],
+        1,
+        1,
+        ":tabe {F1}<CR>:tabprevious<CR>",
+    ),
+    wc_files(
+        "ex:tabmove moves the current tab to position 0",
+        XFILE_MAIN,
+        &[("b.txt", XFILE_B)],
+        1,
+        1,
+        ":tabe {F1}<CR>:tabmove 0<CR>",
+    ),
+    // --- {win,buf,tab}do (ex::) — #1281's own callout: bufdo in particular
+    // "runs a command in every buffer and will surface any ordering
+    // difference immediately." It did: `:windo` iterated
+    // `self.windows.keys()` — every window in the whole engine (not just
+    // the current tabpage `:h :windo` scopes to), in `HashMap` order, so
+    // which window was left active after the loop was both wrong *and*
+    // nondeterministic across runs. Fixed to `Tab::layout.window_ids()`
+    // (tab-scoped, deterministic layout order) — see the fix commit for the
+    // full diagnosis. `normal! G` (last line) is a commutative edit
+    // regardless, so the *content* comparison was never what exposed this;
+    // only "which window/buffer/tab is left current" could disagree.
+    wc(
+        "ex:windo runs a command in every window of the current tab",
+        XFILE_MAIN,
+        1,
+        1,
+        ":sp<CR>:windo normal! G<CR>",
+    ),
+    wc_files(
+        "ex:bufdo runs a command in every listed buffer",
+        XFILE_MAIN,
+        &[("b.txt", XFILE_B)],
+        1,
+        1,
+        ":e {F1}<CR>:bufdo normal! G<CR>",
+    ),
+    wc_files(
+        "ex:tabdo runs a command in every tab",
+        XFILE_MAIN,
+        &[("b.txt", XFILE_B)],
+        1,
+        1,
+        ":tabe {F1}<CR>:tabdo normal! G<CR>",
+    ),
+    wc_files(
+        "ex:b by name switches by partial filename match",
+        XFILE_MAIN,
+        &[("b.txt", XFILE_B), ("c.txt", XFILE_C)],
+        1,
+        1,
+        ":e {F1}<CR>:e {F2}<CR>:b b.txt<CR>",
+    ),
+];
+
+// KNOWN_DEVIATIONS_XFILE — same bidirectional-gate idiom as
+// KNOWN_DEVIATIONS_WIN above, applied to CASES_XFILE (#1281). May only ever
+// SHRINK.
+//
+// ## Follow-up issue status (read before editing any entry below)
+//
+// Same policy as KNOWN_DEVIATIONS_WIN: no `gh` access from a worker session,
+// so nothing here is "filed as #NNNN" yet. Each entry names the exact gap so
+// the coordinator can file it verbatim.
+//
+//   1. "win:q: opens the command-line window" / "win:q/ ..." / "win:q? ..."
+//      — title: "cmdwin: open the command-line window as a split in the
+//      current tab, not a new tab". `Engine::open_cmdline_window`
+//      (src/core/engine/ext_panel.rs) pushes a whole new `Tab` for the
+//      scratch history buffer; Neovim opens a small horizontal split in the
+//      *current* tabpage (`:h cmdwin`). Already documented as a Partial row
+//      in this file's NORM_AUDIT table (`na("q:", ...)` etc.) — this is that
+//      same gap, now with a live oracle case proving it. Fix needs a new
+//      window (not tab) pushed into the active tab's layout, plus
+//      `cmdline_window_execute`'s `self.close_tab()` changed to close the
+//      window it actually opened.
+//   2. "ex:b by number returns to buffer 1" / "ex:bn cycles forward
+//      through the buffer list" / "ex:bd ..." / "ex:bdelete ..." — title:
+//      "buffers: :edit should reuse a still-pristine unnamed buffer instead
+//      of always creating a new one". `Engine::open_file_with_mode_impl`
+//      (src/core/engine/buffers.rs) always calls
+//      `self.buffer_manager.open_file(path)`, which always allocates a new
+//      `BufferId` — even when the buffer being left is the empty, unnamed,
+//      unmodified scratch buffer `Engine::new()` seeds. Neovim's `:edit`
+//      renames/reuses that buffer instead of leaving it behind as a phantom
+//      entry, so every fixture in this harness (and any real vimcode
+//      session) is off by one buffer number relative to Neovim from the
+//      first `:edit` onward. `ex:bp`/`ex:b#`/`ex:b by name` still pass
+//      despite the phantom entry — they're relative-to-current or
+//      name-based, not absolute-number-based — but `:bn` (wraps to the
+//      *lowest*-numbered buffer, which is the phantom, not Neovim's
+//      buffer 1), `:bd`/`:bdelete` (same wrong fallback once the current
+//      buffer is gone), and `:b {N}` (numbers are off by one directly) all
+//      land on the phantom buffer instead of `main.txt`. Fix belongs in
+//      `open_file_with_mode_impl`, guarded by the same
+//      `is_pristine_scratch_buffer` check `push_jump_location` already uses
+//      (`src/core/engine/motions.rs`) — reuse the pristine buffer's
+//      `BufferId` (and switch its content/name in place) instead of
+//      creating a new one. Broad blast radius (every `:b {N}`, `:bfirst`,
+//      `:blast`, `:ls`/`:buffers` numbering) is exactly why this is left as
+//      a finding rather than attempted inline here.
+//
+// Neither was attempted in #1281 itself for the same reason #1162 gave for
+// its own 5: each is a bigger, more failure-prone change (a real split-based
+// command-line window; renumbering every buffer-open call site) than
+// "backfill the 40 rows" should carry in the same slice.
+// ---------------------------------------------------------------------------
+
+const KNOWN_DEVIATIONS_XFILE: &[&str] = &[
+    // Follow-up #1 above ("cmdwin as a split, not a new tab") — not yet filed.
+    "win:q: opens the command-line window",
+    "win:q/ opens the search-history command-line window",
+    "win:q? opens the reverse-search-history command-line window",
+    // Follow-up #2 above ("reuse the pristine scratch buffer") — not yet
+    // filed.
+    "ex:bn cycles forward through the buffer list",
+    "ex:b by number returns to buffer 1",
+    "ex:bd deletes the current buffer and falls back to the previous one",
+    "ex:bdelete deletes the current buffer and falls back to the previous one",
+];
+
+#[test]
+fn nvim_conformance_cross_file_ex() {
+    let version_output = std::process::Command::new("nvim")
+        .arg("--version")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned());
+    let resolved = resolve_on_path("nvim");
+    let resolved_display = resolved
+        .as_deref()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "nvim (resolved by PATH lookup)".to_string());
+    let probe = version_output
+        .as_deref()
+        .map(|out| (resolved_display.as_str(), out));
+
+    let allow_skip = std::env::var_os(ALLOW_SKIP_VAR).is_some();
+    let nvim_version = match preflight(probe, allow_skip) {
+        Preflight::Refuse { reason } => panic!("\n\n{reason}\n"),
+        Preflight::Skip { reason } => {
+            eprintln!("SKIP ({ALLOW_SKIP_VAR} set): {reason}");
+            return;
+        }
+        Preflight::Run { banner, version } => {
+            print_unmissable(&banner);
+            Some(version)
+        }
+    };
+
+    let filter = std::env::var("PROBE_FILTER").ok();
+    let verbose = std::env::var_os("PROBE_VERBOSE").is_some();
+
+    let mut outcomes: Vec<(&str, bool)> = Vec::new();
+    let mut detail: std::collections::HashMap<&str, String> = std::collections::HashMap::new();
+    let mut nvim_broke: Vec<&str> = Vec::new();
+
+    for case in CASES_XFILE
+        .iter()
+        .filter(|c| filter.as_deref().is_none_or(|f| c.label.contains(f)))
+    {
+        match run_win_case(case) {
+            Outcome::NvimBroke => nvim_broke.push(case.label),
+            Outcome::Pass => {
+                outcomes.push((case.label, true));
+                if verbose {
+                    println!("PASS [{}]", case.label);
+                }
+            }
+            Outcome::Fail(msg) => {
+                outcomes.push((case.label, false));
+                if verbose {
+                    println!("FAIL {msg}");
+                }
+                detail.insert(case.label, msg);
+            }
+        }
+    }
+
+    println!("\n=== Neovim Conformance Results: cross-file/buffer/tab ex commands (#1281) ===");
+    println!(
+        "cases run: {}  pass: {}  known-fail: {}",
+        outcomes.len(),
+        outcomes.iter().filter(|(_, p)| *p).count(),
+        outcomes
+            .iter()
+            .filter(|(l, p)| !*p && KNOWN_DEVIATIONS_XFILE.contains(l))
+            .count(),
+    );
+    if !nvim_broke.is_empty() {
+        println!(
+            "\nnvim execution failed for {} case(s): {:?}",
+            nvim_broke.len(),
+            nvim_broke
+        );
+    }
+
+    let all_labels: Vec<&str> = CASES_XFILE.iter().map(|c| c.label).collect();
+    let mut verdict = classify(
+        &outcomes,
+        KNOWN_DEVIATIONS_XFILE,
+        filter.is_none().then_some(all_labels.as_slice()),
+    );
+
+    if !verdict.fixed.is_empty() && !fixes_are_enforced(nvim_version) {
+        println!(
+            "\nNOTE: {} KNOWN_DEVIATIONS_XFILE entr(y/ies) pass against this run's \
+             Neovim but the list was captured against {}.{}.x, so this is oracle-version \
+             skew, not a landed fix — do NOT delete them. Not failing the run:\n{}",
+            verdict.fixed.len(),
+            DEVIATIONS_ORACLE.0,
+            DEVIATIONS_ORACLE.1,
+            bullet_list(&verdict.fixed)
+        );
+        verdict.fixed.clear();
+    }
+
+    if verdict.is_clean() {
+        return;
+    }
+
+    let mut problems: Vec<String> = Vec::new();
+    if !verdict.stale.is_empty() {
+        problems.push(format!(
+            "{} KNOWN_DEVIATIONS_XFILE entr(y/ies) match no case label — delete them:\n{}",
+            verdict.stale.len(),
+            bullet_list(&verdict.stale)
+        ));
+    }
+    if !verdict.regressions.is_empty() {
+        problems.push(format!(
+            "{} cross-file/buffer/tab REGRESSION(S) — cases not in \
+             KNOWN_DEVIATIONS_XFILE that do not match Neovim:\n\n{}",
+            verdict.regressions.len(),
+            verdict
+                .regressions
+                .iter()
+                .map(|l| detail.get(l).cloned().unwrap_or_else(|| (*l).to_string()))
+                .collect::<Vec<_>>()
+                .join("\n\n")
+        ));
+    }
+    if !verdict.fixed.is_empty() {
+        problems.push(format!(
+            "{} case(s) listed in KNOWN_DEVIATIONS_XFILE now PASS. \
+             Good — delete these entries so the list keeps shrinking:\n{}",
+            verdict.fixed.len(),
+            bullet_list(&verdict.fixed)
+        ));
+    }
+    panic!("\n\n{}\n", problems.join("\n\n"));
+}
+
 // ---------------------------------------------------------------------------
 // Categories — the runner flattens these; the split is for editability only.
 // ---------------------------------------------------------------------------
@@ -9025,6 +9580,7 @@ fn all_corpus_cases() -> Vec<(&'static str, &'static str)> {
     out.extend(CASES_MULTI_JUMP.iter().map(|c| (c.label, c.keys)));
     out.extend(CASES_MULTI_JUMPS_LIST.iter().map(|c| (c.label, c.keys)));
     out.extend(CASES_WIN.iter().map(|c| (c.label, c.keys)));
+    out.extend(CASES_XFILE.iter().map(|c| (c.label, c.keys)));
     out
 }
 
@@ -9983,64 +10539,32 @@ const COVERAGE_EXEMPT: &[&str] = &[
     // `COMMAND_PROBES` entry and an oracle case, and delete it.
     // ===========================================================================
 
-    // --- Normal Mode - Search & Marks (search) ---
-    "search:`{A-Z}",
-    "search:g'",
-    "search:g`",
     // --- Normal Mode - Other (other) ---
-    "other:gt",
-    "other:gT",
-    "other:gf",
-    "other:gF",
     "other:ga",
     "other:g8",
-    "other:CTRL-^",
     "other:CTRL-G",
-    "other:q:",
-    "other:q/",
-    "other:q?",
     // --- g-Commands (g) ---
-    "g:gf",
-    "g:gF",
-    "g:gt",
-    "g:gT",
-    "g:g<Tab>",
     "g:ga",
     "g:g8",
     // `g:g-` was here until #1156: the new
     // `undo:g- crosses a branch abandoned by u then edit` case presses `g-`,
     // so the probe matches and the ratchet demands the entry be deleted.
     // That is the list shrinking as designed — do not re-add it.
-    "g:g'",
-    "g:g`",
     // --- Window Commands (CTRL-W) (win) --- #1162 backfilled all 33: 26 now
     // have a real oracle case (CASES_WIN — 18 pass, 8 tracked red in
     // KNOWN_DEVIATIONS_WIN), and the other 7 (H/J/K/L/T/e/E/d) moved to the
     // "Deliberate semantic divergence" permanent heading above.
-    // --- Core Vim Ex Commands (ex) ---
-    "ex::w",
+    // --- Core Vim Ex Commands (ex) --- #1281 backfilled the 22 buffer/tab/
+    // window rows below, plus 18 more (gf/gt/CTRL-^/marks/etc. — CASES_XFILE
+    // is 34 cases total, 27 pass, 7 tracked red in KNOWN_DEVIATIONS_XFILE);
+    // the rest of this family (quickfix, registers, etc.) is unrelated debt,
+    // still uncovered. (`ex::w`'s `Keys(":w")` probe is a loose needle that
+    // also matches ":windo" — retired here as an honest side effect of that
+    // needle, not because `:w` itself gained a dedicated case.)
     "ex::write",
     "ex::wa",
-    "ex::edit",
-    "ex::bn",
-    "ex::bp",
-    "ex::b#",
-    "ex::b {N}",
-    "ex::bd",
-    "ex::bdelete",
     "ex::ls",
     "ex::buffers",
-    "ex::sp",
-    "ex::vs",
-    "ex::close",
-    "ex::only",
-    "ex::new",
-    "ex::vnew",
-    "ex::tabe",
-    "ex::tabclose",
-    "ex::tabnext",
-    "ex::tabprevious",
-    "ex::tabmove",
     "ex::read",
     "ex::reg",
     "ex::registers",
@@ -10058,9 +10582,6 @@ const COVERAGE_EXEMPT: &[&str] = &[
     "ex::print",
     "ex::saveas {file}",
     "ex::update",
-    "ex::windo {cmd}",
-    "ex::bufdo {cmd}",
-    "ex::tabdo {cmd}",
     "ex::copen",
     "ex::cclose",
     "ex::cn",
@@ -10087,7 +10608,6 @@ const COVERAGE_EXEMPT: &[&str] = &[
     "ex::llist",
     "ex::ldo",
     "ex::lfdo",
-    "ex::b {name}",
 ];
 
 // ---------------------------------------------------------------------------
@@ -11848,9 +12368,11 @@ fn coverage_ratchet_is_bidirectional_against_the_real_corpus() {
     // entry the ratchet is meant to force out — CASES_WIN backfilled a real
     // case for it, so it is no longer in COVERAGE_EXEMPT at all and this
     // fixture would read "fixture drifted" (the assertion below) rather
-    // than test anything. `other:gt` is still plain uncovered debt (see the
-    // header comment's tally), so it stands in as the victim now.
-    let victim = "other:gt";
+    // than test anything. #1281 did the same to `other:gt` (its own
+    // previous victim, backfilled by CASES_XFILE) — `other:ga` is still
+    // plain uncovered debt (see the header comment's tally), so it stands
+    // in as the victim now.
+    let victim = "other:ga";
     assert!(COVERAGE_EXEMPT.contains(&victim), "fixture drifted");
     let without: Vec<&str> = COVERAGE_EXEMPT
         .iter()
@@ -11865,7 +12387,7 @@ fn coverage_ratchet_is_bidirectional_against_the_real_corpus() {
 
     // Direction 2 — add a case for an exempt command, leave the entry alone.
     let mut plus = cases.clone();
-    plus.push(("other:gt jumps to the next tab", "gt"));
+    plus.push(("other:ga shows character info", "ga"));
     let improved = classify_coverage(&commands, COMMAND_PROBES, COVERAGE_EXEMPT, &plus);
     assert!(
         improved.newly_covered.iter().any(|u| u.starts_with(victim)),
@@ -14730,13 +15252,13 @@ const REGMARK_AUDIT: &[RegMarkAudit] = &[
             (2, 5),
             "maggg'a",
             "a|    bcd|e",
-            (2, 1),
+            (2, 5),
             "",
         )),
         Some(Label("mark:g'")),
-        "keeps the jumplist untouched (correct), but lands on COLUMN 0 instead of \
-        the first non-blank `'{mark}` uses, and accepts only a-zA-Z — Vim's \
-        `` g`\" `` / `g'.` take any mark",
+        "keeps the jumplist untouched, and (#1281) lands on the first non-blank \
+        like `'{mark}` does — but accepts only a-zA-Z, where Vim's `` g`\" `` / \
+        `g'.` take any mark",
     ),
     rm(
         Marks,
@@ -15454,11 +15976,8 @@ const REGMARK_COVERAGE_EXEMPT: &[&str] = &[
     "m[ and m]",
     "m< and m>",
     ":[range]k{a-zA-Z'}",
-    "`{A-Z}",
     "'{0-9} and `{0-9}",
     "lowercase marks restored by undo/redo",
-    "g'{mark}",
-    "g`{mark}",
     ":marks",
     ":marks {arg}",
     ":delm[arks]!",
@@ -17296,10 +17815,8 @@ const EX_COVERAGE_EXEMPT: &[&str] = &[
     ":=",
     ":abc[lear]",
     ":b[uffer]",
-    ":bd[elete]",
     ":bn[ext]",
     ":bp[revious]",
-    ":bufd[o]",
     ":buffers",
     ":cN[ext]",
     ":ccl[ose]",
@@ -17310,7 +17827,6 @@ const EX_COVERAGE_EXEMPT: &[&str] = &[
     ":changes",
     ":cla[st]",
     ":cl[ist]",
-    ":clo[se]",
     ":cm[ap]",
     ":cmapc[lear]",
     ":cn[ext]",
@@ -17329,7 +17845,6 @@ const EX_COVERAGE_EXEMPT: &[&str] = &[
     ":difft[his]",
     ":dig[raphs]",
     ":di[splay]",
-    ":e[dit]",
     ":f[ile]",
     ":files",
     ":gr[ep]",
@@ -17359,7 +17874,6 @@ const EX_COVERAGE_EXEMPT: &[&str] = &[
     ":map",
     ":mapc[lear]",
     ":marks",
-    ":new",
     ":nmapc[lear]",
     ":no[remap]",
     ":norea[bbrev]",
@@ -17367,7 +17881,6 @@ const EX_COVERAGE_EXEMPT: &[&str] = &[
     ":nun[map]",
     ":om[ap]",
     ":omapc[lear]",
-    ":on[ly]",
     ":ou[nmap]",
     ":p[rint]",
     ":pw[d]",
@@ -17376,12 +17889,6 @@ const EX_COVERAGE_EXEMPT: &[&str] = &[
     ":reg[isters]",
     ":sav[eas]",
     ":sp[lit]",
-    ":tabc[lose]",
-    ":tabd[o]",
-    ":tabe[dit]",
-    ":tabm[ove]",
-    ":tabn[ext]",
-    ":tabp[revious]",
     ":tabs",
     ":te[rminal]",
     ":una[bbreviate]",
@@ -17391,11 +17898,9 @@ const EX_COVERAGE_EXEMPT: &[&str] = &[
     ":vim[grep]",
     ":vm[ap]",
     ":vmapc[lear]",
-    ":vne[w]",
     ":vn[oremap]",
     ":vs[plit]",
     ":vu[nmap]",
-    ":wind[o]",
     ":w[rite]",
     ":wa[ll]",
     ":winc[md]",
@@ -21051,7 +21556,7 @@ const NORMAL_AUDIT: &[NormAudit] = &[
             "alpha beta gamma|delta epsilon zeta|eta theta iota",
             (1, 1),
             "NORMAL",
-            "",
+            "No alternate buffer",
             1,
             1,
             "",
@@ -21059,10 +21564,15 @@ const NORMAL_AUDIT: &[NormAudit] = &[
         )),
         Some(Label("buf:C-^ alternate file")),
         concat!(
-            "Vim edits the alternate file (`:e #`). vimcode keeps a buffer ",
-            "list but has no alternate-file register and no binding: the ",
-            "recording does nothing and says nothing. Worth implementing — ",
-            "\"flip to the last file\" is high-frequency muscle memory.",
+            "Vim edits the alternate file (`:e #`). vimcode's `Engine::",
+            "alternate_buffer` already does the same thing (bound since ",
+            "before this row was written) — #1281 fixed this *spelling* of ",
+            "the key (`<C-^>`, i.e. key_name \"^\") to reach it too, not ",
+            "just the \"6\" spelling some backends report for the same ",
+            "physical Ctrl+Shift+6 combo (`:h CTRL-^`). This single-buffer ",
+            "recording has no alternate buffer set, hence the refusal ",
+            "message — see the real cross-file case in CASES_XFILE (#1281) ",
+            "for the working jump.",
         ),
     ),
     na(
@@ -24959,7 +25469,7 @@ const NORMAL_AUDIT: &[NormAudit] = &[
             "alpha beta gamma|delta epsilon zeta|eta theta iota",
             (1, 1),
             "NORMAL",
-            "Unknown wincmd: ^",
+            "No alternate buffer",
             1,
             1,
             "",
@@ -24967,8 +25477,16 @@ const NORMAL_AUDIT: &[NormAudit] = &[
         )),
         Some(Label("win:C-w C-^ splits to the alternate file")),
         concat!(
-            "Vim's alias for \"CTRL-W ^\". vimcode answers \"Unknown wincmd: ^\" ",
-            "— it has no alternate file at all (see CTRL-^).",
+            "Vim's alias for \"CTRL-W ^\": split, then edit the alternate ",
+            "file in the new window. vimcode still doesn't split — #1281's ",
+            "fix for plain CTRL-^ (making key_name \"^\", not just \"6\", ",
+            "reach `alternate_buffer`) is checked *before* the pending ",
+            "CTRL-W state here (a pre-existing dispatch-order quirk shared ",
+            "with `<C-w><C-6>`, not new to this fix), so the CTRL-W prefix ",
+            "is swallowed and this now falls straight into ",
+            "`alternate_buffer` on the *current* window instead of ",
+            "`execute_wincmd`. Message text changed (was \"Unknown wincmd: ",
+            "^\"); still no split, so still NotImplemented.",
         ),
     ),
     na(
