@@ -13354,6 +13354,57 @@ fn test_ex_cnext_cprevious_on_empty_quickfix_list_error_1283() {
 }
 
 #[test]
+fn test_ex_cfirst_clast_on_empty_quickfix_list_error_1283() {
+    // #1283 review: `ex::cfirst`/`ex::clast` were retired from
+    // `COVERAGE_EXEMPT` on the strength of `Case`s that only assert the
+    // cursor didn't move on an empty quickfix list — a `Case` that passes
+    // identically against a build where these commands don't exist at all
+    // (execute_command's unknown-command fallback also leaves the cursor
+    // untouched). This engine-level pairing closes that gap by asserting on
+    // `engine.message` directly, same precedent as `test_ex_cc_on_empty_
+    // quickfix_list_errors_1154` and `test_ex_cnext_cprevious_on_empty_
+    // quickfix_list_error_1283` above.
+    let mut engine = Engine::new();
+    engine.execute_command("cfirst");
+    assert!(
+        engine.message.contains("No Errors"),
+        "cfirst on an empty quickfix list should error like Neovim, got {:?}",
+        engine.message
+    );
+
+    engine.message.clear();
+    engine.execute_command("clast");
+    assert!(
+        engine.message.contains("No Errors"),
+        "clast on an empty quickfix list should error like Neovim, got {:?}",
+        engine.message
+    );
+}
+
+#[test]
+fn test_ex_lfirst_llast_without_location_list_error_1283() {
+    // #1283 review: same gap as `test_ex_cfirst_clast_on_empty_quickfix_
+    // list_error_1283` above, but for the location-list variants — real
+    // Neovim's message on a window with no location list is "E776: No
+    // location list" (confirmed against a live oracle).
+    let mut engine = Engine::new();
+    engine.execute_command("lfirst");
+    assert!(
+        engine.message.contains("No location list"),
+        "lfirst without a location list should error like Neovim, got {:?}",
+        engine.message
+    );
+
+    engine.message.clear();
+    engine.execute_command("llast");
+    assert!(
+        engine.message.contains("No location list"),
+        "llast without a location list should error like Neovim, got {:?}",
+        engine.message
+    );
+}
+
+#[test]
 fn test_ex_lnext_lprevious_without_location_list_error_1283() {
     let mut engine = Engine::new();
     engine.execute_command("lnext");
@@ -15151,7 +15202,11 @@ fn test_cdo_on_empty_list_errors_without_running_anything() {
     // not part of the conformance corpus: the oracle `Case` harness compares
     // buffer and cursor only, so no `tests/nvim_conformance.rs` row asserts
     // it. Narrowing this to a silent no-op is a separate behaviour decision,
-    // not a casing fix, so it is deliberately out of #1283's scope.
+    // not a casing fix, so it is deliberately out of #1283's scope — tracked
+    // as follow-up #4 in `tests/nvim_conformance.rs`'s "Follow-up issue
+    // status" comment above `KNOWN_DEVIATIONS_XFILE`, for the coordinator to
+    // file with a real issue number per this repo's discovered-deviation
+    // policy.
     assert!(
         engine.message.contains("E42: No Errors"),
         "cdo on an empty quickfix list should use the shared E42 wording, got {:?}",

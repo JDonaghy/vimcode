@@ -5617,10 +5617,16 @@ const CASES_EX: &[Case] = &[
         1,
         ":lfirst<CR>",
     ),
-    // `ex::ll`'s case must come before `ex:llast`/`ex:llist` below: all three
-    // keys start with the literal substring `:ll`, and `Keys(":ll")`
-    // (`ex::ll`'s probe) matches whichever comes first in corpus order —
-    // same "loose needle" hazard the module doc calls out for `:h`/`:hide`.
+    // All three of `:ll`, `:llast`, and `:llist` start with the literal
+    // substring `:ll`, so `Keys(":ll")` (`ex::ll`'s probe) is a "loose
+    // needle" that would also match the `ex:llast`/`ex:llist` cases below
+    // regardless of where they sit in corpus order — `classify_coverage`'s
+    // `cases.iter().find(...)` only checks whether *some* case matches, not
+    // which one or in what position. The dedicated `ex:ll` case just below
+    // still needs to exist so the probe is verified against real `:ll`
+    // behaviour rather than accidentally "passing" on `:llast`/`:llist`'s
+    // coattails — same "loose needle" hazard the module doc calls out for
+    // `:h`/`:hide`, but it's about needle specificity, not ordering.
     c(
         "ex:ll without a location list errors",
         &["a", "b", "c"],
@@ -9601,12 +9607,31 @@ const CASES_XFILE: &[WinCase] = &[
 //      attempt inline alongside backfilling the other 22 ids in this same
 //      issue's slice, same reasoning as follow-ups #1/#2 above.
 //
+//   4. (no case label — this scenario isn't reachable through the oracle
+//      `Case` harness at all, so it cannot be a `KNOWN_DEVIATIONS_XFILE`
+//      entry the way #3 is; it's tracked here purely as a follow-up.)
+//      Title: "`:cdo`/`:cfdo`/`:ldo`/`:lfdo` should be silent no-ops on an
+//      empty quickfix/location list, not set a message". Confirmed against a
+//      live `nvim --headless -u NONE`: real Neovim's `:cdo {cmd}` (etc.) on
+//      an empty list is a silent no-op — `pcall` succeeds, `v:errmsg` stays
+//      empty — unlike `:cc`/`:cnext`/`:clist`/`:cfirst`/`:clast`, which all
+//      raise `E42: No Errors`. vimcode currently sets `engine.message` to
+//      the shared `E42: No Errors` wording for `:cdo`/`:cfdo`/`:ldo`/`:lfdo`
+//      too (see `execute.rs`'s handling of those four commands next to
+//      `qf_empty_msg`) — narrowing that one case to a true no-op (no message
+//      set) is a small, separable fix once filed. See
+//      `test_cdo_on_empty_list_errors_without_running_anything` in
+//      `src/core/engine/tests.rs` for the reproduction.
+//
 // Neither #1 nor #2 was attempted in #1281 itself for the same reason #1162
-// gave for its own 5, and #3 was not attempted in #1283 for the same reason
-// again: each is a bigger, more failure-prone change (a real split-based
+// gave for its own 5, #3 was not attempted in #1283 for the same reason
+// again, and #4 is deliberately left as vimcode's existing (documented)
+// behaviour rather than narrowed inline: each is a bigger, more
+// failure-prone, or more clearly out-of-slice change (a real split-based
 // command-line window; renumbering every buffer-open call site; quickfix
-// panels becoming real split windows) than "backfill N rows" should carry in
-// the same slice.
+// panels becoming real split windows; a message-suppression behaviour
+// change with no oracle case to gate it) than "backfill N rows" should carry
+// in the same slice.
 // ---------------------------------------------------------------------------
 
 const KNOWN_DEVIATIONS_XFILE: &[&str] = &[
