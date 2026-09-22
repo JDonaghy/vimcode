@@ -24040,13 +24040,12 @@ mod tests {
         std::fs::write(&file_c, "CCC1154BFL\n").unwrap();
 
         let mut app = TuiShellApp::new_for_test();
-        // `TuiShellApp::new_for_test` already seeds one empty "[No Name]"
-        // buffer before any file is opened — it is still buffer #1
-        // afterwards (`open_file_with_mode` switches the window's buffer,
-        // it does not delete the one being switched away from), so it must
-        // be wiped out here or `:bfirst` would (correctly) land on it
-        // instead of `file_a`.
-        let initial_buffer_id = app.engine.active_buffer_id();
+        // `TuiShellApp::new_for_test` seeds one empty "[No Name]" scratch
+        // buffer before any file is opened. `open_file_with_mode` reuses
+        // that still-pristine buffer in place for the first file opened
+        // into it (#1298, matching Neovim's `:edit`), so `file_a` becomes
+        // buffer #1 rather than leaving a numbered phantom behind — no
+        // manual cleanup needed here.
         app.engine
             .open_file_with_mode(&file_a, crate::core::engine::OpenMode::Permanent)
             .unwrap();
@@ -24056,7 +24055,6 @@ mod tests {
         app.engine
             .open_file_with_mode(&file_c, crate::core::engine::OpenMode::Permanent)
             .unwrap();
-        app.engine.delete_buffer(initial_buffer_id, true).unwrap();
         assert_eq!(app.engine.buffer_manager.len(), 3);
 
         let mut driver = driver_with_shell(app, config(), 100, 24);
@@ -24118,17 +24116,16 @@ mod tests {
         std::fs::write(&file_b, "BBB1154BW\n").unwrap();
 
         let mut app = TuiShellApp::new_for_test();
-        // See the sibling `:bfirst`/`:blast` test above: the seeded initial
-        // "[No Name]" buffer survives `open_file_with_mode` and must be
-        // wiped out so exactly the two files below are the only buffers.
-        let initial_buffer_id = app.engine.active_buffer_id();
+        // See the sibling `:bfirst`/`:blast` test above: `open_file_with_mode`
+        // reuses the seeded initial "[No Name]" buffer in place for `file_a`
+        // (#1298), so exactly the two files below are the only buffers with
+        // no manual cleanup needed.
         app.engine
             .open_file_with_mode(&file_a, crate::core::engine::OpenMode::Permanent)
             .unwrap();
         app.engine
             .open_file_with_mode(&file_b, crate::core::engine::OpenMode::Permanent)
             .unwrap();
-        app.engine.delete_buffer(initial_buffer_id, true).unwrap();
         assert_eq!(app.engine.buffer_manager.len(), 2);
 
         let mut driver = driver_with_shell(app, config(), 100, 24);
@@ -24150,6 +24147,90 @@ mod tests {
             screen.contains("AAA1154BW") && !screen.contains("BBB1154BW"),
             ":bw must wipe out the active buffer and repaint the window \
              with the remaining one; screen:\n{screen}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1298 driver-tier coverage: `:edit` from the still-pristine startup
+    /// scratch buffer must rename/reuse that buffer in place (matching
+    /// Neovim) rather than leaving it behind as a numbered phantom — driven
+    /// entirely through typed ex commands and asserted on painted screen
+    /// content, not `buffer_manager` state.
+    ///
+    /// RED against unfixed `develop`: `open_file_with_mode_impl` always
+    /// allocated a fresh `BufferId`, so after `:e {file_a}` then
+    /// `:e {file_b}` the empty pristine buffer was still buffer #1 and
+    /// `file_a` was buffer #2 — `:b 1` would repaint the window with the
+    /// *empty* buffer (screen would not contain `AAA1298BUF`), not
+    /// `file_a`'s content.
+    #[test]
+    fn ex_edit_reuses_pristine_scratch_buffer_via_shell_app() {
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_test_1298_edit_reuse_shell_app_{:?}",
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_a = dir.join("a1298buf.txt");
+        let file_b = dir.join("b1298buf.txt");
+        std::fs::write(&file_a, "AAA1298BUF\n").unwrap();
+        std::fs::write(&file_b, "BBB1298BUF\n").unwrap();
+
+        let app = TuiShellApp::new_for_test();
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+
+        // `:e {file_a}` from the pristine startup buffer.
+        driver.type_char(':');
+        for c in "e".chars() {
+            driver.type_char(c);
+        }
+        driver.type_char(' ');
+        for c in file_a.to_string_lossy().chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
+        driver.render();
+        let screen = driver.screen();
+        assert!(
+            screen.contains("AAA1298BUF"),
+            "sanity: :e must open file_a into the current window; \
+             screen:\n{screen}"
+        );
+
+        // `:e {file_b}` from a no-longer-pristine buffer must create a
+        // genuinely new buffer.
+        driver.type_char(':');
+        for c in "e".chars() {
+            driver.type_char(c);
+        }
+        driver.type_char(' ');
+        for c in file_b.to_string_lossy().chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
+        driver.render();
+        assert!(
+            driver.screen().contains("BBB1298BUF"),
+            "sanity: :e must open file_b into the current window; \
+             screen:\n{}",
+            driver.screen()
+        );
+
+        // `:b 1` must land on `file_a` -- the reused pristine buffer -- not
+        // an orphaned empty scratch buffer left behind by the first `:e`.
+        driver.type_char(':');
+        for c in "b 1".chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
+        driver.render();
+        let screen = driver.screen();
+        assert!(
+            screen.contains("AAA1298BUF") && !screen.contains("BBB1298BUF"),
+            ":b 1 must repaint the window with file_a's content -- the \
+             pristine startup buffer renamed in place by the first :e, not \
+             a leftover empty phantom buffer; screen:\n{screen}"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

@@ -9310,12 +9310,6 @@ const CASES_XFILE: &[WinCase] = &[
         1,
         ":e {F1}<CR>:b#<CR>",
     ),
-    // #1281 finding: `open_file_with_mode` always creates a brand-new
-    // buffer, even when the current one is still the pristine unnamed
-    // scratch buffer Engine::new() seeds — Neovim's `:edit` reuses that
-    // buffer's number instead. So vimcode's `main.txt` is buffer 2, not
-    // buffer 1 like Neovim's, and `:b 1` lands on two different files. See
-    // KNOWN_DEVIATIONS_XFILE.
     wc_files(
         "ex:b by number returns to buffer 1",
         XFILE_MAIN,
@@ -9550,9 +9544,11 @@ const CASES_XFILE: &[WinCase] = &[
 // ## Follow-up issue status (read before editing any entry below)
 //
 // Same policy as KNOWN_DEVIATIONS_WIN: no `gh` access from a worker session.
-// Follow-ups #1 and #2 below are now filed, as #1297 and #1298 respectively
-// (filed 2026-09-22); #3 and #4 remain unfiled and each entry still names the
-// exact gap so the coordinator can file it verbatim.
+// Follow-up #1 below is now filed, as #1297 (filed 2026-09-22); #3 and #4
+// remain unfiled and each entry still names the exact gap so the coordinator
+// can file it verbatim. Follow-up #2 ("reuse the pristine scratch buffer",
+// filed as #1298) was fixed — see git history for the writeup that used to
+// live here; the case labels it gated are back in CASES_XFILE above.
 //
 //   1. (#1297) "win:q: opens the command-line window" / "win:q/ ..." / "win:q? ..."
 //      — title: "cmdwin: open the command-line window as a split in the
@@ -9565,31 +9561,6 @@ const CASES_XFILE: &[WinCase] = &[
 //      window (not tab) pushed into the active tab's layout, plus
 //      `cmdline_window_execute`'s `self.close_tab()` changed to close the
 //      window it actually opened.
-//   2. (#1298) "ex:b by number returns to buffer 1" / "ex:bn cycles forward
-//      through the buffer list" / "ex:bd ..." / "ex:bdelete ..." — title:
-//      "buffers: :edit should reuse a still-pristine unnamed buffer instead
-//      of always creating a new one". `Engine::open_file_with_mode_impl`
-//      (src/core/engine/buffers.rs) always calls
-//      `self.buffer_manager.open_file(path)`, which always allocates a new
-//      `BufferId` — even when the buffer being left is the empty, unnamed,
-//      unmodified scratch buffer `Engine::new()` seeds. Neovim's `:edit`
-//      renames/reuses that buffer instead of leaving it behind as a phantom
-//      entry, so every fixture in this harness (and any real vimcode
-//      session) is off by one buffer number relative to Neovim from the
-//      first `:edit` onward. `ex:bp`/`ex:b#`/`ex:b by name` still pass
-//      despite the phantom entry — they're relative-to-current or
-//      name-based, not absolute-number-based — but `:bn` (wraps to the
-//      *lowest*-numbered buffer, which is the phantom, not Neovim's
-//      buffer 1), `:bd`/`:bdelete` (same wrong fallback once the current
-//      buffer is gone), and `:b {N}` (numbers are off by one directly) all
-//      land on the phantom buffer instead of `main.txt`. Fix belongs in
-//      `open_file_with_mode_impl`, guarded by the same
-//      `is_pristine_scratch_buffer` check `push_jump_location` already uses
-//      (`src/core/engine/motions.rs`) — reuse the pristine buffer's
-//      `BufferId` (and switch its content/name in place) instead of
-//      creating a new one. Broad blast radius (every `:b {N}`, `:bfirst`,
-//      `:blast`, `:ls`/`:buffers` numbering) is exactly why this is left as
-//      a finding rather than attempted inline here.
 //   3. "qf:copen opens the quickfix window even on an empty list" (#1283) —
 //      title: "quickfix/location-list panels should be real split windows,
 //      not overlay panels". `Engine::qf_open`/`qf_close`/`qf_window`
@@ -9624,15 +9595,14 @@ const CASES_XFILE: &[WinCase] = &[
 //      `test_cdo_on_empty_list_errors_without_running_anything` in
 //      `src/core/engine/tests.rs` for the reproduction.
 //
-// Neither #1 nor #2 was attempted in #1281 itself for the same reason #1162
+// Follow-up #1 was not attempted in #1281 itself for the same reason #1162
 // gave for its own 5, #3 was not attempted in #1283 for the same reason
 // again, and #4 is deliberately left as vimcode's existing (documented)
 // behaviour rather than narrowed inline: each is a bigger, more
 // failure-prone, or more clearly out-of-slice change (a real split-based
-// command-line window; renumbering every buffer-open call site; quickfix
-// panels becoming real split windows; a message-suppression behaviour
-// change with no oracle case to gate it) than "backfill N rows" should carry
-// in the same slice.
+// command-line window; quickfix panels becoming real split windows; a
+// message-suppression behaviour change with no oracle case to gate it) than
+// "backfill N rows" should carry in the same slice.
 // ---------------------------------------------------------------------------
 
 const KNOWN_DEVIATIONS_XFILE: &[&str] = &[
@@ -9641,12 +9611,6 @@ const KNOWN_DEVIATIONS_XFILE: &[&str] = &[
     "win:q: opens the command-line window",
     "win:q/ opens the search-history command-line window",
     "win:q? opens the reverse-search-history command-line window",
-    // Follow-up #2 above ("reuse the pristine scratch buffer") — filed as
-    // #1298.
-    "ex:bn cycles forward through the buffer list",
-    "ex:b by number returns to buffer 1",
-    "ex:bd deletes the current buffer and falls back to the previous one",
-    "ex:bdelete deletes the current buffer and falls back to the previous one",
     // Follow-up #3 above ("quickfix panels as real split windows") — not yet
     // filed.
     "qf:copen opens the quickfix window even on an empty list",
