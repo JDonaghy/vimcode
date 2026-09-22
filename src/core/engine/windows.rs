@@ -319,6 +319,36 @@ impl Engine {
         }
     }
 
+    /// The window occupying the screen's top-left (`last == false`) or
+    /// bottom-right (`last == true`) corner — the target of `CTRL-W t` /
+    /// `CTRL-W b`.
+    ///
+    /// #1162: vimcode's screen has *two* nested layout levels where Vim has
+    /// one. The outer level is `group_layout` (VSCode-style editor groups);
+    /// each group's active tab then owns its own `WindowLayout` of vim
+    /// splits. "Corner window" therefore means: first/last group in
+    /// `group_layout` order, then first/last window inside that group's
+    /// active tab. Looking at only one level gets a no-op in the other
+    /// level's common case — walking only `group_layout` never moves with a
+    /// single group (a plain `<C-w>s` split), and walking only the active
+    /// tab never leaves the current group when several groups exist.
+    pub(crate) fn corner_window(&self, last: bool) -> Option<WindowId> {
+        let group_ids = self.group_layout.group_ids();
+        let gid = if last {
+            *group_ids.last()?
+        } else {
+            *group_ids.first()?
+        };
+        let group = self.editor_groups.get(&gid)?;
+        let tab = group.tabs.get(group.active_tab)?;
+        let win_ids = tab.window_ids();
+        if last {
+            win_ids.last().copied()
+        } else {
+            win_ids.first().copied()
+        }
+    }
+
     /// Set cursor position for a specific window and make it active.
     /// Clamps line and col to valid buffer positions.
     pub fn set_cursor_for_window(&mut self, window_id: WindowId, line: usize, col: usize) {
@@ -3397,22 +3427,21 @@ impl Engine {
                 }
             }
             // #1162: `t`/`b` ("go to top-left"/"bottom-right window", `:h
-            // CTRL-W_t`/`:h CTRL-W_b`) used to walk `self.group_layout` — the
-            // VSCode-style editor-group tree — which is a no-op whenever
+            // CTRL-W_t`/`:h CTRL-W_b`) used to walk *only* `self.group_layout`
+            // — the VSCode-style editor-group tree — which is a no-op whenever
             // there is exactly one editor group, the common case a plain
-            // `<C-w>s`/`<C-w>v` split lives in. Real Vim's `t`/`b` operate on
-            // the *window* layout within the current tab; `activate_window`
-            // is the same "make this window current" primitive
-            // `set_cursor_for_window`/mouse click already route through.
+            // `<C-w>s`/`<C-w>v` split lives in. Real Vim has no editor groups:
+            // its `t`/`b` name the corner *window* of the whole screen, which
+            // here means descending both levels of the layout — outer group
+            // tree first, then that group's own window tree. See
+            // [`Self::corner_window`].
             't' => {
-                let win_ids = self.active_tab().window_ids();
-                if let Some(&first) = win_ids.first() {
+                if let Some(first) = self.corner_window(false) {
                     self.activate_window(first);
                 }
             }
             'b' => {
-                let win_ids = self.active_tab().window_ids();
-                if let Some(&last) = win_ids.last() {
+                if let Some(last) = self.corner_window(true) {
                     self.activate_window(last);
                 }
             }
