@@ -17432,6 +17432,125 @@ mod tests {
         app
     }
 
+    /// [`app_with_split_shaped_buffer`]'s sibling, split *horizontally*
+    /// (`:split`) instead: the two panes stack, so the boundary between
+    /// them is a screen **row** and `CTRL-W +`/`CTRL-W -` move it. Same
+    /// sidebar/autohide pinning, for the same reason.
+    fn app_with_hsplit_shaped_buffer() -> TuiShellApp {
+        let mut app = app_with_shaped_buffer();
+        app.engine.settings.autohide_panels = false;
+        app.engine.app_shell.hide_sidebar();
+        app.engine.session.explorer_visible = false;
+        app.engine.split_window(SplitDirection::Horizontal, None);
+        app
+    }
+
+    /// Row of the **lower** pane's first painted buffer line in a
+    /// horizontal split — i.e. where the pane boundary currently sits,
+    /// located from painted content rather than from coordinates (or from
+    /// `WindowLayout`'s ratio, which is exactly the state-not-output
+    /// assertion this repo's testing rules forbid).
+    ///
+    /// Both panes show the same fixture buffer scrolled to its top, so the
+    /// literal `"line 0"` is painted on exactly two rows: the upper pane's
+    /// first content row and the lower pane's. No other fixture line
+    /// contains that substring (`"line 0"` is never a prefix of `"line
+    /// 1"`..`"line 239"` — a digit always follows the `0`), so the second
+    /// hit is the lower pane, wherever status lines, gutter and scrollbars
+    /// happen to put it.
+    fn lower_pane_first_row(screen: &str) -> Option<usize> {
+        let hits: Vec<usize> = screen
+            .lines()
+            .enumerate()
+            .filter(|(_, line)| line.contains("line 0"))
+            .map(|(row, _)| row)
+            .collect();
+        hits.get(1).copied()
+    }
+
+    /// #1288 acceptance, painted-output tier: `CTRL-W -` / `CTRL-W +` move
+    /// a horizontal split's boundary by an absolute `[count]` **screen
+    /// rows**, exactly like Neovim's `CTRL-W_-` / `CTRL-W_+` — not by a
+    /// fixed 5%-per-count slice of the split's height.
+    ///
+    /// Reads the boundary back out of the painted frame via
+    /// [`lower_pane_first_row`] and asserts the *delta* in rows, so it is
+    /// independent of the exact chrome above/below each pane.
+    ///
+    /// RED-verified against unfixed `develop`: `resize_window_split` moved
+    /// the ratio by `0.05 * count`, so `5<C-w>-` took a fresh 50/50 split
+    /// from 0.50 to 0.25 — on this frame's 36-row split axis a **nine**-row
+    /// jump, not the five rows Vim moves. Confirmed by restoring
+    /// `develop`'s `src/core/engine/windows.rs` + `src/core/window.rs` over
+    /// the fix and re-running: `left: 9, right: 5` on the first assertion.
+    ///
+    /// The `tick()` calls are what the live runner does between event
+    /// batches, and they matter here rather than being ceremony: `tick`'s
+    /// post-paint block is what feeds each pane's *painted* height back
+    /// into `Engine` via `set_viewport_for_window`, and an absolute-count
+    /// resize is only absolute if it measures the split against those real
+    /// sizes. Skip the opening pair and the engine still holds the
+    /// pre-paint estimate `split_window` seeded (41 raw rows against a
+    /// real 36), so every resize comes out ~12% short — `<C-w>-` with no
+    /// count doesn't move the boundary at all. Skip the one after each
+    /// resize and the *next* resize measures from the pre-resize sizes and
+    /// compounds. Hence one tick per event batch, exactly like `mod.rs`'s
+    /// runner.
+    #[test]
+    fn ctrl_w_resize_moves_the_split_boundary_by_an_absolute_count_via_shell_app() {
+        let mut driver = driver_with_shell(app_with_hsplit_shaped_buffer(), config(), 120, 40);
+        driver.tick();
+        driver.tick();
+        let before = lower_pane_first_row(&driver.screen()).unwrap_or_else(|| {
+            panic!(
+                "fixture must paint both panes' first buffer line; screen:\n{}",
+                driver.screen()
+            )
+        });
+
+        // `5<C-w>-`: shrink the active (upper) window by five rows, so the
+        // boundary rises by exactly five.
+        driver.type_char('5');
+        driver.ctrl_char('w');
+        driver.type_char('-');
+        driver.tick();
+        let shrunk = lower_pane_first_row(&driver.screen()).unwrap_or_else(|| {
+            panic!(
+                "both panes must still paint their first buffer line after \
+                 `5<C-w>-`; screen:\n{}",
+                driver.screen()
+            )
+        });
+        assert_eq!(
+            before as i64 - shrunk as i64,
+            5,
+            "`5<C-w>-` must move the split boundary up by exactly 5 screen \
+             rows (Vim resizes by an absolute [count], #1288); boundary went \
+             from row {before} to row {shrunk}; screen:\n{}",
+            driver.screen()
+        );
+
+        // `3<C-w>+`: grow it back by three, so the boundary drops by three.
+        driver.type_char('3');
+        driver.ctrl_char('w');
+        driver.type_char('+');
+        driver.tick();
+        let grown = lower_pane_first_row(&driver.screen()).unwrap_or_else(|| {
+            panic!(
+                "both panes must still paint their first buffer line after \
+                 `3<C-w>+`; screen:\n{}",
+                driver.screen()
+            )
+        });
+        assert_eq!(
+            grown as i64 - shrunk as i64,
+            3,
+            "`3<C-w>+` must move the split boundary down by exactly 3 screen \
+             rows; boundary went from row {shrunk} to row {grown}; screen:\n{}",
+            driver.screen()
+        );
+    }
+
     /// #722 acceptance, painted-output tier: a `:vsplit` must paint **two**
     /// independent minimap strips, one over each pane's own buffer — not a
     /// single strip pinned to whichever pane happens to be active.
