@@ -115,6 +115,26 @@ fn resize_delta_ratio(is_first: bool, increase: bool, count: usize, axis_size: f
     }
 }
 
+/// Neovim's `'winminheight'`/`'winminwidth'` floor — the smallest raw axis
+/// size (see [`raw_axis_extent`]) a window may be shrunk to — used by
+/// `Engine::maximize_window_split` (#1289) to shrink the *other* window down
+/// to its real floor instead of applying a fixed 0.9/0.1 ratio. Neither
+/// setting is wired up as a real `Settings` field yet (both are
+/// `NotImplemented` in `tests/nvim_conformance.rs`'s settings table), so this
+/// hardcodes their shared Neovim default of 1 (one content row for height,
+/// one column for width) rather than reading a field that doesn't exist —
+/// once those settings land, this should read them instead.
+fn min_raw_extent(direction: SplitDirection) -> f64 {
+    match direction {
+        // 1 content row, plus the 1-row status-line chrome `raw_axis_extent`
+        // always adds back for Horizontal splits.
+        SplitDirection::Horizontal => 2.0,
+        // 1 column; Vertical splits have no per-window chrome column here
+        // (see `resize_window_split`'s #1288 doc), so it round-trips as-is.
+        SplitDirection::Vertical => 1.0,
+    }
+}
+
 impl Engine {
     // =======================================================================
     // Window operations
@@ -3617,16 +3637,52 @@ impl Engine {
     /// Maximize window in a given direction (CTRL-W _ for height, CTRL-W | for width).
     /// Same window-split-first, group-split-fallback preference as
     /// `resize_window_split` (#582).
+    ///
+    /// #1289: used to set a fixed 0.9/0.1 ratio regardless of split size —
+    /// Neovim instead shrinks the *other* window down to its
+    /// `'winminheight'`/`'winminwidth'` floor ([`min_raw_extent`]) and gives
+    /// everything else to the active window. The two only ever agreed for
+    /// height (`CTRL-W _`), and only by accident: 10% of this harness's
+    /// fixed 23-row budget happens to round down to the same 1-content-row
+    /// floor Neovim uses. Works in the same integer raw-line/column space as
+    /// `resize_window_split` (#1288) for the same reason — see that
+    /// function's doc.
     pub(crate) fn maximize_window_split(&mut self, direction: SplitDirection) {
         let active_window = self.active_window_id();
         if let Some((split_idx, split_dir, is_first)) =
             self.active_tab().layout.parent_split_of(active_window)
         {
             if split_dir == direction {
-                let ratio = if is_first { 0.9 } else { 0.1 };
-                self.active_tab_mut()
-                    .layout
-                    .set_ratio_at_index(split_idx, ratio);
+                let sizes =
+                    self.active_tab()
+                        .layout
+                        .children_at_index(split_idx)
+                        .map(|(first, second)| {
+                            (
+                                subtree_raw_extent(first, direction, &self.windows),
+                                subtree_raw_extent(second, direction, &self.windows),
+                            )
+                        });
+                if let Some((first_raw, second_raw)) = sizes {
+                    let axis_size = first_raw + second_raw;
+                    if axis_size > 0.0 {
+                        let other_min_raw = min_raw_extent(direction).min(axis_size);
+                        let new_first_raw = if is_first {
+                            axis_size - other_min_raw
+                        } else {
+                            other_min_raw
+                        };
+                        let new_ratio = (new_first_raw / axis_size).clamp(0.0, 1.0);
+                        // #1289: use the size-derived bound, not the generic
+                        // 0.1..0.9 per-step-resize clamp `set_ratio_at_index`
+                        // applies by default — that clamp would silently
+                        // re-widen the other window straight back out past
+                        // its real floor.
+                        self.active_tab_mut()
+                            .layout
+                            .set_ratio_at_index_bounded(split_idx, new_ratio, 0.0, 1.0);
+                    }
+                }
                 return;
             }
         }
@@ -3634,8 +3690,25 @@ impl Engine {
             self.group_layout.parent_split_of(self.active_group)
         {
             if split_dir == direction {
-                let ratio = if is_first { 0.9 } else { 0.1 };
-                self.group_layout.set_ratio_at_index(split_idx, ratio);
+                if let Some(ratio) = self.group_layout.ratio_at_index(split_idx) {
+                    let share = if is_first { ratio } else { 1.0 - ratio };
+                    let axis_size = if share > 0.0 {
+                        raw_axis_extent(self.view(), direction) / share
+                    } else {
+                        0.0
+                    };
+                    if axis_size > 0.0 {
+                        let other_min_raw = min_raw_extent(direction).min(axis_size);
+                        let new_first_raw = if is_first {
+                            axis_size - other_min_raw
+                        } else {
+                            other_min_raw
+                        };
+                        let new_ratio = (new_first_raw / axis_size).clamp(0.0, 1.0);
+                        self.group_layout
+                            .set_ratio_at_index_bounded(split_idx, new_ratio, 0.0, 1.0);
+                    }
+                }
             }
         }
     }

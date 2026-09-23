@@ -9135,11 +9135,11 @@ const CASES_WIN: &[WinCase] = &[
         1,
         "<C-w>v10<C-w>>",
     ),
-    // `CTRL-W _`: also a real, non-vacuous PASS — `maximize_window_split`'s
-    // 0.9/0.1 ratio happens to shrink the other window to exactly Neovim's
-    // own `'winminheight'` floor (1 content row) on this harness's fixed
-    // 23-row budget. `CTRL-W \|` does NOT coincidentally agree (10% of 80
-    // columns is well above `'winminwidth'`'s floor) — see
+    // `CTRL-W _`: also a real, non-vacuous PASS — `maximize_window_split`
+    // shrinks the other window to exactly Neovim's own `'winminheight'`
+    // floor (1 content row). `CTRL-W \|` (#1289, fixed for the ratio math)
+    // still fails, but only for the same pre-existing divider-thickness
+    // reason as `<`/`>` above, not a ratio mismatch anymore — see
     // KNOWN_DEVIATIONS_WIN.
     wc_sized(
         "win:CTRL-W _ maximizes the active window's height",
@@ -12879,7 +12879,25 @@ fn nvim_conformance_jumplist_multi_file() {
 //      — maximize_window_split's 0.9/0.1 ratio happens to match Neovim's
 //      real "shrink the other window to its 'winminheight' minimum"
 //      behaviour for height (CTRL-W _) but not width (CTRL-W |), where 10%
-//      of 80 columns is well above Neovim's 'winminwidth' floor.
+//      of 80 columns is well above Neovim's 'winminwidth' floor. Fixed:
+//      `maximize_window_split` now shrinks the other side down to a real,
+//      size-derived `'winminwidth'`/`'winminheight'` floor
+//      (`min_raw_extent`, both hardcoded at Neovim's shared default of 1
+//      since neither setting is wired up as a real `Settings` field yet)
+//      instead of a fixed ratio — same integer raw-line/column-space
+//      approach #1288 used for `resize_window_split`, for the same reason.
+//      `CTRL-W |` still fails post-fix, but — like `<`/`>` above — now for
+//      the *same*, already-diagnosed divider-thickness reason, not the
+//      fixed-ratio one: vimcode's `1` in `79/80` is provably the right
+//      *ratio* (Neovim's own two windows are `78`/`1` of a 79-content-column
+//      total, i.e. also "everything but 1 column" to the other side), but
+//      vimcode's total (`80`) doesn't reserve the 1-column divider Neovim's
+//      does, so the active side's absolute count is off by exactly one
+//      column (`79` vs `78`) — see the `<`/`>` entry's comment below for the
+//      root cause. `CTRL-W _` needed no such fix: Horizontal splits have no
+//      divider-column analogue (each window's own status line already
+//      supplies the visual separation), so it was already a real,
+//      non-coincidental pass before and after this change.
 //   3. (#1290) "win:CTRL-W = fix off-by-one rect rounding on odd-sized splits"
 //      — WindowLayout::calculate_rects (SplitTreeMeasure::new(0.0)) rounds
 //      each child's share of a split independently instead of giving one
@@ -12945,10 +12963,23 @@ const KNOWN_DEVIATIONS_WIN: &[&str] = &[
     // its own issue.
     "win:CTRL-W < decreases the active window's width",
     "win:CTRL-W > increases the active window's width",
-    // Follow-up #2 above ("true winminwidth maximize") — filed as #1289.
-    // `CTRL-W _` is kept as a real, non-coincidental-looking pass (both
-    // land the other window at exactly 1 content row); `CTRL-W \|` still
-    // visibly diverges for the reason in follow-up #2.
+    // Follow-up #2 above ("true winminwidth maximize") — filed as #1289,
+    // fixed for the *ratio* math: `maximize_window_split` now shrinks the
+    // other window down to a real, size-derived `'winminwidth'` floor
+    // instead of a fixed 0.1 ratio (10% of 80 columns is well above the
+    // floor; the fix's own `min_raw_extent` hardcodes it to Neovim's
+    // shared default of 1, same as `'winminheight'`, since neither setting
+    // is wired up as a real `Settings` field yet). `CTRL-W \|` still fails
+    // post-fix, but now for the *same* divider-thickness reason as `<`/`>`
+    // just above, not the fixed-ratio one: vimcode's fixed split gives the
+    // other window exactly 1 of its own 80-column total (`79`/`1`), but
+    // Neovim reserves 1 of those 80 columns for the vertical divider bar
+    // first, so its equivalent "everything but 1 column" is `78`/`1` of a
+    // 79-column *content* total — same off-by-one root cause, different
+    // maximize-vs-resize entry point. `CTRL-W _` needed no such fix and
+    // stays a real, non-coincidental pass: Horizontal splits have no
+    // divider-column analogue (each window's own status line already
+    // supplies the visual separation).
     "win:CTRL-W | maximizes the active window's width",
     // Follow-up #3 above ("off-by-one rect rounding on odd-sized splits")
     // — filed as #1290. Distinct from follow-up #1/#2: `equalize_splits`
@@ -26874,12 +26905,17 @@ const NORMAL_AUDIT: &[NormAudit] = &[
             1,
             1,
             "",
-            "(h0.90 2* 1) tabs=1/1",
+            "(h0.92 2* 1) tabs=1/1",
         )),
         Some(Label("win:C-w C-_ maximises the height")),
         concat!(
-            "matches Vim: the alias sets the window height to its maximum ",
-            "(the recorded split ratio goes to 0.90).",
+            "matches Vim: the alias sets the window height to its maximum. ",
+            "#1289: the recorded ratio used to be a flat 0.90 regardless of ",
+            "split size; `maximize_window_split` now shrinks the other ",
+            "window down to its real 'winminheight' floor (1 content row) ",
+            "instead. On this 24-line recording the split's raw axis is 25 ",
+            "rows, so the other window's 1-content-row/2-raw-row floor ",
+            "leaves 23 of 25 to the active window, i.e. ratio 0.92.",
         ),
     ),
     na(
@@ -27266,12 +27302,14 @@ const NORMAL_AUDIT: &[NormAudit] = &[
             1,
             1,
             "",
-            "(h0.90 2* 1) tabs=1/1",
+            "(h0.92 2* 1) tabs=1/1",
         )),
         Some(Label("win:C-w _ maximises the height")),
         concat!(
-            "matches Vim: sets the current window height to the maximum ",
-            "(ratio 0.90).",
+            "matches Vim: sets the current window height to the maximum. ",
+            "#1289: recorded ratio 0.90 -> 0.92 — see the ",
+            "\"CTRL-W_CTRL-_\" row's note (the C-_ alias) for the ",
+            "'winminheight'-floor arithmetic behind the new number.",
         ),
     ),
     na(
@@ -27905,10 +27943,20 @@ const NORMAL_AUDIT: &[NormAudit] = &[
             1,
             1,
             "",
-            "(v0.90 2* 1) tabs=1/1",
+            "(v0.99 2* 1) tabs=1/1",
         )),
         Some(Label("win:C-w bar maximises the width")),
-        "matches Vim: sets the window width to the maximum (ratio 0.90).",
+        concat!(
+            "matches Vim: sets the window width to the maximum. #1289: the ",
+            "recorded ratio used to be a flat 0.90 regardless of split ",
+            "size — the same fixed literal `maximize_window_split` used ",
+            "for height, which only ever coincidentally matched Neovim ",
+            "there and never did for width, where 10% of this fixture's ",
+            "80-column default is well above Neovim's 1-column ",
+            "'winminwidth' floor. Now shrinks the other window down to ",
+            "that real 1-column floor instead: 79 of 80, ratio 0.9875, ",
+            "rendered here to 2 decimal places as 0.99.",
+        ),
     ),
     na(
         "CTRL-W }",
