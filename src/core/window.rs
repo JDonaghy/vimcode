@@ -350,12 +350,41 @@ impl WindowLayout {
             .collect()
     }
 
-    /// Find the Nth split node in pre-order and set its ratio (clamped to 0.1..0.9).
+    /// Find the Nth split node in pre-order and set its ratio (clamped to 0.1..0.9,
+    /// the generic per-step-resize floor — see [`Self::set_ratio_at_index_bounded`]
+    /// for callers, like `Engine::maximize_window_split` (#1289), that need to
+    /// push past that generic floor down to a real, size-derived minimum).
     pub fn set_ratio_at_index(&mut self, split_index: usize, ratio: f64) -> bool {
-        self.set_ratio_at_index_impl(split_index, ratio, &mut 0)
+        self.set_ratio_at_index_bounded(split_index, ratio, 0.1, 0.9)
     }
 
-    fn set_ratio_at_index_impl(&mut self, target: usize, ratio: f64, counter: &mut usize) -> bool {
+    /// Same as [`Self::set_ratio_at_index`], but with explicit clamp bounds
+    /// instead of the generic 0.1..0.9 per-step-resize floor. Used by
+    /// `Engine::maximize_window_split` (#1289): unlike `CTRL-W +`/`-`/`<`/`>`,
+    /// which move the split boundary by a small `[count]` and so should never
+    /// approach a degenerate 0/1 ratio, `CTRL-W _`/`\|` deliberately shrinks
+    /// the *other* window all the way down to its real
+    /// `'winminheight'`/`'winminwidth'` floor — a ratio the generic 0.1/0.9
+    /// clamp would silently re-widen back out, undoing the very shrink the
+    /// caller already computed in raw (integer line/column) space.
+    pub fn set_ratio_at_index_bounded(
+        &mut self,
+        split_index: usize,
+        ratio: f64,
+        min: f64,
+        max: f64,
+    ) -> bool {
+        self.set_ratio_at_index_impl(split_index, ratio, min, max, &mut 0)
+    }
+
+    fn set_ratio_at_index_impl(
+        &mut self,
+        target: usize,
+        ratio: f64,
+        min: f64,
+        max: f64,
+        counter: &mut usize,
+    ) -> bool {
         match self {
             WindowLayout::Leaf(_) => false,
             WindowLayout::Split {
@@ -367,11 +396,11 @@ impl WindowLayout {
                 let idx = *counter;
                 *counter += 1;
                 if idx == target {
-                    *r = ratio.clamp(0.1, 0.9);
+                    *r = ratio.clamp(min, max);
                     return true;
                 }
-                first.set_ratio_at_index_impl(target, ratio, counter)
-                    || second.set_ratio_at_index_impl(target, ratio, counter)
+                first.set_ratio_at_index_impl(target, ratio, min, max, counter)
+                    || second.set_ratio_at_index_impl(target, ratio, min, max, counter)
             }
         }
     }
@@ -815,12 +844,33 @@ impl GroupLayout {
             .collect()
     }
 
-    /// Find the Nth split node in pre-order and set its ratio (clamped to 0.1..0.9).
+    /// Find the Nth split node in pre-order and set its ratio (clamped to 0.1..0.9,
+    /// the generic per-step-resize floor — see [`Self::set_ratio_at_index_bounded`]).
     pub fn set_ratio_at_index(&mut self, split_index: usize, ratio: f64) -> bool {
-        self.set_ratio_at_index_impl(split_index, ratio, &mut 0)
+        self.set_ratio_at_index_bounded(split_index, ratio, 0.1, 0.9)
     }
 
-    fn set_ratio_at_index_impl(&mut self, target: usize, ratio: f64, counter: &mut usize) -> bool {
+    /// See `WindowLayout::set_ratio_at_index_bounded` — same role for the
+    /// editor-group split tree's `Engine::maximize_window_split` fallback
+    /// (#1289).
+    pub fn set_ratio_at_index_bounded(
+        &mut self,
+        split_index: usize,
+        ratio: f64,
+        min: f64,
+        max: f64,
+    ) -> bool {
+        self.set_ratio_at_index_impl(split_index, ratio, min, max, &mut 0)
+    }
+
+    fn set_ratio_at_index_impl(
+        &mut self,
+        target: usize,
+        ratio: f64,
+        min: f64,
+        max: f64,
+        counter: &mut usize,
+    ) -> bool {
         match self {
             GroupLayout::Leaf(_) => false,
             GroupLayout::Split {
@@ -832,11 +882,11 @@ impl GroupLayout {
                 let idx = *counter;
                 *counter += 1;
                 if idx == target {
-                    *r = ratio.clamp(0.1, 0.9);
+                    *r = ratio.clamp(min, max);
                     return true;
                 }
-                first.set_ratio_at_index_impl(target, ratio, counter)
-                    || second.set_ratio_at_index_impl(target, ratio, counter)
+                first.set_ratio_at_index_impl(target, ratio, min, max, counter)
+                    || second.set_ratio_at_index_impl(target, ratio, min, max, counter)
             }
         }
     }

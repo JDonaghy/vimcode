@@ -17551,6 +17551,87 @@ mod tests {
         );
     }
 
+    /// Column of the left pane's own per-window scrollbar-strip glyph
+    /// (`'⢸'`, painted at the right edge of *each* window's content area) on
+    /// the first content row that carries one — a stand-in for "where does
+    /// the left pane's content area end", located from painted content
+    /// rather than from `WindowLayout`'s ratio (#1289). In a `:vsplit` this
+    /// glyph paints once per pane per content row (two occurrences per row,
+    /// left pane's then right pane's), so the *first* hit is always the
+    /// left (active, maximized-into) pane's own strip, regardless of
+    /// whether the right pane is wide enough to paint one of its own.
+    fn left_pane_scrollbar_col(screen: &str) -> Option<usize> {
+        screen
+            .lines()
+            .find_map(|line| line.char_indices().find(|(_, c)| *c == '⢸').map(|(i, _)| i))
+    }
+
+    /// #1289 acceptance, painted-output tier: `CTRL-W |` (maximize width)
+    /// shrinks the *other* window down to its real `'winminwidth'` floor (1
+    /// column), not a fixed 90/10 split — so on a wide-enough terminal the
+    /// active (left) pane's content area, and so its own painted
+    /// right-edge scrollbar strip, should get pushed almost all the way to
+    /// the frame's right edge, not just to ~90% of the width.
+    ///
+    /// RED-verified against unfixed `develop`: restoring `develop`'s
+    /// `src/core/engine/windows.rs` + `src/core/window.rs` over the fix and
+    /// re-running moved the strip from column 101 (fresh 50/50 split) to
+    /// only column 169 on this test's 200-col frame — short of the `WIDTH -
+    /// 20` (180) assertion below, because the flat `0.9` ratio it used
+    /// ignores the split's actual raw column count. The fix instead lands
+    /// it at column 188.
+    ///
+    /// Same `tick()`-per-event-batch precondition as
+    /// `ctrl_w_resize_moves_the_split_boundary_by_an_absolute_count_via_shell_app`
+    /// (#1288's doc comment on that test has the full account): the
+    /// maximize math reads each window's *painted* raw column count via
+    /// `Engine::windows`, which only reflects reality once `tick`'s
+    /// post-paint `set_viewport_for_window` sync has run at least once after
+    /// the split.
+    #[test]
+    fn ctrl_w_bar_maximizes_width_to_the_real_winminwidth_floor_via_shell_app() {
+        const WIDTH: u16 = 200;
+        const HEIGHT: u16 = 30;
+
+        let mut driver = driver_with_shell(app_with_split_shaped_buffer(), config(), WIDTH, HEIGHT);
+        driver.tick();
+        driver.tick();
+        let before = left_pane_scrollbar_col(&driver.screen()).unwrap_or_else(|| {
+            panic!(
+                "fixture must paint a per-window scrollbar strip; screen:\n{}",
+                driver.screen()
+            )
+        });
+
+        driver.ctrl_char('w');
+        driver.type_char('|');
+        driver.tick();
+        let after = left_pane_scrollbar_col(&driver.screen()).unwrap_or_else(|| {
+            panic!(
+                "the maximized left pane must still paint its own \
+                 scrollbar strip after `<C-w>|`; screen:\n{}",
+                driver.screen()
+            )
+        });
+
+        assert!(
+            after > before,
+            "`<C-w>|` must push the left (active) pane's content area \
+             further right, not leave it in place; before col {before}, \
+             after col {after}; screen:\n{}",
+            driver.screen()
+        );
+        assert!(
+            after as u16 >= WIDTH - 20,
+            "`<C-w>|` must shrink the other window down to its real \
+             1-column 'winminwidth' floor, not a fixed 90/10 split — \
+             expected the active pane's scrollbar strip to land within 20 \
+             columns of the {WIDTH}-wide frame's right edge, got column \
+             {after}; screen:\n{}",
+            driver.screen()
+        );
+    }
+
     /// #722 acceptance, painted-output tier: a `:vsplit` must paint **two**
     /// independent minimap strips, one over each pane's own buffer — not a
     /// single strip pinned to whichever pane happens to be active.
