@@ -1066,29 +1066,40 @@ fn vertical_separator_cells(
             let a = &windows[i];
             let b = &windows[j];
 
-            // Window a is the left pane, b is the right pane. The boundary
-            // sits in the last column of a (`sep_x - 1`). Also require
+            // Window a is the left pane, b is the right pane. Also require
             // vertical overlap — windows from different groups may share an
             // x edge but not overlap in y (e.g. 2×2 grid).
             let v_overlap =
                 a.rect.y.max(b.rect.y) < (a.rect.y + a.rect.height).min(b.rect.y + b.rect.height);
-            if (a.rect.x + a.rect.width - b.rect.x).abs() < 1.0 && v_overlap {
-                // This boundary is an editor-group boundary, not a
-                // `:vsplit` one — leave it entirely to `group_divider_cells`
-                // (see this function's own doc comment).
+            if !v_overlap {
+                continue;
+            }
+            // #550: `a.rect`/`b.rect` are already absolute terminal-screen
+            // coordinates, so no `editor_area` offset addition needed.
+            let gap = b.rect.x - (a.rect.x + a.rect.width);
+            let y_start = a.rect.y.max(b.rect.y) as u16;
+            let y_end = (a.rect.y + a.rect.height).min(b.rect.y + b.rect.height) as u16;
+
+            if gap.abs() < 1.0 {
+                // Zero-gap adjacency: an editor-group boundary (`GroupLayout`
+                // still `SplitTreeMeasure::new(0.0)`) — `Vertical` window
+                // splits never land here post-#1326 (they always reserve the
+                // gap==1 column below), so this branch is now, in practice,
+                // exclusively the group-boundary case. Left entirely to
+                // `group_divider_cells` (see this function's own doc
+                // comment) — verified via `group_dividers`, not inferred
+                // from the gap alone, so a future zero-thickness window
+                // split (if one is ever added) wouldn't silently fall
+                // through here unpainted.
                 let is_group_boundary = group_dividers.iter().any(|d| {
                     d.direction == SplitDirection::Vertical && (d.position - b.rect.x).abs() < 1.0
                 });
                 if is_group_boundary {
                     continue;
                 }
-                // #550: `a.rect`/`b.rect` are already absolute terminal-screen
-                // coordinates, so no `editor_area` offset addition needed.
                 // See [`window_right_edge_cell`] for why the boundary column
                 // is not `(a.rect.x + a.rect.width) as u16`.
                 let sep_x = window_right_edge_cell(&a.rect);
-                let y_start = a.rect.y.max(b.rect.y) as u16;
-                let y_end = (a.rect.y + a.rect.height).min(b.rect.y + b.rect.height) as u16;
 
                 // #481 (iter4): `quadraui::tui::draw_editor` already paints
                 // window `a`'s own vertical scrollbar in this exact column
@@ -1110,6 +1121,20 @@ fn vertical_separator_cells(
                     for y in y_start..y_end {
                         cells.insert((sep_x.saturating_sub(1), y));
                     }
+                }
+            } else if (gap - 1.0).abs() < 1.0 {
+                // #1326: a real `:vsplit` window-split boundary reserves its
+                // own blank screen column (`WindowLayout::layout_snapped`,
+                // matching Neovim) — `sep_x` (`a`'s right edge) *is* that
+                // column, not one column inside `a`'s own content the way
+                // the zero-gap branch above has to paint. It never collides
+                // with `a`'s own right-edge scrollbar strip (that lives one
+                // column further in, inside `a.rect`), so — unlike the
+                // zero-gap case — the divider always paints, scrollbar or
+                // not.
+                let sep_x = window_right_edge_cell(&a.rect);
+                for y in y_start..y_end {
+                    cells.insert((sep_x, y));
                 }
             }
         }

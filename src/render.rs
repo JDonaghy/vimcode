@@ -22487,6 +22487,23 @@ pub trait DividerGeometry {
     fn axis_size(&self) -> f64;
     fn cross_start(&self) -> f64;
     fn cross_size(&self) -> f64;
+
+    /// Screen space consumed by the divider itself, along the split axis —
+    /// `axis_size() - divider_thickness()` is the *content* width/height the
+    /// split's `ratio` actually divides (see [`divider_ratio_from_pos`]).
+    /// Zero for every divider today except a `WindowDivider` in the
+    /// `Vertical` direction, which — unlike `GroupDivider`'s editor-group
+    /// splits, still `quadraui::SplitTreeMeasure::new(0.0)` — reserves one
+    /// screen column for Neovim's real vertical divider bar
+    /// (`WindowLayout::layout_snapped`, #1326). `position`/`axis_start`/
+    /// `axis_size` themselves are untouched by this (they describe what was
+    /// actually *painted*, which `divider_to_split`/`divider_hit_test` must
+    /// stay anchored to) — only the drag-to-ratio conversion needs to know
+    /// the reserved thickness, so it is its own method rather than folding
+    /// into `axis_size()`.
+    fn divider_thickness(&self) -> f64 {
+        0.0
+    }
 }
 
 impl DividerGeometry for GroupDivider {
@@ -22528,6 +22545,12 @@ impl DividerGeometry for WindowDivider {
     }
     fn cross_size(&self) -> f64 {
         self.cross_size
+    }
+    fn divider_thickness(&self) -> f64 {
+        match self.direction {
+            SplitDirection::Vertical => 1.0,
+            SplitDirection::Horizontal => 0.0,
+        }
     }
 }
 
@@ -22585,12 +22608,22 @@ pub fn divider_hit_test<D: DividerGeometry>(
 /// Given a divider being dragged and the current pointer position, compute
 /// the new split ratio (unclamped — `set_ratio_at_index` on both
 /// `GroupLayout` and `WindowLayout` already clamps to `0.1..0.9`).
+///
+/// Divides by `axis_size() - divider_thickness()`, not raw `axis_size()`
+/// (#1326): `WindowLayout::layout_snapped` interprets a `Vertical` split's
+/// `ratio` as a fraction of the *content* width (bounds width minus the
+/// reserved divider column), so a drag that instead divided by the full
+/// `axis_size()` would feed back a ratio the layout doesn't mean — a
+/// perceptible drift on a narrow split, since the denominators differ by a
+/// whole screen column. `GroupDivider`'s `divider_thickness()` is always
+/// zero, so this is a no-op there.
 pub fn divider_ratio_from_pos(div: &impl DividerGeometry, x: f64, y: f64) -> f64 {
     let mouse_pos = match div.direction() {
         SplitDirection::Vertical => x,
         SplitDirection::Horizontal => y,
     };
-    (mouse_pos - div.axis_start()) / div.axis_size()
+    let content_axis_size = (div.axis_size() - div.divider_thickness()).max(1.0);
+    (mouse_pos - div.axis_start()) / content_axis_size
 }
 
 /// Convert a [`DividerGeometry`] divider into the `(quadraui::Split,
@@ -26160,8 +26193,20 @@ mod tests {
         // gutter that keeps its own boundary clear of the pane's outermost
         // (scroll) column — see `scroll_gutter_width`'s doc comment. Turning
         // the minimap off reclaims that sliver along with the strip itself.
-        let expected_cols = minimap_reserved_width(&e, 120.0, 1.0, TUI_MINIMAP_SIZING) as usize
-            + scroll_gutter_width(0.0, 1.0) as usize;
+        //
+        // `.ceil()`, not a bare `as usize` truncation (#1326 review): a
+        // 120-wide pane's `minimap_reserved_width` happens to be exactly
+        // `18.0` here (`120 * MINIMAP_WIDTH_FRACTION`), so truncating vs.
+        // ceiling this specific fixture's width was never distinguishable —
+        // but `build_screen_layout`'s own `render_viewport_cols` computation
+        // (`floor(rect.width - minimap_w)`, `minimap_w` a continuous
+        // `f64`) reclaims `ceil(minimap_w)` columns whenever `minimap_w`
+        // isn't already a whole number, not `floor(minimap_w)`. See the
+        // split-pane test below, whose 79-column pane is the first fixture
+        // in this file to actually exercise a fractional `minimap_w`.
+        let expected_cols = (minimap_reserved_width(&e, 120.0, 1.0, TUI_MINIMAP_SIZING)
+            + scroll_gutter_width(0.0, 1.0))
+        .ceil() as usize;
 
         e.settings.minimap = false;
         let without = render_engine(&e, 120.0, 30.0);
@@ -26220,10 +26265,24 @@ mod tests {
             // either carries the same pane width `minimap_reserved_width`
             // expects. The expected reclaim adds `scroll_gutter_width`'s
             // one-column TUI gutter to the strip's own raw width, same as
-            // the single-window test above.
-            let expected_cols =
-                minimap_reserved_width(&e, w_without.rect.width, 1.0, TUI_MINIMAP_SIZING) as usize
-                    + scroll_gutter_width(0.0, 1.0) as usize;
+            // the single-window test above — `.ceil()`'d for the same
+            // reason (#1326 review, see that test's doc comment): a
+            // `:vsplit`'s two panes need not split evenly (#1326 reserves
+            // one column for the divider bar itself, so a fresh 160-wide
+            // `<C-w>v` here is 80/79, not 80/80), and an odd pane width
+            // like 79 gives `minimap_reserved_width` a genuinely
+            // fractional result (`79 * MINIMAP_WIDTH_FRACTION = 11.85`) —
+            // this is the fixture that first exercises that fractional
+            // case, where truncating instead of ceiling disagreed with
+            // `build_screen_layout`'s real reclaimed width by exactly one
+            // column.
+            let expected_cols = (minimap_reserved_width(
+                &e,
+                w_without.rect.width,
+                1.0,
+                TUI_MINIMAP_SIZING,
+            ) + scroll_gutter_width(0.0, 1.0))
+            .ceil() as usize;
             assert_eq!(
                 w_without.text_viewport_cols - w_with.text_viewport_cols,
                 expected_cols,
@@ -30064,10 +30123,12 @@ mod tests {
         );
 
         // The drag ratio is likewise anchored to `axis_start`: dragging to
-        // x=450 is 25% across the group, not 75% (which is what 450/600 would
-        // give if the origin were dropped).
+        // x=450 is ~25% across the group (150 of the 599-column content
+        // width — `axis_size` minus #1326's one reserved divider column,
+        // see `divider_ratio_from_pos`'s doc), not 75% (which is what
+        // 450/600 would give if the origin were dropped).
         let r = divider_ratio_from_pos(&dividers[0], 450.0, 300.0);
-        assert!((r - 0.25).abs() < 0.0001, "ratio = {r}");
+        assert!((r - 150.0 / 599.0).abs() < 0.0001, "ratio = {r}");
     }
 
     /// Companion to the above for the paint side: `divider_to_split` must

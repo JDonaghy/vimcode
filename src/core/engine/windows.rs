@@ -2,15 +2,20 @@ use super::*;
 
 /// A window's own `View::viewport_lines`/`viewport_cols` are content-space —
 /// chrome (each window's own status line) already subtracted, per
-/// `Engine::set_viewport_lines`'s doc. `WindowLayout`/`GroupLayout`'s ratio
-/// tree, by contrast, divides *raw* axis space (`SplitTreeMeasure::new(0.0)`
-/// reserves no chrome at all) — a Horizontal split's two windows' raw row
-/// counts sum to the tree's full axis size, each then losing one row to its
-/// own status line for display. Vertical splits have no equivalent per-window
-/// row/column chrome column here (see `resize_window_split`'s `#1288` doc),
-/// so columns round-trip unchanged. Used by `split_window_with_new_first` and
-/// `resize_window_split` to convert between the two spaces when recovering or
-/// redistributing a split's axis size (#1288).
+/// `Engine::set_viewport_lines`'s doc. `WindowLayout`'s ratio tree, by
+/// contrast, divides *raw* axis space — a Horizontal split's two windows'
+/// raw row counts sum to the tree's full axis size, each then losing one row
+/// to its own status line for display; a Vertical split's two windows' raw
+/// column counts sum to the tree's axis size *minus one* (`WindowLayout::
+/// layout_snapped`'s reserved divider column, #1326), not the full size.
+/// Vertical splits have no equivalent *per-window* row/column chrome column
+/// here (see `resize_window_split`'s `#1288` doc) — the divider column is a
+/// cost the *split* pays once, not each window individually — so a single
+/// window's own `raw_axis_extent` still round-trips through `viewport_cols`
+/// unchanged; only the *pair's* total is one column short of the bounds
+/// width. Used by `split_window_with_new_first` and `resize_window_split` to
+/// convert between the two spaces when recovering or redistributing a
+/// split's axis size (#1288).
 fn raw_axis_extent(view: &View, direction: SplitDirection) -> f64 {
     match direction {
         SplitDirection::Horizontal => view.viewport_lines as f64 + 1.0,
@@ -240,8 +245,19 @@ impl Engine {
             .map(|w| raw_axis_extent(&w.view, direction))
             .unwrap_or(0.0);
         if total_raw > 0.0 {
-            let first_raw = (total_raw * 0.5).round();
-            let second_raw = (total_raw - first_raw).max(0.0);
+            // #1326: a fresh `Vertical` split reserves one screen column for
+            // the divider bar itself, matching `WindowLayout::layout_snapped`
+            // (a fresh 80-column `<C-w>v` gives `40`/`39`, not `40`/`40`) —
+            // `content_total` is what the 0.5 split actually divides.
+            // `Horizontal` reserves nothing (each window's own status line
+            // already supplies the visual separation), so it round-trips
+            // unchanged.
+            let content_total = match direction {
+                SplitDirection::Vertical => (total_raw - 1.0).max(0.0),
+                SplitDirection::Horizontal => total_raw,
+            };
+            let first_raw = (content_total * 0.5).round();
+            let second_raw = (content_total - first_raw).max(0.0);
             let (new_raw, old_raw) = if new_first {
                 (first_raw, second_raw)
             } else {
@@ -3802,6 +3818,19 @@ impl Engine {
     /// already-integer current sizes instead means the result is only ever
     /// `count` away from an already-resolved integer, never a fresh tie.
     ///
+    /// #1326: `[count]` converts against `axis_size = first_raw + second_raw`
+    /// (`subtree_raw_extent`'s own doc), the sum of both children's *actual*
+    /// current content widths — which, thanks to `split_window_with_new_
+    /// first` and `WindowLayout::layout_snapped` both reserving `Vertical`'s
+    /// one-column divider consistently, already equals the split's content
+    /// width (raw axis size minus one), never the raw bounds width. No
+    /// separate divider-column subtraction is needed here: `new_ratio =
+    /// new_first_raw / axis_size`, and `layout_snapped` multiplies that same
+    /// ratio back by the identical content width, so the two cancel back out
+    /// to exactly `new_first_raw` — the same invariant a `Horizontal` split
+    /// (zero divider thickness, `axis_size` and content width always equal)
+    /// has always relied on.
+    ///
     /// #582: tries the active *window*'s split within its tab's
     /// `WindowLayout` first (vim `:split`/`:vsplit` panes) — this was
     /// entirely unwired before (Ctrl-W resize only ever touched
@@ -3895,7 +3924,9 @@ impl Engine {
     /// fixed 23-row budget happens to round down to the same 1-content-row
     /// floor Neovim uses. Works in the same integer raw-line/column space as
     /// `resize_window_split` (#1288) for the same reason — see that
-    /// function's doc.
+    /// function's doc, including #1326's note on why `axis_size` here is
+    /// already the divider-reserved content width for `Vertical` splits and
+    /// needs no separate adjustment.
     pub(crate) fn maximize_window_split(&mut self, direction: SplitDirection) {
         let active_window = self.active_window_id();
         if let Some((split_idx, split_dir, is_first)) =

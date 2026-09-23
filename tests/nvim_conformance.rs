@@ -2638,27 +2638,26 @@ fn run_jumps_case(case: &MultiJumpsCase) -> Outcome {
 // Every leaf carries `rows`/`cols` (Neovim's `nvim_win_get_height`/`_width`,
 // vimcode's own `WindowLayout::calculate_rects` against the same pinned
 // 80x24 screen), but the comparison only *looks* at them when
-// `check_size` is set — see the [`KNOWN_DEVIATIONS_WIN`] entries for the
-// real, distinct behavioural gaps this surfaced (a resize-unit mismatch, a
-// partial vs full maximize, and a rect-rounding artifact — the rotate
-// identity gap this harness also found, #1291, is now fixed). Two of the
-// size-checked ids, `CTRL-W +`
-// and `_`, genuinely pass — not vacuously: both land on the *same* rows/cols
-// as Neovim on this harness's fixed 80x24 screen, which is worth noting
-// precisely because it means a couple of quick hand-tests of this family
-// would not have caught the `-`/`<`/`>`/`\|` siblings' real divergence.
+// `check_size` is set — see the [`KNOWN_DEVIATIONS_WIN`] comment block below
+// for the real, distinct behavioural gaps this surfaced along the way (a
+// resize-unit mismatch, a partial vs full maximize, a rect-rounding
+// artifact, and a divider-thickness gap — all now fixed). Every size-checked
+// id, `CTRL-W +`/`-`/`<`/`>`/`_`/`\|`, genuinely passes — not vacuously: all
+// six land on the *same* rows/cols as Neovim on this harness's fixed 80x24
+// screen.
 //
 // ## What's deliberately out of scope here
 //
 // `CTRL-W H`/`J`/`K`/`L`/`T`/`e`/`E`/`d` are not covered by any
 // [`CASES_WIN`] entry — see the "Deliberate semantic divergence" block in
-// [`COVERAGE_EXEMPT`] for why each is permanent, not debt. Every other id
-// with a case in [`KNOWN_DEVIATIONS_WIN`] (currently just `<`/`>`/`\|`,
-// after `-`/`=`/`r`/`R`/`p` each got fixed and removed) is a real,
-// non-vacuous finding, not a permanent divergence — each one's own comment
-// there names the fix it's waiting on. Cross-file/cross-tab
-// commands (`gf`, `gt`, `CTRL-^`, buffer/tab/window ex commands) that could
-// reuse this same harness are #1281, chained after this one.
+// [`COVERAGE_EXEMPT`] for why each is permanent, not debt. [`KNOWN_
+// DEVIATIONS_WIN`] is currently empty (every id it ever listed — `-`/`=`/
+// `r`/`R`/`p`/`<`/`>`/`\|` — got fixed and removed); were it to gain an
+// entry again, that entry would be a real, non-vacuous finding, not a
+// permanent divergence — the convention this file's comments have followed
+// throughout is that every entry names the fix it's waiting on. Cross-file/
+// cross-tab commands (`gf`, `gt`, `CTRL-^`, buffer/tab/window ex commands)
+// that could reuse this same harness are #1281, chained after this one.
 // ---------------------------------------------------------------------------
 
 /// One scenario for the window-layout harness: `lines` is written to
@@ -9101,13 +9100,13 @@ const CASES_WIN: &[WinCase] = &[
         1,
         "<C-w>s5<C-w>+<C-w>=",
     ),
-    // `CTRL-W +`: a real, non-vacuous PASS — percentage-based resize
-    // (`resize_window_split`'s `delta_per_step = 0.05`) happens to land on
-    // the exact same (rows, cols) as Neovim's absolute-line resize for
-    // [count]=5 on this harness's fixed 80x24, 2-window starting split. See
-    // the module doc and KNOWN_DEVIATIONS_WIN's `-`/`<`/`>` entries, where
-    // the same percentage-vs-line mismatch does NOT coincidentally cancel
-    // out.
+    // `CTRL-W +`/`-`: both real, non-vacuous PASSes since #1288 — the
+    // absolute-`[count]` resize math (`resize_window_split`) lands on the
+    // exact same (rows, cols) as Neovim for both directions on this
+    // harness's fixed 80x24, 2-window starting split; Horizontal splits have
+    // no divider-column gap to account for (see follow-up #6/#1326 in the
+    // KNOWN_DEVIATIONS_WIN comment block above), so there was never a second
+    // bug hiding behind the original percentage-vs-line one here.
     wc_sized(
         "win:CTRL-W + increases the active window's height",
         WIN_TWO_LINES,
@@ -9115,9 +9114,6 @@ const CASES_WIN: &[WinCase] = &[
         1,
         "<C-w>s5<C-w>+",
     ),
-    // #1162 finding: same percentage-vs-line mismatch as `+` above, but
-    // this starting size/count does NOT coincidentally agree. See
-    // KNOWN_DEVIATIONS_WIN.
     wc_sized(
         "win:CTRL-W - decreases the active window's height",
         WIN_TWO_LINES,
@@ -9125,6 +9121,15 @@ const CASES_WIN: &[WinCase] = &[
         1,
         "<C-w>s5<C-w>-",
     ),
+    // `CTRL-W <`/`>`: real, non-vacuous PASSes since #1326 — `<C-w>v10<C-w><`
+    // ends up (30, 49) and `<C-w>v10<C-w>>` (50, 29), i.e. Neovim's real
+    // 40/39-of-80 divider-reserving fresh split moved by an absolute
+    // `[count]` columns. Before #1326, #1288's resize math was already
+    // correct (the active, resized window's own width matched Neovim
+    // exactly), but the *other* window was one column too wide —
+    // `WindowLayout::layout_snapped` reserved zero columns for the vertical
+    // divider bar Neovim's own layout always has. See the KNOWN_DEVIATIONS_
+    // WIN comment block's follow-up #6 for the full diagnosis.
     wc_sized(
         "win:CTRL-W < decreases the active window's width",
         WIN_TWO_LINES,
@@ -9139,12 +9144,15 @@ const CASES_WIN: &[WinCase] = &[
         1,
         "<C-w>v10<C-w>>",
     ),
-    // `CTRL-W _`: also a real, non-vacuous PASS — `maximize_window_split`
-    // shrinks the other window to exactly Neovim's own `'winminheight'`
-    // floor (1 content row). `CTRL-W \|` (#1289, fixed for the ratio math)
-    // still fails, but only for the same pre-existing divider-thickness
-    // reason as `<`/`>` above, not a ratio mismatch anymore — see
-    // KNOWN_DEVIATIONS_WIN.
+    // `CTRL-W _`: a real, non-vacuous PASS since #1289 — `maximize_window_
+    // split` shrinks the other window to exactly Neovim's own
+    // `'winminheight'` floor (1 content row); Horizontal splits have no
+    // divider-column analogue, so there was no second bug to find here
+    // either. `CTRL-W \|` needed the same #1326 divider-column fix as
+    // `<`/`>` above (vimcode's fixed split used to give the other window
+    // exactly 1 of its own 80-column total — `79`/`1` — where Neovim's real
+    // split is `78`/`1` of a 79-column *content* total) and is now a real,
+    // non-vacuous PASS too.
     wc_sized(
         "win:CTRL-W _ maximizes the active window's height",
         WIN_TWO_LINES,
@@ -12960,12 +12968,14 @@ fn nvim_conformance_jumplist_multi_file() {
 //
 // ## Follow-up issue status (read before editing any entry below)
 //
-// All 5 fixes below now have filed GitHub issues: #1288, #1289, #1290,
-// #1291, #1292 respectively (filed 2026-09-22). The worker session that
-// wrote this harness ran under a policy that forbids it from running `gh` —
-// issue filing is reserved for the coordinator, not individual work
-// sessions — so the title/body to file was spelled out here first; it is
-// kept below verbatim as the diagnosis record for each filed issue:
+// All 6 fixes below have filed GitHub issues: #1288, #1289, #1290, #1291,
+// #1292, #1326 respectively (#1288–#1292 filed 2026-09-22; #1326 filed as
+// the remainder #1288/#1289 left behind, recorded only in this file's
+// comments at the time — see below). The worker session that wrote this
+// harness ran under a policy that forbids it from running `gh` — issue
+// filing is reserved for the coordinator, not individual work sessions — so
+// the title/body to file was spelled out here first; it is kept below
+// verbatim as the diagnosis record for each filed issue:
 //
 //   1. (#1288) "win:CTRL-W -/</> resize by absolute count, not a fixed ratio step"
 //      — resize_window_split moves the split ratio by a fixed 5% per count
@@ -12973,9 +12983,8 @@ fn nvim_conformance_jumplist_multi_file() {
 //      lines/columns. Fix: convert the absolute delta into a ratio delta
 //      against WindowLayout::dividers's axis_size. FIXED for the height case
 //      (`-`, and `+`/`_` were already coincidentally-then-genuinely correct);
-//      `<`/`>` (width) still fail post-fix, but now for a *different*,
-//      previously-undiagnosed reason — see the `KNOWN_DEVIATIONS_WIN` entry
-//      comment for those two labels below.
+//      `<`/`>` (width) still failed post-fix, but for a *different*,
+//      previously-undiagnosed reason — see follow-up #6 (#1326) below.
 //   2. (#1289) "win:CTRL-W | give the current window a true winminwidth maximize"
 //      — maximize_window_split's 0.9/0.1 ratio happens to match Neovim's
 //      real "shrink the other window to its 'winminheight' minimum"
@@ -12987,18 +12996,13 @@ fn nvim_conformance_jumplist_multi_file() {
 //      since neither setting is wired up as a real `Settings` field yet)
 //      instead of a fixed ratio — same integer raw-line/column-space
 //      approach #1288 used for `resize_window_split`, for the same reason.
-//      `CTRL-W |` still fails post-fix, but — like `<`/`>` above — now for
-//      the *same*, already-diagnosed divider-thickness reason, not the
-//      fixed-ratio one: vimcode's `1` in `79/80` is provably the right
-//      *ratio* (Neovim's own two windows are `78`/`1` of a 79-content-column
-//      total, i.e. also "everything but 1 column" to the other side), but
-//      vimcode's total (`80`) doesn't reserve the 1-column divider Neovim's
-//      does, so the active side's absolute count is off by exactly one
-//      column (`79` vs `78`) — see the `<`/`>` entry's comment below for the
-//      root cause. `CTRL-W _` needed no such fix: Horizontal splits have no
-//      divider-column analogue (each window's own status line already
-//      supplies the visual separation), so it was already a real,
-//      non-coincidental pass before and after this change.
+//      `CTRL-W |` still failed post-fix, but — like `<`/`>` above — for the
+//      *same*, already-diagnosed divider-thickness reason, not the
+//      fixed-ratio one — see follow-up #6 (#1326) below. `CTRL-W _` needed
+//      no such fix: Horizontal splits have no divider-column analogue (each
+//      window's own status line already supplies the visual separation), so
+//      it was already a real, non-coincidental pass before and after this
+//      change.
 //   3. (#1290) "win:CTRL-W = fix off-by-one rect rounding on odd-sized splits"
 //      — WindowLayout::calculate_rects (SplitTreeMeasure::new(0.0)) rounded
 //      each child's share of a split independently instead of giving one
@@ -13027,94 +13031,39 @@ fn nvim_conformance_jumplist_multi_file() {
 //      window-focus-changing call site (cycle_next_window/cycle_prev_window/
 //      activate_window/set_cursor_for_window/mouse click — ~20 sites per a
 //      #1162 audit).
+//   6. (#1326) "win:CTRL-W </>/\| leave the other window one column too wide"
+//      — Neovim reserves one screen column for a `Vertical` split's divider
+//      bar (confirmed empirically — a fresh 80-column `<C-w>v` gives
+//      Neovim's two windows 40/39, not 40/40), but `WindowLayout::
+//      layout_snapped` hardcoded zero divider thickness for both split
+//      directions, so a vertical split's column widths always summed to the
+//      full bounds width. For `<`/`>`, the resized (active) window's own
+//      width already matched Neovim (#1288's ratio math was correct); only
+//      the *other* window was one column too wide. For `\|`, vimcode split
+//      79/1 of 80 columns where Neovim splits 78/1 of a 79-column content
+//      area. FIXED: `layout_snapped`'s `Vertical` arm now reserves one
+//      column for the divider (the boundary is still rounded exactly once
+//      against the reduced content width, per #1290's tie-break), and
+//      `split_window_with_new_first` reserves it too when seeding a fresh
+//      split's initial sizes, so `resize_window_split`/`maximize_window_
+//      split`'s existing `axis_size` (already the sum of both windows' own
+//      *current* content widths, never the raw bounds width) stays the
+//      content width post-fix without any change to either function's own
+//      math. `Horizontal` splits are unaffected: each window's own status
+//      line already supplies the visual separation, and `-`/`+`/`_` were
+//      already real, non-coincidental passes.
 //
-// None of the 5 was attempted in #1162 itself: each is a bigger, more
+// None of the 6 was attempted in #1162 itself: each is a bigger, more
 // failure-prone change (rewriting window resize math, reworking a shared
-// rect-rounding routine, restructuring rotate's identity model, or adding
-// focus-tracking to ~20 call sites) than "generalise the harness" should
-// carry in the same slice. Kept as real, non-vacuous KNOWN_DEVIATIONS_WIN
-// findings rather than silently dropped or mis-classified as passing.
+// rect-rounding routine, restructuring rotate's identity model, adding
+// focus-tracking to ~20 call sites, or reserving a divider column through
+// every consumer of `WindowLayout`'s geometry) than "generalise the harness"
+// should carry in the same slice. Kept as real, non-vacuous
+// KNOWN_DEVIATIONS_WIN findings rather than silently dropped or
+// mis-classified as passing.
 // ---------------------------------------------------------------------------
 
-const KNOWN_DEVIATIONS_WIN: &[&str] = &[
-    // Follow-up #1 above ("resize by absolute count, not a fixed ratio
-    // step") — filed as #1288, fixed: `resize_window_split` now converts
-    // the absolute `[count]` into a ratio delta against the split's actual
-    // current axis size (`Engine::resize_window_split`'s doc has the full
-    // account, including why the conversion has to stay in integer raw-
-    // line/column space, not a continuous ratio delta, to avoid a fresh
-    // #1290-style rounding tie). "win:CTRL-W - decreases the active
-    // window's height" is now a real, non-vacuous pass and was removed
-    // from this list — `CTRL-W +`/`_` were already real, non-coincidental
-    // passes once #1288 landed (they only *looked* coincidental before, per
-    // the old comment here).
-    //
-    // `<`/`>` (width) are *not* removed: #1288's ratio math is provably
-    // correct for them too — the active (first, resized) window's own size
-    // matches Neovim exactly (e.g. `<C-w>v10<C-w><` lands both sides on 30
-    // columns) — but the *other* window is off by exactly one column
-    // (vimcode's 50, Neovim's 49). Root cause is a second, distinct,
-    // pre-existing bug: Neovim reserves one screen column for the vertical
-    // split's divider bar (confirmed empirically — a fresh 80-column
-    // `<C-w>v` gives Neovim's two windows 40/39, not 40/40), but
-    // `WindowLayout`/`GroupLayout::calculate_rects` always calls
-    // `quadraui::SplitTreeMeasure::new(0.0)` — zero divider thickness — so
-    // vimcode's column totals always sum to the full bounds width with
-    // nothing reserved. Horizontal splits have no equivalent gap (each
-    // window's own status line already visually separates it, and that
-    // chrome is already accounted for on both sides), which is why `-`
-    // above has no analogous residual mismatch. This divider-thickness gap
-    // looks like the same root cause follow-up #3 below (#1290) diagnosed
-    // for *rect rounding* on an odd axis, but is a different symptom (an
-    // even axis, off by a column that's never reserved at all rather than
-    // one that's rounded twice) — flagging here rather than silently
-    // folding it into #1290's existing scope in case it turns out to need
-    // its own issue.
-    "win:CTRL-W < decreases the active window's width",
-    "win:CTRL-W > increases the active window's width",
-    // Follow-up #2 above ("true winminwidth maximize") — filed as #1289,
-    // fixed for the *ratio* math: `maximize_window_split` now shrinks the
-    // other window down to a real, size-derived `'winminwidth'` floor
-    // instead of a fixed 0.1 ratio (10% of 80 columns is well above the
-    // floor; the fix's own `min_raw_extent` hardcodes it to Neovim's
-    // shared default of 1, same as `'winminheight'`, since neither setting
-    // is wired up as a real `Settings` field yet). `CTRL-W \|` still fails
-    // post-fix, but now for the *same* divider-thickness reason as `<`/`>`
-    // just above, not the fixed-ratio one: vimcode's fixed split gives the
-    // other window exactly 1 of its own 80-column total (`79`/`1`), but
-    // Neovim reserves 1 of those 80 columns for the vertical divider bar
-    // first, so its equivalent "everything but 1 column" is `78`/`1` of a
-    // 79-column *content* total — same off-by-one root cause, different
-    // maximize-vs-resize entry point. `CTRL-W _` needed no such fix and
-    // stays a real, non-coincidental pass: Horizontal splits have no
-    // divider-column analogue (each window's own status line already
-    // supplies the visual separation).
-    "win:CTRL-W | maximizes the active window's width",
-    // Follow-up #3 above ("off-by-one rect rounding on odd-sized splits")
-    // — filed as #1290, FIXED: `WindowLayout::calculate_rects`/`dividers`
-    // now round each split's boundary exactly once (giving the exact
-    // integer remainder to the second child) instead of rounding each
-    // child's own float share independently, so a `.5`/`.5` tie (e.g.
-    // `equalize_splits`'s exact `ratio = 0.5` on an odd axis) no longer
-    // sends both children through the same half-up tie-break — see that
-    // method's doc for the fix and the live-`nvim`-verified 12/11 tie-break
-    // direction. "win:CTRL-W = re-equalizes windows after a resize" is now
-    // a real, non-vacuous pass and was removed from this list.
-    // Follow-up #4 above ("rotate window identity, not just content") —
-    // filed and FIXED as #1291: `rotate_windows` now reorders `WindowId`s
-    // in the tree instead of swapping content across static slots, so
-    // focus follows the window. "win:CTRL-W r/R rotate windows
-    // downward/rightward"/"upward/leftward" are now real, non-vacuous
-    // passes and were removed from this list.
-    // Follow-up #5 above ("track Tab::prev_window") — filed and FIXED as
-    // #1292: `Tab::prev_window` now records the window that was active
-    // before the current one at every focus-changing call site
-    // (`Tab::focus_window`), and `execute_wincmd`'s `'p'` arm prefers it
-    // over the pre-existing `prev_active_group` editor-group toggle
-    // whenever the current tab has a valid (still-open) previous window.
-    // "win:CTRL-W p returns to the previously active window" is now a
-    // real, non-vacuous pass and was removed from this list.
-];
+const KNOWN_DEVIATIONS_WIN: &[&str] = &[];
 
 #[test]
 fn nvim_conformance_windows() {
@@ -27130,15 +27079,19 @@ const NORMAL_AUDIT: &[NormAudit] = &[
         )),
         Some(Label("win:C-w < shrinks the width")),
         concat!(
-            "decreases the current window's width by an absolute [count] ",
-            "screen columns (#1288): the 80-column recording's fresh ",
-            "vertical split is 40/40, and the default [count]=1 moves the ",
-            "boundary one column, 40 to 39 of 80, i.e. ratio 0.50 to 0.49 ",
-            "(was a fixed-5% 0.45 before #1288). The active window's own ",
-            "width now matches Vim exactly; the oracle label stays in ",
-            "KNOWN_DEVIATIONS_WIN for a second, unrelated bug — vimcode ",
-            "reserves no screen column for the vertical divider, so the ",
-            "*other* window is one column wider than Vim's.",
+            "matches Vim: decreases the current window's width by an ",
+            "absolute [count] screen columns (#1288). The 80-column ",
+            "recording's fresh vertical split reserves one column for the ",
+            "divider bar (#1326: 40/39, not 40/40), and the default ",
+            "[count]=1 moves the boundary one column within that ",
+            "79-column content total: 40 to 39, i.e. ratio 0.50 to ",
+            "39/79 = 0.4937 — rounded to 2 decimal places here, that's the ",
+            "same 0.49 the pre-#1326 (undivided) 39/80 = 0.4875 also ",
+            "rounds to, so this row's own displayed ratio didn't change; ",
+            "it was the *other* window's width (not recorded by this ",
+            "ratio-only audit — see `win:CTRL-W < decreases the active ",
+            "window's width` in `CASES_WIN` for the pixel-size proof) that ",
+            "was wrong before #1326, per KNOWN_DEVIATIONS_WIN's history.",
         ),
     ),
     na(
@@ -27181,16 +27134,20 @@ const NORMAL_AUDIT: &[NormAudit] = &[
             1,
             1,
             "",
-            "(v0.51 2* 1) tabs=1/1",
+            "(v0.52 2* 1) tabs=1/1",
         )),
         Some(Label("win:C-w > grows the width")),
         concat!(
-            "increases the current window's width by an absolute [count] ",
-            "screen columns (#1288) — the mirror of `CTRL-W <` above, so ",
-            "the same 40/40-of-80 fresh split moves its boundary one ",
-            "column the other way: 40 to 41 of 80, i.e. ratio 0.50 to 0.51 ",
-            "(was a fixed-5% 0.55 before #1288). Same divider-column caveat ",
-            "as `CTRL-W <` for the oracle label.",
+            "matches Vim: increases the current window's width by an ",
+            "absolute [count] screen columns (#1288) — the mirror of ",
+            "`CTRL-W <` above, so the same 40/39-of-80 fresh split (#1326: ",
+            "one column reserved for the divider bar) moves its boundary ",
+            "one column the other way within its 79-column content total: ",
+            "40 to 41, i.e. ratio 0.50 to 41/79 = 0.5190, rounded here to ",
+            "0.52. Unlike `CTRL-W <`, this one *does* move the displayed ",
+            "ratio versus the pre-#1326 39/80... 41/80 = 0.5125 -> 0.51: ",
+            "past the split's midpoint, `content_width - 1` shifts which ",
+            "2-decimal bucket the rounded fraction lands in.",
         ),
     ),
     na(
@@ -28095,8 +28052,14 @@ const NORMAL_AUDIT: &[NormAudit] = &[
             "there and never did for width, where 10% of this fixture's ",
             "80-column default is well above Neovim's 1-column ",
             "'winminwidth' floor. Now shrinks the other window down to ",
-            "that real 1-column floor instead: 79 of 80, ratio 0.9875, ",
-            "rendered here to 2 decimal places as 0.99.",
+            "that real 1-column floor instead — #1326: within the ",
+            "79-column content total a fresh vertical split reserves for ",
+            "the divider bar (40/39, not 40/40), that's 78 of 79, ratio ",
+            "0.9873, which rounds to the same 0.99 displayed here as the ",
+            "pre-#1326 (undivided) 79/80 = 0.9875 also did — this row's ",
+            "own ratio didn't move, only the *other* window's now-correct ",
+            "width did (see `win:CTRL-W | maximizes the active window's ",
+            "width` in `CASES_WIN` for the pixel-size proof).",
         ),
     ),
     na(

@@ -415,12 +415,13 @@ impl WindowLayout {
     /// [`Self::dividers`] — see [`Self::calculate_rects`]'s doc for why
     /// this rounds the split boundary itself rather than delegating to
     /// `quadraui::SplitTree::layout` the way `GroupLayout` still does.
-    /// `WindowLayout` splits always reserve zero divider thickness (each
-    /// window's own status line already supplies the visual separation for
-    /// `Horizontal` splits; `Vertical` splits' real one-column Neovim gap
-    /// is a separate, not-yet-fixed issue — see `KNOWN_DEVIATIONS_WIN`'s
-    /// `<`/`>`/`\|` entries), so it's hardcoded rather than threaded
-    /// through as a parameter no call site would ever set non-zero.
+    /// `Horizontal` splits reserve zero divider thickness (each window's own
+    /// status line already supplies the visual separation); `Vertical`
+    /// splits reserve exactly one screen column for the divider bar itself,
+    /// matching Neovim (#1326) — see the `Vertical` arm below for the
+    /// boundary math. Both are hardcoded rather than threaded through as a
+    /// parameter: no call site would ever want a different thickness for
+    /// either direction.
     fn layout_snapped(
         &self,
         bounds: WindowRect,
@@ -441,13 +442,41 @@ impl WindowLayout {
                 let clamped = ratio.clamp(0.0, 1.0);
                 let (first_bounds, second_bounds, divider) = match direction {
                     // left/right: split bounds.width, boundary rounds `x`.
+                    //
+                    // #1326: Neovim sets aside one screen column for the
+                    // vertical divider bar itself (a fresh 80-column `<C-w>v`
+                    // gives `40`/`39`, not `40`/`40`) — `content_width` is
+                    // what `ratio` actually divides, one less than the raw
+                    // bounds width, with the spare column landing as the gap
+                    // between `first_b`'s far edge and `second_b`'s near
+                    // edge (`second_b` starts at `boundary + 1`, absorbing
+                    // the whole cost so `first_b`'s width — and therefore
+                    // `Engine::resize_window_split`/`maximize_window_split`'s
+                    // absolute-`[count]` math, which targets `first_b`'s
+                    // width directly — is untouched by this change; see
+                    // those functions' docs). The boundary itself is still
+                    // rounded exactly once against `content_width` (#1290's
+                    // tie-break survives unchanged: a `.5` tie always favours
+                    // the first child). `GroupDivider::axis_size` keeps the
+                    // *raw* `bounds.width` (not `content_width`) — it feeds
+                    // paint/hit-test geometry (`render::divider_to_split`/
+                    // `divider_hit_test`), which must stay anchored to what
+                    // was actually painted; only `render::divider_ratio_from_
+                    // pos`'s drag math needs the content-width denominator,
+                    // via `DividerGeometry::divider_thickness`.
                     SplitDirection::Vertical => {
                         let far = bounds.x + bounds.width;
-                        let boundary = (bounds.x + bounds.width * clamped).round();
+                        let content_width = (bounds.width - 1.0).max(0.0);
+                        let boundary = (bounds.x + content_width * clamped).round();
                         let first_b =
                             WindowRect::new(bounds.x, bounds.y, boundary - bounds.x, bounds.height);
-                        let second_b =
-                            WindowRect::new(boundary, bounds.y, far - boundary, bounds.height);
+                        let second_start = boundary + 1.0;
+                        let second_b = WindowRect::new(
+                            second_start,
+                            bounds.y,
+                            (far - second_start).max(0.0),
+                            bounds.height,
+                        );
                         let div = GroupDivider {
                             split_index: idx,
                             direction: *direction,
@@ -1287,12 +1316,60 @@ mod tests {
         let rects = layout.calculate_rects(bounds);
 
         assert_eq!(rects.len(), 2);
-        // First window should be left half
+        // First window should be (about) the left half...
         assert!((rects[0].1.width - 400.0).abs() < 0.001);
         assert!((rects[0].1.x - 0.0).abs() < 0.001);
-        // Second window should be right half
-        assert!((rects[1].1.width - 400.0).abs() < 0.001);
-        assert!((rects[1].1.x - 400.0).abs() < 0.001);
+        // ...and the second window one column narrower (#1326: one of the
+        // 800 columns is reserved for the vertical divider bar, matching
+        // Neovim — the two widths sum to 799, not 800), starting one column
+        // past the first window's far edge.
+        assert!((rects[1].1.width - 399.0).abs() < 0.001);
+        assert!((rects[1].1.x - 401.0).abs() < 0.001);
+    }
+
+    /// #1326: a fresh 80-column `<C-w>v` must give `40`/`39`, not `40`/`40`
+    /// — Neovim reserves one screen column for the vertical divider bar
+    /// itself (confirmed empirically against a live `nvim --headless`).
+    #[test]
+    fn test_calculate_rects_vsplit_reserves_one_column_for_divider_1326() {
+        let mut layout = WindowLayout::leaf(WindowId(1));
+        layout.split_at(WindowId(1), SplitDirection::Vertical, WindowId(2), false);
+
+        let bounds = WindowRect::new(0.0, 0.0, 80.0, 24.0);
+        let rects = layout.calculate_rects(bounds);
+
+        assert!((rects[0].1.width - 40.0).abs() < 0.001, "{:?}", rects[0]);
+        assert!((rects[1].1.width - 39.0).abs() < 0.001, "{:?}", rects[1]);
+        assert!(
+            (rects[0].1.width + rects[1].1.width - 79.0).abs() < 0.001,
+            "the two widths must sum to bounds.width - 1, not bounds.width: {:?}",
+            rects
+        );
+
+        // The divider itself sits in the one-column gap between the two
+        // windows (`Self::dividers`' own boundary position), not painted
+        // over either window's own rect.
+        let dividers = layout.dividers(bounds, &mut 0);
+        assert_eq!(dividers.len(), 1);
+        assert!((dividers[0].position - 40.0).abs() < 0.001);
+        let first_far = rects[0].1.x + rects[0].1.width;
+        let second_near = rects[1].1.x;
+        assert!((first_far - dividers[0].position).abs() < 0.001);
+        assert!((second_near - (dividers[0].position + 1.0)).abs() < 0.001);
+    }
+
+    /// A `Horizontal` split, unlike `Vertical`, reserves no divider row —
+    /// each window's own status line already supplies the visual
+    /// separation (#1326's scope is `Vertical` only).
+    #[test]
+    fn test_calculate_rects_hsplit_reserves_no_divider_row() {
+        let mut layout = WindowLayout::leaf(WindowId(1));
+        layout.split_at(WindowId(1), SplitDirection::Horizontal, WindowId(2), false);
+
+        let bounds = WindowRect::new(0.0, 0.0, 80.0, 24.0);
+        let rects = layout.calculate_rects(bounds);
+
+        assert!((rects[0].1.height + rects[1].1.height - 24.0).abs() < 0.001);
     }
 
     /// #1290: on an odd axis, a `.5`/`.5` tie must round the split
@@ -1351,7 +1428,10 @@ mod tests {
         assert!(layout.set_ratio_at_index(0, 0.7));
         let bounds = WindowRect::new(0.0, 0.0, 1000.0, 600.0);
         let rects = layout.calculate_rects(bounds);
-        assert!((rects[0].1.width - 700.0).abs() < 0.001);
+        // #1326: ratio divides the 999-column content width (1000 minus the
+        // reserved divider column), so 0.7 of 999 rounds to 699, not 700 —
+        // the second window absorbs the reserved column instead.
+        assert!((rects[0].1.width - 699.0).abs() < 0.001);
         assert!((rects[1].1.width - 300.0).abs() < 0.001);
         // Clamping
         assert!(layout.set_ratio_at_index(0, 0.05));
@@ -1368,7 +1448,8 @@ mod tests {
         layout.adjust_ratio_at_index(0, 0.2);
         let bounds = WindowRect::new(0.0, 0.0, 1000.0, 600.0);
         let rects = layout.calculate_rects(bounds);
-        assert!((rects[0].1.width - 700.0).abs() < 0.001); // 0.5 + 0.2
+        // 0.5 + 0.2 = 0.7 of the 999-column content width (#1326) → 699.
+        assert!((rects[0].1.width - 699.0).abs() < 0.001);
     }
 
     #[test]
