@@ -4209,6 +4209,18 @@ fn handle_focus_owner_key(
         // is handled above, and `dispatch_sc_sidebar_key_unified` (like
         // GTK's `map_gtk_key_with_unicode`) already ignores any letter it
         // doesn't recognise.
+        //
+        // Deliberate incidental fix, called out per review (non-blocking,
+        // #1249 iteration 1): the old SC-local shift resolver only
+        // uppercased `is_ascii_lowercase()` characters, so under
+        // keyboard-enhanced (kitty) terminals a `Shift+/` (`Char('/') +
+        // shift`) resolved to the literal `'/'` — matching the old
+        // whitelist's own `'/'` entry — instead of `'?'`. `shift_map_us`
+        // resolves it correctly to `'?'`, which is what a non-kitty
+        // terminal (or GTK) already sends for that chord. Narrow (kitty
+        // keyboard protocol only) and one-directional (fixes a wrong
+        // character, doesn't drop one), so left as this comment rather than
+        // a dedicated driver test.
         let (key_str, unicode): (String, Option<char>) = match key_val {
             Key::Char(_) => {
                 let plain_modifiers = quadraui::Modifiers {
@@ -13279,17 +13291,22 @@ mod tests {
 
     /// #1249: before `handle_focus_owner_key`'s Settings-panel char table
     /// was replaced with a straight `c.to_string()`/`Some(c)` pass-through,
-    /// `Key::Char('j'|'k'|'h'|'l'|' ')` were each remapped to their own
+    /// `Key::Char('j'|'k'|'h'|'l'|' '|'/')` were each remapped to their own
     /// nav-key name with `unicode: None`, so typing any of them into the
     /// settings search filter did nothing (the text-input branch only ever
     /// reads `unicode`); and `Key::Char('q')` was renamed to `"Escape"`, so
     /// typing `q` closed the search box outright instead of appending the
     /// letter.
     ///
+    /// Covers all seven characters the doc comment on the fixed arm claims
+    /// (review non-blocking finding on #1249 iteration 1: the test used to
+    /// cover six of the seven and silently drop `'/'` from the loop even
+    /// though the comment listed it).
+    ///
     /// RED-verified: reverting this commit's `shell_app.rs` change while
     /// keeping this test fails the assertion below — the first keypress
     /// ('q') closes the search box, so the query stays empty and never
-    /// reaches `"qj khl"`.
+    /// reaches `"qj khl/"`.
     #[test]
     fn settings_search_filter_accepts_letters_the_old_hand_written_table_dropped_via_shell_app() {
         let mut app = TuiShellApp::new_for_test();
@@ -13301,9 +13318,9 @@ mod tests {
         app.sidebar.has_focus = true;
 
         let mut driver = driver_with_shell(app, config(), 100, 24);
-        // Every one of these six characters used to be dropped (or, for
+        // Every one of these seven characters used to be dropped (or, for
         // 'q', used to close the search box) by the old hand-written table.
-        for c in ['q', 'j', ' ', 'k', 'h', 'l'] {
+        for c in ['q', 'j', ' ', 'k', 'h', 'l', '/'] {
             driver.dispatch(quadraui::UiEvent::KeyPressed {
                 key: quadraui::Key::Char(c),
                 modifiers: quadraui::Modifiers::default(),
@@ -13314,11 +13331,75 @@ mod tests {
 
         let screen = driver.screen();
         assert!(
-            screen.contains("qj khl"),
-            "typing q/j/space/k/h/l into the settings search filter must \
-             append all six characters to the painted query, not silently \
+            screen.contains("qj khl/"),
+            "typing q/j/space/k/h/l/'/' into the settings search filter must \
+             append all seven characters to the painted query, not silently \
              drop most of them (or close the search box on 'q'); \
              screen:\n{screen}"
+        );
+    }
+
+    /// Blocking review finding on #1249 iteration 1: `h`/`Left` inside the
+    /// Debug (DAP) sidebar was unreachable from the TUI keyboard before this
+    /// fix — the old hand-written char whitelist only listed `'q'`/`'x'`/`'d'`,
+    /// never `'h'`, even though `Engine::dispatch_dap_sidebar_action_key`
+    /// (`src/core/engine/dap_ops.rs`) and GTK's `map_gtk_key_name`
+    /// pass-through both treat `"h"` the same as `"Left"`: focus leaves the
+    /// sidebar and parks the activity-bar cursor on the Debug slot
+    /// (`Engine::activity_bar_focus_in_at(3)`). The new
+    /// `Key::Char(c) => c.to_string()` pass-through restores it.
+    ///
+    /// Asserted on painted, not internal, state (CLAUDE.md rule 1): after
+    /// `h`, activity-bar navigation (`j` then `l`) must actually work — `j`
+    /// moves the toolbar cursor off the Debug slot onto the Source Control
+    /// slot, and `l` activates it, so `SOURCE CONTROL` must paint (replacing
+    /// the Debug sidebar's own "DEBUG | ..." title row). That chain only
+    /// succeeds if `h` genuinely handed keyboard focus to the activity bar:
+    /// `render::route_focus_key` checks `engine.activity_bar_focused`
+    /// *before* any sidebar-panel route, so if `h` were swallowed (old
+    /// behaviour), the Debug panel would still own focus and the trailing
+    /// `j`/`l` would instead reach `dispatch_dap_sidebar_action_key`, which
+    /// ignores both.
+    ///
+    /// **Verified RED against the reverted char-whitelist table:** with
+    /// `'h'` absent from the table, the keypress reaches neither
+    /// `dispatch_dap_sidebar_action_key` nor anywhere else,
+    /// `activity_bar_focused` never becomes `true`, and the final assertion
+    /// (`SOURCE CONTROL` painted) fails — the screen still shows the Debug
+    /// sidebar.
+    #[test]
+    fn debug_sidebar_h_hands_focus_to_activity_bar_via_shell_app() {
+        let mut app = TuiShellApp::new(None);
+        ensure_panel_active(&mut app.engine, PANEL_DEBUG);
+        app.sidebar.has_focus = true;
+
+        let mut driver = driver_with_shell(app, TuiShellApp::build_shell_config(false), 100, 24);
+
+        let before = driver.screen();
+        assert!(
+            before.contains("DEBUG"),
+            "precondition: the Debug panel must be open and painted before \
+             the keypress (`debug_sidebar_chrome_to_status_bars`'s title row \
+             always contains the literal \"DEBUG\"); screen:\n{before}"
+        );
+
+        for c in ['h', 'j', 'l'] {
+            driver.dispatch(quadraui::UiEvent::KeyPressed {
+                key: quadraui::Key::Char(c),
+                modifiers: quadraui::Modifiers::default(),
+                repeat: false,
+            });
+        }
+        driver.render();
+
+        let after = driver.screen();
+        assert!(
+            after.contains("SOURCE CONTROL"),
+            "'h' in the Debug sidebar must hand keyboard focus to the \
+             activity bar (parked on the Debug slot); 'j' then 'l' should \
+             move to and activate the Source Control slot, painting SOURCE \
+             CONTROL — this only happens if 'h' actually worked; \
+             screen:\n{after}"
         );
     }
 
