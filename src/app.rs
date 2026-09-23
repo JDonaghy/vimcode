@@ -5302,6 +5302,13 @@ impl App {
     /// same `Surface::StatusBar` rects it draws, `global_status_rect` likewise
     /// (#752), and the breadcrumb bars carry their own draw-time layout. That
     /// is the #555 rule: never hit-test against freshly recomputed geometry.
+    ///
+    /// #1250: the `StatusBand` assembly itself — separated line, then each
+    /// window's own line, then the global bar — is [`render::status_bands`],
+    /// shared with TUI's `mouse::route_and_apply_chrome_click` now that TUI
+    /// caches its own paint-time layouts the same way this backend always
+    /// has, rather than each backend walking `screen.windows` and rebuilding
+    /// the band rects independently.
     fn route_and_apply_chrome_click(
         &mut self,
         x: f64,
@@ -5316,48 +5323,24 @@ impl App {
         };
         let engine = self.engine.borrow();
         let segment_map = self.status_segment_map.borrow();
+        let global_status_zones = self.global_status_zones.borrow();
 
-        // The separated status line is listed first: it is painted in its own
-        // full-width band *outside* every window's rect, so it can never be
-        // reached through the per-window bars' geometry, and a click in that
-        // band must not fall through to whatever sits underneath it.
-        let mut bands: Vec<render::StatusBand<'_>> = Vec::new();
-        if let Some(rect) = self.separated_status_bar_rect.get() {
-            if let Some(zones) = segment_map.get(&screen.active_window_id.0) {
-                bands.push(render::StatusBand { rect, zones });
-            }
-        }
-        for rw in &screen.windows {
-            if rw.status_line.is_none() || rw.rect.height <= lh {
-                continue;
-            }
-            let Some(zones) = segment_map.get(&rw.window_id.0) else {
-                continue;
-            };
-            // The status line occupies the window's bottom row — the same
-            // `rect.height - lh` `render_content` subtracts before painting it.
-            bands.push(render::StatusBand {
-                rect: quadraui::Rect::new(
-                    rw.rect.x as f32,
-                    (rw.rect.y + rw.rect.height - lh) as f32,
-                    rw.rect.width as f32,
-                    lh as f32,
-                ),
-                zones,
-            });
-        }
-
-        // The global bar last, spatially and in arbitration: it is the bottom
-        // band of the shell, below every window.
+        // #1250: the separated/per-window/global assembly (in that
+        // arbitration order — see `render::status_bands`'s own doc comment
+        // for why) is now the one shared builder both backends call, rather
+        // than this loop and TUI's near-identical twin in
+        // `mouse::route_and_apply_chrome_click`.
         let global_rect = engine.global_status_rect.get();
-        let global_zones;
-        if global_rect.width > 0.0 && global_rect.height > 0.0 {
-            global_zones = self.global_status_zones.borrow().clone();
-            bands.push(render::StatusBand {
-                rect: global_rect,
-                zones: &global_zones,
-            });
-        }
+        let bands = render::status_bands(
+            &screen.windows,
+            lh,
+            &segment_map,
+            self.separated_status_bar_rect
+                .get()
+                .map(|rect| (rect, screen.active_window_id)),
+            (global_rect.width > 0.0 && global_rect.height > 0.0)
+                .then(|| (global_rect, &*global_status_zones)),
+        );
 
         // The same shared hit test, with the same tolerances, the window-split
         // divider rung in `handle_mouse_click_msg` runs — see
@@ -5392,6 +5375,7 @@ impl App {
         );
 
         drop(segment_map);
+        drop(global_status_zones);
         drop(engine);
         drop(layout_ref);
 

@@ -5795,32 +5795,73 @@ pub fn status_bar_zones_from_layout(layout: &quadraui::StatusBarLayout) -> Statu
         .collect()
 }
 
-/// Minimum inter-segment gap, in cells, every status-bar layout is measured
-/// with. Named because the *draw* path (`render_window_status_line`) and the
-/// *hit-test* path must pass the same number or clicks land on the wrong
-/// segment.
-pub const STATUS_BAR_MIN_GAP_CELLS: f32 = 2.0;
-
-/// Lay a `quadraui::StatusBar` out in **character cells** and recover its hit
-/// zones.
+/// Assemble this frame's [`StatusBand`]s, in the order [`route_chrome_click`]
+/// arbitrates them: the separated status line (if painted this frame), then
+/// each window's own status line, then the global bar last.
 ///
-/// The cell-unit twin of [`status_bar_zones_from_layout`], for the TUI — which
-/// has no persistent pixel cache to consult and so re-derives the bar's layout
-/// on each click, exactly as `render_window_status_line` /
-/// `TuiBackend::draw_status_bar` derive it on each paint. Segment widths are
-/// `chars().count()`, the monospace cell count, matching the draw path.
-pub fn status_bar_zones_in_cells(bar: &quadraui::StatusBar, width_cells: usize) -> StatusZones {
-    let layout = bar.layout(width_cells as f32, 1.0, STATUS_BAR_MIN_GAP_CELLS, |seg| {
-        quadraui::StatusSegmentMeasure::new(seg.text.chars().count() as f32)
-    });
-    status_bar_zones_from_layout(&layout)
-}
+/// #1250: both backends now cache their status-bar layouts at **paint**
+/// time — GTK's `status_segment_map` since #672, TUI's own copy since this
+/// function's introduction — rather than one of them (TUI) re-deriving the
+/// separated-status row's rect arithmetically and re-laying the bar's text
+/// out from scratch on every click via the now-deleted
+/// `window_status_line_zones`/`status_bar_zones_in_cells`. This is the one
+/// place that turns "a painted rect + its cached hit zones" into the
+/// `StatusBand` slice the router consumes, so the geometry (`rw.rect.y +
+/// rw.rect.height - lh`, `rw.rect.height <= lh` skip, and the arbitration
+/// order itself) is written once instead of transcribed per backend.
+///
+/// `windows`/`lh` are the same painted geometry [`ChromeState::line_height`]
+/// documents (`1.0` for TUI cells, the painted line height for GTK).
+/// `segment_map` is keyed by [`WindowId`] (`.0`), as populated by each
+/// backend's own per-window and separated-status paint sites.
+/// `separated`/`global` are `None` whenever that band did not paint this
+/// frame — the empty/absent convention [`ChromeState`] documents.
+pub fn status_bands<'a>(
+    windows: &[RenderedWindow],
+    lh: f64,
+    segment_map: &'a crate::app_support::StatusSegmentMap,
+    separated: Option<(quadraui::Rect, WindowId)>,
+    global: Option<(quadraui::Rect, &'a StatusZones)>,
+) -> Vec<StatusBand<'a>> {
+    let mut bands = Vec::new();
 
-/// [`status_bar_zones_in_cells`] for a [`WindowStatusLine`], which has to be
-/// converted to the primitive first.
-pub fn window_status_line_zones(status: &WindowStatusLine, width_cells: usize) -> StatusZones {
-    let bar = window_status_line_to_status_bar(status, quadraui::WidgetId::new("status:window"));
-    status_bar_zones_in_cells(&bar, width_cells)
+    // The separated status line is listed first: it is painted in its own
+    // full-width band *outside* every window's rect, so it can never be
+    // reached through the per-window bars' geometry, and a click in that band
+    // must not fall through to whatever sits underneath it.
+    if let Some((rect, window_id)) = separated {
+        if let Some(zones) = segment_map.get(&window_id.0) {
+            bands.push(StatusBand { rect, zones });
+        }
+    }
+
+    for rw in windows {
+        if rw.status_line.is_none() || rw.rect.height <= lh {
+            continue;
+        }
+        let Some(zones) = segment_map.get(&rw.window_id.0) else {
+            continue;
+        };
+        // The status line occupies the window's bottom row — the same
+        // `rect.height - lh` both paint paths subtract before drawing it.
+        bands.push(StatusBand {
+            rect: quadraui::Rect::new(
+                rw.rect.x as f32,
+                (rw.rect.y + rw.rect.height - lh) as f32,
+                rw.rect.width as f32,
+                lh as f32,
+            ),
+            zones,
+        });
+    }
+
+    // The global bar last, spatially and in arbitration: it is the bottom
+    // band of the shell, below every window.
+    if let Some((rect, zones)) = global {
+        bands.push(StatusBand { rect, zones });
+    }
+
+    bands
 }
 
 /// Apply a resolved [`StatusAction`], including the follow-up both backends
@@ -9261,11 +9302,11 @@ pub fn paint_wildmenu_rung(
 /// The [`FrameOp::StatusBar`] (global status line) rung's whole body on both
 /// backends.
 ///
-/// Returns the resolved [`quadraui::StatusBarLayout`] so GTK can derive its
-/// click zones from the same measurement the paint produced — mirrors
-/// [`paint_separated_status_rung`]'s reasoning exactly. TUI recomputes zones
-/// statelessly at click time instead (cheap in cell units) and ignores the
-/// return value.
+/// Returns the resolved [`quadraui::StatusBarLayout`] so both backends can
+/// derive their click zones from the same measurement the paint produced —
+/// mirrors [`paint_separated_status_rung`]'s reasoning exactly. #1250: TUI
+/// used to recompute zones statelessly at click time instead; it now caches
+/// this return value the same way GTK always has.
 pub fn paint_global_status_bar_rung(
     b: &mut dyn quadraui::Backend,
     engine: &Engine,
