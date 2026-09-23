@@ -12293,6 +12293,74 @@ mod tests {
         );
     }
 
+    /// #1299: `:reg {register-name}` must reach the ex parser *and* paint
+    /// Neovim's real `Type Name Content` header. Two bugs in one row, both
+    /// visible on the command line:
+    ///
+    /// * before the fix, `execute_command`'s `"registers" | "display"` arm
+    ///   matched only the bare command, so any argument fell through to the
+    ///   unknown-command path and the command line painted
+    ///   `Not an editor command: registers a`;
+    /// * even bare `:reg` painted a vimcode-invented `--- Registers ---`
+    ///   banner rather than Neovim's header.
+    ///
+    /// Reads the **painted last row** rather than `engine.message`, per
+    /// `render_content_paints_command_line_via_shell_app` above (which
+    /// establishes that the command line renders `engine.message` verbatim)
+    /// and per `CLAUDE.md`'s rule 1 — `tests/ex_commands.rs`'s
+    /// `cmd_display_shows_registers` / `cmd_registers_argument_filters_listing`
+    /// are the engine-tier twins that cover the full multi-row table, which
+    /// the one-row command line necessarily truncates to its first line
+    /// (`build_command_line` strips newlines so the row can never overflow).
+    ///
+    /// **Verified RED against unfixed `develop`:** with `execute.rs` reverted
+    /// to develop's `"registers" | "display"` match arm, the row paints
+    /// `Not an editor command: registers a` and both assertions below fail.
+    #[test]
+    fn reg_with_register_argument_paints_nvim_header_via_shell_app() {
+        const HEIGHT: u16 = 24;
+        let mut app = TuiShellApp::new_for_test();
+        // Seeded rather than yanked: the register's *provenance* is not what
+        // is under test here, the argument parse and the header are. The
+        // engine-tier twins in `tests/ex_commands.rs` drive real yanks.
+        app.engine.registers.insert(
+            'a',
+            (
+                "alpha\n".to_string(),
+                crate::core::engine::RegType::Linewise,
+            ),
+        );
+
+        let mut driver = driver_with_shell(app, config(), 100, HEIGHT);
+        run_ex_command(&mut driver, ":reg a");
+
+        let screen = driver.screen();
+        let (_, y) = driver.find("Type Name Content").unwrap_or_else(|| {
+            panic!(
+                "`:reg a` must reach the ex parser and paint Neovim's real \
+                 `Type Name Content` header on the command line (#1299); \
+                 screen:\n{screen}"
+            )
+        });
+        assert_eq!(
+            y as u16,
+            HEIGHT - 1,
+            "the register listing's header must paint on the command line \
+             (last row), not in the document body — a hit anywhere else means \
+             the keystrokes were swallowed as normal/insert-mode edits \
+             instead of reaching the ex `:registers` branch; screen:\n{screen}"
+        );
+        assert!(
+            !screen.contains("Not an editor command"),
+            "`:reg a` must not be rejected as an unknown command (#1299); \
+             screen:\n{screen}"
+        );
+        assert!(
+            !screen.contains("--- Registers ---"),
+            "the pre-#1299 invented header must be gone; screen:\n{screen}"
+        );
+    }
+
     /// A modal dialog must paint *and* cache its `DialogLayout` — the layout
     /// is what `handle_key_pressed`'s dialog tier and `handle_mouse_event`
     /// hit-test against, so a paint that doesn't publish it is only half
