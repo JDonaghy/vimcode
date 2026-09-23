@@ -20,7 +20,14 @@ pub enum StatusKind {
     Modified,
     Deleted,
     Renamed,
+    Copied,
     Untracked,
+    /// Merge conflict — git reports the path as *unmerged*. Never appears
+    /// in [`FileStatus::staged`] / [`FileStatus::unstaged`]: a conflicted
+    /// path is carried by [`FileStatus::unmerged`] instead (see #991), and
+    /// this variant exists so the Merge Changes rows have a label char
+    /// from the same single source of truth as every other row.
+    Unmerged,
 }
 
 impl StatusKind {
@@ -31,19 +38,170 @@ impl StatusKind {
             StatusKind::Modified => 'M',
             StatusKind::Deleted => 'D',
             StatusKind::Renamed => 'R',
-            StatusKind::Untracked => '?',
+            StatusKind::Copied => 'C',
+            // VS Code's explorer/SC badge for an untracked file. Git's own
+            // porcelain notation uses `?` here (see `parse_status_char`
+            // below, which stays `?` — it parses `git status --porcelain`
+            // output, a wire format this display label must not leak into
+            // and must not be confused with) (#1051).
+            StatusKind::Untracked => 'U',
+            // VS Code's conflict marker.
+            StatusKind::Unmerged => '!',
+        }
+    }
+
+    /// Human-readable name used in panel hovers.
+    pub fn description(self) -> &'static str {
+        match self {
+            StatusKind::Added => "Added",
+            StatusKind::Modified => "Modified",
+            StatusKind::Deleted => "Deleted",
+            StatusKind::Renamed => "Renamed",
+            StatusKind::Copied => "Copied",
+            StatusKind::Untracked => "Untracked",
+            StatusKind::Unmerged => "Conflict",
         }
     }
 }
 
+/// Which of git's seven *unmerged* `XY` porcelain codes a conflicted path
+/// is in (#991). These cannot be classified one character at a time — `AA`
+/// and `DD` are conflicts while a lone `A`/`D` on either side is an
+/// ordinary add/delete — so the pair is always classified as a pair by
+/// [`UnmergedKind::from_xy`], the single shared entry point used by both
+/// [`status_detailed`] (the SC panel) and [`status_text`] (`:Git status`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnmergedKind {
+    /// `DD`
+    BothDeleted,
+    /// `AU`
+    AddedByUs,
+    /// `UD`
+    DeletedByThem,
+    /// `UA`
+    AddedByThem,
+    /// `DU`
+    DeletedByUs,
+    /// `AA`
+    BothAdded,
+    /// `UU`
+    BothModified,
+}
+
+impl UnmergedKind {
+    /// Classify a porcelain `XY` **pair**. Returns `None` for every
+    /// non-conflict pair, including a lone `A`/`D` on one side.
+    pub fn from_xy(x: char, y: char) -> Option<Self> {
+        Some(match (x, y) {
+            ('D', 'D') => UnmergedKind::BothDeleted,
+            ('A', 'U') => UnmergedKind::AddedByUs,
+            ('U', 'D') => UnmergedKind::DeletedByThem,
+            ('U', 'A') => UnmergedKind::AddedByThem,
+            ('D', 'U') => UnmergedKind::DeletedByUs,
+            ('A', 'A') => UnmergedKind::BothAdded,
+            ('U', 'U') => UnmergedKind::BothModified,
+            _ => return None,
+        })
+    }
+
+    /// The two-character porcelain code this kind came from.
+    pub fn code(self) -> &'static str {
+        match self {
+            UnmergedKind::BothDeleted => "DD",
+            UnmergedKind::AddedByUs => "AU",
+            UnmergedKind::DeletedByThem => "UD",
+            UnmergedKind::AddedByThem => "UA",
+            UnmergedKind::DeletedByUs => "DU",
+            UnmergedKind::BothAdded => "AA",
+            UnmergedKind::BothModified => "UU",
+        }
+    }
+
+    /// Git's own wording for the conflict, as `git status` prints it.
+    pub fn description(self) -> &'static str {
+        match self {
+            UnmergedKind::BothDeleted => "both deleted",
+            UnmergedKind::AddedByUs => "added by us",
+            UnmergedKind::DeletedByThem => "deleted by them",
+            UnmergedKind::AddedByThem => "added by them",
+            UnmergedKind::DeletedByUs => "deleted by us",
+            UnmergedKind::BothAdded => "both added",
+            UnmergedKind::BothModified => "both modified",
+        }
+    }
+}
+
+/// The classification of one porcelain `XY` pair (#991).
+///
+/// Exactly one shape is ever produced: either `unmerged` is `Some` and
+/// both `staged`/`unstaged` are `None` (a merge conflict, which belongs to
+/// the Merge Changes section alone and must never be swept into a
+/// stage-all / discard-all), or `unmerged` is `None` and the two sides
+/// carry the ordinary index/worktree kinds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct XyStatus {
+    pub staged: Option<StatusKind>,
+    pub unstaged: Option<StatusKind>,
+    pub unmerged: Option<UnmergedKind>,
+}
+
+impl XyStatus {
+    /// True when the pair describes no change at all (e.g. `"  "`), i.e.
+    /// there is nothing for the SC panel to show.
+    pub fn is_empty(self) -> bool {
+        self.staged.is_none() && self.unstaged.is_none() && self.unmerged.is_none()
+    }
+}
+
+/// **The** classifier for a `git status --porcelain` `XY` pair (#991).
+///
+/// Both the SC panel ([`status_detailed`]) and the `:Git status` buffer
+/// ([`status_text`]) route through this one function; the bug this replaced
+/// existed twice precisely because each had hand-rolled its own table.
+pub fn classify_xy(x: char, y: char) -> XyStatus {
+    // A `U` on either side always means "unmerged" per gitstatus(1); the
+    // seven named pairs are the only combinations git actually emits, but
+    // fall back to "both modified" rather than letting a stray `U` be
+    // mislabelled as an ordinary staged/unstaged change.
+    if let Some(kind) = UnmergedKind::from_xy(x, y).or(if x == 'U' || y == 'U' {
+        Some(UnmergedKind::BothModified)
+    } else {
+        None
+    }) {
+        return XyStatus {
+            staged: None,
+            unstaged: None,
+            unmerged: Some(kind),
+        };
+    }
+    XyStatus {
+        staged: parse_status_char(x, false),
+        unstaged: parse_status_char(y, true),
+        unmerged: None,
+    }
+}
+
 /// Status of a single file from `git status --porcelain`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct FileStatus {
     pub path: String,
     /// Status in the index (staged area). `None` = unmodified in index.
     pub staged: Option<StatusKind>,
     /// Status in the working tree (unstaged). `None` = unmodified on disk.
     pub unstaged: Option<StatusKind>,
+    /// `Some(kind)` when git reports the path as *unmerged* (a merge
+    /// conflict). Conflicted paths always carry `staged == unstaged ==
+    /// None` so that every `staged.is_some()` / `unstaged.is_some()`
+    /// filter in the SC panel excludes them by construction — they belong
+    /// to the Merge Changes section only (#991).
+    pub unmerged: Option<UnmergedKind>,
+}
+
+impl FileStatus {
+    /// True when this path has a merge conflict.
+    pub fn is_unmerged(&self) -> bool {
+        self.unmerged.is_some()
+    }
 }
 
 // ─── Source Control: worktrees ────────────────────────────────────────────────
@@ -93,12 +251,20 @@ pub fn hidden_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
 /// Create a `git` Command with `CREATE_NO_WINDOW` on Windows to prevent
 /// console window flashes in GUI mode.
 fn git_command() -> Command {
+    hidden_command("git")
+}
+
+/// Like [`hidden_command`], but also puts the child in a new process group
+/// on Windows (`CREATE_NEW_PROCESS_GROUP`). Used by long-running child
+/// processes (LSP/DAP servers) that need to be signaled as a group without
+/// affecting our own console, in addition to not flashing a console window.
+pub fn hidden_command_new_process_group(program: impl AsRef<std::ffi::OsStr>) -> Command {
     #[allow(unused_mut)]
-    let mut cmd = Command::new("git");
+    let mut cmd = Command::new(program);
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+        cmd.creation_flags(0x00000200 | 0x08000000); // CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW
     }
     cmd
 }
@@ -181,33 +347,58 @@ pub fn status_text(dir: &Path) -> Option<String> {
         ));
     }
 
-    let mut staged: Vec<&StatusEntry> = entries
-        .iter()
-        .filter(|e| e.xy.starts_with(['M', 'A', 'D', 'R', 'C']))
-        .collect();
-    let mut unstaged: Vec<&StatusEntry> = entries
-        .iter()
-        .filter(|e| {
-            let c = e.xy.chars().nth(1).unwrap_or(' ');
-            matches!(c, 'M' | 'D')
-        })
-        .collect();
-    let untracked: Vec<&StatusEntry> = entries.iter().filter(|e| e.xy == "??").collect();
+    // #991: classify through the *shared* `classify_xy` rather than a
+    // second hand-rolled table. The old per-character filters here put
+    // `AA`/`DD`/`AU`/`DU` under "Changes to be committed" and dropped `UU`
+    // from every section — the same bug the SC panel had, twice over.
+    let mut staged: Vec<(&StatusEntry, StatusKind)> = Vec::new();
+    let mut unstaged: Vec<(&StatusEntry, StatusKind)> = Vec::new();
+    let mut untracked: Vec<&StatusEntry> = Vec::new();
+    let mut unmerged: Vec<(&StatusEntry, UnmergedKind)> = Vec::new();
+    for e in &entries {
+        let mut ch = e.xy.chars();
+        let x = ch.next().unwrap_or(' ');
+        let y = ch.next().unwrap_or(' ');
+        let cls = classify_xy(x, y);
+        if let Some(kind) = cls.unmerged {
+            unmerged.push((e, kind));
+            continue;
+        }
+        if let Some(kind) = cls.staged {
+            staged.push((e, kind));
+        }
+        match cls.unstaged {
+            Some(StatusKind::Untracked) => untracked.push(e),
+            Some(kind) => unstaged.push((e, kind)),
+            None => {}
+        }
+    }
 
     // Deduplicate entries that appear in both staged and unstaged
-    staged.dedup_by_key(|e| e.path.clone());
-    unstaged.dedup_by_key(|e| e.path.clone());
+    staged.dedup_by_key(|(e, _)| e.path.clone());
+    unstaged.dedup_by_key(|(e, _)| e.path.clone());
 
     let mut out = format!("{}\n\n", branch);
 
+    if !unmerged.is_empty() {
+        out.push_str("You have unmerged paths.\n");
+        out.push_str("  (fix conflicts and run \"git commit\")\n\n");
+        out.push_str("Unmerged paths:\n");
+        for (e, kind) in &unmerged {
+            out.push_str(&format!("        {}: {}\n", kind.description(), e.path));
+        }
+        out.push('\n');
+    }
+
     if !staged.is_empty() {
         out.push_str("Changes to be committed:\n");
-        for e in &staged {
-            let label = match e.xy.chars().next().unwrap_or(' ') {
-                'M' => "modified",
-                'A' => "new file",
-                'D' => "deleted",
-                'R' => "renamed",
+        for (e, kind) in &staged {
+            let label = match kind {
+                StatusKind::Modified => "modified",
+                StatusKind::Added => "new file",
+                StatusKind::Deleted => "deleted",
+                StatusKind::Renamed => "renamed",
+                StatusKind::Copied => "copied",
                 _ => "changed",
             };
             out.push_str(&format!("        {}: {}\n", label, e.path));
@@ -217,10 +408,10 @@ pub fn status_text(dir: &Path) -> Option<String> {
 
     if !unstaged.is_empty() {
         out.push_str("Changes not staged for commit:\n");
-        for e in &unstaged {
-            let label = match e.xy.chars().nth(1).unwrap_or(' ') {
-                'M' => "modified",
-                'D' => "deleted",
+        for (e, kind) in &unstaged {
+            let label = match kind {
+                StatusKind::Modified => "modified",
+                StatusKind::Deleted => "deleted",
                 _ => "changed",
             };
             out.push_str(&format!("        {}: {}\n", label, e.path));
@@ -397,31 +588,101 @@ pub fn commit(dir: &Path, message: &str) -> Result<String, String> {
 ///
 /// Uses `SSH_ASKPASS` + `SSH_ASKPASS_REQUIRE=force` to prevent SSH from
 /// prompting on the parent terminal.  When `passphrase` is `Some`, an
-/// ephemeral askpass script echoes it; when `None`, the askpass script
+/// ephemeral askpass helper echoes it; when `None`, the askpass helper
 /// prints an empty line (handles keys with empty passphrases or keys
 /// already loaded in ssh-agent).
+///
+/// # Windows leg (#1105)
+///
+/// On Windows this writes a `.bat` helper instead of a `#!/bin/sh` script.
+/// Investigation for #1105 found:
+///   - Git for Windows' own `git.exe` (native MinGW build) has its own
+///     shebang-parsing spawn layer (`compat/mingw.c`'s `parse_interpreter` /
+///     `try_shell_exec`) — but that layer only kicks in for programs *git
+///     itself* spawns (editor, pager, `GIT_ASKPASS`/`core.askpass`).
+///   - `SSH_ASKPASS` is instead invoked by whichever `ssh` binary git's
+///     transport resolves — normally Git for Windows' own bundled
+///     MSYS2-built `ssh.exe`, whose POSIX layer (derived from Cygwin, whose
+///     user guide documents `#!`-prefixed files as recognized-executable)
+///     likely *would* run a shebang script correctly. But if `ssh` instead
+///     resolves to Windows' native OpenSSH client (`System32\OpenSSH\ssh.exe`,
+///     a plain Win32 build with no shebang support), a `#!/bin/sh` file has
+///     no interpreter to run it and the askpass helper silently fails,
+///     leaving the fetch/push blocked on a prompt nobody can see — exactly
+///     the bug this issue reports. A `.bat` file sidesteps the ambiguity
+///     entirely: Windows dispatches `.bat` through `cmd.exe` regardless of
+///     which `ssh.exe` (MSYS or native Win32) ends up invoking it, and both
+///     the MSVC CRT spawn/exec family and Cygwin/MSYS's own exec layer are
+///     documented to recognize and dispatch `.bat`/`.cmd` targets that way.
+///   - This could not be exercised on an actual Windows host in this
+///     session (no Windows machine available); the `.bat` leg is the
+///     verifiable-by-construction choice rather than a bet on which `ssh`
+///     a given install resolves.
+///
+/// ## Passphrase delivery differs per leg (review fix, #1105)
+///
+/// The POSIX leg passes the passphrase through the `VIMCODE_ASKPASS_PHRASE`
+/// env var and echoes it with `echo "$VIMCODE_ASKPASS_PHRASE"` — safe,
+/// because the shell expands a quoted `"$VAR"` to a single literal argument
+/// with no re-parsing.
+///
+/// The `.bat` leg does **not** use `%VAR%` expansion for the passphrase,
+/// because cmd.exe expands `%VAR%` while it is still scanning the line for
+/// `&`/`|`/`<`/`>`/`^`, so a passphrase containing any of those characters
+/// would be spliced into the batch file as a second command instead of
+/// printed literally — and an empty passphrase collapses `echo ` (no
+/// argument) into cmd printing its own echo-toggle state (`ECHO is off.`)
+/// instead of a blank line. Both are real, deterministic bugs, not edge
+/// cases: the first fires on every passphrase containing a cmd.exe
+/// metacharacter, the second on every no-passphrase / agent-loaded-key
+/// push. Instead, the Windows leg writes the passphrase to a sibling
+/// "phrase file" and has the `.bat` stream it with `type "<path>"`. `type`
+/// copies the file's bytes to stdout with no command-line re-parsing, so it
+/// has neither failure mode — the empty-passphrase file just produces an
+/// empty (newline-only) line, and any byte sequence in the passphrase file
+/// is passed through unparsed.
 fn run_git_remote(
     dir: &Path,
     args: &[&str],
     label: &str,
     passphrase: Option<&str>,
 ) -> Result<String, String> {
-    // Build an ephemeral askpass script that echoes the passphrase.
+    // Build an ephemeral askpass helper. On Windows the passphrase is
+    // delivered via a sibling "phrase file" streamed with `type` (see the
+    // doc comment above for why `%VAR%` expansion isn't safe there); on
+    // POSIX it's delivered via the VIMCODE_ASKPASS_PHRASE env var, which the
+    // shell script echoes back quoted.
     let phrase = passphrase.unwrap_or("");
     let askpass_dir = std::env::temp_dir();
-    let askpass_path = askpass_dir.join(format!("vimcode_askpass_{}", std::process::id()));
-    std::fs::write(
-        &askpass_path,
-        format!("#!/bin/sh\necho '{}'\n", phrase.replace('\'', "'\\''")),
-    )
-    .map_err(|e| format!("{} failed: cannot create askpass helper: {}", label, e))?;
+    let pid = std::process::id();
+    #[cfg(windows)]
+    let askpass_path = askpass_dir.join(format!("vimcode_askpass_{}.bat", pid));
+    #[cfg(not(windows))]
+    let askpass_path = askpass_dir.join(format!("vimcode_askpass_{}", pid));
+
+    #[cfg(windows)]
+    let phrase_path = askpass_dir.join(format!("vimcode_askpass_phrase_{}.txt", pid));
+    #[cfg(windows)]
+    {
+        std::fs::write(&phrase_path, windows_askpass_phrase_file_contents(phrase))
+            .map_err(|e| format!("{} failed: cannot create askpass phrase file: {}", label, e))?;
+    }
+
+    #[cfg(windows)]
+    let script = windows_askpass_script(&phrase_path);
+    #[cfg(not(windows))]
+    let script = "#!/bin/sh\necho \"$VIMCODE_ASKPASS_PHRASE\"\n".to_string();
+
+    std::fs::write(&askpass_path, script)
+        .map_err(|e| format!("{} failed: cannot create askpass helper: {}", label, e))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&askpass_path, std::fs::Permissions::from_mode(0o700)).ok();
     }
 
-    let output = git_command()
+    let mut command = git_command();
+    command
         .arg("-C")
         .arg(dir)
         .args(args)
@@ -432,12 +693,18 @@ fn run_git_remote(
         .env("SSH_ASKPASS", &askpass_path)
         .env("SSH_ASKPASS_REQUIRE", "force")
         // DISPLAY must be set for SSH_ASKPASS to work on some systems.
-        .env("DISPLAY", std::env::var("DISPLAY").unwrap_or_default())
+        .env("DISPLAY", std::env::var("DISPLAY").unwrap_or_default());
+    #[cfg(not(windows))]
+    command.env("VIMCODE_ASKPASS_PHRASE", phrase);
+
+    let output = command
         .output()
         .map_err(|e| format!("{} failed: {}", label, e));
 
-    // Clean up the askpass script.
+    // Clean up the askpass script (and, on Windows, the phrase file).
     let _ = std::fs::remove_file(&askpass_path);
+    #[cfg(windows)]
+    let _ = std::fs::remove_file(&phrase_path);
 
     let output = output?;
     if output.status.success() {
@@ -452,6 +719,31 @@ fn run_git_remote(
             err
         })
     }
+}
+
+/// Build the contents of the Windows askpass "phrase file" (#1105): the
+/// passphrase plus a trailing newline, matching the POSIX leg's
+/// `echo "$VIMCODE_ASKPASS_PHRASE"` output (which always terminates with a
+/// newline, including when the phrase is empty). Kept as a standalone,
+/// platform-independent function — no `cfg(windows)` gate — so the exact
+/// bytes SSH will receive can be unit-tested without a Windows host.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn windows_askpass_phrase_file_contents(phrase: &str) -> String {
+    let mut contents = phrase.to_string();
+    contents.push('\n');
+    contents
+}
+
+/// Build the Windows askpass `.bat` body. It streams `phrase_path`'s bytes
+/// via `type` rather than interpolating the passphrase into the script
+/// through `%VAR%` expansion — see the doc comment on `run_git_remote` for
+/// why that's unsafe (metacharacter injection, and a mis-rendered empty
+/// line). The passphrase itself must never appear in this string; platform-
+/// independent — no `cfg(windows)` gate — so that invariant is
+/// unit-testable without a Windows host.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn windows_askpass_script(phrase_path: &Path) -> String {
+    format!("@echo off\r\ntype \"{}\"\r\n", phrase_path.display())
 }
 
 /// Returns `true` when the error message looks like an SSH authentication
@@ -501,10 +793,10 @@ pub fn unstage_all(dir: &Path) -> Result<(), String> {
     run_git_result(dir, &["restore", "--staged", "."])
 }
 
-/// Discard all working-tree changes (`git restore .`).
-pub fn discard_all(dir: &Path) -> Result<(), String> {
-    run_git_result(dir, &["restore", "."])
-}
+// #991: the path-spec-wide `discard_all` (`git restore .`) was removed —
+// it blew away the half-merged content of conflicted files along with the
+// ordinary changes. `sc_discard_all_unstaged` now passes an explicit,
+// conflict-free path list to [`discard_paths`].
 
 // ─── Blame ────────────────────────────────────────────────────────────────────
 
@@ -850,6 +1142,46 @@ fn parse_unified_diff(diff: &str, total_lines: usize) -> Vec<Option<GitLineStatu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Windows askpass leg (#1105) ─────────────────────────────────────────
+    // These exercise the pure string-building helpers directly so the two
+    // review-flagged bugs (empty-passphrase mis-render, metacharacter
+    // injection via %VAR% expansion) stay caught without needing a Windows
+    // host to run the actual .bat file.
+
+    #[test]
+    fn windows_askpass_phrase_file_empty_phrase_is_just_a_newline() {
+        // The old `echo %VIMCODE_ASKPASS_PHRASE%` leg rendered an empty
+        // phrase as the literal text "ECHO is off." (cmd.exe's bare-`echo`
+        // toggle-state message) instead of a blank line. The phrase-file
+        // approach must produce exactly a newline, with no such artifact.
+        assert_eq!(windows_askpass_phrase_file_contents(""), "\n");
+    }
+
+    #[test]
+    fn windows_askpass_phrase_file_preserves_metacharacters_literally() {
+        // A passphrase containing cmd.exe metacharacters must survive
+        // byte-for-byte in the phrase file — no reinterpretation, since
+        // `type` never re-parses file contents as commands.
+        let phrase = "abc&whoami|echo^pwned<x>y";
+        assert_eq!(
+            windows_askpass_phrase_file_contents(phrase),
+            format!("{}\n", phrase)
+        );
+    }
+
+    #[test]
+    fn windows_askpass_script_never_embeds_the_passphrase() {
+        // The .bat body must only ever reference the phrase file's path —
+        // never the passphrase text itself. If a future edit reintroduces
+        // `%VAR%`-style interpolation of the phrase into the script, this
+        // test catches it.
+        let phrase_path = Path::new(r"C:\Temp\vimcode_askpass_phrase_1234.txt");
+        let script = windows_askpass_script(phrase_path);
+        assert!(script.starts_with("@echo off"));
+        assert!(script.contains("type "));
+        assert!(script.contains("vimcode_askpass_phrase_1234.txt"));
+    }
 
     // ── parse_diff_hunks ───────────────────────────────────────────────────
 
@@ -1267,6 +1599,16 @@ pub fn status_detailed(dir: &Path) -> Vec<FileStatus> {
         Some(o) => o,
         None => return Vec::new(),
     };
+    parse_status_porcelain(&output)
+}
+
+/// Parse `git status --porcelain` output into [`FileStatus`] entries.
+///
+/// Split out of [`status_detailed`] (#991) so a test can drive the whole
+/// parse→panel pipeline from a literal porcelain string — in particular
+/// one case per unmerged `XY` code — without needing seven separate real
+/// merge conflicts on disk.
+pub fn parse_status_porcelain(output: &str) -> Vec<FileStatus> {
     output
         .lines()
         .filter_map(|line| {
@@ -1285,27 +1627,31 @@ pub fn status_detailed(dir: &Path) -> Vec<FileStatus> {
                 path
             };
 
-            let staged = parse_status_char(x, false);
-            let unstaged = parse_status_char(y, true);
-
-            if staged.is_none() && unstaged.is_none() {
+            let cls = classify_xy(x, y);
+            if cls.is_empty() {
                 return None;
             }
             Some(FileStatus {
                 path,
-                staged,
-                unstaged,
+                staged: cls.staged,
+                unstaged: cls.unstaged,
+                unmerged: cls.unmerged,
             })
         })
         .collect()
 }
 
+/// Classify a **single** porcelain status character. Not a valid
+/// classifier on its own — the conflict codes (`AA`, `DD`, and anything
+/// with a `U`) only mean "conflict" as a pair, so callers must go through
+/// [`classify_xy`], which handles those first.
 fn parse_status_char(ch: char, is_workdir: bool) -> Option<StatusKind> {
     match ch {
         'A' => Some(StatusKind::Added),
         'M' => Some(StatusKind::Modified),
         'D' => Some(StatusKind::Deleted),
         'R' => Some(StatusKind::Renamed),
+        'C' => Some(StatusKind::Copied),
         '?' if is_workdir => Some(StatusKind::Untracked),
         _ => None,
     }
@@ -1313,7 +1659,35 @@ fn parse_status_char(ch: char, is_workdir: bool) -> Option<StatusKind> {
 
 /// Stage a single path (equivalent to `git add <path>`).
 pub fn stage_path(dir: &Path, path: &str) -> Result<(), String> {
-    run_git_result(dir, &["add", path])
+    run_git_result(dir, &["add", "--", path])
+}
+
+/// Stage an explicit list of paths (`git add -- <paths…>`).
+///
+/// #991: the SC panel's "stage all" used to run `git add .`, which sweeps
+/// *conflicted* files in too — and `git add` on a conflicted file is how
+/// you mark it resolved, so a bulk stage silently resolved every conflict
+/// with the markers still in the files. Callers now pass the exact set of
+/// non-conflicted paths instead. Empty `paths` is a no-op.
+pub fn stage_paths(dir: &Path, paths: &[String]) -> Result<(), String> {
+    if paths.is_empty() {
+        return Ok(());
+    }
+    let mut args: Vec<&str> = vec!["add", "--"];
+    args.extend(paths.iter().map(|s| s.as_str()));
+    run_git_result(dir, &args)
+}
+
+/// Discard working-tree changes for an explicit list of paths
+/// (`git restore -- <paths…>`). Empty `paths` is a no-op. See
+/// [`stage_paths`] for why the bulk variants take explicit paths (#991).
+pub fn discard_paths(dir: &Path, paths: &[String]) -> Result<(), String> {
+    if paths.is_empty() {
+        return Ok(());
+    }
+    let mut args: Vec<&str> = vec!["restore", "--"];
+    args.extend(paths.iter().map(|s| s.as_str()));
+    run_git_result(dir, &args)
 }
 
 /// Unstage a single path (equivalent to `git restore --staged <path>`).
@@ -2188,7 +2562,90 @@ mod sc_tests {
         assert_eq!(StatusKind::Modified.label(), 'M');
         assert_eq!(StatusKind::Deleted.label(), 'D');
         assert_eq!(StatusKind::Renamed.label(), 'R');
-        assert_eq!(StatusKind::Untracked.label(), '?');
+        assert_eq!(StatusKind::Copied.label(), 'C');
+        // #1051: VS Code's explorer/SC badge, not git's own '?' porcelain
+        // notation (`parse_status_char` above still parses that '?').
+        assert_eq!(StatusKind::Untracked.label(), 'U');
+        // #991: VS Code's conflict marker.
+        assert_eq!(StatusKind::Unmerged.label(), '!');
+    }
+
+    /// #991: unit coverage on the shared classifier for **all seven**
+    /// unmerged XY codes. Each must come back as a conflict with *both*
+    /// ordinary sides `None`, so every `staged.is_some()` /
+    /// `unstaged.is_some()` filter in the SC panel excludes it.
+    #[test]
+    fn classify_xy_recognises_all_seven_unmerged_codes() {
+        let cases = [
+            ("DD", UnmergedKind::BothDeleted, "both deleted"),
+            ("AU", UnmergedKind::AddedByUs, "added by us"),
+            ("UD", UnmergedKind::DeletedByThem, "deleted by them"),
+            ("UA", UnmergedKind::AddedByThem, "added by them"),
+            ("DU", UnmergedKind::DeletedByUs, "deleted by us"),
+            ("AA", UnmergedKind::BothAdded, "both added"),
+            ("UU", UnmergedKind::BothModified, "both modified"),
+        ];
+        for (code, kind, description) in cases {
+            let mut ch = code.chars();
+            let cls = classify_xy(ch.next().unwrap(), ch.next().unwrap());
+            assert_eq!(
+                cls.unmerged,
+                Some(kind),
+                "{code} must classify as a merge conflict"
+            );
+            assert_eq!(cls.staged, None, "{code} must not look staged");
+            assert_eq!(cls.unstaged, None, "{code} must not look unstaged");
+            assert!(!cls.is_empty(), "{code} must not be dropped as no-change");
+            assert_eq!(kind.code(), code);
+            assert_eq!(kind.description(), description);
+        }
+    }
+
+    /// #991 regression guard: a lone `A`/`D` on one side is an ordinary
+    /// change, not a conflict — `AA`/`DD` are conflicts only *as pairs*,
+    /// which is why the classifier takes the pair.
+    #[test]
+    fn classify_xy_keeps_ordinary_pairs_out_of_the_conflict_bucket() {
+        let ordinary = ["A ", "M ", " M", "D ", " D", "R ", "MM", "AM", "??", "C "];
+        for code in ordinary {
+            let mut ch = code.chars();
+            let cls = classify_xy(ch.next().unwrap(), ch.next().unwrap());
+            assert_eq!(
+                cls.unmerged, None,
+                "{code:?} is an ordinary change, not a merge conflict"
+            );
+            assert!(!cls.is_empty(), "{code:?} must still produce a row");
+        }
+        // Truly-unmodified pairs produce nothing at all.
+        assert!(classify_xy(' ', ' ').is_empty());
+    }
+
+    #[test]
+    fn classify_xy_pairs_map_to_the_expected_sides() {
+        assert_eq!(
+            classify_xy('A', ' '),
+            XyStatus {
+                staged: Some(StatusKind::Added),
+                unstaged: None,
+                unmerged: None,
+            }
+        );
+        assert_eq!(
+            classify_xy('M', 'M'),
+            XyStatus {
+                staged: Some(StatusKind::Modified),
+                unstaged: Some(StatusKind::Modified),
+                unmerged: None,
+            }
+        );
+        assert_eq!(
+            classify_xy('?', '?'),
+            XyStatus {
+                staged: None,
+                unstaged: Some(StatusKind::Untracked),
+                unmerged: None,
+            }
+        );
     }
 
     #[test]

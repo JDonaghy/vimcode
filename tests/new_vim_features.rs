@@ -1,6 +1,6 @@
 mod common;
 use common::*;
-use vimcode_core::Mode;
+use vimcode_core::{EngineAction, Mode};
 
 // ── ^ first non-blank ────────────────────────────────────────────────────────
 
@@ -190,6 +190,41 @@ fn test_counted_ctrl_d_then_bare_ctrl_d_full_window() {
     assert_cursor(&e, 5, 0);
     ctrl(&mut e, 'd');
     assert_cursor(&e, 10, 0);
+}
+
+#[test]
+fn test_ctrl_b_chain_lands_on_the_window_bottom_when_clamped() {
+    // #1008: real Neovim — headless *and* interactive, they agree on 0.12 —
+    // puts `2<C-b>` from line 60 on line 22. The second `<C-b>` cannot scroll
+    // a whole page, so "cursor to the last line of the new window" (what Vim
+    // does) stops agreeing with "cursor to a fixed offset from the old
+    // window" (what `page_up` used to compute, giving 20).
+    let mut e = scroll_fixture();
+    e.view_mut().cursor.line = 59;
+    e.ensure_cursor_visible();
+    ctrl(&mut e, 'b');
+    assert_cursor(&e, 39, 0); // a full page back: unchanged by the fix
+    ctrl(&mut e, 'b');
+    assert_cursor(&e, 21, 0); // clamped at the top; window bottom is line 22
+}
+
+#[test]
+fn test_ctrl_b_keeps_the_cursor_scrolloff_above_the_window_bottom() {
+    // #1008: `<C-b>` lands on the window's last line, so `'scrolloff'` pushes
+    // the cursor *up* from it — the pre-#1008 formula moved it down instead,
+    // which no test and no conformance case exercised. Real Neovim on the
+    // same geometry (`:set so=5`, 60 lines, 22 rows, topline 19) answers 35.
+    let mut e = scroll_fixture();
+    e.settings.scrolloff = 5;
+    // Placed directly rather than via `ensure_cursor_visible`, which has a
+    // separate bug at the buffer end with `'scrolloff'` set (it scrolls past
+    // the last line); that is not what this test is about.
+    e.view_mut().scroll_top = 38;
+    e.view_mut().cursor.line = 59;
+    ctrl(&mut e, 'b');
+    // new topline 19 (0-indexed 18), window bottom line 40, minus scrolloff.
+    assert_eq!(e.view().scroll_top, 18);
+    assert_cursor(&e, 34, 0);
 }
 
 #[test]
@@ -624,12 +659,152 @@ fn test_changes_shows_change_list() {
 
 // ── :history ─────────────────────────────────────────────────────────────────
 
+/// #1327: `:history`'s no-argument listing must match Neovim's own
+/// `      #  cmd history` header and column layout (confirmed against a
+/// live oracle) instead of the vimcode-invented `--- Command History ---`
+/// header this used to assert on.
 #[test]
 fn test_history_shows_command_history() {
     let mut e = engine_with("hello\n");
     run_cmd(&mut e, "echo hello");
     exec(&mut e, "history");
-    assert!(e.message.contains("History") || e.message.contains("echo"));
+    assert!(
+        e.message.starts_with("      #  cmd history\n"),
+        "{:?}",
+        e.message
+    );
+    assert!(e.message.contains("echo hello"));
+}
+
+/// Hermeticity regression for #1304: `Engine::new()` used to read the real
+/// `~/.config/vimcode/history.json` unconditionally, so `:history` printed
+/// whatever the developer machine's config had lying around (confirmed:
+/// this repo's own dev machine had ~100 stale entries) instead of only the
+/// commands this test itself typed. `engine_with` now calls
+/// `suppress_disk_loads()` before `Engine::new()`, so `HistoryState::load()`
+/// returns `Default` instead of touching disk. Assert the exact rendered
+/// `:history` output — not just that *a* history entry is present, which
+/// would pass just as well with real disk history leaked in ahead of it.
+///
+/// #1327 rewrote the expected string to match Neovim's real `:history`
+/// format: the `      #  cmd history` header (not vimcode's invented
+/// `--- Command History ---`) and a leading `>` marker on the newest entry
+/// (`echo two`, the last one added — `exec` calls `execute_command`
+/// directly, bypassing the command-line UI path that would otherwise also
+/// add `"history"` itself to `command_history`, so the newest entry stays
+/// `echo two`). Both confirmed against a live oracle.
+#[test]
+fn test_history_is_hermetic_and_shows_only_this_tests_commands() {
+    let mut e = engine_with("hello\n");
+    run_cmd(&mut e, "echo one");
+    run_cmd(&mut e, "echo two");
+    exec(&mut e, "history");
+    assert_eq!(
+        e.message, "      #  cmd history\n      1  echo one\n>     2  echo two",
+        "message should contain exactly this test's two commands, not any \
+         real ~/.config/vimcode/history.json entries from the machine \
+         running the test"
+    );
+}
+
+/// #1327: `:history /` (and its `?`/`search` spellings, `:h :history`)
+/// selects the *search* history rather than the command one — confirmed
+/// against a live oracle. Before #1327, any argument to `:history` fell
+/// through to "not an editor command" (the old match arm matched only the
+/// bare `"history"` string), so this is new behavior, not a reformat.
+#[test]
+fn test_history_slash_selects_search_history() {
+    let mut e = engine_with("hello\nworld\n");
+    search_fwd(&mut e, "hello");
+    search_fwd(&mut e, "world");
+    exec(&mut e, "history /");
+    assert_eq!(
+        e.message,
+        "      #  search history\n      1  hello\n>     2  world"
+    );
+}
+
+/// #1327: `:history all` lists every history kind's table back to back —
+/// `cmd`, `search`, then the always-empty `expr`/`input`/`debug` headers
+/// (vimcode tracks none of those three) — with no separator line between
+/// sections, confirmed against a live oracle.
+#[test]
+fn test_history_all_lists_every_kind() {
+    let mut e = engine_with("hello\n");
+    run_cmd(&mut e, "echo hi");
+    search_fwd(&mut e, "hello");
+    exec(&mut e, "history all");
+    assert_eq!(
+        e.message,
+        "      #  cmd history\n>     1  echo hi\n      #  search history\n>     1  hello\n      #  expr history\n      #  input history\n      #  debug history"
+    );
+}
+
+/// #1327: a trailing `{first}[,{last}]` index range (`:h
+/// :history-indexing`) restricts which rows of the selected history print —
+/// confirmed against a live oracle, including that `first` and `last` are
+/// each entries' *absolute* position, unaffected by the filter (row `1` is
+/// omitted here, but the surviving row still says `2`, not renumbered `1`).
+#[test]
+fn test_history_range_filters_rows() {
+    let mut e = engine_with("hello\n");
+    run_cmd(&mut e, "echo one");
+    run_cmd(&mut e, "echo two");
+    exec(&mut e, "history 2,2");
+    assert_eq!(e.message, "      #  cmd history\n>     2  echo two");
+}
+
+/// #1327: on a totally fresh session — nothing ever recorded in *any*
+/// history kind — every one of `:history`, `:history {name}` and
+/// `:history all` errors with Neovim's own `'history' option is zero`
+/// message (`:h :history`) rather than printing an empty table. Confirmed
+/// against a live oracle.
+#[test]
+fn test_history_named_empty_kind_errors() {
+    let mut e = engine_with("hello\n");
+    let action = exec(&mut e, "history search");
+    assert_eq!(e.message, "'history' option is zero");
+    assert!(matches!(action, EngineAction::Error));
+}
+
+/// #1327 review: the `'history' option is zero` gate is session-wide, not
+/// per-requested-kind — confirmed against a live oracle. Once *any* kind has
+/// recorded something (here, only `cmd` via `run_cmd`), requesting a
+/// *different*, still-empty kind (`search`) must print that kind's empty
+/// table, not error. Before this fix, `ex_history` checked only the
+/// requested kind's own entries, so this exact case incorrectly errored.
+#[test]
+fn test_history_other_kind_empty_prints_empty_table_when_something_recorded() {
+    let mut e = engine_with("hello\n");
+    run_cmd(&mut e, "echo one");
+    let action = exec(&mut e, "history search");
+    assert_eq!(e.message, "      #  search history");
+    assert!(!matches!(action, EngineAction::Error));
+}
+
+/// #1327 review: the symmetric case of the test above — only `search`
+/// history has ever been recorded, `cmd` history (the bare `:history`
+/// default, `:h :history`) is empty. Must print an empty table, not error.
+/// Confirmed against a live oracle.
+#[test]
+fn test_history_bare_default_prints_empty_table_when_only_search_recorded() {
+    let mut e = engine_with("hello\nworld\n");
+    search_fwd(&mut e, "hello");
+    let action = exec(&mut e, "history");
+    assert_eq!(e.message, "      #  cmd history");
+    assert!(!matches!(action, EngineAction::Error));
+}
+
+/// #1327 review: `:history all` on a totally fresh session — nothing ever
+/// recorded in any kind — errors exactly like a single named kind does,
+/// rather than printing five empty headers. Confirmed against a live
+/// oracle.
+#[test]
+fn test_history_all_errors_on_totally_fresh_session() {
+    let mut e = engine_with("hello\n");
+    let action = exec(&mut e, "history all");
+    assert_eq!(e.message, "'history' option is zero");
+    assert!(matches!(action, EngineAction::Error));
 }
 
 // ── :reg ─────────────────────────────────────────────────────────────────────
@@ -640,7 +815,25 @@ fn test_reg_shows_registers() {
     press(&mut e, 'y');
     press(&mut e, 'w'); // yank 'hello'
     exec(&mut e, "reg");
-    assert!(e.message.contains("Registers") || e.message.contains('"'));
+    // #1299: Neovim's real `Type Name Content` table. The old assertion here
+    // was `contains("Registers") || contains('"')`, which passed against any
+    // listing at all — including the pre-#1299 invented header.
+    assert!(
+        e.message.starts_with("Type Name Content\n"),
+        ":reg header: {:?}",
+        e.message
+    );
+    // `yw` is charwise, so the unnamed and `0` rows both use the `c` type.
+    assert!(
+        e.message.contains("  c  \"\"   hello"),
+        ":reg unnamed row: {:?}",
+        e.message
+    );
+    assert!(
+        e.message.contains("  c  \"0   hello"),
+        ":reg yank row: {:?}",
+        e.message
+    );
 }
 
 // ── :tabmove ────────────────────────────────────────────────────────────────
@@ -674,9 +867,91 @@ fn test_echo_empty_clears_message() {
 
 #[test]
 fn test_shell_command_shows_output() {
+    // Shares `SHELL_ENV_LOCK` with `test_bang_command_honours_shell_env_var`
+    // below: that test points process-global `$SHELL` at a fake shell for
+    // its duration, which would otherwise race this test's `:!` (both run
+    // in the same test binary, in parallel, by default).
+    let _lock = SHELL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut e = engine_with("hello\n");
     exec(&mut e, "!echo test_output");
     assert!(e.message.contains("test_output"));
+}
+
+/// #948: `:!` used to hardcode `Command::new("sh")`, ignoring `$SHELL`
+/// entirely (and having no Windows leg at all — `sh` doesn't exist there).
+/// Point `$SHELL` at a fake shell script that unconditionally prints a
+/// marker regardless of the command string it's handed, then run `:!` with
+/// a *different* command. If `:!` really resolves the shell binary through
+/// quadraui's `shell_command()` seam (as fixed), the fake shell runs and the
+/// marker shows up in the output instead of the real command's output.
+/// Verified RED against unfixed develop: reverting #948's `execute.rs`
+/// change back to `Command::new("sh")` makes this fail because a real `sh`
+/// ignores `$SHELL` and runs `echo real_sh_output` literally, never
+/// producing the marker.
+#[test]
+#[cfg(unix)]
+fn test_bang_command_honours_shell_env_var() {
+    let _lock = SHELL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let dir = std::env::temp_dir().join(format!("vimcode_test_fake_shell_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("create fake-shell temp dir");
+    let script = dir.join("fake_shell.sh");
+    std::fs::write(&script, "#!/bin/sh\necho FAKE_SHELL_MARKER\n").expect("write fake shell");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&script)
+            .expect("stat fake shell")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script, perms).expect("chmod fake shell");
+    }
+
+    let _guard = EnvVarGuard::set("SHELL", script.as_os_str());
+
+    let mut e = engine_with("hello\n");
+    exec(&mut e, "!echo real_sh_output");
+    assert!(
+        e.message.contains("FAKE_SHELL_MARKER"),
+        "expected :! to resolve the shell via $SHELL (fake shell script), got: {:?}",
+        e.message
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Serializes tests in this file that mutate the process-global `$SHELL`
+/// env var (shared with every other test in this binary), and an RAII guard
+/// that restores the prior value on drop — including on panic. Mirrors the
+/// pattern in `tests/extensions.rs`'s `HOMEBREW_ENV_LOCK`/`EnvVarGuard`.
+static SHELL_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+// Only ever constructed by `test_bang_command_honours_shell_env_var` above,
+// which is itself `#[cfg(unix)]`-gated — gate the whole type the same way so
+// a non-unix build doesn't carry an unused struct + `Drop` impl.
+#[cfg(unix)]
+struct EnvVarGuard {
+    key: &'static str,
+    old: Option<std::ffi::OsString>,
+}
+
+#[cfg(unix)]
+impl EnvVarGuard {
+    fn set(key: &'static str, value: &std::ffi::OsStr) -> Self {
+        let old = std::env::var_os(key);
+        std::env::set_var(key, value);
+        Self { key, old }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        match self.old.take() {
+            Some(v) => std::env::set_var(self.key, v),
+            None => std::env::remove_var(self.key),
+        }
+    }
 }
 
 // ── ignorecase / smartcase ──────────────────────────────────────────────────

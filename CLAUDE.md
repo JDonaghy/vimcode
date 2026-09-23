@@ -45,14 +45,13 @@ line-level confirmation — not the first move.
 
 ### quadraui is a pinned git dependency, not a sibling checkout (#691)
 
-Vimcode depends on `quadraui` via a **git dependency pinned to a `rev`** in `Cargo.toml` — `quadraui = { git = "https://github.com/JDonaghy/quadraui.git", rev = "<sha>", ... }`, and `[patch.crates-io] vt100` is pinned the same way. Cargo clones the pinned rev into `~/.cargo/git/` itself and locks the resolved SHA in `Cargo.lock`. **`~/src/quadraui` is not consulted by a normal build at all** — a plain `cargo build` is reproducible regardless of what's checked out there, including on a machine running several agents concurrently.
+Vimcode depends on `quadraui` via a **git dependency pinned to a `rev`** in `Cargo.toml` — `quadraui = { git = "https://github.com/JDonaghy/quadraui.git", rev = "<sha>", ... }`. (There is **one** pin now: the `[patch.crates-io] vt100` entry that used to shadow it was removed once quadraui#795 dropped the vendored shim upstream — see the comment above `[patch...]` in `Cargo.toml`.) The repo is public, so cargo resolves the pin anonymously with no token — which is what lets GitHub-hosted CI and release runners build it. Cargo clones the pinned rev into `~/.cargo/git/` itself and locks the resolved SHA in `Cargo.lock`. **`~/src/quadraui` is not consulted by a normal build at all** — a plain `cargo build` is reproducible regardless of what's checked out there, including on a machine running several agents concurrently.
 
 ```bash
 # Build against the pin (the normal case, and the only case for a plain checkout):
 cargo build
 
-# Bump the pin: edit `rev = "..."` in Cargo.toml (the quadraui dependency AND
-# the [patch.crates-io] vt100 entry — they must match), then:
+# Bump the pin: edit `rev = "..."` in Cargo.toml, then:
 cargo test    # updates Cargo.lock and re-runs snapshots against the new rev
 
 # Co-developing quadraui on a local branch? Opt in per-checkout, not per-env-var:
@@ -178,6 +177,18 @@ The adversarial reviewer reads this file and **rejects** behaviour-changing PRs 
 2. **State in the PR that the new test fails against unfixed `develop`.** #553 shipped
    black-box tests that stayed green with the bug reinstated. A test that cannot fail is not
    coverage. Remove the fix, re-run, confirm red, restore — then say so in the PR.
+3. **A reproduction is not a fix, and a `KNOWN_BUGS` entry is not a closed bug.** A
+   test-only issue (one that ships a red, `KNOWN_BUGS`-gated scenario and no code change)
+   **may not be closed until its follow-up fix issue exists**, and that fix issue's number
+   goes in the `KNOWN_BUGS` comment beside the label it gates. The bidirectional gate makes
+   a still-broken bug report a *green* CI run, so without this rule a reproduced bug
+   silently disappears: the v0.11.0 suite (#983, #984, #986, #987, #988, #990) shipped 15
+   gated labels in v0.12.0, all six issues closed, zero fix issues filed, and the bugs went
+   out to a user who believed they were fixed.
+4. **Never describe a `KNOWN_BUGS`-gated issue as fixed** — not in a PR body, not in
+   release notes, not in a status report. Before writing release notes, read `KNOWN_BUGS`
+   and list every issue it still gates under an explicit **"Reproduced, not yet fixed"**
+   heading. "Closed" describes the issue; only a green, un-gated test describes the bug.
 
 If the change touches a surface both backends render, the multi-backend rule above applies to
 the tests too: cover both.
@@ -219,9 +230,16 @@ The coordinator drives issues through `Work → Test → Review → Merge`. The 
 - **ALWAYS pull the prebuilt artifact** with `coord pull-artifact <work_aid>`. Do **NOT** run `cargo build` / `cargo test` yourself — the work-stage worker already compiled the binary and ran the full suite before finishing. Rebuilding or re-testing here **pins the CPU for zero new signal**.
 - **Do NOT run the full test suite** (`cargo test`) at the Test stage. It already ran at the Work stage. The Test stage is **black-box behavior validation + user smoke**: drive the *pulled* binary, exercise the changed behavior end-to-end, and confirm it does what the issue asks.
 - The "**MANDATORY before commits: run all four commands**" rule above is for the **work-stage worker authoring the change**, NOT for the test-stage agent.
+- **For a bug-fix issue, the branch does not pass the Test stage without a named black-box test and a RED verification.** Check that the PR/branch names the test that covers the reported bug, and that it states the test was observed failing against unfixed `develop` (rule 2 above). If the branch ships a `KNOWN_BUGS`-gated scenario instead of a green one, the bug is **reproduced, not fixed** — `coord test --fail` it unless the issue was explicitly scoped test-only, and in that case confirm its follow-up fix issue exists before passing (rule 3 above).
 - Record the verdict with `coord test --passed <work_aid>` or `coord test --fail <work_aid> --reason "<full repro: expected vs actual, steps, suspected files>"`.
 
 ## Branching & Releases
+
+> **Cutting a release: [`docs/RELEASING.md`](docs/RELEASING.md).** It holds the
+> pre-release architecture gate — the per-backend test lanes, which machine can run
+> each one, and which failures are expected-red on which platform — plus what the
+> release artifacts actually are. Operator-facing; workers don't need it.
+
 - All work happens on `develop`; `main` is the release branch
 - Merge `develop` → `main` via GitHub PR (CI runs on the PR before release)
 - Before creating the PR: bump version in `Cargo.toml`

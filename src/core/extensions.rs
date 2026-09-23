@@ -77,6 +77,10 @@ pub struct ExtensionManifest {
     /// Derived at fetch time; not serialized to JSON/TOML.
     #[serde(skip)]
     pub registry_base_url: String,
+    /// Declares this extension as a Board-panel data provider (#522).
+    /// `None` means this extension doesn't provide a board.
+    #[serde(default)]
+    pub board: Option<BoardProviderConfig>,
 }
 
 /// Comment style override specified in an extension manifest `[comment]` section.
@@ -88,6 +92,59 @@ pub struct CommentConfig {
     pub block_open: String,
     #[serde(default)]
     pub block_close: String,
+}
+
+/// Declares an extension as a Board-panel data provider (#522).
+///
+/// Generic on purpose — this struct names no particular provider. Any
+/// extension can point `refresh_command` at an external tool that emits
+/// vimcode's board JSON contract (`quadraui::BoardModel`, see
+/// `crate::core::tool_client::fetch_board_model`) on stdout and get a
+/// working Board panel. A pipeline-management bundle is one such
+/// provider, not the only one — nothing here names any particular
+/// external tool or its subcommands.
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct BoardProviderConfig {
+    /// Argv to run for a board refresh. `refresh_command[0]` is the
+    /// binary, the rest are arguments. Must emit a `quadraui::BoardModel`
+    /// JSON document on stdout and exit zero.
+    #[serde(default)]
+    pub refresh_command: Vec<String>,
+    /// Seconds between automatic background refreshes.
+    #[serde(default = "default_board_poll_interval_secs")]
+    pub poll_interval_secs: u64,
+    /// Maps a `quadraui::BoardAction` variant name (e.g. `"OpenIssue"`,
+    /// `"OpenReview"`) to an argv template to run when that action fires.
+    /// The literal token `{id}` in any argument is replaced with the
+    /// acted-on card id at dispatch time. Actions with no entry here are
+    /// simply not runnable — the panel host should no-op rather than
+    /// error.
+    #[serde(default)]
+    pub actions: std::collections::HashMap<String, Vec<String>>,
+}
+
+fn default_board_poll_interval_secs() -> u64 {
+    30
+}
+
+impl BoardProviderConfig {
+    /// Resolve the argv to run for `action_name` (a `quadraui::BoardAction`
+    /// variant name) against `card_id`, substituting `{id}` in every
+    /// argument. Returns `None` if this provider declared no command for
+    /// that action, or if it declared one as an explicit empty array
+    /// (equivalent to "not runnable").
+    pub fn action_argv(&self, action_name: &str, card_id: &str) -> Option<Vec<String>> {
+        let template = self.actions.get(action_name)?;
+        if template.is_empty() {
+            return None;
+        }
+        Some(
+            template
+                .iter()
+                .map(|arg| arg.replace("{id}", card_id))
+                .collect(),
+        )
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
@@ -130,21 +187,78 @@ pub struct LspConfig {
     pub initialization_options: Option<serde_json::Value>,
 }
 
+// ─── Target platform (testable seam, #919) ────────────────────────────────────
+
+/// A target platform for install-command resolution. Install commands are
+/// naturally platform-specific (`apt`/`brew`/`winget`, `sh -c` vs `cmd /C`);
+/// this type makes "which platform" an explicit parameter passed to
+/// `install_cmd_for` instead of a `cfg!` baked into the compiled binary, so a
+/// single test run can assert every manifest resolves an install command on
+/// *all three* platforms regardless of which one the test binary happens to
+/// be compiled for. See the registry conformance gate in `tests/extensions.rs`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Platform {
+    Linux,
+    MacOS,
+    Windows,
+}
+
+impl Platform {
+    /// All platforms vimcode ships a backend for, in a stable order.
+    pub const ALL: [Platform; 3] = [Platform::Linux, Platform::MacOS, Platform::Windows];
+
+    /// The platform this binary was actually compiled for — what
+    /// `install_cmd_for_platform()` resolves against by default.
+    pub fn host() -> Platform {
+        #[cfg(target_os = "windows")]
+        {
+            Platform::Windows
+        }
+        #[cfg(target_os = "macos")]
+        {
+            Platform::MacOS
+        }
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+        {
+            Platform::Linux
+        }
+    }
+}
+
+impl std::fmt::Display for Platform {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Platform::Linux => "linux",
+            Platform::MacOS => "macos",
+            Platform::Windows => "windows",
+        })
+    }
+}
+
 impl LspConfig {
-    /// Return the install command for the current platform.
+    /// Return the install command for the current (host) platform.
     /// Prefers the platform-specific field; falls back to the generic `install` field.
     /// Applies known fixups (e.g. rust-analyzer falls back to `rustup component add`
     /// when rustup is available, since `cargo install rust-analyzer` compiles
     /// from source and is slow).
     pub fn install_cmd_for_platform(&self) -> &str {
-        self.install_cmd_with(rustup_on_path())
+        self.install_cmd_for(Platform::host())
     }
 
-    /// Inner helper for `install_cmd_for_platform`, parameterised over rustup
+    /// Same as `install_cmd_for_platform`, but for an explicitly-named
+    /// platform rather than the one this binary happens to be compiled for.
+    /// This is the seam the #919 registry conformance test uses to check a
+    /// manifest resolves an install command on all three platforms from a
+    /// single (any-OS) test binary.
+    pub fn install_cmd_for(&self, platform: Platform) -> &str {
+        self.install_cmd_with(platform, rustup_on_path())
+    }
+
+    /// Inner helper for `install_cmd_for`, parameterised over rustup
     /// availability so the fixup can be tested without depending on the host's
     /// PATH.
-    fn install_cmd_with(&self, rustup_available: bool) -> &str {
-        let raw = self.platform_install_cmd_raw();
+    fn install_cmd_with(&self, platform: Platform, rustup_available: bool) -> &str {
+        let raw = self.platform_install_cmd_raw(platform);
         // rust-analyzer: prefer `rustup component add` over `cargo install`.
         // Anyone with a Rust toolchain has rustup; the component is a
         // ~30-second binary download vs the ~10-minute source build.
@@ -154,16 +268,17 @@ impl LspConfig {
         raw
     }
 
-    fn platform_install_cmd_raw(&self) -> &str {
-        let platform = platform_install_field(
+    fn platform_install_cmd_raw(&self, platform: Platform) -> &str {
+        let platform_field = platform_install_field(
+            platform,
             &self.install_linux,
             &self.install_macos,
             &self.install_windows,
         );
-        if platform.is_empty() {
+        if platform_field.is_empty() {
             &self.install
         } else {
-            platform
+            platform_field
         }
     }
 }
@@ -210,39 +325,124 @@ pub struct DapConfig {
 }
 
 impl DapConfig {
-    /// Return the install command for the current platform.
+    /// Return the install command for the current (host) platform.
     /// Prefers the platform-specific field; falls back to the generic `install` field.
     pub fn install_cmd_for_platform(&self) -> &str {
-        let platform = platform_install_field(
+        self.install_cmd_for(Platform::host())
+    }
+
+    /// Same as `install_cmd_for_platform`, but for an explicitly-named
+    /// platform. See `LspConfig::install_cmd_for` / `Platform` for why this
+    /// seam exists (#919).
+    pub fn install_cmd_for(&self, platform: Platform) -> &str {
+        let platform_field = platform_install_field(
+            platform,
             &self.install_linux,
             &self.install_macos,
             &self.install_windows,
         );
-        if platform.is_empty() {
+        if platform_field.is_empty() {
             &self.install
         } else {
-            platform
+            platform_field
         }
     }
 }
 
-/// Pick the install command string for the current OS.
-fn platform_install_field<'a>(linux: &'a str, macos: &'a str, windows: &'a str) -> &'a str {
-    #[cfg(target_os = "windows")]
-    {
-        let _ = (linux, macos);
-        windows
+/// Pick the install command string for the given platform.
+fn platform_install_field<'a>(
+    platform: Platform,
+    linux: &'a str,
+    macos: &'a str,
+    windows: &'a str,
+) -> &'a str {
+    match platform {
+        Platform::Linux => linux,
+        Platform::MacOS => macos,
+        Platform::Windows => windows,
     }
-    #[cfg(target_os = "macos")]
-    {
-        let _ = (linux, windows);
-        macos
-    }
-    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-    {
-        let _ = (macos, windows);
-        linux
-    }
+}
+
+// ─── Prerequisite install guidance (#918) ─────────────────────────────────────
+
+/// Per-platform install guidance for the handful of runtime prerequisites
+/// shared across many extensions' `lsp.dependencies` (e.g. `["npm"]`).
+///
+/// `dependencies` is intentionally a bare `Vec<String>` of binary names —
+/// extending the manifest schema so each entry could carry its own install
+/// metadata would break the `dependencies = ["npm"]` shorthand already used
+/// by 10+ registry manifests (it would need to accept both a bare string and
+/// a `{name, install_linux, ...}` object, and every extension author would
+/// need to fill it in). A small built-in table for the six prerequisites
+/// actually shared across the registry today — `npm`, `dotnet`, `go`, `gem`,
+/// `cargo`, `rustup` — is simpler, keeps the manifest format backward
+/// compatible, and covers every affected extension without a schema change.
+struct PrereqInstall {
+    linux: &'static str,
+    macos: &'static str,
+    windows: &'static str,
+}
+
+const PREREQ_INSTALLS: &[(&str, PrereqInstall)] = &[
+    (
+        "npm",
+        PrereqInstall {
+            linux: "sudo apt install nodejs npm",
+            macos: "brew install node",
+            windows: "winget install OpenJS.NodeJS",
+        },
+    ),
+    (
+        "dotnet",
+        PrereqInstall {
+            linux: "sudo apt install dotnet-sdk-8.0",
+            macos: "brew install dotnet-sdk",
+            windows: "winget install Microsoft.DotNet.SDK.8",
+        },
+    ),
+    (
+        "go",
+        PrereqInstall {
+            linux: "sudo apt install golang-go",
+            macos: "brew install go",
+            windows: "winget install GoLang.Go",
+        },
+    ),
+    (
+        "gem",
+        PrereqInstall {
+            linux: "sudo apt install ruby",
+            macos: "brew install ruby",
+            windows: "winget install RubyInstallerTeam.Ruby",
+        },
+    ),
+    (
+        "cargo",
+        PrereqInstall {
+            linux: "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh",
+            macos: "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh",
+            windows: "winget install Rustlang.Rustup",
+        },
+    ),
+    (
+        "rustup",
+        PrereqInstall {
+            linux: "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh",
+            macos: "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh",
+            windows: "winget install Rustlang.Rustup",
+        },
+    ),
+];
+
+/// Return a runnable install command for a known prerequisite binary (e.g.
+/// `"npm"`), chosen for the current platform. Returns `None` for names
+/// outside the built-in table above — callers should fall back to a
+/// generic "install X and try again" message in that case.
+pub fn prereq_install_cmd(dep: &str) -> Option<&'static str> {
+    PREREQ_INSTALLS
+        .iter()
+        .find(|(name, _)| *name == dep)
+        .map(|(_, t)| platform_install_field(Platform::host(), t.linux, t.macos, t.windows))
 }
 
 impl ExtensionManifest {
@@ -261,6 +461,20 @@ impl ExtensionManifest {
 
     pub fn matches_language_id(&self, lang: &str) -> bool {
         self.language_ids.iter().any(|l| l == lang)
+    }
+
+    /// The name to show the user: `display_name` when set, falling back to
+    /// the internal `name` otherwise. Several install-failure messages
+    /// (`lsp_manager.rs`'s `missing_dependency_message` and the two
+    /// `ensure_server_for_language` error branches, #918) all needed this
+    /// exact fallback independently — pulled out once here so it can't drift
+    /// between call sites.
+    pub fn display_or_name(&self) -> &str {
+        if self.display_name.is_empty() {
+            &self.name
+        } else {
+            &self.display_name
+        }
     }
 }
 
@@ -453,7 +667,7 @@ binary = "test-lsp"
             ..Default::default()
         };
         assert_eq!(
-            cfg.install_cmd_with(true),
+            cfg.install_cmd_with(Platform::host(), true),
             "rustup component add rust-analyzer"
         );
     }
@@ -467,7 +681,10 @@ binary = "test-lsp"
             install: "cargo install rust-analyzer".to_string(),
             ..Default::default()
         };
-        assert_eq!(cfg.install_cmd_with(false), "cargo install rust-analyzer");
+        assert_eq!(
+            cfg.install_cmd_with(Platform::host(), false),
+            "cargo install rust-analyzer"
+        );
     }
 
     #[test]
@@ -485,7 +702,9 @@ binary = "test-lsp"
         };
         // The platform-specific field is selected (not the cargo command),
         // so the fixup does not match `starts_with("cargo install")`.
-        assert!(!cfg.install_cmd_with(true).starts_with("rustup"));
+        assert!(!cfg
+            .install_cmd_with(Platform::host(), true)
+            .starts_with("rustup"));
     }
 
     #[test]
@@ -497,8 +716,105 @@ binary = "test-lsp"
             ..Default::default()
         };
         assert_eq!(
-            cfg.install_cmd_with(true),
+            cfg.install_cmd_with(Platform::host(), true),
             "cargo install some-other-server"
         );
+    }
+
+    #[test]
+    fn install_cmd_for_resolves_explicit_platform_regardless_of_host() {
+        // #919: the whole point of `install_cmd_for(Platform)` is that a
+        // test running on any host OS can ask "what would this resolve to
+        // on Windows/macOS/Linux specifically" — not just "what does it
+        // resolve to on the OS I happen to be compiled for".
+        let cfg = LspConfig {
+            binary: "clangd".to_string(),
+            install_linux: "sudo apt-get install -y clangd".to_string(),
+            install_macos: "brew install llvm".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            cfg.install_cmd_for(Platform::Linux),
+            "sudo apt-get install -y clangd"
+        );
+        assert_eq!(cfg.install_cmd_for(Platform::MacOS), "brew install llvm");
+        // No install_windows and no generic `install` fallback set → empty.
+        assert_eq!(cfg.install_cmd_for(Platform::Windows), "");
+    }
+
+    #[test]
+    fn board_provider_config_defaults_when_absent_from_toml() {
+        // A manifest with no [board] section should parse to `None`, not
+        // an error — most extensions never touch the board panel.
+        let toml = r#"
+name = "rust"
+display_name = "Rust Language Support"
+"#;
+        let m = ExtensionManifest::parse(toml).expect("should parse");
+        assert!(m.board.is_none());
+    }
+
+    #[test]
+    fn board_provider_config_parses_from_toml() {
+        let toml = r#"
+name = "example-provider"
+display_name = "Example Board Provider"
+
+[board]
+refresh_command = ["example-tool", "board", "--json"]
+poll_interval_secs = 15
+
+[board.actions]
+OpenIssue = ["example-tool", "open", "{id}"]
+"#;
+        let m = ExtensionManifest::parse(toml).expect("should parse");
+        let board = m.board.expect("board provider config should be present");
+        assert_eq!(
+            board.refresh_command,
+            vec!["example-tool", "board", "--json"]
+        );
+        assert_eq!(board.poll_interval_secs, 15);
+        assert_eq!(
+            board.action_argv("OpenIssue", "card:42"),
+            Some(vec![
+                "example-tool".to_string(),
+                "open".to_string(),
+                "card:42".to_string()
+            ])
+        );
+        assert_eq!(board.action_argv("Merge", "card:42"), None);
+    }
+
+    #[test]
+    fn board_provider_config_poll_interval_defaults_when_unset() {
+        let toml = r#"
+name = "example-provider"
+display_name = "Example Board Provider"
+
+[board]
+refresh_command = ["example-tool", "board", "--json"]
+"#;
+        let m = ExtensionManifest::parse(toml).expect("should parse");
+        let board = m.board.expect("board provider config should be present");
+        assert_eq!(board.poll_interval_secs, 30);
+    }
+
+    #[test]
+    fn dap_install_cmd_for_resolves_explicit_platform() {
+        let cfg = DapConfig {
+            adapter: "netcoredbg".to_string(),
+            install_linux: "sudo apt-get install -y netcoredbg".to_string(),
+            install_windows: "winget install netcoredbg".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            cfg.install_cmd_for(Platform::Linux),
+            "sudo apt-get install -y netcoredbg"
+        );
+        assert_eq!(
+            cfg.install_cmd_for(Platform::Windows),
+            "winget install netcoredbg"
+        );
+        assert_eq!(cfg.install_cmd_for(Platform::MacOS), "");
     }
 }

@@ -501,10 +501,24 @@ fn test_sort_basic() {
 
 #[test]
 fn test_sort_reverse() {
+    // Reversing is the bang, `:sort!` — not a letter flag.
     let mut e = engine_with("a\nb\nc\n");
-    exec(&mut e, "sort r");
+    exec(&mut e, "sort!");
     let lines = get_lines(&e);
     assert_eq!(lines, vec!["c", "b", "a"]);
+}
+
+#[test]
+fn test_sort_r_flag_without_pattern_does_not_reverse() {
+    // `r` selects the `/pattern/` *match* as the sort key; with no pattern
+    // there is nothing to select, so the sort is a plain ascending one.
+    // Verified against `nvim --headless -u NONE -c 'sort r'`: `c a b` → `a b c`.
+    // This repo used to treat `r` as "reverse", which broke `:sort /pat/ r`
+    // (#879).
+    let mut e = engine_with("c\na\nb\n");
+    exec(&mut e, "sort r");
+    let lines = get_lines(&e);
+    assert_eq!(lines, vec!["a", "b", "c"]);
 }
 
 #[test]

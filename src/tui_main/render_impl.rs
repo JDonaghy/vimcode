@@ -1,5 +1,101 @@
 use super::*;
 
+// ─── Bottom band row accounting ────────────────────────────────────────────────
+
+/// The height, in rows, of each vimcode-specific chrome band that stacks
+/// below the editor column: quickfix/location-list, the terminal/debug
+/// bottom panel, the debug toolbar, the wildmenu, and the status line(s).
+/// `AppShellLayout` has no concept of any of these — see
+/// [`bottom_chrome_rects_for_shell_content`]'s doc comment for why they are
+/// carved out by hand.
+///
+/// Single source of truth for this arithmetic (#1164). Before this type
+/// existed, `build_screen_for_tui`, `build_screen_for_shell_content`,
+/// `bottom_chrome_rects_for_shell_content` and `TuiShellApp::tick` each
+/// hand-summed the same five gates independently — `tick` in particular ran
+/// ahead of any paint (no `ScreenLayout` yet to read a rect back from), so
+/// it re-derived every gate from `Engine` flags on its own rather than
+/// composing bands, which is the exact "second geometry model" #1164
+/// flagged: it duplicated `bottom_chrome_rects_for_shell_content`'s
+/// per-band heights, drifting from them under nobody's notice (menu-bar
+/// height folded into the wrong side of the sum, `window_status_line`
+/// ignored in favour of a hardcoded status row) until this convergence.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct BottomBandRowHeights {
+    pub(super) quickfix: u16,
+    pub(super) terminal: u16,
+    pub(super) debug_toolbar: u16,
+    pub(super) wildmenu: u16,
+    pub(super) global_status: u16,
+    pub(super) separated_status: u16,
+}
+
+impl BottomBandRowHeights {
+    /// Total rows this band stack reserves below the editor, **including**
+    /// the always-present 1-row command line but **excluding** the
+    /// menu-bar row — callers that see the raw terminal viewport (`tick`,
+    /// `build_screen_for_tui`) carve that off separately, matching
+    /// `bottom_chrome_rects_for_shell_content`'s `area`, which never
+    /// carries it in the first place (AppShell already carved its own
+    /// title-bar row off before handing out `main_content_bounds`).
+    pub(super) fn total(&self) -> u16 {
+        1 + self.quickfix
+            + self.terminal
+            + self.debug_toolbar
+            + self.wildmenu
+            + self.global_status
+            + self.separated_status
+    }
+}
+
+/// Computes [`BottomBandRowHeights`] from live `Engine` state alone — no
+/// `ScreenLayout` required, so this is cheap enough to call every `tick`,
+/// not just once per paint.
+///
+/// `content_height` bounds the terminal panel's "maximize" target
+/// (`terminal_target_maximize_rows_tui`): pass the editor-column height the
+/// panel will actually be measured against — the AppShell-carved
+/// `area.height` from a paint call, or the menu-row-adjusted raw viewport
+/// height from `tick`.
+pub(super) fn bottom_band_row_heights(
+    engine: &Engine,
+    content_height: u16,
+) -> BottomBandRowHeights {
+    // `quickfix_panel_rows` also accounts for the active window's open
+    // location list (#1155) — the two share one bottom "list rung".
+    let quickfix = render::quickfix_panel_rows(engine);
+    let bottom_panel_open = engine.terminal_open || engine.bottom_panel_open;
+    let terminal = if bottom_panel_open {
+        let target = super::terminal_target_maximize_rows_tui(engine, content_height);
+        engine.effective_terminal_panel_rows(target) + 2 // tab bar + header + content
+    } else {
+        0
+    };
+    let debug_toolbar = if engine.debug_toolbar_visible { 1 } else { 0 };
+    let wildmenu: u16 = if !engine.wildmenu_items.is_empty() {
+        1
+    } else {
+        0
+    };
+    let per_window_status = render::effective_window_status_line(engine);
+    let global_status = if render::global_status_bar_visible(engine) {
+        1
+    } else {
+        0
+    };
+    let separate_status =
+        per_window_status && !engine.settings.status_line_above_terminal && bottom_panel_open;
+    let separated_status = if separate_status { 1 } else { 0 };
+    BottomBandRowHeights {
+        quickfix,
+        terminal,
+        debug_toolbar,
+        wildmenu,
+        global_status,
+        separated_status,
+    }
+}
+
 // ─── Screen layout bridging ───────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -13,35 +109,10 @@ pub(super) fn build_screen_for_tui(
     // Global bottom rows: status(1) + cmd(1).  The tab bar row is included in
     // content_bounds and handled by calculate_group_window_rects (tab_bar_height=1).
     // Must match draw_frame's vertical layout exactly.
-    let qf_height: u16 = if engine.quickfix_open { 6 } else { 0 };
-    let bottom_panel_open = engine.terminal_open || engine.bottom_panel_open;
-    let term_height: u16 = if bottom_panel_open {
-        let target = super::terminal_target_maximize_rows_tui(engine, area.height);
-        engine.effective_terminal_panel_rows(target) + 2 // tab bar + header + content
-    } else {
-        0
-    };
     let menu_height: u16 = if engine.menu_bar_visible { 1 } else { 0 };
-    let dbg_height: u16 = if engine.debug_toolbar_visible { 1 } else { 0 };
-    let wildmenu_height: u16 = if !engine.wildmenu_items.is_empty() {
-        1
-    } else {
-        0
-    };
-    let per_window_status = engine.settings.window_status_line;
-    let global_status_rows: u16 = if per_window_status { 0 } else { 1 };
-    let separate_status =
-        per_window_status && !engine.settings.status_line_above_terminal && bottom_panel_open;
-    let separated_status_rows: u16 = if separate_status { 1 } else { 0 };
-    let content_rows = area.height.saturating_sub(
-        1 + global_status_rows
-            + qf_height
-            + term_height
-            + menu_height
-            + dbg_height
-            + wildmenu_height
-            + separated_status_rows,
-    ); // cmd(1) + optional status(1) + panels + separated status
+    let content_height = area.height.saturating_sub(menu_height);
+    let bands = bottom_band_row_heights(engine, content_height);
+    let content_rows = content_height.saturating_sub(bands.total()); // cmd(1) + optional status(1) + panels + separated status
     let sv = engine.app_shell.sidebar_visible();
     let sidebar_cols = if sv { sidebar_width + 1 } else { 0 }; // +1 sep
     let ab_width = if engine.settings.autohide_panels && !sv {
@@ -88,7 +159,20 @@ pub(super) fn build_screen_for_tui(
         );
     }
     let bsl_t0 = std::time::Instant::now();
-    let result = build_screen_layout(engine, theme, &window_rects, 1.0, 1.0, true);
+    // TUI's `quadraui::Backend::scrollbar_reserve()` is always `0.0` (the
+    // trait default — TUI has no overlay scrollbar chrome to dodge), so
+    // this test-only helper states it directly rather than threading a
+    // `&dyn Backend` through just to ask a question with one known answer.
+    let result = build_screen_layout(
+        engine,
+        theme,
+        &window_rects,
+        1.0,
+        1.0,
+        true,
+        0.0,
+        render::TUI_MINIMAP_SIZING,
+    );
     let bsl_elapsed = bsl_t0.elapsed();
     if bsl_elapsed.as_millis() > 10 {
         debug_log!(
@@ -136,36 +220,12 @@ pub(super) fn build_screen_for_shell_content(
     engine: &Engine,
     theme: &Theme,
     area: Rect,
+    backend: &dyn quadraui::Backend,
 ) -> render::ScreenLayout {
-    let qf_height: u16 = if engine.quickfix_open { 6 } else { 0 };
-    let bottom_panel_open = engine.terminal_open || engine.bottom_panel_open;
-    let term_height: u16 = if bottom_panel_open {
-        let target = super::terminal_target_maximize_rows_tui(engine, area.height);
-        engine.effective_terminal_panel_rows(target) + 2
-    } else {
-        0
-    };
     // No `menu_height` term here — `area` already excludes AppShell's own
     // title-bar row. See this function's doc comment.
-    let dbg_height: u16 = if engine.debug_toolbar_visible { 1 } else { 0 };
-    let wildmenu_height: u16 = if !engine.wildmenu_items.is_empty() {
-        1
-    } else {
-        0
-    };
-    let per_window_status = engine.settings.window_status_line;
-    let global_status_rows: u16 = if per_window_status { 0 } else { 1 };
-    let separate_status =
-        per_window_status && !engine.settings.status_line_above_terminal && bottom_panel_open;
-    let separated_status_rows: u16 = if separate_status { 1 } else { 0 };
-    let content_rows = area.height.saturating_sub(
-        1 + global_status_rows
-            + qf_height
-            + term_height
-            + dbg_height
-            + wildmenu_height
-            + separated_status_rows,
-    );
+    let bands = bottom_band_row_heights(engine, area.height);
+    let content_rows = area.height.saturating_sub(bands.total());
     let editor_origin_x = area.x as f64;
     let editor_origin_y = area.y as f64;
     let content_bounds = WindowRect::new(
@@ -181,7 +241,44 @@ pub(super) fn build_screen_for_shell_content(
     };
     let (window_rects, _dividers) =
         engine.calculate_group_window_rects(content_bounds, tui_tab_bar_height);
-    build_screen_layout(engine, theme, &window_rects, 1.0, 1.0, true)
+    // #828/quadraui#776: ask the real backend instead of sniffing
+    // `char_width` inside `render.rs` — always `0.0` for TUI today (the
+    // `Backend` trait's default, since TUI has no overlay scrollbar chrome
+    // to dodge), but this is the one call site whose value should track
+    // the trait, not restate the constant.
+    //
+    // #1097 (residual minimap-off click-cost profiling): this is the
+    // *live* per-frame path — `TuiShellApp::render_content` calls this once
+    // per redraw, and `handle_mouse_event` returns `Reaction::Redraw`
+    // unconditionally for every dispatched mouse event, including every
+    // coalesced `MouseMoved` fired while the mouse merely moves over the
+    // editor (mouse capture reports motion, not just clicks). The
+    // pre-existing `PERF build_screen_layout` hook on `build_screen_for_tui`
+    // above only instruments that `#[cfg(test)]`-only helper — it can never
+    // fire on a live run, since nothing outside tests calls it (see that
+    // function's own gating). This is the timer that actually sees what a
+    // live click/hover session costs. Threshold is 1ms, not that helper's
+    // 10ms: the residual cost #1097 chases is *many small frames*, not one
+    // slow one, and a 10ms floor would hide exactly that shape.
+    let bsl_t0 = std::time::Instant::now();
+    let result = build_screen_layout(
+        engine,
+        theme,
+        &window_rects,
+        1.0,
+        1.0,
+        true,
+        backend.scrollbar_reserve() as f64,
+        render::TUI_MINIMAP_SIZING,
+    );
+    let bsl_elapsed = bsl_t0.elapsed();
+    if bsl_elapsed.as_millis() >= 1 {
+        debug_log!(
+            "PERF build_screen_layout(live): {:.2}ms",
+            bsl_elapsed.as_secs_f64() * 1000.0
+        );
+    }
+    result
 }
 
 /// Quickfix panel + bottom panel (terminal/debug output) rects for
@@ -229,26 +326,17 @@ pub(super) struct BottomChromeRects {
 
 pub(super) fn bottom_chrome_rects_for_shell_content(
     engine: &Engine,
-    screen: &render::ScreenLayout,
     area: Rect,
 ) -> BottomChromeRects {
-    let qf_height: u16 = if screen.quickfix.is_some() { 6 } else { 0 };
-    let bottom_panel_open = engine.terminal_open || engine.bottom_panel_open;
-    let bottom_panel_height: u16 = if bottom_panel_open {
-        let target = super::terminal_target_maximize_rows_tui(engine, area.height);
-        engine.effective_terminal_panel_rows(target) + 2
-    } else {
-        0
-    };
-    let debug_toolbar_height: u16 = if screen.debug_toolbar.is_some() { 1 } else { 0 };
-    let wildmenu_height: u16 = if screen.wildmenu.is_some() { 1 } else { 0 };
-    let per_window_status = engine.settings.window_status_line;
-    let global_status_height: u16 = if per_window_status { 0 } else { 1 };
-    let separated_status_height: u16 = if screen.separated_status_line.is_some() {
-        1
-    } else {
-        0
-    };
+    // #1164: sourced from the same `bottom_band_row_heights` every other
+    // row-accounting call site now shares, rather than re-deriving each
+    // gate from `screen.<field>.is_some()` — those were always exactly
+    // equivalent to the `Engine`-flag gates below (each `ScreenLayout`
+    // field is populated from precisely one of these flags at `screen`
+    // build time), so this drops a redundant, `ScreenLayout`-shaped
+    // restatement of the same five gates instead of keeping two encodings
+    // of one fact in sync by hand.
+    let bands = bottom_band_row_heights(engine, area.height);
 
     // Mirrors `draw_frame`'s `v_chunks` layout exactly (see its own comment)
     // so `content_rows`'s reservation in `build_screen_for_shell_content`
@@ -256,14 +344,14 @@ pub(super) fn bottom_chrome_rects_for_shell_content(
     let v_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Min(0),                          // 0: editor
-            Constraint::Length(qf_height),               // 1: quickfix
-            Constraint::Length(bottom_panel_height),     // 2: terminal/debug bottom panel
-            Constraint::Length(debug_toolbar_height),    // 3: debug toolbar
-            Constraint::Length(separated_status_height), // 4: separated status
-            Constraint::Length(wildmenu_height),         // 5: wildmenu
-            Constraint::Length(global_status_height),    // 6: global status
-            Constraint::Length(1),                       // 7: cmd
+            Constraint::Min(0),                         // 0: editor
+            Constraint::Length(bands.quickfix),         // 1: quickfix
+            Constraint::Length(bands.terminal),         // 2: terminal/debug bottom panel
+            Constraint::Length(bands.debug_toolbar),    // 3: debug toolbar
+            Constraint::Length(bands.separated_status), // 4: separated status
+            Constraint::Length(bands.wildmenu),         // 5: wildmenu
+            Constraint::Length(bands.global_status),    // 6: global status
+            Constraint::Length(1),                      // 7: cmd
         ])
         .split(area);
 
@@ -314,6 +402,14 @@ pub(super) fn bottom_chrome_rects_for_shell_content(
 /// drift on this logic. `area` stands in for each block's original
 /// `frame.area()` call (all four computed the identical value from the
 /// same frame, just redundantly per-block).
+///
+/// #1167: the build-adapter → `.layout()` → `backend.draw_*` → cache-
+/// output part (identical to GTK's `App::paint_editor_popups_rung`, modulo
+/// coordinate units) now lives once in `render::paint_editor_popups`. This
+/// function's own job shrank to exactly what stays genuinely per-backend:
+/// finding the active window and resolving each popup's on-screen anchor
+/// point from it (gutter width, scroll offsets, tab-aware column math) —
+/// cell math here, pixel math in `App::paint_editor_popups_rung`.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn paint_editor_popups(
     backend: &mut dyn quadraui::Backend,
@@ -321,8 +417,8 @@ pub(super) fn paint_editor_popups(
     area: Rect,
     theme: &Theme,
     completion_layout_out: &mut Option<quadraui::CompletionsLayout>,
-    editor_hover_link_rects_out: &mut Vec<(u16, u16, u16, u16, String)>,
-    editor_hover_popup_rect_out: &mut Option<(u16, u16, u16, u16)>,
+    editor_hover_link_rects_out: &mut Vec<(quadraui::Rect, String)>,
+    editor_hover_popup_rect_out: &mut Option<quadraui::Rect>,
     editor_hover_scrollbar_out: &mut Option<render::PopupScrollbarHit>,
 ) {
     let viewport = quadraui::Rect::new(
@@ -331,158 +427,129 @@ pub(super) fn paint_editor_popups(
         area.width as f32,
         area.height as f32,
     );
+    let active_win = screen
+        .windows
+        .iter()
+        .find(|w| w.window_id == screen.active_window_id);
+    // #1237: the char→display column arithmetic (tab expansion, scroll
+    // offset) for every one of the five anchors below now lives once in
+    // `render::editor_popup_anchors`, shared with GTK's
+    // `App::paint_editor_popups_rung`. Per D6/#669 TUI's unit scale is
+    // 1.0/1.0 (already cell-native). `win_origin` snaps to the same
+    // whole-cell grid `tui_window_paint_rect` gives the completion
+    // viewport below (#1040) — TUI's five anchors have always been
+    // computed from truncated `u16` window coordinates, not the raw
+    // (possibly fractional) `RenderedWindow::rect`.
+    let win_origin = active_win.map(|w| {
+        let r = render::tui_window_paint_rect(&w.rect);
+        (r.x as f32, r.y as f32)
+    });
+    let anchor_points = render::editor_popup_anchors(screen, win_origin, 1.0, 1.0);
 
-    // ── Completion popup (rendered on top of editor) ───────────────────────
-    if let Some(ref menu) = screen.completion {
-        if let Some(active_win) = screen
-            .windows
-            .iter()
-            .find(|w| w.window_id == screen.active_window_id)
-        {
-            if let Some((cursor_pos, _)) = &active_win.cursor {
-                let gutter_w = active_win.gutter_char_width as u16;
-                let win_x = active_win.rect.x as u16;
-                let win_y = active_win.rect.y as u16;
-                let raw = active_win
-                    .lines
-                    .get(cursor_pos.view_line)
-                    .map(|l| l.raw_text.as_str())
-                    .unwrap_or("");
-                let vis_col = char_col_to_visual(raw, cursor_pos.col, active_win.tabstop)
-                    .saturating_sub(active_win.scroll_left) as u16;
-                let popup_x = win_x + gutter_w + vis_col;
-                let popup_y = win_y + cursor_pos.view_line as u16 + 1;
-                // Per D6: build quadraui::Completions + layout + rasterise.
-                let completions = render::completion_menu_to_quadraui_completions(menu);
-                let popup_width = (menu.max_width as f32 + 4.0).max(12.0);
-                let max_popup_height = 10.0;
-                let layout = completions.layout(
-                    popup_x as f32,
-                    popup_y as f32 - 1.0, // cursor y; layout adds line_height below
-                    1.0,
-                    viewport,
-                    popup_width,
-                    max_popup_height,
-                    |_| quadraui::CompletionItemMeasure::new(1.0),
-                );
-                backend.draw_completions(&completions, &layout);
-                *completion_layout_out = Some(layout);
-            }
-        }
-    }
+    // ── Completion popup anchor ─────────────────────────────────────────────
+    let completion = active_win.and_then(|active_win| {
+        let menu = screen.completion.as_ref()?;
+        let (popup_x, popup_y) = anchor_points.completion?;
+        // #420: clamp the popup into the *active window's own* rect, not
+        // the shared `viewport` above (which spans every split in the
+        // editor band, plus the gap the sidebar already leaves for the
+        // first split). Feeding the wider shared viewport into
+        // `Completions::layout` let its "shift left on right-overflow"
+        // clamp push the popup past the active window's own left edge —
+        // into a neighbouring split, or, with the leftmost split narrow,
+        // visibly against the sidebar boundary. GTK's
+        // `paint_editor_popups_rung` equivalent in `app.rs` already scopes
+        // to `win_viewport` this way; this brings TUI in line with it.
+        //
+        // Built from `tui_window_paint_rect(&active_win.rect)` rather than
+        // the raw (possibly fractional) `active_win.rect` directly:
+        // `RenderedWindow` rects come from continuous float split math and
+        // are not integer-valued in general (see the doc comment on
+        // `tui_window_paint_rect` in `render.rs`, #1040), and every TUI
+        // call site that resolves geometry against window bounds must snap
+        // to the same whole-cell grid the paint path already truncated to,
+        // or it silently clamps against geometry that was never painted.
+        let win_rect = render::tui_window_paint_rect(&active_win.rect);
+        let win_viewport = quadraui::Rect::from(win_rect);
+        // #420: `Completions::layout` clamps the popup's *position* into
+        // the viewport (`x.max(viewport.x)`), which is what fixes the
+        // "bleeds into the sidebar/neighbouring split" symptom above — but
+        // it never clamps `popup_width` itself, so an over-wide popup (a
+        // long candidate label in a narrow split) can still render past
+        // the viewport's right edge even once correctly positioned as far
+        // left as it can go. That's a gap in the shared
+        // `quadraui::Completions::layout` primitive (it already does the
+        // symmetric clamp for height, `clipped_h` below `desired_height`),
+        // not something to patch around per-backend here — see the
+        // Platform-Neutrality Rule. Left as a tracked follow-up pending a
+        // quadraui-side fix; do not re-add a `.min(win_viewport...)` cap
+        // here without one.
+        let popup_width = (menu.max_width as f32 + 4.0).max(12.0);
+        let max_popup_height = 10.0;
+        Some((
+            render::PopupAnchor {
+                x: popup_x,
+                y: popup_y,
+                viewport: win_viewport,
+            },
+            popup_width,
+            max_popup_height,
+        ))
+    });
 
-    // ── Hover popup (rendered on top of editor) ──────────────────────────────
-    if let Some(ref hover) = screen.hover {
-        if let Some(active_win) = screen
-            .windows
-            .iter()
-            .find(|w| w.window_id == screen.active_window_id)
-        {
-            let gutter_w = active_win.gutter_char_width as u16;
-            let win_x = active_win.rect.x as u16;
-            let win_y = active_win.rect.y as u16;
-            let anchor_view = hover.anchor_line.saturating_sub(active_win.scroll_top) as u16;
-            let vis_col = hover.anchor_col.saturating_sub(active_win.scroll_left) as u16;
-            let popup_x = win_x + gutter_w + vis_col;
-            let popup_y = win_y + anchor_view;
-            // Per D6: build quadraui::Tooltip + layout + rasterise. Unit
-            // scale is 1.0/1.0 — TUI coordinates are already cell-native
-            // (#669 widened this adapter to also serve GTK's pixel space).
-            let (tooltip, layout) = render::hover_popup_to_quadraui_tooltip(
-                hover,
-                popup_x as f32,
-                popup_y as f32,
-                viewport,
-                1.0,
-                1.0,
-            );
-            backend.draw_tooltip(&tooltip, &layout);
-        }
-    }
+    // ── Hover popup anchor ───────────────────────────────────────────────────
+    let hover = anchor_points
+        .hover
+        .map(|(x, y)| render::PopupAnchor { x, y, viewport });
 
-    // ── Editor hover popup (rich markdown, triggered by gh or mouse dwell) ─
-    *editor_hover_popup_rect_out = None; // Clear stale rect before rendering
-    *editor_hover_scrollbar_out = None;
-    if let Some(ref eh) = screen.editor_hover {
-        if let Some(active_win) = screen
-            .windows
-            .iter()
-            .find(|w| w.window_id == screen.active_window_id)
-        {
-            let gutter_w = active_win.gutter_char_width as u16;
-            let win_x = active_win.rect.x as u16;
-            let win_y = active_win.rect.y as u16;
-            // Use frozen scroll offsets so the popup stays fixed on screen
-            let anchor_view = eh.anchor_line.saturating_sub(eh.frozen_scroll_top) as u16;
-            let vis_col = eh.anchor_col.saturating_sub(eh.frozen_scroll_left) as u16;
-            let popup_x = win_x + gutter_w + vis_col;
-            let popup_y = win_y + anchor_view;
-            let (eh_links, eh_rect, eh_sb) =
-                render_editor_hover_popup(backend, eh, popup_x, popup_y, area, theme);
-            *editor_hover_link_rects_out = eh_links;
-            *editor_hover_popup_rect_out = eh_rect;
-            *editor_hover_scrollbar_out = eh_sb;
-        }
-    }
+    // ── Editor hover popup anchor (rich markdown, gh key or mouse dwell) ────
+    // Frozen scroll offsets (baked in by `editor_popup_anchors`) so the
+    // popup stays fixed on screen.
+    let editor_hover = anchor_points
+        .editor_hover
+        .map(|(x, y)| render::PopupAnchor { x, y, viewport });
 
-    // ── Diff peek popup (inline git hunk preview) ──────────────────────────
-    if let Some(ref peek) = screen.diff_peek {
-        if let Some(active_win) = screen
-            .windows
-            .iter()
-            .find(|w| w.window_id == screen.active_window_id)
-        {
-            let gutter_w = active_win.gutter_char_width as u16;
-            let win_x = active_win.rect.x as u16;
-            let win_y = active_win.rect.y as u16;
-            let anchor_view = peek.anchor_line.saturating_sub(active_win.scroll_top) as u16;
-            let popup_x = win_x + gutter_w;
-            // anchor at the cursor's own row; placement=Bottom (with
-            // primitive fallback to Top) puts the popup just below it.
-            let popup_y = win_y + anchor_view;
-            // Per D6: build quadraui::Tooltip + layout + rasterise. Unit
-            // scale 1.0/1.0 — see the hover popup's comment above (#669).
-            let (tooltip, layout) = render::diff_peek_to_quadraui_tooltip(
-                peek,
-                popup_x as f32,
-                popup_y as f32,
-                viewport,
-                theme,
-                1.0,
-                1.0,
-            );
-            backend.draw_tooltip(&tooltip, &layout);
-        }
-    }
+    // ── Diff peek popup anchor (inline git hunk preview) ────────────────────
+    // Anchors at the cursor's own row, left edge (no column offset);
+    // placement=Bottom (with primitive fallback to Top) puts the popup
+    // just below it.
+    let diff_peek = anchor_points
+        .diff_peek
+        .map(|(x, y)| render::PopupAnchor { x, y, viewport });
 
-    // ── Signature-help popup (shown in insert mode when cursor is inside a call) ─
-    if let Some(ref sig) = screen.signature_help {
-        if let Some(active_win) = screen
-            .windows
-            .iter()
-            .find(|w| w.window_id == screen.active_window_id)
-        {
-            let gutter_w = active_win.gutter_char_width as u16;
-            let win_x = active_win.rect.x as u16;
-            let win_y = active_win.rect.y as u16;
-            let anchor_view = sig.anchor_line.saturating_sub(active_win.scroll_top) as u16;
-            let vis_col = sig.anchor_col.saturating_sub(active_win.scroll_left) as u16;
-            let popup_x = win_x + gutter_w + vis_col;
-            let popup_y = win_y + anchor_view;
-            // Per D6: build quadraui::Tooltip + layout + rasterise. Unit
-            // scale 1.0/1.0 — see the hover popup's comment above (#669).
-            let (tooltip, layout) = render::signature_help_to_quadraui_tooltip(
-                sig,
-                popup_x as f32,
-                popup_y as f32,
-                viewport,
-                theme,
-                1.0,
-                1.0,
-            );
-            backend.draw_tooltip(&tooltip, &layout);
-        }
-    }
+    // ── Signature-help popup anchor (insert mode, cursor inside a call) ─────
+    let signature_help = anchor_points
+        .signature_help
+        .map(|(x, y)| render::PopupAnchor { x, y, viewport });
+
+    // The deleted per-popup `render_editor_hover_popup` wrapper used to
+    // re-sync the theme right before painting the rich-markdown editor-hover
+    // popup specifically; both frame-level call sites (`draw_frame` /
+    // `TuiShellApp::render_content`) already sync it earlier in the same
+    // frame, so this is redundant in practice — kept anyway since it's a
+    // one-line no-op when already in sync, and removing it isn't part of
+    // this convergence.
+    backend.set_theme(super::quadraui_tui::q_theme(theme));
+
+    // Per D6: unit scale is 1.0/1.0 — TUI coordinates are already
+    // cell-native (#669 widened these adapters to also serve GTK's pixel
+    // space).
+    render::paint_editor_popups(
+        backend,
+        screen,
+        theme,
+        1.0,
+        1.0,
+        completion,
+        hover,
+        editor_hover,
+        diff_peek,
+        signature_help,
+        completion_layout_out,
+        editor_hover_link_rects_out,
+        editor_hover_popup_rect_out,
+        editor_hover_scrollbar_out,
+    );
 }
 
 // ─── Tab bar hit testing ─────────────────────────────────────────────────────
@@ -490,8 +557,8 @@ pub(super) fn paint_editor_popups(
 /// Given a column within a group's tab bar, return the shortened file path of
 /// the tab at that column, or `None` if the column doesn't hit a tab with a file.
 ///
-/// `hit_regions` are the bar-relative regions cached on `ScreenLayout` /
-/// `GroupTabBar` by `render::build_screen_layout` — the same list
+/// `hit_regions` is the `TabBarLayout` cached on `ScreenLayout` /
+/// `GroupTabBar` by `render::build_screen_layout` — the same layout
 /// `render::resolve_tab_bar_click` routes real clicks through.
 ///
 /// #654: this used to walk the tabs itself, hand-rolling
@@ -500,16 +567,13 @@ pub(super) fn paint_editor_popups(
 /// space for (see `tab_drag_slots_from_hit_regions`' #477 note — the same
 /// duplicate had already drifted there). The result was a two-column drift
 /// between tooltip and click hit-testing on any tab bar scrolled past tab 0.
-/// Sharing the regions removes the whole class: tooltip, click, and drag now
+/// Sharing the layout removes the whole class: tooltip, click, and drag now
 /// read the same geometry.
 pub(super) fn tab_tooltip_at_col(
     engine: &Engine,
     group_id: GroupId,
     local_col: u16,
-    hit_regions: &[(
-        crate::core::engine::TabBarHitRegion,
-        crate::core::engine::TabBarClickTarget,
-    )],
+    hit_regions: &quadraui::TabBarLayout,
 ) -> Option<String> {
     use crate::core::engine::TabBarClickTarget;
     let i = match render::resolve_tab_bar_click(hit_regions, local_col)? {
@@ -531,32 +595,30 @@ pub(super) fn tab_tooltip_at_col(
 
 /// Extract per-tab drag-and-drop slot bounds — `(x_start, x_end)` pairs in
 /// absolute screen-column units, ordered by tab index — from a tab bar's
-/// hit regions. `base_x` is the absolute left edge the region columns are
+/// layout. `base_x` is the absolute left edge the region columns are
 /// relative to (bar left edge = column 0).
 ///
-/// #477: hit regions are the single source of truth already used for mouse
-/// click routing (`render::resolve_tab_bar_click`); this just re-slices
-/// them into the `(f32, f32)` shape the drag overlay / drop-zone geometry
-/// expects, instead of hand-rolling `name.chars().count() + TAB_CLOSE_COLS`
-/// per tab (which had drifted from the real per-tab close-button width and
-/// from an obsolete "+2 for the scroll indicator" adjustment that the
-/// quadraui TUI tab bar rasteriser doesn't actually reserve space for).
+/// #477: `visible_tabs` is the single source of truth already used for mouse
+/// click routing (`render::resolve_tab_bar_click`'s `hit_test`); this just
+/// re-slices it into the `(f32, f32)` shape the drag overlay / drop-zone
+/// geometry expects, instead of hand-rolling `name.chars().count() +
+/// TAB_CLOSE_COLS` per tab (which had drifted from the real per-tab
+/// close-button width and from an obsolete "+2 for the scroll indicator"
+/// adjustment that the quadraui TUI tab bar rasteriser doesn't actually
+/// reserve space for).
 fn tab_drag_slots_from_hit_regions(
-    hit_regions: &[(
-        crate::core::engine::TabBarHitRegion,
-        crate::core::engine::TabBarClickTarget,
-    )],
+    hit_regions: &quadraui::TabBarLayout,
     base_x: f32,
 ) -> Vec<(f32, f32)> {
-    use crate::core::engine::TabBarClickTarget;
     let mut tabs: Vec<(usize, f32, f32)> = hit_regions
+        .visible_tabs
         .iter()
-        .filter_map(|(region, target)| match target {
-            TabBarClickTarget::Tab(idx) => {
-                let start = base_x + region.col as f32;
-                Some((*idx, start, start + region.width as f32))
-            }
-            _ => None,
+        .map(|vt| {
+            (
+                vt.tab_idx,
+                base_x + vt.bounds.x,
+                base_x + vt.bounds.x + vt.bounds.width,
+            )
         })
         .collect();
     tabs.sort_unstable_by_key(|(idx, ..)| *idx);
@@ -564,9 +626,9 @@ fn tab_drag_slots_from_hit_regions(
 }
 
 /// Build the per-group tab-drag slot map consumed by the drag overlay and
-/// drop-zone hit testing. Reuses the hit regions already cached on each
+/// drop-zone hit testing. Reuses the layout already cached on each
 /// `GroupTabBar` by `render::build_screen_layout()` (from
-/// `compute_tab_bar_hit_regions()`) instead of recomputing tab positions
+/// `compute_tab_bar_layout()`) instead of recomputing tab positions
 /// (#515).
 ///
 /// #551: this used to branch, reading `ScreenLayout::tab_bar_hit_regions` at
@@ -766,40 +828,60 @@ pub(super) fn render_all_windows(
     backend: &mut dyn quadraui::Backend,
     mut frame: Option<&mut ratatui::Frame>,
     windows: &[RenderedWindow],
+    group_dividers: &[GroupDivider],
     theme: &Theme,
 ) {
-    for window in windows {
-        // #550: `window.rect` is already absolute terminal-screen coordinates.
+    // #1039: paint the active window *last*.
+    //
+    // `render_window`'s own `frame: Some(_)` branch below already gates
+    // correctly (it only calls `Frame::set_cursor_position` when
+    // `cursor_position_native` is `Some`, and `render::build_rendered_window`
+    // already only ever gives a non-active `RenderedWindow` a `None` cursor)
+    // — but that branch is dead in the live app today: both call sites of
+    // `render_all_windows` (this module's own live path and
+    // `TuiShellApp::render_content`) pass `frame: None`, so real cursor
+    // placement happens entirely through quadraui's `TuiBackend`, which
+    // caches the *last* `Backend::draw_editor` call's `cursor_position` on
+    // itself (`last_cursor_position`) and applies it to the real `Frame`
+    // once `render_content` returns (see this fn's own doc comment for the
+    // #604 handoff). That cache is overwritten unconditionally on *every*
+    // `draw_editor` call — including ones for inactive windows, which
+    // always report `cursor_position: None` — so whichever window happens
+    // to paint last decides the whole frame's caret, active or not. Since
+    // exactly one window is ever active, and only the active one ever
+    // reports a `Bar`/`Underline` position, painting it last guarantees
+    // its position is the one still standing when the frame's done — no
+    // new state, just reordering against data (`is_active`) already on
+    // `RenderedWindow`. The real fix belongs in quadraui (the cache should
+    // not let a `None` clobber a `Some` within one frame); this is the
+    // vimcode-side workaround pending that. That gap is drafted, ready to
+    // file, in `docs/PENDING_QUADRAUI_ISSUES.md` ("`TuiBackend` lets a
+    // `None` cursor_position clobber a `Some` within one frame", blocks
+    // vimcode#1039); it is not filed yet because filing GitHub issues is a
+    // coordinator/human action this worker session cannot perform
+    // (`git`-only). Once that lands upstream, this partition-and-reorder
+    // becomes redundant (order stops mattering) and can be deleted as a
+    // deliberate follow-up — don't assume it's still needed without
+    // rechecking.
+    let (active, inactive): (Vec<&RenderedWindow>, Vec<&RenderedWindow>) =
+        windows.iter().partition(|w| w.is_active);
+    for window in inactive.into_iter().chain(active) {
+        // #550: `window.rect` is already absolute terminal-screen
+        // coordinates. #1040: this truncation to whole cells is the one
+        // `render::tui_window_paint_rect`/`render::tui_editor_text_layout`
+        // must reproduce exactly for click resolution to agree with what
+        // gets painted — route through the shared helper rather than
+        // repeating the `as u16` formula a second time.
+        let paint_rect = render::tui_window_paint_rect(&window.rect);
         let win_rect = Rect {
-            x: window.rect.x as u16,
-            y: window.rect.y as u16,
-            width: window.rect.width as u16,
-            height: window.rect.height as u16,
+            x: paint_rect.x as u16,
+            y: paint_rect.y as u16,
+            width: paint_rect.width as u16,
+            height: paint_rect.height as u16,
         };
         render_window(backend, frame.as_deref_mut(), win_rect, window, theme);
     }
-    render_separators(backend, windows, theme);
-}
-
-/// Render the unified picker popup. Supports single-pane (no preview) and
-/// two-pane (with preview) layouts, fuzzy match highlighting, and scrollbar.
-pub(super) fn render_picker_popup(
-    picker: &render::PickerPanel,
-    term_area: Rect,
-    theme: &Theme,
-    backend: &mut dyn quadraui::Backend,
-) {
-    let has_preview = picker.preview.is_some();
-    let geo = render::PickerGeometry::compute(
-        term_area.width as f32,
-        term_area.height as f32,
-        has_preview,
-        &render::TUI_PICKER_SIZING,
-    );
-    let palette = render::picker_panel_to_palette(picker);
-    let q_rect = quadraui::Rect::new(geo.popup_x, geo.popup_y, geo.popup_w, geo.popup_h);
-    backend.set_theme(super::quadraui_tui::q_theme(theme));
-    backend.draw_palette(q_rect, &palette);
+    render_separators(backend, windows, group_dividers, theme);
 }
 
 /// Render one editor window (pane) into `frame`.
@@ -899,29 +981,6 @@ pub(super) fn render_window_status_line(
     let _ = backend.draw_status_bar(q_rect, &bar, None, None);
 }
 
-/// Convert a character-index column to a visual column, expanding tabs.
-/// Used by mouse hit-tests outside the editor paint path; the
-/// in-rasteriser callers were lifted to `quadraui::tui::editor` in
-/// Stage 1C of #276.
-pub(super) fn char_col_to_visual(raw_text: &str, char_col: usize, tabstop: usize) -> usize {
-    let tabstop = tabstop.max(1);
-    let mut vis = 0usize;
-    for (i, ch) in raw_text.chars().enumerate() {
-        if ch == '\n' || ch == '\r' {
-            break;
-        }
-        if i >= char_col {
-            break;
-        }
-        if ch == '\t' {
-            vis = ((vis / tabstop) + 1) * tabstop;
-        } else {
-            vis += 1;
-        }
-    }
-    vis
-}
-
 /// True when `w`'s own `Backend::draw_editor` scrollbar occupies its last
 /// column (i.e. its buffer content overflows the visible text rows).
 /// Extracted from `render_separators`' vertical-separator branch (#481
@@ -939,31 +998,112 @@ fn window_overflows_vertically(w: &RenderedWindow) -> bool {
     w.total_lines > text_rows
 }
 
+/// Terminal column one past a window's right edge — i.e. the column the
+/// *next* pane starts in, and therefore the column its group divider paints
+/// in.
+///
+/// The sum is deliberately taken in **f32**, then truncated with quadraui's
+/// own cell convention (`as u16`, per `SplitTreeDivider::cell_position`).
+/// `RenderedWindow::rect` is an f64 *widening* of the f32 rect
+/// `quadraui::SplitTree::layout` produced, and the sibling divider's
+/// `position` is that same layout's `bounds.x + first_w` added in f32 — so
+/// adding the two f64 fields back together here is not the same arithmetic
+/// and can land a whole cell away.
+///
+/// Concretely (the drag this fixes, #753's `group_divider_drag_moves_the_
+/// painted_divider_via_shell_app`): dragging a group divider to column 48 of
+/// a 46-wide editor area stores `ratio = 14/46`, which f32 resolves to a
+/// left pane of `13.999999046…` cells. quadraui's f32 `34.0 + 13.999999046`
+/// rounds back up to exactly `48.0`, so the divider paints at cell 48; the
+/// f64 sum stays `47.999999046…` and truncates to **47**, putting the left
+/// pane's own separator at 46 instead of 47. `group_divider_cells`' "the
+/// left pane already separates these two groups" guard then stops matching
+/// and both lines paint — the #481 phantom double divider, with a blank
+/// column wedged between them.
+fn window_right_edge_cell(rect: &WindowRect) -> u16 {
+    (rect.x as f32 + rect.width as f32).max(0.0) as u16
+}
+
 /// Absolute `(x, y)` terminal cells where [`render_separators`] paints a
 /// vertical `'│'` window-divider glyph — the same geometry its own
 /// painting loop below walks, factored out as a pure data computation (no
 /// `Buffer`/`Backend` access) so [`group_divider_cells`] (#609) can ask
 /// "would `render_separators` already put a divider-like glyph in this
 /// cell?" without needing to read back whatever was actually painted.
-fn vertical_separator_cells(windows: &[RenderedWindow]) -> std::collections::HashSet<(u16, u16)> {
+///
+/// `group_dividers` (#1094): the authoritative list of *editor-group*
+/// boundaries, consulted only to exclude them from the geometric adjacency
+/// test below. Before #1094, `RenderedWindow.rect` stopped short of a
+/// pane's true right edge by its own minimap strip's width whenever the
+/// strip was on — which, for two windows meeting at a *group* boundary
+/// (the ordinary case for side-by-side groups, each with one full-height
+/// window), coincidentally kept `a.rect`'s right edge more than a cell
+/// short of `b.rect.x`, so this adjacency test could only ever fire for a
+/// genuine `:vsplit` sibling *within* one group. #1094 widened
+/// `RenderedWindow.rect` back out to the pane's true edge (needed so the
+/// pane's own scroll column lands past the strip, not before it — see
+/// `render.rs`'s `build_screen_layout_with_breadcrumb_row` doc comment),
+/// which closed that gap and exposed a blind spot: nothing here previously
+/// distinguished "two windows that are `:vsplit` siblings" from "two
+/// windows that just happen to tile edge-to-edge because they're in
+/// adjacent groups" — without this exclusion, a plain two-group split with
+/// neither window scrolled painted its divider one column early (`sep_x -
+/// 1`, this pass's own cell) with `group_divider_cells` correctly (but
+/// now wrongly) yielding to it, and that painted column drifted out of
+/// sync with `GroupDivider::position` as soon as float rounding gave the
+/// two computations different answers (`separator_column_tracks_the_
+/// divider_after_a_fractional_drag` pins exactly that drift) — the #753
+/// group-divider-drag driver test caught the live version of this as the
+/// divider under-tracking the drag by more than a cell.
+///
+/// Compared in `f64`, against `b.rect.x` directly — not the `u16`-truncated
+/// `sep_x` computed below — because that comparison is `window_right_edge_
+/// cell`'s own f32-rounding-prone one; using it here would just move the
+/// drift into the exclusion test instead of removing it.
+fn vertical_separator_cells(
+    windows: &[RenderedWindow],
+    group_dividers: &[GroupDivider],
+) -> std::collections::HashSet<(u16, u16)> {
     let mut cells = std::collections::HashSet::new();
     for i in 0..windows.len() {
         for j in (i + 1)..windows.len() {
             let a = &windows[i];
             let b = &windows[j];
 
-            // Window a is the left pane, b is the right pane. The boundary
-            // sits in the last column of a (`sep_x - 1`). Also require
+            // Window a is the left pane, b is the right pane. Also require
             // vertical overlap — windows from different groups may share an
             // x edge but not overlap in y (e.g. 2×2 grid).
             let v_overlap =
                 a.rect.y.max(b.rect.y) < (a.rect.y + a.rect.height).min(b.rect.y + b.rect.height);
-            if (a.rect.x + a.rect.width - b.rect.x).abs() < 1.0 && v_overlap {
-                // #550: `a.rect`/`b.rect` are already absolute terminal-screen
-                // coordinates, so no `editor_area` offset addition needed.
-                let sep_x = (a.rect.x + a.rect.width) as u16;
-                let y_start = a.rect.y.max(b.rect.y) as u16;
-                let y_end = (a.rect.y + a.rect.height).min(b.rect.y + b.rect.height) as u16;
+            if !v_overlap {
+                continue;
+            }
+            // #550: `a.rect`/`b.rect` are already absolute terminal-screen
+            // coordinates, so no `editor_area` offset addition needed.
+            let gap = b.rect.x - (a.rect.x + a.rect.width);
+            let y_start = a.rect.y.max(b.rect.y) as u16;
+            let y_end = (a.rect.y + a.rect.height).min(b.rect.y + b.rect.height) as u16;
+
+            if gap.abs() < 1.0 {
+                // Zero-gap adjacency: an editor-group boundary (`GroupLayout`
+                // still `SplitTreeMeasure::new(0.0)`) — `Vertical` window
+                // splits never land here post-#1326 (they always reserve the
+                // gap==1 column below), so this branch is now, in practice,
+                // exclusively the group-boundary case. Left entirely to
+                // `group_divider_cells` (see this function's own doc
+                // comment) — verified via `group_dividers`, not inferred
+                // from the gap alone, so a future zero-thickness window
+                // split (if one is ever added) wouldn't silently fall
+                // through here unpainted.
+                let is_group_boundary = group_dividers.iter().any(|d| {
+                    d.direction == SplitDirection::Vertical && (d.position - b.rect.x).abs() < 1.0
+                });
+                if is_group_boundary {
+                    continue;
+                }
+                // See [`window_right_edge_cell`] for why the boundary column
+                // is not `(a.rect.x + a.rect.width) as u16`.
+                let sep_x = window_right_edge_cell(&a.rect);
 
                 // #481 (iter4): `quadraui::tui::draw_editor` already paints
                 // window `a`'s own vertical scrollbar in this exact column
@@ -985,6 +1125,20 @@ fn vertical_separator_cells(windows: &[RenderedWindow]) -> std::collections::Has
                     for y in y_start..y_end {
                         cells.insert((sep_x.saturating_sub(1), y));
                     }
+                }
+            } else if (gap - 1.0).abs() < 1.0 {
+                // #1326: a real `:vsplit` window-split boundary reserves its
+                // own blank screen column (`WindowLayout::layout_snapped`,
+                // matching Neovim) — `sep_x` (`a`'s right edge) *is* that
+                // column, not one column inside `a`'s own content the way
+                // the zero-gap branch above has to paint. It never collides
+                // with `a`'s own right-edge scrollbar strip (that lives one
+                // column further in, inside `a.rect`), so — unlike the
+                // zero-gap case — the divider always paints, scrollbar or
+                // not.
+                let sep_x = window_right_edge_cell(&a.rect);
+                for y in y_start..y_end {
+                    cells.insert((sep_x, y));
                 }
             }
         }
@@ -1056,14 +1210,7 @@ pub(super) fn draw_rule_row_themed(
     fg: Color,
     bg: Color,
 ) {
-    draw_rule_row_q(
-        backend,
-        x,
-        y,
-        text,
-        render::to_quadraui_color(fg),
-        render::to_quadraui_color(bg),
-    );
+    draw_rule_row_q(backend, x, y, text, fg, bg);
 }
 
 /// [`draw_rule_row_themed`] over already-converted `quadraui::Color`s.
@@ -1120,6 +1267,7 @@ pub(super) fn draw_rule_row_q(
 pub(super) fn render_separators(
     backend: &mut dyn quadraui::Backend,
     windows: &[RenderedWindow],
+    group_dividers: &[GroupDivider],
     theme: &Theme,
 ) {
     if windows.len() <= 1 {
@@ -1132,7 +1280,7 @@ pub(super) fn render_separators(
     // `quadraui::Theme` dozens of times per frame.
     backend.set_theme(super::quadraui_tui::q_theme(theme));
 
-    for (x, y) in vertical_separator_cells(windows) {
+    for (x, y) in vertical_separator_cells(windows, group_dividers) {
         draw_rule_cell_themed(backend, x, y, '│', theme.separator, theme.background);
     }
 
@@ -1197,7 +1345,7 @@ pub(super) fn group_divider_cells(
     windows: &[RenderedWindow],
     editor_area: Rect,
 ) -> Vec<(u16, u16)> {
-    let already_separated = vertical_separator_cells(windows);
+    let already_separated = vertical_separator_cells(windows, dividers);
     let mut out = Vec::new();
     for div in dividers {
         if div.direction != SplitDirection::Vertical {
@@ -1213,7 +1361,9 @@ pub(super) fn group_divider_cells(
             if div_x > editor_area.x {
                 let left_col = div_x - 1;
                 let left_has_scrollbar = windows.iter().any(|w| {
-                    let last_col = (w.rect.x + w.rect.width) as u16;
+                    // Same f32-precision boundary the separator pass uses —
+                    // see [`window_right_edge_cell`].
+                    let last_col = window_right_edge_cell(&w.rect);
                     // Bound the row range the same way `window_overflows_vertically`
                     // bounds `text_rows`: `draw_editor` only paints the scrollbar
                     // into the window's *text* rows, never the last row when that
@@ -1311,6 +1461,167 @@ mod tests {
         e
     }
 
+    // ─── `bottom_band_row_heights` — single-source-of-truth pins (#1164) ───
+    //
+    // `TuiShellApp::tick`'s own regression test
+    // (`tick_viewport_estimate_matches_the_composed_editor_band_height`)
+    // compares `tick()`'s pre-paint estimate against the real composer's
+    // painted output — but that comparison can never distinguish "routes
+    // through `bottom_band_row_heights`" from "hand-rolls an equivalent
+    // formula", because (per that test's own doc comment) the pre-#1164
+    // hand-rolled formula happens to be numerically identical to this
+    // function's output for every reachable `Engine` state. These tests
+    // pin this function's *own* per-field contract directly instead, so a
+    // future edit that changes one field's rule (e.g. reinstating "always
+    // reserve a global status row") fails here even in the states where
+    // `tick()`'s own comparison can't tell the difference.
+
+    /// `global_status` is the pre-#1164 bug's exact axis: reserved only
+    /// when `window_status_line` is off. On, no row is reserved for a
+    /// *global* status line here — the per-window row `render::
+    /// window_status_row_reserved` accounts for lives one layer above this
+    /// function's callers, inside `build_rendered_window`.
+    #[test]
+    fn bottom_band_row_heights_global_status_tracks_window_status_line_setting() {
+        let mut engine = test_engine("");
+        engine.settings.window_status_line = false;
+        assert_eq!(bottom_band_row_heights(&engine, 40).global_status, 1);
+
+        engine.settings.window_status_line = true;
+        assert_eq!(bottom_band_row_heights(&engine, 40).global_status, 0);
+    }
+
+    /// `separated_status` — the one band the pre-#1164 hand-rolled `tick()`
+    /// formula never had a term for at all — is reserved only when *all
+    /// three* of `window_status_line` is on, `status_line_above_terminal`
+    /// is off, and the bottom panel (terminal or debug-output) is open.
+    /// Flips each axis independently to pin that it's a genuine AND, not an
+    /// OR or a two-of-three majority.
+    #[test]
+    fn bottom_band_row_heights_separated_status_requires_all_three_conditions() {
+        let mut engine = test_engine("");
+        engine.settings.window_status_line = true;
+        engine.settings.status_line_above_terminal = false;
+        engine.bottom_panel_open = true;
+        assert_eq!(
+            bottom_band_row_heights(&engine, 40).separated_status,
+            1,
+            "all three conditions met -- must reserve the separated row"
+        );
+
+        engine.settings.window_status_line = false;
+        assert_eq!(
+            bottom_band_row_heights(&engine, 40).separated_status,
+            0,
+            "window_status_line off -- no per-window status to separate"
+        );
+        engine.settings.window_status_line = true;
+
+        engine.settings.status_line_above_terminal = true;
+        assert_eq!(
+            bottom_band_row_heights(&engine, 40).separated_status,
+            0,
+            "status_line_above_terminal on -- status stays inline, not separated"
+        );
+        engine.settings.status_line_above_terminal = false;
+
+        engine.bottom_panel_open = false;
+        assert_eq!(
+            bottom_band_row_heights(&engine, 40).separated_status,
+            0,
+            "bottom panel closed -- nothing to separate the status line from"
+        );
+    }
+
+    /// `quickfix`/`debug_toolbar`/`wildmenu` each track their own single
+    /// `Engine` flag directly, independent of every other band.
+    #[test]
+    fn bottom_band_row_heights_independent_bands_track_their_own_flag_only() {
+        let mut engine = test_engine("");
+        assert_eq!(bottom_band_row_heights(&engine, 40).quickfix, 0);
+        assert_eq!(bottom_band_row_heights(&engine, 40).debug_toolbar, 0);
+        assert_eq!(bottom_band_row_heights(&engine, 40).wildmenu, 0);
+
+        engine
+            .quickfix
+            .items
+            .push(crate::core::project_search::ProjectMatch {
+                file: std::path::PathBuf::from("zqxw1164.rs"),
+                line: 0,
+                col: 0,
+                line_text: "ZQXW_1164_MARKER".to_string(),
+            });
+        engine.quickfix.open = true;
+        let bands = bottom_band_row_heights(&engine, 40);
+        assert_eq!(
+            bands.quickfix, 6,
+            "quickfix panel is a fixed 6 rows once open"
+        );
+        assert_eq!(bands.debug_toolbar, 0);
+        assert_eq!(bands.wildmenu, 0);
+
+        engine.debug_toolbar_visible = true;
+        let bands = bottom_band_row_heights(&engine, 40);
+        assert_eq!(
+            bands.quickfix, 6,
+            "unrelated bands must not move each other"
+        );
+        assert_eq!(bands.debug_toolbar, 1);
+        assert_eq!(bands.wildmenu, 0);
+
+        engine.wildmenu_items = vec!["zqxw1164".to_string()];
+        let bands = bottom_band_row_heights(&engine, 40);
+        assert_eq!(bands.quickfix, 6);
+        assert_eq!(bands.debug_toolbar, 1);
+        assert_eq!(bands.wildmenu, 1);
+    }
+
+    /// `total()` must never drift from a literal re-sum of its own six
+    /// public fields plus the always-present command line -- pins the `1 +`
+    /// constant documented on `total()` itself, across a fixture that
+    /// exercises every band at once.
+    #[test]
+    fn bottom_band_row_heights_total_is_exactly_cmd_plus_every_band() {
+        let mut engine = test_engine("");
+        engine.settings.window_status_line = true;
+        engine.settings.status_line_above_terminal = false;
+        engine.bottom_panel_open = true;
+        engine.debug_toolbar_visible = true;
+        engine.wildmenu_items = vec!["zqxw1164".to_string()];
+        engine
+            .quickfix
+            .items
+            .push(crate::core::project_search::ProjectMatch {
+                file: std::path::PathBuf::from("zqxw1164.rs"),
+                line: 0,
+                col: 0,
+                line_text: "ZQXW_1164_MARKER".to_string(),
+            });
+        engine.quickfix.open = true;
+
+        let bands = bottom_band_row_heights(&engine, 40);
+        assert_eq!(
+            bands.total(),
+            1 + bands.quickfix
+                + bands.terminal
+                + bands.debug_toolbar
+                + bands.wildmenu
+                + bands.global_status
+                + bands.separated_status
+        );
+        // Every band this fixture turned on must actually be nonzero, or
+        // the sum above would trivially hold without exercising anything.
+        assert!(bands.quickfix > 0);
+        assert!(bands.terminal > 0);
+        assert!(bands.debug_toolbar > 0);
+        assert!(bands.wildmenu > 0);
+        assert!(bands.separated_status > 0);
+        assert_eq!(
+            bands.global_status, 0,
+            "window_status_line is on in this fixture"
+        );
+    }
+
     /// Paint `engine`'s editor + bottom bands into a fresh `width`×`height`
     /// grid and return the painted buffer — the shared implementation behind
     /// [`render_tui`] / [`render_tui_row_cells`] / [`render_tui_buffer`].
@@ -1346,15 +1657,14 @@ mod tests {
             width: width.saturating_sub(editor_x),
             height: height.saturating_sub(menu_h),
         };
-        let screen = build_screen_for_shell_content(engine, &theme, area);
-        let chrome = bottom_chrome_rects_for_shell_content(engine, &screen, area);
+        let mut tui_backend = super::backend::TuiBackend::new();
+        let screen = build_screen_for_shell_content(engine, &theme, area, &tui_backend);
+        let chrome = bottom_chrome_rects_for_shell_content(engine, area);
         let tui_tbh: f64 = if engine.settings.breadcrumbs && !engine.terminal_maximized {
             2.0
         } else {
             1.0
         };
-
-        let mut tui_backend = super::backend::TuiBackend::new();
         terminal
             .draw(|frame| {
                 super::with_frame_scope(&mut tui_backend, frame, |backend, _frame| {
@@ -1366,9 +1676,13 @@ mod tests {
                         engine.terminal_maximized,
                     ) {
                         match op {
-                            render::EditorOp::Windows => {
-                                render_all_windows(backend, None, &screen.windows, &theme)
-                            }
+                            render::EditorOp::Windows => render_all_windows(
+                                backend,
+                                None,
+                                &screen.windows,
+                                &screen.group_dividers,
+                                &theme,
+                            ),
                             render::EditorOp::Minimap => {
                                 render::draw_minimap_strip(backend, &screen);
                             }
@@ -2184,6 +2498,21 @@ mod tests {
         s
     }
 
+    /// #1175 updated the golden file: the minimap strip's braille changed
+    /// from `⠍⠈⠛⠛⠓⠓⠒⠒` to `⠅⠛⠓⠒⠒⠂⠀⠀`. That is quadraui#1032 (in the pin
+    /// this issue bumps to) making the TUI dot scale adapt to the buffer's
+    /// own widest sampled line — here the 22-column `println!` line — where
+    /// it was previously a fixed 2-source-columns-per-cell. The same three
+    /// lines are therefore drawn across a wider per-cell bucket, so the
+    /// marks compress leftwards and the strip's last two cells fall empty.
+    ///
+    /// Verified to be an upstream-only change, not a side effect of this
+    /// issue's own aggregation refactor: checking out `develop`'s
+    /// `src/render.rs` and `src/tui_main/shell_app.rs` on top of the new
+    /// pin reproduces byte-identical new output for both this snapshot and
+    /// [`snapshot_split_panes`]. The colour-aggregation move (#1175) cannot
+    /// affect these goldens at all — they capture `lines.join("\n")`, i.e.
+    /// glyphs, and `syntax_spans` only carries colour.
     #[test]
     fn snapshot_normal_mode() {
         let e = test_engine("fn main() {\n    println!(\"hello\");\n}\n");
@@ -2221,6 +2550,12 @@ mod tests {
         snap_settings().bind(|| insta::assert_snapshot!("command_line", lines.join("\n")));
     }
 
+    /// #1175 updated the golden file, for the same reason as
+    /// [`snapshot_normal_mode`] — quadraui#1032's adaptive TUI dot scale.
+    /// Both panes show the same buffer, so both strips move identically
+    /// (`⠉⠉⠈⠉⠁⠉` → `⠉⠉⠉⠉⠁⠀`): the 17-column `left pane content` now drives
+    /// a wider per-cell bucket than the old fixed scale, filling the first
+    /// four cells solid and emptying the last.
     #[test]
     fn snapshot_split_panes() {
         let mut e = test_engine("left pane content\n");
@@ -2239,6 +2574,23 @@ mod tests {
     /// RED-first: commenting out `render_content`'s `draw_minimap_strip`
     /// call makes the non-blank-braille assertion below fail — confirmed by
     /// hand before restoring the fix.
+    ///
+    /// #1093 introduced a fixed-scale *window* onto the buffer instead of
+    /// squeezing the whole file to fit. #1186 then let that window grow to
+    /// a multi-line-per-row *compressed* window once the file exceeds the
+    /// strip's own `target_lines` sample budget — at this fixture's
+    /// geometry, `target_lines == 52`, so this 120-line file compresses to
+    /// `K == 3` real buffer lines per painted row (well within
+    /// `MINIMAP_MAX_COMPRESSION`), showing the whole file top-to-bottom
+    /// rather than only its first `target_lines` lines.
+    ///
+    /// #1211 changed how `K` itself is derived — from the strip's own
+    /// geometry (`editor_visible_rows`, `target_lines`), never from
+    /// `total_buffer_lines` (see `MINIMAP_VIEWPORT_MULTIPLE` in
+    /// `render.rs`) — but at this fixture's specific geometry the new
+    /// formula still resolves to the same `K == 3`, so this golden file is
+    /// unchanged by that fix: confirmed by hand, this test stayed green
+    /// across it.
     #[test]
     fn snapshot_minimap_braille() {
         let text: String = (0..120)
@@ -2454,6 +2806,7 @@ mod tests {
             total_lines,
             gutter_char_width: 0,
             text_viewport_cols: 0,
+            minimap_reserved_w: 0.0,
             is_active: true,
             show_active_bg: false,
             has_git_diff: false,
@@ -2530,5 +2883,208 @@ mod tests {
                  divider should not double up there. got cells: {cells:?}"
             );
         }
+    }
+
+    /// Regression pin for [`window_right_edge_cell`]: the exact geometry a
+    /// group-divider drag produces (the `#753`
+    /// `group_divider_drag_moves_the_painted_divider_via_shell_app` driver
+    /// test's, reduced to pure data).
+    ///
+    /// Dragging the divider of a 46-cell-wide editor area to column 48
+    /// stores `ratio = 14/46`, and `quadraui::SplitTree::layout` resolves
+    /// that to a left pane exactly `13.999999046325684` cells wide — while
+    /// the divider `position` it returns from the *same* `first_w`, summed
+    /// in f32, is exactly `48.0`. Summing the pane's f64 `x + width` here
+    /// instead yields `47.999999046…`, truncating to 47 — `window_right_edge_
+    /// cell`'s own doc comment has the full #481 history of the phantom
+    /// double divider that rounding drift used to cause here.
+    ///
+    /// #1094 closed that gap a different way: [`vertical_separator_cells`]
+    /// no longer claims an *editor-group* boundary at all (it now excludes
+    /// any pair whose meeting point matches a `GroupDivider`, comparing the
+    /// same f64 `rect.x`/`position` units the group layout itself produced,
+    /// not the `u16`-truncated `sep_x` this fixture's rounding drift was
+    /// about) — group boundaries are [`group_divider_cells`]'s alone,
+    /// unconditionally, at the divider's own authoritative `position`. That
+    /// sidesteps the #481 rounding drift entirely for this case: nothing
+    /// downstream of `group_divider_cells` ever re-derives the boundary
+    /// column from `window_right_edge_cell`'s f32 sum. This fixture — a
+    /// two-group boundary whose panes carry exactly the #481 rounding drift
+    /// — now pins the *new* invariant: `vertical_separator_cells` produces
+    /// nothing for it, and `group_divider_cells` alone paints the divider,
+    /// consistently at its own `position`, drift or not.
+    #[test]
+    fn separator_column_tracks_the_divider_after_a_fractional_drag() {
+        // `13.999999046325684` is not a typo — it is `(14f32 / 46f32 * 46f32)`
+        // widened to f64, i.e. what quadraui actually hands back.
+        let left_width = (14.0f32 / 46.0f32 * 46.0f32) as f64;
+        assert!(
+            left_width < 14.0,
+            "fixture precondition: the f32 round-trip must land just *under* \
+             a whole cell (got {left_width})"
+        );
+        let left = fixture_window(
+            WindowId(0),
+            WindowRect::new(34.0, 2.0, left_width, 21.0),
+            1,
+            None,
+        );
+        let right = fixture_window(WindowId(1), WindowRect::new(48.0, 2.0, 32.0, 21.0), 1, None);
+        let windows = [left, right];
+        let divider = GroupDivider {
+            split_index: 0,
+            direction: SplitDirection::Vertical,
+            position: 48.0,
+            axis_start: 34.0,
+            axis_size: 46.0,
+            cross_start: 0.0,
+            cross_size: 24.0,
+        };
+
+        // #1094: this boundary is a *group* boundary (`right.rect.x == 48.0
+        // == divider.position`, within the same f64 precision) — excluded
+        // from `vertical_separator_cells` regardless of the f32 rounding
+        // drift `window_right_edge_cell`'s own `sep_x` would otherwise carry.
+        let cells = vertical_separator_cells(&windows, std::slice::from_ref(&divider));
+        assert!(
+            cells.is_empty(),
+            "a pair of windows meeting exactly at a known group-divider \
+             position must be left entirely to `group_divider_cells` — got \
+             {cells:?}"
+        );
+
+        // ...so the group divider paints on every row, unconditionally, at
+        // its own `position` (48) — not a rect-derived, rounding-prone
+        // column beside it (#481's original failure mode).
+        let editor_area = Rect {
+            x: 34,
+            y: 0,
+            width: 46,
+            height: 24,
+        };
+        let div_cells = group_divider_cells(&[divider], &windows, editor_area);
+        for y in 1..23u16 {
+            assert!(
+                div_cells.contains(&(48, y)),
+                "row {y}: with `vertical_separator_cells` no longer claiming \
+                 this boundary, the group divider must paint every row at \
+                 its own position (48); got {div_cells:?}"
+            );
+        }
+    }
+
+    // ── #1097: residual (minimap-off) click-cost profile ────────────────────
+    //
+    // Manual perf probe, not a regression gate — `#[ignore]`d so it never
+    // runs in the normal suite. Opens this repo's own `src/app.rs`
+    // (8,800+ lines, real tree-sitter Rust highlighting), forces `:set
+    // nominimap`, and times the two things #1097 asked to have measured
+    // apart from each other:
+    //
+    //  * the per-frame layout cost — `build_screen_for_shell_content`, the
+    //    actual *live* render path (`TuiShellApp::render_content` calls this
+    //    once per redraw; see that function's own doc comment, added by
+    //    this issue, for why the pre-existing `build_screen_for_tui` PERF
+    //    hook above can never fire on a live run — nothing outside
+    //    `#[cfg(test)]` calls that helper at all);
+    //  * the syntax/buffer-layer cost — `BufferState::update_syntax_with_limit`'s
+    //    two whole-buffer passes, the issue's "unverified lead".
+    //
+    // Run with:
+    //   cargo test --release --lib \
+    //     tui_main::render_impl::tests::profile_minimap_off_click_cost \
+    //     -- --ignored --nocapture
+    #[test]
+    #[ignore = "manual perf probe for #1097 — run with --ignored --nocapture"]
+    fn profile_minimap_off_click_cost() {
+        crate::core::session::suppress_disk_saves();
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/app.rs");
+        let mut e = Engine::new_for_test();
+        e.startup_without_session_restore(Some(path.as_path()));
+        e.settings.minimap = false;
+
+        let line_count = e.active_buffer_state().buffer.content.len_lines();
+        assert!(
+            line_count > 8_000,
+            "fixture precondition: src/app.rs must still be an 8,000+ line \
+             file for this probe to reproduce #1097's repro shape (got \
+             {line_count} lines)"
+        );
+        assert_eq!(
+            render::minimap_reserved_width(&e, 200.0, 1.0, render::TUI_MINIMAP_SIZING),
+            0.0,
+            "scope guard: this probe measures the *minimap-off* residual \
+             cost only — if this fails, `:set nominimap` didn't take, and \
+             any numbers below are measuring #1096 (already root-caused), \
+             not #1097"
+        );
+
+        let theme = crate::render::Theme::onedark();
+        let tui_backend = super::backend::TuiBackend::new();
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 200,
+            height: 50,
+        };
+
+        // Warm-up: pays any one-time allocation/cache cost outside the
+        // timed loop.
+        let _ = build_screen_for_shell_content(&e, &theme, area, &tui_backend);
+
+        const N: u32 = 100;
+        let t0 = Instant::now();
+        for _ in 0..N {
+            let _ = std::hint::black_box(build_screen_for_shell_content(
+                &e,
+                &theme,
+                area,
+                &tui_backend,
+            ));
+        }
+        let layout_total = t0.elapsed();
+
+        let bid = {
+            let wid = e.active_window_id();
+            e.windows.get(&wid).unwrap().buffer_id
+        };
+        let max_lines = crate::core::buffer_manager::syntax_max_lines();
+        let t1 = Instant::now();
+        for _ in 0..N {
+            e.buffer_manager
+                .get_mut(bid)
+                .unwrap()
+                .update_syntax_with_limit(max_lines);
+        }
+        let syntax_total = t1.elapsed();
+
+        // Third number: the *full* per-frame paint (compose + style-every-
+        // visible-cell + write into the ratatui buffer), not just the
+        // layout step above — `render_tui_buffer_impl` runs the same
+        // `build_screen_for_shell_content` plus the paint walk
+        // `TuiShellApp::render_content` performs on every live redraw
+        // (`render_all_windows` et al.). Layout alone turned out cheap
+        // above; this checks whether the *paint* half of the frame — which
+        // the layout-only number can't see — is where a click-driven
+        // redraw storm would actually spend its time.
+        let _ = render_tui_buffer_impl(&e, area.width, area.height);
+        let t2 = Instant::now();
+        for _ in 0..N {
+            let _ = std::hint::black_box(render_tui_buffer_impl(&e, area.width, area.height));
+        }
+        let paint_total = t2.elapsed();
+
+        println!(
+            "#1097 profile ({line_count}-line file, minimap off, N={N}):\n  \
+             build_screen_for_shell_content (layout only):   {:.3}ms/call ({:.1}ms total)\n  \
+             render_tui_buffer_impl (layout + full paint):   {:.3}ms/call ({:.1}ms total)\n  \
+             update_syntax_with_limit (syntax, full-buffer): {:.3}ms/call ({:.1}ms total)",
+            layout_total.as_secs_f64() * 1000.0 / N as f64,
+            layout_total.as_secs_f64() * 1000.0,
+            paint_total.as_secs_f64() * 1000.0 / N as f64,
+            paint_total.as_secs_f64() * 1000.0,
+            syntax_total.as_secs_f64() * 1000.0 / N as f64,
+            syntax_total.as_secs_f64() * 1000.0,
+        );
     }
 }

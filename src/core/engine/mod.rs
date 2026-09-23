@@ -1,9 +1,16 @@
+// #937's quadraui pin bump deprecated `TabBarHits` (quadraui#823) that this
+// module (and its `terminal_ops` child) still reads; migrating to its
+// `TabBarLayout` replacement is an unrelated, cross-backend refactor deferred
+// to a follow-up, so it's silenced here rather than left as a stray warning
+// under `-D warnings`.
+#![allow(deprecated)]
+
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 
 use super::ai::AiMessage;
 use super::buffer::{Buffer, BufferId};
-use super::buffer_manager::{BufferManager, BufferState, UndoEntry};
+use super::buffer_manager::{BufferManager, BufferState};
 use super::comment;
 use super::dap::{BreakpointInfo, DapEvent, DapVariable, StackFrame};
 use super::dap_manager::{
@@ -19,13 +26,15 @@ use super::lsp::{
 use super::lsp_manager::LspManager;
 use super::paths;
 use super::plugin;
-use super::project_search::{self, ProjectMatch, ReplaceResult, SearchError, SearchOptions};
+use super::project_search::{
+    self, ProjectMatch, QuickfixList, ReplaceResult, SearchError, SearchOptions,
+};
 use super::registry;
 use super::session::{ExtensionState, HistoryState, SessionGroupLayout, SessionState};
 use super::settings::{EditorMode, Settings};
 use super::syntax::Syntax;
 use super::tab::{Tab, TabId};
-use super::terminal::{default_shell, InstallContext};
+use super::terminal::{default_shell, shell_command, InstallContext};
 use super::view::{FoldRegion, View};
 use super::vim_regex;
 use super::window::{
@@ -265,33 +274,68 @@ pub enum SettingsRow {
 // Each entry is (canonical_name, min_prefix_length).
 // `normalize_ex_command("sor foo")` → `"sort foo"`.
 static EX_ABBREVS: &[(&str, usize)] = &[
+    ("abbreviate", 2),
+    ("abclear", 3),
     ("bdelete", 2),
+    ("bfirst", 2),
+    ("blast", 2),
     ("bnext", 2),
     ("bprevious", 2),
     ("buffer", 1),
+    ("bwipeout", 2),
+    ("cabbrev", 2),
     ("cclose", 3),
+    ("cdo", 3),
+    ("cfdo", 4),
+    ("cfirst", 4),
+    ("clast", 3),
+    ("clist", 2),
     ("close", 3),
+    ("cnewer", 4),
     ("cnext", 2),
+    ("cnoreabbrev", 6),
+    ("colder", 3),
     ("colorscheme", 4),
     ("copen", 4),
     ("copy", 2),
     ("cprevious", 2),
     ("cquit", 2),
+    ("cwindow", 2),
     ("delete", 1),
+    ("delmarks", 4),
+    ("digraphs", 3),
     ("display", 2),
+    ("earlier", 2),
     ("echo", 2),
     ("edit", 1),
     ("enew", 3),
     ("file", 1),
     ("grep", 2),
     ("help", 1),
+    ("hide", 3),
     ("history", 3),
+    ("iabbrev", 2),
+    ("inoreabbrev", 6),
     ("join", 1),
     ("jumps", 2),
+    ("later", 3),
+    ("lclose", 3),
+    ("ldo", 3),
+    ("lfdo", 4),
+    ("lfirst", 4),
+    ("lgrep", 2),
+    ("llast", 3),
+    ("llist", 3),
+    ("lnext", 2),
+    ("lopen", 3),
+    ("lprevious", 2),
+    ("lvimgrep", 3),
+    ("lwindow", 2),
     ("make", 3),
     ("mark", 2),
     ("move", 1),
     ("nohlsearch", 3),
+    ("noreabbrev", 5),
     ("number", 2),
     ("only", 2),
     ("print", 1),
@@ -307,12 +351,20 @@ static EX_ABBREVS: &[(&str, usize)] = &[
     ("set", 2),
     ("sort", 3),
     ("split", 2),
+    ("startinsert", 4),
+    ("stopinsert", 5),
     ("tabclose", 4),
+    ("tabfirst", 6),
+    ("tablast", 4),
     ("tabmove", 4),
     ("tabnext", 4),
+    ("tabonly", 4),
     ("tabprevious", 4),
     ("terminal", 2),
+    ("unabbreviate", 3),
     ("undo", 1),
+    ("undojoin", 5),
+    ("undolist", 5),
     ("update", 2),
     ("version", 2),
     ("vimgrep", 3),
@@ -328,10 +380,28 @@ static EX_ABBREVS: &[(&str, usize)] = &[
 
 /// Split an ex-command string into (command_word, bang, rest).
 /// Example: `"q!"` → `("q", "!", "")`, `"sor foo"` → `("sor", "", " foo")`
+///
+/// `_` counts as part of the word, not a boundary (#1125): no real Vim
+/// ex-command name contains an underscore, but `execute_command` also
+/// doubles as the dispatch target for menu/palette action-id strings like
+/// `"save_workspace_as_dialog"` (`Engine::dispatch_menu_action`,
+/// `Engine::picker_confirm`'s `other => self.execute_command(other)`
+/// fallback — see #634). Splitting at `_` treated those as a short
+/// abbreviation-eligible word ("save") glued to an unrecognised
+/// "argument" ("_workspace_as_dialog"), so [`normalize_ex_command`]'s
+/// abbreviation table rewrote `cmd_word` (`"save"` → `"saveas"`, since
+/// `"saveas"` is in [`EX_ABBREVS`]) and reassembled a garbled command —
+/// `"saveas_workspace_as_dialog"` — that matches nothing, silently
+/// breaking the menu/palette entry instead of reaching
+/// `execute_command`'s own `cmd == "save_workspace_as_dialog"` equality
+/// check a few lines down. Keeping `_` in the word makes `cmd_word` the
+/// whole action-id string, which is always longer than every
+/// [`EX_ABBREVS`] canonical name, so the abbreviation loop never matches
+/// and the string reaches that equality check unmodified.
 fn split_ex_command(input: &str) -> (&str, &str, &str) {
-    // Find end of alphabetic command word
+    // Find end of alphabetic (+ underscore) command word
     let cmd_end = input
-        .find(|c: char| !c.is_ascii_alphabetic())
+        .find(|c: char| !(c.is_ascii_alphabetic() || c == '_'))
         .unwrap_or(input.len());
     let cmd_word = &input[..cmd_end];
     let rest = &input[cmd_end..];
@@ -600,7 +670,9 @@ pub static PALETTE_COMMANDS: &[PaletteCommand] = &[
     },
     PaletteCommand {
         label: "Go: Go to Definition",
-        shortcut: "gd",
+        // `gd` is Vim's local-declaration motion, not this LSP command
+        // (:h gd) — the tag-jump `Ctrl-]` is what invokes the server.
+        shortcut: "Ctrl+]",
         vscode_shortcut: "F12",
         action: "lsp_definition",
     },
@@ -1239,16 +1311,6 @@ pub enum TabBarClickTarget {
     DiffToggle,
 }
 
-/// A hit region within a group's tab bar, expressed in character-cell units
-/// relative to the tab bar's left edge.
-#[derive(Debug, Clone)]
-pub struct TabBarHitRegion {
-    /// Column offset from the tab bar left edge.
-    pub col: u16,
-    /// Width of this region in char cells.
-    pub width: u16,
-}
-
 // ── Context menu hit regions ────────────────────────────────────────────────
 
 /// Result of resolving a click against a context menu popup.
@@ -1452,9 +1514,19 @@ pub struct ContextMenuItem {
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct PanelHoverPopup {
-    /// Rendered markdown lines + spans (reuses the existing markdown module).
-    pub rendered: crate::core::markdown::MdRendered,
-    /// Clickable link URLs extracted from LinkUrl spans: (line_idx, start_byte, end_byte, url).
+    /// Raw markdown source (already passed through
+    /// `core::markdown::linkify_bare_urls`). Styled at paint time via
+    /// `quadraui::compose::markdown::render_markdown_to_styled` with the
+    /// active theme (#821) — see `EditorHoverPopup::markdown`'s doc for the
+    /// full rationale.
+    pub markdown: String,
+    /// Plain per-line text (markdown syntax stripped) — used for the
+    /// popup's empty-content check and content-width sizing.
+    pub line_text: Vec<String>,
+    /// Per-line tree-sitter highlights for fenced code-block lines. See
+    /// `EditorHoverPopup::code_highlights`.
+    pub code_highlights: Vec<Vec<crate::core::markdown::MdCodeHighlight>>,
+    /// Clickable link URLs: (line_idx, start_byte, end_byte, url).
     pub links: Vec<(usize, usize, usize, String)>,
     /// Panel name this hover belongs to.
     pub panel_name: String,
@@ -1492,8 +1564,23 @@ pub enum EditorHoverSource {
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct EditorHoverPopup {
-    /// Rendered markdown content.
-    pub rendered: crate::core::markdown::MdRendered,
+    /// Raw markdown source (already passed through
+    /// `core::markdown::linkify_bare_urls`, and with any "Go to" nav links
+    /// appended). Styled at paint time via
+    /// `quadraui::compose::markdown::render_markdown_to_styled` with the
+    /// active theme — see `render.rs`'s `markdown_hover_to_quadraui_lines`
+    /// (#821).
+    pub markdown: String,
+    /// Plain per-line text (markdown syntax stripped) — used for scroll
+    /// bounds, clipboard copy, and selection extraction. Computed once, at
+    /// show time, via `core::markdown::hover_markdown_structure` (theme-
+    /// independent, so it doesn't drift from what's painted regardless of
+    /// theme changes while the popup is open).
+    pub line_text: Vec<String>,
+    /// Per-line tree-sitter highlights for fenced code-block lines (empty
+    /// for non-code-block lines). Byte offsets are relative to the code
+    /// line's own raw text — see `hover_markdown_structure`'s doc.
+    pub code_highlights: Vec<Vec<crate::core::markdown::MdCodeHighlight>>,
     /// Clickable link regions: (line_idx, start_byte, end_byte, url).
     pub links: Vec<(usize, usize, usize, String)>,
     /// Buffer line where the hover is anchored (0-indexed).
@@ -1589,44 +1676,34 @@ pub fn is_safe_url(url: &str) -> bool {
     lower.starts_with("https://") || lower.starts_with("http://") || lower.starts_with("command:")
 }
 
-/// Open a URL in the platform's default browser. Validates the URL scheme
-/// first via `is_safe_url`. This is shared across all backends (GTK, TUI,
-/// Win-GUI) to avoid duplicating platform-specific logic.
-pub fn open_url_in_browser(url: &str) {
-    if !is_safe_url(url) {
-        return;
-    }
-    #[cfg(target_os = "windows")]
-    {
-        // `cmd /c start "" "url"` — empty title needed for start.
-        let mut cmd = std::process::Command::new("cmd");
-        cmd.args(["/c", "start", "", url])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
-        {
-            use std::os::windows::process::CommandExt;
-            cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
-        }
-        cmd.spawn().ok();
-    }
-    #[cfg(target_os = "macos")]
-    {
-        std::process::Command::new("open")
-            .arg(url)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .ok();
-    }
-    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-    {
-        std::process::Command::new("xdg-open")
-            .arg(url)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .ok();
-    }
+/// A platform action requested by engine logic that must be carried out via
+/// the runner-owned `backend`'s `quadraui::PlatformServices` (#1134) — see
+/// [`Engine::pending_platform_actions`]'s doc for why this can't happen
+/// inline in `core/engine/`.
+///
+/// Before #1134, `core/engine/` hand-rolled four separate per-OS opener
+/// implementations (`open_url_in_browser` here, `gx` in `keys.rs`,
+/// `Engine::open_url` in `ext_panel.rs`, `reveal_in_file_manager` in
+/// `windows.rs`) — each its own `#[cfg(target_os = ...)]` triple of
+/// `Command::new` calls out to `open`, the Linux freedesktop.org opener, or
+/// `cmd`, and one of the four (`gx`) had no `target_os` guard at all, so it
+/// ran the Linux opener unconditionally on every platform including macOS
+/// and Windows. `quadraui::PlatformServices` (quadraui#956) already carries
+/// a correct, tested opener per backend (`gio::AppInfo::launch_default_for_uri`
+/// on GTK, `ShellExecuteW` on Win-GUI, `open`/`open -R` on macOS, and TUI's
+/// own shell-out-with-OSC-8-fallback, quadraui#969) — this enum plus
+/// [`Engine::pending_platform_actions`] is the one place all four call
+/// sites now route through instead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PendingPlatformAction {
+    /// Open a URL in the platform's default browser/handler
+    /// (`PlatformServices::open_url_result`). Always `is_safe_url`-validated
+    /// *before* being queued (at each push site — `Engine::open_url`, `gx`),
+    /// never here, so an unsafe scheme can never even enter the queue.
+    OpenUrl(String),
+    /// Reveal a path in the platform's file manager, selected
+    /// (`PlatformServices::reveal_in_file_manager`).
+    Reveal(PathBuf),
 }
 
 /// Convert a hex ASCII byte to its numeric value (0–15), or `None`.
@@ -1730,19 +1807,125 @@ impl EditorGroup {
 
 // ─── User keymaps ────────────────────────────────────────────────────────────
 
+/// Vim's `maxmapdepth` default — the recursion ceiling for `:map`-style
+/// (non-`noremap`) key-to-keys expansion. Vim errors with `E223: recursive
+/// mapping` past this depth rather than hanging on a cycle like `nmap a b` +
+/// `nmap b a`; vimcode does the same (#1151).
+pub(crate) const MAXMAPDEPTH: usize = 1000;
+
+/// What a [`UserKeymap`] does when its `keys` (lhs) match: run an ex command,
+/// or feed a raw key sequence (rhs) back through the normal key path.
+///
+/// The `:`-prefix on the persisted string distinguishes them: `":join"`
+/// parses as `Ex("join")`, anything else (`"<Esc>"`, `"<C-w>h"`, …) parses as
+/// `Keys([...])`. This is what makes vim's single most common mapping line,
+/// `inoremap jk <Esc>`, expressible — before #1151 every `UserKeymap` target
+/// was an ex command, so key-to-keys remapping did not exist.
+#[derive(Debug, Clone, PartialEq)]
+pub enum UserKeymapAction {
+    /// Ex command to run (without leading `:`), e.g. `"Commentary"`.
+    Ex(String),
+    /// Key sequence to feed back through `Engine::handle_key`, in the same
+    /// encoded-token form as `UserKeymap::keys` (e.g. `["<Esc>"]`).
+    Keys(Vec<String>),
+}
+
+impl std::fmt::Display for UserKeymapAction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            UserKeymapAction::Ex(cmd) => write!(f, ":{cmd}"),
+            UserKeymapAction::Keys(keys) => write!(f, "{}", keys.join("")),
+        }
+    }
+}
+
 /// A parsed user-defined key mapping from settings.json.
 #[derive(Debug, Clone)]
 pub struct UserKeymap {
-    /// Mode: "n", "v", "i", "c".
+    /// Mode: "n", "v", "x", "o", "i", "c", "s" (vim's `:map-modes` letters;
+    /// "s" — Select mode — is accepted for parsing/listing but never active,
+    /// since vimcode has no separate Select mode from Visual).
     pub mode: String,
+    /// `true` for a `noremap`-family definition: the rhs is fed through
+    /// `handle_key` with user-keymap matching disabled, so it cannot recurse
+    /// into another mapping. `false` (`map`-family) allows recursion, guarded
+    /// by [`MAXMAPDEPTH`].
+    pub noremap: bool,
     /// Parsed key sequence, e.g. `["g", "c", "c"]` or `["<C-/>"]`.
     pub keys: Vec<String>,
-    /// The ex command to run (without leading `:`), e.g. `"Commentary"`.
-    pub action: String,
+    /// What firing this mapping does.
+    pub action: UserKeymapAction,
+}
+
+/// Normalize one `<...>` key-notation token to vimcode's canonical encoded
+/// form (the format `encode_keypress`/`decode_keypress` use), accepting
+/// vim's common spellings case-insensitively. `<leader>` is left as a literal
+/// marker — it is expanded against `Settings::leader` in
+/// `Engine::rebuild_user_keymaps`, since this free function has no settings
+/// access. Unrecognised tokens (`<F1>`, `<Up>`, `<Plug>foo`, …) pass through
+/// unchanged, since those are also vimcode's own storage format.
+fn normalize_key_token(tok: &str) -> String {
+    if tok.len() < 3 || !tok.starts_with('<') || !tok.ends_with('>') {
+        return tok.to_string();
+    }
+    let inner = &tok[1..tok.len() - 1];
+    let lower = inner.to_ascii_lowercase();
+    // `encode_keypress` special-cases the two *named* keys that can follow
+    // Ctrl with a mixed-case canonical spelling (`<C-Space>`, `<C-Tab>` —
+    // capital S/T), rather than the plain lowercasing every other `<C-x>`
+    // combo gets. `<C-Space>` is also the literal default completion-trigger
+    // keybinding (`Settings::completion_trigger_key`, settings.rs). If this
+    // function lowercased those two like everything else, a keymap lhs/rhs
+    // written as `<C-Space>`/`<C-Tab>` (verbatim vim spelling, or matching
+    // that default) would normalize to `<C-space>`/`<C-tab>` and then never
+    // match a real keypress's `<C-Space>`/`<C-Tab>` encoding again (#1151
+    // review).
+    if let Some(rest) = lower.strip_prefix("c-") {
+        return match rest {
+            "space" => "<C-Space>".to_string(),
+            "tab" => "<C-Tab>".to_string(),
+            _ => format!("<C-{rest}>"),
+        };
+    }
+    if let Some(rest) = lower
+        .strip_prefix("a-")
+        .or_else(|| lower.strip_prefix("m-"))
+    {
+        return format!("<A-{rest}>");
+    }
+    match lower.as_str() {
+        "esc" | "escape" => "<Escape>".to_string(),
+        "cr" | "return" | "enter" => "<Return>".to_string(),
+        "tab" => "<Tab>".to_string(),
+        "bs" | "backspace" => "<BS>".to_string(),
+        "space" => "<Space>".to_string(),
+        "leader" => "<leader>".to_string(),
+        "plug" => "<Plug>".to_string(),
+        _ => tok.to_string(),
+    }
+}
+
+/// Substitute the literal `<leader>` marker `parse_key_sequence` leaves in
+/// place (see [`normalize_key_token`]) with the configured leader key.
+/// Shared by `Engine::rebuild_user_keymaps` and the `:map`-family ex-command
+/// handlers in `execute.rs`, both of which need it applied to freshly parsed
+/// key tokens before they're matched or stored (#1151).
+pub(crate) fn expand_leader_tokens(toks: Vec<String>, leader: &str) -> Vec<String> {
+    toks.into_iter()
+        .map(|t| {
+            if t == "<leader>" {
+                leader.to_string()
+            } else {
+                t
+            }
+        })
+        .collect()
 }
 
 /// Parse a key notation string into individual key specs.
 /// `"gcc"` → `["g", "c", "c"]`; `"<C-/>x"` → `["<C-/>", "x"]`.
+/// Recognises vim's `<Esc> <CR> <Tab> <C-x> <A-x> <leader> <Plug>` notation
+/// (case-insensitively) via [`normalize_key_token`] (#1151).
 fn parse_key_sequence(s: &str) -> Vec<String> {
     let mut keys = Vec::new();
     let chars: Vec<char> = s.chars().collect();
@@ -1752,7 +1935,7 @@ fn parse_key_sequence(s: &str) -> Vec<String> {
             // Find matching '>'
             if let Some(end) = chars[i..].iter().position(|&c| c == '>') {
                 let token: String = chars[i..=i + end].iter().collect();
-                keys.push(token);
+                keys.push(normalize_key_token(&token));
                 i += end + 1;
             } else {
                 keys.push(chars[i].to_string());
@@ -1766,29 +1949,167 @@ fn parse_key_sequence(s: &str) -> Vec<String> {
     keys
 }
 
-/// Parse a keymap definition string: `"n gcc :Commentary"` → `UserKeymap`.
+/// Parse a keymap definition string, vimcode's persisted `settings.json`
+/// `keymaps` entry format: `"{mode}[!] {lhs} {rhs}"`.
+///
+/// `{mode}` is one of `n v x o i c s`; a trailing `!` marks the entry
+/// `noremap` (e.g. `"i! jk <Esc>"` is `inoremap jk <Esc>`, `"i jk <Esc>"` is
+/// `imap jk <Esc>`). `{rhs}` is `Ex` when `:`-prefixed (`"n gcc :Commentary"`,
+/// the pre-#1151 form — still parses identically, so existing `settings.json`
+/// keeps working unmigrated) and `Keys` otherwise (`"i! jk <Esc>"`).
 fn parse_keymap_def(s: &str) -> Option<UserKeymap> {
     let s = s.trim();
-    // Split: mode (first char or token), keys, :action
+    // Split: mode[!] (first token), keys, rhs
     let mut parts = s.splitn(3, ' ');
-    let mode = parts.next()?.to_string();
-    if !matches!(mode.as_str(), "n" | "v" | "i" | "c") {
+    let mode_tok = parts.next()?;
+    let (mode, noremap) = match mode_tok.strip_suffix('!') {
+        Some(base) => (base.to_string(), true),
+        None => (mode_tok.to_string(), false),
+    };
+    if !matches!(mode.as_str(), "n" | "v" | "x" | "o" | "i" | "c" | "s") {
         return None;
     }
     let keys_str = parts.next()?;
     let action_str = parts.next()?.trim();
-    if !action_str.starts_with(':') {
-        return None;
-    }
-    let action = action_str[1..].to_string();
-    if action.is_empty() {
+    if action_str.is_empty() {
         return None;
     }
     let keys = parse_key_sequence(keys_str);
     if keys.is_empty() {
         return None;
     }
-    Some(UserKeymap { mode, keys, action })
+    let action = if let Some(cmd) = action_str.strip_prefix(':') {
+        if cmd.is_empty() {
+            return None;
+        }
+        UserKeymapAction::Ex(cmd.to_string())
+    } else {
+        let rhs_keys = parse_key_sequence(action_str);
+        if rhs_keys.is_empty() {
+            return None;
+        }
+        UserKeymapAction::Keys(rhs_keys)
+    };
+    Some(UserKeymap {
+        mode,
+        noremap,
+        keys,
+        action,
+    })
+}
+
+// ─── User abbreviations (#1152) ───────────────────────────────────────────────
+
+/// A parsed user-defined abbreviation from settings.json (`:h abbreviations`).
+///
+/// An abbreviation is a key-to-keys substitution like [`UserKeymap`], but
+/// triggered by typing a non-keyword character (or leaving Insert / running
+/// the command line) immediately after the `lhs`, rather than by typing the
+/// `lhs` as a command in its own right.
+#[derive(Debug, Clone)]
+pub struct UserAbbrev {
+    /// `"i"` (Insert-mode only, `:iabbrev`), `"c"` (Command-line only,
+    /// `:cabbrev`), or `"a"` (both, `:abbreviate`/`:noreabbrev`).
+    pub mode: String,
+    /// The abbreviation itself, e.g. `"teh"` or `"#i"`.
+    pub lhs: String,
+    /// The replacement text, e.g. `"the"`. May itself contain spaces.
+    pub rhs: String,
+}
+
+/// Parse one `settings.abbreviations` entry: `"mode lhs rhs..."` → `UserAbbrev`.
+/// Mirrors [`parse_keymap_def`]'s storage convention, but `rhs` may contain
+/// spaces (`"i @@ John Doe <jd@example.com>"`), so only the first two tokens
+/// are split off; everything after that is `rhs` verbatim.
+fn parse_abbrev_def(s: &str) -> Option<UserAbbrev> {
+    let s = s.trim();
+    let mut parts = s.splitn(3, ' ');
+    let mode = parts.next()?.to_string();
+    if !matches!(mode.as_str(), "i" | "c" | "a") {
+        return None;
+    }
+    let lhs = parts.next()?.to_string();
+    let rhs = parts.next()?.trim().to_string();
+    if lhs.is_empty() || rhs.is_empty() {
+        return None;
+    }
+    Some(UserAbbrev { mode, lhs, rhs })
+}
+
+/// An abbreviation's `lhs` falls into one of three classes (`:h
+/// abbreviations`), which determine what may precede a match for it to count
+/// as triggered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AbbrevClass {
+    /// full-id: every character is a keyword character (`'iskeyword'`):
+    /// `"foo"`.
+    Full,
+    /// end-id: ends in a keyword character, but has a non-keyword one
+    /// earlier: `"#i"`.
+    End,
+    /// non-id: does not end in a keyword character: `"def:"`.
+    Symbol,
+}
+
+fn classify_abbrev_lhs(lhs: &[char]) -> AbbrevClass {
+    match lhs.last() {
+        Some(&last) if is_word_char(last) => {
+            if lhs.iter().all(|&c| is_word_char(c)) {
+                AbbrevClass::Full
+            } else {
+                AbbrevClass::End
+            }
+        }
+        _ => AbbrevClass::Symbol,
+    }
+}
+
+/// Does `prefix` (the text immediately before the cursor / trigger, on one
+/// line) end with `lhs` in a position `:h abbreviations` counts as a match?
+///
+/// `full-id` abbreviations must be a whole word — preceded by a non-keyword
+/// character or the start of line — so `"teh"` matches in `"a teh"` but not
+/// in `"ateh"` (the "does not fire mid-word" rule, #1152). `end-id` and
+/// `non-id` abbreviations need no such boundary check: their own leading
+/// character is already non-keyword, so it can never be a continuation of a
+/// keyword run.
+fn abbrev_matches_at_end(prefix: &[char], lhs: &[char], class: AbbrevClass) -> bool {
+    if lhs.is_empty() || lhs.len() > prefix.len() {
+        return false;
+    }
+    let start = prefix.len() - lhs.len();
+    if prefix[start..] != *lhs {
+        return false;
+    }
+    match class {
+        AbbrevClass::Full => start == 0 || !is_word_char(prefix[start - 1]),
+        AbbrevClass::End | AbbrevClass::Symbol => true,
+    }
+}
+
+/// Find the best (longest) abbreviation match ending at `prefix`'s end,
+/// among `abbrevs` eligible for `mode` (`"i"` or `"c"`; entries stored as
+/// `"a"` match either). Longest-`lhs` wins when several could match, mirroring
+/// Vim's own preference for the longest word before the cursor.
+fn find_abbrev_match<'a>(
+    abbrevs: &'a [UserAbbrev],
+    prefix: &[char],
+    mode: &str,
+) -> Option<(usize, &'a str)> {
+    let mut best: Option<(usize, &str)> = None;
+    for ab in abbrevs {
+        if ab.mode != "a" && ab.mode != mode {
+            continue;
+        }
+        let lhs_chars: Vec<char> = ab.lhs.chars().collect();
+        let class = classify_abbrev_lhs(&lhs_chars);
+        if abbrev_matches_at_end(prefix, &lhs_chars, class)
+            && best.map(|(len, _)| lhs_chars.len() > len).unwrap_or(true)
+        {
+            best = Some((lhs_chars.len(), ab.rhs.as_str()));
+        }
+    }
+    best
 }
 
 // ── Keybinding reference generators ──────────────────────────────────────────
@@ -1798,7 +2119,7 @@ pub(super) fn keybindings_reference_vim() -> String {
 VimCode — Vim Mode Keybinding Reference
 ========================================
 Use / to search.  :Keymaps to add custom overrides.
-Commands shown on the right (e.g. :def) can be remapped via :map n <key> :command
+Commands shown on the right (e.g. :def) can be remapped via :nnoremap <key> :command
 
 ── Movement ────────────────────────────────────────────
 h j k l             Left / down / up / right
@@ -1820,6 +2141,7 @@ Ctrl+D  Ctrl+U      Half-page down / up
 Ctrl+F  Ctrl+B      Page down / up
 Ctrl+E  Ctrl+Y      Scroll one line down / up (cursor stays)
 Ctrl+O  Ctrl+I      Jump list back / forward
+Ctrl+]              Go to definition (LSP)                :def
 
 ── Editing ─────────────────────────────────────────────
 i I                 Insert before cursor / at first non-blank
@@ -1875,7 +2197,7 @@ it at               Inner / around HTML/XML tag
 
 ── g-Commands ──────────────────────────────────────────
 gg                  Go to first line
-gd                  Go to definition (LSP)                :def
+gd                  Go to local declaration
 gr                  Find references (LSP)                 :refs
 gy                  Go to type definition (LSP)           :LspTypedef
 gi                  Insert at last insert position
@@ -2056,7 +2378,7 @@ pub(super) fn keybindings_reference_vscode() -> String {
 VimCode — VSCode Mode Keybinding Reference
 ===========================================
 Use Ctrl+F or / to search.
-Remap keys: F1 → \"Open Keyboard Shortcuts\", or :map n <key> :command
+Remap keys: F1 → \"Open Keyboard Shortcuts\", or :nnoremap <key> :command
 
 ── Editing ─────────────────────────────────────────────
 Ctrl+Z              Undo
@@ -2327,6 +2649,12 @@ pub struct Engine {
     pub wildmenu_selected: Option<usize>,
     /// Original command buffer before wildmenu was opened (for cycling back).
     pub wildmenu_original: String,
+    /// How many `<Tab>` presses into the current wildmenu completion round
+    /// we are — indexes into `'wildmode'`'s comma-separated stages
+    /// (`Settings::wildmode_stage_at`, #1206). Reset by `wildmenu_clear`.
+    /// Only consulted for `'wildmode'` configurations other than the bare
+    /// default `"full"` — see `Settings::wildmode_is_plain_full`.
+    pub wildmenu_press: usize,
     /// Status message shown in the command line area (e.g. "written", errors).
     pub message: String,
     /// Current search query (from last `/` or `?` search).
@@ -2368,10 +2696,20 @@ pub struct Engine {
     pub pending_key: Option<char>,
     /// Parsed user keymaps from settings (rebuilt on settings change).
     pub user_keymaps: Vec<UserKeymap>,
+    /// Parsed user abbreviations from settings (rebuilt on settings change).
+    pub user_abbrevs: Vec<UserAbbrev>,
     /// Accumulated keypress buffer for multi-key user keymap matching.
     pub keymap_buf: Vec<String>,
     /// Guard: true while replaying buffered keys through handle_key.
     pub keymap_replaying: bool,
+    /// When `keymap_buf` is a non-empty, still-ambiguous prefix of some
+    /// mapping's lhs, the instant `'timeoutlen'` ms after the *last*
+    /// keystroke — refreshed on every keypress that extends the buffer,
+    /// consulted by `tick_keymap_timeout` (`poll_idle`, #1206, `:h
+    /// 'timeoutlen'`). `None` when the buffer is empty, or when
+    /// `'timeoutlen'` is `0` (the pre-#1206 behavior: wait indefinitely for
+    /// a resolving keystroke, never auto-flush on idle).
+    pub keymap_buf_deadline: Option<std::time::Instant>,
     /// Set by `focus_window_direction` when navigation overflows the window list.
     /// `Some(false)` = tried to go left past first window, `Some(true)` = right past last.
     /// Consumed by the UI backend to move focus to sidebar/toolbar.
@@ -2760,7 +3098,10 @@ pub struct Engine {
     /// Flat selection index across all SC sections (staged/unstaged/worktrees).
     pub sc_selected: usize,
     /// Which sections are expanded: [staged, unstaged, worktrees, log].
-    pub sc_sections_expanded: [bool; 4],
+    /// Expand/collapse state per SC section, indexed by the
+    /// `SC_SECTION_*` constants (0=merge, 1=staged, 2=changes,
+    /// 3=worktrees, 4=log — #991 inserted MERGE CHANGES at the front).
+    pub sc_sections_expanded: [bool; SC_SECTION_COUNT],
     /// Whether the Source Control panel currently has keyboard focus.
     pub sc_has_focus: bool,
     /// quadraui SidebarSystem — owns SC sidebar (4 sections: Staged Changes,
@@ -2834,15 +3175,39 @@ pub struct Engine {
     /// True when navigating via back/forward (suppresses pushing to history).
     tab_nav_navigating: bool,
 
-    // --- Quickfix state ---
-    /// Quickfix list populated by :grep / :vimgrep.
-    pub quickfix_items: Vec<ProjectMatch>,
-    /// Currently selected quickfix item (0-based).
-    pub quickfix_selected: usize,
-    /// Whether the quickfix panel is visible.
-    pub quickfix_open: bool,
-    /// Whether the quickfix panel has keyboard focus.
-    pub quickfix_has_focus: bool,
+    // --- Quickfix / location-list state (#1155) ---
+    /// The global quickfix list, populated by :grep / :vimgrep / :cexpr-style
+    /// producers and driven by the `:c*` family.
+    pub quickfix: QuickfixList,
+    /// History of previous global quickfix lists for `:colder`/`:cnewer`,
+    /// always including the currently-loaded list at `quickfix_stack
+    /// [quickfix_stack_pos]`. Capped at 10 entries, matching Vim's default
+    /// quickfix-stack depth. Vim's location lists don't get their own
+    /// `:lolder`/`:lnewer` stack here — out of scope for #1155.
+    pub quickfix_stack: Vec<QuickfixList>,
+    /// Index of the currently active list within `quickfix_stack`.
+    pub quickfix_stack_pos: usize,
+    /// Per-window location lists — the `:l*` family's target. A window with
+    /// no entry here behaves like Vim's "no location list" (`E776`).
+    pub location_lists: HashMap<WindowId, QuickfixList>,
+    /// Real `WindowLayout` leaves opened by `qf_open`/`qf_window` for a
+    /// quickfix/location-list panel (#1307) — keyed by `qf_get`'s own `win`
+    /// shape (`None` = the global quickfix panel, `Some(owner)` = window
+    /// `owner`'s location-list panel). Matches Neovim's own `:copen`/`:lopen`:
+    /// the panel is a genuine split window, so `winnr("$")` grows and
+    /// `CTRL-W` navigation reaches it, unlike the sidebar/terminal overlay
+    /// panels. Advisory, not authoritative — an entry can outlive the window
+    /// it names if that window closed through a path other than `qf_close`
+    /// (`CTRL-W q`, `:only`, ...); every reader checks `self.windows` before
+    /// trusting it, and `forget_closed_panel_window` prunes the entry the
+    /// next time any window-close path removes that id. `QuickfixList::open`/
+    /// `has_focus` remain the flags most existing code reads/writes — a
+    /// target with no entry here (e.g. `qf_set_list`'s implicit `:grep`
+    /// auto-open, or any test that pokes `open`/`has_focus` directly without
+    /// going through `qf_open`) still renders via the legacy overlay band in
+    /// `render.rs`, which only self-suppresses for a target that *does* have
+    /// a real window here.
+    pub qf_panel_windows: HashMap<Option<WindowId>, WindowId>,
     /// Whether the debug sidebar has keyboard focus.
     pub dap_sidebar_has_focus: bool,
 
@@ -2898,6 +3263,12 @@ pub struct Engine {
     /// Used by `build_selection()` to render the original selection without it
     /// changing as the cursor jumps to search matches.
     pub find_replace_visual_end: Option<crate::core::cursor::Cursor>,
+
+    // --- `:s///c` confirm loop (#1031, #801 Phase 2) ---
+    /// `Some` while a `:s///c` confirm prompt is awaiting an answer;
+    /// intercepts all keys (see `handle_key`) until `y`/`n`/`a`/`q`/`l` (or
+    /// `<Esc>`) resolves it. `<C-e>`/`<C-y>` scroll without consuming it.
+    pub(crate) confirm_sub: Option<execute::ConfirmSubState>,
 
     // --- Breadcrumb focus mode ---
     /// Whether breadcrumb keyboard navigation is active (entered via `<leader>b`).
@@ -3011,6 +3382,57 @@ pub struct Engine {
     /// #695). Empty rect (`width`/`height` 0) means "not currently painted",
     /// matching GTK's `unwrap_or_default()` convention.
     pub menu_bar_rect: std::cell::Cell<quadraui::Rect>,
+    /// #1029 (review, fix iteration 1): one-shot guard for
+    /// `TuiShellApp::handle`'s "stale hamburger-corner" interception.
+    /// Armed `true` exactly on a genuine `false -> true` transition of
+    /// [`Self::menu_bar_visible`] caused by the hamburger reveal (not on
+    /// the `PanelChanged` echoes `ShellAdapter` re-fires after every
+    /// `handle()`/`tick()` poll — see `on_shell_event`'s hamburger arm,
+    /// which only arms this on the transition, so an echo of an
+    /// already-true flag is a no-op here too).
+    ///
+    /// **Spent (set back to `false`) by the very next user interaction,
+    /// on every path** — not just by events that happen to reach
+    /// `TuiShellApp::handle` (review, #1029 iteration 2). Two spenders,
+    /// one per path:
+    ///
+    /// - `TuiShellApp::consume_hamburger_stale_click_guard`, called at
+    ///   the top of `handle` before its `'dispatch` block, for every
+    ///   event that reaches the app directly: a `MouseDown` (the one the
+    ///   corner check is for), a keystroke, a scroll, a paste …
+    ///   Pointer/window plumbing — `MouseUp` (the release half of the
+    ///   reveal's own click!), `MouseMoved`, focus/resize/DPI — is
+    ///   deliberately excluded, since none of it is the user moving on.
+    /// - `TuiShellApp::disarm_hamburger_stale_click_guard`, called from
+    ///   `on_shell_event`, for every click `ShellAdapter` hit-tests and
+    ///   consumes *upstream* of `handle` — a real activity-bar panel icon
+    ///   (Explorer/Search/Git/an extension panel), the Settings cog, a
+    ///   divider drag. Those never reach `handle` at all, so without this
+    ///   half the guard survived them and then mis-fired on the next
+    ///   genuine `File` click.
+    ///
+    /// The one exception is the `suppress_shell_panel_echo` reconciliation
+    /// echo `take_requested_panel` provokes right after every hamburger
+    /// reveal: it is the app steering the runner back onto the shadow's
+    /// panel, not user input, and spending the guard on it would disable
+    /// this fix entirely.
+    ///
+    /// Purely positional matching (the click lands where the activity
+    /// bar used to be, before the reveal shifted it down a row) can't
+    /// tell the one stale muscle-memory click a reveal leaves behind
+    /// apart from a later, deliberate click on `File` — which paints at
+    /// the exact same columns once the menu bar is open (review, #1029
+    /// iteration 1: "it fires identically for every left-click landing
+    /// on the `File` label for as long as the menu bar stays visible").
+    /// Bounding the corner-check to the single click immediately
+    /// following a reveal fixes the one stale click without permanently
+    /// stealing mouse access to `File` — but only if "immediately
+    /// following" is literally true, which is why the spend has to cover
+    /// the shell-consumed path too (review, #1029 iteration 2: "it's
+    /// consumed by the next `MouseDown` that happens not to be a
+    /// recognized activity-bar panel click, which can be arbitrarily
+    /// later").
+    pub hamburger_stale_click_guard: bool,
     /// Cached global (bottom-of-screen) status bar rect from the last paint
     /// (#752) — the exact twin of [`Self::menu_bar_rect`] one band lower, and
     /// for the same reason.
@@ -3088,6 +3510,11 @@ pub struct Engine {
     pub debug_button_pressed: Option<usize>,
     /// True while a DAP debug session is active.
     pub dap_session_active: bool,
+
+    // --- ACP (Agent Client Protocol) state (#951, ACP-0 — transport only, no UI) ---
+    /// The live ACP agent subprocess + session, if one has been started.
+    /// `None` until a later slice starts one; `poll_acp` is a no-op then.
+    pub acp_client: Option<crate::core::acp::AcpClient>,
 
     // --- DAP (Debug Adapter Protocol) state ---
     /// Multi-adapter DAP coordinator. None until first debug session is started.
@@ -3302,6 +3729,13 @@ pub struct Engine {
     /// Last executed ex command (for @: repeat).
     pub last_ex_command: Option<String>,
 
+    /// Set by `:undojoin` (#1156): the undo-tree `seq` to fold the *next*
+    /// committed undo group back into, so the change `:undojoin` precedes
+    /// and the one that follows it undo as a single `u`. Consumed (cleared)
+    /// by the next `Engine::finish_undo_group` call, whether or not it
+    /// actually commits anything.
+    pub pending_undojoin: Option<usize>,
+
     // --- Last substitute (&) ---
     /// Last substitute (pattern, replacement, flags) for & repeat.
     pub last_substitute: Option<(String, String, String)>,
@@ -3318,14 +3752,62 @@ pub struct Engine {
     /// Updated at the end of `handle_key()`.
     pub bracket_match: Option<(usize, usize)>,
 
+    /// `'showmatch'` (#1207): the (line, col) of the opening bracket a just-
+    /// typed closing bracket in Insert mode matched, while the momentary
+    /// "flash" is active. Deliberately never moves `view.cursor` — Vim's own
+    /// `'showmatch'` is a *display* trick (it repaints the cursor over the
+    /// match, waits, then repaints it back) that does not touch where the
+    /// next typed character lands; representing that as a display-only
+    /// cursor move would need a real timer (`'matchtime'`, out of scope,
+    /// #1207), so this is a transient side channel instead — analogous to
+    /// `yank_highlight` above. Set by `Engine::handle_insert_key` when a
+    /// closing `)`/`]`/`}` has a match; cleared at the very top of the same
+    /// fn on the *next* key, so a test can observe it True for exactly the
+    /// one key that triggered it. Painted by `build_rendered_window` in
+    /// `render.rs`, which folds this into `bracket_match_positions` (the
+    /// same `bracket_match_bg`-themed channel `bracket_match` above already
+    /// used) whenever `'showmatch'` is on — so this is user-visible, not
+    /// just engine state; see
+    /// `set_showmatch_flashes_the_matching_open_paren_via_shell_app` in
+    /// `src/tui_main/shell_app.rs` for the driver-tier proof.
+    pub showmatch_flash: Option<(usize, usize)>,
+
     // --- Insert mode Ctrl+r pending ---
     /// When true, the next keypress in Insert (or Replace) mode inserts a register's content.
     pub insert_ctrl_r_pending: bool,
     pub insert_ctrl_g_pending: bool,
+    /// `<C-k>` digraph entry (`:h digraphs`, #1160). `None` when not
+    /// entering a digraph; `Some(None)` right after `<C-k>` itself (waiting
+    /// for the first of the two digraph characters); `Some(Some(c1))` after
+    /// the first character has been typed (waiting for the second).
+    pub insert_ctrl_k_pending: Option<Option<char>>,
+    /// `<C-x>` completion submode (`:h i_CTRL-X`, #1160): true right after
+    /// `<C-x>` while waiting for the sub-mode selector key
+    /// (`<C-x><C-n>`/`<C-x><C-f>`/etc).
+    pub insert_ctrl_x_pending: bool,
+    /// User-defined digraphs added via `:digraph {char1}{char2} {number}`
+    /// (`:h digraph-usage`). Consulted before the builtin table so a user
+    /// override wins; keyed in the order the two characters were typed.
+    pub custom_digraphs: HashMap<(char, char), char>,
     /// When true, after one Normal-mode command, auto-return to Insert mode (Ctrl-O).
     pub insert_ctrl_o_active: bool,
-    /// Column where insert mode was entered (for Ctrl-U to delete only typed text).
+    /// Column of the `'backspace'` `"start"` / Ctrl-U boundary (`:h
+    /// i_CTRL-U`, `:h 'backspace'`'s `"start"` token, #1206). Set when
+    /// Insert mode is entered, then **re-anchored to the cursor's new
+    /// position by `split_insert_undo_group`** every time an insert-mode
+    /// cursor-movement key (arrow/Home/End) fires — mirroring real Vim's
+    /// `stop_arrow()`, which resets `Insstart` on exactly those keys. This
+    /// is why it is *not* simply "where insert mode was entered" after the
+    /// first cursor move.
     pub insert_enter_col: usize,
+    /// Line counterpart to `insert_enter_col` — `insert_enter_col` alone
+    /// can't tell "BackSpace is about to delete text that predates this
+    /// Insert session" from "the cursor moved to a different line since"
+    /// (e.g. after `<CR>`, or after an arrow key re-anchored both fields to
+    /// a pre-existing line); this pairs with it so the `"start"` gate only
+    /// fires relative to the *current* anchor line, which moves with
+    /// `insert_enter_col` (see there for when).
+    pub insert_enter_line: usize,
     /// Line index of a freshly created, still-untouched autoindent-only line
     /// (`:h 'autoindent'`), or `None`. Set when `<CR>`/`o`/`O` create a line
     /// whose only content is the copied indent; cleared by any key other
@@ -3437,6 +3919,14 @@ pub struct Engine {
     pub settings_scroll_top: usize,
     /// Form scroll/scrollbar controller for the settings panel.
     pub settings_form_controller: std::cell::RefCell<quadraui::FormController>,
+    /// Cached content rect from the last render frame — the same rect
+    /// `render_settings_panel` (TUI) / the GTK `PANEL_SETTINGS` arm passed to
+    /// `FormController::render_and_cache`. Hit-testing must reuse this exact
+    /// rect (mirrors `explorer_tree_rect` / `dap_sidebar_body_rect`) rather
+    /// than re-deriving it by hand — see #1238, where a hand-derived
+    /// `y = 2` TUI rect drifted from the real painted origin the moment the
+    /// menu bar (or any other chrome above the sidebar) shifted it.
+    pub settings_form_rect: std::cell::Cell<quadraui::Rect>,
     /// Search/filter query typed in the settings panel.
     pub settings_query: String,
     /// Whether the search input is active (user typing a filter).
@@ -3570,6 +4060,40 @@ pub struct Engine {
     pub ext_panel_help_open: bool,
     /// Extension panel help bindings: panel_name -> [(key, description)]
     pub ext_panel_help_bindings: HashMap<String, Vec<(String, String)>>,
+    /// The `AppShellLayout::sidebar_content_bounds` rect `render_ext_panel`
+    /// was last painted into — i.e. its own `area` parameter, verbatim,
+    /// *before* subtracting the panel's own header/search chrome. #1086:
+    /// originally read by click routing to avoid re-deriving the sidebar
+    /// content's top row from the menu-bar row count by hand — that
+    /// hand-rolled arithmetic never budgeted for `AppShellLayout`'s own
+    /// one-row sidebar header *above* `sidebar_content_bounds`, landing every
+    /// click one row low. #1089/#1236 moved both click and hover routing onto
+    /// `ext_panel_tree_layout` below (a real multi-section panel has no
+    /// single row height for this field's rect to divide by), so this is now
+    /// unread; kept in case a future rung wants "the exact rect that was
+    /// painted" without the tree-layout hit-test machinery. Mirrors
+    /// `explorer_tree_rect` / `dap_sidebar_body_rect`'s "cache what was
+    /// actually painted" pattern.
+    pub ext_panel_content_rect: std::cell::Cell<quadraui::Rect>,
+    /// The `Backend::tree_layout` result for the plugin panel's tree body,
+    /// paired with the body rect (chrome excluded) it was computed
+    /// against — cached by whichever paint arm ran this frame
+    /// (`tui_main::panels::render_ext_panel` or `App::
+    /// paint_sidebar_panel_rung`'s `ext:` arm) so a later click resolves
+    /// against the *exact* geometry that was painted (#1089).
+    ///
+    /// Why not extend `ext_panel_content_rect` + `SidebarBodyGeometry`'s
+    /// uniform-row-height formula instead: GTK/macOS/Win pitch a tree's
+    /// `Decoration::Header` rows at `line_height` and every other row at
+    /// `line_height * 1.4` (`quadraui::TreeStyle::row_height`'s own doc).
+    /// Every real plugin panel has more than one section, so it has no
+    /// single row height a linear formula could hit-test against on those
+    /// backends — only `Backend::tree_layout`'s own per-row bounds (the
+    /// same ones `Backend::draw_tree` painted with) resolve correctly.
+    /// `None` when nothing is currently painted (no live registration, or
+    /// the panel's body has zero height this frame).
+    pub ext_panel_tree_layout:
+        std::cell::RefCell<Option<(quadraui::Rect, quadraui::TreeViewLayout)>>,
 
     // --- Notifications (background operation progress) ---
     /// Active notifications (spinner/bell indicators in status bar).
@@ -3628,6 +4152,20 @@ pub struct Engine {
     /// Set to true when a file move completes; backends should refresh the explorer tree
     /// and clear this flag.
     pub explorer_needs_refresh: bool,
+
+    /// Platform actions (open a URL, reveal a path in the file manager)
+    /// queued by engine logic for the runner to carry out via the
+    /// runner-owned `backend`'s `PlatformServices` (#1134). `Engine` has no
+    /// `Backend` handle of its own — see `PendingFileDialog` (#572, `app.rs`)
+    /// for the identical reason file dialogs are deferred rather than
+    /// actioned inline. Drained every frame by `App::tick_dispatch` (GTK)
+    /// and `TuiShellApp::tick` (TUI), in FIFO order, via
+    /// `backend.services().open_url_result(..)` /
+    /// `.reveal_in_file_manager(..)`. A `Vec` rather than a single `Option`
+    /// (unlike `PendingFileDialog`) because a single frame can legitimately
+    /// queue more than one — e.g. `Engine::open_plugin_context`'s `for url in
+    /// ctx.open_urls { self.open_url(&url); }` loop.
+    pub pending_platform_actions: Vec<PendingPlatformAction>,
 
     /// Inline rename state for the explorer sidebar.  When `Some`, the
     /// sidebar row matching `path` should render an editable text input
@@ -3750,6 +4288,7 @@ impl Engine {
             wildmenu_items: Vec::new(),
             wildmenu_selected: None,
             wildmenu_original: String::new(),
+            wildmenu_press: 0,
             message: String::new(),
             search_query: String::new(),
             search_matches: Vec::new(),
@@ -3764,8 +4303,10 @@ impl Engine {
             replace_flags: String::new(),
             pending_key: None,
             user_keymaps: Vec::new(),
+            user_abbrevs: Vec::new(),
             keymap_buf: Vec::new(),
             keymap_replaying: false,
+            keymap_buf_deadline: None,
             window_nav_overflow: None,
             activity_bar_focused: false,
             activity_bar_selected: 1,
@@ -3880,6 +4421,7 @@ impl Engine {
             find_replace_options: FindReplaceOptions::default(),
             find_replace_selection_range: None,
             find_replace_visual_end: None,
+            confirm_sub: None,
             workspace_file: None,
             workspace_root: Some(cwd.clone()),
             base_settings: None,
@@ -3898,10 +4440,14 @@ impl Engine {
             sc_file_statuses: Vec::new(),
             sc_worktrees: Vec::new(),
             sc_selected: 0,
-            sc_sections_expanded: [true, true, true, true],
+            sc_sections_expanded: [true; SC_SECTION_COUNT],
             sc_has_focus: false,
             sc_sidebar_system: {
+                // Order matters — it is the painted order, and the
+                // `SC_SECTION_*` constants index it. MERGE CHANGES sits
+                // above STAGED CHANGES, matching VS Code (#991).
                 let mut s = quadraui::SidebarSystem::new(vec![
+                    quadraui::SidebarSectionDef::new("merge", "MERGE CHANGES"),
                     quadraui::SidebarSectionDef::new("staged", "STAGED CHANGES"),
                     quadraui::SidebarSectionDef::new("changes", "CHANGES"),
                     quadraui::SidebarSectionDef::new("worktrees", "WORKTREES"),
@@ -3939,10 +4485,11 @@ impl Engine {
             tab_nav_history: vec![(GroupId(0), TabId(1))],
             tab_nav_index: 0,
             tab_nav_navigating: false,
-            quickfix_items: Vec::new(),
-            quickfix_selected: 0,
-            quickfix_open: false,
-            quickfix_has_focus: false,
+            quickfix: QuickfixList::default(),
+            quickfix_stack: Vec::new(),
+            quickfix_stack_pos: 0,
+            location_lists: HashMap::new(),
+            qf_panel_windows: HashMap::new(),
             dap_sidebar_has_focus: false,
             picker_open: false,
             picker_source: PickerSource::Files,
@@ -3997,6 +4544,7 @@ impl Engine {
                 Vec::new(),
             ))),
             menu_bar_rect: std::cell::Cell::new(quadraui::Rect::default()),
+            hamburger_stale_click_guard: false,
             global_status_rect: std::cell::Cell::new(quadraui::Rect::default()),
             command_line_rect: std::cell::Cell::new(quadraui::Rect::default()),
             cmd_sel: std::cell::Cell::new(None),
@@ -4031,6 +4579,7 @@ impl Engine {
             debug_button_hovered: None,
             debug_button_pressed: None,
             dap_session_active: false,
+            acp_client: None,
             dap_manager: None,
             dap_stopped_thread: None,
             dap_breakpoints: HashMap::new(),
@@ -4091,14 +4640,20 @@ impl Engine {
             change_list_pos: 0,
             last_inserted_text: String::new(),
             last_ex_command: None,
+            pending_undojoin: None,
             last_substitute: None,
             last_sub_replacement: String::new(),
             yank_highlight: None,
             bracket_match: None,
+            showmatch_flash: None,
             insert_ctrl_r_pending: false,
             insert_ctrl_g_pending: false,
+            insert_ctrl_k_pending: None,
+            insert_ctrl_x_pending: false,
+            custom_digraphs: HashMap::new(),
             insert_ctrl_o_active: false,
             insert_enter_col: 0,
+            insert_enter_line: 0,
             insert_indent_only_line: None,
             insert_last_key_char: None,
             insert_ctrl_v_pending: false,
@@ -4141,6 +4696,7 @@ impl Engine {
             settings_form_controller: std::cell::RefCell::new(quadraui::FormController::new(
                 "settings".to_string(),
             )),
+            settings_form_rect: std::cell::Cell::new(quadraui::Rect::new(0.0, 0.0, 0.0, 0.0)),
             settings_query: String::new(),
             settings_input_active: false,
             settings_editing: None,
@@ -4190,6 +4746,8 @@ impl Engine {
             ext_panel_focus_pending: None,
             ext_panel_help_open: false,
             ext_panel_help_bindings: HashMap::new(),
+            ext_panel_content_rect: std::cell::Cell::new(quadraui::Rect::new(0.0, 0.0, 0.0, 0.0)),
+            ext_panel_tree_layout: std::cell::RefCell::new(None),
             notifications: Vec::new(),
             next_notification_id: 1,
             toasts: Vec::new(),
@@ -4212,72 +4770,32 @@ impl Engine {
             pending_move: None,
             pending_delete: None,
             explorer_needs_refresh: false,
+            pending_platform_actions: Vec::new(),
             explorer_rename: None,
             explorer_new_entry: None,
-            app_shell: {
-                use quadraui::{AppShell, PanelDefinition, WidgetId};
-                AppShell::new(
-                    vec![
-                        PanelDefinition {
-                            id: WidgetId::new("panel:explorer"),
-                            icon: "".to_string(),
-                            tooltip: "Explorer".to_string(),
-                            title: "EXPLORER".to_string(),
-                        },
-                        PanelDefinition {
-                            id: WidgetId::new("panel:search"),
-                            icon: "".to_string(),
-                            tooltip: "Search".to_string(),
-                            title: "SEARCH".to_string(),
-                        },
-                        PanelDefinition {
-                            id: WidgetId::new("panel:debug"),
-                            icon: "".to_string(),
-                            tooltip: "Run and Debug".to_string(),
-                            title: "RUN AND DEBUG".to_string(),
-                        },
-                        PanelDefinition {
-                            id: WidgetId::new("panel:git"),
-                            icon: "".to_string(),
-                            tooltip: "Source Control".to_string(),
-                            title: "SOURCE CONTROL".to_string(),
-                        },
-                        PanelDefinition {
-                            id: WidgetId::new("panel:extensions"),
-                            icon: "".to_string(),
-                            tooltip: "Extensions".to_string(),
-                            title: "EXTENSIONS".to_string(),
-                        },
-                        PanelDefinition {
-                            id: WidgetId::new("panel:ai"),
-                            icon: "".to_string(),
-                            tooltip: "AI".to_string(),
-                            title: "AI".to_string(),
-                        },
-                        PanelDefinition {
-                            id: WidgetId::new("bottom:settings"),
-                            icon: "".to_string(),
-                            tooltip: "Settings".to_string(),
-                            title: "SETTINGS".to_string(),
-                        },
-                    ],
-                    30.0,
-                )
-            },
+            // #1166: the panel list — order, ids, titles, tooltips — is
+            // built from `sidebar::engine_app_shell_panel_definitions`
+            // rather than a hand-transcribed literal, so this shadow
+            // `AppShell` (which `App::shell_config` reads through
+            // `app_shell.panels()` on every GUI backend) can no longer
+            // silently drift out of order with `sidebar::FIXED_ACTIVITY_PANEL_IDS`
+            // — the same constant `TuiShellApp::build_shell_config` iterates
+            // directly. See that function's doc for the two-sources-of-truth
+            // history this replaces.
+            app_shell: quadraui::AppShell::new(sidebar::engine_app_shell_panel_definitions(), 30.0),
             file_watcher: None,
             file_watcher_rx: None,
             file_watcher_pending: HashSet::new(),
             accelerators: Vec::new(),
             idle_last_file_check: std::time::Instant::now(),
         };
-        let show_sidebar = if engine.settings.autohide_panels {
-            false
-        } else {
-            engine.session.explorer_visible || engine.settings.explorer_visible_on_startup
-        };
-        if !show_sidebar {
-            engine.app_shell.hide_sidebar();
-        }
+        // A freshly-built `AppShell` (above) defaults `sidebar_visible: true`,
+        // so this only ever needs to *hide* it here — but it's expressed via
+        // the same bidirectional `Engine::sync_app_shell_sidebar_visibility`
+        // every other caller uses (`TuiShellApp::from_engine`, #1117) rather
+        // than a second copy of the `autohide_panels` / `explorer_visible`
+        // derivation, so the formula lives in exactly one place.
+        engine.sync_app_shell_sidebar_visibility();
         engine.init_file_watcher();
         // Register Phase B.2 accelerators (terminal maximize for now).
         engine.register_default_accelerators();
@@ -4287,11 +4805,19 @@ impl Engine {
             engine.menu_bar_visible = true;
         }
         engine.rebuild_user_keymaps();
+        engine.rebuild_user_abbrevs();
         engine.ensure_spell_checker();
         // Sync the syntax-highlighting line-count threshold before any file
         // is opened via restore_session_files / CLI args, so huge buffers
         // skip the expensive initial tree-sitter parse.
         crate::core::buffer_manager::set_syntax_max_lines(engine.settings.syntax_max_lines);
+        // Sync undo-tree settings (#1156) the same way, before any file is
+        // opened: `undolevels` bounds tree growth on every commit,
+        // `undofile`/`undodir` decide whether/where a freshly-opened file's
+        // undo history gets loaded from.
+        crate::core::buffer_manager::set_undo_levels(engine.settings.undolevels);
+        crate::core::undofile::set_enabled(engine.settings.undofile);
+        crate::core::undofile::set_dir(&engine.settings.undodir);
         engine.explorer_rebuild_rows();
         // Record the startup position for `seed_jump_list_if_line_left` —
         // see that function's doc comment (#806).
@@ -4303,7 +4829,7 @@ impl Engine {
     /// registry, then either open the CLI-supplied path or restore the
     /// previous session.  Both TUI and GTK call this identically.
     pub fn startup(&mut self, file_path: Option<&Path>) {
-        self.startup_inner(file_path, true);
+        self.startup_inner(file_path, true, true);
     }
 
     /// [`Engine::startup`] minus the per-workspace session restore — the
@@ -4329,15 +4855,43 @@ impl Engine {
     /// This entry point skips the restore entirely, so the resulting engine
     /// depends on nothing but its in-memory defaults and the explicit
     /// `file_path` argument.
+    ///
+    /// #890: for the same reason it also skips the *other* two ambient reads
+    /// `startup` performs — `plugin_init()` (loads and **executes** every
+    /// `.lua` script in the developer's real
+    /// `~/.config/vimcode/{plugins,extensions}/`, then fires `VimEnter`) and
+    /// `ext_refresh()` (spawns a thread that fetches the remote extension
+    /// registry over the network). Both make driver-tier tests depend on the
+    /// machine they run on: a user plugin that hooks `ModeChanged` /
+    /// `InsertEnter` / `cursor_move` can call `vimcode.buf.set_cursor` or
+    /// `set_lines` *synchronously inside a keystroke*, so an installed
+    /// plugin silently rewrites what a `TuiDriver` test types. That is how
+    /// `gp_charwise_multiline_lands_cursor_on_rendered_last_pasted_char_via_shell_app`
+    /// failed on one machine while passing on every other — reproduced
+    /// exactly by pointing `$HOME` at a config dir holding a two-line
+    /// `ModeChanged` plugin. Tests must exercise vimcode, not vimcode plus
+    /// whatever the developer happens to have installed.
     pub fn startup_without_session_restore(&mut self, file_path: Option<&Path>) {
-        self.startup_inner(file_path, false);
+        self.startup_inner(file_path, false, false);
     }
 
     /// Shared body of [`Engine::startup`] and
     /// [`Engine::startup_without_session_restore`].
-    fn startup_inner(&mut self, file_path: Option<&Path>, restore_session: bool) {
-        self.plugin_init();
-        self.ext_refresh();
+    ///
+    /// `load_ambient_state` covers the two startup steps that read (and
+    /// run) whatever is on the host machine — user plugins/extensions and
+    /// the remote extension registry. Production startup wants them; the
+    /// deterministic test entry point must not have them.
+    fn startup_inner(
+        &mut self,
+        file_path: Option<&Path>,
+        restore_session: bool,
+        load_ambient_state: bool,
+    ) {
+        if load_ambient_state {
+            self.plugin_init();
+            self.ext_refresh();
+        }
         if let Some(path) = file_path {
             if path.is_dir() {
                 self.open_folder(path);
@@ -4359,12 +4913,24 @@ impl Engine {
     /// - `explorer_needs_refresh` — GTK calls `App::refresh_file_tree`
     /// - SC/explorer periodic auto-refresh — gated on sidebar visibility
     /// - Settings file auto-reload (#376)
+    /// - `post_draw_apply_widths` — paint-time, not idle-time; both backends
+    ///   call it once per tick anyway (see that method's own doc for exactly
+    ///   where — #1165 added the GTK call, which had been missing entirely)
+    /// - `tab_switcher_confirm`'s hold-to-cycle auto-confirm timer — both
+    ///   backends *call* it from `tick` (TUI has since #595, GTK does not —
+    ///   #1165 audit), but neither backend ever arms the deadline it checks
+    ///   (`tab_switcher_cycle`, the only writer, is `#[allow(dead_code)]` and
+    ///   unreachable from either key-dispatch path — #448-C follow-on). Not
+    ///   a tick asymmetry to converge: it is equally dead on both backends
+    ///   today, and wiring the real hold-to-cycle gesture is separate,
+    ///   pre-existing feature work, not part of this method's contract.
     pub fn poll_idle(&mut self) -> bool {
         let mut redraw = false;
         redraw |= self.process_pending_sidebar();
         redraw |= self.flush_cursor_move_hook();
         self.lsp_flush_changes();
         redraw |= self.poll_lsp();
+        redraw |= self.poll_acp();
         if self.poll_project_search() {
             self.search_switch_to_results();
             redraw = true;
@@ -4381,6 +4947,7 @@ impl Engine {
         redraw |= self.poll_blame();
         redraw |= self.tick_ai_completion();
         redraw |= self.tick_syntax_debounce();
+        redraw |= self.tick_keymap_timeout();
         self.tick_swap_files();
         self.tick_file_watcher();
         redraw |= self.tick_git_branch();
@@ -5065,9 +5632,11 @@ pub(crate) fn diff_state_from_hunks(
 }
 
 mod accessors;
+mod acp_ops;
 mod buffers;
 mod dap_ops;
 pub use dap_ops::DEBUG_BUTTON_IDS;
+mod digraph_ops;
 mod explorer_ops;
 pub use explorer_ops::ExplorerKeyResult;
 mod execute;
@@ -5085,6 +5654,10 @@ pub mod sidebar;
 mod source_control;
 pub use source_control::ScKeyResult;
 pub use source_control::SC_BUTTON_IDS;
+pub use source_control::{
+    SC_SECTION_CHANGES, SC_SECTION_COUNT, SC_SECTION_LOG, SC_SECTION_MERGE, SC_SECTION_STAGED,
+    SC_SECTION_WORKTREES,
+};
 mod spell_ops;
 mod terminal_ops;
 mod visual;

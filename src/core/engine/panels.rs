@@ -97,6 +97,70 @@ impl Engine {
         );
     }
 
+    /// `:CheckNerdFonts` (issue #999) — paint a sample row of a few
+    /// file-type glyphs next to their ASCII fallbacks and let the user say
+    /// which one actually rendered.
+    ///
+    /// There is no reliable way to detect terminal glyph support from
+    /// inside the terminal (a CSI-6n cursor-advance probe measures width
+    /// handling, not whether a real glyph painted — a tofu box still
+    /// advances the cursor the same as a glyph would). So instead of
+    /// guessing, this asks the one oracle that actually knows: the user,
+    /// once, with both variants on screen at the same time. The answer is
+    /// persisted as an explicit `use_nerd_fonts` override (`Some(_)`),
+    /// which always wins over the backend-derived default and survives
+    /// restarts — see [`crate::core::settings::Settings::use_nerd_fonts`].
+    ///
+    /// Reads `Icon::nerd`/`Icon::fallback` directly rather than going
+    /// through `Icon::s()` so both variants show regardless of the
+    /// thread-local `use_nerd_fonts` flag currently in effect.
+    pub fn show_check_nerd_fonts_dialog(&mut self) {
+        let sample = [
+            crate::icons::FILE_RUST,
+            crate::icons::FILE_PYTHON,
+            crate::icons::FILE_JS,
+            crate::icons::FILE_JSON,
+        ];
+        let nerd_row: String = sample
+            .iter()
+            .map(|i| i.nerd)
+            .collect::<Vec<_>>()
+            .join("   ");
+        let fallback_row: String = sample
+            .iter()
+            .map(|i| i.fallback)
+            .collect::<Vec<_>>()
+            .join("   ");
+        self.show_dialog(
+            "check_nerd_fonts",
+            "Check Nerd Fonts",
+            vec![
+                "Do the top row's icons look like distinct file-type glyphs".to_string(),
+                "(not boxes, question marks, or blank cells)?".to_string(),
+                String::new(),
+                format!("Nerd Font:  {nerd_row}"),
+                format!("Fallback:   {fallback_row}"),
+            ],
+            vec![
+                DialogButton {
+                    label: "Nerd Font row looks right".into(),
+                    hotkey: 'n',
+                    action: "enable".into(),
+                },
+                DialogButton {
+                    label: "Fallback row looks right".into(),
+                    hotkey: 'f',
+                    action: "disable".into(),
+                },
+                DialogButton {
+                    label: "Cancel".into(),
+                    hotkey: '\0',
+                    action: "cancel".into(),
+                },
+            ],
+        );
+    }
+
     /// Convenience: show an error dialog with a single OK button.
     #[allow(dead_code)]
     pub fn show_error_dialog(&mut self, title: &str, message: &str) {
@@ -494,6 +558,23 @@ impl Engine {
             },
             "file_changed" => {
                 self.handle_file_watcher_action(action);
+                EngineAction::None
+            }
+            "check_nerd_fonts" => {
+                if let Some(enabled) = match action {
+                    "enable" => Some(true),
+                    "disable" => Some(false),
+                    _ => None, // cancel — leave the setting untouched
+                } {
+                    self.settings.use_nerd_fonts = Some(enabled);
+                    crate::icons::set_nerd_fonts(enabled);
+                    let state = if enabled { "enabled" } else { "disabled" };
+                    self.message = if let Err(e) = self.settings.save() {
+                        format!("Nerd Fonts {state} but failed to save: {e}")
+                    } else {
+                        format!("Nerd Fonts {state} and saved to settings.")
+                    };
+                }
                 EngineAction::None
             }
             _ => EngineAction::None,
@@ -1218,8 +1299,12 @@ impl Engine {
                         self.view_mut().cursor.col = col;
                         self.ensure_cursor_visible();
                     } else {
-                        // Multiple results — populate quickfix window
-                        self.quickfix_items = locations
+                        // Multiple results — populate the quickfix window.
+                        // `qf_set_list` also snapshots whatever quickfix list
+                        // was there before onto the `:colder`/`:cnewer` stack
+                        // (#1155), same as `:grep`.
+                        let n = locations.len();
+                        let items = locations
                             .into_iter()
                             .map(|l| ProjectMatch {
                                 file: l.path,
@@ -1228,14 +1313,15 @@ impl Engine {
                                 line_text: String::new(),
                             })
                             .collect();
-                        self.quickfix_selected = 0;
-                        self.quickfix_open = true;
                         // Focus the panel — Neovim convention for `gr`
                         // (Find References) is to land the user in the
                         // quickfix so j/k/Enter drive the result list
                         // without a follow-up `:copen`. Closes #150.
-                        self.quickfix_has_focus = true;
-                        self.message = format!("{} references found", self.quickfix_items.len());
+                        // `qf_set_list` already focuses whenever the new
+                        // list is non-empty, which always holds here (this
+                        // branch is only reached for `locations.len() > 1`).
+                        self.qf_set_list(None, items);
+                        self.message = format!("{n} references found");
                     }
                     redraw = true;
                 }
@@ -1533,7 +1619,9 @@ impl Engine {
             return result;
         };
         if mgr.server_supports(&path, "definitionProvider") {
-            result.push(("Definition", "gd", "command:definition"));
+            // `gd` is Vim's local-declaration motion, not this LSP command
+            // (:h gd) — the tag-jump `Ctrl-]` is what invokes the server.
+            result.push(("Definition", "Ctrl+]", "command:definition"));
         }
         if mgr.server_supports(&path, "typeDefinitionProvider") {
             result.push(("Type Definition", "gy", "command:type_definition"));
@@ -1547,73 +1635,10 @@ impl Engine {
         result
     }
 
-    /// Extract clickable links from rendered markdown.
-    ///
-    /// Two sources of click regions are handled:
-    ///
-    /// 1. **Markdown links** — each `Link` span (the label text) is paired with
-    ///    the following `LinkUrl` span on the same line.  The click region covers
-    ///    the label; the URL drives dispatch.  Command URIs displayed as
-    ///    `:Name?args` are restored to `command:Name?args`.
-    ///
-    /// 2. **Bare URLs** — standalone `LinkUrl` spans (emitted by `render_markdown`
-    ///    for plain `http://` / `https://` text) become their own click regions.
-    ///    The span text is the URL itself, so no reconstruction is needed beyond
-    ///    the same `:` → `command:` prefix check used for markdown link URLs.
-    pub(crate) fn extract_hover_links(
-        rendered: &crate::core::markdown::MdRendered,
-    ) -> Vec<(usize, usize, usize, String)> {
-        use crate::core::markdown::MdStyle;
-        let mut links = Vec::new();
-        for (line_idx, line_spans) in rendered.spans.iter().enumerate() {
-            let Some(line) = rendered.lines.get(line_idx) else {
-                continue;
-            };
-            // Walk every span on this line.
-            let mut span_iter = line_spans.iter().peekable();
-            while let Some(span) = span_iter.next() {
-                if span.style == MdStyle::Link {
-                    // Paired markdown link: look for the following LinkUrl span.
-                    let url = span_iter
-                        .peek()
-                        .filter(|next| next.style == MdStyle::LinkUrl)
-                        .and_then(|next| {
-                            if next.end_byte <= line.len() {
-                                Some(&line[next.start_byte..next.end_byte])
-                            } else {
-                                None
-                            }
-                        });
-                    if let Some(url_text) = url {
-                        // Command URIs display as ":Name?args" — restore prefix.
-                        let url = if url_text.starts_with(':') {
-                            format!("command{}", url_text)
-                        } else {
-                            url_text.to_string()
-                        };
-                        if is_safe_url(&url) {
-                            // Click region = the Link label span.
-                            links.push((line_idx, span.start_byte, span.end_byte, url));
-                        }
-                    }
-                } else if span.style == MdStyle::LinkUrl && span.end_byte <= line.len() {
-                    // Standalone LinkUrl span (bare URL or the URL display of a
-                    // markdown link).  Make the span itself clickable.
-                    let url_text = &line[span.start_byte..span.end_byte];
-                    // Restore command: prefix if displayed as ":Name?args".
-                    let url = if url_text.starts_with(':') {
-                        format!("command{}", url_text)
-                    } else {
-                        url_text.to_string()
-                    };
-                    if is_safe_url(&url) {
-                        links.push((line_idx, span.start_byte, span.end_byte, url));
-                    }
-                }
-            }
-        }
-        links
-    }
+    // Link extraction from hover markdown moved to
+    // `core::markdown::hover_markdown_structure` (#821 — hover popups adopt
+    // quadraui's `render_markdown_to_styled`, which resolves link ranges
+    // itself instead of vimcode re-pairing `Link`/`LinkUrl` spans).
 
     /// Execute an LSP navigation command from a hover popup link.
     /// Moves the cursor to the given position before invoking the LSP request.
@@ -2016,7 +2041,10 @@ impl Engine {
             }
         }
         if let Some(state) = self.buffer_manager.get_mut(buffer_id) {
-            state.finish_undo_group();
+            // Not necessarily the active buffer/window, so there's no engine
+            // view cursor to read for "after" — reuse the same position the
+            // group started at (LSP edits don't move the caller's cursor).
+            state.finish_undo_group(cursor);
             // Clear stale semantic tokens immediately — positions are now wrong.
             state.semantic_tokens.clear();
         }

@@ -12,10 +12,16 @@ use vimcode_core::{Cursor, Engine, EngineAction, Mode, RegType};
 ///
 /// Also calls `suppress_disk_saves()` so that commands like `:ExtInstall` that
 /// trigger `save()` do not overwrite the user's real `~/.config/vimcode/` files
-/// during `cargo test`.
+/// during `cargo test`, and `suppress_disk_loads()` (#1304) so that
+/// `Engine::new()`'s `HistoryState::load()` does not seed every test's
+/// `:history`/`<C-r>` state with whatever command history happens to be
+/// sitting in the developer machine's real config directory.
 pub fn engine_with(text: &str) -> Engine {
     // Suppress all disk writes for the lifetime of this test process.
     vimcode_core::core::session::suppress_disk_saves();
+    // Suppress opted-in disk loads (currently just history.json) for the
+    // lifetime of this test process.
+    vimcode_core::core::session::suppress_disk_loads();
     let mut e = Engine::new();
     e.settings = vimcode_core::Settings::default();
     e.extension_state = vimcode_core::core::session::ExtensionState::default();

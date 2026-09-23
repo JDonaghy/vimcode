@@ -6,6 +6,37 @@ use super::*;
 /// id↔index mapping has a single source of truth (#505).
 pub const SC_BUTTON_IDS: [&str; 4] = ["sc:commit", "sc:push", "sc:pull", "sc:sync"];
 
+// ─── SC panel section indices (#991) ──────────────────────────────────────
+//
+// The SC panel's sections are addressed *positionally* by a long tail of
+// call sites — `sc_flat_len`, `sc_visual_row_to_flat`,
+// `sc_flat_to_section_idx`, `sc_stage_selected`, `sc_activate_row`,
+// `sc_hover_markdown`, `populate_sc_sidebar_system`, the `Tab`
+// expand/collapse handler and `Engine::sc_sections_expanded`. #991 added
+// MERGE CHANGES *above* STAGED (matching VS Code), shifting every one of
+// those by one, so the indices live here as named constants rather than
+// as bare integers scattered across four files.
+//
+// Note these are **absolute** section indices into the `SidebarSystem`'s
+// section list — they do not shift when a section is hidden.
+// `SidebarSystem::set_section_visible` keeps indices stable and simply
+// skips invisible sections when rendering and when cycling focus, which
+// is exactly how the optional WORKTREES section has always worked.
+
+/// Merge Changes — unmerged (conflicted) paths. Only visible when the
+/// working tree actually has a conflict.
+pub const SC_SECTION_MERGE: usize = 0;
+/// Staged Changes — index-side changes.
+pub const SC_SECTION_STAGED: usize = 1;
+/// Changes — working-tree (unstaged + untracked) changes.
+pub const SC_SECTION_CHANGES: usize = 2;
+/// Worktrees — only visible when there are linked worktrees.
+pub const SC_SECTION_WORKTREES: usize = 3;
+/// Recent Commits.
+pub const SC_SECTION_LOG: usize = 4;
+/// Number of SC panel sections (the width of `Engine::sc_sections_expanded`).
+pub const SC_SECTION_COUNT: usize = 5;
+
 pub enum ScKeyResult {
     Consumed,
     Unfocused,
@@ -89,62 +120,139 @@ impl Engine {
         }
     }
 
+    /// Files shown in SC section `section`, in panel order.
+    ///
+    /// The three file sections partition `sc_file_statuses` cleanly:
+    /// a conflicted path always carries `staged == unstaged == None`
+    /// (see [`git::FileStatus::unmerged`]), so it appears in Merge
+    /// Changes and nowhere else (#991).
+    pub fn sc_section_files(&self, section: usize) -> Vec<git::FileStatus> {
+        self.sc_file_statuses
+            .iter()
+            .filter(|f| match section {
+                SC_SECTION_MERGE => f.is_unmerged(),
+                SC_SECTION_STAGED => f.staged.is_some(),
+                SC_SECTION_CHANGES => f.unstaged.is_some(),
+                _ => false,
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// Number of files in SC section `section`.
+    pub fn sc_section_file_count(&self, section: usize) -> usize {
+        self.sc_file_statuses
+            .iter()
+            .filter(|f| match section {
+                SC_SECTION_MERGE => f.is_unmerged(),
+                SC_SECTION_STAGED => f.staged.is_some(),
+                SC_SECTION_CHANGES => f.unstaged.is_some(),
+                _ => false,
+            })
+            .count()
+    }
+
+    /// True when the working tree has at least one merge conflict — the
+    /// condition that makes the Merge Changes section visible (#991). A
+    /// conflict-free repo therefore still renders exactly two file
+    /// sections, matching VS Code.
+    pub fn sc_has_conflicts(&self) -> bool {
+        self.sc_file_statuses.iter().any(|f| f.is_unmerged())
+    }
+
     /// Stage or unstage the currently selected SC item.
     /// If the cursor is on a section header (idx == usize::MAX):
     ///   - STAGED header → unstage all
     ///   - CHANGES header → stage all
+    ///   - MERGE CHANGES header → nothing (see below)
+    ///
+    /// #991 — **staging a conflicted file from the panel**: `git add` on a
+    /// conflicted path is exactly how git marks the conflict resolved, so
+    /// this stays allowed, but only as a *deliberate* per-file action taken
+    /// from the Merge Changes section (and it reports "Marked resolved: …"
+    /// so the user knows that is what happened). The header-level bulk
+    /// "stage all" is deliberately **not** wired up for Merge Changes:
+    /// before this fix conflicted files were mislabelled into the ordinary
+    /// staged/unstaged sections and a bulk stage silently marked every
+    /// conflict resolved with the markers still in the files.
     pub fn sc_stage_selected(&mut self) {
         let (section, idx) = self.sc_selected_from_sidebar_system();
         // Section header: bulk operation
         if idx == usize::MAX {
-            if section == 0 {
-                self.sc_unstage_all();
-            } else if section == 1 {
-                self.sc_stage_all();
+            match section {
+                SC_SECTION_STAGED => self.sc_unstage_all(),
+                SC_SECTION_CHANGES => self.sc_stage_all(),
+                SC_SECTION_MERGE => {
+                    self.message = "Merge Changes: stage a conflicted file individually to \
+                                    mark it resolved"
+                        .to_string();
+                }
+                _ => {}
             }
             return;
         }
         // Use git repo root so paths from `git status` (relative to git root) work
         // correctly even when cwd is a sub-directory.
         let dir = git::find_repo_root(&self.cwd).unwrap_or_else(|| self.cwd.clone());
-        if section == 0 {
-            // Staged section: unstage the selected file
-            let staged: Vec<git::FileStatus> = self
-                .sc_file_statuses
-                .iter()
-                .filter(|f| f.staged.is_some())
-                .cloned()
-                .collect();
-            if let Some(f) = staged.get(idx) {
-                let path = f.path.clone();
-                match git::unstage_path(&dir, &path) {
-                    Ok(()) => {}
-                    Err(e) => self.message = format!("unstage: {e}"),
+        let files = self.sc_section_files(section);
+        match section {
+            SC_SECTION_STAGED => {
+                // Staged section: unstage the selected file
+                if let Some(f) = files.get(idx) {
+                    let path = f.path.clone();
+                    match git::unstage_path(&dir, &path) {
+                        Ok(()) => {}
+                        Err(e) => self.message = format!("unstage: {e}"),
+                    }
                 }
             }
-        } else if section == 1 {
-            // Unstaged/untracked section: stage the selected file
-            let unstaged: Vec<git::FileStatus> = self
-                .sc_file_statuses
-                .iter()
-                .filter(|f| f.unstaged.is_some())
-                .cloned()
-                .collect();
-            if let Some(f) = unstaged.get(idx) {
-                let path = f.path.clone();
-                match git::stage_path(&dir, &path) {
-                    Ok(()) => {}
-                    Err(e) => self.message = format!("stage: {e}"),
+            SC_SECTION_CHANGES => {
+                // Unstaged/untracked section: stage the selected file
+                if let Some(f) = files.get(idx) {
+                    let path = f.path.clone();
+                    match git::stage_path(&dir, &path) {
+                        Ok(()) => {}
+                        Err(e) => self.message = format!("stage: {e}"),
+                    }
                 }
             }
+            SC_SECTION_MERGE => {
+                // Conflicted file: `git add` marks it resolved. Deliberate
+                // and explicitly reported — see this function's doc.
+                if let Some(f) = files.get(idx) {
+                    let path = f.path.clone();
+                    match git::stage_path(&dir, &path) {
+                        Ok(()) => self.message = format!("Marked resolved: {path}"),
+                        Err(e) => self.message = format!("resolve: {e}"),
+                    }
+                }
+            }
+            _ => {}
         }
         self.sc_refresh();
     }
 
     /// Stage all unstaged/untracked files.
+    ///
+    /// #991: this used to run `git add .`, which sweeps conflicted paths
+    /// in as well — and `git add` on a conflicted path marks it resolved,
+    /// so "stage all" silently resolved every conflict with the markers
+    /// still in the files. It now stages an explicit list of the
+    /// non-conflicted working-tree changes instead.
     pub fn sc_stage_all(&mut self) {
         let dir = git::find_repo_root(&self.cwd).unwrap_or_else(|| self.cwd.clone());
-        if let Err(e) = git::stage_path(&dir, ".") {
+        let paths: Vec<String> = self
+            .sc_file_statuses
+            .iter()
+            .filter(|f| f.unstaged.is_some() && !f.is_unmerged())
+            .map(|f| f.path.clone())
+            .collect();
+        if paths.is_empty() {
+            if self.sc_has_conflicts() {
+                self.message =
+                    "Nothing to stage — resolve the conflicts in Merge Changes first".to_string();
+            }
+        } else if let Err(e) = git::stage_paths(&dir, &paths) {
             self.message = format!("stage all: {e}");
         }
         self.sc_refresh();
@@ -158,9 +266,23 @@ impl Engine {
     }
 
     /// Discard all unstaged working-tree changes (called after dialog confirmation).
+    ///
+    /// #991: like [`sc_stage_all`](Self::sc_stage_all), this used to run a
+    /// path-spec-wide `git restore .`, which would blow away the
+    /// half-merged content of conflicted files along with the ordinary
+    /// changes. Conflicted paths are now excluded — resolving a conflict
+    /// is an explicit, per-file action from the Merge Changes section.
     pub fn sc_discard_all_unstaged(&mut self) {
         let dir = git::find_repo_root(&self.cwd).unwrap_or_else(|| self.cwd.clone());
-        let _ = git::discard_all(&dir);
+        let paths: Vec<String> = self
+            .sc_file_statuses
+            .iter()
+            .filter(|f| {
+                !f.is_unmerged() && matches!(f.unstaged, Some(k) if k != git::StatusKind::Untracked)
+            })
+            .map(|f| f.path.clone())
+            .collect();
+        let _ = git::discard_paths(&dir, &paths);
         // #189: reload any open buffer whose file just got discarded on
         // disk. Without this the editor keeps showing the pre-discard
         // rope contents + stale `git_diff` hunks, so the diff-peek
@@ -429,7 +551,7 @@ impl Engine {
                 if ctrl {
                     // Ctrl+V paste from system clipboard.
                     if unicode == Some('v') || unicode == Some('V') || key == "v" {
-                        if let Some(text) = Self::clipboard_paste() {
+                        if let Some(text) = self.clipboard_read.as_ref().and_then(|cb| cb().ok()) {
                             self.sc_commit_message
                                 .insert_str(self.sc_commit_cursor, &text);
                             self.sc_commit_cursor += text.len();
@@ -453,54 +575,6 @@ impl Engine {
                 } else {
                     false
                 }
-            }
-        }
-    }
-
-    /// Try to paste from the system clipboard. Returns None on failure.
-    pub fn clipboard_paste() -> Option<String> {
-        #[cfg(test)]
-        {
-            None
-        }
-        #[cfg(not(test))]
-        {
-            use std::process::Command;
-            #[cfg(target_os = "windows")]
-            {
-                use std::os::windows::process::CommandExt;
-                if let Ok(out) = Command::new("powershell")
-                    .args(["-NoProfile", "-Command", "Get-Clipboard"])
-                    .creation_flags(0x08000000) // CREATE_NO_WINDOW
-                    .output()
-                {
-                    if out.status.success() {
-                        let text = String::from_utf8_lossy(&out.stdout)
-                            .trim_end_matches("\r\n")
-                            .to_string();
-                        if !text.is_empty() {
-                            return Some(text);
-                        }
-                    }
-                }
-                None
-            }
-            #[cfg(not(target_os = "windows"))]
-            {
-                // Try xclip first, then xsel, then wl-paste (Wayland), then pbpaste (macOS).
-                for cmd in &[
-                    &["xclip", "-selection", "clipboard", "-o"][..],
-                    &["xsel", "--clipboard", "--output"][..],
-                    &["wl-paste", "--no-newline"][..],
-                    &["pbpaste"][..],
-                ] {
-                    if let Ok(out) = Command::new(cmd[0]).args(&cmd[1..]).output() {
-                        if out.status.success() {
-                            return Some(String::from_utf8_lossy(&out.stdout).into_owned());
-                        }
-                    }
-                }
-                None
             }
         }
     }
@@ -633,15 +707,12 @@ impl Engine {
     /// Show a confirmation dialog before discarding changes for the selected file.
     pub fn sc_confirm_discard_selected(&mut self) {
         let (section, idx) = self.sc_selected_from_sidebar_system();
-        if section != 1 || idx == usize::MAX {
+        // Only the Changes section: discarding a *conflicted* file is not
+        // offered here (#991) — it would throw away the merge in progress.
+        if section != SC_SECTION_CHANGES || idx == usize::MAX {
             return;
         }
-        let unstaged: Vec<git::FileStatus> = self
-            .sc_file_statuses
-            .iter()
-            .filter(|f| f.unstaged.is_some())
-            .cloned()
-            .collect();
+        let unstaged = self.sc_section_files(SC_SECTION_CHANGES);
         if let Some(f) = unstaged.get(idx) {
             let name = f.path.rsplit('/').next().unwrap_or(&f.path);
             self.pending_sc_discard = Some(f.path.clone());
@@ -757,7 +828,7 @@ impl Engine {
                 let (section, idx) = self.sc_flat_to_section_idx(self.sc_selected);
                 if idx == usize::MAX {
                     // On a section header: toggle expand/collapse.
-                    if section < 4 {
+                    if section < SC_SECTION_COUNT {
                         self.sc_sections_expanded[section] = !self.sc_sections_expanded[section];
                     }
                 } else {
@@ -768,10 +839,10 @@ impl Engine {
             }
             "Return" | "Enter" => {
                 let (section, idx) = self.sc_flat_to_section_idx(self.sc_selected);
-                if section == 2 {
+                if section == SC_SECTION_WORKTREES {
                     // Worktree: switch and keep panel focus.
                     self.sc_switch_worktree(idx);
-                } else if section == 3 && idx != usize::MAX {
+                } else if section == SC_SECTION_LOG && idx != usize::MAX {
                     // Log entry: show the commit hash + message in the status bar.
                     if let Some(entry) = self.sc_log.get(idx) {
                         self.message = format!("{} {}", entry.hash, entry.message);
@@ -780,36 +851,7 @@ impl Engine {
                     // File row: open in editor, keep SC panel focus so the user
                     // can continue navigating / staging without re-clicking.
                     // (Press q / Escape to return focus to the editor.)
-                    let statuses = self.sc_file_statuses.clone();
-                    let all_files: Vec<&git::FileStatus> = if section == 0 {
-                        statuses.iter().filter(|f| f.staged.is_some()).collect()
-                    } else {
-                        statuses.iter().filter(|f| f.unstaged.is_some()).collect()
-                    };
-                    if let Some(f) = all_files.get(idx) {
-                        // Use the git repo root to resolve the path so that
-                        // git-relative paths work even when cwd is a sub-dir.
-                        let git_root =
-                            git::find_repo_root(&self.cwd).unwrap_or_else(|| self.cwd.clone());
-                        let path = git_root.join(&f.path);
-                        if !path.exists() {
-                            self.message = format!("SC: file not found: {}", path.display());
-                        } else {
-                            // For files with a HEAD version, open diff split.
-                            // For untracked/new files, open normally.
-                            let is_new = matches!(f.unstaged, Some(git::StatusKind::Untracked))
-                                || matches!(f.staged, Some(git::StatusKind::Added));
-                            let has_head = !is_new
-                                && git::show_file_at_ref(&git_root, "HEAD", &f.path).is_some();
-                            if has_head {
-                                self.cmd_git_diff_split(&path);
-                            } else {
-                                let _ = self
-                                    .open_file_with_mode(&path, crate::core::OpenMode::Permanent);
-                            }
-                            self.sc_set_focus(false);
-                        }
-                    }
+                    self.sc_open_section_file(section, idx);
                 }
                 // Header rows (idx == usize::MAX): no action for Enter.
                 true
@@ -979,40 +1021,55 @@ impl Engine {
         true
     }
 
-    /// Number of visible flat rows across all sections.
-    /// The WORKTREES section is only counted when there are linked worktrees
-    /// (i.e. `sc_worktrees.len() > 1` — the main worktree is always present).
-    pub fn sc_flat_len(&self) -> usize {
-        let staged_count = self
-            .sc_file_statuses
-            .iter()
-            .filter(|f| f.staged.is_some())
-            .count();
-        let unstaged_count = self
-            .sc_file_statuses
-            .iter()
-            .filter(|f| f.unstaged.is_some())
-            .count();
-        let show_worktrees = self.sc_worktrees.len() > 1;
-        // 2–3 section headers (staged + unstaged + optional worktrees) + 1 log header
-        let base = if show_worktrees { 4 } else { 3 };
-        base + if self.sc_sections_expanded[0] {
-            staged_count
-        } else {
-            0
-        } + if self.sc_sections_expanded[1] {
-            unstaged_count
-        } else {
-            0
-        } + if show_worktrees && self.sc_sections_expanded[2] {
-            self.sc_worktrees.len()
-        } else {
-            0
-        } + if self.sc_sections_expanded[3] {
-            self.sc_log.len()
-        } else {
-            0
+    /// The SC panel's sections **in painted order**, as `(section_index,
+    /// item_count)` pairs, with hidden sections omitted.
+    ///
+    /// Two sections are conditional: MERGE CHANGES appears only when the
+    /// working tree actually has a conflict, and WORKTREES only when there
+    /// are linked worktrees (`sc_worktrees.len() > 1` — the main worktree
+    /// is always present). The returned indices are the absolute
+    /// `SC_SECTION_*` values, which do **not** shift when a section is
+    /// hidden — the same contract `SidebarSystem::set_section_visible`
+    /// keeps on the rendering side.
+    ///
+    /// #991: this is the single source of truth for [`Self::sc_flat_len`],
+    /// [`Self::sc_visual_row_to_flat`] and
+    /// [`Self::sc_flat_to_section_idx`]. Those three used to walk the
+    /// section list by hand, which is exactly how inserting a section
+    /// above all the others ships an off-by-one.
+    pub fn sc_visible_sections(&self) -> Vec<(usize, usize)> {
+        let mut out: Vec<(usize, usize)> = Vec::with_capacity(SC_SECTION_COUNT);
+        let merge_count = self.sc_section_file_count(SC_SECTION_MERGE);
+        if merge_count > 0 {
+            out.push((SC_SECTION_MERGE, merge_count));
         }
+        out.push((
+            SC_SECTION_STAGED,
+            self.sc_section_file_count(SC_SECTION_STAGED),
+        ));
+        out.push((
+            SC_SECTION_CHANGES,
+            self.sc_section_file_count(SC_SECTION_CHANGES),
+        ));
+        if self.sc_worktrees.len() > 1 {
+            out.push((SC_SECTION_WORKTREES, self.sc_worktrees.len()));
+        }
+        out.push((SC_SECTION_LOG, self.sc_log.len()));
+        out
+    }
+
+    /// Number of visible flat rows across all sections.
+    pub fn sc_flat_len(&self) -> usize {
+        self.sc_visible_sections()
+            .iter()
+            .map(|&(section, count)| {
+                1 + if self.sc_sections_expanded[section] {
+                    count
+                } else {
+                    0
+                }
+            })
+            .sum()
     }
 
     /// Map a visual row index (0=panel header, 1=commit input, 2+=sections)
@@ -1031,30 +1088,10 @@ impl Engine {
             // Rows 0 (header), 1 (commit input), 2 (button row) are not selectable.
             return None;
         }
-        let staged_count = self
-            .sc_file_statuses
-            .iter()
-            .filter(|f| f.staged.is_some())
-            .count();
-        let unstaged_count = self
-            .sc_file_statuses
-            .iter()
-            .filter(|f| f.unstaged.is_some())
-            .count();
-        let wt_count = self.sc_worktrees.len();
-        // Only show the WORKTREES section when there are linked worktrees.
-        let three_counts = [staged_count, unstaged_count, wt_count];
-        let two_counts = [staged_count, unstaged_count];
-        let counts: &[usize] = if wt_count > 1 {
-            &three_counts
-        } else {
-            &two_counts
-        };
-
         let mut row = 3usize; // sections start after header + commit + button rows
         let mut flat = 0usize;
 
-        for (sec, &count) in counts.iter().enumerate() {
+        for (section, count) in self.sc_visible_sections() {
             // Section header row
             if row == visual_row {
                 return Some((flat, true));
@@ -1062,7 +1099,7 @@ impl Engine {
             row += 1;
             flat += 1;
 
-            if self.sc_sections_expanded[sec] {
+            if self.sc_sections_expanded[section] {
                 if count == 0 && empty_section_hint {
                     // TUI renders a "(no changes)" hint row; skip it without
                     // advancing the flat index.
@@ -1078,93 +1115,30 @@ impl Engine {
                 }
             }
         }
-        // Log section (always present, section index 3)
-        let log_count = self.sc_log.len();
-        if row == visual_row {
-            return Some((flat, true)); // log header
-        }
-        row += 1;
-        flat += 1;
-        if self.sc_sections_expanded[3] {
-            if log_count == 0 && empty_section_hint {
-                row += 1;
-            } else {
-                for _ in 0..log_count {
-                    if row == visual_row {
-                        return Some((flat, false));
-                    }
-                    row += 1;
-                    flat += 1;
-                }
-            }
-        }
-        let _ = row; // used for loop tracking only
         None
     }
 
     /// Map a flat index to (section_idx, item_idx_within_section).
-    /// Sections: 0=staged, 1=unstaged, 2=worktrees (optional), 3=log.
+    /// `section_idx` is one of the `SC_SECTION_*` constants
+    /// (0=merge, 1=staged, 2=changes, 3=worktrees, 4=log).
     /// Header rows are represented as item_idx = usize::MAX.
     pub fn sc_flat_to_section_idx(&self, flat: usize) -> (usize, usize) {
-        let staged_count = self
-            .sc_file_statuses
-            .iter()
-            .filter(|f| f.staged.is_some())
-            .count();
-        let unstaged_count = self
-            .sc_file_statuses
-            .iter()
-            .filter(|f| f.unstaged.is_some())
-            .count();
-        let wt_count = self.sc_worktrees.len();
-        let show_worktrees = wt_count > 1;
-
         let mut pos = 0usize;
-        // Staged section header
-        if flat == pos {
-            return (0, usize::MAX);
-        }
-        pos += 1;
-        if self.sc_sections_expanded[0] {
-            if flat < pos + staged_count {
-                return (0, flat - pos);
-            }
-            pos += staged_count;
-        }
-        // Unstaged section header
-        if flat == pos {
-            return (1, usize::MAX);
-        }
-        pos += 1;
-        if self.sc_sections_expanded[1] {
-            if flat < pos + unstaged_count {
-                return (1, flat - pos);
-            }
-            pos += unstaged_count;
-        }
-        // Worktrees section (only when there are linked worktrees)
-        if show_worktrees {
+        let mut last = SC_SECTION_LOG;
+        for (section, count) in self.sc_visible_sections() {
+            last = section;
             if flat == pos {
-                return (2, usize::MAX);
+                return (section, usize::MAX);
             }
             pos += 1;
-            if self.sc_sections_expanded[2] {
-                if flat < pos + wt_count {
-                    return (2, flat - pos);
+            if self.sc_sections_expanded[section] {
+                if flat < pos + count {
+                    return (section, flat - pos);
                 }
-                pos += wt_count;
+                pos += count;
             }
         }
-        // Log section (always present)
-        let log_count = self.sc_log.len();
-        if flat == pos {
-            return (3, usize::MAX);
-        }
-        pos += 1;
-        if self.sc_sections_expanded[3] && flat < pos + log_count {
-            return (3, flat - pos);
-        }
-        (3, usize::MAX) // fallback
+        (last, usize::MAX) // fallback: past the end → last section's header
     }
 
     // ─── SidebarSystem integration ───────────────────────────────────
@@ -1221,12 +1195,14 @@ impl Engine {
     }
 
     /// Read the active section index and selected item index from the
-    /// SidebarSystem. Returns `(section, item_idx)` where section is
-    /// 0=staged, 1=changes, 2=worktrees, 3=log. Returns `(0, usize::MAX)`
-    /// if nothing is selected.
+    /// SidebarSystem. Returns `(section, item_idx)` where section is one of
+    /// the `SC_SECTION_*` constants (0=merge, 1=staged, 2=changes,
+    /// 3=worktrees, 4=log). Returns `(SC_SECTION_STAGED, usize::MAX)` if
+    /// nothing is selected — Merge Changes is never the implicit default,
+    /// since its actions resolve conflicts (#991).
     pub fn sc_selected_from_sidebar_system(&self) -> (usize, usize) {
         let sidebar = self.sc_sidebar_system.borrow();
-        let section = sidebar.active_section().unwrap_or(0);
+        let section = sidebar.active_section().unwrap_or(SC_SECTION_STAGED);
         let idx = sidebar
             .selected_path(section)
             .and_then(|p| p.first().copied())
@@ -1257,12 +1233,17 @@ impl Engine {
                 true
             }
             quadraui::SidebarEvent::RowSelected { .. } => true,
-            quadraui::SidebarEvent::HeaderActivated { section } => {
-                let mut sys = self.sc_sidebar_system.borrow_mut();
-                let collapsed = sys.is_collapsed(section);
-                sys.set_collapsed(section, !collapsed);
-                true
-            }
+            // #971: `SidebarSystem::click` already flips `collapsed[section]`
+            // itself before returning this event (when `allow_collapse` is
+            // set, which `Engine::new`'s `sc_sidebar_system` does) —
+            // `HeaderActivated` is a *notification*, not an instruction to
+            // toggle again. Re-toggling here canceled the click's own
+            // toggle out on every press, so a header click looked like it
+            // took focus (the active-section chevron moved) but never
+            // actually collapsed/expanded anything — caught by
+            // `src/macos/mod.rs`'s `sc_panel_header_click_hit_band_matches_the_painted_row`
+            // sanity check, added alongside this fix.
+            quadraui::SidebarEvent::HeaderActivated { .. } => true,
             quadraui::SidebarEvent::Ignored => false,
             _ => true,
         }
@@ -1276,42 +1257,52 @@ impl Engine {
             return;
         }
         match section {
-            2 => self.sc_switch_worktree(idx),
-            3 => {
+            SC_SECTION_WORKTREES => self.sc_switch_worktree(idx),
+            SC_SECTION_LOG => {
                 if let Some(entry) = self.sc_log.get(idx) {
                     self.message = format!("{} {}", entry.hash, entry.message);
                 }
             }
-            0 | 1 => {
-                let statuses = self.sc_file_statuses.clone();
-                let files: Vec<&git::FileStatus> = if section == 0 {
-                    statuses.iter().filter(|f| f.staged.is_some()).collect()
-                } else {
-                    statuses.iter().filter(|f| f.unstaged.is_some()).collect()
-                };
-                if let Some(f) = files.get(idx) {
-                    let git_root =
-                        git::find_repo_root(&self.cwd).unwrap_or_else(|| self.cwd.clone());
-                    let path = git_root.join(&f.path);
-                    if !path.exists() {
-                        self.message = format!("SC: file not found: {}", path.display());
-                    } else {
-                        let is_new = matches!(f.unstaged, Some(git::StatusKind::Untracked))
-                            || matches!(f.staged, Some(git::StatusKind::Added));
-                        let has_head =
-                            !is_new && git::show_file_at_ref(&git_root, "HEAD", &f.path).is_some();
-                        if has_head {
-                            self.cmd_git_diff_split(&path);
-                        } else {
-                            let _ =
-                                self.open_file_with_mode(&path, crate::core::OpenMode::Permanent);
-                        }
-                        self.sc_set_focus(false);
-                    }
-                }
+            SC_SECTION_MERGE | SC_SECTION_STAGED | SC_SECTION_CHANGES => {
+                self.sc_open_section_file(section, idx)
             }
             _ => {}
         }
+    }
+
+    /// Open file `idx` of SC file section `section` in the editor: a diff
+    /// split when the file has a HEAD version, a plain open otherwise.
+    ///
+    /// Shared by `handle_sc_key`'s Enter arm and [`Self::sc_activate_row`]
+    /// so the two cannot drift. Conflicted files (Merge Changes) always
+    /// take the plain-open path — the useful view of a conflict is the
+    /// working-tree file *with* its conflict markers, not a diff of it
+    /// against HEAD (#991).
+    fn sc_open_section_file(&mut self, section: usize, idx: usize) {
+        let files = self.sc_section_files(section);
+        let Some(f) = files.get(idx) else {
+            return;
+        };
+        // Use the git repo root to resolve the path so that git-relative
+        // paths work even when cwd is a sub-dir.
+        let git_root = git::find_repo_root(&self.cwd).unwrap_or_else(|| self.cwd.clone());
+        let path = git_root.join(&f.path);
+        if !path.exists() {
+            self.message = format!("SC: file not found: {}", path.display());
+            return;
+        }
+        // For files with a HEAD version, open diff split. For
+        // untracked/new/conflicted files, open normally.
+        let is_new = f.is_unmerged()
+            || matches!(f.unstaged, Some(git::StatusKind::Untracked))
+            || matches!(f.staged, Some(git::StatusKind::Added));
+        let has_head = !is_new && git::show_file_at_ref(&git_root, "HEAD", &f.path).is_some();
+        if has_head {
+            self.cmd_git_diff_split(&path);
+        } else {
+            let _ = self.open_file_with_mode(&path, crate::core::OpenMode::Permanent);
+        }
+        self.sc_set_focus(false);
     }
 
     /// Handle domain-specific action keys (stage, discard, commit, etc.)
@@ -1435,7 +1426,10 @@ impl Engine {
             "Page_Up" => Some(Key::Named(NamedKey::PageUp)),
             "Page_Down" => Some(Key::Named(NamedKey::PageDown)),
             "Tab" => Some(Key::Named(NamedKey::Tab)),
-            "BackTab" => Some(Key::Named(NamedKey::BackTab)),
+            // "ISO_Left_Tab" is TUI's (and, since #1060, GTK's own)
+            // `render::engine_key_from_ui` spelling for Shift+Tab;
+            // "BackTab" is kept for any caller still on the pre-#1060 name.
+            "BackTab" | "ISO_Left_Tab" => Some(Key::Named(NamedKey::BackTab)),
             _ => None,
         };
         if let Some(k) = nav_key {

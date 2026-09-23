@@ -1,46 +1,7 @@
 use super::*;
 
+use crate::click;
 use crate::core::engine::TabBarClickTarget;
-
-/// Compute the `grab_offset` to seed [`quadraui::DragTarget::ScrollbarY`]
-/// at click-down time so the thumb doesn't jump out from under the cursor.
-///
-/// Mirrors the thumb math `dispatch_mouse_drag` uses: if `cursor_y` lands
-/// inside the visible thumb (between `thumb_top` and `thumb_top + thumb_length`),
-/// returns the cursor's offset from the thumb top — the cursor stays at
-/// the same relative spot on the thumb during the drag.
-///
-/// If `cursor_y` is on the track outside the thumb (or above/below the
-/// track entirely), returns `0.0` — the standard "click track to jump"
-/// behavior where the thumb hops to put its top at the cursor.
-fn scrollbar_grab_offset(
-    cursor_y: f32,
-    track_start: f32,
-    track_length: f32,
-    visible_rows: usize,
-    total_items: usize,
-    current_scroll: usize,
-) -> f32 {
-    if track_length <= 0.0 || total_items == 0 {
-        return 0.0;
-    }
-    let thumb_ratio = (visible_rows as f32 / total_items as f32).min(1.0);
-    let thumb_length = (track_length * thumb_ratio).max(1.0);
-    let max_scroll = total_items.saturating_sub(visible_rows);
-    let effective_track = (track_length - thumb_length).max(1.0);
-    let scroll_ratio = if max_scroll == 0 {
-        0.0
-    } else {
-        (current_scroll as f32 / max_scroll as f32).clamp(0.0, 1.0)
-    };
-    let thumb_top = track_start + scroll_ratio * effective_track;
-    let dy = cursor_y - thumb_top;
-    if dy >= 0.0 && dy < thumb_length {
-        dy
-    } else {
-        0.0
-    }
-}
 
 /// Run [`quadraui::dispatch_mouse_drag`] for an active drag and apply the
 /// resulting `ScrollOffsetChanged` events to the matching scroll-state
@@ -104,7 +65,6 @@ fn text_drag_origin_window(region: &quadraui::WidgetId) -> Option<crate::core::W
 struct SidebarBodyDragGeometry {
     ab_width: u16,
     sidebar_width: u16,
-    term_height: u16,
     menu_rows: u16,
     sb_visible: bool,
 }
@@ -168,22 +128,12 @@ fn apply_tui_sidebar_body_drag(
     if engine.active_panel_is(PANEL_SEARCH) {
         engine.handle_search_sidebar_ui_event(move_ev);
     } else if engine.active_panel_is(PANEL_SETTINGS) {
-        let content_start = 2_u16;
-        let content_height = geo.term_height.saturating_sub(4);
-        let q_rect = quadraui::Rect::new(
-            geo.ab_width as f32,
-            content_start as f32,
-            geo.sidebar_width as f32,
-            content_height as f32,
-        );
-        render::populate_settings_form_controller(engine);
-        let result = engine
-            .settings_form_controller
-            .borrow_mut()
-            .handle_cached(&move_ev, q_rect);
-        if !matches!(result, quadraui::FormControllerEvent::Ignored) {
-            engine.settings_scroll_top = engine.settings_form_controller.borrow().scroll_offset();
-        }
+        // #1238: route through the shared router, against the rect
+        // `render_settings_panel` actually painted into last frame
+        // (`engine.settings_form_rect`), not a hand-derived `y = 2` rect
+        // that drifts whenever the sidebar's own origin isn't `y == 0`.
+        let rect = engine.settings_form_rect.get();
+        render::handle_settings_form_ui_event(engine, &move_ev, rect);
     }
 }
 
@@ -238,7 +188,11 @@ fn apply_tui_editor_text_drag(
     // #560: resolve via the shared quadraui text-layout inverse
     // (`EditorLayout::col_at_x`) instead of hand-rolled cell math, so TUI and
     // GTK column resolution can never diverge.
-    let (editor, editor_layout) = render::editor_text_layout(rw, 1.0, 1.0);
+    // #1040: `tui_editor_text_layout`, not `editor_text_layout` — the
+    // latter lays out against `rw.rect` verbatim, which is fractional for
+    // a group's non-origin pane and was never what TUI's paint path
+    // actually drew into (see that function's doc for the full mechanism).
+    let (editor, editor_layout) = render::tui_editor_text_layout(rw);
     let col_in_text = editor_layout.col_at_x(&editor, view_row, col as f32);
     engine.mouse_drag(rw.window_id, buf_line, col_in_text);
 }
@@ -273,10 +227,10 @@ pub(super) fn handle_mouse(
     explorer_drag_src: &mut Option<usize>,
     explorer_drag_active: &mut Option<(usize, Option<usize>)>,
     tab_drag: &mut render::TabDragState,
-    hover_link_rects: &[(u16, u16, u16, u16, String)],
-    hover_popup_rect: Option<(u16, u16, u16, u16)>,
-    editor_hover_popup_rect: Option<(u16, u16, u16, u16)>,
-    editor_hover_link_rects: &[(u16, u16, u16, u16, String)],
+    hover_link_rects: &[(quadraui::Rect, String, bool)],
+    hover_popup_rect: Option<quadraui::Rect>,
+    editor_hover_popup_rect: Option<quadraui::Rect>,
+    editor_hover_link_rects: &[(quadraui::Rect, String)],
     editor_hover_scrollbar: Option<crate::render::PopupScrollbarHit>,
     hover_selecting: &mut bool,
     fr_input_dragging: &mut bool,
@@ -315,10 +269,10 @@ pub(super) fn handle_mouse(
     let has_separated = last_layout
         .as_ref()
         .is_some_and(|l| l.separated_status_line.is_some());
-    let bottom_chrome: u16 = if engine.settings.window_status_line {
-        1 // cmd only
-    } else {
+    let bottom_chrome: u16 = if render::global_status_bar_visible(engine) {
         2 // status + cmd
+    } else {
+        1 // cmd only
     };
     // Separated status row between terminal and cmd (when noslat + terminal open).
     let sep_status_rows: u16 = if has_separated { 1 } else { 0 };
@@ -326,13 +280,20 @@ pub(super) fn handle_mouse(
     // Check if the mouse cursor is currently inside or adjacent to the hover
     // popup bounding rect. We include 1 column to the left (the sidebar
     // separator) so the popup doesn't dismiss while the mouse crosses to it.
-    let mouse_on_hover_popup = hover_popup_rect.is_some_and(|(px, py, pw, ph)| {
-        col >= px.saturating_sub(1) && col < px + pw && row >= py && row < py + ph
+    let mouse_on_hover_popup = hover_popup_rect.is_some_and(|r| {
+        (col as f32) >= r.x - 1.0
+            && (col as f32) < r.x + r.width
+            && (row as f32) >= r.y
+            && (row as f32) < r.y + r.height
     });
 
     // Check if mouse is on the editor hover popup (exact bounds).
-    let mouse_on_editor_hover = editor_hover_popup_rect
-        .is_some_and(|(px, py, pw, ph)| col >= px && col < px + pw && row >= py && row < py + ph);
+    let mouse_on_editor_hover = editor_hover_popup_rect.is_some_and(|r| {
+        (col as f32) >= r.x
+            && (col as f32) < r.x + r.width
+            && (row as f32) >= r.y
+            && (row as f32) < r.y + r.height
+    });
 
     // Reconcile the editor hover popup with the modal stack (#216).
     // Push whenever the popup is visible — even unfocused. Right-click
@@ -341,16 +302,8 @@ pub(super) fn handle_mouse(
     {
         let editor_hover_id = quadraui::WidgetId::new("editor_hover");
         match (engine.editor_hover.is_some(), editor_hover_popup_rect) {
-            (true, Some((px, py, pw, ph))) => {
-                modal_stack.push(
-                    editor_hover_id,
-                    quadraui::Rect {
-                        x: px as f32,
-                        y: py as f32,
-                        width: pw as f32,
-                        height: ph as f32,
-                    },
-                );
+            (true, Some(rect)) => {
+                modal_stack.push(editor_hover_id, rect);
             }
             _ => {
                 modal_stack.pop(&editor_hover_id);
@@ -616,19 +569,24 @@ pub(super) fn handle_mouse(
         }
     }
 
-    // ── Hover link click-to-copy ────────────────────────────────────────────────
+    // ── Panel-hover popup link click (#1067) ────────────────────────────────
+    //
+    // Shared with GTK's `App::route_and_apply_panel_hover_popup` via
+    // `render::route_panel_hover_popup_click` +
+    // `render::apply_panel_hover_popup_route` — GTK never wired a click
+    // handler for this popup at all before #1067 (see that function's doc).
+    // "Open vs copy" for a plain link stays the one per-backend step, same
+    // split the editor-hover-popup rung above already uses.
     if !hover_link_rects.is_empty() {
         if let MouseEventKind::Down(MouseButton::Left) = ev.kind {
-            for &(lx, ly, lw, _lh, ref url) in hover_link_rects {
-                if row == ly && col >= lx && col < lx + lw {
-                    if url.starts_with("command:") {
-                        engine.execute_command_uri(url);
-                    } else {
-                        tui_copy_to_clipboard(url, engine);
-                    }
-                    engine.dismiss_panel_hover_now();
-                    return sidebar_width;
-                }
+            let route =
+                render::route_panel_hover_popup_click(hover_link_rects, col as f64, row as f64);
+            let effect = render::apply_panel_hover_popup_route(engine, route);
+            if let Some(url) = effect.open_url {
+                tui_copy_to_clipboard(&url, engine);
+            }
+            if effect.consumed {
+                return sidebar_width;
             }
         }
     }
@@ -850,7 +808,8 @@ pub(super) fn handle_mouse(
                     apply_scrollbar_drag(drag_state, point, engine, sidebar);
                 }
                 render::MouseDragRoute::HoverPopupSelection => {
-                    if let Some((px, py, _pw, _ph)) = editor_hover_popup_rect {
+                    if let Some(rect) = editor_hover_popup_rect {
+                        let (px, py) = (rect.x.round() as u16, rect.y.round() as u16);
                         let scroll = engine
                             .editor_hover
                             .as_ref()
@@ -869,7 +828,6 @@ pub(super) fn handle_mouse(
                         SidebarBodyDragGeometry {
                             ab_width,
                             sidebar_width,
-                            term_height,
                             menu_rows,
                             sb_visible,
                         },
@@ -962,9 +920,14 @@ pub(super) fn handle_mouse(
                         available.saturating_sub(1).clamp(5, max_rows);
                 }
                 render::MouseDragRoute::Minimap => {
-                    if let Some(layout) = last_layout {
-                        render::apply_minimap_click(engine, layout, col as f64, row as f64);
-                    }
+                    // #1187: a real minimap drag now arms a
+                    // `DragTarget::ScrollbarY` on press (above), so a
+                    // following move routes to `ArmedTarget` above, never
+                    // here — re-running `apply_minimap_click` (an absolute
+                    // seek against the strip's own scroll-following window)
+                    // on every move was the crawl bug this issue fixes. See
+                    // `MouseDragRoute::Minimap`'s doc comment for when this
+                    // arm can still be reached at all.
                 }
                 render::MouseDragRoute::TerminalContent => {
                     // #533: shared drag handler — tries forward_mouse(Move)
@@ -1114,28 +1077,16 @@ pub(super) fn handle_mouse(
                 && !ext_panel_showing
                 && engine.active_panel_is(PANEL_SETTINGS)
             {
-                let content_start = 2_u16;
-                let content_height = term_height.saturating_sub(4);
-                let q_rect = quadraui::Rect::new(
-                    ab_width as f32,
-                    content_start as f32,
-                    sidebar_width as f32,
-                    content_height as f32,
-                );
                 let scroll_ev = quadraui::UiEvent::Scroll {
                     widget: None,
                     delta: quadraui::ScrollDelta::new(0.0, if scroll_up { 3.0 } else { -3.0 }),
                     position: quadraui::Point::new(col as f32, row as f32),
                 };
-                render::populate_settings_form_controller(engine);
-                let result = engine
-                    .settings_form_controller
-                    .borrow_mut()
-                    .handle_cached(&scroll_ev, q_rect);
-                if !matches!(result, quadraui::FormControllerEvent::Ignored) {
-                    engine.settings_scroll_top =
-                        engine.settings_form_controller.borrow().scroll_offset();
-                }
+                // #1238: hit-test against the rect actually painted last
+                // frame (`engine.settings_form_rect`), not a hand-derived
+                // `y = 2` rect — see `apply_tui_sidebar_body_drag`'s twin.
+                let rect = engine.settings_form_rect.get();
+                render::handle_settings_form_ui_event(engine, &scroll_ev, rect);
                 return sidebar_width;
             }
             // Terminal panel scroll now routes through dispatch_scroll
@@ -1177,15 +1128,17 @@ pub(super) fn handle_mouse(
                                 engine.handle_debug_output_scroll(delta.y);
                                 return sidebar_width;
                             }
-                            "explorer:sb" => {
-                                let delta = if down {
-                                    step as isize
-                                } else {
-                                    -(step as isize)
-                                };
-                                engine.explorer_scroll(delta);
-                                return sidebar_width;
-                            }
+                            // #1055: an `"explorer:sb"` arm lived here. Dead:
+                            // `render_sidebar_content` only registers the
+                            // `"explorer:sb"` `ScrollSurface` (panels.rs) when
+                            // `!ext_panel_showing && active_panel_is(PANEL_EXPLORER)`
+                            // — the exact condition the early-return block above
+                            // (this function, `PANEL_EXPLORER` arm) already
+                            // handles and returns from first. `dispatch_scroll`
+                            // can only ever emit an id present in
+                            // `engine.scroll_surfaces`, so this arm could never
+                            // run. Confirmed dead by the #1044 audit; deleted
+                            // rather than wired up.
                             "ext_panel:sb" => {
                                 let flat_len = engine.ext_panel_flat_len();
                                 if down {
@@ -1198,10 +1151,19 @@ pub(super) fn handle_mouse(
                                 }
                                 return sidebar_width;
                             }
-                            "tui:search_results" => {
-                                // SidebarSystem handles scroll internally
-                                return sidebar_width;
-                            }
+                            // #1055: a `"tui:search_results"` arm lived here.
+                            // Dead: grepped the tree for
+                            // `WidgetId::new("tui:search_results")` and for any
+                            // `modal_stack.push` of that id — neither exists.
+                            // The only `ScrollSurface`s ever registered are
+                            // `"explorer:sb"`, `"ext_panel:sb"` (panels.rs) and
+                            // `"terminal_scrollback"` (render.rs), so
+                            // `dispatch_scroll` could never hand back this id.
+                            // Search-panel wheel scroll is already handled
+                            // earlier in this function, in the
+                            // `active_panel_is(PANEL_SEARCH)` block that calls
+                            // `engine.handle_search_sidebar_ui_event` and
+                            // returns before this match ever runs.
                             other if other.starts_with("debug_sidebar:") => {
                                 // SidebarSystem handles scroll internally
                                 return sidebar_width;
@@ -1214,41 +1176,58 @@ pub(super) fn handle_mouse(
                                 engine.handle_terminal_scroll(delta.y);
                                 return sidebar_width;
                             }
-                            "tui:editor_viewport" => {
-                                // #550: `find_window_at` compares against
-                                // already-absolute `rw.rect`, so the raw
-                                // event `col`/`row` are used directly.
-                                let target = last_layout.and_then(|layout| {
-                                    render::find_window_at(layout, col as f64, row as f64)
-                                        .map(|idx| &layout.windows[idx])
-                                });
-                                if let Some(rw) = target {
-                                    let dir = if down { 1 } else { -1 };
-                                    engine.scroll_viewport_with_cursor_for_window(
-                                        rw.window_id,
-                                        dir,
-                                        step,
-                                    );
-                                    engine.sync_scroll_binds();
-                                }
-                                return sidebar_width;
-                            }
                             _ => {}
                         }
                     }
                 }
             }
 
-            // Editor viewport scroll is now handled via dispatch_scroll
-            // "tui:editor_viewport" surface above — fallback to active window
-            // for scroll events that don't hit any registered surface.
+            // #825: this used to be a *fallback* below a `"tui:editor_viewport"`
+            // arm in the `dispatch_scroll` match above, for events that missed
+            // every registered surface. That arm was dead code — nothing ever
+            // registers a `"tui:editor_viewport"` `ScrollSurface` or pushes that
+            // id onto the `ModalStack`, so `dispatch_scroll` (which can only
+            // emit an id it was handed one of those two ways) could never
+            // produce it. Deleted rather than wired up as a `ScrollSurface`.
+            //
+            // #1066: product decision was to converge on GTK's
+            // `hovered_window_id` behaviour — scroll the pane *under the
+            // pointer*, not whichever pane holds focus, without moving focus
+            // (standard scroll-follows-pointer, and also `:split`'s own
+            // behaviour in real Vim). Resolved via the same shared primitives
+            // `handle_mouse_scroll_msg` (app.rs) already uses for GTK —
+            // `render::find_window_at` plus
+            // `Engine::scroll_viewport_with_cursor_for_window` — so this is
+            // TUI-side wiring onto existing engine/render infrastructure, not
+            // new per-backend logic.
             if col >= editor_left && row + 2 < term_height {
                 let dir = if matches!(ev.kind, MouseEventKind::ScrollUp) {
                     -1
                 } else {
                     1
                 };
-                engine.scroll_viewport_with_cursor(dir, 3);
+                let active_id = engine.active_window_id();
+                // #550: `rw.rect` is already absolute terminal-screen space.
+                // Query the *center* of the cell (`+ 0.5`), not its top-left
+                // corner: an odd number of rows available to a horizontal
+                // split divides unevenly (e.g. 37 rows -> two 18.5-row
+                // panes), so a pane boundary can land at a half-row
+                // (`rect.y == 20.5`). `find_window_at`'s `y < r.y + r.height`
+                // check is exclusive, so querying the integer row itself
+                // (`20.0`) falls just *outside* the pane that visually owns
+                // that row and matches the pane above it instead — the same
+                // cell-center convention `TuiDriver::find`/`find_bounds`
+                // already use for exactly this reason.
+                let hovered_id = last_layout.and_then(|layout| {
+                    render::find_window_at(layout, col as f64 + 0.5, row as f64 + 0.5)
+                        .map(|idx| layout.windows[idx].window_id)
+                });
+                let target = hovered_id.unwrap_or(active_id);
+                if target == active_id {
+                    engine.scroll_viewport_with_cursor(dir, 3);
+                } else {
+                    engine.scroll_viewport_with_cursor_for_window(target, dir, 3);
+                }
                 engine.sync_scroll_binds();
             }
             return sidebar_width;
@@ -1307,29 +1286,80 @@ pub(super) fn handle_mouse(
             // the sidebar body leaves `active_panel_id` pointing at Explorer,
             // so the old gate handed *its* right-clicks to the file tree too.
             if render::sidebar_owner(engine) == render::SidebarOwner::Explorer {
-                let sidebar_row = row.saturating_sub(menu_rows);
-                let tree_row = sidebar_row as usize + engine.explorer_tree.borrow().scroll_offset();
-                if tree_row < engine.explorer_rows.len() {
-                    engine
-                        .explorer_tree
-                        .borrow_mut()
-                        .set_selected_path(Some(vec![tree_row as u16]));
-                    let path = engine.explorer_rows[tree_row].path.clone();
-                    let is_dir = engine.explorer_rows[tree_row].is_dir;
-                    engine.open_explorer_context_menu(path, is_dir, col, row);
-                } else {
-                    // Empty space below last entry → context menu for root folder
-                    let root = engine.cwd.clone();
-                    engine.open_explorer_context_menu(root, true, col, row);
-                }
+                // #1025: this used to hand-roll `row - menu_rows` row
+                // arithmetic that never subtracted the sidebar header row
+                // `explorer_tree_rect` already accounts for (quadraui's
+                // `AppShellLayout::sidebar_content_bounds` puts `content_y`
+                // one row below the band, for the header) — landing every
+                // right-click exactly one row low versus the left-click arm
+                // below, which already routes through the shared
+                // `render::route_explorer_tree_event` + painted
+                // `explorer_tree_rect`. Routing the right button through the
+                // same function (which dispatches `MouseDown { button:
+                // Right, .. }` to `TreeController::right_click` and resolves
+                // the resulting `ContextMenuRequested` itself, including
+                // calling `open_explorer_context_menu`) makes the two
+                // buttons share one geometry instead of two that can drift
+                // apart again.
+                let rect = engine.explorer_tree_rect.get();
+                let click_ev = quadraui::UiEvent::MouseDown {
+                    widget: None,
+                    button: quadraui::MouseButton::Right,
+                    position: quadraui::Point::new(col as f32, row as f32),
+                    modifiers: quadraui::Modifiers::default(),
+                };
+                let theme = render::Theme::from_name(&engine.settings.colorscheme);
+                let mut tui_backend = super::backend::TuiBackend::default();
+                // #1025 review: intentional, discussed behavior change —
+                // the pre-fix hand-rolled arithmetic this replaced had an
+                // `else` fallback for a miss (added deliberately in
+                // `19eabbe`): right-clicking empty space below the last row
+                // opened a context menu for the root/`cwd` folder. That
+                // fallback does not survive this fix, and it is not being
+                // silently dropped — it's being called out here.
+                //
+                // `TreeController::right_click` (quadraui
+                // `compose/tree_controller.rs`) resolves a
+                // `TreeViewHit::Empty` — the empty-space case — to
+                // `TreeControllerEvent::Consumed`, not
+                // `ContextMenuRequested`, so `route_explorer_tree_event`
+                // has nothing to turn into an `open_explorer_context_menu`
+                // call; the binding below is genuinely `Consumed` (or
+                // `Ignored`, if the click missed `rect` entirely) in that
+                // case, not a return value being thrown away. GTK's
+                // `explorer_ui_event` (`src/app.rs`) already goes through
+                // this same shared function and never had the fallback
+                // either, so dropping it here makes the two backends match
+                // — consistent with this repo's Platform-Neutrality Rule,
+                // which forbids adding TUI-only geometry/logic to restore
+                // it here. Restoring the old UX (if still wanted) belongs
+                // in quadraui itself — e.g. `right_click` returning a
+                // container-level `ContextMenuRequested` for `Empty` — so
+                // both backends would pick it up identically; that has not
+                // been filed as a quadraui issue yet.
+                //
+                // Right-click no longer needs anything back from this call
+                // (unlike the left-click arm below, which still dispatches
+                // `Row`/`Chevron`/scrollbar-drag results itself) — a
+                // `ContextMenuRequested` is fully resolved inside
+                // `route_explorer_tree_event`, and every other variant is a
+                // no-op for a bare right-click.
+                let _tree_event = render::route_explorer_tree_event(
+                    engine,
+                    &click_ev,
+                    rect,
+                    (1.0, 1.0),
+                    &theme,
+                    &mut tui_backend,
+                );
             }
             return sidebar_width;
         }
 
         // Right-click on tab bar → open tab context menu.
         //
-        // #654: hit-test via the cached `hit_regions` (built once by
-        // `render::compute_tab_bar_hit_regions` during
+        // #654: hit-test via the cached `hit_regions` layout (built once by
+        // `render::compute_tab_bar_layout` during
         // `build_screen_layout`) rather than rebuilding the primitive and
         // re-measuring every tab here. Left-click routing (below) and the
         // drag-slot map already read those regions, so all three now share
@@ -1514,8 +1544,10 @@ pub(super) fn handle_mouse(
                 } = zone
                 {
                     // #560: shared quadraui text-layout inverse (see the
-                    // drag handler above for the full rationale).
-                    let (editor, editor_layout) = render::editor_text_layout(rw, 1.0, 1.0);
+                    // drag handler above for the full rationale). #1040:
+                    // `tui_editor_text_layout`, not `editor_text_layout` —
+                    // see that function's doc.
+                    let (editor, editor_layout) = render::tui_editor_text_layout(rw);
                     let text_col = editor_layout.col_at_x(&editor, view_row, col as f32);
                     engine.editor_hover_mouse_move(buf_line, text_col, mouse_on_editor_hover);
                     found = true;
@@ -1547,14 +1579,11 @@ pub(super) fn handle_mouse(
     // did not: the popup paints on top of the editor, so it must also win the
     // click that lands on it (#229/#486).
     {
-        let popup_links = editor_hover_popup_link_rects(editor_hover_link_rects);
         let route = render::route_editor_hover_popup_click(
             engine.editor_hover.is_some(),
             &render::EditorHoverPopupState {
-                popup: editor_hover_popup_rect.map(|(px, py, pw, ph)| {
-                    quadraui::Rect::new(px as f32, py as f32, pw as f32, ph as f32)
-                }),
-                links: &popup_links,
+                popup: editor_hover_popup_rect,
+                links: editor_hover_link_rects,
                 scrollbar: editor_hover_scrollbar,
                 has_focus: engine.editor_hover_has_focus,
                 // TUI measures in whole cells: the popup's border eats one
@@ -1723,32 +1752,26 @@ pub(super) fn handle_mouse(
         for cev in &click_events {
             match cev {
                 quadraui::UiEvent::ScrollOffsetChanged { widget, new_offset } => {
-                    match widget.as_str() {
-                        "debug_output" => {
-                            engine.debug_output_scroll = *new_offset;
-                            engine.debug_output_auto_scroll = false;
-                            return sidebar_width;
-                        }
-                        "explorer:sb" => {
-                            engine
-                                .explorer_tree
-                                .borrow_mut()
-                                .set_scroll_offset(*new_offset);
-                            return sidebar_width;
-                        }
-                        "ext_panel:sb" => {
-                            engine.ext_panel_scroll_top = *new_offset;
-                            return sidebar_width;
-                        }
-                        "tui:settings" => {
-                            engine.settings_scroll_top = *new_offset;
-                            return sidebar_width;
-                        }
-                        other if other.starts_with("debug_sidebar:") => {
-                            // SidebarSystem handles scrollbar internally
-                            return sidebar_width;
-                        }
-                        _ => {}
+                    // #825: `terminal_scrollback` is deliberately excluded —
+                    // a click on it must `drag_state.begin()` via the
+                    // bottom-panel rung below (a scrollbar drag-begin, not a
+                    // bare offset-set), so it falls through this dispatch and
+                    // is picked up there instead. Every other id is
+                    // `render::apply_scroll_offset`, the same table the drag
+                    // path (#756) and GTK's click table share — the
+                    // hand-rolled copy this replaced knew ids GTK's copy did
+                    // not, and vice versa.
+                    if widget.as_str() != "terminal_scrollback"
+                        && render::apply_scroll_offset(
+                            engine,
+                            widget.as_str(),
+                            *new_offset,
+                            render::ScrollApplyContext {
+                                picker_visible_rows: 0,
+                            },
+                        )
+                    {
+                        return sidebar_width;
                     }
                 }
                 quadraui::UiEvent::MouseDown {
@@ -1826,59 +1849,32 @@ pub(super) fn handle_mouse(
     // Click landed outside the bottom panel — return focus to the editor.
     engine.terminal_has_focus = false;
 
-    // ── Activity bar ──────────────────────────────────────────────────────────
+    // ── Activity bar (swallow only — #1053) ─────────────────────────────────
+    // A genuine single click here never reaches this function in production:
+    // `TuiShellApp::shell_config` registers every activity-bar item
+    // (including the hamburger) as a real `quadraui::PanelDefinition`, so
+    // `ShellAdapter::handle` -> `AppShell::handle_activity_click` consumes
+    // the `MouseDown` into a semantic `AppShellEvent` upstream of
+    // `TuiShellApp::handle` -> `mouse::handle_mouse` (see `shell_app.rs`'s
+    // `driver_click_on_every_activity_bar_icon_opens_its_panel_via_shell_app`,
+    // which proves all 8 `ActivityBarTarget` kinds plus the hamburger
+    // resolve via that path). #1053 deleted the dead target-resolution that
+    // used to live here (`resolve_activity_bar_click` + the
+    // `ActivityBarTarget`/`MenuToggle` dispatch, including a hand-rolled
+    // menu-close) as confirmed-unreachable — see `GOALS.md`'s 2026-09-16
+    // audit (#1044) and `on_shell_event`'s `PanelChanged`/`BottomItemClicked`
+    // arms for the real dispatch.
+    //
+    // This early return itself stays: `AppShell::handle` only intercepts
+    // `UiEvent::MouseDown`, not `DoubleClick` (quadraui's own `_ =>
+    // AppShellEvent::Ignored` catch-all), so a double-click landing in the
+    // activity-bar columns — `handle_mouse_event`'s own doc, "fold
+    // `DoubleClick` back to `MouseDown`" — still reaches this function with
+    // `col < ab_width`. Without a guard here, that click would fall through
+    // into the sidebar-panel-area arm below, which indexes `col` assuming
+    // it already lies in `[ab_width, ab_width + sidebar_width)` and has no
+    // bounds check of its own for the activity-bar columns to its left.
     if col < ab_width {
-        // Activity bar spans full height below the menu bar row (matching GTK layout).
-        if row < menu_rows {
-            return sidebar_width;
-        }
-        let bar_row = row - menu_rows;
-        let bar_height = term_height.saturating_sub(menu_rows);
-        // Resolve click target using shared function
-        let mut ext_names: Vec<_> = engine.ext_panels.keys().cloned().collect();
-        ext_names.sort();
-        let ab_target =
-            crate::core::engine::resolve_activity_bar_click(bar_row, bar_height, &ext_names);
-        use crate::core::engine::{ActivityBarTarget, SidebarPanel};
-        if matches!(ab_target, Some(ActivityBarTarget::MenuToggle)) {
-            engine.toggle_menu_bar();
-            if !engine.menu_bar_visible {
-                // Close the dropdown. MenuSystem::close() needs &mut Backend,
-                // but the mouse handler only has (drag_state, modal_stack).
-                // Pop the modal directly and reset the MenuSystem state by
-                // re-creating it with the same menu definitions.
-                modal_stack.pop(&quadraui::WidgetId::new("menu-system-dropdown"));
-                let menus = crate::render::build_menu_defs(engine.is_vscode_mode());
-                *engine.menu_system.borrow_mut() = quadraui::MenuSystem::new(menus);
-            }
-            return sidebar_width;
-        }
-        // #754: the ext-panel toggle and the built-in panel switch — which used
-        // to be ~50 lines here and a near-copy in GTK's `App::switch_panel` —
-        // are one call to `render::apply_activity_panel_switch`.
-        let target_panel_id = match ab_target {
-            Some(ActivityBarTarget::ExtensionPanel(name)) => Some(format!("ext:{name}")),
-            Some(ActivityBarTarget::Panel(p)) => Some(
-                match p {
-                    SidebarPanel::Explorer => PANEL_EXPLORER,
-                    SidebarPanel::Search => PANEL_SEARCH,
-                    SidebarPanel::Debug => PANEL_DEBUG,
-                    SidebarPanel::Git => PANEL_GIT,
-                    SidebarPanel::Extensions => PANEL_EXTENSIONS,
-                    SidebarPanel::Ai => PANEL_AI,
-                }
-                .to_string(),
-            ),
-            Some(ActivityBarTarget::Settings) => Some(PANEL_SETTINGS.to_string()),
-            _ => None,
-        };
-        if let Some(panel_id) = target_panel_id {
-            let switched = render::apply_activity_panel_switch(engine, &panel_id);
-            sidebar.ext_panel_name = switched.ext_panel;
-            if switched.sidebar_visible {
-                sidebar.has_focus = true;
-            }
-        }
         return sidebar_width;
     }
 
@@ -1896,20 +1892,22 @@ pub(super) fn handle_mouse(
             sidebar.has_focus = true;
             engine.ext_panel_has_focus = true;
 
-            // Account for the search input row when it's visible
-            let input_rows: u16 = if engine.ext_panel_input_active
-                || engine
-                    .ext_panel_active
-                    .as_ref()
-                    .and_then(|n| engine.ext_panel_input_text.get(n))
-                    .map(|t| !t.is_empty())
-                    .unwrap_or(false)
-            {
-                1
-            } else {
-                0
-            };
-            let content_start = 1 + input_rows; // header + optional input
+            // #1089: row resolution goes through `render::
+            // ext_panel_hit_flat_index`/`route_ext_panel_click` — the same
+            // shared router `App::try_route_sidebar_mouse_event`
+            // (GTK/macOS/Win) uses — which reads the `Backend::tree_layout`
+            // `render_ext_panel` cached this frame
+            // (`Engine::ext_panel_tree_layout`) instead of a hand-rolled
+            // `sidebar_row - content_start` formula. That formula never
+            // budgeted for `AppShellLayout`'s own one-row sidebar header
+            // *above* `sidebar_content_bounds` (#1086's own fix) and, more
+            // fundamentally, assumed one uniform row height — wrong the
+            // moment a pixel backend pitches section headers shorter than
+            // item rows (see `ext_panel_tree_layout`'s own doc). Both
+            // out-of-bounds cases (the sidebar header row above the panel,
+            // and this panel's own header/search chrome) resolve to `None`
+            // without a magic `sidebar_row == 0` special case.
+            let click_pos = quadraui::Point::new(col as f32, row as f32);
 
             // Right-click fires panel_context_menu event.
             // #451: accept Up(Right) too (Alacritty/crossterm-0.28 only sends Up).
@@ -1917,11 +1915,8 @@ pub(super) fn handle_mouse(
                 ev.kind,
                 MouseEventKind::Down(MouseButton::Right) | MouseEventKind::Up(MouseButton::Right)
             ) {
-                if sidebar_row >= content_start {
-                    let flat_idx =
-                        engine.ext_panel_scroll_top + (sidebar_row - content_start) as usize;
-                    let flat_len = engine.ext_panel_flat_len();
-                    if flat_idx < flat_len {
+                if let Some(flat_idx) = render::ext_panel_hit_flat_index(engine, click_pos) {
+                    if flat_idx < engine.ext_panel_flat_len() {
                         engine.ext_panel_selected = flat_idx;
                     }
                 }
@@ -1929,28 +1924,9 @@ pub(super) fn handle_mouse(
                 return sidebar_width;
             }
 
-            let flat_len = engine.ext_panel_flat_len();
-
-            if sidebar_row == 0 {
-                // Header — no-op
-            } else if sidebar_row >= content_start {
-                // Map sidebar_row to flat index
-                let flat_idx = engine.ext_panel_scroll_top + (sidebar_row - content_start) as usize;
-                if flat_idx < flat_len {
-                    engine.ext_panel_selected = flat_idx;
-                    // #817: double-click verdict from the backend's
-                    // `DoubleClickDetector`, not a re-derived local timer.
-                    let is_double = is_double_click;
-                    if is_double {
-                        engine.handle_ext_panel_double_click();
-                    } else {
-                        // Single-click toggles sections/expandable items.
-                        // Suppressed on double-click so the second Down doesn't
-                        // un-toggle what the first one just toggled (#484).
-                        engine.handle_ext_panel_key("Return", false, None);
-                    }
-                }
-            }
+            // #817: double-click verdict from the backend's
+            // `DoubleClickDetector`, not a re-derived local timer.
+            render::route_ext_panel_click(engine, click_pos, is_double_click);
         } else if owner == render::SidebarOwner::Explorer {
             sidebar.has_focus = true;
             engine.explorer_has_focus = true;
@@ -2091,66 +2067,52 @@ pub(super) fn handle_mouse(
         } else if owner == render::SidebarOwner::Settings {
             sidebar.has_focus = true;
             engine.settings_has_focus = true;
-            let flat_total = engine.settings_flat_list().len();
 
-            // Route scrollbar clicks through FormController.
-            let sb_col = ab_width + sidebar_width - 1;
-            if col == sb_col && sidebar_row >= 2 {
-                let content_start = 2_u16;
-                let content_height = term_height.saturating_sub(4);
-                let q_rect = quadraui::Rect::new(
-                    ab_width as f32,
-                    content_start as f32,
-                    sidebar_width as f32,
-                    content_height as f32,
-                );
-                let click_ev = quadraui::UiEvent::MouseDown {
-                    button: quadraui::MouseButton::Left,
-                    position: quadraui::Point::new(col as f32, row as f32),
-                    modifiers: Default::default(),
-                    widget: None,
-                };
-                render::populate_settings_form_controller(engine);
-                let result = engine
-                    .settings_form_controller
-                    .borrow_mut()
-                    .handle_cached(&click_ev, q_rect);
-                if !matches!(result, quadraui::FormControllerEvent::Ignored) {
-                    engine.settings_scroll_top =
-                        engine.settings_form_controller.borrow().scroll_offset();
-                }
-            } else if sidebar_row == 0 {
+            if sidebar_row == 0 {
                 // Header — no-op
             } else if sidebar_row == 1 {
                 // Search box — activate search input
                 engine.settings_input_active = true;
             } else {
-                let content_row = sidebar_row.saturating_sub(2) as usize;
-                let fi = engine.settings_scroll_top + content_row;
-                if fi < flat_total {
-                    engine.settings_selected = fi;
-                    // #817: double-click toggles bools / expands categories —
-                    // verdict from the backend's `DoubleClickDetector`.
-                    let is_double = is_double_click;
-                    if is_double {
-                        engine.handle_settings_key("Return", false, None);
+                // #1238: one call through the shared router handles row
+                // selection/toggle/activation *and* the scrollbar column —
+                // GTK's `App::try_route_sidebar_mouse_event` (`app.rs`) does
+                // the same single dispatch. Hit-test against the rect
+                // `render_settings_panel` actually painted into last frame
+                // (`engine.settings_form_rect`), not a hand-derived `y = 2`
+                // rect that drifts whenever the sidebar's own origin isn't
+                // `y == 0` (e.g. the menu bar visible).
+                let position = quadraui::Point::new(col as f32, row as f32);
+                // #817: double-click verdict from the backend's
+                // `DoubleClickDetector`, folded into the same
+                // `UiEvent::DoubleClick` -> activation mapping
+                // `handle_settings_form_ui_event` documents.
+                let click_ev = if is_double_click {
+                    quadraui::UiEvent::DoubleClick {
+                        widget: None,
+                        position,
                     }
-                }
+                } else {
+                    quadraui::UiEvent::MouseDown {
+                        button: quadraui::MouseButton::Left,
+                        position,
+                        modifiers: Default::default(),
+                        widget: None,
+                    }
+                };
+                let rect = engine.settings_form_rect.get();
+                render::handle_settings_form_ui_event(engine, &click_ev, rect);
             }
         }
         return sidebar_width;
     }
 
     // ── Editor area ───────────────────────────────────────────────────────────
+    // #823 item 8: was the same 9-flag clear `Engine::clear_sidebar_focus`
+    // (accessors.rs) already states once, called by GTK's two identical
+    // "clicking the editor clears every sidebar's focus" sites.
     sidebar.has_focus = false;
-    engine.activity_bar_focused = false;
-    engine.explorer_has_focus = false;
-    engine.sc_set_focus(false);
-    engine.dap_sidebar_has_focus = false;
-    engine.ext_sidebar_has_focus = false;
-    engine.ai_has_focus = false;
-    engine.settings_has_focus = false;
-    engine.ext_panel_has_focus = false;
+    engine.clear_sidebar_focus();
     if col < editor_left {
         return sidebar_width; // separator column
     }
@@ -2217,29 +2179,29 @@ pub(super) fn handle_mouse(
                         crate::render::resolve_tab_bar_click(&gtb.hit_regions, local_col)
                     });
                 if let Some(target) = hit_target {
-                    match target {
-                        TabBarClickTarget::Tab(_) => {
-                            let needs_confirm = engine.handle_tab_bar_click(group_id, target);
-                            if needs_confirm {
-                                engine.show_close_tab_confirm();
-                            }
-                            tab_drag.arm(col as f64, row as f64);
-                        }
-                        TabBarClickTarget::CloseTab(_) => {
-                            let needs_confirm = engine.handle_tab_bar_click(group_id, target);
-                            if needs_confirm {
-                                engine.show_close_tab_confirm();
-                            }
-                        }
-                        TabBarClickTarget::ActionMenu => {
-                            engine.active_group = group_id;
+                    // #1059: routed through the same `click::dispatch_tab_bar_target`
+                    // GTK calls (#814) instead of a hand-rolled arm-by-arm copy —
+                    // the shape #752 already flagged as how this file's *other*
+                    // copy (below) silently dropped `lsp_ensure_active_buffer()`.
+                    let is_tab = matches!(target, TabBarClickTarget::Tab(_));
+                    match click::dispatch_tab_bar_target(engine, group_id, Some(target)) {
+                        render::ClickTarget::ActionMenuButton(group_id) => {
                             // #434: pass tab-row height (1.0 row in TUI) so the
                             // engine drives Below placement; replaces the prior
                             // `row + 1` hack.
                             engine.open_editor_action_menu(group_id, col, row, 1.0);
                         }
+                        render::ClickTarget::CloseTab(group_id, idx) => {
+                            let needs_confirm = engine
+                                .handle_tab_bar_click(group_id, TabBarClickTarget::CloseTab(idx));
+                            if needs_confirm {
+                                engine.show_close_tab_confirm();
+                            }
+                        }
                         _ => {
-                            engine.handle_tab_bar_click(group_id, target);
+                            if is_tab {
+                                tab_drag.arm(col as f64, row as f64);
+                            }
                         }
                     }
                     return sidebar_width;
@@ -2310,24 +2272,31 @@ pub(super) fn handle_mouse(
                 // this arm now measures `local_col` against (#735's audit note on
                 // `ScreenLayout::tab_bar_hit_regions` called this arm out as its
                 // last remaining reader).
-                match render::resolve_tab_bar_click(&gtb.hit_regions, local_col) {
-                    Some(TabBarClickTarget::ActionMenu) => {
+                //
+                // #1059: dispatch itself now goes through the shared
+                // `click::dispatch_tab_bar_target` (GTK's rung since #814)
+                // instead of the hand-rolled copy #752's comment above already
+                // called out as the *last* one — this was it.
+                let target = render::resolve_tab_bar_click(&gtb.hit_regions, local_col);
+                let is_tab = matches!(target, Some(TabBarClickTarget::Tab(_)));
+                match click::dispatch_tab_bar_target(engine, group_id, target) {
+                    render::ClickTarget::ActionMenuButton(group_id) => {
                         // Needs screen coordinates, so the engine's own arm is a
                         // deliberate no-op (see `handle_tab_bar_click`). #434:
                         // pass the tab-row height (1.0 row in TUI) so the engine
                         // drives `Below` placement.
-                        engine.active_group = group_id;
                         engine.open_editor_action_menu(group_id, col, row, 1.0);
                     }
-                    Some(target) => {
-                        let is_tab = matches!(target, TabBarClickTarget::Tab(_));
-                        if engine.handle_tab_bar_click(group_id, target) {
+                    render::ClickTarget::CloseTab(group_id, idx) => {
+                        if engine.handle_tab_bar_click(group_id, TabBarClickTarget::CloseTab(idx)) {
                             engine.show_close_tab_confirm();
-                        } else if is_tab {
+                        }
+                    }
+                    _ => {
+                        if is_tab {
                             tab_drag.arm(col as f64, row as f64);
                         }
                     }
-                    None => {}
                 }
                 return sidebar_width;
             }
@@ -2383,9 +2352,10 @@ pub(super) fn handle_mouse(
         }
     }
 
-    // ── Minimap press (#35) ─────────────────────────────────────────────────
+    // ── Minimap press (#35, #1187) ────────────────────────────────────────
     // Pure rect plumbing: hand the press's cell coordinates to the shared
-    // resolver, which owns the hit-test and the scroll.
+    // resolver, which owns the hit-test, the #1093 jump-to-position, and the
+    // drag geometry.
     //
     // Deliberately *after* both divider hit-tests: the strip is carved off
     // the active window's right edge, so in a `:vsplit` it abuts (and would
@@ -2395,10 +2365,40 @@ pub(super) fn handle_mouse(
     // #756: this arm used to match `Down | Drag`, but it sits below the
     // `ev.kind != Down(Left) → return` gate above, so the `Drag` half was
     // unreachable and press-and-hold on a TUI minimap seeked exactly once. The
-    // drag half is now `render::MouseDragRoute::Minimap`, shared with GTK,
-    // which had the arm working all along.
+    // drag half is now `render::MouseDragRoute::Minimap` for as long as
+    // nothing is armed, but #1187 arms a real `DragTarget::ScrollbarY` here on
+    // press (mirroring the v/h-scrollbar rungs below) so a held drag routes
+    // to `MouseDragRoute::ArmedTarget` instead and traverses the whole file
+    // in one gesture rather than re-seeking against the strip's own
+    // scroll-following window every move.
     if let Some(layout) = last_layout {
-        if render::apply_minimap_click(engine, layout, col as f64, row as f64).is_some() {
+        // #1271: Alt held at press time arms the fine-seek virtual track
+        // (`~MINIMAP_LINES_PER_ROW` lines/cell against the painted window)
+        // instead of the default file-wide one (#1187) — see
+        // `render::minimap_press`'s `fine` parameter doc.
+        let fine = ev.modifiers.contains(KeyModifiers::ALT);
+        if let Some(press) = render::minimap_press(engine, layout, col as f64, row as f64, fine) {
+            if press.jump {
+                render::apply_minimap_click(engine, layout, col as f64, row as f64);
+            } else {
+                // #722: a press directly on the highlight band skips
+                // `apply_minimap_click`'s centring (nothing should scroll
+                // yet — that's the whole point of preserving the grab
+                // offset), but a click on a *background* pane's strip must
+                // still focus that pane, exactly like every other click
+                // does. `apply_minimap_click`'s `jump` branch above already
+                // covers this itself.
+                engine.activate_window(press.window_id);
+            }
+            drag_state.begin(quadraui::DragTarget::ScrollbarY {
+                widget: render::minimap_drag_widget(press.window_id),
+                track_start: press.track_start,
+                track_length: press.track_length,
+                thumb_length: press.thumb_length,
+                max_scroll: press.max_scroll,
+                grab_offset: press.grab_offset,
+                inverted: false,
+            });
             return sidebar_width;
         }
     }
@@ -2447,73 +2447,76 @@ pub(super) fn handle_mouse(
                     let track_len =
                         content_height.saturating_sub(if has_h_scrollbar { 1 } else { 0 });
                     let track_visible = track_len as usize;
-                    // Track-click vs thumb-click: page-jump on empty
-                    // track, drag-start on thumb. Standard editor UX —
-                    // clicking the empty track moves by one viewport
-                    // toward the click direction; clicking the thumb
-                    // begins a drag.
-                    let (thumb_start, thumb_len) = quadraui::fit_thumb(
+                    // Quantize the continuous thumb to whole cells so the
+                    // click decision matches what's actually painted — a
+                    // terminal grid has no fractional cell boundaries.
+                    let (thumb_start_f, thumb_len_f) = quadraui::fit_thumb(
                         rw.scroll_top as f32,
                         rw.total_lines as f32,
                         track_visible as f32,
                         track_len as f32,
                         1.0,
                     );
-                    let thumb_top = thumb_start.floor() as u16;
-                    let thumb_size = thumb_len.ceil().max(1.0) as u16;
-                    let cursor_offset = row.saturating_sub(track_abs_start);
-                    if cursor_offset < thumb_top {
-                        let new_scroll = rw.scroll_top.saturating_sub(track_visible);
-                        engine.set_scroll_top_for_window(rw.window_id, new_scroll);
-                        engine.sync_scroll_binds();
-                        return sidebar_width;
-                    } else if cursor_offset >= thumb_top.saturating_add(thumb_size) {
-                        let max_scroll = rw.total_lines.saturating_sub(track_visible);
-                        let new_scroll = (rw.scroll_top + track_visible).min(max_scroll);
-                        engine.set_scroll_top_for_window(rw.window_id, new_scroll);
-                        engine.sync_scroll_binds();
-                        return sidebar_width;
-                    }
-                    // Phase B.4 Stage 5d: editor scrollbars on the shared
-                    // `quadraui::DragState`. Widget id encodes the window id
-                    // so the apply-side router can call
-                    // `engine.set_scroll_*_for_window(...)` against the
-                    // right window. `grab_offset` preserves cursor position
-                    // on the thumb during drag — same UX every other
-                    // migrated scrollbar gives.
-                    let grab_offset = scrollbar_grab_offset(
+                    let thumb_abs_start = track_abs_start as f32 + thumb_start_f.floor();
+                    let thumb_abs_end = thumb_abs_start + thumb_len_f.ceil().max(1.0);
+                    let max_scroll = rw.total_lines.saturating_sub(track_visible);
+
+                    // #1061: page-vs-thumb decision and grab_offset now
+                    // share `render::resolve_editor_scrollbar_click` with
+                    // GTK's own v/h scrollbar click handlers (`app.rs`)
+                    // instead of a hand-rolled copy plus a second,
+                    // independent re-derivation of the same thumb math
+                    // (the deleted `scrollbar_grab_offset`).
+                    match render::resolve_editor_scrollbar_click(
                         row as f32,
-                        track_abs_start as f32,
-                        track_len as f32,
+                        thumb_abs_start,
+                        thumb_abs_end,
                         track_visible,
-                        rw.total_lines,
+                        max_scroll,
                         rw.scroll_top,
-                    );
-                    let tl = track_len as f32;
-                    drag_state.begin(quadraui::DragTarget::ScrollbarY {
-                        widget: quadraui::WidgetId::new(format!(
-                            "tui:editor:{}:vsb",
-                            rw.window_id.0
-                        )),
-                        track_start: track_abs_start as f32,
-                        track_length: tl,
-                        thumb_length: (tl * track_visible as f32 / rw.total_lines.max(1) as f32)
-                            .max(1.0),
-                        max_scroll: rw.total_lines.saturating_sub(track_visible),
-                        grab_offset,
-                        inverted: false,
-                    });
-                    apply_scrollbar_drag(
-                        drag_state,
-                        quadraui::Point {
-                            x: col as f32,
-                            y: row as f32,
-                        },
-                        engine,
-                        sidebar,
-                    );
-                    engine.sync_scroll_binds();
-                    return sidebar_width;
+                    ) {
+                        render::EditorScrollbarClick::PageTo(new_scroll) => {
+                            engine.set_scroll_top_for_window(rw.window_id, new_scroll);
+                            engine.sync_scroll_binds();
+                            return sidebar_width;
+                        }
+                        render::EditorScrollbarClick::BeginDrag { grab_offset } => {
+                            // Phase B.4 Stage 5d: editor scrollbars on the
+                            // shared `quadraui::DragState`. Widget id
+                            // encodes the window id so the apply-side
+                            // router can call
+                            // `engine.set_scroll_*_for_window(...)` against
+                            // the right window. `grab_offset` preserves
+                            // cursor position on the thumb during drag —
+                            // same UX every other migrated scrollbar gives.
+                            let tl = track_len as f32;
+                            drag_state.begin(quadraui::DragTarget::ScrollbarY {
+                                widget: quadraui::WidgetId::new(format!(
+                                    "tui:editor:{}:vsb",
+                                    rw.window_id.0
+                                )),
+                                track_start: track_abs_start as f32,
+                                track_length: tl,
+                                thumb_length: (tl * track_visible as f32
+                                    / rw.total_lines.max(1) as f32)
+                                    .max(1.0),
+                                max_scroll,
+                                grab_offset,
+                                inverted: false,
+                            });
+                            apply_scrollbar_drag(
+                                drag_state,
+                                quadraui::Point {
+                                    x: col as f32,
+                                    y: row as f32,
+                                },
+                                engine,
+                                sidebar,
+                            );
+                            engine.sync_scroll_binds();
+                            return sidebar_width;
+                        }
+                    }
                 }
 
                 // Horizontal scrollbar click/drag-start.
@@ -2535,105 +2538,81 @@ pub(super) fn handle_mouse(
                         // #550: `track_x` (derived from `wx`) is already absolute.
                         let track_abs_start = track_x;
                         let track_visible = viewport_cols;
-                        // Track-click vs thumb-click: page-jump on the
-                        // empty track, drag-start on the thumb (mirrors
-                        // the v-scrollbar above).
-                        let (thumb_start, thumb_len) = quadraui::fit_thumb(
+                        // Quantize the continuous thumb to whole cells,
+                        // mirroring the v-scrollbar rung above.
+                        let (thumb_start_f, thumb_len_f) = quadraui::fit_thumb(
                             rw.scroll_left as f32,
                             rw.max_col as f32,
                             track_visible as f32,
                             track_w as f32,
                             1.0,
                         );
-                        let thumb_left = thumb_start.floor() as u16;
-                        let thumb_size = thumb_len.ceil().max(1.0) as u16;
-                        let cursor_offset = col.saturating_sub(track_abs_start);
-                        if cursor_offset < thumb_left {
-                            let new_left = rw.scroll_left.saturating_sub(track_visible);
-                            engine.set_scroll_left_for_window(rw.window_id, new_left);
-                            return sidebar_width;
-                        } else if cursor_offset >= thumb_left.saturating_add(thumb_size) {
-                            let max_left = rw.max_col.saturating_sub(track_visible);
-                            let new_left = (rw.scroll_left + track_visible).min(max_left);
-                            engine.set_scroll_left_for_window(rw.window_id, new_left);
-                            return sidebar_width;
-                        }
-                        let grab_offset = scrollbar_grab_offset(
+                        let thumb_abs_start = track_abs_start as f32 + thumb_start_f.floor();
+                        let thumb_abs_end = thumb_abs_start + thumb_len_f.ceil().max(1.0);
+                        let max_left = rw.max_col.saturating_sub(track_visible);
+
+                        // #1061: shared decision — see the v-scrollbar rung
+                        // above for the full rationale.
+                        match render::resolve_editor_scrollbar_click(
                             col as f32,
-                            track_abs_start as f32,
-                            track_w as f32,
+                            thumb_abs_start,
+                            thumb_abs_end,
                             track_visible,
-                            rw.max_col,
+                            max_left,
                             rw.scroll_left,
-                        );
-                        let tl = track_w as f32;
-                        drag_state.begin(quadraui::DragTarget::ScrollbarX {
-                            widget: quadraui::WidgetId::new(format!(
-                                "tui:editor:{}:hsb",
-                                rw.window_id.0
-                            )),
-                            track_start: track_abs_start as f32,
-                            track_length: tl,
-                            thumb_length: (tl * track_visible as f32 / rw.max_col.max(1) as f32)
-                                .max(1.0),
-                            max_scroll: rw.max_col.saturating_sub(track_visible),
-                            grab_offset,
-                            inverted: false,
-                        });
-                        apply_scrollbar_drag(
-                            drag_state,
-                            quadraui::Point {
-                                x: col as f32,
-                                y: row as f32,
-                            },
-                            engine,
-                            sidebar,
-                        );
-                        return sidebar_width;
+                        ) {
+                            render::EditorScrollbarClick::PageTo(new_left) => {
+                                engine.set_scroll_left_for_window(rw.window_id, new_left);
+                                return sidebar_width;
+                            }
+                            render::EditorScrollbarClick::BeginDrag { grab_offset } => {
+                                let tl = track_w as f32;
+                                drag_state.begin(quadraui::DragTarget::ScrollbarX {
+                                    widget: quadraui::WidgetId::new(format!(
+                                        "tui:editor:{}:hsb",
+                                        rw.window_id.0
+                                    )),
+                                    track_start: track_abs_start as f32,
+                                    track_length: tl,
+                                    thumb_length: (tl * track_visible as f32
+                                        / rw.max_col.max(1) as f32)
+                                        .max(1.0),
+                                    max_scroll: max_left,
+                                    grab_offset,
+                                    inverted: false,
+                                });
+                                apply_scrollbar_drag(
+                                    drag_state,
+                                    quadraui::Point {
+                                        x: col as f32,
+                                        y: row as f32,
+                                    },
+                                    engine,
+                                    sidebar,
+                                );
+                                return sidebar_width;
+                            }
+                        }
                     }
                 }
 
-                // Check gutter area — shared resolution via render::resolve_gutter_action (#344).
+                // Check gutter area — shared resolution + apply via
+                // render::resolve_gutter_action / render::apply_gutter_action
+                // (#344, #823 item 3: the match itself moved to
+                // render::apply_gutter_action — this was an identical 5-arm
+                // match to GTK's `execute_gutter_action`, gtk/click.rs).
                 let view_row = (row - wy) as usize;
                 if gutter > 0 && col >= wx && col < wx + gutter {
                     if let Some(rl) = rw.lines.get(view_row) {
                         let gutter_col = (col - wx) as usize;
-                        use crate::render::GutterAction;
-                        match crate::render::resolve_gutter_action(rw, rl.line_idx, gutter_col) {
-                            Some(GutterAction::ToggleBreakpoint(line)) => {
-                                let file = engine
-                                    .windows
-                                    .get(&rw.window_id)
-                                    .and_then(|w| engine.buffer_manager.get(w.buffer_id))
-                                    .and_then(|bs| bs.file_path.as_ref())
-                                    .map(|p| p.to_string_lossy().into_owned())
-                                    .unwrap_or_default();
-                                engine.dap_toggle_breakpoint(&file, line as u64 + 1);
-                            }
-                            Some(GutterAction::DiffPeek(line)) => {
-                                engine.active_tab_mut().active_window = rw.window_id;
-                                engine.view_mut().cursor.line = line;
-                                engine.open_diff_peek();
-                            }
-                            Some(GutterAction::DiagnosticHover(line)) => {
-                                engine.active_tab_mut().active_window = rw.window_id;
-                                engine.view_mut().cursor.line = line;
-                                engine.trigger_editor_hover_for_line(line);
-                            }
-                            Some(GutterAction::CodeAction(line)) => {
-                                engine.active_tab_mut().active_window = rw.window_id;
-                                engine.view_mut().cursor.line = line;
-                                engine.show_code_actions_popup();
-                            }
-                            Some(GutterAction::ToggleFold(line)) => {
-                                let has_fold_indicator =
-                                    rl.gutter_text.chars().any(|c| c == '+' || c == '-');
-                                if has_fold_indicator {
-                                    engine.toggle_fold_at_line(line);
-                                }
-                            }
-                            None => {}
-                        }
+                        crate::render::apply_gutter_action(
+                            engine,
+                            rw,
+                            rw.window_id,
+                            rl.line_idx,
+                            gutter_col,
+                            &rl.gutter_text,
+                        );
                     }
                     return sidebar_width;
                 }
@@ -2648,7 +2627,13 @@ pub(super) fn handle_mouse(
                 // itself) instead of hand-rolled cell math — the same
                 // function GTK's `Backend::editor_col_at_x` falls back to,
                 // so both backends' click math derives from one source.
-                let (editor, editor_layout) = crate::render::editor_text_layout(rw, 1.0, 1.0);
+                // #1040: `tui_editor_text_layout`, not `editor_text_layout`
+                // — the latter lays out against `rw.rect` verbatim, which
+                // carries a fractional cell origin for a group's
+                // non-origin (right/bottom) pane and was never the
+                // viewport TUI's paint path actually drew into. See that
+                // function's doc for the full mechanism.
+                let (editor, editor_layout) = crate::render::tui_editor_text_layout(rw);
                 let col_in_text = editor_layout.col_at_x(&editor, view_row, col as f32);
 
                 // #817: double-click verdict from the backend's
@@ -2699,27 +2684,6 @@ pub(super) fn handle_mouse(
     }
 
     sidebar_width
-}
-
-/// Lift the TUI's cached `(col, row, w, h, uri)` hover-link tuples into the
-/// `(Rect, String)` pairs the shared hover-popup rung takes.
-///
-/// A zero-height rect is widened to one cell: `render_impl` only ever paints
-/// links on a single row, and the old TUI hit test encoded that by comparing
-/// `row == ly` and ignoring the height outright. The shared router does a real
-/// half-open rect test, so the height has to be honest.
-fn editor_hover_popup_link_rects(
-    rects: &[(u16, u16, u16, u16, String)],
-) -> Vec<(quadraui::Rect, String)> {
-    rects
-        .iter()
-        .map(|(lx, ly, lw, lh, uri)| {
-            (
-                quadraui::Rect::new(*lx as f32, *ly as f32, *lw as f32, (*lh).max(1) as f32),
-                uri.clone(),
-            )
-        })
-        .collect()
 }
 
 /// The bits of `handle_mouse`'s own layout arithmetic the chrome rung needs to
@@ -3011,12 +2975,75 @@ mod tests {
             is_expanded: false,
         });
         assert!(engine.active_panel_is(PANEL_EXPLORER));
+        // #1025: the right-click arm now routes through
+        // `render::route_explorer_tree_event`, the same shared function the
+        // left-click arm already used — which bails out on a zero-width
+        // rect (it has no painted geometry to hit-test against). A real
+        // click can only ever land after a paint has populated this, so
+        // give it one here, containing `(ACTIVITY_BAR_WIDTH + 1, 0)`.
+        engine
+            .explorer_tree_rect
+            .set(quadraui::Rect::new(0.0, 0.0, 40.0, 10.0));
 
         dispatch_right_click(&mut engine, ACTIVITY_BAR_WIDTH + 1, 0);
 
         assert!(
             engine.context_menu.is_some(),
             "right-click in the Explorer panel must still open its context menu"
+        );
+    }
+
+    /// #1025 review: pins an intentional, discussed behavior change.
+    ///
+    /// Pre-fix, this arm hand-rolled its own row arithmetic and had an
+    /// `else` fallback (added deliberately in `19eabbe`) for a miss:
+    /// right-clicking empty space below the last explorer row opened a
+    /// context menu for the root/`cwd` folder. Routing the right-click arm
+    /// through the shared `render::route_explorer_tree_event` — the same
+    /// function the left-click arm and GTK's `explorer_ui_event` already
+    /// use, and which never had this fallback — drops it:
+    /// `TreeController::right_click` resolves a `TreeViewHit::Empty` to
+    /// `TreeControllerEvent::Consumed`, not `ContextMenuRequested`, so
+    /// there is nothing left to turn into an `open_explorer_context_menu`
+    /// call.
+    ///
+    /// This brings TUI in line with GTK (which never had the fallback
+    /// either) and with this repo's Platform-Neutrality Rule, which
+    /// forbids re-adding TUI-only geometry/logic to restore it. See the
+    /// comment at the `mouse.rs` call site for the full rationale and the
+    /// quadraui-side path that *would* restore it for both backends at
+    /// once, if that UX is still wanted.
+    #[test]
+    fn right_click_below_last_explorer_row_is_a_no_op() {
+        let mut engine = Engine::new();
+        engine.focus_sidebar_panel(PANEL_EXPLORER);
+        // `Engine::new()` calls `explorer_rebuild_rows()` internally,
+        // populating `explorer_rows` from this test process's *real* cwd —
+        // an arbitrary, environment-dependent row count. Overwrite (not
+        // push onto) that so the fixture is exactly one row, with rows
+        // 1..10 of the rect below genuinely empty space.
+        engine.explorer_rows = vec![crate::core::engine::ExplorerRow {
+            depth: 0,
+            name: "foo.txt".into(),
+            path: std::path::PathBuf::from("/tmp/foo.txt"),
+            is_dir: false,
+            is_expanded: false,
+        }];
+        assert!(engine.active_panel_is(PANEL_EXPLORER));
+        // Same painted rect as the sanity-counterpart test above: 10 rows
+        // tall, but only one explorer row (index 0) is populated — rows
+        // 1..10 are empty space below the last real row.
+        engine
+            .explorer_tree_rect
+            .set(quadraui::Rect::new(0.0, 0.0, 40.0, 10.0));
+
+        dispatch_right_click(&mut engine, ACTIVITY_BAR_WIDTH + 1, 5);
+
+        assert!(
+            engine.context_menu.is_none(),
+            "right-clicking empty space below the last explorer row must \
+             not open any context menu — the pre-#754 root-folder fallback \
+             was intentionally dropped by #1025's fix, not silently lost"
         );
     }
 
@@ -3808,6 +3835,165 @@ mod tests {
         assert!(
             engine.context_menu.is_some(),
             "right-click at the painted tab-bar position ({col}, {tab_bar_row}) must open the tab context menu"
+        );
+    }
+
+    // ── #1055: wheel-scroll dead-arm deletion is provably inert ────────────
+
+    /// Dispatch a single mouse-wheel `MouseEvent` at `(col, row)` through
+    /// `handle_mouse`, mirroring `dispatch_right_click` above but for
+    /// `ScrollUp`/`ScrollDown`.
+    fn dispatch_wheel_scroll(engine: &mut Engine, col: u16, row: u16, up: bool) {
+        let ev = MouseEvent {
+            kind: if up {
+                MouseEventKind::ScrollUp
+            } else {
+                MouseEventKind::ScrollDown
+            },
+            column: col,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+        let mut sidebar = TuiSidebar::new();
+        let mut drag_state = quadraui::DragState::default();
+        let mut modal_stack = quadraui::ModalStack::new();
+        let mut should_quit = false;
+
+        handle_mouse(
+            ev,
+            &mut sidebar,
+            engine,
+            &Some(Size {
+                width: 120,
+                height: 40,
+            }),
+            SIDEBAR_WIDTH,
+            &mut false,
+            &mut false,
+            &mut false,
+            &mut None,
+            &mut drag_state,
+            &mut modal_stack,
+            None,
+            false,
+            &mut None,
+            &mut should_quit,
+            &mut None,
+            &mut None,
+            &mut render::TabDragState::default(),
+            &[],
+            None,
+            None,
+            &[],
+            None,
+            &mut false,
+            &mut false,
+            None,
+            None,
+            None,
+            None,
+        );
+    }
+
+    /// Render the sidebar body (whatever panel is active) into an in-memory
+    /// buffer and return it as trimmed lines. Same `TestBackend`
+    /// rasterisation pattern `panels.rs`'s `sc_panel_tests::render_sc` uses,
+    /// generalised to `render_sidebar_content` (the dispatcher, rather than
+    /// one specific panel's renderer) so it also covers Explorer.
+    fn render_sidebar_lines(engine: &Engine, width: u16, height: u16) -> Vec<String> {
+        let backend = ratatui::backend::TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let theme = crate::render::Theme::onedark();
+        let mut tui_backend = super::backend::TuiBackend::new();
+        let sidebar = TuiSidebar::new();
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width,
+            height,
+        };
+        terminal
+            .draw(|frame| {
+                super::with_frame_scope(&mut tui_backend, frame, |backend, _frame| {
+                    super::panels::render_sidebar_content(backend, area, &sidebar, engine, &theme);
+                });
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        (0..height)
+            .map(|y| {
+                let mut line = String::new();
+                for x in 0..width {
+                    line.push_str(buf[(x, y)].symbol());
+                }
+                line.trim_end().to_string()
+            })
+            .collect()
+    }
+
+    /// #1055: the `"explorer:sb"` arm inside the scroll-surface wheel
+    /// dispatch (`handle_mouse`'s `match id.as_str()`) was deleted as dead —
+    /// shadowed by the `PANEL_EXPLORER` early-return block earlier in the
+    /// same function, which already handles every wheel-scroll event that
+    /// reaches the sidebar column range while Explorer is active (the exact
+    /// condition under which `render_explorer_sidebar_content` registers the
+    /// `"explorer:sb"` `ScrollSurface` the deleted arm was keyed on).
+    ///
+    /// This drives the *actual* live path end-to-end (`handle_mouse` ->
+    /// `Engine::explorer_scroll` -> `TreeController` -> rendered rows) and
+    /// asserts on painted text, not on `explorer_tree`'s scroll-offset field
+    /// being set — see CLAUDE.md's Testing section on why a state-only
+    /// assertion would have passed straight through the #587/#592 paint bugs.
+    ///
+    /// Observed RED against unfixed `develop` by temporarily short-circuiting
+    /// `Engine::explorer_scroll` to a no-op (simulating a bad refactor of the
+    /// live path this deletion leans on): the first row then never leaves
+    /// the screen and the final assertion fails. Restored before committing.
+    #[test]
+    fn wheel_scroll_over_explorer_sidebar_still_scrolls_it() {
+        let mut engine = Engine::new();
+        engine.focus_sidebar_panel(PANEL_EXPLORER);
+        // Overwrite (not push onto) `explorer_rows` — `Engine::new()` already
+        // populated it from this test process's real cwd (an arbitrary,
+        // environment-dependent row count/order); see the same note on
+        // `right_click_below_last_explorer_row_is_a_no_op` above. Many more
+        // rows than any plausible viewport height, so a real scroll always
+        // moves the first row out of view.
+        engine.explorer_rows = (0..60)
+            .map(|i| crate::core::engine::ExplorerRow {
+                depth: 0,
+                name: format!("file{i:04}.txt"),
+                path: std::path::PathBuf::from(format!("/tmp/file{i:04}.txt")),
+                is_dir: false,
+                is_expanded: false,
+            })
+            .collect();
+
+        let width = 40;
+        let height = 20;
+
+        let before = render_sidebar_lines(&engine, width, height);
+        assert!(
+            before.iter().any(|l| l.contains("file0000.txt")),
+            "expected the first row visible before any scroll, got: {before:#?}"
+        );
+        assert!(
+            !before.iter().any(|l| l.contains("file0059.txt")),
+            "row 59 should start below the fold, got: {before:#?}"
+        );
+
+        // Wheel-scroll down repeatedly over the sidebar column — the same
+        // `MouseEventKind::ScrollDown` `event_loop` (mod.rs) feeds
+        // `handle_mouse` in production.
+        for _ in 0..30 {
+            dispatch_wheel_scroll(&mut engine, ACTIVITY_BAR_WIDTH + 1, 5, false);
+        }
+
+        let after = render_sidebar_lines(&engine, width, height);
+        assert!(
+            !after.iter().any(|l| l.contains("file0000.txt")),
+            "the first row must have scrolled out of view after 30 wheel \
+             ticks, got: {after:#?}"
         );
     }
 }

@@ -775,8 +775,13 @@ fn test_vscode_progressive_fold_parent() {
 
 #[test]
 fn test_vscode_progressive_unfold() {
-    // Fold a region, then unfold it. The flat fold model merges nested folds
-    // into one, so unfolding the outer fold reveals all nested content.
+    // Fold a region, progressively fold its parent, then unfold just the
+    // parent. #1006 fixed `close_fold` to stop discarding an
+    // already-closed nested fold when a bigger fold closes over it (the
+    // "flat fold model merges nested folds into one" this test used to
+    // document was itself the bug — opening only the outer fold must leave
+    // an independently-closed inner fold still closed, matching real
+    // nested-fold semantics in both Vim and VSCode).
     let src = "fn outer() {\n    fn inner() {\n        let x = 1;\n    }\n}\n";
     let mut e = engine_with(src);
     vscode_mode(&mut e);
@@ -788,11 +793,19 @@ fn test_vscode_progressive_unfold() {
     e.handle_key("Shift_bracketleft", None, true);
     assert_eq!(e.cursor().line, 0);
     assert!(e.view().fold_at(0).is_some(), "outer fold exists");
-    // The inner fold was absorbed by the outer fold
-    assert!(e.view().fold_at(1).is_none(), "inner fold absorbed");
-    // Unfold the outer fold — all lines become visible
+    // The inner fold is still independently closed (#1006) — it's only
+    // hidden from *view* right now because the outer fold also covers it.
+    assert!(e.view().fold_at(1).is_some(), "inner fold stays defined");
+    // Unfold just the outer fold — the still-closed inner fold keeps its
+    // own body hidden.
     e.handle_key("Shift_bracketright", None, true);
     assert!(e.view().fold_at(0).is_none(), "outer fold removed");
+    assert!(e.view().fold_at(1).is_some(), "inner fold still closed");
+    assert!(!e.view().is_line_hidden(1), "inner fold header visible");
+    assert!(e.view().is_line_hidden(2), "inner fold body still hidden");
+    // Unfold the now-visible inner fold too — everything is visible.
+    e.handle_key("Shift_bracketright", None, true);
+    assert!(e.view().fold_at(1).is_none(), "inner fold removed");
     assert!(!e.view().is_line_hidden(1), "line 1 visible");
     assert!(!e.view().is_line_hidden(2), "line 2 visible");
     assert!(!e.view().is_line_hidden(3), "line 3 visible");

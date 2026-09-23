@@ -78,6 +78,36 @@ impl SpellChecker {
     }
 }
 
+/// Words from the bundled `en_US.dic` word list that start with `prefix`
+/// (case-insensitive), for `<C-x><C-k>` dictionary completion (`:h
+/// i_CTRL-X_CTRL-K`, #1160). Each `.dic` line is `word[/flags]`; only the
+/// word part is used — flags describe applicable affixes, not spelling
+/// variants, so they aren't useful as completion candidates. Deduplicated
+/// and sorted; capped at 200 results since a short prefix (e.g. "a") can
+/// match thousands of entries.
+pub fn dictionary_words_with_prefix(prefix: &str) -> Vec<String> {
+    if prefix.is_empty() {
+        return Vec::new();
+    }
+    let prefix_lower = prefix.to_lowercase();
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for line in BUNDLED_DIC.lines().skip(1) {
+        let word = line.split('/').next().unwrap_or(line).trim();
+        if word.is_empty() {
+            continue;
+        }
+        if word.to_lowercase().starts_with(&prefix_lower) && word != prefix && seen.insert(word) {
+            out.push(word.to_string());
+            if out.len() >= 200 {
+                break;
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
 /// Extract the user dictionary path.
 fn user_dict_path() -> PathBuf {
     super::paths::vimcode_config_dir().join("user.dic")

@@ -55,8 +55,8 @@ pub(super) fn render_explorer_sidebar_content(
         id: quadraui::WidgetId::new("explorer:bg"),
         left_segments: vec![quadraui::StatusBarSegment {
             text: String::new(),
-            fg: render::to_quadraui_color(theme.explorer_file_fg),
-            bg: render::to_quadraui_color(theme.tab_bar_bg),
+            fg: theme.explorer_file_fg,
+            bg: theme.tab_bar_bg,
             bold: false,
             action_id: None,
         }],
@@ -201,15 +201,7 @@ fn fill_row(
     fg: Color,
     bg: Color,
 ) {
-    fill_row_q(
-        backend,
-        x,
-        y,
-        width,
-        text,
-        render::to_quadraui_color(fg),
-        render::to_quadraui_color(bg),
-    );
+    fill_row_q(backend, x, y, width, text, fg, bg);
 }
 
 /// Clear `area` to `bg` — the trait-only equivalent of the nested
@@ -282,6 +274,12 @@ pub(super) fn render_settings_panel(
         area.width as f32,
         content_height as f32,
     );
+    // Cache the exact rect this frame painted into (#1238) — mirrors
+    // `explorer_tree_rect` / `ext_panel_content_rect`. `mouse.rs`'s hit-tests
+    // read this back instead of re-deriving `y = area.y + 2` by hand, which
+    // drifted the moment the sidebar's own origin was not `y == 0` (e.g. the
+    // menu bar visible).
+    engine.settings_form_rect.set(q_rect);
     backend.set_theme(super::quadraui_tui::q_theme(theme));
     engine
         .settings_form_controller
@@ -334,23 +332,20 @@ pub(super) fn render_search_panel(
 
 // ─── Status / command line ────────────────────────────────────────────────────
 
-/// Paint the `:`-command line row (background fill, text, inverted block
-/// cursor, and the mouse drag-selection inversion).
+/// Paint the `:`-command line row (background fill, text, insert cursor,
+/// and the mouse drag-selection highlight) through the shared
+/// `quadraui::Backend::draw_command_line_selection` primitive (quadraui#1001).
 ///
-/// #605 (Stage 6 parity sweep): this used to write straight into
-/// `frame.buffer_mut()` via `set_cell`, which made it unreachable from
-/// `TuiShellApp::render_content`'s `&mut dyn Backend`-only signature. It now
-/// composes the row into a `(char, fg, bg)` cell vector and paints it through
-/// [`render_impl::draw_rule_row_themed`] — the same
-/// `Backend::draw_status_bar`-stands-in-for-a-raw-`set_cell` trick #609
-/// introduced for the window dividers (see that helper's doc comment).
-///
-/// The two inversions (cursor, then `selection`) are applied to the composed
-/// cells *before* painting rather than as buffer read-back passes afterwards.
-/// That's behaviour-identical to the old two-pass version — including the
-/// double-invert-cancels case where the cursor cell also falls inside the
-/// selection — but needs no `Buffer` access. `selection` is `event_loop`'s
-/// `cmd_sel` local (`(start, end)` character indices, either order).
+/// #1185: this used to hand-compose a `(char, fg, bg)` cell vector and
+/// invert fg/bg per cell for both the cursor and `selection` — the one
+/// backend-specific paint path `CLAUDE.md`'s Platform-Neutrality Rule
+/// exists to delete, and the reason GTK never got a visual selection
+/// highlight at all (there was no shared primitive to paint it through).
+/// `render::command_line_view` builds the same `quadraui::CommandLine`
+/// descriptor GTK's `FrameOp::CommandLine` arm uses; `selection` (`cmd_sel`'s
+/// `(start, end)` character indices, either order, into `command.text`) is
+/// converted to the byte-offset pair the primitive expects via
+/// `render::command_line_selection_bytes`, the exact twin of GTK's call.
 pub(super) fn render_command_line(
     backend: &mut dyn quadraui::Backend,
     area: Rect,
@@ -361,70 +356,10 @@ pub(super) fn render_command_line(
     if area.width == 0 || area.height == 0 {
         return;
     }
-    let fg = theme.command_fg;
-    let bg = theme.command_bg;
-    let width = area.width as usize;
-
-    // Row composition: background fill first, then the text on top.
-    let mut cells: Vec<(char, Color, Color)> = vec![(' ', fg, bg); width];
-    let chars: Vec<char> = command.text.chars().collect();
-    if command.right_align {
-        // Right-aligned text that doesn't fit is dropped entirely — matches
-        // the old `if len <= area.width` guard.
-        if chars.len() <= width {
-            let start = width - chars.len();
-            for (i, &ch) in chars.iter().enumerate() {
-                cells[start + i].0 = ch;
-            }
-        }
-    } else {
-        for (i, &ch) in chars.iter().enumerate() {
-            if i >= width {
-                break;
-            }
-            cells[i].0 = ch;
-        }
-    }
-
-    // Command-line cursor (inverted block at insertion point).
-    if command.show_cursor {
-        let cursor_col = command.cursor_anchor_text.chars().count();
-        let idx = cursor_col.min(width - 1);
-        let cell = &mut cells[idx];
-        std::mem::swap(&mut cell.1, &mut cell.2);
-    }
-
-    // Mouse drag-selection: invert fg/bg for the selected span.
-    if let Some((start, end)) = selection {
-        let lo = start.min(end);
-        let hi = start.max(end);
-        for cell in cells.iter_mut().take(hi + 1).skip(lo) {
-            std::mem::swap(&mut cell.1, &mut cell.2);
-        }
-    }
-
-    // Paint, batching runs of identically-coloured cells into one
-    // `draw_status_bar` call so a plain uncoloured command line costs one
-    // draw rather than `width` of them.
     backend.set_theme(super::quadraui_tui::q_theme(theme));
-    let mut run_start = 0usize;
-    while run_start < width {
-        let (_, run_fg, run_bg) = cells[run_start];
-        let mut run_end = run_start + 1;
-        while run_end < width && cells[run_end].1 == run_fg && cells[run_end].2 == run_bg {
-            run_end += 1;
-        }
-        let text: String = cells[run_start..run_end].iter().map(|c| c.0).collect();
-        super::render_impl::draw_rule_row_themed(
-            backend,
-            area.x + run_start as u16,
-            area.y,
-            &text,
-            run_fg,
-            run_bg,
-        );
-        run_start = run_end;
-    }
+    let cmd = render::command_line_view(command);
+    let sel_bytes = selection.map(|sel| render::command_line_selection_bytes(&command.text, sel));
+    backend.draw_command_line_selection(super::shell_app::to_q_rect(area), &cmd, sel_bytes);
 }
 
 // ─── Input translation ────────────────────────────────────────────────────────
@@ -451,7 +386,16 @@ pub(super) fn render_source_control(
     let dim_fg = theme.line_number_fg;
 
     // Build SC data from engine state via the render abstraction.
-    let screen = render::build_screen_layout(engine, theme, &[], 1.0, 1.0, true);
+    let screen = render::build_screen_layout(
+        engine,
+        theme,
+        &[],
+        1.0,
+        1.0,
+        true,
+        0.0,
+        render::TUI_MINIMAP_SIZING,
+    );
     let Some(ref sc) = screen.source_control else {
         return;
     };
@@ -631,10 +575,34 @@ pub(super) fn render_ext_panel(
     if area.height == 0 {
         return;
     }
-    let screen = render::build_screen_layout(engine, theme, &[], 1.0, 1.0, true);
+    let screen = render::build_screen_layout(
+        engine,
+        theme,
+        &[],
+        1.0,
+        1.0,
+        true,
+        0.0,
+        render::TUI_MINIMAP_SIZING,
+    );
     let Some(ref panel) = screen.ext_panel else {
+        engine.ext_panel_tree_layout.replace(None);
         return;
     };
+
+    // #1086: cache the exact rect this frame painted the ext panel into —
+    // `AppShellLayout::sidebar_content_bounds`, verbatim, before subtracting
+    // this function's own chrome — so click routing (`mouse.rs`'s
+    // `SidebarOwner::ExtPanel` arm) can derive its row index from what was
+    // actually painted instead of re-deriving the sidebar content's top row
+    // from the menu-bar row count by hand. Mirrors `explorer_tree_rect` /
+    // `dap_sidebar_body_rect`.
+    engine.ext_panel_content_rect.set(quadraui::Rect::new(
+        area.x as f32,
+        area.y as f32,
+        area.width as f32,
+        area.height as f32,
+    ));
 
     // ── Chrome: header (always) + search input (only when active or text). ─
     let input_visible = panel.input_active || !panel.input_text.is_empty();
@@ -668,6 +636,16 @@ pub(super) fn render_ext_panel(
         );
         backend.set_theme(super::quadraui_tui::q_theme(theme));
         backend.draw_tree(body_q_rect, &tree);
+        // #1089: cache the exact `Backend::tree_layout` this frame painted
+        // with — the click router (`render::route_ext_panel_click`, shared
+        // with the GTK/macOS/Win `App`) reads this instead of re-deriving
+        // row geometry from a uniform row height. See
+        // `Engine::ext_panel_tree_layout`'s own doc for why that matters on
+        // the pixel backends even though TUI's own rows are uniform.
+        let tree_layout = backend.tree_layout(body_q_rect, &tree);
+        engine
+            .ext_panel_tree_layout
+            .replace(Some((body_q_rect, tree_layout)));
 
         // Scrollbar: `draw_tree` doesn't render scrollbars yet. Total
         // visible rows = tree.rows.len() (sections + their expanded items,
@@ -723,6 +701,8 @@ pub(super) fn render_ext_panel(
                 ),
                 scrollbar: ext_panel_scrollbar,
             });
+    } else {
+        engine.ext_panel_tree_layout.replace(None);
     }
 
     // ── Help popup overlay ──────────────────────────────────────────────────
@@ -746,8 +726,8 @@ pub(super) fn render_ext_panel(
         let popup_x = area.x + (area.width.saturating_sub(popup_w)) / 2;
         let popup_y = area.y + (area.height.saturating_sub(popup_h)) / 2;
 
-        let q_popup_fg = render::to_quadraui_color(theme.completion_fg);
-        let q_key_fg = render::to_quadraui_color(theme.function);
+        let q_popup_fg = theme.completion_fg;
+        let q_key_fg = theme.function;
         let mut lines: Vec<quadraui::StyledText> = vec![quadraui::StyledText::plain("Keybindings")];
         for (key, desc) in bindings.iter() {
             lines.push(quadraui::StyledText {
@@ -761,7 +741,7 @@ pub(super) fn render_ext_panel(
         let mut tooltip =
             render::quadraui_tooltip(quadraui::WidgetId::new("ext_panel:help"), String::new());
         tooltip.styled_lines = Some(lines);
-        tooltip.bg = Some(render::to_quadraui_color(theme.completion_bg));
+        tooltip.bg = Some(theme.completion_bg);
         tooltip.fg = Some(q_popup_fg);
         let layout = quadraui::TooltipLayout {
             bounds: quadraui::Rect::new(
@@ -783,7 +763,11 @@ pub(super) fn render_ext_panel(
 ///
 /// The popup displays rendered markdown content and appears to the right of
 /// the sidebar at the vertical position of the hovered item.
-/// Returns (link_rects, popup_rect) where popup_rect is (x, y, w, h).
+/// Returns `(link_rects, popup_rect)`. `link_rects` carries the trailing
+/// `is_native` flag (#1067) the same way GTK's `render::
+/// panel_hover_popup_paint` does — both caches are now the exact same
+/// element shape, so `render::route_panel_hover_popup_click` is callable
+/// from either backend without an adapter.
 #[allow(clippy::type_complexity, clippy::too_many_arguments)]
 pub(super) fn render_panel_hover_popup(
     backend: &mut dyn quadraui::Backend,
@@ -793,15 +777,12 @@ pub(super) fn render_panel_hover_popup(
     sidebar_y: u16,
     sidebar_height: u16,
     term_area: Rect,
-) -> (
-    Vec<(u16, u16, u16, u16, String)>,
-    Option<(u16, u16, u16, u16)>,
-) {
+) -> (Vec<(quadraui::Rect, String, bool)>, Option<quadraui::Rect>) {
     let Some(ref ph) = screen.panel_hover else {
         return (vec![], None);
     };
 
-    let lines = &ph.rendered.lines;
+    let lines = &ph.line_text;
     if lines.is_empty() {
         return (vec![], None);
     }
@@ -832,7 +813,23 @@ pub(super) fn render_panel_hover_popup(
             .unwrap_or(2u16);
         section_start + ph.item_index as u16
     } else {
-        ph.item_index as u16 + 1
+        // #1087: `ph.item_index` is a flat index across the whole panel list
+        // (`route_sidebar_hover`'s `ExtPanel` arm sets `flat_idx =
+        // ext_panel_scroll_top + row`), not a screen row — this used to
+        // anchor straight off the flat index (`item_index + 1`), landing the
+        // card dozens of rows below the viewport once the panel scrolled.
+        // `ext_panel_hover_screen_row`/`ext_panel_chrome_rows` are the same
+        // shared derivation `panel_hover_anchor_y` (GTK's twin of this
+        // function) now uses, so the two backends can't drift on this again.
+        let Some(panel) = screen.ext_panel.as_ref() else {
+            return (vec![], None);
+        };
+        let Some(screen_row) = render::ext_panel_hover_screen_row(panel, ph.item_index) else {
+            // Stale frame right after a scroll: `item_index` hasn't caught
+            // up with `scroll_top` yet. Skip painting rather than underflow.
+            return (vec![], None);
+        };
+        render::ext_panel_chrome_rows(panel) as u16 + screen_row as u16
     };
     let raw_y = sidebar_y + item_row;
     // Same secondary clamp the legacy renderer applied: don't let the
@@ -878,7 +875,8 @@ pub(super) fn render_panel_hover_popup(
     backend.set_theme(super::quadraui_tui::q_theme(theme));
     backend.draw_rich_text_popup(&popup, &layout);
 
-    let link_rects: Vec<(u16, u16, u16, u16, String)> = layout
+    let is_native = render::panel_hover_link_is_native(&ph.panel_name);
+    let link_rects: Vec<(quadraui::Rect, String, bool)> = layout
         .link_hit_regions
         .iter()
         .map(|(rect, idx)| {
@@ -887,117 +885,23 @@ pub(super) fn render_panel_hover_popup(
                 .get(*idx)
                 .map(|l| l.url.clone())
                 .unwrap_or_default();
-            (
-                rect.x.round() as u16,
-                rect.y.round() as u16,
-                rect.width.round() as u16,
-                rect.height.round() as u16,
-                url,
-            )
+            (*rect, url, is_native)
         })
         .collect();
 
-    let popup_rect = Some((
-        layout.bounds.x.round() as u16,
-        layout.bounds.y.round() as u16,
-        layout.bounds.width.round() as u16,
-        layout.bounds.height.round() as u16,
-    ));
-
-    (link_rects, popup_rect)
-}
-
-// ─── Editor hover popup ─────────────────────────────────────────────────────
-
-/// Render an editor hover popup via the `quadraui::RichTextPopup`
-/// primitive. Returns `(link_rects, popup_bounds, scrollbar_hit)` for
-/// mouse hit-testing — derived from the primitive's resolved layout.
-/// `backend` is `&mut dyn quadraui::Backend` (not the concrete `TuiBackend`)
-/// so this is callable from `TuiShellApp::render_content` (#601) — see
-/// `render_impl.rs::render_tab_bar`'s doc comment for the general rationale.
-#[allow(clippy::type_complexity, clippy::too_many_arguments)]
-pub(super) fn render_editor_hover_popup(
-    backend: &mut dyn quadraui::Backend,
-    eh: &render::EditorHoverPopupData,
-    popup_x: u16,
-    popup_y: u16,
-    term_area: Rect,
-    theme: &Theme,
-) -> (
-    Vec<(u16, u16, u16, u16, String)>,
-    Option<(u16, u16, u16, u16)>,
-    Option<render::PopupScrollbarHit>,
-) {
-    if eh.rendered.lines.is_empty() {
-        return (vec![], None, None);
-    }
-    let popup = render::editor_hover_to_quadraui_rich_text(eh, theme);
-    // Content width: precomputed by engine (popup_width chars) clamped to
-    // viewport - 4 to leave space for borders + minimum padding.
-    let content_w = (eh.popup_width as f32)
-        .max(10.0)
-        .min((term_area.width as f32 - 4.0).max(10.0));
-    let viewport = quadraui::Rect::new(
-        term_area.x as f32,
-        term_area.y as f32,
-        term_area.width as f32,
-        term_area.height as f32,
-    );
-    let measure = quadraui::RichTextPopupMeasure::new(content_w, 1.0);
-    // TUI link widths: 1 cell per char.
-    let layout = popup.layout(
-        popup_x as f32,
-        popup_y as f32,
-        viewport,
-        measure,
-        |line_idx, start_byte, end_byte| {
-            popup
-                .line_text
-                .get(line_idx)
-                .map(|t| {
-                    t[start_byte.min(t.len())..end_byte.min(t.len())]
-                        .chars()
-                        .count() as f32
-                })
-                .unwrap_or(0.0)
-        },
-    );
-
-    backend.set_theme(super::quadraui_tui::q_theme(theme));
-    backend.draw_rich_text_popup(&popup, &layout);
-
-    let link_rects: Vec<(u16, u16, u16, u16, String)> = layout
-        .link_hit_regions
-        .iter()
-        .map(|(rect, idx)| {
-            let url = popup
-                .links
-                .get(*idx)
-                .map(|l| l.url.clone())
-                .unwrap_or_default();
-            (
-                rect.x.round() as u16,
-                rect.y.round() as u16,
-                rect.width.round() as u16,
-                rect.height.round() as u16,
-                url,
-            )
-        })
-        .collect();
-
-    let popup_rect = Some((
-        layout.bounds.x.round() as u16,
-        layout.bounds.y.round() as u16,
-        layout.bounds.width.round() as u16,
-        layout.bounds.height.round() as u16,
-    ));
-    let scrollbar_hit = layout.scrollbar.map(|sb| render::PopupScrollbarHit {
-        track: sb.track,
-        thumb: sb.thumb,
-        visible_rows: render::EDITOR_HOVER_MAX_ROWS,
-        total: popup.lines.len(),
-    });
-    (link_rects, popup_rect, scrollbar_hit)
+    // `layout.bounds` is cached (and later hit-tested) as the raw `f32`
+    // `quadraui::Rect` the primitive returned — no `.round()`-to-cell step
+    // the way the pre-#831 hand-rolled `u16` cache had. That's only safe
+    // because every input feeding `RichTextPopup::layout` here is already
+    // integral in cell units: `padding: 0.0` (`panel_hover_to_quadraui_rich_text`,
+    // `render.rs`) and the primitive's own `border` (fixed at `1.0`,
+    // `rich_text_popup.rs`) are the only two offsets `layout()` adds beyond
+    // the whole-cell `popup_x`/`top_row` this function passes in. If either
+    // ever became fractional (e.g. a future padding tweak), the painted box
+    // and the cached hit-test rect would still agree with each other — both
+    // come from this one `layout` call — but would silently stop landing on
+    // whole terminal cells.
+    (link_rects, Some(layout.bounds))
 }
 
 // ─── Extensions sidebar panel ─────────────────────────────────────────────────
@@ -1028,7 +932,16 @@ pub(super) fn render_ext_sidebar(
         return;
     }
 
-    let screen = render::build_screen_layout(engine, theme, &[], 1.0, 1.0, true);
+    let screen = render::build_screen_layout(
+        engine,
+        theme,
+        &[],
+        1.0,
+        1.0,
+        true,
+        0.0,
+        render::TUI_MINIMAP_SIZING,
+    );
     let Some(ref ext) = screen.ext_sidebar else {
         return;
     };
@@ -1147,7 +1060,16 @@ pub(super) fn render_debug_sidebar(
     }
 
     // Build minimal screen layout to get debug_sidebar data.
-    let screen = render::build_screen_layout(engine, theme, &[], 1.0, 1.0, true);
+    let screen = render::build_screen_layout(
+        engine,
+        theme,
+        &[],
+        1.0,
+        1.0,
+        true,
+        0.0,
+        render::TUI_MINIMAP_SIZING,
+    );
     let sidebar = &screen.debug_sidebar;
 
     // ── Chrome rows (panel-specific): header + Run/Stop button via StatusBar. ──

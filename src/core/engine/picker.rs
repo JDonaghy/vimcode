@@ -516,7 +516,7 @@ impl Engine {
         for km in &self.user_keymaps {
             let keys_str = km.keys.join("");
             let display = format!(
-                "{:<24}:{} [mode: {}] (user remap)",
+                "{:<24}{} [mode: {}] (user remap)",
                 keys_str, km.action, km.mode
             );
             self.picker_all_items.push(PickerItem {
@@ -2213,7 +2213,7 @@ impl Engine {
             }
             "v" if ctrl => {
                 // Paste clipboard into picker query
-                if let Some(text) = Self::clipboard_paste() {
+                if let Some(text) = self.clipboard_read.as_ref().and_then(|cb| cb().ok()) {
                     // Take first line only, strip control chars
                     let line = text.lines().next().unwrap_or("");
                     for c in line.chars() {
@@ -2276,60 +2276,409 @@ impl Engine {
     }
 }
 
-// ─── Quickfix ─────────────────────────────────────────────────────────────────
+// ─── Quickfix / location list ──────────────────────────────────────────────
+//
+// Vim's location list is a per-window twin of the global quickfix list —
+// same shape, same navigation, same panel, just scoped to a window instead
+// of shared globally. Rather than writing the open/close/navigate/jump
+// logic twice, every `qf_*` method below is generic over *which* list it
+// targets via `win: Option<WindowId>` (`None` = the global quickfix list,
+// `Some(id)` = window `id`'s location list) and is the single
+// implementation behind both the `:c*` and `:l*` ex-command families
+// (`src/core/engine/execute.rs`) (#1155).
 
 impl Engine {
-    /// Open the quickfix panel and give it focus.
-    pub fn open_quickfix(&mut self) -> EngineAction {
-        if self.quickfix_items.is_empty() {
-            self.message = "Quickfix list is empty".to_string();
+    /// Borrow the target list mutably, creating an empty location list on
+    /// first use (mirrors how the global quickfix list starts out empty
+    /// rather than absent).
+    pub fn qf_get_mut(&mut self, win: Option<WindowId>) -> &mut QuickfixList {
+        match win {
+            None => &mut self.quickfix,
+            Some(w) => self.location_lists.entry(w).or_default(),
+        }
+    }
+
+    /// Borrow the target list read-only, without creating a location list
+    /// that doesn't exist yet.
+    pub fn qf_get(&self, win: Option<WindowId>) -> Option<&QuickfixList> {
+        match win {
+            None => Some(&self.quickfix),
+            Some(w) => self.location_lists.get(&w),
+        }
+    }
+
+    /// The "list is empty" message for the target, matching Vim's distinct
+    /// quickfix (`E42`) vs location-list (`E776`) wording.
+    ///
+    /// #1283: confirmed by hand against `nvim --headless -u NONE` — the
+    /// global-list message is `E42: No Errors` verbatim (capital `E` in
+    /// `Errors`), not the "Quickfix list is empty" prose this used to read.
+    /// The wrong casing/wording was invisible before #1283 because nothing
+    /// in the oracle corpus compared it: the buffer/cursor-only `Case`
+    /// harness `ex:cc on empty quickfix list` (#1154) can't see `message` at
+    /// all, and its paired engine-level test asserted the same wrong text
+    /// back (`.contains("No errors")`) — see that test's #1283 update.
+    pub(super) fn qf_empty_msg(win: Option<WindowId>) -> String {
+        if win.is_some() {
+            "E776: No location list".to_string()
+        } else {
+            "E42: No Errors".to_string()
+        }
+    }
+
+    /// Replace the target list's contents (used by `:grep`/`:vimgrep`/
+    /// `:lgrep`/`:lvimgrep` and by LSP producers such as "Find References").
+    /// Replacing the *global* list snapshots the new contents onto
+    /// `quickfix_stack` for `:colder`/`:cnewer`.
+    pub fn qf_set_list(&mut self, win: Option<WindowId>, items: Vec<ProjectMatch>) {
+        let n = items.len();
+        let list = self.qf_get_mut(win);
+        list.items = items;
+        list.selected = 0;
+        list.open = true;
+        list.has_focus = n > 0;
+        if win.is_none() {
+            self.qf_push_history();
+        }
+        // #1307: this flips `open` unconditionally (existing behaviour,
+        // unrelated to #1307) but deliberately does *not* call
+        // `qf_ensure_panel_window` — a plain `:grep`/`:vimgrep` re-run must
+        // not conjure a real split window out of nowhere; only `:copen`/
+        // `:lopen`/`:cwindow`/`:lwindow` do that. If one is *already* open
+        // (from an earlier `:copen`), keep it live instead of leaving it
+        // showing stale entries.
+        self.qf_refresh_panel_if_open(win);
+    }
+
+    /// Snapshot the (just-updated) global quickfix list onto
+    /// `quickfix_stack`, truncating any "newer" entries beyond the current
+    /// browse position first (creating a new list while parked on an older
+    /// one via `:colder` discards the ones ahead, like an undo tree branch)
+    /// and capping the stack at 10 entries — Vim's default quickfix-stack
+    /// depth. `quickfix_stack[quickfix_stack_pos]` always equals
+    /// `self.quickfix` immediately after this call.
+    fn qf_push_history(&mut self) {
+        const MAX_QF_HISTORY: usize = 10;
+        self.quickfix_stack.truncate(self.quickfix_stack_pos + 1);
+        self.quickfix_stack.push(self.quickfix.clone());
+        if self.quickfix_stack.len() > MAX_QF_HISTORY {
+            self.quickfix_stack.remove(0);
+        }
+        self.quickfix_stack_pos = self.quickfix_stack.len() - 1;
+    }
+
+    /// `:colder [count]` — move `count` (default 1) steps back through the
+    /// quickfix stack.
+    pub fn qf_colder(&mut self, count: usize) -> EngineAction {
+        let count = count.max(1);
+        if self.quickfix_stack.is_empty() || self.quickfix_stack_pos == 0 {
+            self.message = "E380: At bottom of quickfix stack".to_string();
             return EngineAction::None;
         }
-        self.quickfix_open = true;
-        self.quickfix_has_focus = true;
+        self.quickfix_stack_pos = self.quickfix_stack_pos.saturating_sub(count);
+        self.quickfix = self.quickfix_stack[self.quickfix_stack_pos].clone();
+        self.qf_refresh_panel_if_open(None);
+        self.message = format!(
+            "list {} of {}",
+            self.quickfix_stack_pos + 1,
+            self.quickfix_stack.len()
+        );
         EngineAction::None
     }
 
-    /// Close the quickfix panel.
-    pub fn close_quickfix(&mut self) -> EngineAction {
-        self.quickfix_open = false;
-        self.quickfix_has_focus = false;
+    /// `:cnewer [count]` — move `count` (default 1) steps forward through
+    /// the quickfix stack.
+    pub fn qf_newer(&mut self, count: usize) -> EngineAction {
+        let count = count.max(1);
+        if self.quickfix_stack.is_empty()
+            || self.quickfix_stack_pos + 1 >= self.quickfix_stack.len()
+        {
+            self.message = "E381: At top of quickfix stack".to_string();
+            return EngineAction::None;
+        }
+        self.quickfix_stack_pos =
+            (self.quickfix_stack_pos + count).min(self.quickfix_stack.len() - 1);
+        self.quickfix = self.quickfix_stack[self.quickfix_stack_pos].clone();
+        self.qf_refresh_panel_if_open(None);
+        self.message = format!(
+            "list {} of {}",
+            self.quickfix_stack_pos + 1,
+            self.quickfix_stack.len()
+        );
         EngineAction::None
     }
 
-    /// Move to the next quickfix item and jump to it.
-    pub fn quickfix_next(&mut self) -> EngineAction {
-        let max = self.quickfix_items.len().saturating_sub(1);
-        self.quickfix_selected = (self.quickfix_selected + 1).min(max);
-        self.quickfix_jump()
+    /// Format one entry the way a real panel window's buffer displays it:
+    /// `"file.rs:12: line text"` — no directory, matching real Neovim's
+    /// quickfix buffer lines (`:h quickfix-window-function`'s default
+    /// formatter).
+    fn qf_format_item(m: &ProjectMatch) -> String {
+        let f = m.file.file_name().and_then(|n| n.to_str()).unwrap_or("?");
+        let snippet: String = m.line_text.trim().chars().take(80).collect();
+        format!("{}:{}: {}", f, m.line + 1, snippet)
     }
 
-    /// Move to the previous quickfix item and jump to it.
-    pub fn quickfix_prev(&mut self) -> EngineAction {
-        self.quickfix_selected = self.quickfix_selected.saturating_sub(1);
-        self.quickfix_jump()
+    /// Format every entry in `list` (see [`Self::qf_format_item`]).
+    fn qf_format_items(list: &QuickfixList) -> Vec<String> {
+        list.items.iter().map(Self::qf_format_item).collect()
     }
 
-    /// Jump to a specific quickfix item by index (0-based).
-    pub fn quickfix_go(&mut self, idx: usize) -> EngineAction {
-        self.quickfix_selected = idx.min(self.quickfix_items.len().saturating_sub(1));
-        self.quickfix_jump()
+    /// If a real panel window is currently open for `target` (#1307),
+    /// refresh its buffer text from the list's current items and move its
+    /// cursor to the list's current `selected` index — call after anything
+    /// that mutates a `QuickfixList`'s `items`/`selected` so an already-open
+    /// panel window stays live, the way Neovim's own quickfix buffer does.
+    /// A no-op when no real window is open for `target` (the common case for
+    /// `qf_set_list`'s implicit `:grep`/`:vimgrep` auto-open, which only
+    /// ever flips the legacy overlay flags — see that method's own doc).
+    fn qf_refresh_panel_if_open(&mut self, target: Option<WindowId>) {
+        let Some(&win_id) = self.qf_panel_windows.get(&target) else {
+            return;
+        };
+        if !self.windows.contains_key(&win_id) {
+            return;
+        }
+        let (lines, selected) = match self.qf_get(target) {
+            Some(list) => (Self::qf_format_items(list), list.selected),
+            None => return,
+        };
+        self.qf_refresh_panel_window(win_id, &lines);
+        self.qf_set_panel_cursor(win_id, selected);
     }
 
-    /// Jump to the currently selected quickfix item; return focus to the editor.
-    pub fn quickfix_jump(&mut self) -> EngineAction {
-        if let Some(m) = self.quickfix_items.get(self.quickfix_selected).cloned() {
-            self.quickfix_has_focus = false;
-            self.open_file_in_tab(&m.file.clone());
-            let win_id = self.active_window_id();
+    /// Does `target` have a real `WindowLayout` leaf open for it right now
+    /// (#1307)? `render.rs`'s legacy overlay-band renderer
+    /// (`quickfix_panel_rows`, `compute_editor_layout`, `build_screen_
+    /// layout_with_breadcrumb_row`'s `screen.quickfix` builder) calls this
+    /// to self-suppress for a target that already has a real window —
+    /// painting both at once would double up the same content in two
+    /// places. Any caller that still drives `QuickfixList::open`/
+    /// `has_focus` directly (most of this codebase's own rendering tests,
+    /// and `qf_set_list`'s implicit `:grep` auto-open) never populates
+    /// `qf_panel_windows`, so this stays `false` for them and the overlay
+    /// keeps rendering exactly as it always has.
+    pub fn qf_has_real_window(&self, target: Option<WindowId>) -> bool {
+        self.qf_panel_windows
+            .get(&target)
+            .is_some_and(|id| self.windows.contains_key(id))
+    }
+
+    /// The window id `execute_command`'s `:l*` family should pass as
+    /// `qf_get`'s `win` — ordinarily just the active window, *except* when
+    /// the active window is itself a location-list panel window (#1307): a
+    /// real Neovim location-list window keeps a hidden reference to the
+    /// window it was opened for (`getloclist(0, {'filewinid': 0})`), so
+    /// `:lclose`/`:lnext`/... typed *while inside* the panel still target
+    /// that owner, not the panel window itself. Every `:l*` ex-command
+    /// handler in `execute.rs` calls this instead of `active_window_id()`
+    /// directly.
+    pub(crate) fn qf_loc_target_window(&self) -> WindowId {
+        match self.qf_panel_target(self.active_window_id()) {
+            Some(Some(owner)) => owner,
+            _ => self.active_window_id(),
+        }
+    }
+
+    /// If `id` is a quickfix/location-list panel window (#1307), the list it
+    /// targets (`qf_get`'s `win` shape: `None` = global, `Some(owner)` =
+    /// window `owner`'s location list). `None` if `id` isn't a panel window.
+    pub(crate) fn qf_panel_target(&self, id: WindowId) -> Option<Option<WindowId>> {
+        self.qf_panel_windows
+            .iter()
+            .find(|(_, &w)| w == id)
+            .map(|(&target, _)| target)
+    }
+
+    /// Undo `qf_open`'s bookkeeping when `window_id` — possibly a quickfix/
+    /// location-list panel window (#1307) — is removed from `self.windows`
+    /// through *any* window-close path, not just `qf_close`/
+    /// `qf_close_panel_window` (`CTRL-W q`/`CTRL-W c` on a focused panel
+    /// window, `:only`, closing its owning tab/group, a diff-pair cleanup,
+    /// ...). Every one of those already removes the window correctly on its
+    /// own — a panel window is now an entirely ordinary `Window`/
+    /// `WindowLayout` leaf — so this only keeps `QuickfixList::open`/
+    /// `has_focus` from lying about a window that no longer exists, and
+    /// drops the now-stale `qf_panel_windows` entry. A no-op for any id that
+    /// isn't a panel window (the overwhelmingly common case, since
+    /// `qf_panel_windows` rarely holds more than one or two entries).
+    pub(crate) fn forget_closed_panel_window(&mut self, window_id: WindowId) {
+        if let Some(target) = self.qf_panel_target(window_id) {
+            self.qf_panel_windows.remove(&target);
+            let list = self.qf_get_mut(target);
+            list.open = false;
+            list.has_focus = false;
+        }
+    }
+
+    /// Open the target panel and give it focus.
+    ///
+    /// #1283 finding, confirmed by hand against `nvim --headless -u NONE`:
+    /// `:copen` opens the quickfix window **unconditionally** — even on a
+    /// totally empty list (`winnr('$')` goes 1 -> 2, no error) — so the
+    /// global list (`win == None`, which always exists per `qf_get`) must
+    /// never refuse here. `:lopen` only refuses when the *window has never
+    /// had a location list at all* (`E776: No location list`); once one
+    /// exists — even populated with zero items via `setloclist(0, [])` —
+    /// `:lopen` opens it exactly like `:copen`. `qf_get` (read-only, no
+    /// autovivify) is what distinguishes "never created" from "empty",
+    /// unlike `qf_get_mut`'s `entry(..).or_default()` this used to check
+    /// against, which collapsed both into the same wrong refusal.
+    ///
+    /// #1307: also opens (or reuses) the panel's real `WindowLayout` leaf
+    /// (`qf_ensure_panel_window`) — the reason `:copen`/`:lopen` are the
+    /// entry points that get a real window at all, unlike `qf_set_list`'s
+    /// implicit auto-open, which only flips the flags below.
+    pub fn qf_open(&mut self, win: Option<WindowId>) -> EngineAction {
+        if win.is_some() && self.qf_get(win).is_none() {
+            self.message = Self::qf_empty_msg(win);
+            return EngineAction::None;
+        }
+        let lines = Self::qf_format_items(self.qf_get(win).expect("checked above"));
+        let scratch_name = if win.is_some() {
+            "[Location List]"
+        } else {
+            "[Quickfix List]"
+        };
+        self.qf_ensure_panel_window(win, &lines, scratch_name);
+        let list = self.qf_get_mut(win);
+        list.open = true;
+        list.has_focus = true;
+        EngineAction::None
+    }
+
+    /// Close the target panel, including its real `WindowLayout` leaf if one
+    /// is open (#1307).
+    pub fn qf_close(&mut self, win: Option<WindowId>) -> EngineAction {
+        self.qf_close_panel_window(win);
+        let list = self.qf_get_mut(win);
+        list.open = false;
+        list.has_focus = false;
+        EngineAction::None
+    }
+
+    /// `:cwindow`/`:lwindow` — open the panel only if the target list is
+    /// non-empty; close it (if open) otherwise.
+    ///
+    /// #1283 finding: `:cwindow` never errors (the global list always
+    /// exists), matching the pre-existing behaviour below. But `:lwindow`
+    /// on a window with **no location list at all** does error (`E776: No
+    /// location list`, confirmed against a live oracle) rather than silently
+    /// no-op like it does once a list exists (even an empty one, via
+    /// `setloclist(0, [])`) — the same "never created" vs "empty" split as
+    /// `qf_open` above, so it needs the same `qf_get` (not `qf_get_mut`)
+    /// existence check first.
+    pub fn qf_window(&mut self, win: Option<WindowId>) -> EngineAction {
+        if win.is_some() && self.qf_get(win).is_none() {
+            self.message = Self::qf_empty_msg(win);
+            return EngineAction::None;
+        }
+        let empty = self.qf_get_mut(win).items.is_empty();
+        if empty {
+            self.qf_close_panel_window(win);
+            let list = self.qf_get_mut(win);
+            list.open = false;
+            list.has_focus = false;
+        } else {
+            let lines = Self::qf_format_items(self.qf_get(win).expect("checked above"));
+            let scratch_name = if win.is_some() {
+                "[Location List]"
+            } else {
+                "[Quickfix List]"
+            };
+            self.qf_ensure_panel_window(win, &lines, scratch_name);
+            let list = self.qf_get_mut(win);
+            list.open = true;
+            list.has_focus = true;
+        }
+        EngineAction::None
+    }
+
+    /// Move to the next entry and jump to it.
+    ///
+    /// #1283 finding: on an empty (or, for a location list, altogether
+    /// absent) target, real Neovim's `:cnext`/`:lnext` refuse with an
+    /// explicit error (`E42: No Errors` / `E776: No location list`) rather
+    /// than silently doing nothing. Before this fix `qf_jump` still declined
+    /// to move (there is no item at index 0 of an empty `Vec`), so the
+    /// buffer/cursor-only oracle `Case` harness could not see the gap — only
+    /// `engine.message` can, which is why this is paired with an
+    /// engine-level test rather than relying on a `Case` alone (same
+    /// precedent as `ex:cc on empty quickfix list`, #1154).
+    pub fn qf_next(&mut self, win: Option<WindowId>) -> EngineAction {
+        if self.qf_get(win).is_none_or(|l| l.items.is_empty()) {
+            self.message = Self::qf_empty_msg(win);
+            return EngineAction::None;
+        }
+        let list = self.qf_get_mut(win);
+        let max = list.items.len().saturating_sub(1);
+        list.selected = (list.selected + 1).min(max);
+        self.qf_jump(win)
+    }
+
+    /// Move to the previous entry and jump to it. See [`Engine::qf_next`]'s
+    /// #1283 doc comment — same empty/absent-list refusal.
+    pub fn qf_prev(&mut self, win: Option<WindowId>) -> EngineAction {
+        if self.qf_get(win).is_none_or(|l| l.items.is_empty()) {
+            self.message = Self::qf_empty_msg(win);
+            return EngineAction::None;
+        }
+        let list = self.qf_get_mut(win);
+        list.selected = list.selected.saturating_sub(1);
+        self.qf_jump(win)
+    }
+
+    /// Jump to a specific entry by index (0-based, clamped to the list).
+    pub fn qf_go(&mut self, win: Option<WindowId>, idx: usize) -> EngineAction {
+        let list = self.qf_get_mut(win);
+        list.selected = idx.min(list.items.len().saturating_sub(1));
+        self.qf_jump(win)
+    }
+
+    /// Jump to the currently selected entry; return focus to the editor.
+    ///
+    /// The global quickfix list opens each entry in a new tab
+    /// (`open_file_in_tab`) since it isn't bound to any one window. A
+    /// location list *is* bound to a window, so navigating it must reuse
+    /// that window (`open_file_in_window`) — otherwise each jump would open
+    /// a fresh tab/window and `self.active_window_id()` would drift away
+    /// from the window the list actually belongs to (#1155).
+    pub fn qf_jump(&mut self, win: Option<WindowId>) -> EngineAction {
+        let item = {
+            let list = self.qf_get_mut(win);
+            list.items.get(list.selected).cloned()
+        };
+        if let Some(m) = item {
+            self.qf_get_mut(win).has_focus = false;
+            let win_id = match win {
+                None => {
+                    self.open_file_in_tab(&m.file.clone());
+                    self.active_window_id()
+                }
+                Some(w) => {
+                    self.open_file_in_window(w, &m.file.clone());
+                    w
+                }
+            };
             self.set_cursor_for_window(win_id, m.line, m.col);
             self.ensure_cursor_visible();
         }
+        // #1307: the panel window (if open) stays open after a jump — real
+        // Neovim leaves the quickfix window in place after `<CR>` too — but
+        // its own cursor should still land on the entry that was just
+        // jumped to, so tabbing back into it later starts on the right row.
+        self.qf_refresh_panel_if_open(win);
         EngineAction::None
     }
 
-    /// Run a grep search and populate the quickfix list.
-    pub fn run_quickfix_grep(&mut self, pattern: &str, cwd: PathBuf) -> EngineAction {
+    /// Run a grep search and populate the target list (`:grep`/`:vimgrep`
+    /// for the global list, `:lgrep`/`:lvimgrep` for the active window's
+    /// location list).
+    pub fn qf_run_grep(
+        &mut self,
+        win: Option<WindowId>,
+        pattern: &str,
+        cwd: PathBuf,
+    ) -> EngineAction {
         if pattern.is_empty() {
             self.message = "Usage: :grep <pattern>".to_string();
             return EngineAction::None;
@@ -2338,14 +2687,7 @@ impl Engine {
         match project_search::search_in_project(&cwd, pattern, &opts) {
             Ok(results) => {
                 let n = results.len();
-                self.quickfix_items = results;
-                self.quickfix_selected = 0;
-                self.quickfix_open = true;
-                // Focus the panel so j/k/Enter drive the result list
-                // immediately — matches VimCode's other "open panel"
-                // commands (:copen) and the UX convention users expect
-                // after an interactive search.
-                self.quickfix_has_focus = n > 0;
+                self.qf_set_list(win, results);
                 self.message = format!("{} match{}", n, if n == 1 { "" } else { "es" });
             }
             Err(e) => {
@@ -2355,30 +2697,114 @@ impl Engine {
         EngineAction::None
     }
 
-    /// Route a key press when the quickfix panel has focus.
-    pub fn handle_quickfix_key(&mut self, key_name: &str, ctrl: bool) -> EngineAction {
+    /// `:clist`/`:llist` — print every entry in the target list, marking
+    /// the currently selected one.
+    pub fn qf_list_cmd(&mut self, win: Option<WindowId>) -> EngineAction {
+        let list = self.qf_get_mut(win);
+        if list.items.is_empty() {
+            self.message = Self::qf_empty_msg(win);
+            return EngineAction::None;
+        }
+        let lines: Vec<String> = list
+            .items
+            .iter()
+            .enumerate()
+            .map(|(i, m)| {
+                let marker = if i == list.selected { ">" } else { " " };
+                let file = m.file.display();
+                let text = m.line_text.trim();
+                if text.is_empty() {
+                    format!("{marker}{:>3} {file}:{}:{}", i + 1, m.line + 1, m.col + 1)
+                } else {
+                    format!(
+                        "{marker}{:>3} {file}:{}:{}: {text}",
+                        i + 1,
+                        m.line + 1,
+                        m.col + 1
+                    )
+                }
+            })
+            .collect();
+        self.message = lines.join("\n");
+        EngineAction::None
+    }
+
+    /// `:cdo`/`:cfdo`/`:ldo`/`:lfdo` — run an ex command once per entry
+    /// (`per_file = false`) or once per distinct file, in first-seen order
+    /// (`per_file = true`), jumping to each one first like `:cc`/`:ll`.
+    pub fn qf_do(&mut self, win: Option<WindowId>, cmd: &str, per_file: bool) -> EngineAction {
+        if cmd.trim().is_empty() {
+            self.message = "E471: Argument required".to_string();
+            return EngineAction::None;
+        }
+        // #1308: unlike `:cc`/`:cnext`/`:clist`/`:cfirst`/`:clast`, real
+        // Neovim's `:cdo`/`:cfdo`/`:ldo`/`:lfdo` are a silent no-op on an
+        // empty list — confirmed against a live `nvim --headless -u NONE`
+        // oracle. `pcall` succeeds and `v:errmsg` stays empty, so this must
+        // NOT set `Self::qf_empty_msg` like the other list-empty checks do.
+        let items = match self.qf_get(win) {
+            Some(list) if !list.items.is_empty() => list.items.clone(),
+            _ => {
+                return EngineAction::None;
+            }
+        };
+        let mut seen_files = std::collections::HashSet::new();
+        let mut count = 0usize;
+        for (idx, item) in items.iter().enumerate() {
+            if per_file && !seen_files.insert(item.file.clone()) {
+                continue;
+            }
+            self.qf_get_mut(win).selected = idx;
+            self.qf_jump(win);
+            self.execute_command(cmd);
+            count += 1;
+        }
+        self.message = format!(
+            "{count} {}",
+            if per_file {
+                "file(s)"
+            } else {
+                "quickfix entries"
+            }
+        );
+        EngineAction::None
+    }
+
+    /// Route a key press when the target panel has keyboard focus.
+    pub fn qf_handle_key(
+        &mut self,
+        win: Option<WindowId>,
+        key_name: &str,
+        ctrl: bool,
+    ) -> EngineAction {
         match key_name {
-            "Escape" | "q" => self.close_quickfix(),
+            "Escape" | "q" => self.qf_close(win),
             "Return" => {
-                self.quickfix_jump();
+                self.qf_jump(win);
                 EngineAction::None
             }
             "Down" | "j" => {
-                self.quickfix_selected =
-                    (self.quickfix_selected + 1).min(self.quickfix_items.len().saturating_sub(1));
+                let list = self.qf_get_mut(win);
+                list.selected = (list.selected + 1).min(list.items.len().saturating_sub(1));
+                self.qf_refresh_panel_if_open(win);
                 EngineAction::None
             }
             "Up" | "k" => {
-                self.quickfix_selected = self.quickfix_selected.saturating_sub(1);
+                let list = self.qf_get_mut(win);
+                list.selected = list.selected.saturating_sub(1);
+                self.qf_refresh_panel_if_open(win);
                 EngineAction::None
             }
             "n" if ctrl => {
-                self.quickfix_selected =
-                    (self.quickfix_selected + 1).min(self.quickfix_items.len().saturating_sub(1));
+                let list = self.qf_get_mut(win);
+                list.selected = (list.selected + 1).min(list.items.len().saturating_sub(1));
+                self.qf_refresh_panel_if_open(win);
                 EngineAction::None
             }
             "p" if ctrl => {
-                self.quickfix_selected = self.quickfix_selected.saturating_sub(1);
+                let list = self.qf_get_mut(win);
+                list.selected = list.selected.saturating_sub(1);
+                self.qf_refresh_panel_if_open(win);
                 EngineAction::None
             }
             _ => EngineAction::None,

@@ -58,16 +58,11 @@ pub fn cargo_bin_probe_ok(path: &Path, binary: &str) -> bool {
     }
 
     // Quick probe: run `<binary> --version` and check for a successful exit.
-    let mut cmd = std::process::Command::new(path);
+    let mut cmd = crate::core::git::hidden_command(path);
     cmd.arg("--version")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
-    #[cfg(target_os = "windows")]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
-    }
     match cmd.output() {
         Ok(output) => {
             if output.status.success() {
@@ -318,9 +313,70 @@ fn mason_bin_dir() -> Option<PathBuf> {
     }
 }
 
+/// Homebrew formulas that are **keg-only** — Homebrew does not symlink their
+/// binaries into `<prefix>/bin`, so the binary a manifest names doesn't match
+/// the formula that ships it. `clangd` ships in the `llvm` formula, which is
+/// keg-only because symlinking it into the prefix would shadow the
+/// system-provided `/usr/bin/clang` (#917). Extend this list if another
+/// registry extension's `install_macos` hits the same problem.
+///
+/// Not `#[cfg(macos)]`-gated: it's inert data, and leaving it compiled on
+/// every target lets the `VIMCODE_TEST_HOMEBREW_PREFIXES` test override (see
+/// `homebrew_prefixes()`) exercise the exact same keg-only probe on any host
+/// OS instead of a duplicated copy.
+const HOMEBREW_KEG_ONLY_FORMULAS: &[(&str, &str)] = &[("clangd", "llvm")];
+
+/// Homebrew prefix directories to probe for LSP/DAP binaries (#917).
+///
+/// A native macOS `.app` launched from Finder/Dock/launchd gets launchd's
+/// minimal PATH, which contains neither Homebrew prefix — Apple Silicon
+/// symlinks into `/opt/homebrew`, Intel Macs into `/usr/local`. `brew
+/// --prefix` is authoritative but costs a subprocess spawn on every LSP
+/// resolve; checking both fixed candidates with a stat is cheap and covers
+/// both architectures (only one will ever exist on a given machine).
+///
+/// On non-macOS targets this returns an empty list — Windows/Linux discovery
+/// order is intentionally unchanged by #917.
+///
+/// The `VIMCODE_TEST_HOMEBREW_PREFIXES` environment variable overrides the
+/// probed prefixes with a `PATH`-style (`:`-separated) list of directories,
+/// on **every** target including macOS. That override exists solely so
+/// `tests/extensions.rs` can drive this resolution logic against a fake
+/// Homebrew layout without touching (or depending on the contents of) a real
+/// `/opt/homebrew`; real builds never set it.
+///
+/// #918 follow-up: the override used to be `cfg(not(macos))`-gated, which
+/// meant the two `resolve_command_finds_*_homebrew_*` tests silently probed
+/// the host's *real* Homebrew prefixes when the suite ran on a Mac and could
+/// never pass there (the fake prefix was ignored; `clangd` resolved to
+/// `/usr/bin/clangd`). The override is deliberately *exclusive* — when set,
+/// the real prefixes are not probed — so a test can assert on exactly the
+/// layout it created.
+fn homebrew_prefixes() -> Vec<PathBuf> {
+    if let Some(val) = std::env::var_os("VIMCODE_TEST_HOMEBREW_PREFIXES") {
+        return std::env::split_paths(&val).filter(|p| p.is_dir()).collect();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        ["/opt/homebrew", "/usr/local"]
+            .into_iter()
+            .map(PathBuf::from)
+            .filter(|p| p.is_dir())
+            .collect()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Vec::new()
+    }
+}
+
 /// Resolve a command to an absolute path.
 /// Checks Mason bin directory first (if it exists), then falls back to PATH.
-fn resolve_command(cmd: &str) -> Option<PathBuf> {
+///
+/// `pub` (rather than crate-private) specifically so `tests/extensions.rs`
+/// — a separate integration-test crate — can drive it directly for #917's
+/// black-box Homebrew-resolution coverage.
+pub fn resolve_command(cmd: &str) -> Option<PathBuf> {
     // Split on whitespace to get just the binary name
     let binary = cmd.split_whitespace().next().unwrap_or(cmd);
 
@@ -335,13 +391,24 @@ fn resolve_command(cmd: &str) -> Option<PathBuf> {
     // Check common tool directories that may not be in PATH when launched
     // from a desktop environment (not a login shell).
     let home = super::paths::home_dir();
-    let tool_dirs = [
+    let mut tool_dirs = vec![
         home.join(".dotnet/tools"),
         home.join(".cargo/bin"),
         home.join(".local/bin"),
         home.join("go/bin"),
         home.join(".npm-global/bin"),
     ];
+    // #917: Homebrew prefixes (macOS only — see `homebrew_prefixes()`).
+    for prefix in homebrew_prefixes() {
+        tool_dirs.push(prefix.join("bin"));
+        // Keg-only formulas (e.g. clangd/llvm) never reach `<prefix>/bin`;
+        // probe `<prefix>/opt/<formula>/bin` too.
+        for (kegged_binary, formula) in HOMEBREW_KEG_ONLY_FORMULAS {
+            if *kegged_binary == binary {
+                tool_dirs.push(prefix.join("opt").join(formula).join("bin"));
+            }
+        }
+    }
     for dir in &tool_dirs {
         let candidate = dir.join(binary);
         if candidate.exists() && cargo_bin_probe_ok(&candidate, binary) {
@@ -363,13 +430,8 @@ fn resolve_command(cmd: &str) -> Option<PathBuf> {
     #[cfg(not(target_os = "windows"))]
     let which_cmd = "which";
 
-    let mut cmd = std::process::Command::new(which_cmd);
+    let mut cmd = crate::core::git::hidden_command(which_cmd);
     cmd.arg(binary);
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
-    }
     let output = cmd.output().ok()?;
     if output.status.success() {
         let path_str = String::from_utf8_lossy(&output.stdout);
@@ -387,6 +449,44 @@ fn resolve_command(cmd: &str) -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// Build the actionable "missing prerequisite" error message for a manifest,
+/// given the dependency names that failed to resolve on PATH.
+///
+/// Pulled out of `ensure_server_for_language` as a pure function (no PATH
+/// access) so tests can drive the message-building logic directly with a
+/// synthetic `missing` list instead of depending on which of `npm`,
+/// `dotnet`, `go`, etc. happen to be installed on the machine running the
+/// test suite (#918) — mirrors the `install_cmd_with(rustup_available:
+/// bool)` split already used in `extensions.rs` for the same reason.
+///
+/// `pub` (rather than crate-private) so `tests/extensions.rs` — a separate
+/// integration-test crate — can call it directly.
+pub fn missing_dependency_message(
+    manifest: &extensions::ExtensionManifest,
+    missing: &[&str],
+) -> String {
+    let name = manifest.display_or_name();
+    // #918: naming the missing binary alone ("requires npm — install npm
+    // and try again") tells the user what's missing but not what to
+    // actually run. Attach a runnable, platform-specific command for the
+    // prerequisites shared across the registry (npm, dotnet, go, gem,
+    // cargo, rustup); fall back to the old generic phrasing for any
+    // dependency name outside that table.
+    let hints: Vec<String> = missing
+        .iter()
+        .map(|dep| match extensions::prereq_install_cmd(dep) {
+            Some(cmd) => format!("{dep}: {cmd}"),
+            None => format!("install {dep} and try again"),
+        })
+        .collect();
+    format!(
+        "{} requires {} — {}",
+        name,
+        missing.join(", "),
+        hints.join("; ")
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -691,17 +791,7 @@ impl LspManager {
                 .map(|s| s.as_str())
                 .collect();
             if !missing.is_empty() {
-                let name = if manifest.display_name.is_empty() {
-                    &manifest.name
-                } else {
-                    &manifest.display_name
-                };
-                self.last_start_error = Some(format!(
-                    "{} requires {} — install {} and try again",
-                    name,
-                    missing.join(", "),
-                    missing.join(", "),
-                ));
+                self.last_start_error = Some(missing_dependency_message(manifest, &missing));
                 return None;
             }
         }
@@ -744,12 +834,38 @@ impl LspManager {
                     extensions::find_manifest_for_language_id(&self.ext_manifests, language_id)
                 {
                     let install_cmd = manifest.lsp.install_cmd_for_platform();
-                    if !install_cmd.is_empty() && !manifest.lsp.binary.is_empty() {
-                        self.last_start_error = Some(format!(
-                            "{} not found. Run: {}",
-                            manifest.lsp.binary, install_cmd
-                        ));
-                    }
+                    let name = manifest.display_or_name();
+                    self.last_start_error = Some(if !install_cmd.is_empty() {
+                        // #918 review follow-up: branch only on `install_cmd`
+                        // being present, not also on `manifest.lsp.binary`
+                        // being non-empty. The old `&&` condition discarded a
+                        // real, resolvable install command whenever a
+                        // manifest happened to have an empty `lsp.binary`
+                        // field, silently falling to the generic "no install
+                        // command" message below even though one *was*
+                        // known. Fall back to the extension's display name
+                        // for the "not found" label in that edge case
+                        // instead of printing an empty binary name.
+                        let binary_label = if manifest.lsp.binary.is_empty() {
+                            name
+                        } else {
+                            manifest.lsp.binary.as_str()
+                        };
+                        format!("{binary_label} not found. Run: {install_cmd}")
+                    } else {
+                        // #918: previously this branch fell through to
+                        // `return None` with `last_start_error` left
+                        // untouched, so the user saw the generic "No
+                        // LSP server found" with no hint an extension
+                        // was even involved (`java` hits this on every
+                        // platform — no install command anywhere in
+                        // its manifest). Always name the extension and
+                        // say plainly that it has no installer here.
+                        format!(
+                            "{name} extension declares no LSP install command for this \
+                             platform — install its language server manually."
+                        )
+                    });
                 }
                 return None;
             }
@@ -802,19 +918,21 @@ impl LspManager {
                 std::env::var("PATH").unwrap_or_else(|_| "(unset)".into()),
             ));
 
-            // Run via shell so npm/pip/dotnet etc. resolve from user PATH
-            #[cfg(target_os = "windows")]
-            let result = {
-                use std::os::windows::process::CommandExt;
-                std::process::Command::new("cmd")
-                    .args(["/C", &install_cmd])
-                    .creation_flags(0x08000000) // CREATE_NO_WINDOW
-                    .output()
-            };
-            #[cfg(not(target_os = "windows"))]
-            let result = std::process::Command::new("sh")
-                .args(["-c", &install_cmd])
-                .output();
+            // Run via shell so npm/pip/dotnet etc. resolve from user PATH.
+            // `shell_command()` (quadraui#970) picks `sh -c` vs `cmd /C` —
+            // this used to be a hand-rolled cfg split duplicating that same
+            // decision; #948 collapsed it into the shared seam. The only
+            // platform-specific bit left is hiding the console window on
+            // Windows, which has no portable equivalent.
+            //
+            // #948 review (non-blocking): no dedicated regression test for
+            // this call site — same identical `shell_command()` pattern
+            // already covered by `:!`'s tests, so a future divergence here
+            // wouldn't be caught by this PR's tests.
+            let (shell, flag) = crate::core::terminal::shell_command();
+            let mut command = crate::core::git::hidden_command(&shell);
+            command.args([&flag, &install_cmd]);
+            let result = command.output();
 
             match result {
                 Ok(out) => {

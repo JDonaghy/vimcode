@@ -32,6 +32,16 @@ pub struct View {
     /// Closed fold regions for this window, sorted by `start`, non-overlapping.
     /// Folds are ephemeral (not persisted to session).
     pub folds: Vec<FoldRegion>,
+    /// Every fold region ever defined for this window, open or closed —
+    /// Vim's actual fold hierarchy (`:h folds`). Closing a fold (`zc`/`zf`)
+    /// both defines it here and adds it to `folds`; opening it (`zo`) only
+    /// removes it from `folds`, keeping the definition so a later `zc`
+    /// recloses the *same* region instead of losing it. Before this field
+    /// existed, `open_fold` deleted the region outright, so `zf{motion}` on
+    /// text with no indent structure (nothing for `detect_fold_range` to
+    /// rediscover) round-tripped `zo` into a fold `zc` could never reclose
+    /// (#1006).
+    pub fold_defs: Vec<FoldRegion>,
     /// In aligned-diff view, the aligned-row index this window's render
     /// should start at. Set by `sync_scroll_binds`; cleared when the
     /// window leaves aligned-diff mode (via `clear_diff_alignment`).
@@ -55,6 +65,7 @@ impl View {
             scroll_left: 0,
             viewport_cols: 80, // sensible default, overridden by UI
             folds: Vec::new(),
+            fold_defs: Vec::new(),
             aligned_top: None,
         }
     }
@@ -71,40 +82,103 @@ impl View {
         self.folds.iter().find(|f| f.start == line_idx)
     }
 
-    /// Close a fold spanning `start..=end`.
-    /// Merges or discards any existing overlapping folds to keep `folds` sorted
-    /// and non-overlapping.
+    /// Record `start..=end` in the fold hierarchy without changing whether
+    /// anything is currently closed. A no-op if the exact region is already
+    /// defined (nested/overlapping regions are otherwise allowed — Vim folds
+    /// nest).
+    pub fn define_fold(&mut self, start: usize, end: usize) {
+        if end <= start {
+            return;
+        }
+        if self
+            .fold_defs
+            .iter()
+            .any(|f| f.start == start && f.end == end)
+        {
+            return;
+        }
+        let pos = self.fold_defs.partition_point(|f| f.start < start);
+        self.fold_defs.insert(pos, FoldRegion { start, end });
+    }
+
+    /// The innermost defined fold (open or closed) containing `line_idx`,
+    /// i.e. the region `zc`/`za` would close when the cursor sits anywhere
+    /// inside it. `None` if no fold is defined there at all.
+    pub fn enclosing_fold_def(&self, line_idx: usize) -> Option<&FoldRegion> {
+        self.fold_defs
+            .iter()
+            .filter(|f| f.start <= line_idx && line_idx <= f.end)
+            .min_by_key(|f| f.end - f.start)
+    }
+
+    /// The outermost *closed* fold containing `line_idx`, if any — mirrors
+    /// Vim's `foldclosed()` (which reports the outermost, not a nested
+    /// one). Used to extend a linewise command's range when it touches a
+    /// closed fold, e.g. `dd`/`yy` on a closed fold's header apply to every
+    /// line inside it (`:h fold-behavior`, #1006).
+    pub fn enclosing_closed_fold(&self, line_idx: usize) -> Option<&FoldRegion> {
+        self.folds
+            .iter()
+            .filter(|f| f.start <= line_idx && line_idx <= f.end)
+            .max_by_key(|f| f.end - f.start)
+    }
+
+    /// Close a fold spanning `start..=end`, keeping `folds` sorted by
+    /// `start`. Also records the region in `fold_defs` (#1006) so a later
+    /// `zo` then `zc` recloses exactly this region.
+    ///
+    /// Deliberately does **not** drop an existing closed fold that's fully
+    /// contained in the new one (an earlier version did, to keep `folds`
+    /// tidy) — closing a *nested* fold's parent must not silently reopen
+    /// the child. Verified against `nvim --headless`: opening a closed
+    /// outer fold with a closed inner fold still inside leaves the inner
+    /// one closed (#1006) — `foldclosed()` on an inner line still reports
+    /// the inner range. Losing the inner entry when the outer closed broke
+    /// exactly that. Multiple overlapping closed entries are fine:
+    /// `is_line_hidden` only needs *any* of them to match, and
+    /// `next_visible_line`/`prev_visible_line` below take the outermost
+    /// (widest) match rather than the first one found.
     pub fn close_fold(&mut self, start: usize, end: usize) {
         if end <= start {
             return;
         }
-        // Remove any folds that are fully contained within the new region.
-        self.folds.retain(|f| !(f.start >= start && f.end <= end));
-        // Insert the new fold in sorted order.
+        self.define_fold(start, end);
+        if self.folds.iter().any(|f| f.start == start && f.end == end) {
+            return;
+        }
         let pos = self.folds.partition_point(|f| f.start < start);
         self.folds.insert(pos, FoldRegion { start, end });
     }
 
-    /// Open (remove) the fold whose header is `start`.
+    /// Open (remove) the fold whose header is `start`. The definition is
+    /// kept in `fold_defs` — only its closed/open display state changes
+    /// (#1006).
     pub fn open_fold(&mut self, start: usize) {
         self.folds.retain(|f| f.start != start);
     }
 
-    /// Remove all folds in this window.
+    /// Remove all folds in this window. Definitions are kept (`zR` doesn't
+    /// forget folds, it just opens them — #1006).
     pub fn open_all_folds(&mut self) {
         self.folds.clear();
     }
 
-    /// Remove the fold whose header is `start`. Returns `true` if found.
+    /// Remove the fold whose header is `start`, permanently (both its closed
+    /// state and its definition). Returns `true` if found.
     pub fn delete_fold_at(&mut self, start: usize) -> bool {
         let len = self.folds.len();
         self.folds.retain(|f| f.start != start);
-        self.folds.len() < len
+        let def_len = self.fold_defs.len();
+        self.fold_defs.retain(|f| f.start != start);
+        len != self.folds.len() || def_len != self.fold_defs.len()
     }
 
-    /// Remove all folds whose headers fall within `start..=end`.
+    /// Remove all folds whose headers fall within `start..=end`, permanently
+    /// (both closed state and definition).
     pub fn delete_folds_in_range(&mut self, start: usize, end: usize) {
         self.folds.retain(|f| !(f.start >= start && f.start <= end));
+        self.fold_defs
+            .retain(|f| !(f.start >= start && f.start <= end));
     }
 
     /// Open (remove) all folds whose headers fall within `start..=end`.
@@ -119,9 +193,19 @@ impl View {
         let mut remaining = count;
         while remaining > 0 && line < max_line {
             line += 1;
-            // If we landed inside a fold body, jump past it
-            if let Some(f) = self.folds.iter().find(|f| line > f.start && line <= f.end) {
-                line = f.end + 1;
+            // If we landed inside a fold body, jump past it. Several closed
+            // folds can contain the same line when they're nested (#1006) —
+            // take the outermost (largest `end`), not just the first match,
+            // or a nested fold's own end would land the cursor back inside
+            // its still-closed parent.
+            if let Some(end) = self
+                .folds
+                .iter()
+                .filter(|f| line > f.start && line <= f.end)
+                .map(|f| f.end)
+                .max()
+            {
+                line = end + 1;
             }
             if line > max_line {
                 return max_line;
@@ -138,9 +222,16 @@ impl View {
         let mut remaining = count;
         while remaining > 0 && line > 0 {
             line -= 1;
-            // If we landed inside a fold body, jump to the fold header
-            if let Some(f) = self.folds.iter().find(|f| line > f.start && line <= f.end) {
-                line = f.start;
+            // If we landed inside a fold body, jump to the fold header —
+            // outermost (smallest `start`) match, see `next_visible_line`.
+            if let Some(start) = self
+                .folds
+                .iter()
+                .filter(|f| line > f.start && line <= f.end)
+                .map(|f| f.start)
+                .min()
+            {
+                line = start;
             }
             remaining -= 1;
         }

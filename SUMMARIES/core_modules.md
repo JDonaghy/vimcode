@@ -97,15 +97,26 @@ Lua 5.4 plugin manager (mlua 0.9).
 - `call_command(name, args, ctx)` / `call_event(event, ctx)` / `call_keymap(mode, key, ctx)` — dispatch
 - `setup_vimcode_api(lua)` — register `vimcode.*` Lua globals
 
-## buffer_manager.rs — 908 lines
+## buffer_manager.rs — 1,571 lines
 Buffer storage and management.
 ### Types
 - `BufferManager` — `HashMap<BufferId, BufferState>` wrapper
-- `BufferState` — buffer content (Ropey rope), file path, dirty flag, syntax tree, undo/redo stacks, git diff, semantic tokens, diff label
+- `BufferState` — buffer content (Ropey rope), file path, dirty flag, syntax tree, undo tree, git diff, semantic tokens, diff label
 - `Buffer` — Ropey rope wrapper with line/char accessors
+- `UndoTree` / `UndoNode` (#1156) — a buffer's full undo history as a tree (not a stack): every edit is a child of the node you were on, so `u` + a new edit starts a branch instead of discarding the old one. Each node stores the *full* post-edit buffer text (like the old `undo_timeline` did) rather than a diff, so jumping to any node — including across branches — is just "copy the text". `seq`-ordered traversal (`older`/`newer`/`at_or_before`/`at_or_after`) backs `g-`/`g+`/`:earlier`/`:later`; `merge_since` backs `:undojoin` and the `:g`/`:normal {range}`/`:folddo*` "these sub-edits are one undo step" merge
 ### Key Functions
 - `BufferManager::create(path)` / `get(id)` / `get_mut(id)` / `remove(id)`
 - `BufferState::from_text(text)` / `from_file(path)` — buffer creation
+- `BufferState::start_undo_group(cursor)` / `record_insert`/`record_delete` / `finish_undo_group(cursor_after)` — accumulate then commit one undo-tree node
+- `BufferState::undo()` / `redo()` / `undo_older()` (`g-`) / `undo_newer()` (`g+`) / `undo_at_or_before(time)` / `undo_at_or_after(time)` (`:earlier`/`:later`) / `undo_position()` (`:undolist`'s `#N/M`) / `merge_undo_since(mark)` (`:undojoin`)
+- `set_undo_levels(n)` / `undo_levels()` — process-wide `'undolevels'` atomic, same pattern as `set_syntax_max_lines`
+
+## undofile.rs — 187 lines (#1156)
+`'undofile'`/`'undodir'` persistence: saves a buffer's `UndoTree` next to its saves, mirroring `swap.rs`'s directory-and-hash convention for where a per-file sidecar lives. Pretty-JSON with a version header; a version mismatch or content that doesn't match what's on disk is discarded rather than loaded.
+### Key Functions
+- `set_enabled(bool)` / `enabled()` / `set_dir(&str)` / `dir()` — process-wide `'undofile'`/`'undodir'` atomics
+- `path_for(canonical_path, undodir)` — per-file undofile path (path separators mangled to `%`)
+- `write(path, tree)` / `read(path)` — atomic write (`.tmp` + rename) / parse; both no-op or return `None` under `cfg!(test)`
 
 ## syntax.rs — 1,703 lines
 Tree-sitter syntax highlighting for 20 languages. Comprehensive highlight queries with 23 capture names: keyword, keyword.control, operator, string, comment, function, function.call, method.call, type, variable, number, boolean, constant, punctuation.bracket, punctuation.delimiter, macro, attribute, lifetime, escape, module, parameter, property, field.
@@ -130,19 +141,60 @@ Spell checking via spellbook (Hunspell format).
 - `suggest(word)` — spelling suggestions
 - `add_word(word)` / `remove_word(word)` — user dictionary management
 
-## extensions.rs — 353 lines
-Bundled extension system.
+## extensions.rs — 819 lines
+Extension manifest data model (fetched from a remote registry; no compiled-in extensions).
 ### Types
-- `BundledExtension` — name + manifest TOML + script files
-- `ExtensionManifest` — parsed extension metadata (name, languages, LSP/DAP config, install commands)
+- `ExtensionManifest` — parsed manifest (name, languages, LSP/DAP config, `board` provider config, install commands)
+- `LspConfig` / `DapConfig` / `CommentConfig` / `ExtSettingDef` — manifest sub-sections
+- `BoardProviderConfig` (#522) — declares an extension as a Board-panel data provider: `refresh_command` argv, `poll_interval_secs`, `actions` map (BoardAction variant name -> argv template with `{id}` substitution). Generic — names no particular provider.
+- `Platform` — testable seam for platform-specific install command resolution
 ### Key Functions
-- `find_by_name(name)` / `find_for_file_ext(ext)` / `find_for_language_id(id)` — extension lookup
-- `BUNDLED` — static array of 12 compiled-in extensions
+- `find_manifest_by_name(name)` / `find_manifest_for_file_ext(ext)` / `find_manifest_for_language_id(id)` — manifest lookup
+- `ExtensionManifest::parse(toml)` / `display_or_name()`
+- `LspConfig::install_cmd_for(platform)` / `DapConfig::install_cmd_for(platform)`
+- `BoardProviderConfig::action_argv(action_name, card_id)` — resolve an action's argv, substituting `{id}`
 
-## settings.rs — 2,206 lines
+## tool_client.rs — 291 lines (#522)
+Generic external-tool JSON seam. No coordinator-specific vocabulary — vimcode is an editor
+that can *host* a pipeline-management client, not one itself.
+### Types
+- `ToolError` — typed failure modes (`EmptyCommand`, `BinaryNotFound`, `Spawn`, `NonZeroExit`, `InvalidJson`), with `user_message()`
+- `ToolClient` trait — `run_json(argv) -> Result<serde_json::Value, ToolError>` (blocking; callers thread it like `Engine::ext_refresh`)
+- `SubprocessToolClient` — real impl, spawns an OS subprocess via `core::git::hidden_command`
+- `MockToolClient` — test impl, returns a canned `Result` with no subprocess spawned
+### Key Functions
+- `fetch_board_model(client, argv)` — run argv and parse stdout into `quadraui::BoardModel` (vimcode's board contract, reused directly from quadraui's `Board` primitive rather than duplicated)
+
+## acp.rs — 959 lines (#951, ACP-0)
+ACP (Agent Client Protocol) transport — NDJSON JSON-RPC 2.0 over a subprocess's stdio, plus
+client<->agent session lifecycle. Foundation of the ACP track (epic #531); no UI here.
+Differs from `lsp.rs` in two load-bearing ways: NDJSON framing (one JSON message per line, no
+`Content-Length`), and agent->client requests are dispatched by method name and **parked**
+(not blanket-answered with `result: null`) via `AcpEvent::ClientRequest` +
+`respond_to_client_request`, answerable later out of band through the same `Arc<Mutex<_>>`
+stdin the reader thread holds.
+### Types
+- `AcpClient` — manages one agent subprocess (spawn, reader thread, stderr ring, shared stdin)
+- `AcpEvent` — `Initialized`, `SessionCreated`, `PromptStopped`, `SessionUpdate`,
+  `ClientRequest`, `RequestFailed`, `AgentExited`
+- `ParsedLine` (private) — pure classification of one NDJSON line (request/notification/response/unusable)
+### Key Functions
+- `AcpClient::spawn(argv, cwd)` / `spawn_with_env(argv, cwd, extra_env)` — start the agent process
+- `initialize()` / `new_session(cwd, mcp_servers)` / `prompt(session_id, blocks)` / `cancel(session_id)` — client->agent calls, protocol version pinned at 1
+- `respond_to_client_request(id, result)` — answer a parked agent->client request
+- `poll()` — non-blocking drain, capped at 50 events/call like `LspManager::poll_events`
+- `classify_line(line)` / `encode_ndjson_line(value)` — pure NDJSON framing helpers
+- `Engine::poll_acp()` (`src/core/engine/acp_ops.rs`) — the one `poll_idle` call site; today only handles `AgentExited` (clears `acp_client`, sets `self.message`)
+### Test fixture
+`tests/fixtures/fake_acp_agent.sh` — deterministic `/bin/sh` NDJSON echo agent (no
+jq/python/node) shared by the whole ACP track; drives initialize -> session/new ->
+session/prompt -> `stopReason: end_turn`, including a scripted mid-turn agent->client request
+that blocks until answered out of band.
+
+## settings.rs — 5,473 lines
 User settings with serde JSON persistence.
 ### Types
-- `Settings` — all user-configurable settings (~40 fields with serde defaults)
+- `Settings` — all user-configurable settings (~90 fields with serde defaults), including `undolevels`/`undofile`/`undodir` (#1156)
 ### Key Functions
 - `Settings::load()` — load from `~/.config/vimcode/settings.json` (returns default in tests)
 - `Settings::save()` — write settings to disk

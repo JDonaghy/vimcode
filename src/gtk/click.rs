@@ -1,647 +1,76 @@
-use super::*;
-use crate::core::engine::EngineAction;
-use crate::core::window::GroupId;
-use crate::core::WindowId;
+//! GTK-only click-context construction. Everything else that used to live
+//! in this file (`pixel_to_click_target`, `handle_mouse_click`,
+//! `handle_mouse_double_click`, `handle_mouse_drag`,
+//! `resolve_tab_right_click`, the tab-bar pixel-geometry helpers, ...) moved
+//! to the backend-neutral `crate::click` (#862) — none of it named a
+//! `gtk4`/`pango` type. Re-exported below so this module's own tests (and
+//! the rest of `crate::gtk`) keep resolving the names unchanged.
 #[cfg(test)]
-use crate::render::Theme;
-use crate::render::{self as render_mod, GutterAction, ScreenZone, WindowZone};
+use gtk4::pango;
+#[cfg(test)]
+use pangocairo::functions as pangocairo;
+
+// Only this file's own `#[cfg(test)]` modules below reach these through
+// `use super::*` (they exercise the moved functions against real headless
+// Pango layouts), so a non-test build sees the re-export as unused.
+#[allow(unused_imports)]
+pub(crate) use crate::click::*;
+
+// The rest of this module is tests only — they exercise the re-exported
+// `crate::click` functions against real headless Pango layouts, which is why
+// this GTK-only file (rather than the neutral `crate::click`) still hosts
+// them. `use super::*` inside each `mod ... tests` pulls these in, mirroring
+// what `use super::*` (of `crate::gtk`) used to provide before #862 moved the
+// production code out.
+#[cfg(test)]
+use crate::core;
+#[cfg(test)]
+use crate::core::engine::EngineAction;
+#[cfg(test)]
+use crate::core::window::GroupId;
+#[cfg(test)]
+use crate::core::Engine;
+#[cfg(test)]
+use crate::gtk::backend;
+#[cfg(test)]
+use crate::render;
+#[cfg(test)]
+use crate::render::{self as render_mod, ScreenZone, Theme};
 #[cfg(test)]
 use std::cell::RefCell;
 #[cfg(test)]
+use std::collections::HashMap;
+#[cfg(test)]
 use std::rc::Rc;
 
-/// Re-export the shared ClickTarget enum.
-pub(crate) use render_mod::ClickTarget;
-
-/// Convert pixel (x, y) to a click target using the cached ScreenLayout from
-/// the last paint pass (#344). Zone detection delegates to the shared
-/// `screen_zone_hit_test` / `window_zone_hit_test` / `resolve_gutter_action`
-/// functions in render.rs so both backends use one source of truth.
+/// Build a throwaway Pango context, fonted with nothing in particular, for
+/// tests that need to hand a `GtkBackend` *some* stored `pango::Context` so
+/// `GtkBackend::editor_col_at_x`'s last-resort `editor_pango_layout()`
+/// fallback (quadraui#971) has something to build a `pango::Layout` from —
+/// `editor_pango_layout()` fonts that layout from the backend's *own*
+/// `editor_font_family`/`editor_font_size_pt` state (set via
+/// `Backend::set_editor_font`), ignoring whatever font description this
+/// context itself carries, so a throwaway context is exactly as good as a
+/// real widget one for that purpose.
 ///
-/// Tab bar inner hit-testing (which specific tab/button) stays here because it
-/// uses Pango-measured pixel slot positions from `draw_tab_bar`.
-///
-/// The text-area column is resolved via `backend.editor_col_at_x` (quadraui,
-/// #420/#560) — the same Pango layout + attributes `draw_editor` painted
-/// with — instead of a bespoke `xy_to_index` reconstruction, so paint and
-/// click can never drift apart again.
-///
-/// `mutate_focus` gates every side effect this function performs purely as a
-/// byproduct of resolving a pixel position — flipping `active_group`/the
-/// active tab, and executing a gutter action (e.g. toggling a breakpoint).
-/// Real clicks (`handle_mouse_click`, `handle_mouse_double_click`, Ctrl+click,
-/// tab-drag-start detection) pass `true`, since landing on a pane or tab
-/// should focus it. `handle_mouse_drag` passes `false`: while a text-selection
-/// drag is held down, the mouse sweeping over a *different* split's tab bar or
-/// gutter must not steal focus or fire actions there — `Engine::mouse_drag`'s
-/// origin-window lock already keeps the selection pinned to the split the
-/// drag started in (#568), but only if this hit-test stays a pure query
-/// during a drag, matching how TUI's drag path (`src/tui_main/mouse.rs`)
-/// never mutates engine focus state either.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn pixel_to_click_target(
-    engine: &mut Engine,
-    backend: &dyn quadraui::Backend,
-    x: f64,
-    y: f64,
-    line_height: f64,
-    char_width: f64,
-    cached_layout: &render::ScreenLayout,
-    // Pixel-accurate per-group tab-bar hit geometry captured from the
-    // rasteriser during `render_content` (via `Backend::tab_bar_layout`). GTK
-    // draws tabs with proportional-font Pango widths, so the char-cell
-    // `hit_regions` on `cached_layout` do NOT match the drawn geometry — clicks
-    // must resolve against these actual pixel bounds. (#515)
-    tab_pixel_hits: &TabPixelHitMap,
-    // Cached `quadraui::FrameHitMap` covering the Editor/TabBar surfaces
-    // painted this frame (#449), plus a `FrameZone::TabBar { idx } -> (GroupId,
-    // rect)` table keyed by the tab bar's *global* surface index (editors are
-    // pushed into the same `ScreenLayout` before any tab bar, so a tab bar's
-    // `idx` is offset by however many editor surfaces preceded it — a plain
-    // 0-based `Vec` here would look up the wrong entry, or none at all).
-    // `None` before the first paint. See `frame_zone_to_screen_zone` for how
-    // these replace `screen_zone_hit_test`'s manual Window/TabBar rect-walk.
-    frame_hit_map: Option<&quadraui::FrameHitMap>,
-    tab_bar_zones: &HashMap<usize, (GroupId, quadraui::Rect)>,
-    mutate_focus: bool,
-) -> ClickTarget {
-    // #752: the separated status line's arm was here, and the per-window
-    // status line's arm was in the `WindowZone::StatusBar` match below. Both
-    // are now status bands walked by `render::route_chrome_click`, which
-    // `App::handle_mouse_click_msg` runs *before* it ever reaches this
-    // function — so a status click can no longer arrive here at all, and the
-    // shared router (not this backend) decides the order the three bars are
-    // arbitrated in.
-
-    // ── Minimap click / drag (#35, #722) ────────────────────────────────────
-    // Pure rect plumbing: the shared resolver owns the hit-test and the
-    // scroll. Checked before the zone walk because every window's strip is
-    // carved out of that window's own rect, so a `ScreenZone::Window` hit
-    // would otherwise swallow it. Gated on `mutate_focus` so a hover query
-    // never scrolls. `apply_minimap_click` resolves against *every* pane's
-    // strip and reports which one it hit — never assumed to be the active
-    // window, since a split can have a strip on an inactive pane too.
-    if mutate_focus {
-        if let Some((window_id, line)) =
-            render_mod::apply_minimap_click(engine, cached_layout, x, y)
-        {
-            return ClickTarget::Minimap(window_id, line);
-        }
-    }
-
-    let tab_bar_height = render_mod::tab_bar_height_px(line_height, engine.settings.breadcrumbs);
-    let single_tab_hidden = engine.is_tab_bar_hidden(engine.active_group);
-
-    let zone = frame_hit_map
-        .and_then(|hit_map| {
-            let z = frame_zone_to_screen_zone(hit_map, tab_bar_zones, cached_layout, x, y);
-            (!matches!(z, ScreenZone::None)).then_some(z)
-        })
-        .unwrap_or_else(|| {
-            render_mod::screen_zone_hit_test(
-                cached_layout,
-                x,
-                y,
-                tab_bar_height,
-                single_tab_hidden,
-                engine.active_group,
-            )
-        });
-    match zone {
-        ScreenZone::TabBar {
-            group_id,
-            local_x,
-            bar_width: _,
-        } => {
-            if !mutate_focus {
-                // A drag sweeping over another split's tab bar must not
-                // switch tabs/focus there (#568) — treat it as a miss.
-                return ClickTarget::None;
-            }
-            engine.active_group = group_id;
-            tab_bar_inner_hit_test(
-                engine,
-                group_id,
-                local_x,
-                char_width,
-                cached_layout,
-                tab_pixel_hits,
-            )
-        }
-        ScreenZone::Window {
-            window_id,
-            window_idx,
-            rel_x,
-            rel_y,
-        } => {
-            if mutate_focus {
-                engine.activate_group_for_window(window_id);
-            }
-
-            let Some(rw) = cached_layout.windows.get(window_idx) else {
-                return ClickTarget::None;
-            };
-            match render_mod::window_zone_hit_test(rw, rel_x, rel_y, line_height, char_width) {
-                WindowZone::Gutter {
-                    line_idx,
-                    gutter_col,
-                    ..
-                } => {
-                    if !mutate_focus {
-                        // A drag sweeping over another split's gutter must
-                        // not fire gutter actions (e.g. toggle a breakpoint)
-                        // there (#568).
-                        return ClickTarget::None;
-                    }
-                    execute_gutter_action(engine, rw, window_id, line_idx, gutter_col);
-                    ClickTarget::Gutter
-                }
-                WindowZone::TextArea {
-                    view_row, buf_line, ..
-                } => {
-                    // #560: resolve the exact column via the shared
-                    // quadraui text-layout inverse instead of a
-                    // separately-built, attribute-less Pango layout —
-                    // `editor_col_at_x` re-runs `xy_to_index` against the
-                    // same per-span-attributed layout `draw_editor`
-                    // painted with (or the cached last-painted clone when
-                    // called outside a frame scope), so it can't drift
-                    // from the glyphs actually drawn on screen. `x`/`y`
-                    // are absolute surface coordinates, matching
-                    // `editor.rect`'s coordinate space (`rw.rect` here),
-                    // so the original click `x` is passed straight
-                    // through — no gutter/scroll reconstruction needed.
-                    let (editor, editor_layout) =
-                        render_mod::editor_text_layout(rw, char_width, line_height);
-                    let col = backend.editor_col_at_x(&editor_layout, &editor, view_row, x as f32);
-                    ClickTarget::BufferPos(window_id, buf_line, col)
-                }
-                _ => ClickTarget::None,
-            }
-        }
-        _ => ClickTarget::None,
-    }
-}
-
-/// Resolve the top-level `ScreenZone` using the cached `quadraui::FrameHitMap`
-/// (#449), which covers exactly the `Editor`/`TabBar` surfaces painted in
-/// `App::render_content` via `quadraui::ScreenLayout::hit_map()`
-/// (quadraui#425) — pushed from the SAME objects/rects already painted, so
-/// this can never drift from what's on screen. Returns `ScreenZone::None`
-/// when the point isn't in an Editor/TabBar zone (including breadcrumb/
-/// divider pixels, which have no `FrameZone` equivalent — the caller falls
-/// back to `render_mod::screen_zone_hit_test` for those).
-fn frame_zone_to_screen_zone(
-    hit_map: &quadraui::FrameHitMap,
-    // Keyed by `FrameZone::TabBar { idx }`'s global surface index, NOT a
-    // per-tab-bar position — see the doc comment on `pixel_to_click_target`'s
-    // `tab_bar_zones` parameter.
-    tab_bar_zones: &HashMap<usize, (GroupId, quadraui::Rect)>,
-    cached_layout: &render::ScreenLayout,
-    x: f64,
-    y: f64,
-) -> ScreenZone {
-    match hit_map.hit_test(x as f32, y as f32) {
-        quadraui::FrameZone::TabBar { idx } => {
-            if let Some((group_id, rect)) = tab_bar_zones.get(&idx) {
-                return ScreenZone::TabBar {
-                    group_id: *group_id,
-                    local_x: x - rect.x as f64,
-                    bar_width: rect.width as f64,
-                };
-            }
-        }
-        quadraui::FrameZone::Editor { idx } => {
-            if let Some(rw) = cached_layout.windows.get(idx) {
-                let r = &rw.rect;
-                return ScreenZone::Window {
-                    window_id: rw.window_id,
-                    window_idx: idx,
-                    rel_x: x - r.x,
-                    rel_y: y - r.y,
-                };
-            }
-        }
-        _ => {}
-    }
-    ScreenZone::None
-}
-
-/// Build the Pango context the *click* backend uses to resolve editor
-/// columns, matched to the editor's **painted** font.
-///
-/// vimcode keeps a separate `GtkBackend` for click hit-testing than the one
-/// quadraui's ShellApp runner paints with (see `App::render_content`). At
-/// click time `editor_col_at_x` runs `xy_to_index` against *this* context's
-/// Pango layout, so its glyph advances must reproduce the ones the painted
-/// glyphs actually used — otherwise column resolution scales by the wrong
-/// cell width and drifts left, the drift growing with `x` (#560 iter-3
-/// smoke failure).
-///
-/// The runner paints the editor with a hardcoded monospace font
-/// (`quadraui::gtk::run` → `"Monospace 11"`), **ignoring** `settings.font_*`;
-/// the resulting painted cell advance is what `Backend::char_width()` reports
-/// and what `build_screen_layout` / `editor_text_layout` positioned glyphs
-/// with. The earlier fix fonted this context from `settings.font_size` (14 by
-/// default) while the paint ran at 11 — a ~1.27× scale error that produced
-/// exactly the reported left-growing drift on plain text, bold, italic and
-/// scrolled lines alike.
-///
-/// So we mirror the runner's family (`Monospace`) and tune only the point
-/// size: measure a probe `'0'` advance and scale until it equals the painted
-/// `char_width`. Because it is the same family at the reproduced size, *all*
-/// glyph advances — including emoji/CJK fallback — line up with the paint.
-pub(crate) fn build_editor_click_context(paint_char_width: f64) -> Option<pango::Context> {
+/// **#1104:** production no longer calls this. Before #1104, vimcode's mouse
+/// handlers never received the runner's own live `GtkBackend` (`App`'s
+/// `handle()` override didn't thread it past `handle_dispatch`), so
+/// `App::render_content` kept a SECOND, separately-constructed `GtkBackend`
+/// (`self.backend`) alive purely for click-time hit-testing, and called this
+/// function every frame to give that second backend a Pango context of its
+/// own — mirroring the "stable widget Pango context" `quadraui::gtk::run`'s
+/// `activate()` already sets on the real backend at widget realize. #1104
+/// threaded the real backend through the whole click/drag/modal-stack call
+/// chain instead, so there is no second backend left needing one of these.
+/// Kept `#[cfg(test)]` as a fixture builder for this module's own
+/// `GtkBackend::editor_col_at_x` unit tests below, which still want a
+/// from-scratch backend with no painted frame.
+#[cfg(test)]
+pub(crate) fn build_editor_click_context() -> Option<pango::Context> {
     let surface = gtk4::cairo::ImageSurface::create(gtk4::cairo::Format::ARgb32, 1, 1).ok()?;
     let cr = gtk4::cairo::Context::new(&surface).ok()?;
-    let ctx = pangocairo::create_context(&cr);
-
-    // Mirror the runner's editor font family; only the size is tuned so the
-    // measured '0' advance reproduces the painted cell width.
-    let family = "Monospace";
-    let mut size = 11.0_f64;
-    let probe = pango::Layout::new(&ctx);
-    probe.set_font_description(Some(&pango::FontDescription::from_string(&format!(
-        "{family} {size}"
-    ))));
-    probe.set_text("0");
-    let w0 = probe.pixel_size().0 as f64;
-    if w0 > 0.1 && paint_char_width > 0.1 {
-        size = (size * paint_char_width / w0).clamp(1.0, 400.0);
-    }
-
-    ctx.set_font_description(Some(&pango::FontDescription::from_string(&format!(
-        "{family} {size}"
-    ))));
-    Some(ctx)
-}
-
-/// Tab bar inner hit-test.
-///
-/// `local_x` is pixels relative to the tab bar's left edge. For GTK we resolve
-/// against the pixel-accurate geometry the rasteriser actually drew this frame
-/// (`tab_pixel_hits`, captured in `render_content` via `Backend::tab_bar_layout`).
-/// GTK tabs are laid out with proportional-font Pango widths + fixed pixel
-/// padding, so the char-cell `hit_regions` (correct for the monospace TUI) badly
-/// mis-measure them — clicks in a tab's middle landed on the close button and
-/// clicks near its right edge landed on the next tab (#515 regression). Falls
-/// back to the char-cell path only if no pixel geometry was cached (e.g. a click
-/// arriving before the first paint populated the map).
-fn tab_bar_inner_hit_test(
-    engine: &mut Engine,
-    group_id: GroupId,
-    local_x: f64,
-    char_width: f64,
-    cached_layout: &render::ScreenLayout,
-    tab_pixel_hits: &TabPixelHitMap,
-) -> ClickTarget {
-    let target = tab_pixel_hits
-        .get(&group_id.0)
-        .and_then(|ph| resolve_pixel_tab_click(ph, local_x))
-        .or_else(|| resolve_charcell_tab_click(cached_layout, group_id, local_x, char_width));
-
-    dispatch_tab_bar_target(engine, group_id, target)
-}
-
-/// Resolve a tab-bar click against the pixel-accurate drawn geometry.
-///
-/// Close buttons are checked before tab bodies (a close zone is a sub-region of
-/// its tab), then tab bodies, then the disjoint right-segment buttons.
-fn resolve_pixel_tab_click(
-    ph: &TabBarPixelHits,
-    local_x: f64,
-) -> Option<crate::core::engine::TabBarClickTarget> {
-    use crate::core::engine::TabBarClickTarget as T;
-
-    let in_range = |(a, b): (f64, f64)| a != b && local_x >= a && local_x < b;
-
-    for (idx, cb) in ph.close.iter().enumerate() {
-        if let Some(&bounds) = cb.as_ref() {
-            if in_range(bounds) {
-                return Some(T::CloseTab(idx));
-            }
-        }
-    }
-    for (idx, &slot) in ph.slots.iter().enumerate() {
-        if in_range(slot) {
-            return Some(T::Tab(idx));
-        }
-    }
-    for &(start, end, target) in &ph.segments {
-        if in_range((start, end)) {
-            return Some(target);
-        }
-    }
-    None
-}
-
-/// Char-cell fallback (matches the TUI monospace layout). Only used before the
-/// first paint has populated the pixel-hit cache.
-fn resolve_charcell_tab_click(
-    cached_layout: &render::ScreenLayout,
-    group_id: GroupId,
-    local_x: f64,
-    char_width: f64,
-) -> Option<crate::core::engine::TabBarClickTarget> {
-    let col = (local_x / char_width).floor().max(0.0) as u16;
-    let regions: &[(
-        crate::core::engine::TabBarHitRegion,
-        crate::core::engine::TabBarClickTarget,
-    )] = if cached_layout.editor_group_split.is_some() {
-        cached_layout
-            .group_tab_bars
-            .iter()
-            .find(|g| g.group_id == group_id)
-            .map(|g| g.hit_regions.as_slice())
-            .unwrap_or(&[])
-    } else {
-        cached_layout.tab_bar_hit_regions.as_slice()
-    };
-    render_mod::resolve_tab_bar_click(regions, col)
-}
-
-/// Resolve which tab (if any) a right-click landed on, without any of the
-/// left-click side effects `tab_bar_inner_hit_test`/`dispatch_tab_bar_target`
-/// apply (selecting the tab, closing it, opening a split, ...).
-///
-/// Right-clicks reach `ShellApp::handle` via a dedicated `MouseButton::Right`
-/// branch that historically only ever opened the *editor* context menu — there
-/// was no tab-bar-aware routing at all, so right-clicking a tab always opened
-/// the *editor's* context menu instead of a tab-specific one (#546 FAILED-1).
-/// This mirrors `pixel_to_click_target`'s zone resolution (read-only) so the
-/// caller can tell a tab-bar right-click apart from an editor right-click
-/// before deciding which `Msg` to dispatch.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn resolve_tab_right_click(
-    engine: &Engine,
-    x: f64,
-    y: f64,
-    line_height: f64,
-    char_width: f64,
-    cached_layout: &render::ScreenLayout,
-    tab_pixel_hits: &TabPixelHitMap,
-    frame_hit_map: Option<&quadraui::FrameHitMap>,
-    tab_bar_zones: &HashMap<usize, (GroupId, quadraui::Rect)>,
-) -> Option<(GroupId, usize)> {
-    use crate::core::engine::TabBarClickTarget as T;
-
-    let tab_bar_height = render_mod::tab_bar_height_px(line_height, engine.settings.breadcrumbs);
-    let single_tab_hidden = engine.is_tab_bar_hidden(engine.active_group);
-    let zone = frame_hit_map
-        .and_then(|hit_map| {
-            let z = frame_zone_to_screen_zone(hit_map, tab_bar_zones, cached_layout, x, y);
-            (!matches!(z, ScreenZone::None)).then_some(z)
-        })
-        .unwrap_or_else(|| {
-            render_mod::screen_zone_hit_test(
-                cached_layout,
-                x,
-                y,
-                tab_bar_height,
-                single_tab_hidden,
-                engine.active_group,
-            )
-        });
-    let ScreenZone::TabBar {
-        group_id, local_x, ..
-    } = zone
-    else {
-        return None;
-    };
-    let target = tab_pixel_hits
-        .get(&group_id.0)
-        .and_then(|ph| resolve_pixel_tab_click(ph, local_x))
-        .or_else(|| resolve_charcell_tab_click(cached_layout, group_id, local_x, char_width));
-    match target {
-        Some(T::Tab(idx)) | Some(T::CloseTab(idx)) => Some((group_id, idx)),
-        _ => None,
-    }
-}
-
-/// Resolve a tab-bar click target and, for everything except the two targets
-/// that must defer to the caller, apply it through `Engine::handle_tab_bar_click`
-/// — the single dispatch the engine, the TUI and (as of #814) GTK all share.
-///
-/// GTK used to re-implement this arm by arm (goto_tab / open_editor_group /
-/// jump_prev_hunk / ... called directly), which is exactly how the TUI's own
-/// duplicate copy silently dropped `lsp_ensure_active_buffer()` (#752) before
-/// this file did the same. Routing through the engine's own function means a
-/// future fix to any arm lands on both backends for free.
-///
-/// The two exceptions:
-/// - `ActionMenu` needs the click's screen coordinates to place the popup,
-///   which the engine doesn't have — its own arm for this target is a
-///   deliberate no-op, so `handle_mouse_click`'s `ActionMenuButton` arm opens
-///   the menu directly instead.
-/// - `CloseTab` on a dirty buffer must defer to a confirmation dialog before
-///   anything closes, so resolution only identifies *which* tab was
-///   targeted — `handle_mouse_click`'s `CloseTab` arm makes the one call into
-///   `Engine::handle_tab_bar_click` that decides confirm-vs-close.
-fn dispatch_tab_bar_target(
-    engine: &mut Engine,
-    group_id: GroupId,
-    target: Option<crate::core::engine::TabBarClickTarget>,
-) -> ClickTarget {
-    use crate::core::engine::TabBarClickTarget as T;
-
-    match target {
-        Some(T::ActionMenu) => ClickTarget::ActionMenuButton(group_id),
-        Some(T::CloseTab(idx)) => ClickTarget::CloseTab(group_id, idx),
-        Some(t) => {
-            engine.handle_tab_bar_click(group_id, t);
-            ClickTarget::TabBar
-        }
-        None => ClickTarget::TabBar,
-    }
-}
-
-/// Execute the engine-side action for a gutter click using shared resolution.
-fn execute_gutter_action(
-    engine: &mut Engine,
-    rw: &render::RenderedWindow,
-    window_id: WindowId,
-    line_idx: usize,
-    gutter_col: usize,
-) {
-    match render_mod::resolve_gutter_action(rw, line_idx, gutter_col) {
-        Some(GutterAction::ToggleBreakpoint(line)) => {
-            let file = engine
-                .windows
-                .get(&window_id)
-                .and_then(|w| engine.buffer_manager.get(w.buffer_id))
-                .and_then(|bs| bs.file_path.as_ref())
-                .map(|p| p.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            engine.dap_toggle_breakpoint(&file, line as u64 + 1);
-        }
-        Some(GutterAction::DiffPeek(line)) => {
-            engine.active_tab_mut().active_window = window_id;
-            engine.view_mut().cursor.line = line;
-            engine.open_diff_peek();
-        }
-        Some(GutterAction::DiagnosticHover(line)) => {
-            engine.active_tab_mut().active_window = window_id;
-            engine.view_mut().cursor.line = line;
-            engine.trigger_editor_hover_for_line(line);
-        }
-        Some(GutterAction::CodeAction(line)) => {
-            engine.active_tab_mut().active_window = window_id;
-            engine.view_mut().cursor.line = line;
-            engine.show_code_actions_popup();
-        }
-        Some(GutterAction::ToggleFold(line)) => {
-            engine.toggle_fold_at_line(line);
-        }
-        None => {}
-    }
-}
-
-/// Handle mouse click by converting coordinates to buffer position.
-/// Returns: `(click, engine_action)` where click is `None` = non-buffer click,
-/// `Some(true)` = close-tab on dirty buffer, `Some(false)` = normal buffer click;
-/// `engine_action` is an optional action the caller must dispatch (e.g. sidebar toggle).
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn handle_mouse_click(
-    engine: &mut Engine,
-    backend: &dyn quadraui::Backend,
-    x: f64,
-    y: f64,
-    alt: bool,
-    line_height: f64,
-    char_width: f64,
-    cached_layout: &render::ScreenLayout,
-    tab_pixel_hits: &TabPixelHitMap,
-    frame_hit_map: Option<&quadraui::FrameHitMap>,
-    tab_bar_zones: &HashMap<usize, (GroupId, quadraui::Rect)>,
-) -> (Option<bool>, Option<EngineAction>) {
-    match pixel_to_click_target(
-        engine,
-        backend,
-        x,
-        y,
-        line_height,
-        char_width,
-        cached_layout,
-        tab_pixel_hits,
-        frame_hit_map,
-        tab_bar_zones,
-        true, // real click: focus/tab/gutter side effects are intended
-    ) {
-        ClickTarget::BufferPos(wid, line, col) => {
-            // Alt+Click in VSCode mode → add cursor at position
-            if alt && engine.is_vscode_mode() {
-                engine.add_cursor_at_pos(line, col);
-            } else {
-                engine.mouse_click(wid, line, col);
-            }
-            (Some(false), None)
-        }
-        ClickTarget::CloseTab(group_id, tab_idx) => {
-            // The one call into `Engine::handle_tab_bar_click` for this
-            // click — `dispatch_tab_bar_target` deliberately left the
-            // dirty-check/close undone so it could happen exactly once, here,
-            // where the caller is ready to show a confirmation dialog.
-            let needs_confirm = engine.handle_tab_bar_click(
-                group_id,
-                crate::core::engine::TabBarClickTarget::CloseTab(tab_idx),
-            );
-            (needs_confirm.then_some(true), None)
-        }
-        ClickTarget::ActionMenuButton(group_id) => {
-            let col = (x / char_width.max(1.0)) as u16;
-            let row = (y / line_height.max(1.0)) as u16;
-            // #434: pass the trigger's exact height in line_height units so
-            // the menu sits flush against the button's bottom (no sub-cell
-            // gap). GTK's tab row is ceil(1.6 * line_height).
-            let trigger_h =
-                (render_mod::tab_row_height_px(line_height) / line_height.max(1.0)) as f32;
-            engine.open_editor_action_menu(group_id, col, row, trigger_h);
-            (None, None)
-        }
-        _ => (None, None),
-    }
-}
-
-// Tab-drag drop-zone geometry is now computed in `App::render_content` from the
-// shared `render::screen_to_drop_group_bounds` pipeline and cached on the App for
-// the drag hit-test to reuse — see `cached_drop_groups`. The former GTK-specific
-// `build_gtk_tab_slots` / `compute_tab_drop_zone` helpers (which depended on the
-// legacy per-backend pixel maps) were removed in #515.
-
-/// Handle mouse double-click — select word at position.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn handle_mouse_double_click(
-    engine: &mut Engine,
-    backend: &dyn quadraui::Backend,
-    x: f64,
-    y: f64,
-    line_height: f64,
-    char_width: f64,
-    cached_layout: &render::ScreenLayout,
-    tab_pixel_hits: &TabPixelHitMap,
-    frame_hit_map: Option<&quadraui::FrameHitMap>,
-    tab_bar_zones: &HashMap<usize, (GroupId, quadraui::Rect)>,
-) {
-    if let ClickTarget::BufferPos(wid, line, col) = pixel_to_click_target(
-        engine,
-        backend,
-        x,
-        y,
-        line_height,
-        char_width,
-        cached_layout,
-        tab_pixel_hits,
-        frame_hit_map,
-        tab_bar_zones,
-        true, // real click: focus/tab/gutter side effects are intended
-    ) {
-        engine.mouse_double_click(wid, line, col);
-    }
-}
-
-/// Apply a [`render::MouseDragRoute::EditorText`] drag — extend the visual
-/// selection to the glyph under the cursor.
-///
-/// #568: this only ever fires while a mouse button is held (drag
-/// continuation), so text-selection resolution goes through
-/// `pixel_to_click_target` as a pure query (`mutate_focus: false`) — the
-/// mouse sweeping over a different split's tab bar/gutter while the drag is
-/// held must not steal focus or fire actions there. `Engine::mouse_drag`'s
-/// origin-window lock then keeps the selection itself pinned to the split
-/// the drag started in.
-///
-/// #756: the minimap check that used to open this function is gone — the
-/// strip is now [`render::MouseDragRoute::Minimap`], arbitrated above the
-/// editor text area by the shared drag router, so this function is only
-/// reached once that router has already ruled the point out.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn handle_mouse_drag(
-    engine: &mut Engine,
-    backend: &dyn quadraui::Backend,
-    x: f64,
-    y: f64,
-    line_height: f64,
-    char_width: f64,
-    cached_layout: &render::ScreenLayout,
-    tab_pixel_hits: &TabPixelHitMap,
-    frame_hit_map: Option<&quadraui::FrameHitMap>,
-    tab_bar_zones: &HashMap<usize, (GroupId, quadraui::Rect)>,
-) {
-    if let ClickTarget::BufferPos(wid, line, col) = pixel_to_click_target(
-        engine,
-        backend,
-        x,
-        y,
-        line_height,
-        char_width,
-        cached_layout,
-        tab_pixel_hits,
-        frame_hit_map,
-        tab_bar_zones,
-        false, // drag continuation: pure query, no focus/tab/gutter side effects
-    ) {
-        engine.mouse_drag(wid, line, col);
-    }
+    Some(pangocairo::create_context(&cr))
 }
 
 #[cfg(test)]
@@ -677,12 +106,15 @@ mod emoji_click_column_tests {
         let surface = ImageSurface::create(Format::ARgb32, 900, 60).expect("create ImageSurface");
         let cr = Context::new(&surface).expect("Context::new");
         let ctx = pangocairo::create_context(&cr);
-        ctx.set_font_description(Some(&pango::FontDescription::from_string("Monospace 12")));
+        ctx.set_font_description(&pango::FontDescription::from_string("Monospace 12"));
         pango::Layout::new(&ctx)
     }
 
     #[test]
     fn click_resolves_exact_column_on_emoji_markdown_line() {
+        // Concurrent Pango/Cairo text work from two test threads segfaults
+        // inside FreeType — see `src/test_paint.rs`.
+        let _paint = crate::test_paint::PaintGuard::acquire();
         let text = "Total: **58 commands**  \u{b7}  \u{2705} 36  \u{b7}  \u{1f7e1} 2  \u{b7}  \u{274c} 14  \u{b7}  \u{23ed}\u{fe0f} 6";
         let mut engine = Engine::new();
         engine.buffer_mut().insert(0, text);
@@ -695,7 +127,16 @@ mod emoji_click_column_tests {
         let theme = Theme::onedark();
         let bounds = WindowRect::new(0.0, 0.0, 800.0, 600.0);
         let (rects, _) = engine.calculate_group_window_rects(bounds, 24.0);
-        let layout = build_screen_layout(&engine, &theme, &rects, line_height, char_width, true);
+        let layout = build_screen_layout(
+            &engine,
+            &theme,
+            &rects,
+            line_height,
+            char_width,
+            true,
+            8.0,
+            crate::render::gtk_minimap_sizing(),
+        );
         let rw = &layout.windows[0];
         assert_eq!(
             rw.lines[0].raw_text, text,
@@ -786,6 +227,9 @@ mod emoji_click_column_tests {
     /// uniform-cell division would drift +1 column per preceding wide glyph and
     /// fail — this is what pins that neither branch degrades to it.
     fn assert_emoji_columns_resolve(paint_first: bool) {
+        // Concurrent Pango/Cairo text work from two test threads segfaults
+        // inside FreeType — see `src/test_paint.rs`.
+        let _paint = crate::test_paint::PaintGuard::acquire();
         use quadraui::{Backend as _, ScreenLayout as QScreenLayout, Surface};
         use std::cell::RefCell;
         use std::rc::Rc;
@@ -801,7 +245,7 @@ mod emoji_click_column_tests {
         let cr = Context::new(&surface).expect("Context::new");
         let pango_ctx = pangocairo::create_context(&cr);
         let font_desc = pango::FontDescription::from_string("Monospace 12");
-        pango_ctx.set_font_description(Some(&font_desc));
+        pango_ctx.set_font_description(&font_desc);
         let layout = pango::Layout::new(&pango_ctx);
         layout.set_font_description(Some(&font_desc));
         let metrics = pango_ctx.metrics(Some(&font_desc), None);
@@ -812,20 +256,32 @@ mod emoji_click_column_tests {
         let theme = Theme::onedark();
         let bounds = WindowRect::new(0.0, 0.0, 800.0, 600.0);
         let (rects, _) = engine.calculate_group_window_rects(bounds, (line_height * 1.6).ceil());
-        let screen = build_screen_layout(&engine, &theme, &rects, line_height, char_width, false);
+        let screen = build_screen_layout(
+            &engine,
+            &theme,
+            &rects,
+            line_height,
+            char_width,
+            false,
+            8.0,
+            crate::render::gtk_minimap_sizing(),
+        );
         let rw = &screen.windows[0];
         assert_eq!(rw.lines[0].raw_text, text, "line should not wrap");
 
         let backend = Rc::new(RefCell::new(super::backend::GtkBackend::new()));
-        // Mirror `App::render_content`: hand the click backend an editor-fonted
-        // PangoCairo context (built from a throwaway surface, NOT the paint
-        // layout) so the click-time fallback is per-glyph accurate.
+        // Mirror `App::render_content` (#947): `set_editor_font` with the
+        // same family/size the paint side used, plus a throwaway Pango
+        // context (NOT the paint layout) for `editor_pango_layout()`'s
+        // fallback to build a layout from — that layout fonts itself from
+        // `editor_font_family`/`editor_font_size_pt`, not from anything set
+        // on this context directly.
+        backend.borrow_mut().set_editor_font("Monospace", 12.0);
         {
             let click_surface =
                 ImageSurface::create(Format::ARgb32, 1, 1).expect("click ImageSurface");
             let click_cr = Context::new(&click_surface).expect("click Context");
             let click_ctx = pangocairo::create_context(&click_cr);
-            click_ctx.set_font_description(Some(&font_desc));
             backend.borrow_mut().set_pango_context(click_ctx);
         }
 
@@ -893,52 +349,55 @@ mod emoji_click_column_tests {
         assert_emoji_columns_resolve(false);
     }
 
-    /// #560 iteration 3 (the smoke failure this fix targets): plain / bold /
-    /// italic / scrolled clicks landed LEFT of the target, the drift growing
-    /// with `x`. Root cause: the quadraui runner paints the editor with a
-    /// hardcoded "Monospace 11" (ignoring `settings.font_*`), but the previous
-    /// fix fonted the click backend's Pango context from `settings.font_size`
-    /// (14) — so `editor_col_at_x`'s `xy_to_index` measured against glyphs
-    /// ~1.27× too wide and scaled every column down, drifting left more the
-    /// further right the click. The earlier emoji tests use ONE self-consistent
-    /// font for both paint and resolve, so they never caught this size split.
-    ///
-    /// This test reproduces the split: paint at one size, resolve through the
-    /// context `App::render_content` actually builds (`build_editor_click_context`,
-    /// matched to the *painted* `char_width`), and assert every column on a long
-    /// plain ASCII line resolves exactly — including the far right where a
-    /// size-mismatched context drifts. The `bad_drift_seen` assertion pins that
-    /// a mismatched context genuinely fails, so this test can't silently pass by
-    /// resolving on a too-short line.
+    /// #947: click-to-column resolution must track `settings.font_family`/
+    /// `font_size` — not a hardcoded `"Monospace"` family matched only by a
+    /// probed size. Before #947, the click backend was always fonted as
+    /// `"Monospace"` (mirroring the *paint* side's own former hardcode) no
+    /// matter what `App::render_content` was asked to
+    /// paint, so a non-monospace family would have silently resolved clicks
+    /// against the wrong glyph advances — structurally, not just as a bug,
+    /// since the family itself was never a parameter. `Backend::set_editor_font`
+    /// (quadraui#422, wired for both paint and click in #947) is now the
+    /// single source of truth for both, so this drives them from the SAME
+    /// live `(family, size)` pair, asserted at two sizes and at a
+    /// non-`Monospace` family. It also paints NO frame, so resolution must
+    /// go through `GtkBackend::editor_col_at_x`'s `editor_pango_layout()`
+    /// fallback (quadraui#971) — proving the live `set_editor_font` state
+    /// drives correctness, not a stashed `last_editor_pango_layout`.
     #[test]
-    fn click_context_matches_painted_font_not_settings_size() {
-        // ── The runner's painted editor font (see quadraui `gtk::run`). ──
-        let paint_surface =
-            ImageSurface::create(Format::ARgb32, 2000, 60).expect("paint ImageSurface");
-        let pcr = Context::new(&paint_surface).expect("paint Context");
-        let pctx = pangocairo::create_context(&pcr);
-        let paint_font = pango::FontDescription::from_string("Monospace 11");
-        pctx.set_font_description(Some(&paint_font));
-        let probe = pango::Layout::new(&pctx);
-        probe.set_font_description(Some(&paint_font));
+    fn click_column_resolves_at_non_monospace_family_and_two_sizes() {
+        for (family, size_pt) in [("Sans", 10.0_f32), ("Sans", 22.0_f32)] {
+            assert_click_columns_resolve_for_font(family, size_pt);
+        }
+    }
+
+    /// Shared body for the test above: run the exact sequence
+    /// `App::render_content`'s `sync_per_frame_backend_state` runs on the
+    /// (single, #1104) backend every frame — `set_editor_font` with the live
+    /// `(family, size)`, plus a stored Pango context — then assert every
+    /// character on a plain ASCII line resolves to its own column via
+    /// `GtkBackend::editor_col_at_x` — the exact trait method
+    /// `pixel_to_click_target` calls on a live click.
+    fn assert_click_columns_resolve_for_font(family: &str, size_pt: f32) {
+        // Concurrent Pango/Cairo text work from two test threads segfaults
+        // inside FreeType — see `src/test_paint.rs`.
+        let _paint = crate::test_paint::PaintGuard::acquire();
+        use quadraui::Backend as _;
+
+        // ── The font this iteration paints AND resolves with. ──
+        let font_desc = pango::FontDescription::from_string(&format!("{family} {size_pt}"));
+        let measure_surface =
+            ImageSurface::create(Format::ARgb32, 2000, 60).expect("measure ImageSurface");
+        let mcr = Context::new(&measure_surface).expect("measure Context");
+        let mctx = pangocairo::create_context(&mcr);
+        mctx.set_font_description(&font_desc);
+        let probe = pango::Layout::new(&mctx);
+        probe.set_font_description(Some(&font_desc));
         probe.set_text("0");
-        let paint_cw = probe.pixel_size().0 as f64;
-        let metrics = pctx.metrics(Some(&paint_font), None);
+        let char_width = probe.pixel_size().0 as f64;
+        let metrics = mctx.metrics(Some(&font_desc), None);
         let line_height = (metrics.ascent() + metrics.descent()) as f64 / pango::SCALE as f64;
 
-        // ── The click context production actually builds, matched to the
-        //    painted char width — NOT to any `settings.font_size`. ──
-        let click_ctx = super::build_editor_click_context(paint_cw).expect("click ctx");
-        let click_probe = pango::Layout::new(&click_ctx);
-        click_probe.set_text("0");
-        let click_cw = click_probe.pixel_size().0 as f64;
-        assert!(
-            (click_cw - paint_cw).abs() <= 1.0,
-            "build_editor_click_context('0' adv {click_cw}) must reproduce the painted \
-             char width {paint_cw}, else column resolution scales by the wrong cell width"
-        );
-
-        // ── End-to-end on a long plain ASCII line. ──
         let text = "The quick brown fox jumps over the lazy dog end AAAA BBBB CCCC DDDD EEEE";
         let mut engine = Engine::new();
         engine.buffer_mut().insert(0, text);
@@ -946,29 +405,36 @@ mod emoji_click_column_tests {
         let theme = Theme::onedark();
         let bounds = WindowRect::new(0.0, 0.0, 2000.0, 400.0);
         let (rects, _) = engine.calculate_group_window_rects(bounds, (line_height * 1.6).ceil());
-        let screen = build_screen_layout(&engine, &theme, &rects, line_height, paint_cw, false);
+        let screen = build_screen_layout(
+            &engine,
+            &theme,
+            &rects,
+            line_height,
+            char_width,
+            false,
+            8.0,
+            crate::render::gtk_minimap_sizing(),
+        );
         let rw = &screen.windows[0];
         assert_eq!(rw.lines[0].raw_text, text, "line should not wrap");
 
-        let (editor, editor_layout) = render::editor_text_layout(rw, paint_cw, line_height);
-        let line = &editor.lines[0];
+        let (editor, editor_layout) = render::editor_text_layout(rw, char_width, line_height);
 
-        // Glyph geometry from the PAINT font (what draw_editor rendered with).
-        let measure = pango::Layout::new(&pctx);
-        measure.set_font_description(Some(&paint_font));
+        // Glyph geometry from the same font — what the paint side would
+        // have rendered this line with.
+        let measure = pango::Layout::new(&mctx);
+        measure.set_font_description(Some(&font_desc));
         measure.set_text(text);
 
-        // The good resolver: the production click context.
-        let good_layout = pango::Layout::new(&click_ctx);
+        // ── The exact production sequence `sync_per_frame_backend_state`
+        // runs on the live backend (#947): `set_editor_font` with the live
+        // `(family, size)`, then a throwaway Pango context — NO frame ever
+        // painted. ──
+        let backend = Rc::new(RefCell::new(super::backend::GtkBackend::new()));
+        backend.borrow_mut().set_editor_font(family, size_pt);
+        let click_ctx = super::build_editor_click_context().expect("click ctx");
+        backend.borrow_mut().set_pango_context(click_ctx);
 
-        // The pre-fix bug: font the resolver from `settings.font_size` (14).
-        let bad_surface = ImageSurface::create(Format::ARgb32, 1, 1).expect("bad ImageSurface");
-        let bad_cr = Context::new(&bad_surface).expect("bad Context");
-        let bad_ctx = pangocairo::create_context(&bad_cr);
-        bad_ctx.set_font_description(Some(&pango::FontDescription::from_string("Monospace 14")));
-        let bad_layout = pango::Layout::new(&bad_ctx);
-
-        let mut bad_drift_seen = false;
         for (char_idx, (byte_idx, ch)) in text.char_indices().enumerate() {
             let pos = measure.index_to_pos(byte_idx as i32);
             let glyph_left =
@@ -976,23 +442,16 @@ mod emoji_click_column_tests {
             let gw = (pos.width() as f64 / pango::SCALE as f64).max(2.0);
             let click_x = (glyph_left + gw * 0.25) as f32;
 
-            let good = quadraui::gtk::editor_col_at_x(&good_layout, line, &editor_layout, click_x);
+            let resolved = backend
+                .borrow()
+                .editor_col_at_x(&editor_layout, &editor, 0, click_x);
             assert_eq!(
-                good, char_idx,
-                "clicking char {char_idx} ({ch:?}) resolved to col {good} — the \
-                 production click context has drifted from the painted font"
+                resolved, char_idx,
+                "family={family:?} size={size_pt}: clicking char {char_idx} ({ch:?}) \
+                 resolved to col {resolved}, not {char_idx} — the click backend's \
+                 editor_col_at_x has drifted from the (family, size) it was set to"
             );
-
-            let bad = quadraui::gtk::editor_col_at_x(&bad_layout, line, &editor_layout, click_x);
-            if bad != char_idx {
-                bad_drift_seen = true;
-            }
         }
-        assert!(
-            bad_drift_seen,
-            "a size-mismatched click context (the pre-fix bug) must drift on this line, \
-             else the test can't prove the width-match is what fixes it"
-        );
     }
 }
 
@@ -1055,7 +514,16 @@ mod cross_split_drag_focus_tests {
         let line_height: f64 = 18.0;
         let char_width: f64 = 9.0;
         let (rects, _) = engine.calculate_group_window_rects(bounds, (line_height * 1.6).ceil());
-        let screen = build_screen_layout(&engine, &theme, &rects, line_height, char_width, false);
+        let screen = build_screen_layout(
+            &engine,
+            &theme,
+            &rects,
+            line_height,
+            char_width,
+            false,
+            8.0,
+            crate::render::gtk_minimap_sizing(),
+        );
         let rw_b = screen
             .windows
             .iter()
@@ -1083,6 +551,8 @@ mod cross_split_drag_focus_tests {
             // `screen_zone_hit_test` fallback path (#449)
             &HashMap::new(),
             false, // mutate_focus: drag continuation
+            &mut quadraui::DragState::default(),
+            false, // no Alt context in this test
         );
         assert_eq!(
             engine.active_group, group_a,
@@ -1125,6 +595,8 @@ mod cross_split_drag_focus_tests {
             None,
             &HashMap::new(),
             true, // mutate_focus: genuine click
+            &mut quadraui::DragState::default(),
+            false, // no Alt context in this test
         );
         assert_eq!(
             engine.active_group, group_b,
@@ -1171,7 +643,16 @@ mod frame_hit_map_tests {
     ) {
         let bounds = WindowRect::new(0.0, 0.0, 800.0, 600.0);
         let (rects, _) = engine.calculate_group_window_rects(bounds, (line_height * 1.6).ceil());
-        let screen = build_screen_layout(engine, theme, &rects, line_height, char_width, false);
+        let screen = build_screen_layout(
+            engine,
+            theme,
+            &rects,
+            line_height,
+            char_width,
+            false,
+            8.0,
+            crate::render::gtk_minimap_sizing(),
+        );
 
         let window_editors: Vec<quadraui::Editor> =
             screen.windows.iter().map(render_mod::to_q_editor).collect();
@@ -1306,6 +787,8 @@ mod frame_hit_map_tests {
             Some(&hit_map),
             &tab_bar_zones,
             true,
+            &mut quadraui::DragState::default(),
+            false,
         );
         match target {
             ClickTarget::BufferPos(id, _, _) => assert_eq!(id, wid),
@@ -1435,8 +918,16 @@ mod single_group_tab_click_dispatch_tests {
                 render_mod::tab_bar_height_px(line_height, engine.settings.breadcrumbs);
             let content = core::WindowRect::new(CONTENT_X, CONTENT_Y, CONTENT_W, CONTENT_H);
             let (rects, _) = engine.calculate_group_window_rects(content, tab_bar_height);
-            let screen =
-                build_screen_layout(&engine, &theme, &rects, line_height, char_width, false);
+            let screen = build_screen_layout(
+                &engine,
+                &theme,
+                &rects,
+                line_height,
+                char_width,
+                false,
+                8.0,
+                crate::render::gtk_minimap_sizing(),
+            );
             assert!(
                 screen.editor_group_split.is_none(),
                 "these tests must exercise the single-group arm; a split layout would \
@@ -1479,6 +970,8 @@ mod single_group_tab_click_dispatch_tests {
                 None,
                 &HashMap::new(),
                 true, // a genuine click
+                &mut quadraui::DragState::default(),
+                false, // no Alt context in this test
             )
         }
 
@@ -1498,6 +991,7 @@ mod single_group_tab_click_dispatch_tests {
                 &self.tab_pixel_hits,
                 None,
                 &HashMap::new(),
+                &mut quadraui::DragState::default(),
             )
         }
     }

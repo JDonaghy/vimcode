@@ -1,5 +1,16 @@
 # src/gtk/mod.rs — 7,999 lines (~7,684 production)
 
+> **Stale below (#785, #862):** `App` and its `ShellApp` impl moved to
+> `src/app.rs` well before this note — see `SUMMARIES/app.md` once it exists,
+> or `src/app.rs`'s own module doc. #862 further moved
+> `calculate_gutter_width`/`compute_editor_window_rects`/`h_scrollbar_geometry`/
+> `h_scrollbar_hit_test`/`tab_hits_to_pixel_hits` and the UI-font/tab-bar-hit
+> helpers out of this file to the backend-neutral `src/app_support.rs`/
+> `src/click.rs` (re-exported here so `super::X` still resolves). `App`'s
+> remaining platform-typed fields are now type-erased — see
+> `PlatformWindowHandle`/`PlatformCssProvider` in `src/app.rs`, not four bare
+> toolkit-typed fields.
+
 The GTK backend's whole application shell: the `App` struct and its
 `impl quadraui::ShellApp for App`. **Not** Relm4 — that was stripped by #540 —
 and there is no `Msg` enum any more: #732 retired the 124-variant message bus and

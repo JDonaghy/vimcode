@@ -79,7 +79,7 @@ impl Engine {
     /// Ensure the cursor is visible within the viewport, adjusting scroll_top.
     ///
     /// #185: `view.viewport_lines` is updated by the backends on the next
-    /// draw pass, but engine-side operations (e.g. `quickfix_jump`)
+    /// draw pass, but engine-side operations (e.g. `qf_jump`)
     /// may call this synchronously BEFORE the next draw — at which
     /// point the cached `viewport_lines` reflects the previous chrome
     /// configuration. If a panel (quickfix, terminal, debug output,
@@ -104,7 +104,7 @@ impl Engine {
     /// hasn't happened yet" window.
     fn bottom_chrome_rows_since_last_draw(&self) -> usize {
         // Quickfix panel. Fixed 6-row height in both backends when open.
-        let qf = if self.quickfix_open && !self.quickfix_items.is_empty() {
+        let qf = if self.quickfix.open && !self.quickfix.items.is_empty() {
             6
         } else {
             0
@@ -140,17 +140,33 @@ impl Engine {
             let viewport_lines = self.effective_viewport_lines();
             let cursor_line = self.view().cursor.line;
             let scroll_top = self.view().scroll_top;
+            // `:h 'scrolljump'` (#1206): the minimum number of lines to
+            // scroll when the cursor moves off the top/bottom edge. `sj`'s
+            // formula collapses to the pre-#1206 "jump exactly the minimal
+            // amount" behavior when `scrolljump` is `1` (its default) —
+            // `jumped` and `minimal` are then never more than one line
+            // apart in the direction that matters, so `min`/`max` always
+            // pick `minimal`. `.max(1)` treats a stored `0` (Neovim accepts
+            // it) the same as `1`, since a zero-line "minimum jump" isn't a
+            // real constraint.
+            let sj = self.settings.scrolljump.max(1);
             if cursor_line < scroll_top + scrolloff {
-                self.view_mut().scroll_top = cursor_line.saturating_sub(scrolloff);
+                let minimal = cursor_line.saturating_sub(scrolloff);
+                let jumped = scroll_top.saturating_sub(sj);
+                self.view_mut().scroll_top = jumped.min(minimal);
             } else if viewport_lines > 0
                 && cursor_line + scrolloff + 1 > scroll_top + viewport_lines
             {
-                self.view_mut().scroll_top = cursor_line + scrolloff + 1 - viewport_lines;
+                let minimal = cursor_line + scrolloff + 1 - viewport_lines;
+                let jumped = scroll_top + sj;
+                self.view_mut().scroll_top = jumped.max(minimal);
             }
 
-            // Horizontal: keep cursor within the visible column range.
-            // Prefer paint-time viewport_cols (exact) over the resize
-            // handler's approximate value.
+            // Horizontal: keep cursor within the visible column range,
+            // respecting 'sidescrolloff' (#1206, `:h 'sidescrolloff'`) —
+            // the horizontal counterpart of 'scrolloff' above. Prefer
+            // paint-time viewport_cols (exact) over the resize handler's
+            // approximate value.
             let wid = self.active_window_id();
             let viewport_cols = self
                 .paint_viewport_cols
@@ -160,18 +176,48 @@ impl Engine {
                 .unwrap_or(self.view().viewport_cols);
             let cursor_col = self.view().cursor.col;
             let scroll_left = self.view().scroll_left;
+            let sso = self.settings.sidescrolloff;
             if viewport_cols > 0 {
-                if cursor_col < scroll_left {
-                    self.view_mut().scroll_left = cursor_col;
-                } else if cursor_col >= scroll_left + viewport_cols {
-                    self.view_mut().scroll_left = cursor_col + 1 - viewport_cols;
+                if cursor_col < scroll_left + sso {
+                    self.view_mut().scroll_left = cursor_col.saturating_sub(sso);
+                } else if cursor_col + sso + 1 > scroll_left + viewport_cols {
+                    self.view_mut().scroll_left = cursor_col + sso + 1 - viewport_cols;
                 }
             }
         }
     }
 
+    /// Buffer line `line`'s length in chars, excluding its trailing
+    /// newline — the input `engine_visual_rows_for_line` expects. Small
+    /// private helper factoring out a `.len_chars().saturating_sub(1)` that
+    /// was duplicated across `ensure_cursor_visible_wrap`'s margin/top/
+    /// bottom walks (#1293 review nit).
+    fn wrap_line_len(&self, line: usize) -> usize {
+        self.buffer()
+            .content
+            .line(line)
+            .len_chars()
+            .saturating_sub(1)
+    }
+
+    /// Sum of visual rows occupied by buffer lines `[start, end)`. Used by
+    /// `ensure_cursor_visible_wrap` to measure `'scrolloff'` margins in
+    /// visual rows rather than buffer lines (#1293).
+    fn visual_rows_for_range(&self, start: usize, end: usize, viewport_cols: usize) -> usize {
+        if start >= end {
+            return 0;
+        }
+        (start..end)
+            .map(|r| engine_visual_rows_for_line(self.wrap_line_len(r), viewport_cols))
+            .sum()
+    }
+
     /// Wrap-aware scroll-to-cursor. Counts visual rows (accounting for
-    /// soft-wrapped buffer lines) to determine when to adjust `scroll_top`.
+    /// soft-wrapped buffer lines) to determine when to adjust `scroll_top`,
+    /// honoring `'scrolloff'` (#1293) — the `'wrap'`-off counterpart above
+    /// (`ensure_cursor_visible`) does this in buffer lines; here the margin
+    /// has to be counted in *visual* rows instead, since a single wrapped
+    /// buffer line can span more than one screen row.
     pub(crate) fn ensure_cursor_visible_wrap(&mut self) {
         let viewport_cols = self.view().viewport_cols;
         // #185: use effective viewport (accounts for bottom chrome like
@@ -181,10 +227,51 @@ impl Engine {
         let cursor_col = self.view().cursor.col;
         let scroll_top = self.view().scroll_top;
         let total_lines = self.buffer().len_lines();
+        let scrolloff = self.settings.scrolloff;
 
-        // Scroll up if cursor is above the viewport.
-        if cursor_line < scroll_top {
-            self.view_mut().scroll_top = cursor_line;
+        // Only ever called with viewport_cols > 0 (see `ensure_cursor_visible`'s
+        // guard), so `cursor_col / viewport_cols` below is safe.
+        let cursor_seg = cursor_col / viewport_cols;
+
+        // How many visual rows of margin the buffer can actually supply
+        // above/below the cursor — same clamping Vim does: no margin is
+        // forced within `scrolloff` rows of the start/end of the file.
+        let rows_above_cursor =
+            cursor_seg + self.visual_rows_for_range(0, cursor_line, viewport_cols);
+        let top_margin = scrolloff.min(rows_above_cursor);
+
+        let cursor_line_segs =
+            engine_visual_rows_for_line(self.wrap_line_len(cursor_line), viewport_cols);
+        let rows_below_cursor = cursor_line_segs.saturating_sub(cursor_seg + 1)
+            + self.visual_rows_for_range(cursor_line + 1, total_lines, viewport_cols);
+        let bottom_margin = scrolloff.min(rows_below_cursor);
+
+        // Visual rows currently visible above the cursor's segment, i.e.
+        // from `scroll_top` up to (but not including) the cursor's own
+        // segment. Zero when the cursor has scrolled entirely above
+        // `scroll_top` (handled uniformly by the branch below).
+        let visible_rows_above = if cursor_line >= scroll_top {
+            self.visual_rows_for_range(scroll_top, cursor_line, viewport_cols) + cursor_seg
+        } else {
+            0
+        };
+
+        if cursor_line < scroll_top || visible_rows_above < top_margin {
+            // Scroll up: walk backward from the cursor to find the
+            // closest scroll_top that leaves `top_margin` visual rows
+            // above the cursor's segment (or reaches buffer start).
+            let mut rows_used = cursor_seg;
+            let mut new_scroll_top = cursor_line;
+            if rows_used < top_margin && cursor_line > 0 {
+                for r in (0..cursor_line).rev() {
+                    if rows_used >= top_margin {
+                        break;
+                    }
+                    rows_used += engine_visual_rows_for_line(self.wrap_line_len(r), viewport_cols);
+                    new_scroll_top = r;
+                }
+            }
+            self.view_mut().scroll_top = new_scroll_top;
             return;
         }
 
@@ -196,31 +283,30 @@ impl Engine {
         // visual row within cursor_line.
         let mut visual_rows: usize = 0;
         for r in scroll_top..=cursor_line {
-            let line_len = self.buffer().content.line(r).len_chars().saturating_sub(1);
             if r < cursor_line {
-                visual_rows += engine_visual_rows_for_line(line_len, viewport_cols);
+                visual_rows += engine_visual_rows_for_line(self.wrap_line_len(r), viewport_cols);
             } else {
                 // Partial count: only up to the cursor's visual segment.
-                visual_rows += cursor_col / viewport_cols + 1;
+                visual_rows += cursor_seg + 1;
             }
         }
 
-        // If cursor fits within the viewport, nothing to adjust.
-        if visual_rows <= viewport_lines {
+        // If cursor plus its `bottom_margin` rows of scrolloff fit within
+        // the viewport, nothing to adjust.
+        if visual_rows + bottom_margin <= viewport_lines {
             return;
         }
 
-        // Cursor is below the viewport — walk backwards from cursor_line
-        // to find the new scroll_top that makes the cursor visible.
-        let cursor_visual_row_within_line = cursor_col / viewport_cols;
-        // Rows the cursor's line contributes, up to and including cursor segment.
-        let mut rows_used = cursor_visual_row_within_line + 1;
+        // Cursor (or its scrolloff margin) is below the viewport — walk
+        // backwards from cursor_line to find the new scroll_top that
+        // leaves `bottom_margin` visual rows free below the cursor.
+        let target_rows = viewport_lines.saturating_sub(bottom_margin);
+        let mut rows_used = cursor_seg + 1;
         let mut new_scroll_top = cursor_line;
-        if rows_used < viewport_lines && cursor_line > 0 {
+        if rows_used < target_rows && cursor_line > 0 {
             for r in (0..cursor_line).rev() {
-                let line_len = self.buffer().content.line(r).len_chars().saturating_sub(1);
-                let vrows = engine_visual_rows_for_line(line_len, viewport_cols);
-                if rows_used + vrows > viewport_lines {
+                let vrows = engine_visual_rows_for_line(self.wrap_line_len(r), viewport_cols);
+                if rows_used + vrows > target_rows {
                     break;
                 }
                 rows_used += vrows;
@@ -338,14 +424,16 @@ impl Engine {
     /// When wrap is off, equivalent to `$`.
     pub(crate) fn move_screen_line_end(&mut self) {
         let line = self.view().cursor.line;
-        let line_len = self
-            .buffer()
-            .content
-            .line(line)
-            .len_chars()
-            .saturating_sub(1); // exclude newline
+        // #1280: `get_max_cursor_col` (what plain `$` uses) is the
+        // newline-safe way to find the line's last real column — a raw
+        // `.len_chars().saturating_sub(1)` assumes every line ends with
+        // `\n`, which the buffer's last line does not when the source file
+        // itself has no trailing newline, undercounting that line's length
+        // by one and landing `g$`/`g<End>` one column short of Neovim there.
+        let max_col = self.get_max_cursor_col(line);
+        let line_len = max_col + 1;
         if !self.settings.wrap {
-            self.view_mut().cursor.col = line_len.saturating_sub(1);
+            self.view_mut().cursor.col = max_col;
         } else {
             let vp = self.view().viewport_cols.max(1);
             let col = self.view().cursor.col;
@@ -631,7 +719,10 @@ impl Engine {
                 self.search_input_move_caret(is_replace, key);
                 SearchInputAction::Consumed
             }
-            "Tab" | "BackTab" => {
+            // "ISO_Left_Tab" is TUI's (and, since #1060, GTK's own)
+            // `render::engine_key_from_ui` spelling for Shift+Tab;
+            // "BackTab" is kept for any caller still on the pre-#1060 name.
+            "Tab" | "BackTab" | "ISO_Left_Tab" => {
                 if is_query {
                     self.search_panel_form_focus
                         .replace(Some("search:replace".to_string()));
@@ -1208,8 +1299,7 @@ impl Engine {
                     if let Some(state) = self.buffer_manager.get_mut(id) {
                         state.buffer.content = ropey::Rope::from_str(&content);
                         state.dirty = false;
-                        state.undo_stack.clear();
-                        state.redo_stack.clear();
+                        state.reset_undo_history();
                     }
                     self.refresh_git_diff(id);
                 }
@@ -1258,19 +1348,19 @@ impl Engine {
         if col >= chars.len() {
             return None;
         }
-        if !Self::is_word_char(chars[col]) {
+        if !self.is_word_char(chars[col]) {
             return None;
         }
 
         // Find start of word
         let start = (0..=col)
             .rev()
-            .take_while(|&i| Self::is_word_char(chars[i]))
+            .take_while(|&i| self.is_word_char(chars[i]))
             .last()
             .unwrap_or(col);
         // Find end of word (exclusive)
         let end = (col..chars.len())
-            .take_while(|&i| Self::is_word_char(chars[i]))
+            .take_while(|&i| self.is_word_char(chars[i]))
             .last()
             .map(|i| i + 1)
             .unwrap_or(col + 1);
@@ -1292,7 +1382,7 @@ impl Engine {
         let chars: Vec<char> = line_content.chars().collect();
 
         let mut i = col;
-        while i < chars.len() && !Self::is_word_char(chars[i]) {
+        while i < chars.len() && !self.is_word_char(chars[i]) {
             i += 1;
         }
         if i >= chars.len() {
@@ -1300,11 +1390,11 @@ impl Engine {
         }
         let start = (0..=i)
             .rev()
-            .take_while(|&j| Self::is_word_char(chars[j]))
+            .take_while(|&j| self.is_word_char(chars[j]))
             .last()
             .unwrap_or(i);
         let end = (i..chars.len())
-            .take_while(|&j| Self::is_word_char(chars[j]))
+            .take_while(|&j| self.is_word_char(chars[j]))
             .last()
             .map(|j| j + 1)
             .unwrap_or(i + 1);
@@ -1326,7 +1416,7 @@ impl Engine {
         // Vim places the cursor on the start of the identified word first.
         self.view_mut().cursor.col = start_col;
 
-        let escaped = crate::core::vim_regex::escape_vim_literal(&word);
+        let escaped = crate::core::vim_regex::escape_vim_literal(&word, self.settings.magic);
         self.search_query = if whole_word {
             format!("\\<{}\\>", escaped)
         } else {
@@ -1357,6 +1447,109 @@ impl Engine {
     /// Search forward (`*`) or backward (`#`) for the whole word under the cursor.
     pub(crate) fn search_word_under_cursor(&mut self, forward: bool) {
         self.search_word_under_cursor_generic(forward, true);
+    }
+
+    /// `gd` — go to local declaration (`:h gd`).
+    ///
+    /// This is a pure motion: it does not touch the language server. Vim's
+    /// documented algorithm is:
+    ///   1. Search backward for the start of the current function, exactly
+    ///      like `[[` (a line whose first character is `{`). If none is
+    ///      found, start at line 1.
+    ///   2. If one *was* found, keep walking further back until a blank
+    ///      line is found (skips attributes/doc-comments above the brace).
+    ///   3. From that position, search forward for the first whole-word
+    ///      match of the identifier under the cursor, like `*`.
+    ///
+    /// After `gd` lands, `n` repeats the same search forward (`:h gd`), so
+    /// this seeds `search_query`/`search_direction` exactly like `*` does.
+    pub(crate) fn cmd_gd(&mut self) {
+        self.take_count(); // no count variant of `gd` is implemented; discard cleanly
+        let Some((word, _start_col)) = self.star_word_under_cursor() else {
+            self.message = "E349: No identifier under cursor".to_string();
+            return;
+        };
+
+        let cur_line = self.view().cursor.line;
+
+        // Step 1: search backward, like `[[`, for a line starting with `{`.
+        let func_brace_line = (0..cur_line).rev().find(|&line| {
+            self.buffer().line_len_chars(line) > 0
+                && self.buffer().content.char(self.buffer().line_to_char(line)) == '{'
+        });
+
+        // Step 2: if found, keep going back to the nearest blank line above it.
+        let search_start_line = match func_brace_line {
+            Some(brace_line) => {
+                let mut line = brace_line;
+                while line > 0 {
+                    let prev = line - 1;
+                    let is_blank = self
+                        .buffer()
+                        .content
+                        .line(prev)
+                        .chars()
+                        .all(|c| c.is_whitespace());
+                    if is_blank {
+                        break;
+                    }
+                    line = prev;
+                }
+                line
+            }
+            None => 0,
+        };
+
+        // Step 3: search forward for the first whole-word match.
+        let total_lines = self.buffer().len_lines();
+        for line in search_start_line..total_lines {
+            let line_content: String = self.buffer().content.line(line).chars().collect();
+            if let Some(col) = self.find_whole_word_col(&line_content, &word) {
+                self.push_jump_location();
+                self.view_mut().cursor.line = line;
+                self.view_mut().cursor.col = col;
+
+                // Seed the search register so `n` continues forward from here.
+                let escaped =
+                    crate::core::vim_regex::escape_vim_literal(&word, self.settings.magic);
+                self.search_query = format!("\\<{}\\>", escaped);
+                self.search_offset.clear();
+                self.search_smartcase_applies = false;
+                self.search_direction = SearchDirection::Forward;
+                self.run_search();
+                let cursor_char = self.buffer().line_to_char(line) + col;
+                self.search_index = self
+                    .search_matches
+                    .iter()
+                    .position(|(start, _)| *start == cursor_char);
+                return;
+            }
+        }
+        self.message = format!("E387: Match not found for {}", word);
+    }
+
+    /// First whole-word (`\<word\>`) match of `word` in `line`; returns the
+    /// (char) column of the match start.
+    fn find_whole_word_col(&self, line: &str, word: &str) -> Option<usize> {
+        let chars: Vec<char> = line.chars().collect();
+        let wchars: Vec<char> = word.chars().collect();
+        if wchars.is_empty() || chars.len() < wchars.len() {
+            return None;
+        }
+        'outer: for start in 0..=(chars.len() - wchars.len()) {
+            for (i, &wc) in wchars.iter().enumerate() {
+                if chars[start + i] != wc {
+                    continue 'outer;
+                }
+            }
+            let before_ok = start == 0 || !self.is_word_char(chars[start - 1]);
+            let end = start + wchars.len();
+            let after_ok = end >= chars.len() || !self.is_word_char(chars[end]);
+            if before_ok && after_ok {
+                return Some(start);
+            }
+        }
+        None
     }
 
     // ===================================================================
@@ -1500,11 +1693,11 @@ impl Engine {
                 if opts.whole_word {
                     let before_ok = start_byte == 0 || {
                         let c = text[..start_byte].chars().last().unwrap_or(' ');
-                        !Self::is_word_char(c)
+                        !self.is_word_char(c)
                     };
                     let after_ok = end_byte >= text.len() || {
                         let c = text[end_byte..].chars().next().unwrap_or(' ');
-                        !Self::is_word_char(c)
+                        !self.is_word_char(c)
                     };
                     if !before_ok || !after_ok {
                         byte_pos = start_byte + 1;
@@ -1727,6 +1920,43 @@ impl Engine {
         true
     }
 
+    /// Paste already-resolved clipboard text into the focused find/replace
+    /// field (query or replacement), replacing the selection if any.
+    ///
+    /// Shared by [`handle_find_replace_key`]'s own Ctrl+V arm (which reads
+    /// `self.clipboard_read` itself) and [`Engine::route_paste`] (`keys.rs`)
+    /// — the latter is the one real backends actually reach for Ctrl+V today
+    /// (#946): quadraui#813 intercepts Ctrl+V/Ctrl+Shift+V ahead of
+    /// `AppLogic::handle` on every backend and delivers the resolved text as
+    /// `UiEvent::ClipboardPaste` → `route_paste`, so a raw `KeyPressed`
+    /// Ctrl+V never reaches [`handle_find_replace_key`]'s own arm in
+    /// practice. Before this method existed, `route_paste` had no branch for
+    /// `find_replace_open` at all, so Ctrl+V while the find/replace overlay
+    /// was focused fell through to `route_paste`'s `Mode::Normal` arm and
+    /// pasted into the *editor buffer* instead of the overlay field — a
+    /// live, user-visible bug on both GTK and TUI, not a dead-code gap.
+    ///
+    /// [`handle_find_replace_key`]: Self::handle_find_replace_key
+    pub(crate) fn find_replace_paste(&mut self, clip: &str) {
+        let paste = clip.lines().next().unwrap_or("").to_string();
+        self.fr_delete_selection(); // remove selected text first
+        let (field, is_find) = if self.find_replace_focus == 0 {
+            (&mut self.find_replace_query, true)
+        } else {
+            (&mut self.find_replace_replacement, false)
+        };
+        let byte_idx = field
+            .char_indices()
+            .nth(self.find_replace_cursor)
+            .map(|(i, _)| i)
+            .unwrap_or(field.len());
+        field.insert_str(byte_idx, &paste);
+        self.find_replace_cursor += paste.chars().count();
+        if is_find {
+            self.run_find_replace_search();
+        }
+    }
+
     /// Handle a key press in the find/replace overlay.
     pub(crate) fn handle_find_replace_key(
         &mut self,
@@ -1892,24 +2122,8 @@ impl Engine {
 
                 // Ctrl+V paste (replaces selection if any)
                 if ctrl && key_name == "v" {
-                    if let Some(clip) = Self::clipboard_paste() {
-                        let paste = clip.lines().next().unwrap_or("").to_string();
-                        self.fr_delete_selection(); // remove selected text first
-                        let (field, is_find) = if self.find_replace_focus == 0 {
-                            (&mut self.find_replace_query, true)
-                        } else {
-                            (&mut self.find_replace_replacement, false)
-                        };
-                        let byte_idx = field
-                            .char_indices()
-                            .nth(self.find_replace_cursor)
-                            .map(|(i, _)| i)
-                            .unwrap_or(field.len());
-                        field.insert_str(byte_idx, &paste);
-                        self.find_replace_cursor += paste.chars().count();
-                        if is_find {
-                            self.run_find_replace_search();
-                        }
+                    if let Some(clip) = self.clipboard_read.as_ref().and_then(|cb| cb().ok()) {
+                        self.find_replace_paste(&clip);
                     }
                     return;
                 }

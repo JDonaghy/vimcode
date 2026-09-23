@@ -1,6 +1,6 @@
 [package]
 name = "vimcode"
-version = "0.10.0"
+version = "0.12.0"
 edition = "2021"
 description = "Vim-like code editor with GTK4 and tree-sitter"
 license = "MIT"
@@ -23,10 +23,39 @@ assets = [
 name = "vimcode_core"
 path = "src/lib.rs"
 
+# #859: `required-features` used to be `["gui"]`. That list is an **AND**, so
+# ANY feature set without `gui` — including `--no-default-features` and
+# `--no-default-features --features macos` — made cargo **silently omit this
+# whole bin target**: no error, no warning, and none of its tests compiled or
+# ran. That is the #645 trap in its purest form, and it was measured, not
+# hypothetical: on macmini (2026-09-10) `cargo test --no-default-features`
+# exited 0 having built only 2 test binaries, because the app bin was dropped
+# on the floor rather than reported as unbuildable.
+#
+# It is now empty, and `src/main.rs` gates *internally* on which GUI backend
+# was compiled in (`cfg(feature = "gui")` / `cfg(all(feature = "macos",
+# target_os = "macos"))` / `cfg(all(feature = "win", target_os = "windows"))`
+# — #866 added the third arm, no `Cargo.toml` change needed since this stanza
+# was already empty), falling back to the terminal UI — loudly, on stderr —
+# when none is. Deliberately NOT a `compile_error!`: CI's
+# `Test (Linux, headless)` job runs `cargo build/clippy/test
+# --no-default-features`, so a hard error there would turn a green lane red
+# for a build configuration that is genuinely supported (vimcode-as-TUI, the
+# same thing the `vcd` bin is). The omission can no longer be silent because
+# the target now builds in *every* feature set — see
+# `src/main.rs::gui_backend_tests`. Verified for `win` too (#866): `cargo
+# build --no-default-features --features win` produces a real ELF on Linux
+# (`GuiBackend::None`, TUI fallback) and, cross-compiled via `cargo xwin
+# build --target x86_64-pc-windows-msvc --no-default-features --features
+# win`, a real `PE32+ executable ... for MS Windows` (checked with `file`,
+# not just a zero exit code).
+#
+# #645's gui-on invariant is untouched: `default = ["gui"]`, so a plain
+# `cargo build` / `cargo test` still compiles the GTK backend exactly as
+# before.
 [[bin]]
 name = "vimcode"
 path = "src/main.rs"
-required-features = ["gui"]
 
 [[bin]]
 name = "vcd"
@@ -51,6 +80,22 @@ name = "acceptance"
 path = "tests/acceptance.rs"
 required-features = ["test-support", "gui"]
 
+# #1106 review: `tests/gtk_no_display.rs` spawns the compiled `vimcode` binary
+# and asserts on the "no display found" message that `src/gtk/mod.rs` prints
+# before `gtk4::init()`. That codepath only exists when the binary was built
+# with the `gui` feature — under `--no-default-features`, `launch_gui` falls
+# straight through to the TUI (see the #859 comment above), so the same
+# no-DISPLAY invocation instead starts the TUI against a piped, immediately-
+# EOF stdin, which is not what this test is exercising and can fail or hang
+# unpredictably in that lane. Pinning `required-features = ["gui"]` makes
+# `cargo test --no-default-features` skip this target instead of running it
+# against the wrong backend (the same trap `tests/acceptance.rs` above and
+# `tests/cli_help.rs`'s `--help` sidestep were written to avoid).
+[[test]]
+name = "gtk_no_display"
+path = "tests/gtk_no_display.rs"
+required-features = ["gui"]
+
 [features]
 default = ["gui"]
 
@@ -66,6 +111,62 @@ test-support = []
 # (#223). vimcode adopts them one primitive at a time inside
 # `src/gtk/quadraui_gtk.rs`.
 gui = ["gtk4", "pangocairo", "gio", "quadraui/gtk"]
+
+# #859 (stage 2 of #47): the native macOS backend.
+#
+# Enables `quadraui/macos` — AppKit + Core Graphics + Core Text rasterisers
+# plus `quadraui::macos::shell_runner::run_with_shell`, the AppKit sibling of
+# the GTK/TUI shell runners. quadraui gates its own module
+# `#[cfg(all(feature = "macos", target_os = "macos"))]`, so on a non-macOS
+# host this feature compiles NONE of `quadraui/src/macos/` — enabling it on
+# Linux is resolvable and harmless (it pulls no Linux-side code at all), which
+# is exactly what makes it usable as the "does the bin still build without
+# `gui`?" probe in `src/main.rs`'s tests.
+#
+# Deliberately does NOT imply `gui`: the whole point is a macOS binary with no
+# GTK4 anywhere in the dependency graph (macmini carries no Homebrew/gtk4/
+# pkg-config by policy).
+#
+# The vimcode-side wrapper this gates is `src/macos/mod.rs` — ~30 lines of
+# runner wiring with no layout, hit-test, paint or dispatch decision in it.
+# It wraps `crate::app::App` directly: #861/#862 type-erased `App`'s last
+# GTK-only seams (the `TextMetricsBackend` context setter and the three
+# platform-resource fields), so `App` is no longer `#[cfg(feature = "gui")]`
+# and the macOS runner drives the same `impl quadraui::ShellApp for App` the
+# GTK runner does — see that file's module doc and `src/app.rs`'s.
+macos = ["quadraui/macos"]
+
+# #866 (stage 3 of #47, the Win-GUI twin of #859): the native Windows GUI
+# backend.
+#
+# Enables `quadraui/win` — Direct2D + DirectWrite rasterisers plus
+# `quadraui::win::shell_runner::run_with_shell`, the Win32 sibling of the
+# GTK/macOS/TUI shell runners. Unlike `macos` above, quadraui does **not**
+# gate its own `win` module on `target_os = "windows"` (see that module's own
+# doc comment): every real WinAPI call inside it is individually
+# `cfg(target_os = "windows")`-gated, falling back to a `todo!()` stub
+# everywhere else, specifically so `cargo check --features win` type-checks
+# on an ordinary Linux host. `win` here inherits that same un-target-gated
+# posture — enabling it on Linux is resolvable and compiles the vimcode-side
+# wrapper (`src/win/mod.rs`), proving it well-typed without needing a
+# Windows host, exactly the "does the bin still build without `gui`?" probe
+# `macos` already serves in `src/main.rs`'s tests. Producing (and running) a
+# real PE32+ binary additionally needs `cargo xwin build --target
+# x86_64-pc-windows-msvc` plus a Windows C cross-toolchain (`clang-cl` +
+# `lld-link` + the Windows SDK, via `cargo-xwin`) — `mlua`'s `vendored`
+# feature below compiles Lua's C sources for whatever the *target* is, so
+# that toolchain is the actual reason this needs pinning to a
+# `windows`-capability host, not anything Rust-side.
+#
+# Deliberately does NOT imply `gui`: the whole point is a Windows binary with
+# no GTK4 anywhere in its dependency graph.
+#
+# The vimcode-side wrapper this gates is `src/win/mod.rs` + `src/win/backend.rs`
+# — together comparable in size to their macOS twins. It wraps
+# `crate::app::App` directly, the same way `src/macos/mod.rs` does; see that
+# file's module doc and `src/app.rs`'s for why `App` needs no `gui` gate to
+# support this.
+win = ["quadraui/win"]
 
 [dependencies]
 # `quadraui/tui` enables the public `quadraui::tui::draw_*` rasterisers
@@ -87,9 +188,21 @@ gui = ["gtk4", "pangocairo", "gio", "quadraui/gtk"]
 # that file and CLAUDE.md's "Wrong quadraui checkout" section) — this
 # replaces the old `VIMCODE_QUADRAUI_UNPINNED=1` escape hatch, which could
 # not build backwards drift (a checkout older than a rev vimcode requires).
-quadraui = { git = "https://github.com/JDonaghy/quadraui.git", rev = "4ff2a645023637bba7229e0aeee5968a9c6f3652", features = ["tui", "terminal"] }
-gtk4 = { version = "0.7", features = ["v4_10"], optional = true }
-pangocairo = { version = "0.18", optional = true }
+quadraui = { git = "https://github.com/JDonaghy/quadraui.git", rev = "0dc838134a407061e7e937c2515900c27b300f72", features = ["tui", "terminal"] }
+# #896: gtk4/pangocairo/gio are ONE version family with quadraui's own
+# gtk4-rs dependency, not three independent bumps. `gtk4-sys` carries
+# `links = "gtk-4"`, so Cargo permits exactly one `gtk4-sys` in the whole
+# dependency graph — and that check is feature-independent (the lockfile
+# resolves optional deps too), so a mismatch fails `cargo check
+# --no-default-features` *before compiling anything*, not just the `gui`
+# lane.  quadraui moved to gtk4 0.11 / pangocairo 0.22 in quadraui#796;
+# vimcode has to move in lockstep or no lane resolves at all.  When the
+# quadraui pin above moves across another gtk4-rs bump, these three lines
+# move with it — and `gio` must stay in the same gtk-rs release family
+# (gtk4 0.11 ↔ glib/gio 0.22), because pairing it with an older major
+# resolves two incompatible `glib` majors side by side.
+gtk4 = { version = "0.11", features = ["v4_10"], optional = true }
+pangocairo = { version = "0.22", optional = true }
 ropey = "1.6.1"
 tree-sitter = "0.26"
 tree-sitter-rust = "0.24"
@@ -114,12 +227,19 @@ tree-sitter-language = "0.1"
 # tree-sitter-latex: vendored from latex-lsp/tree-sitter-latex v0.3.0 (language version 14)
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-gio = { version = "0.17", optional = true }
+# Same gtk-rs release family as `gtk4`/`pangocairo` above — see #896.
+gio = { version = "0.22", optional = true }
 ratatui = "0.30"
 ignore = "0.4"
 regex = "1"
+# `regex` is deliberately backtracking-free (linear-time guarantee) and so
+# cannot express `\1`..`\9` backreferences at all — not a missing feature,
+# a permanent design constraint of the crate. `fancy-regex` layers a
+# backtracking VM on top of it; vim_regex.rs uses it only for the patterns
+# that actually contain a backreference (#1004). Already resolved
+# transitively via `termwiz`, so this adds no new dependency to the tree.
+fancy-regex = "0.11"
 lsp-types = "0.97"
-copypasta-ext = "0.4"
 mlua = { version = "0.9", features = ["lua54", "vendored"] }
 toml = "0.8"
 libc = "0.2"
@@ -130,26 +250,32 @@ notify = { version = "7", default-features = false, features = ["macos_kqueue"] 
 
 [dev-dependencies]
 insta = "1.39"
+# #1008: msgpack values for the `tests/nvim_conformance.rs` oracle, which
+# drives `nvim --embed` over msgpack-RPC with a UI attached (`nvim_ui_attach`)
+# instead of the old `nvim --headless -l script.lua`. Deliberately a
+# **dev**-dependency: nothing vimcode ships touches msgpack.
+#
+# `rmpv` (values + reader/writer), not `nvim-rs` (the transport #27 names):
+# nvim-rs is an async client that would drag `tokio` into the test graph for a
+# suite whose every call is a blocking request/response over one pipe. The
+# ~100-line `NvimRpc` in that file speaks the same three-frame msgpack-RPC
+# protocol synchronously; #27's fuzzing loop can build on it or swap in
+# nvim-rs then without touching anything else.
+rmpv = "1.3"
 
 [build-dependencies]
 cc = "1.0"
 
-# quadraui#452: quadraui's develop tip pulls in vt100 0.16, whose upstream
-# manifest exact-pins its own `unicode-width` floor to "^0.2.1" — mutually
-# exclusive with `ratatui = "0.29"` above, which upstream-pins
-# `unicode-width` to exactly "=0.2.0". quadraui vendored a copy of vt100
-# 0.16.2 with only that bound loosened (no source changes) and patches it
-# via `[patch.crates-io]` in its OWN Cargo.toml — but Cargo only honors a
-# `[patch]` section declared in the root manifest of the workspace actually
-# being built, so quadraui's patch has zero effect here; this repo's own
-# `[patch.crates-io]` entry (pointing at the same vendored copy, which
-# lives at the quadraui monorepo root) is required too. See
-# vendor/vt100-0.16.2-patched/README-PATCH.md (in the quadraui repo, at the
-# rev pinned above) and quadraui's docs/LESSONS.md for the full rationale —
-# do not remove this without reading both first. #691: same rev as the
-# `quadraui` dep above, resolved via git instead of a sibling path.
-[patch.crates-io]
-vt100 = { git = "https://github.com/JDonaghy/quadraui.git", rev = "4ff2a645023637bba7229e0aeee5968a9c6f3652" }
+# quadraui#452 / #691 used to need a `[patch.crates-io]` vt100 shim here
+# (see git history) because vt100 0.16's own manifest exact-pinned
+# `unicode-width` to a bound incompatible with `ratatui`'s. quadraui#795
+# removed that vendored shim upstream — its own Cargo.toml now documents
+# the conflict as resolved — and the rev bumped for #829 (quadraui#775,
+# `Theme::from_vscode_json` / `Color::try_from_hex_over`) postdates that
+# fix, so the matching patch here is gone too: keeping it pointed at a
+# rev whose repo root no longer vendors `vt100-0.16.2-patched/` broke
+# `cargo check` outright ("patch location ... does not contain packages
+# matching `vt100`").
 
 # Optimize dependencies in dev builds — GTK/Relm4/Cairo/Pango FFI calls and
 # Tree-sitter parsing are 10-50× slower without optimization, causing visible

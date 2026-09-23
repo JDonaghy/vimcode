@@ -8,6 +8,12 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # #865: the Neovim that tests/nvim_conformance.rs uses as its oracle. Must be
+  # >= `MIN_NVIM_VERSION` in that file (0.12), and should match the fleet
+  # standard installed on every agent host so CI and the fleet judge Vim
+  # behaviour with the same binary. `ubuntu-24.04`'s apt ships 0.9.5, which is
+  # below the floor, so both jobs install this pinned upstream tarball instead.
+  NVIM_ORACLE_VERSION: v0.12.5
 
 jobs:
   test:
@@ -24,15 +30,23 @@ jobs:
     # dep pinned out-of-band via `quadraui-pin.txt`; see git history / #638 /
     # #625 for why that existed and why it was retired.)
 
-    # #795: tests/nvim_conformance.rs is the only test that validates VimCode
-    # against real Vim behaviour. It's a default integration test compiled in
-    # this (`--no-default-features`) lane too, and it hard-fails under CI (the
-    # `CI` env var GitHub Actions always sets) if nvim is missing rather than
-    # silently skipping — so this install step is load-bearing, not optional.
-    - name: Install Neovim (oracle for tests/nvim_conformance.rs)
+    # #795/#865: tests/nvim_conformance.rs is the only test that validates
+    # VimCode against real Vim behaviour. It's a default integration test
+    # compiled in this (`--no-default-features`) lane too, and since #865 it
+    # hard-fails on EVERY lane if nvim is missing or older than its declared
+    # `MIN_NVIM_VERSION` — so this install step is load-bearing, not optional.
+    # Do not swap it back to `apt-get install neovim`: ubuntu-24.04 apt ships
+    # 0.9.5, which is below the floor and would fail the job.
+    - name: Install Neovim ${{ env.NVIM_ORACLE_VERSION }} (oracle for tests/nvim_conformance.rs)
       run: |
-        sudo apt-get update
-        sudo apt-get install -y --no-install-recommends neovim
+        set -euo pipefail
+        curl -fsSL -o /tmp/nvim.tar.gz \
+          "https://github.com/neovim/neovim/releases/download/${NVIM_ORACLE_VERSION}/nvim-linux-x86_64.tar.gz"
+        sudo tar -C /opt -xzf /tmp/nvim.tar.gz
+        echo "/opt/nvim-linux-x86_64/bin" >> "$GITHUB_PATH"
+
+    - name: Verify the conformance oracle
+      run: nvim --version | head -1
 
     - name: Install Rust toolchain
       uses: dtolnay/rust-toolchain@stable
@@ -97,11 +111,25 @@ jobs:
         # tests (src/gtk/testing.rs, src/gtk/util.rs) hard-fail rather than
         # exercising real rasterised pixels.
         #
-        # #795: neovim is the oracle for tests/nvim_conformance.rs, a default
-        # integration test this (default-features) lane also compiles and
-        # runs. It hard-fails under CI (the `CI` env var GitHub Actions always
-        # sets) if nvim is missing, so this install is load-bearing.
-        sudo apt-get install -y --no-install-recommends libgtk-4-dev librsvg2-common neovim
+        sudo apt-get install -y --no-install-recommends libgtk-4-dev librsvg2-common
+
+    # #795/#865: neovim is the oracle for tests/nvim_conformance.rs, a default
+    # integration test this (default-features) lane also compiles and runs. It
+    # hard-fails on every lane if nvim is missing or below its declared
+    # `MIN_NVIM_VERSION`, so this install is load-bearing. It is a pinned
+    # upstream tarball rather than `apt-get install neovim` because
+    # ubuntu-24.04 apt ships 0.9.5, below the floor — and because CI and the
+    # agent fleet must judge Vim behaviour with the same binary.
+    - name: Install Neovim ${{ env.NVIM_ORACLE_VERSION }} (oracle for tests/nvim_conformance.rs)
+      run: |
+        set -euo pipefail
+        curl -fsSL -o /tmp/nvim.tar.gz \
+          "https://github.com/neovim/neovim/releases/download/${NVIM_ORACLE_VERSION}/nvim-linux-x86_64.tar.gz"
+        sudo tar -C /opt -xzf /tmp/nvim.tar.gz
+        echo "/opt/nvim-linux-x86_64/bin" >> "$GITHUB_PATH"
+
+    - name: Verify the conformance oracle
+      run: nvim --version | head -1
 
     - name: Install Rust toolchain
       uses: dtolnay/rust-toolchain@stable
@@ -130,3 +158,85 @@ jobs:
         # Guard the lane's whole point: this must be a headless run.
         test -z "${DISPLAY:-}" && test -z "${WAYLAND_DISPLAY:-}"
         cargo test
+
+  # #1042: the two jobs above are both Linux, so `src/macos/mod.rs` — gated
+  # `#[cfg(all(feature = "macos", target_os = "macos"))]` in src/lib.rs, and
+  # likewise in quadraui itself — is never compiled by either of them and its
+  # `mac_driver_tests` (18 `#[test]`s) never run anywhere. This job is a real
+  # `macos-latest` runner, not a cross-target `cargo check`: that route was
+  # tried and abandoned in #859 (see src/macos/mod.rs's own module doc,
+  # "Verifying this file without a Mac") because vimcode depends on
+  # tree-sitter, whose build.rs compiles `lib.c` for the *target* — `cc-rs`
+  # dies on `-arch` long before rustc would ever see this file.
+  #
+  # Scoped to `--lib` deliberately: tests/nvim_conformance.rs is a default
+  # integration test that hard-fails (not skips) when `nvim` is missing, and
+  # this job installs no oracle. `--lib` compiles and runs only the crate's
+  # unit tests — which is where `mac_driver_tests` lives — without pulling in
+  # the integration targets that need it.
+  test-macos:
+    name: Test (macOS native, AppKit)
+    runs-on: macos-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    # #691: quadraui fetched by Cargo itself, same as the Linux jobs — see
+    # the comment on the `test` job above.
+
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        components: clippy, rustfmt
+
+    - name: Cache cargo registry
+      uses: actions/cache@v4
+      with:
+        path: ~/.cargo/registry
+        key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+
+    - name: Cache cargo index
+      uses: actions/cache@v4
+      with:
+        path: ~/.cargo/git
+        key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
+
+    - name: Cache cargo build
+      uses: actions/cache@v4
+      with:
+        path: target
+        # Distinct key from the Linux jobs — the target dirs diverge (macOS
+        # toolchain, AppKit/Core Graphics/Core Text deps).
+        key: ${{ runner.os }}-cargo-build-target-macos-${{ hashFiles('**/Cargo.lock') }}
+
+    - name: Check formatting
+      run: cargo fmt -- --check
+
+    - name: Run clippy
+      run: cargo clippy --no-default-features --features macos -- -D warnings
+
+    - name: Run tests
+      run: |
+        # `cargo test --lib --no-default-features --features macos` (issue
+        # #1042's own minimum) runs the *whole* portable lib suite, not just
+        # `mac_driver_tests` — on Linux with the equivalent
+        # `--no-default-features` flags it's ~2,845 tests. That means a bare
+        # "did the overall run report zero tests" check would NOT catch the
+        # #645 vacuous-green trap this job exists to close: if some cfg
+        # mismatch silently dropped `src/macos/mod.rs::mac_driver_tests`
+        # (double-gated on `feature = "macos"` AND `target_os = "macos"`)
+        # while the shared portable suite still ran fine, the overall count
+        # would stay in the thousands and the job would report green having
+        # exercised zero macOS-specific code — exactly the failure mode this
+        # issue is about. So: run the full command as specified, but assert
+        # specifically on how many `macos::mac_driver_tests::*` cases ran.
+        set -euo pipefail
+        cargo test --lib --no-default-features --features macos 2>&1 | tee /tmp/macos-test-output.txt
+        TOTAL_LINE=$(grep -E '^test result: ' /tmp/macos-test-output.txt | tail -1)
+        echo "Overall lib suite: $TOTAL_LINE"
+        MAC_PASSED=$(grep -cE '^test macos::mac_driver_tests::.* \.\.\. ok$' /tmp/macos-test-output.txt || true)
+        echo "macos::mac_driver_tests cases passed: $MAC_PASSED"
+        if [ -z "$MAC_PASSED" ] || [ "$MAC_PASSED" -eq 0 ]; then
+          echo "::error::macos::mac_driver_tests ran zero tests — src/macos/ may have compiled but its own suite never executed. This is the #645 vacuous-green trap, not a pass."
+          exit 1
+        fi

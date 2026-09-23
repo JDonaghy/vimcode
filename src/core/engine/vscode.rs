@@ -747,6 +747,14 @@ impl Engine {
     }
 
     /// VSCode Ctrl+] → indent current line or selection.
+    ///
+    /// Passes `reposition_cursor: false` to `indent_lines`/`dedent_lines`
+    /// throughout this function and `vscode_outdent` below — VSCode mode's
+    /// multi-cursor model manages every cursor's column itself right after
+    /// the loop, and the shared helper's Vim-style cursor landing
+    /// (`self.view_mut().cursor.line = start_line` on every call) would
+    /// otherwise stomp every cursor but the last shifted line's onto
+    /// `start_line` (#883 review).
     fn vscode_indent(&mut self, changed: &mut bool) {
         if !self.view().extra_cursors.is_empty() {
             // Collect all unique lines from primary + extra cursors
@@ -758,7 +766,7 @@ impl Engine {
             }
             lines.sort_unstable();
             for &line in &lines {
-                self.indent_lines(line, 1, changed);
+                self.indent_lines(line, 1, changed, false);
             }
             // Adjust cursor columns for indent
             let indent_size = if self.settings.expand_tab {
@@ -773,7 +781,7 @@ impl Engine {
         } else {
             let (start_line, end_line) = self.vscode_affected_lines();
             let count = end_line - start_line + 1;
-            self.indent_lines(start_line, count, changed);
+            self.indent_lines(start_line, count, changed, false);
         }
     }
 
@@ -794,7 +802,7 @@ impl Engine {
                 1
             };
             for &line in &lines {
-                self.dedent_lines(line, 1, changed);
+                self.dedent_lines(line, 1, changed, false);
             }
             // Adjust cursor columns
             self.view_mut().cursor.col = self.view().cursor.col.saturating_sub(indent_size);
@@ -804,7 +812,7 @@ impl Engine {
         } else {
             let (start_line, end_line) = self.vscode_affected_lines();
             let count = end_line - start_line + 1;
-            self.dedent_lines(start_line, count, changed);
+            self.dedent_lines(start_line, count, changed, false);
         }
     }
 
@@ -887,7 +895,7 @@ impl Engine {
             return self.handle_command_key(key_name, unicode, ctrl);
         }
 
-        // User-defined keymaps (`:map n <key> :command`) work in VSCode mode too.
+        // User-defined keymaps (`:nnoremap <key> :command`) work in VSCode mode too.
         // Mode "n" maps are matched since VSCode has no modal distinction.
         if !self.user_keymaps.is_empty() {
             let mut km_changed = false;

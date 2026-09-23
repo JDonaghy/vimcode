@@ -7,6 +7,54 @@ impl Engine {
             .active_panel_id()
             .is_some_and(|id| id.as_str() == panel_id)
     }
+
+    /// The sidebar-visibility verdict `autohide_panels` /
+    /// `session.explorer_visible` / `explorer_visible_on_startup` derive —
+    /// the single formula both [`Self::sync_app_shell_sidebar_visibility`]
+    /// and `Engine::new_from_state`'s construction-time bake-in apply.
+    /// Pulled out on its own so there is exactly one place that formula
+    /// lives (#1117 review) — see [`Self::sync_app_shell_sidebar_visibility`]'s
+    /// doc for why a *second*, independent copy of it went stale.
+    pub fn derived_sidebar_visible(&self) -> bool {
+        if self.settings.autohide_panels {
+            false
+        } else {
+            self.session.explorer_visible || self.settings.explorer_visible_on_startup
+        }
+    }
+
+    /// Make `self.app_shell`'s sidebar visibility agree with
+    /// [`Self::derived_sidebar_visible`], regardless of which direction it
+    /// currently disagrees in.
+    ///
+    /// `self.app_shell` (the "shadow": see
+    /// `tui_main::shell_app`'s module doc for the runner-vs-shadow split
+    /// that only exists on TUI) is a fully independent [`quadraui::AppShell`]
+    /// instance from the one the TUI runner actually paints through. It only
+    /// gets to the right answer at construction time (`Engine::new_from_state`
+    /// derives it there, once, before anything else can touch it) — a
+    /// caller that mutates `self.session` on an already-built `Engine` (as
+    /// `Engine::new_for_test`'s own doc warns against) leaves it behind.
+    /// That staleness is not just cosmetic: `TuiShellApp::handle`'s own
+    /// runner-vs-shadow resync (`shell_app.rs`, "#634 smoke retry") pushes
+    /// *this* shadow's `sidebar_visible()` onto the runner every dispatch,
+    /// so a stale shadow doesn't just mis-answer a query — it actively
+    /// hides a sidebar the runner had correctly showing (#1117).
+    ///
+    /// Callers: `Engine::new_from_state` (construction) and
+    /// `TuiShellApp::from_engine` (picks up whatever a caller mutated on
+    /// the engine after construction but before the shell app takes
+    /// ownership of it — the only path this ever has real work to do on).
+    pub fn sync_app_shell_sidebar_visibility(&mut self) {
+        let show_sidebar = self.derived_sidebar_visible();
+        if show_sidebar != self.app_shell.sidebar_visible() {
+            if show_sidebar {
+                self.app_shell.toggle_sidebar();
+            } else {
+                self.app_shell.hide_sidebar();
+            }
+        }
+    }
 }
 
 pub const PANEL_EXPLORER: &str = "panel:explorer";
@@ -73,6 +121,62 @@ pub const FIXED_ACTIVITY_PANEL_IDS: [&str; 6] = [
     PANEL_EXTENSIONS,
     PANEL_AI,
 ];
+
+/// Title/tooltip pair the engine's own "shadow" `AppShell` (see
+/// [`Engine::sync_app_shell_sidebar_visibility`]'s doc for what that means)
+/// shows for a built-in panel id — one entry per id in
+/// [`FIXED_ACTIVITY_PANEL_IDS`] plus [`PANEL_SETTINGS`].
+///
+/// This is display metadata only; it has no bearing on activity-bar
+/// keyboard order (that's [`FIXED_ACTIVITY_PANEL_IDS`] itself) or icon
+/// resolution (`App::resolve_builtin_panel_icon`). Panics on any other id —
+/// callers only ever feed it ids drawn from those two sources.
+fn fixed_panel_title_tooltip(id: &str) -> (&'static str, &'static str) {
+    match id {
+        PANEL_EXPLORER => ("EXPLORER", "Explorer"),
+        PANEL_SEARCH => ("SEARCH", "Search"),
+        PANEL_DEBUG => ("RUN AND DEBUG", "Run and Debug"),
+        PANEL_GIT => ("SOURCE CONTROL", "Source Control"),
+        PANEL_EXTENSIONS => ("EXTENSIONS", "Extensions"),
+        PANEL_AI => ("AI", "AI"),
+        PANEL_SETTINGS => ("SETTINGS", "Settings"),
+        _ => unreachable!("fixed_panel_title_tooltip called with a non-fixed panel id: {id:?}"),
+    }
+}
+
+/// The engine's shadow `AppShell`'s panel list (#1166): [`FIXED_ACTIVITY_PANEL_IDS`]
+/// in order, then [`PANEL_SETTINGS`] last, each with an empty icon (the
+/// engine is backend-agnostic — see `App::shell_config`'s doc for who fills
+/// icons in) and title/tooltip from [`fixed_panel_title_tooltip`].
+///
+/// Before this, `Engine::new_from_state` built `self.app_shell` from a
+/// hand-transcribed `vec![PanelDefinition { .. }, ..]` literal that
+/// happened to list the same six ids in the same order as
+/// [`FIXED_ACTIVITY_PANEL_IDS`] — a second, independent copy of the order
+/// this constant already exists to be the one source of truth for. GUI
+/// backends read that shadow shell's order straight through
+/// `App::shell_config` (`self.engine.app_shell.panels()`), so a reorder of
+/// `FIXED_ACTIVITY_PANEL_IDS` moved TUI's activity bar (which iterates the
+/// constant directly in `TuiShellApp::build_shell_config`) without moving
+/// GUI's — exactly the icon-table split #1107 fixed, one level up. Building
+/// this list *from* the constant instead of beside it closes that gap:
+/// there is now one order both backends' `ShellConfig`s ultimately trace
+/// back to.
+pub fn engine_app_shell_panel_definitions() -> Vec<quadraui::PanelDefinition> {
+    FIXED_ACTIVITY_PANEL_IDS
+        .into_iter()
+        .chain(std::iter::once(PANEL_SETTINGS))
+        .map(|id| {
+            let (title, tooltip) = fixed_panel_title_tooltip(id);
+            quadraui::PanelDefinition {
+                id: quadraui::WidgetId::new(id),
+                icon: String::new(),
+                tooltip: tooltip.to_string(),
+                title: title.to_string(),
+            }
+        })
+        .collect()
+}
 
 /// Keyboard (toolbar) index of the bottom-pinned Settings item.
 ///

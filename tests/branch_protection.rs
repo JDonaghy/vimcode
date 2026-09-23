@@ -197,14 +197,16 @@ fn required_contexts_match_ci_job_names() {
     let jobs = ci_job_names(&workflow);
 
     // Anti-vacuity: a parser that silently returned nothing would make the
-    // equality below pass against an empty config. CI has two lanes (#645) —
-    // the `--no-default-features` one and the GUI one — and both are load
-    // bearing, so anything other than two named jobs means the scan drifted
-    // from the file it is meant to read.
+    // equality below pass against an empty config. CI has three lanes — the
+    // two Linux ones from #645 (the `--no-default-features` lane and the GUI
+    // lane) plus the native macOS lane added in #1042, which is the only one
+    // that compiles `src/macos/` at all. All three are load bearing, so
+    // anything other than three named jobs means the scan drifted from the
+    // file it is meant to read.
     assert_eq!(
         jobs.len(),
-        2,
-        "expected 2 jobs parsed from .github/workflows/ci.yml, got {jobs:?}"
+        3,
+        "expected 3 jobs parsed from .github/workflows/ci.yml, got {jobs:?}"
     );
     assert!(
         jobs.iter().all(|n| !n.trim().is_empty()),

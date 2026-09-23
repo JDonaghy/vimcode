@@ -16,10 +16,17 @@
 > started consuming the fix on the TUI side. #813 (also on this branch) has
 > now retyped `App::backend` off the concrete `GtkBackend` struct onto a
 > narrow `TextMetricsBackend: quadraui::Backend` trait and retired the two
-> `glib`-timer hooks the module doc used to list as blockers. What's left of
-> Stage 1 is the three remaining platform-typed fields
-> (`window`/`css_provider`/`settings_monitor`) — read the section below for
-> what's still accurate.
+> `glib`-timer hooks the module doc used to list as blockers.
+>
+> **Corrected 2026-09-19 (#1168): Stage 1 is merged and `settings_monitor` is
+> gone.** This paragraph used to say "what's left of Stage 1 is the three
+> remaining platform-typed fields (`window`/`css_provider`/`settings_monitor`)".
+> `settings_monitor` was **deleted by #949** — it survives only as a historical
+> note in `src/app.rs`'s and `src/lib.rs`'s module docs, and naming it as
+> remaining work sends a reader looking for a field that does not exist. **#47 is
+> now scoped to Stage 2** (`src/macos/mod.rs` wrapper + the `macos` feature), per
+> its own title. The section below is a 2026-09-02 audit kept for its history —
+> read it as history, not as a work list.
 
 ---
 
@@ -60,6 +67,13 @@ here rather than attempting the move blind, per the Platform-Neutrality Rule
 a quadraui issue... build infra in quadraui first").
 
 ### #47 re-audit findings (2026-09-02, `develop @ f93fb3d`, post-#657)
+
+> **Stale as of 2026-09-19 (#1168) — kept for history.** Since this audit was
+> taken: `settings_monitor` was deleted (#949); `struct App` moved out of
+> `src/gtk/mod.rs` entirely (#785/#862), which is now **140 production lines**;
+> and `Backend::window()` was adopted (#1124/quadraui#950), taking title-sync and
+> minimize off the `window` field. Do not plan against the line references or the
+> field list below — re-derive them.
 
 `struct App` (`src/gtk/mod.rs:538-878`, 340 lines) now has **four** genuinely
 platform-typed fields — the issue's list (`sidebar_revealer`,

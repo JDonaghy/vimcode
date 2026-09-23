@@ -169,6 +169,18 @@ fn wincmd_maximize() {
 
 /// #582: `Ctrl-W |` (maximize width) previously only ever operated on
 /// `self.group_layout`, a no-op for a plain `:vsplit` window pane.
+///
+/// #1289: the expected ratio here used to be a flat `0.9` — a fixed 90/10
+/// split regardless of the window's actual size, which doesn't match
+/// Neovim's real behaviour (shrink the *other* window down to its
+/// `'winminwidth'` floor, 1 column by default). This test used to be
+/// vacuously green against that bug (a fixed-ratio implementation trivially
+/// produces a fixed ratio); it was observed RED — expecting `0.9875` while
+/// unfixed `develop` still produced `0.9` — before `maximize_window_split`
+/// was changed to compute the ratio from the split's actual raw column
+/// count. A fresh `vsplit` on this test's default 80-column engine gives
+/// each side 40 columns; maximizing the active (first) side should shrink
+/// the other side to exactly 1 column, i.e. give the active side 79 of 80.
 #[test]
 fn wincmd_maximize_actually_widens_window_split() {
     let mut e = engine_with("hello\n");
@@ -176,8 +188,35 @@ fn wincmd_maximize_actually_widens_window_split() {
     exec(&mut e, "wincmd |");
     assert_eq!(
         window_split_ratio(&e),
-        Some(0.9),
-        "wincmd | must maximize the active (first/left) window's split ratio to 0.9"
+        Some(78.0 / 79.0),
+        "wincmd | must shrink the other window to its 1-column 'winminwidth' \
+         floor, not a fixed 0.9 ratio — #1326: a fresh vertical split \
+         reserves one column for the divider bar (matching Neovim), so the \
+         80-column default's content total is 79, not 80, and the floor is \
+         78/79, not 79/80"
+    );
+}
+
+/// #1289 regression guard: `CTRL-W _` (maximize height) was already a real,
+/// non-coincidental Neovim match before this fix on the `nvim_conformance.rs`
+/// oracle fixture (its 0.1-ratio floor happened to round down to the same
+/// 1-content-row `'winminheight'` floor Neovim uses there) — pin that here on
+/// a plain `:split` too, on this test's default 40-line engine, so a future
+/// change to `maximize_window_split`'s height math can't silently regress it
+/// the way `|` regressed for width. Default `viewport_lines=40` gives a raw
+/// axis size of 41 (`raw_axis_extent`'s `+1` status-line chrome); shrinking
+/// the other side to its 2-raw-unit (1 content row + chrome) floor leaves
+/// the active side 39 of 41.
+#[test]
+fn wincmd_maximize_actually_heightens_window_split() {
+    let mut e = engine_with("hello\n");
+    exec(&mut e, "split");
+    exec(&mut e, "wincmd _");
+    assert_eq!(
+        window_split_ratio(&e),
+        Some(39.0 / 41.0),
+        "wincmd _ must shrink the other window to its 1-content-row \
+         'winminheight' floor (39/41)"
     );
 }
 
@@ -539,8 +578,8 @@ fn vscode_keybindings_reference_shows_command_names() {
     assert!(content.contains(":debug"), "vscode ref should show :debug");
     assert!(content.contains(":fuzzy"), "vscode ref should show :fuzzy");
     assert!(
-        content.contains(":map n"),
-        "vscode ref should mention :map n for remapping"
+        content.contains(":nnoremap"),
+        "vscode ref should mention :nnoremap for remapping"
     );
 }
 

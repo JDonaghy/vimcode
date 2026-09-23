@@ -3,12 +3,23 @@ use common::*;
 
 // ── zM: close all folds ─────────────────────────────────────────────────────
 
+// zM only closes folds that already exist (Vim's default 'foldmethod' is
+// "manual" — zM never invents one from indentation, #1006), so these two
+// tests define both folds with `zf` first, matching a realistic manual-fold
+// workflow, then verify zM (re)closes everything that's defined.
+
 #[test]
 fn test_zm_close_all_folds() {
     let mut e =
         engine_with("fn main() {\n    let x = 1;\n    let y = 2;\n}\nfn foo() {\n    bar();\n}\n");
-    type_chars(&mut e, "zM");
-    // Both functions should have folds
+    type_chars(&mut e, "zf3j"); // define+close fn main (lines 0-3)
+    type_chars(&mut e, "zo"); // reopen — fold stays defined (#1006)
+    e.view_mut().cursor.line = 4;
+    type_chars(&mut e, "zf2j"); // define+close fn foo (lines 4-6)
+    type_chars(&mut e, "zo");
+    e.view_mut().cursor.line = 0;
+    type_chars(&mut e, "zM"); // reclose every defined fold
+                              // Both functions should have folds
     assert!(e.view().fold_at(0).is_some(), "fold at line 0");
     assert!(e.view().fold_at(4).is_some(), "fold at line 4");
 }
@@ -16,7 +27,9 @@ fn test_zm_close_all_folds() {
 #[test]
 fn test_zm_cursor_clamp() {
     let mut e = engine_with("fn main() {\n    let x = 1;\n    let y = 2;\n}\n");
-    // Move cursor inside the fold body
+    type_chars(&mut e, "zf3j"); // define+close lines 0-3
+    type_chars(&mut e, "zo"); // reopen
+                              // Move cursor inside the fold body
     e.view_mut().cursor.line = 2;
     type_chars(&mut e, "zM");
     // Cursor should be moved to the fold header
@@ -28,8 +41,13 @@ fn test_zm_cursor_clamp() {
 #[test]
 fn test_za_big_toggle_recursive_open() {
     let mut e = engine_with("fn main() {\n    if true {\n        x();\n    }\n}\n");
-    // Close all, then zA on outer should open all
-    type_chars(&mut e, "zM");
+    // Define a nested pair of manual folds — inner if-block, then outer fn
+    // (which subsumes it) — then close all, then zA on the outer header
+    // should open all.
+    e.view_mut().cursor.line = 1;
+    type_chars(&mut e, "zf2j"); // inner fold: lines 1-3
+    e.view_mut().cursor.line = 0;
+    type_chars(&mut e, "zf4j"); // outer fold: lines 0-4 (nests the inner one)
     assert!(e.view().fold_at(0).is_some());
     type_chars(&mut e, "zA");
     // After zA on header, all nested folds should be opened
@@ -39,7 +57,12 @@ fn test_za_big_toggle_recursive_open() {
 #[test]
 fn test_za_big_toggle_recursive_close() {
     let mut e = engine_with("fn main() {\n    let x = 1;\n}\n");
-    // No fold exists, zA should create one (same as zc)
+    // zA toggles: with no fold defined it does nothing (Vim: E490, #1006 —
+    // 'foldmethod' defaults to "manual", so there's nothing to fold without
+    // an explicit `zf`). Define one, reopen it, then zA recloses it.
+    type_chars(&mut e, "zfj");
+    type_chars(&mut e, "zo");
+    assert!(e.view().fold_at(0).is_none());
     type_chars(&mut e, "zA");
     assert!(e.view().fold_at(0).is_some());
 }
@@ -49,7 +72,12 @@ fn test_za_big_toggle_recursive_close() {
 #[test]
 fn test_zo_big_open_recursive() {
     let mut e = engine_with("fn main() {\n    if true {\n        x();\n    }\n}\n");
-    type_chars(&mut e, "zM");
+    e.view_mut().cursor.line = 1;
+    type_chars(&mut e, "zf2j"); // inner fold: lines 1-3
+    e.view_mut().cursor.line = 0;
+    type_chars(&mut e, "zf4j"); // outer fold: lines 0-4 (nests the inner one)
+    type_chars(&mut e, "zM"); // close everything defined
+    e.view_mut().cursor.line = 0;
     // zO on outer header should open all nested
     type_chars(&mut e, "zO");
     assert!(e.view().folds.is_empty(), "all folds should be opened");
@@ -60,8 +88,10 @@ fn test_zo_big_open_recursive() {
 #[test]
 fn test_zc_big_close_recursive() {
     let mut e = engine_with("fn main() {\n    let x = 1;\n}\n");
-    type_chars(&mut e, "zC");
-    assert!(e.view().fold_at(0).is_some(), "fold should be created");
+    type_chars(&mut e, "zfj"); // define+close lines 0-1
+    type_chars(&mut e, "zo"); // reopen — still defined (#1006)
+    type_chars(&mut e, "zC"); // close recursively: recloses the same fold
+    assert!(e.view().fold_at(0).is_some(), "fold should be reclosed");
 }
 
 // ── zd: delete fold ─────────────────────────────────────────────────────────
@@ -69,7 +99,7 @@ fn test_zc_big_close_recursive() {
 #[test]
 fn test_zd_delete_fold() {
     let mut e = engine_with("fn main() {\n    let x = 1;\n}\n");
-    type_chars(&mut e, "zc"); // create fold
+    type_chars(&mut e, "zfj"); // create fold
     assert!(e.view().fold_at(0).is_some());
     type_chars(&mut e, "zd"); // delete fold
     assert!(e.view().fold_at(0).is_none());
@@ -89,8 +119,11 @@ fn test_zd_error_no_fold() {
 #[test]
 fn test_zd_big_delete_recursive() {
     let mut e = engine_with("fn main() {\n    if true {\n        x();\n    }\n}\n");
-    type_chars(&mut e, "zM");
-    // Should have folds at line 0 and nested at line 1
+    e.view_mut().cursor.line = 1;
+    type_chars(&mut e, "zf2j"); // inner fold: lines 1-3
+    e.view_mut().cursor.line = 0;
+    type_chars(&mut e, "zf4j"); // outer fold: lines 0-4 (nests the inner one)
+                                // Should have folds at line 0 and nested at line 1
     type_chars(&mut e, "zD");
     // All folds starting within the outer fold range should be deleted
     assert!(e.view().folds.is_empty());
@@ -158,12 +191,18 @@ fn test_zf_paragraph_create_fold() {
 
 #[test]
 fn test_zf_big_create_fold_n_lines() {
+    // #1280: `3zF` folds 3 *total* lines (the count includes the header),
+    // not 4 — verified against the real oracle (`fold:zF folds a count of
+    // lines` in `tests/nvim_conformance.rs`). This test used to pin the
+    // off-by-one (`fold.end == 3`, i.e. lines 0-3 = 4 lines): `end` is the
+    // last *hidden* line, so a 3-line fold from line 0 hides lines 1-2 only
+    // — `end == 2`.
     let mut e = engine_with("line 0\nline 1\nline 2\nline 3\n");
     type_chars(&mut e, "3zF");
     assert!(e.view().fold_at(0).is_some());
     let fold = e.view().fold_at(0).unwrap();
-    assert_eq!(fold.end, 3);
-    assert_msg_contains(&e, "3 lines folded");
+    assert_eq!(fold.end, 2);
+    assert_msg_contains(&e, "2 lines folded");
 }
 
 // ── zv: open folds to make cursor visible ───────────────────────────────────
@@ -171,8 +210,8 @@ fn test_zf_big_create_fold_n_lines() {
 #[test]
 fn test_zv_open_cursor_visible() {
     let mut e = engine_with("fn main() {\n    let x = 1;\n    let y = 2;\n}\n");
-    type_chars(&mut e, "zc"); // close fold at line 0
-                              // Move cursor to hidden line
+    type_chars(&mut e, "zf2j"); // close fold spanning lines 0-2
+                                // Move cursor to hidden line
     e.view_mut().cursor.line = 1;
     type_chars(&mut e, "zv");
     // Fold should be opened
@@ -193,20 +232,37 @@ fn test_zx_recompute() {
 
 // ── zj/zk: fold navigation ─────────────────────────────────────────────────
 
+// zj/zk navigate *defined* folds (any `zf`, open or closed) — with the
+// default 'foldmethod' "manual" there is nothing to jump to until one
+// exists (#1006), so both tests define one first.
+
 #[test]
 fn test_zj_move_to_next_fold() {
     let mut e = engine_with("top\nfn main() {\n    body;\n}\nbottom\n");
-    // Cursor at line 0, zj should find next foldable line
+    e.view_mut().cursor.line = 1;
+    type_chars(&mut e, "zf2j"); // define fold at lines 1-3
+    type_chars(&mut e, "zo"); // reopen — still defined
+    e.view_mut().cursor.line = 0;
+    // Cursor at line 0, zj should find the next defined fold's header
     type_chars(&mut e, "zj");
     assert_eq!(e.cursor().line, 1, "should move to fn main (foldable)");
 }
 
 #[test]
 fn test_zk_move_to_prev_fold() {
+    // zk moves to the *end* of the previous fold, not its start — that
+    // asymmetry with zj is real Vim behavior (`:h zk`, verified against
+    // `nvim --headless`, #1006).
     let mut e = engine_with("fn main() {\n    body;\n}\nbottom\n");
+    type_chars(&mut e, "zf2j"); // define fold at lines 0-2
+    type_chars(&mut e, "zo"); // reopen — still defined
     e.view_mut().cursor.line = 3;
     type_chars(&mut e, "zk");
-    assert_eq!(e.cursor().line, 0, "should move back to fn main");
+    assert_eq!(
+        e.cursor().line,
+        2,
+        "should move to the fold's closing brace"
+    );
 }
 
 #[test]
@@ -320,7 +376,7 @@ fn test_zl_big_scroll_half_right() {
 #[test]
 fn test_zr_big_open_all() {
     let mut e = engine_with("fn main() {\n    let x = 1;\n}\n");
-    type_chars(&mut e, "zc"); // close fold
+    type_chars(&mut e, "zfj"); // close fold
     assert!(!e.view().folds.is_empty());
     type_chars(&mut e, "zR"); // open all
     assert!(e.view().folds.is_empty());
@@ -331,7 +387,7 @@ fn test_zr_big_open_all() {
 #[test]
 fn test_fold_then_j_skips_hidden_lines() {
     let mut e = engine_with("fn main() {\n    let x = 1;\n    let y = 2;\n}\nafter\n");
-    type_chars(&mut e, "zc"); // fold fn main body
+    type_chars(&mut e, "zf2j"); // fold fn main body (lines 0-2)
     assert_eq!(e.cursor().line, 0);
     // j should skip hidden lines and land on "}"
     press(&mut e, 'j');

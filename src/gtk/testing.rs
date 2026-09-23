@@ -46,8 +46,16 @@
 //!   means "not recorded", not necessarily "not drawn".
 //! - **No window.** `App::window` stays `None`
 //!   (`capture_window_and_apply_csd` finds no mapped toplevel), so CSD
-//!   minimise/maximise/close and anything else routed through
-//!   `gtk4::Window` is inert under test.
+//!   minimise and anything else routed through `gtk4::Window` is inert
+//!   under test. Close is the one CSD control that is *not* on this list
+//!   any more (#857): `window_close` used to call `w.close()` directly,
+//!   which is exactly the inert-under-test, only-testable-live pattern
+//!   this bullet describes — and also the reason its
+//!   `w.close()` → GTK `close-request` re-entrancy bug went unnoticed by
+//!   this harness. It now routes through `show_quit_confirm` instead
+//!   (same fix shape as maximize's #813 `toggle_window_maximize`), which
+//!   never touches `self.window`, so `issue_857_titlebar_close_button`'s
+//!   tests below observe it fully headlessly.
 //! - **No display-dependent init.** No CSS is attached to a `GdkDisplay`, no
 //!   icon theme search path, no clipboard provider, no
 //!   `Engine::startup`/session restore. Behaviour that depends on any of
@@ -78,46 +86,64 @@ pub struct Harness<A: AppLogic> {
     /// — the source for per-editor-window pixel rects (see
     /// [`Self::window_center`]).
     pub screen_layout: Rc<RefCell<Option<crate::render::ScreenLayout>>>,
-    /// Picker/command-palette popup rect `(x, y, w, h)` the last frame
+    /// Picker/command-palette popup rect the last frame
     /// actually painted, or `None` if that frame drew no picker — see
     /// [`Self::picker_popup`] (#555).
-    #[allow(clippy::type_complexity)]
-    pub picker_popup_rect: Rc<std::cell::Cell<Option<(f64, f64, f64, f64)>>>,
+    pub picker_popup_rect: Rc<std::cell::Cell<Option<quadraui::Rect>>>,
     /// Line height the last frame actually painted with (#555).
     pub painted_line_height: Rc<std::cell::Cell<Option<f64>>>,
-    /// Character-cell advance (pixels) the shell last reported to `App`.
-    /// The horizontal twin of [`Self::painted_line_height`] — needed to turn
+    /// Character-cell advance (pixels) the last `render_content` frame
+    /// actually painted with. The horizontal twin of
+    /// [`Self::painted_line_height`] — needed to turn
     /// `RenderedWindow::gutter_char_width` (char cells) into the pixel band
     /// the line-number gutter occupies (#701).
-    pub painted_char_width: Rc<Cell<f64>>,
+    ///
+    /// **#947 fix:** this used to alias `App::char_width_cell` — set only
+    /// from `tick_dispatch`/`WindowResized` (real GTK event-loop ticks a
+    /// headless `GtkDriver` test never fires), not from `render_content`
+    /// itself — so it stayed at whatever `Backend::char_width()` returned
+    /// the one time some other event happened to run `tick_dispatch`
+    /// (often quadraui's own hardcoded `GtkBackend::new()` default, 8.0px),
+    /// regardless of the font any given test actually painted with. That
+    /// was masked while the paint backend was itself hardcoded to
+    /// `"Monospace 11"` (~8.8px, close enough to the stale 8.0px default
+    /// not to matter for most assertions); #947 wiring the real (larger)
+    /// `settings.font_size` default (14pt, ~11.2px) through to paint
+    /// widened the gap enough to break every test that trusted this
+    /// accessor for anything font-size-sensitive (the minimap-visibility
+    /// threshold below among them). `App::painted_char_width` (aliased
+    /// here now) is the correct source — set inside `render_content`
+    /// itself, alongside `painted_line_height`, from the exact `cw` that
+    /// frame's `build_screen_layout` call used.
+    pub painted_char_width: Rc<Cell<Option<f64>>>,
     /// Completion popup layout the last frame painted, or `None` if that
     /// frame drew no completion popup — the completion twin of
     /// [`Self::picker_popup_rect`] (#669).
     pub completion_layout: Rc<RefCell<Option<quadraui::CompletionsLayout>>>,
-    /// Editor hover (rich markdown) popup bounds `(x, y, w, h)` the last
+    /// Editor hover (rich markdown) popup bounds the last
     /// frame painted, or `None` if that frame drew no editor hover popup
     /// (#669).
-    #[allow(clippy::type_complexity)]
-    pub editor_hover_popup_rect: Rc<std::cell::Cell<Option<(f64, f64, f64, f64)>>>,
+    pub editor_hover_popup_rect: Rc<std::cell::Cell<Option<quadraui::Rect>>>,
     /// The editor hover popup's painted scrollbar track/thumb, or `None` when
     /// its content fits. Exposed for #755's scrollbar-rung coverage: tests
     /// aim at the *painted* thumb rather than hardcoding a pixel.
     pub editor_hover_scrollbar: Rc<std::cell::Cell<Option<crate::render::PopupScrollbarHit>>>,
-    /// The editor hover popup's painted link rects `(x, y, w, h, uri)`.
+    /// The editor hover popup's painted link rects (rect, uri).
     /// Exposed for #755's link-rung coverage, for the same reason as the
     /// scrollbar above: aim at what was painted, never at a hardcoded pixel.
-    #[allow(clippy::type_complexity)]
-    pub editor_hover_link_rects: Rc<RefCell<Vec<(f64, f64, f64, f64, String)>>>,
-    /// Sidebar-item hover popup bounds `(x, y, w, h)` the last frame painted,
+    pub editor_hover_link_rects: Rc<RefCell<Vec<(quadraui::Rect, String)>>>,
+    /// Sidebar-item hover popup bounds the last frame painted,
     /// or `None` if that frame drew no panel-hover popup (#670).
-    #[allow(clippy::type_complexity)]
-    pub panel_hover_popup_rect: Rc<std::cell::Cell<Option<(f64, f64, f64, f64)>>>,
-    /// Tab-switcher popup bounds `(x, y, w, h)` the last frame painted, or
+    pub panel_hover_popup_rect: Rc<std::cell::Cell<Option<quadraui::Rect>>>,
+    /// The panel-hover popup's painted link rects (rect, uri, is_native).
+    /// Exposed for #1067's click-rung coverage — same "aim at what was
+    /// painted" reasoning as `editor_hover_link_rects` above.
+    pub panel_hover_link_rects: Rc<RefCell<Vec<(quadraui::Rect, String, bool)>>>,
+    /// Tab-switcher popup bounds the last frame painted, or
     /// `None` if that frame drew no tab switcher (#671). Same field
     /// `handle_mouse_press`'s "Tab switcher modal arbitration" block reads
     /// for click routing (`App::tab_switcher_popup_rect`).
-    #[allow(clippy::type_complexity)]
-    pub tab_switcher_popup_rect: Rc<std::cell::Cell<Option<(f64, f64, f64, f64)>>>,
+    pub tab_switcher_popup_rect: Rc<std::cell::Cell<Option<quadraui::Rect>>>,
     /// The frame rungs the last frame actually composed, in composition order
     /// (#735, folded into one sequence by #766). The GTK half of the
     /// cross-backend sequence-equality assertion — `TuiShellApp` carries the
@@ -203,6 +229,23 @@ pub struct Harness<A: AppLogic> {
     /// for the mechanism, including the "never take a `CwdGuard` on a thread
     /// holding a harness" rule.
     _cwd: crate::test_cwd::CwdReadGuard,
+    /// Held for the harness's whole lifetime so no other thread can be
+    /// inside Pango/Cairo text code while this one paints.
+    ///
+    /// `cargo test` runs the suite on ~20 threads and this harness paints
+    /// for real (Cairo `ImageSurface` + `pango::Layout`); libcairo hands
+    /// glyph work to a process-global FreeType layer that is not safe to use
+    /// from two threads at once, and doing so segfaults inside
+    /// `FT_Load_Glyph`. That showed up as an intermittent `SIGSEGV` in ~10%
+    /// of full-suite runs of the `vimcode_core` lib test binary — never
+    /// reproducible with the GTK tests run alone, because 123 of them rarely
+    /// collide. See `src/test_paint.rs` for the coredump stacks and the
+    /// mechanism.
+    ///
+    /// Private and deliberately unnamed by any test, same as [`Self::_cwd`]:
+    /// construct a harness through [`harness`] and the protection comes with
+    /// it.
+    _paint: crate::test_paint::PaintGuard,
 }
 
 impl<A: AppLogic> Harness<A> {
@@ -341,7 +384,9 @@ impl<A: AppLogic> Harness<A> {
     /// `engine.picker_open` flipped (#555).
     #[allow(clippy::type_complexity)]
     pub fn picker_popup(&self) -> Option<(f64, f64, f64, f64)> {
-        self.picker_popup_rect.get()
+        self.picker_popup_rect
+            .get()
+            .map(|r| (r.x as f64, r.y as f64, r.width as f64, r.height as f64))
     }
 
     /// Line height the last frame painted with — the value every painted-
@@ -354,7 +399,11 @@ impl<A: AppLogic> Harness<A> {
     /// [`crate::render::RenderedWindow::gutter_char_width`] to get the pixel
     /// width of the line-number gutter (#701).
     pub fn painted_char_width(&self) -> f64 {
-        self.painted_char_width.get()
+        // `unwrap_or` only bites before the first `render_content` frame —
+        // matches `App::cached_char_width`'s own init default (#947, see
+        // the field doc for why this no longer aliases the stale
+        // `char_width_cell`).
+        self.painted_char_width.get().unwrap_or(9.0)
     }
 
     /// Geometry of the painted picker's result list: `(popup_x, list_w,
@@ -410,9 +459,14 @@ impl<A: AppLogic> Harness<A> {
 /// buffers, tabs and groups it asserts on — no `Engine::startup`, hence no
 /// dependence on the developer's real session (see [`App::new_headless`]).
 pub fn harness(engine: Engine, width: i32, height: i32) -> Harness<impl AppLogic> {
-    // Taken *before* the first frame is painted (`driver_with_shell` paints
-    // one immediately) and released only when the harness drops — see
-    // `Harness::_cwd` (#785).
+    // Both taken *before* the first frame is painted (`driver_with_shell`
+    // paints one immediately) and released only when the harness drops — see
+    // `Harness::_cwd` (#785) and `Harness::_paint`.
+    //
+    // Order matters only in that it must be consistent: paint first, then
+    // cwd. The `CwdGuard` writers never take the paint lock, so there is no
+    // cycle either way — see `src/test_paint.rs`.
+    let paint = crate::test_paint::PaintGuard::acquire();
     let cwd = crate::test_cwd::CwdReadGuard::acquire();
     let engine = Rc::new(RefCell::new(engine));
     let app = App::new_headless(Rc::clone(&engine));
@@ -420,13 +474,14 @@ pub fn harness(engine: Engine, width: i32, height: i32) -> Harness<impl AppLogic
     let screen_layout = Rc::clone(&app.cached_screen_layout);
     let picker_popup_rect = Rc::clone(&app.picker_popup_rect);
     let painted_line_height = Rc::clone(&app.painted_line_height);
-    let painted_char_width = Rc::clone(&app.char_width_cell);
+    let painted_char_width = Rc::clone(&app.painted_char_width);
     let painted_sidebar_bounds = Rc::clone(&app.painted_sidebar_bounds);
     let completion_layout = Rc::clone(&app.completion_layout);
     let editor_hover_popup_rect = Rc::clone(&app.editor_hover_popup_rect);
     let editor_hover_scrollbar = Rc::clone(&app.editor_hover_scrollbar);
     let editor_hover_link_rects = Rc::clone(&app.editor_hover_link_rects);
     let panel_hover_popup_rect = Rc::clone(&app.panel_hover_popup_rect);
+    let panel_hover_link_rects = Rc::clone(&app.panel_hover_link_rects);
     let tab_switcher_popup_rect = Rc::clone(&app.tab_switcher_popup_rect);
     let composed_frame = Rc::clone(&app.composed_frame);
     let composed_editor_band = Rc::clone(&app.composed_editor_band);
@@ -452,6 +507,7 @@ pub fn harness(engine: Engine, width: i32, height: i32) -> Harness<impl AppLogic
         editor_hover_scrollbar,
         editor_hover_link_rects,
         panel_hover_popup_rect,
+        panel_hover_link_rects,
         tab_switcher_popup_rect,
         composed_frame,
         composed_editor_band,
@@ -465,7 +521,57 @@ pub fn harness(engine: Engine, width: i32, height: i32) -> Harness<impl AppLogic
         native_dialog_shown,
         pending_native_dialog,
         _cwd: cwd,
+        _paint: paint,
     }
+}
+
+/// The `GtkDriver` instantiation of `crate::harness::ConformanceHarness`
+/// (#928) — alongside, not replacing, [`harness`]/[`Harness`] above.
+/// [`harness`] exposes ~20 GTK-only `Rc`-cloned fields for the existing
+/// 134-test suite; this constructor hands back only what
+/// `quadraui::testing::ConformanceDriver` needs, so a scenario written
+/// against it also runs unmodified on `MacDriver`/`WinDriver` — see
+/// `crate::harness`'s module doc for the full design and its proof slice.
+pub fn conformance_harness(
+    engine: Engine,
+    width: i32,
+    height: i32,
+) -> crate::harness::ConformanceHarness<GtkDriver<impl AppLogic>> {
+    let paint = crate::test_paint::PaintGuard::acquire();
+    let cwd = crate::test_cwd::CwdReadGuard::acquire();
+    let engine = Rc::new(RefCell::new(engine));
+    let backend: Rc<RefCell<Box<dyn crate::app::TextMetricsBackend>>> =
+        Rc::new(RefCell::new(Box::new(super::backend::GtkBackend::new())));
+    let (app, config) = crate::harness::build_app_and_config(Rc::clone(&engine), backend);
+    let screen_layout = Rc::clone(&app.cached_screen_layout);
+    let driver = driver_with_shell(app, config, width, height);
+    crate::harness::ConformanceHarness::new_with_screen_layout(
+        driver,
+        engine,
+        screen_layout,
+        paint,
+        cwd,
+    )
+}
+
+/// The same as [`conformance_harness`], but with `dir`'s shared
+/// folder/workspace picker (#815) already open on the returned driver's
+/// first painted frame — see `crate::harness::install_folder_picker`.
+pub fn conformance_harness_with_folder_picker(
+    engine: Engine,
+    dir: std::path::PathBuf,
+    width: i32,
+    height: i32,
+) -> crate::harness::ConformanceHarness<GtkDriver<impl AppLogic>> {
+    let paint = crate::test_paint::PaintGuard::acquire();
+    let cwd = crate::test_cwd::CwdReadGuard::acquire();
+    let engine = Rc::new(RefCell::new(engine));
+    let backend: Rc<RefCell<Box<dyn crate::app::TextMetricsBackend>>> =
+        Rc::new(RefCell::new(Box::new(super::backend::GtkBackend::new())));
+    let (app, config) = crate::harness::build_app_and_config(Rc::clone(&engine), backend);
+    crate::harness::install_folder_picker(&app, dir);
+    let driver = driver_with_shell(app, config, width, height);
+    crate::harness::ConformanceHarness::new(driver, engine, paint, cwd)
 }
 
 #[cfg(test)]
@@ -544,13 +650,36 @@ mod tests {
     // `group_divider_drag_moves_the_painted_divider_via_shell_app` and
     // `group_divider_click_without_move_leaves_the_divider_put_via_shell_app`.
 
+    /// Per-channel closeness, loose enough to absorb the divider hairline's
+    /// antialiasing rounding without weakening the position check it backs.
+    ///
+    /// #934: a Darwin/Quartz run of `window_split_divider_drag_repaints_the_
+    /// line_at_the_new_position` reported "no divider line found near the
+    /// drag column" against an exact `==` match. The divider is a plain
+    /// filled line (not text), so its geometry can't shift with the font —
+    /// but a 1px-wide line at a fractional x still gets antialiased across
+    /// two columns by Cairo, and Core Text's compositing spreads that blend
+    /// differently than freetype's, so neither column can land on the exact
+    /// full-intensity `colour` byte value even though the line plainly
+    /// painted. Tolerance-matching (mirroring `vscode_dimming::near`'s
+    /// TOL=10 for the identical class of rasteriser rounding) still requires
+    /// the pixel to be close to the divider's own colour, not merely
+    /// "different from background", so a divider that fails to move (or
+    /// stops rendering) still leaves no match within tolerance.
+    fn colour_near(a: (u8, u8, u8), b: (u8, u8, u8)) -> bool {
+        const TOL: i32 = 10;
+        (a.0 as i32 - b.0 as i32).abs() <= TOL
+            && (a.1 as i32 - b.1 as i32).abs() <= TOL
+            && (a.2 as i32 - b.2 as i32).abs() <= TOL
+    }
+
     /// Scan one painted row for the x of the window-split divider line.
     ///
     /// `draw_split` paints no text, so `find`/`find_bounds` cannot see it —
     /// this is the #555 "probe pixels when the content is not a label" route.
-    /// Searches for `colour` within `+/- span` of `near`, which keeps the test
-    /// honest about *where* the line ended up without hardcoding either end of
-    /// the drag.
+    /// Searches for `colour` (within `colour_near`'s AA tolerance) within
+    /// `+/- span` of `near`, which keeps the test honest about *where* the
+    /// line ended up without hardcoding either end of the drag.
     fn painted_divider_x<A: AppLogic>(
         h: &mut Harness<A>,
         near: i32,
@@ -558,7 +687,7 @@ mod tests {
         span: i32,
         colour: (u8, u8, u8),
     ) -> Option<i32> {
-        (near - span..=near + span).find(|x| h.driver.pixel(*x, y) == colour)
+        (near - span..=near + span).find(|x| colour_near(h.driver.pixel(*x, y), colour))
     }
 
     /// #753, GTK half: dragging a `:vsplit` window divider must repaint the
@@ -625,6 +754,24 @@ mod tests {
     /// The arm-without-apply case that `route_divider_grab` and
     /// `apply_divider_drag` are deliberately split across — a router that
     /// applied a ratio on press would nudge the divider here.
+    ///
+    /// #1094: this fixture (`engine_with_long_buffer`, so the left pane
+    /// overflows) now also exercises quadraui's `gtk::editor::draw_editor`
+    /// painting *that* window's own vertical scrollbar at `RenderedWindow.
+    /// rect`'s own right edge — which, post-#1094, is the pane's true edge,
+    /// i.e. exactly this `:vsplit` boundary (the scroll column now lands
+    /// past the minimap strip rather than before it, same as the TUI half
+    /// of this issue). The scrollbar's track colour and the window
+    /// divider's own line colour are both `theme.separator`-derived, so
+    /// they paint as one merged, several-pixel-wide band rather than the
+    /// divider's own single hairline — expected, not a regression (VS Code
+    /// shows the same scroll affordance flush against a pane boundary).
+    /// `line_colour`/`painted_divider_x` is measured *before* the click too
+    /// now, rather than assuming the raw `div.position` is the first
+    /// matching pixel the scan finds — the merged band's leading edge is
+    /// what "the painted line" means here, and this test only needs it to
+    /// hold still across the click, not to coincide with `div.position`
+    /// itself.
     #[test]
     fn window_split_divider_click_without_move_leaves_the_line_put() {
         let mut engine = engine_with_long_buffer();
@@ -645,6 +792,8 @@ mod tests {
             )
         };
         let line_colour = h.driver.pixel(start_x, mid_y);
+        let before = painted_divider_x(&mut h, start_x, mid_y, 8, line_colour)
+            .expect("the divider (or the window's own merged scrollbar band) must paint near its layout position before any click");
 
         h.driver.mouse_down(start_x as f32, mid_y as f32);
         h.driver.mouse_up(start_x as f32, mid_y as f32);
@@ -652,7 +801,7 @@ mod tests {
 
         assert_eq!(
             painted_divider_x(&mut h, start_x, mid_y, 8, line_colour),
-            Some(start_x),
+            Some(before),
             "a press-and-release on the divider with no drag must not move it"
         );
     }
@@ -1670,7 +1819,7 @@ mod tests {
         // the harness paints its first frame.
         let render_with_nerd_fonts = |on: bool| {
             let mut engine = engine_with_two_rust_tabs();
-            engine.settings.use_nerd_fonts = on;
+            engine.settings.use_nerd_fonts = Some(on);
             crate::icons::set_nerd_fonts(on);
             let mut h = harness(engine, 1400, 900);
             tab_zero_left_half(&mut h)
@@ -1706,6 +1855,86 @@ mod tests {
         );
     }
 
+    /// #999 acceptance, GTK half: with `use_nerd_fonts` left **unset**
+    /// (`None` — the state of a fresh `Settings::default()`, i.e. no
+    /// `settings.json` on disk at all) a GUI backend must still paint the
+    /// Nerd Font language badge, on the strength of the bundled icon font
+    /// alone (`app_support::ICON_FONT_BYTES`) rather than any guess about
+    /// the host OS. This is the driver-tier twin of `Settings::
+    /// use_nerd_fonts`'s unit tests (`use_nerd_fonts_unset_is_true_on_gui_backend`
+    /// et al. in `core/settings.rs`), asserted on **rendered pixels**
+    /// rather than on `Settings` state — see `CLAUDE.md`'s "Testing
+    /// (CRITICAL)" rule ("assert on rendered output, never on state being
+    /// populated").
+    ///
+    /// Uses `Engine::new_for_test()`, not `engine_with_two_rust_tabs`'s
+    /// usual `Engine::new()`: this test's whole point is the *unset*
+    /// resolution path, so it must not risk inheriting an explicit
+    /// `use_nerd_fonts` from whatever `~/.config/vimcode/settings.json`
+    /// happens to exist on the machine running the suite.
+    ///
+    /// # Why this fails against unfixed `develop`
+    ///
+    /// Before #999, `Settings::use_nerd_fonts` was a plain `bool` defaulted
+    /// by `!cfg!(target_os = "windows")` — on this Linux/macOS test fleet
+    /// that guess happens to also be `true`, so the pixel assertion below
+    /// stays green even against the old code by accident of host OS. The
+    /// part unfixed `develop` actually gets wrong — defaulting `false` on a
+    /// Windows *GTK* build despite bundling the font — has no compilable
+    /// driver in this fleet (`src/win/mod.rs` is Windows-only, same
+    /// constraint noted there). What this test *does* pin down, and what
+    /// breaks immediately under a naive revert: swapping the accessor back
+    /// to reading `self.use_nerd_fonts` directly no longer compiles once
+    /// the field is `Option<bool>`, and reverting `App::new_headless_with_backend`'s
+    /// `icons::set_gui_backend(true)` call (so `is_gui_backend()` stays
+    /// `false` here, the TUI-shaped answer) does *not* flip this test on
+    /// this host, precisely because TUI's guess and GUI's new default
+    /// happen to coincide off Windows — which is exactly the coverage gap
+    /// `use_nerd_fonts_unset_is_true_on_gui_backend`'s unit test exists to
+    /// close for the resolution logic itself; this test's job is only to
+    /// prove that logic is actually wired into what gets painted.
+    #[test]
+    fn tab_language_icon_paints_by_default_with_use_nerd_fonts_unset() {
+        let prev_nf = crate::icons::nerd_fonts_enabled();
+
+        let mut engine = Engine::new_for_test();
+        assert!(
+            engine.settings.use_nerd_fonts.is_none(),
+            "fixture must start from the unset default, not an explicit override"
+        );
+        let cwd = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        engine.cwd = cwd.clone();
+        for (i, name) in ["aaa703.rs", "bbb703.rs"].iter().enumerate() {
+            if i > 0 {
+                engine.new_tab(None);
+            }
+            let buf = engine.active_buffer_id();
+            if let Some(state) = engine.buffer_manager.get_mut(buf) {
+                state.file_path = Some(cwd.join(name));
+            }
+        }
+
+        let mut h = harness(engine, 1400, 900);
+        let (on_px, _) = tab_zero_left_half(&mut h);
+
+        crate::icons::set_nerd_fonts(prev_nf);
+
+        let reddest = |px: &[(u8, u8, u8)]| {
+            px.iter()
+                .max_by_key(|(r, _, b)| *r as i32 - *b as i32)
+                .copied()
+        };
+        assert!(
+            on_px.iter().copied().any(is_icon_orange),
+            "with use_nerd_fonts unset, a GUI backend must still paint the \
+             orange Rust badge — the font is bundled, so there is nothing \
+             to detect and nothing to guess wrong; sampled {} px, reddest \
+             was {:?}",
+            on_px.len(),
+            reddest(&on_px)
+        );
+    }
+
     /// #703, **the regression that matters**: with icons painted, a click on
     /// the painted × must still close the tab it sits on.
     ///
@@ -1734,7 +1963,7 @@ mod tests {
         // After `Engine::new` (which applies the developer's own settings),
         // before the harness paints — see `tab_paints_its_language_icon…`.
         let mut engine = engine_with_three_named_tabs();
-        engine.settings.use_nerd_fonts = true;
+        engine.settings.use_nerd_fonts = Some(true);
         crate::icons::set_nerd_fonts(true);
         let mut h = harness(engine, 1400, 900);
 
@@ -1757,6 +1986,295 @@ mod tests {
             "clicking tab 1's painted × must close tab 1 — measuring with \
              the icon-less `tab_bar_layout` while painting with icons closes \
              the tab to its left"
+        );
+    }
+
+    // ── #992: file-type icon coverage (.cs via the expanded extension
+    // table) ─────────────────────────────────────────────────────────────
+
+    /// True for a pixel painted near `target` — the identity colour of some
+    /// file type's badge. A *tighter* ±10-per-channel tolerance than
+    /// `is_icon_orange`'s ±25 above: `ICON_BLUE` (#519aba) sits much closer
+    /// than orange does to this theme's ordinary antialiased text-on-dark-
+    /// background fringe colours, so ±25 picked up false "blue" matches on
+    /// tabs with no badge at all (verified by hand: a `.zz` control tab's
+    /// unbadged slot had pixels ±16-24 off ICON_BLUE, all antialiasing
+    /// fringe, while the glyph body itself paints the exact RGB triple with
+    /// no tolerance needed at all). ±10 still comfortably covers the glyph's
+    /// own edge antialiasing without reaching into that fringe.
+    fn pixel_near((r, g, b): (u8, u8, u8), target: (u8, u8, u8)) -> bool {
+        let near = |a: u8, b: u8| (a as i32 - b as i32).abs() <= 10;
+        near(r, target.0) && near(g, target.1) && near(b, target.2)
+    }
+
+    /// Two tabs, backed by the given (equal-length, so their painted slots
+    /// are equal-width) filenames. Mirrors `engine_with_two_rust_tabs` but
+    /// parameterised so the #992 `.cs` coverage tests below can reuse the
+    /// same `tab_zero_left_half` trick for any extension pairing.
+    fn engine_with_two_tabs_named(names: [&str; 2]) -> Engine {
+        let mut engine = Engine::new();
+        let cwd = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        engine.cwd = cwd.clone();
+        for (i, name) in names.iter().enumerate() {
+            if i > 0 {
+                engine.new_tab(None);
+            }
+            let buf = engine.active_buffer_id();
+            if let Some(state) = engine.buffer_manager.get_mut(buf) {
+                state.file_path = Some(cwd.join(name));
+            }
+        }
+        engine
+    }
+
+    /// A `.cs` tab paints its badge in `ICON_BLUE` (C#'s Seti-UI colour),
+    /// and a same-shaped tab with an unrecognised extension does not. The
+    /// two-case comparison is what actually proves "non-generic badge, not
+    /// just some badge": a single render showing a blue-ish pixel somewhere
+    /// could also be an antialiasing fringe of unrelated chrome, and a
+    /// render that only checked "some Nerd Font glyph painted" would have
+    /// passed against the #992 bug report, where `.json` painted a badge
+    /// while `.cs` silently fell through to the generic one because no
+    /// extension-table arm existed for it.
+    ///
+    /// # Why this fails against unfixed `develop`
+    ///
+    /// Before #992 added a `"cs"` arm to `icons::file_icon_color`, `.cs`
+    /// fell through the same `_ => ICON_NEUTRAL` catch-all as the
+    /// unrecognised-extension control case — both tabs would paint
+    /// `ICON_NEUTRAL` (off-white), never `ICON_BLUE`, and the first
+    /// assertion below fails.
+    #[test]
+    fn tab_paints_a_distinct_icon_for_cs_files() {
+        let prev_nf = crate::icons::nerd_fonts_enabled();
+
+        let render_with = |names: [&str; 2]| {
+            let mut engine = engine_with_two_tabs_named(names);
+            engine.settings.use_nerd_fonts = Some(true);
+            crate::icons::set_nerd_fonts(true);
+            let mut h = harness(engine, 1400, 900);
+            tab_zero_left_half(&mut h)
+        };
+
+        // Tab 0 is `.cs` in the first render, an unrecognised extension in
+        // the second — `tab_zero_left_half` always samples tab 0.
+        let (cs_px, _) = render_with(["aaa992.cs", "bbb992.zz"]);
+        let (generic_px, _) = render_with(["ccc992.zz", "ddd992.cs"]);
+
+        crate::icons::set_nerd_fonts(prev_nf);
+
+        assert!(
+            cs_px
+                .iter()
+                .copied()
+                .any(|p| pixel_near(p, crate::icons::ICON_BLUE)),
+            "a .cs tab must paint its blue C# badge inside its own slot; \
+             sampled: {:?}",
+            cs_px
+        );
+        assert!(
+            !generic_px
+                .iter()
+                .copied()
+                .any(|p| pixel_near(p, crate::icons::ICON_BLUE)),
+            "an unrecognised extension must not paint the C# blue badge; \
+             matches: {:?}",
+            generic_px
+                .iter()
+                .copied()
+                .filter(|p| pixel_near(*p, crate::icons::ICON_BLUE))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// A fresh temp dir containing a single file named `file_name`, with an
+    /// `Engine` whose explorer sidebar has revealed it (the default active
+    /// panel is Explorer, per `App::new_headless`/`Engine::new`). Returns
+    /// the engine and the directory (the caller must clean the directory up
+    /// once done with the harness built from it).
+    fn engine_revealing_one_explorer_file(
+        file_name: &str,
+        tag: &str,
+    ) -> (Engine, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_test_992_gtk_explorer_{tag}_{:?}",
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join(file_name);
+        std::fs::write(&file, "marker\n").unwrap();
+
+        let mut engine = Engine::new();
+        engine.cwd = dir.clone();
+        engine.settings.use_nerd_fonts = Some(true);
+        engine.explorer_reveal_path(&file);
+        (engine, dir)
+    }
+
+    /// The explorer-tree counterpart to `tab_paints_a_distinct_icon_for_cs_
+    /// files` above: a `.cs` file's row paints the C# badge glyph, and a
+    /// sibling file with an unrecognised extension does not — rendered in
+    /// **separate** fixtures (one file per render) rather than side by side,
+    /// because `GtkDriver::find_bounds` returns only the *first* match for a
+    /// needle and `FILE_GENERIC`'s glyph is also painted elsewhere in this
+    /// fixture's chrome (verified by hand: it resolves to an unrelated
+    /// widget, not the row under test), so a shared-screen comparison could
+    /// silently pass by matching the wrong occurrence. There is no per-icon
+    /// *colour* to probe here unlike the tab bar: `build_explorer_tree_rows`
+    /// constructs `QIcon::new(glyph, fallback)` with no colour parameter at
+    /// all (unlike `quadraui::TabIcon`), so the glyph identity itself is the
+    /// only thing to assert on — via `find_bounds` locating the raw glyph
+    /// string, the same way `find_bounds("Paste")` locates ordinary text.
+    ///
+    /// # Why this fails against unfixed `develop`
+    ///
+    /// Before #992 added a `"cs"` arm to `icons::file_icon`, `.cs` fell
+    /// through to `FILE_GENERIC` just like the unrecognised-extension
+    /// control case, so `find_bounds(FILE_CSHARP.nerd)` would find nothing
+    /// in the first fixture — the first assertion fails.
+    #[test]
+    fn explorer_tree_paints_a_distinct_icon_for_cs_files() {
+        let prev_nf = crate::icons::nerd_fonts_enabled();
+        crate::icons::set_nerd_fonts(true);
+
+        let (cs_engine, cs_dir) = engine_revealing_one_explorer_file("cs992.cs", "cs");
+        let h_cs = harness(cs_engine, 1400, 900);
+        let cs_glyph = h_cs.driver.find_bounds(crate::icons::FILE_CSHARP.nerd);
+        let _ = std::fs::remove_dir_all(&cs_dir);
+
+        let (generic_engine, generic_dir) =
+            engine_revealing_one_explorer_file("zz992.zqx", "generic");
+        let h_generic = harness(generic_engine, 1400, 900);
+        let generic_has_cs_glyph = h_generic
+            .driver
+            .find_bounds(crate::icons::FILE_CSHARP.nerd)
+            .is_some();
+        let generic_has_generic_glyph = h_generic
+            .driver
+            .find_bounds(crate::icons::FILE_GENERIC.nerd)
+            .is_some();
+        let _ = std::fs::remove_dir_all(&generic_dir);
+
+        crate::icons::set_nerd_fonts(prev_nf);
+
+        assert!(
+            cs_glyph.is_some(),
+            "the cs992.cs file's explorer-tree row must paint the C# badge \
+             glyph somewhere on screen"
+        );
+        assert!(
+            !generic_has_cs_glyph,
+            "an unrecognised-extension file's row must not paint the C# \
+             badge glyph"
+        );
+        assert!(
+            generic_has_generic_glyph,
+            "an unrecognised-extension file's row must still paint the \
+             generic badge (proving the difference above is real, not just \
+             'nothing painted')"
+        );
+    }
+
+    // ── #1051: explorer paints VS Code's 'U' for untracked, not git's '?' ──
+
+    /// A fresh temp dir containing one file, with an `Engine` whose explorer
+    /// has revealed it and whose `sc_file_statuses` marks it with `kind`.
+    /// Separate single-file fixtures per case (mirroring
+    /// `engine_revealing_one_explorer_file` above) rather than one shared
+    /// screen with both files, because `GtkDriver::find_bounds` matches the
+    /// *first* run containing the needle anywhere on screen — a shared
+    /// fixture couldn't tell "this row's own badge" from "some other row's
+    /// badge" for a single-character needle like `"U"`.
+    fn engine_revealing_one_explorer_file_with_status(
+        file_name: &str,
+        tag: &str,
+        kind: crate::core::git::StatusKind,
+    ) -> (Engine, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "vc1051_gtk_explorer_{tag}_{:?}",
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // `Engine::explorer_indicators` only paints a git badge at all when
+        // `git::find_repo_root` resolves — a real (if minimal) repo is
+        // required, `sc_file_statuses` alone is not enough.
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&dir)
+            .output()
+            .ok();
+        let file = dir.join(file_name);
+        std::fs::write(&file, "marker\n").unwrap();
+
+        let mut engine = Engine::new();
+        engine.cwd = dir.clone();
+        engine.sc_file_statuses = vec![crate::core::git::FileStatus {
+            path: file_name.to_string(),
+            staged: None,
+            unstaged: Some(kind),
+            unmerged: None,
+        }];
+        engine.explorer_reveal_path(&file);
+        (engine, dir)
+    }
+
+    /// The explorer's git-status badge for an untracked file must paint VS
+    /// Code's `U`, not git's own `--porcelain` `?` notation (#1051's bug
+    /// report: the root row and an untracked doc both rendered a bare `?`
+    /// that read as a missing-glyph box). A modified file's badge must still
+    /// read `M` — the differential proof this codebase's icon tests use
+    /// (see `explorer_tree_paints_a_distinct_icon_for_cs_files` above):
+    /// checking the untracked case alone can't distinguish "got its own
+    /// correct badge" from "some unrelated chrome happens to contain that
+    /// character".
+    ///
+    /// # Why this fails against unfixed `develop`
+    ///
+    /// Before this fix, `StatusKind::Untracked::label()` returns `?`, so
+    /// `find_bounds("U")` finds nothing in the untracked fixture and the
+    /// first assertion fails.
+    #[test]
+    fn explorer_tree_paints_u_for_untracked_not_git_porcelain_question_mark() {
+        // Tags deliberately contain no 'u'/'U': the explorer's root row
+        // uppercases the directory's own basename (`build_explorer_rows`),
+        // so a tag like "untracked" would bake a stray capital 'U' into the
+        // root row and make `find_bounds("U")` pass vacuously against that,
+        // not against the file row's badge under test.
+        let (untracked_engine, untracked_dir) = engine_revealing_one_explorer_file_with_status(
+            "untracked1051.txt",
+            "case1051a",
+            crate::core::git::StatusKind::Untracked,
+        );
+        let mut h_untracked = harness(untracked_engine, 1400, 900);
+        let untracked_has_u_badge = h_untracked.driver.find_bounds("U").is_some();
+        let untracked_has_question_mark = h_untracked.driver.screen_contains("?");
+        let _ = std::fs::remove_dir_all(&untracked_dir);
+
+        let (modified_engine, modified_dir) = engine_revealing_one_explorer_file_with_status(
+            "modified1051.txt",
+            "case1051b",
+            crate::core::git::StatusKind::Modified,
+        );
+        let h_modified = harness(modified_engine, 1400, 900);
+        let modified_has_m_badge = h_modified.driver.find_bounds("M").is_some();
+        let _ = std::fs::remove_dir_all(&modified_dir);
+
+        assert!(
+            untracked_has_u_badge,
+            "an untracked file's explorer row must paint the VS-Code-style \
+             'U' badge somewhere on screen"
+        );
+        assert!(
+            !untracked_has_question_mark,
+            "an untracked file's explorer row must not leak git's own '?' \
+             porcelain notation anywhere on screen"
+        );
+        assert!(
+            modified_has_m_badge,
+            "a modified file's explorer row must still paint 'M' \
+             (proving the fix didn't just blanket-relabel every status)"
         );
     }
 
@@ -1963,15 +2481,13 @@ mod tests {
     }
 
     /// #700 items 2/3: the tab-bar row and the breadcrumb row are fixed-pixel
-    /// chrome, not `ceil(line_height * 1.6)` / `+ line_height`. This harness
-    /// cannot vary `settings.font_size` and observe a painted difference —
-    /// vimcode's GTK runner paints the editor at a hardcoded "Monospace 11"
-    /// regardless of `settings.font_size`/`font_family` (see the
-    /// `build_editor_click_context` call site's doc comment in
-    /// `App::render_content`), so `render::tests::
+    /// chrome, not `ceil(line_height * 1.6)` / `+ line_height`. This test
+    /// does not itself vary `settings.font_size` to prove that (a driver
+    /// harness that does exists: `set_font_family_size_and_zoomin_zoomout_
+    /// commands_reach_paint` above); `render::tests::
     /// test_tab_bar_height_px_independent_of_font_size` (varying the
-    /// `line_height` parameter those helpers actually take) is the real
-    /// font-size-independence proof; this test instead pins that the fixed
+    /// `line_height` parameter those helpers actually take) is the direct
+    /// font-size-independence proof. This test instead pins that the fixed
     /// pixel constants actually reach the live paint pipeline, and that
     /// breadcrumbs add exactly [`crate::render::BREADCRUMB_ROW_HEIGHT_PX`] —
     /// not a whole `line_height`-tall row — above the window content.
@@ -2492,7 +3008,7 @@ mod tests {
 
         fn activity_bar_strip(with_ext: bool) -> Vec<(u8, u8, u8)> {
             let mut engine = Engine::new();
-            engine.settings.use_nerd_fonts = false;
+            engine.settings.use_nerd_fonts = Some(false);
             engine.ext_panels.clear();
             if with_ext {
                 engine.ext_panels.insert(
@@ -2530,6 +3046,112 @@ mod tests {
              {}/{} sampled pixels differed",
             differing,
             with.len()
+        );
+    }
+
+    /// #950 review: `App::shell_config()`'s `"panel:search"` arm used to
+    /// build its own GTK-only `SEARCH_COD` (nf-cod-search, `\u{ea6d}`)
+    /// instead of the shared `crate::icons::SEARCH` (nf-fa-search,
+    /// `\u{f002}`) TUI always used — an accidental per-backend icon fork
+    /// with no product reason, converged onto the shared constant. That is
+    /// a user-visible rendered-output change (the activity-bar search glyph
+    /// literally changes shape whenever Nerd Fonts are on), so per #555 it
+    /// must be asserted in *pixels*, not by reading `PanelDefinition.icon`
+    /// back out — a string-equality assertion against `crate::icons::SEARCH`
+    /// would keep passing even if `App::shell_config()`'s match arm were
+    /// reverted to build the string by hand instead of calling through the
+    /// constant.
+    ///
+    /// Mirrors `extension_panel_contributes_an_activity_bar_icon` immediately
+    /// above (render the same app twice, diff the activity-bar column), but
+    /// deliberately keeps Nerd Fonts **on** rather than off: unlike that
+    /// test's synthetic extension icon, `SEARCH` and the deleted
+    /// `SEARCH_COD` shared the exact same ASCII fallback (`"/"`, see
+    /// `icons.rs`'s pre-#950 history) — the whole bug only ever showed with
+    /// Nerd Fonts enabled, so a fallback-glyph probe cannot see it at all.
+    ///
+    /// # Why this fails if `"panel:search"` reverts to the deleted glyph
+    ///
+    /// `current` renders the real, live `App::shell_config()` output
+    /// unmodified. `reverted` renders the identical app/engine with only
+    /// `"panel:search"`'s `icon` field patched back to the deleted
+    /// `SEARCH_COD` codepoint (`\u{ea6d}`) *after* `build_shell_config` runs
+    /// — i.e. exactly the string `App::shell_config()` used to produce
+    /// before #950. If the fix is reverted, `current` starts producing that
+    /// same string again, `current == reverted`, and `differing` collapses
+    /// to `0`: the assertion below goes red. Verified this fails (0/…
+    /// differing) with `"panel:search" => crate::icons::SEARCH.s()`
+    /// hand-reverted to `"panel:search" => crate::icons::SEARCH_COD.s()`-style
+    /// literal `"\u{ea6d}".to_string()` locally.
+    #[test]
+    fn activity_bar_search_icon_paints_the_shared_glyph_not_the_deleted_cod_variant() {
+        /// Comfortably inside the activity bar and below the title-bar band
+        /// — same window/scan geometry as
+        /// `extension_panel_contributes_an_activity_bar_icon` just above.
+        const STRIP_W: i32 = 40;
+        const STRIP_Y: std::ops::Range<i32> = 100..800;
+        /// The deleted `crate::icons::SEARCH_COD` constant's Nerd Font
+        /// codepoint (nf-cod-search) — inlined because the constant itself
+        /// is gone; this is what `"panel:search"`'s `icon` field used to
+        /// hold before #950.
+        const OLD_SEARCH_COD_GLYPH: &str = "\u{ea6d}";
+
+        fn activity_bar_strip(icon_override: Option<&str>) -> Vec<(u8, u8, u8)> {
+            // This helper calls `driver_with_shell` by hand (rather than
+            // going through `harness`) because it has to patch
+            // `build_shell_config`'s output *between* build and render, so
+            // it must take `harness`'s two guards itself — in the same
+            // order, paint then cwd (see `src/test_paint.rs`). Declared
+            // first so they drop *last*, after `driver`: a GTK driver
+            // rasterises activity-bar glyphs through Pango/Cairo, and two
+            // threads doing that at once segfaults inside `FT_Load_Glyph`.
+            let _paint = crate::test_paint::PaintGuard::acquire();
+            let _cwd = crate::test_cwd::CwdReadGuard::acquire();
+            let mut engine = Engine::new();
+            engine.settings.use_nerd_fonts = Some(true);
+            let engine = Rc::new(RefCell::new(engine));
+            let app = App::new_headless(Rc::clone(&engine));
+            let mut config = crate::gtk::build_shell_config(&app);
+            if let Some(icon) = icon_override {
+                let panel = config
+                    .panels
+                    .iter_mut()
+                    .find(|p| p.id.as_str() == "panel:search")
+                    .expect("fixture: shell_config must register panel:search");
+                panel.icon = icon.to_string();
+            }
+            let mut driver = driver_with_shell(app, config, 1400, 900);
+            let mut px = Vec::new();
+            for y in STRIP_Y.step_by(2) {
+                for x in (0..STRIP_W).step_by(2) {
+                    px.push(driver.pixel(x, y));
+                }
+            }
+            px
+        }
+
+        let prev_nf = crate::icons::nerd_fonts_enabled();
+        crate::icons::set_nerd_fonts(true);
+
+        let current = activity_bar_strip(None);
+        let reverted = activity_bar_strip(Some(OLD_SEARCH_COD_GLYPH));
+
+        crate::icons::set_nerd_fonts(prev_nf);
+
+        let differing = current
+            .iter()
+            .zip(reverted.iter())
+            .filter(|(a, b)| a != b)
+            .count();
+        assert!(
+            differing > 0,
+            "panel:search's live rendering must differ from the deleted \
+             SEARCH_COD (nf-cod-search, \\u{{ea6d}}) glyph it used to paint \
+             pre-#950 — {}/{} sampled pixels differed; a revert of the \
+             SEARCH_COD → SEARCH convergence would make these two renders \
+             identical",
+            differing,
+            current.len()
         );
     }
 
@@ -2631,6 +3253,187 @@ mod tests {
         }
     }
 
+    /// #823 item 4: `App::show_quit_confirm` used to restate
+    /// `Engine::show_quit_confirm`'s dialog body inline (byte-identical
+    /// `DialogButton` literals, `core/engine/panels.rs`) instead of calling
+    /// it. Reached here through the real menu path — clicking File > Quit
+    /// with unsaved changes — rather than calling either method directly,
+    /// so a regression in the collapse (the App method silently not
+    /// calling the engine one, or calling some other dialog) shows up the
+    /// same way a user's click would, unlike the sibling test above (which
+    /// opens the identical dialog via `engine.show_quit_confirm()` directly
+    /// and would stay green even if `App::show_quit_confirm` called
+    /// nothing at all).
+    ///
+    /// The dialog is natively-expressible (#727), so — same as the sibling
+    /// test above — it never paints in-canvas and `screen_contains
+    /// ("Unsaved Changes")` cannot be the proof; `native_dialog_shown` /
+    /// `pending_native_dialog` are the same two signals reused here.
+    ///
+    /// RED-verified: with `App::show_quit_confirm`'s
+    /// `self.engine.borrow_mut().show_quit_confirm()` call replaced by a
+    /// no-op, this test fails (no native dialog is ever queued); restored
+    /// before committing.
+    #[test]
+    fn menu_quit_with_unsaved_changes_opens_confirm_dialog() {
+        let mut engine = Engine::new_for_test();
+        engine.buffer_mut().insert(0, "unsaved change");
+        // `buffer_mut().insert` edits the rope directly and does not flip
+        // `BufferState::dirty` (that's set by the engine's own edit
+        // commands) — `has_any_unsaved()` (what `handle_menu_action`'s
+        // "quit_menu" arm gates on) reads `dirty` directly, so the fixture
+        // must set it explicitly or the click below silently takes the
+        // "nothing unsaved" branch instead.
+        let id = engine.active_buffer_id();
+        if let Some(buf) = engine.buffer_manager.get_mut(id) {
+            buf.dirty = true;
+        }
+        let mut h = harness(engine, 1200, 800);
+        h.driver.render();
+
+        let file = h
+            .driver
+            .find_bounds("File")
+            .expect("the File menu-bar header must paint");
+        h.driver
+            .click(file.x + file.width / 2.0, file.y + file.height / 2.0);
+        h.driver.render();
+
+        let quit = h
+            .driver
+            .find_bounds("Quit")
+            .expect("clicking File must open its dropdown, showing Quit");
+        h.driver
+            .click(quit.x + quit.width / 2.0, quit.y + quit.height / 2.0);
+        h.driver.render();
+
+        assert!(
+            h.native_dialog_shown.get(),
+            "File > Quit with unsaved changes must open the quit-confirm \
+             dialog (the edge-trigger flag must flip)"
+        );
+        assert!(
+            h.pending_native_dialog.take().is_some(),
+            "File > Quit with unsaved changes must queue the native \
+             quit-confirm present"
+        );
+    }
+
+    /// #823 item 4 (close-tab half): `App::show_close_tab_confirm` used to
+    /// restate `Engine::show_close_tab_confirm`'s dialog body inline
+    /// (byte-identical `DialogButton` literals, `core/engine/panels.rs`)
+    /// instead of calling it. Reached through a real click on a dirty tab's
+    /// × button — `handle_mouse_click`'s `Some(true)` ("close-tab on dirty
+    /// buffer") result, `gtk/click.rs` — the same path
+    /// `single_group_tab_close_button_closes_that_tab` above exercises for
+    /// a *clean* tab (which closes immediately, no dialog); this is its
+    /// dirty-tab sibling.
+    ///
+    /// Same reasoning as the quit-confirm test above applies to the
+    /// assertions: `close_tab_confirm` is equally natively-expressible
+    /// (#727: no `DialogTable`, no text input), so `native_dialog_shown` /
+    /// `pending_native_dialog` are the proof, not `screen_contains`.
+    ///
+    /// RED-verified: with `App::show_close_tab_confirm`'s
+    /// `self.engine.borrow_mut().show_close_tab_confirm()` call replaced by
+    /// a no-op, this test fails (no native dialog is ever queued);
+    /// restored before committing.
+    #[test]
+    fn close_dirty_tab_button_opens_confirm_dialog() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "alpha");
+        // Captured before `new_tab` below switches the active buffer —
+        // this is tab 0's buffer, the one whose × this test clicks.
+        let buf0 = engine.active_buffer_id();
+        engine.new_tab(None);
+        engine.new_tab(None);
+        if let Some(buf) = engine.buffer_manager.get_mut(buf0) {
+            buf.dirty = true;
+        }
+        let mut h = harness(engine, 1400, 900);
+
+        let (x, y) = h
+            .driver
+            .tab_close_center(&editor_tab_bar_id(), 0)
+            .expect("the single-group tab bar must have painted tab 0's close button");
+        h.driver.click(x, y);
+        h.driver.render();
+
+        assert!(
+            h.native_dialog_shown.get(),
+            "clicking \u{d7} on a dirty tab must open the close-tab-confirm \
+             dialog (the edge-trigger flag must flip)"
+        );
+        assert!(
+            h.pending_native_dialog.take().is_some(),
+            "clicking \u{d7} on a dirty tab must queue the native \
+             close-tab-confirm present"
+        );
+    }
+
+    /// #1038 (GTK half of the shared-engine fix): `handle_mouse_click`
+    /// routes a tab-bar × click through the very same
+    /// `Engine::handle_tab_bar_click` `CloseTab` arm the TUI does
+    /// (`gtk/click.rs`'s `tab_bar_split_right_button_...` test documents the
+    /// same shared dispatch for the split-right button). That arm now
+    /// skips the close-tab-confirm dialog when another window still shows
+    /// the buffer being closed — the buffer isn't going away, so there is
+    /// nothing to lose. This is the sibling of
+    /// `close_dirty_tab_button_opens_confirm_dialog` above: same dirty
+    /// buffer, same × click, but with a second tab in the *same* group
+    /// pointed at the identical buffer, so no confirm should appear at
+    /// all.
+    ///
+    /// RED-verified: reverting `handle_tab_bar_click`'s `CloseTab` arm to
+    /// the pre-#1038 `if self.dirty() { return true; }` (no other-views
+    /// check at all) makes this test fail — a dialog opens even though tab
+    /// 1 still shows the buffer; restored before committing.
+    #[test]
+    fn close_dirty_tab_button_with_other_tab_showing_same_buffer_does_not_confirm() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "alpha");
+        let buf_id = engine.active_buffer_id();
+        if let Some(buf) = engine.buffer_manager.get_mut(buf_id) {
+            buf.dirty = true;
+        }
+        engine.new_tab(None);
+        // Point tab 1's window at the same (dirty) buffer as tab 0 — a
+        // second *tab* on the same buffer is another legitimate "other
+        // view", alongside a same-tab split or a second editor group.
+        // Keeping it as a second tab in one group (rather than a second
+        // group) means this test can use the same single `editor_tab_bar_id`
+        // as the sibling test above instead of juggling two tab bars.
+        let win1 = engine.active_window_id();
+        if let Some(w) = engine.windows.get_mut(&win1) {
+            w.buffer_id = buf_id;
+        }
+        engine.active_group_mut().active_tab = 0; // focus tab 0 so its × is clicked
+        let mut h = harness(engine, 1400, 900);
+
+        let (x, y) = h
+            .driver
+            .tab_close_center(&editor_tab_bar_id(), 0)
+            .expect("the single-group tab bar must have painted tab 0's close button");
+        h.driver.click(x, y);
+        h.driver.render();
+
+        assert!(
+            !h.native_dialog_shown.get(),
+            "closing tab 0's \u{d7} must not open the close-tab-confirm \
+             dialog: tab 1 still shows the same dirty buffer, so nothing \
+             would be lost by closing this view (#1038)"
+        );
+        assert!(
+            h.pending_native_dialog.take().is_none(),
+            "no confirm needed, so no native dialog present should be queued"
+        );
+        assert_eq!(
+            h.engine.borrow().active_group().tabs.len(),
+            1,
+            "with no confirmation needed, the click must actually close the tab"
+        );
+    }
+
     /// #727's native path only covers dialogs `quadraui::native_dialog_options`
     /// reports as natively expressible — a dialog carrying a text input
     /// (e.g. the move-file destination prompt) is not, and must keep
@@ -2712,7 +3515,7 @@ mod sidebar_panel_clicks {
     /// a Nerd Font installed.
     fn panel_harness(panel: &str) -> Harness<impl AppLogic> {
         let mut engine = Engine::new();
-        engine.settings.use_nerd_fonts = false;
+        engine.settings.use_nerd_fonts = Some(false);
         engine.app_shell.show_panel(&quadraui::WidgetId::new(panel));
         harness(engine, 1400, 900)
     }
@@ -2883,6 +3686,163 @@ mod sidebar_panel_clicks {
         );
     }
 
+    /// Git: the wheel must scroll the sidebar's content list, not the editor
+    /// behind it (#1065).
+    ///
+    /// #1065's own investigation found this rung *already wired* — GTK's
+    /// generic `try_route_sidebar_mouse_event` has routed `UiEvent::Scroll`
+    /// to `route_sc_sidebar_event` -> `render::route_sc_sidebar_click` ->
+    /// `Engine::handle_sc_sidebar_ui_event` since #544/#754, well before the
+    /// #1044 audit that (incorrectly) filed this as a GTK gap to match TUI.
+    /// This is regression coverage for behaviour that already worked, not a
+    /// new feature — there is no unfixed-`develop` RED state to cite because
+    /// nothing needed fixing here (contrast the Search test below).
+    ///
+    /// Injects 80 fake unstaged files (no real git repo needed —
+    /// `sc_file_statuses` is the engine's own source of truth) so the panel
+    /// body overflows, then reads the *painted* geometry of a mid-list
+    /// filename before and after a wheel notch — `find_bounds`, not an
+    /// internal scroll-offset field, per `CLAUDE.md`'s "assert on rendered
+    /// output" rule.
+    #[test]
+    fn git_panel_scrolls_under_the_wheel() {
+        let mut engine = Engine::new();
+        engine.settings.use_nerd_fonts = Some(false);
+        engine.sc_file_statuses = (0..80)
+            .map(|i| crate::core::git::FileStatus {
+                path: format!("zqxw1065_file_{i:03}.rs"),
+                unstaged: Some(crate::core::git::StatusKind::Modified),
+                ..Default::default()
+            })
+            .collect();
+        engine
+            .app_shell
+            .show_panel(&quadraui::WidgetId::new(PANEL_GIT));
+        let mut h = harness(engine, 1400, 900);
+        h.driver.render();
+        if h.engine.borrow().sc_panel_layout.borrow().is_none() {
+            return; // no SourceControl screen in this checkout state
+        }
+        let sb = h
+            .painted_sidebar_bounds
+            .get()
+            .expect("the git panel must have painted into a sidebar rect");
+        let before = h
+            .driver
+            .find_bounds("zqxw1065_file_005")
+            .expect("file_005 must be painted before any scroll");
+
+        for _ in 0..20 {
+            h.driver.dispatch(UiEvent::Scroll {
+                widget: None,
+                // Negative y = wheel down in quadraui's convention.
+                delta: ScrollDelta::new(0.0, -1.0),
+                position: Point::new(sb.x + 20.0, sb.y + 100.0),
+            });
+        }
+        h.driver.render();
+        let after = h
+            .driver
+            .find_bounds("zqxw1065_file_005")
+            .expect("file_005 must still be painted (just scrolled) after the wheel");
+
+        assert!(
+            after.y < before.y,
+            "20 wheel-down notches over the git sidebar must have scrolled the \
+             content up (file_005's painted y should have decreased from \
+             {} to something less, got {})",
+            before.y,
+            after.y
+        );
+    }
+
+    /// Search: the wheel must scroll the results tree, not the editor behind
+    /// it (#1065).
+    ///
+    /// **Was actually broken**, unlike Git/Settings: `paint_sidebar_panel_rung`'s
+    /// `PANEL_SEARCH` arm never called `search_sidebar_system.set_backend_info`
+    /// — the exact #971 gap (`render::gui_sidebar_system_metrics`'s own doc)
+    /// already fixed for `sc_sidebar_system` and `ext_sidebar_system` but
+    /// missed for search. `SidebarSystem::handle_cached` returns
+    /// `SidebarEvent::Ignored` unconditionally until `set_backend_info` has
+    /// been called at least once, so every wheel notch over the results list
+    /// (and every content-row click) silently no-op'd.
+    /// `search_panel_click_focuses_the_query_field` never caught this
+    /// because its click lands on the query text box, a separate hit-test
+    /// that doesn't go through `handle_cached`.
+    ///
+    /// **Verified RED against unfixed `develop`:** with the `set_backend_info`
+    /// call removed from the `PANEL_SEARCH` arm, this test fails — the
+    /// scrolled position stays fixed at the pre-scroll row window (file_005
+    /// still visible, file_015 never appears); restored before committing.
+    ///
+    /// Injects 80 fake results across 80 distinct files (no filesystem
+    /// search needed — `project_search_results` is the engine's own source
+    /// of truth) so the results tree overflows the panel, then asserts on
+    /// **painted text** — this tree virtualizes (unlike the git panel's,
+    /// which paints every row regardless of clip), so `screen_contains` is a
+    /// direct, unambiguous visibility check here.
+    #[test]
+    fn search_panel_scrolls_under_the_wheel() {
+        let mut engine = Engine::new();
+        engine.settings.use_nerd_fonts = Some(false);
+        engine
+            .app_shell
+            .show_panel(&quadraui::WidgetId::new(PANEL_SEARCH));
+        engine.project_search_query = "zqxw1065".to_string();
+        engine.project_search_results = (0..80)
+            .map(|i| crate::core::project_search::ProjectMatch {
+                file: std::path::PathBuf::from(format!("zqxw1065_file_{i:03}.rs")),
+                line: 0,
+                col: 0,
+                line_text: format!("zqxw1065 match {i}"),
+            })
+            .collect();
+        let mut h = harness(engine, 1400, 900);
+        h.driver.render();
+        let sb = h
+            .painted_sidebar_bounds
+            .get()
+            .expect("the search panel must have painted into a sidebar rect");
+
+        assert!(
+            h.driver.screen_contains("zqxw1065_file_005"),
+            "precondition: file_005 must be in the initial (unscrolled) \
+             results window; painted: {:?}",
+            h.driver.painted_texts()
+        );
+        assert!(
+            !h.driver.screen_contains("zqxw1065_file_060"),
+            "precondition: file_060 must be well outside the initial \
+             results window, or this test can't tell scrolled from \
+             unscrolled"
+        );
+
+        // Scroll deep enough into the results tree (below the search form's
+        // query/replace/toggle/button rows) that the wheel lands on content,
+        // not chrome.
+        for _ in 0..20 {
+            h.driver.dispatch(UiEvent::Scroll {
+                widget: None,
+                delta: ScrollDelta::new(0.0, -1.0),
+                position: Point::new(sb.x + 20.0, sb.y + 600.0),
+            });
+        }
+        h.driver.render();
+
+        assert!(
+            !h.driver.screen_contains("zqxw1065_file_005"),
+            "a wheel notch over the search results must scroll file_005 out \
+             of view; painted: {:?}",
+            h.driver.painted_texts()
+        );
+        assert!(
+            h.driver.screen_contains("zqxw1065_file_015"),
+            "and scroll a later file into view; painted: {:?}",
+            h.driver.painted_texts()
+        );
+    }
+
     // ── #754 (mouse ladder slice 4: panels) ────────────────────────────────
 
     /// GTK half of `bottom_panel_tab_strip_click_switches_the_painted_panel_
@@ -2898,7 +3858,7 @@ mod sidebar_panel_clicks {
     #[test]
     fn bottom_panel_tab_strip_click_switches_the_painted_panel() {
         let mut engine = Engine::new();
-        engine.settings.use_nerd_fonts = false;
+        engine.settings.use_nerd_fonts = Some(false);
         engine.terminal_new_tab(80, 10);
         engine
             .dap_output_lines
@@ -2964,7 +3924,7 @@ mod sidebar_panel_clicks {
     #[test]
     fn terminal_ctrl_f_opens_the_painted_find_bar() {
         let mut engine = Engine::new_for_test();
-        engine.settings.use_nerd_fonts = false;
+        engine.settings.use_nerd_fonts = Some(false);
         // `terminal_new_tab` opens the panel and focuses it.
         engine.terminal_new_tab(80, 10);
 
@@ -3010,7 +3970,7 @@ mod sidebar_panel_clicks {
     fn focused_terminal_swallows_editor_keys_on_gtk() {
         let build = |focused: bool| {
             let mut engine = Engine::new_for_test();
-            engine.settings.use_nerd_fonts = false;
+            engine.settings.use_nerd_fonts = Some(false);
             engine.buffer_mut().insert(0, "ZQXWTERMGTK758\n");
             engine.terminal_new_tab(80, 6);
             engine.terminal_has_focus = focused;
@@ -3044,6 +4004,187 @@ mod sidebar_panel_clicks {
             "control: with the terminal unfocused `x` must delete the first \
              character; painted: {:?}",
             control.driver.painted_texts()
+        );
+    }
+
+    /// #1058: opening a terminal split (clicking the toolbar's split button)
+    /// must size the two new PTY panes off the *real* live panel pixel
+    /// width, not the fixed `terminal_cols() == 80` fallback — a window
+    /// whose panel is nowhere near 80 columns wide must not get a split
+    /// pinned at 80 columns regardless.
+    ///
+    /// Drives it through the real production click path:
+    /// `resolve_terminal_toolbar_click` -> `TerminalToolbarAction::
+    /// ToggleSplit` -> `execute_terminal_toolbar_action`, fed the
+    /// `ctx.terminal_cols` `App::handle_mouse_click_msg` builds — the call
+    /// site this issue fixes (`self.terminal_panel_cols(width)`, using the
+    /// click's own live `width` rather than the old `self.terminal_cols()`).
+    ///
+    /// Compares the *same* scenario at two driver widths rather than
+    /// asserting one exact predicted column count: `App::cached_char_width`
+    /// (what the fixed conversion divides by) is deliberately not the same
+    /// number `Self::painted_char_width` reports (`cached_char_width` is
+    /// seeded once at `setup()`, `painted_char_width` is the live
+    /// per-frame max with the backend's measured width — see
+    /// `App::painted_char_width`'s own doc, #555/#947), so a test computing
+    /// its own "expected" column count from the painted width wouldn't
+    /// reliably match what the fix under test actually divides by. A much
+    /// wider window producing a much larger column count is: (a) the
+    /// user-visible bug this issue reports, and (b) impossible under either
+    /// hardcode, which fixes the total regardless of the driver's width.
+    ///
+    /// **Verified RED against unfixed `develop`:** with `ctx.terminal_cols`
+    /// pinned to `self.terminal_cols() == 80`, both the narrow and the wide
+    /// window's two new panes sum to the same fixed total (`80` halved and
+    /// doubled back), so the final `assert!(wide_total > narrow_total)`
+    /// fails.
+    #[test]
+    fn terminal_split_open_sizes_panes_off_the_real_window_width_on_gtk() {
+        const HEIGHT: i32 = 900;
+
+        /// Open a single terminal tab, click the toolbar's "split" segment
+        /// (AddTab, ToggleSplit, ToggleMaximize, CloseTab —
+        /// `resolve_terminal_toolbar_click`), and return the two new PTY
+        /// panes' combined column count.
+        fn split_total_cols(width: i32) -> u16 {
+            let mut engine = Engine::new_for_test();
+            engine.settings.use_nerd_fonts = Some(false);
+            // `terminal_new_tab` opens the panel and focuses it, mirroring
+            // opening the panel for the first time.
+            engine.terminal_new_tab(80, 10);
+
+            let mut h = harness(engine, width, HEIGHT);
+            h.driver.render();
+
+            let (seg_x, seg_y) = {
+                let engine = h.engine.borrow();
+                let hits = engine.terminal_toolbar_hits.borrow();
+                let crate::core::engine::TerminalToolbarHits::TabStrip(bar_hits) = hits
+                    .as_ref()
+                    .expect("the terminal toolbar must have painted a tab strip")
+                else {
+                    panic!("expected a tab-strip toolbar before any split exists");
+                };
+                let &(sx, ex) = bar_hits
+                    .right_segment_bounds
+                    .get(1)
+                    .expect("AddTab, ToggleSplit, ToggleMaximize, CloseTab must all paint");
+                let geom = engine
+                    .bottom_panel_geometry
+                    .borrow()
+                    .expect("the bottom panel must have painted");
+                // The toolbar row spans `[toolbar_y, content_y)` relative to
+                // `top_y` (`Engine::resolve_bottom_panel_zone`) — distinct
+                // from the tab-bar row above it (`[0, toolbar_y)`), which is
+                // what `bottom_panel_tab_strip_click_switches_the_painted_
+                // panel` targets instead.
+                (
+                    (sx + ex) / 2.0,
+                    geom.top_y + (geom.toolbar_y + geom.content_y) / 2.0,
+                )
+            };
+
+            h.driver.click(seg_x as f32, seg_y as f32);
+            h.driver.render();
+
+            assert!(
+                h.engine.borrow().terminal_split,
+                "clicking the toolbar's split segment must open a split \
+                 (width {width})"
+            );
+            assert_eq!(
+                h.engine.borrow().terminal_panes.len(),
+                2,
+                "a freshly opened split must have exactly two PTY panes \
+                 (width {width})"
+            );
+
+            let engine = h.engine.borrow();
+            engine.terminal_panes[0].session.cols() + engine.terminal_panes[1].session.cols()
+        }
+
+        let narrow_total = split_total_cols(800);
+        let wide_total = split_total_cols(4000);
+
+        assert!(
+            wide_total > narrow_total,
+            "a terminal split opened in a 4000px-wide window must get more \
+             total columns ({wide_total}) than the same split opened in an \
+             800px-wide window ({narrow_total}) — both pinned to the same \
+             total means the split is still sized off a hardcoded width \
+             fallback, not the real one"
+        );
+    }
+
+    /// #1058: finalizing a terminal-split divider *drag* (as opposed to the
+    /// initial split-open covered by the sibling test above) must also
+    /// convert the real live panel pixel width to columns, not the fixed
+    /// `da_w = 800.0` guess — `App::handle_mouse_up_msg`'s
+    /// `terminal_split_dragging` arm.
+    ///
+    /// Same before/after-widths comparison as the sibling test, for the same
+    /// reason (`cached_char_width` vs `painted_char_width` staleness, #555/
+    /// #947, makes an exact predicted column count unreliable): a fixed
+    /// pixel-delta drag finalized in a much wider window must land on a
+    /// larger total than the identical drag finalized in a narrow one.
+    ///
+    /// **Verified RED against unfixed `develop`:** with `da_w` hardcoded to
+    /// `800.0`, `total_cols` is `((800.0 - 6.0) / cached_char_width) as u16`
+    /// regardless of the driver's actual width, so both the narrow and the
+    /// wide window finalize to the same total and the final
+    /// `assert!(wide_total > narrow_total)` fails.
+    #[test]
+    fn terminal_split_drag_finalize_uses_the_real_window_width_on_gtk() {
+        const HEIGHT: i32 = 900;
+
+        /// Open a terminal already in split mode, drag the divider a fixed
+        /// 10px to the right, release, and return the two panes' combined
+        /// column count after the finalize.
+        fn drag_finalize_total_cols(width: i32) -> u16 {
+            let mut engine = Engine::new_for_test();
+            engine.settings.use_nerd_fonts = Some(false);
+            // Opens two PTY panes side-by-side and marks the panel
+            // open/focused, mirroring what the terminal toolbar's "split"
+            // button does.
+            engine.terminal_open_split(20, 10);
+
+            let mut h = harness(engine, width, HEIGHT);
+            h.driver.render();
+
+            let (divider_x, divider_y) = {
+                let engine = h.engine.borrow();
+                let split = engine.terminal_split_layout.borrow();
+                let sl = split
+                    .as_ref()
+                    .expect("a live split must have painted a TerminalSplitLayout");
+                (
+                    (sl.divider_x + sl.divider_width / 2.0) as f32,
+                    (sl.left.y + sl.left.height / 2.0) as f32,
+                )
+            };
+
+            // Grab the divider and drag it 10px right, then release — this
+            // is the drag `MouseDragRoute::TerminalSplitDivider` tracks live
+            // and `handle_mouse_up_msg`'s `terminal_split_dragging` arm
+            // finalizes on release. A small, fixed delta so the drag lands
+            // well inside both a narrow and a wide window's valid range.
+            h.driver
+                .drag(divider_x, divider_y, divider_x + 10.0, divider_y);
+
+            let engine = h.engine.borrow();
+            engine.terminal_panes[0].session.cols() + engine.terminal_panes[1].session.cols()
+        }
+
+        let narrow_total = drag_finalize_total_cols(800);
+        let wide_total = drag_finalize_total_cols(4000);
+
+        assert!(
+            wide_total > narrow_total,
+            "finalizing the same divider drag in a 4000px-wide window must \
+             land on more total columns ({wide_total}) than finalizing it in \
+             an 800px-wide window ({narrow_total}) — both pinned to the same \
+             total means the finalize is still sized off a hardcoded width \
+             (`da_w = 800.0`), not the real one"
         );
     }
 
@@ -3112,6 +4253,87 @@ mod sidebar_panel_clicks {
         );
     }
 
+    /// #823 item 8: `Engine::clear_sidebar_focus` used to set
+    /// `sc_has_focus = false` directly instead of calling
+    /// `Engine::sc_set_focus(false)` — skipping that method's other two
+    /// effects, one of which is clearing `sc_button_focused`. `sc_button_focused`
+    /// drives `draw_sc_sidebar_panel`'s `pressed` highlight
+    /// (`render.rs`: `let pressed = sc.button_focused.and_then(Engine::sc_button_id);`)
+    /// independently of `sc_has_focus`, so the bug was real and visible: a
+    /// Source Control toolbar button left "pressed" (e.g. via keyboard nav)
+    /// stayed highlighted even after focus moved to the editor.
+    ///
+    /// Reuses `source_control_toolbar_button_highlights_on_hover`'s
+    /// pixel-diff technique just above (same reasoning: asserting
+    /// `sc_button_focused.is_none()` would pass even if nothing ever
+    /// repainted).
+    ///
+    /// RED-verified: with `Engine::clear_sidebar_focus`'s `self.sc_set_focus
+    /// (false)` reverted to a direct `self.sc_has_focus = false`, this test
+    /// fails (the pressed highlight survives the editor click); restored
+    /// before committing.
+    #[test]
+    fn clicking_editor_clears_a_pressed_sc_toolbar_button_highlight() {
+        let mut h = panel_harness(PANEL_GIT);
+        h.driver.render();
+        match h.painted_sidebar_bounds.get() {
+            Some(_) if h.engine.borrow().sc_panel_layout.borrow().is_some() => {}
+            _ => return,
+        };
+
+        let button = {
+            let engine = h.engine.borrow();
+            let layout = engine.sc_panel_layout.borrow();
+            layout
+                .as_ref()
+                .and_then(|l| l.toolbar_layout.as_ref())
+                .and_then(|t| t.visible_items.iter().find(|i| i.clickable).cloned())
+        };
+        let Some(button) = button else {
+            return; // no clickable toolbar buttons painted in this repo state
+        };
+        let by = button.bounds.y + button.bounds.height / 2.0;
+        let sample = |h: &mut Harness<_>| -> Vec<(u8, u8, u8)> {
+            let x0 = (button.bounds.x + 3.0) as i32;
+            let x1 = (button.bounds.x + button.bounds.width - 3.0) as i32;
+            (x0..x1).map(|x| h.driver.pixel(x, by as i32)).collect()
+        };
+        let baseline = sample(&mut h);
+
+        // Arm: this button "pressed"/focused, as keyboard nav within the
+        // panel would leave it (`source_control.rs`'s Tab handling sets
+        // exactly this field).
+        h.engine.borrow_mut().sc_has_focus = true;
+        h.engine.borrow_mut().sc_button_focused = Some(button.item_idx);
+        h.driver.render();
+        let pressed = sample(&mut h);
+        assert_ne!(
+            baseline, pressed,
+            "test setup sanity: sc_button_focused must actually repaint a \
+             pressed highlight, or this test cannot tell a fixed bug from a \
+             no-op one"
+        );
+
+        // Click into the editor pane — the same "clicking the editor clears
+        // every sidebar's keyboard focus" rung `clear_sidebar_focus`'s own
+        // doc comment describes.
+        let win = h.engine.borrow().active_window_id();
+        let (ex, ey) = h
+            .window_center(win)
+            .expect("the editor pane must have painted a window rect");
+        h.driver.click(ex, ey);
+        h.driver.render();
+        let after = sample(&mut h);
+
+        assert_eq!(
+            after, baseline,
+            "clicking the editor must clear the Source Control toolbar's \
+             pressed/focused button highlight all the way back to baseline \
+             (Engine::clear_sidebar_focus must fully clear sc_button_focused \
+             via sc_set_focus, not just sc_has_focus)"
+        );
+    }
+
     /// #637/#754: switching to a plugin ("extension") panel from the
     /// activity bar must clear focus flags a previously-visited panel left
     /// set, on **this** backend too.
@@ -3144,7 +4366,7 @@ mod sidebar_panel_clicks {
     #[test]
     fn switching_to_a_plugin_panel_clears_stale_marketplace_focus() {
         let mut engine = Engine::new();
-        engine.settings.use_nerd_fonts = false;
+        engine.settings.use_nerd_fonts = Some(false);
         engine.ext_panels.clear();
         engine.ext_panels.insert(
             "git-insights".to_string(),
@@ -3217,7 +4439,7 @@ mod sidebar_panel_clicks {
     #[test]
     fn an_editor_drag_crossing_the_sidebar_is_not_stolen_by_a_panel() {
         let mut engine = Engine::new();
-        engine.settings.use_nerd_fonts = false;
+        engine.settings.use_nerd_fonts = Some(false);
         engine.buffer_mut().insert(
             0,
             "alpha beta gamma
@@ -3253,7 +4475,7 @@ second line here
     #[test]
     fn an_editor_text_drag_paints_a_selection_through_the_shared_drag_router() {
         let mut engine = Engine::new();
-        engine.settings.use_nerd_fonts = false;
+        engine.settings.use_nerd_fonts = Some(false);
         let mut text = String::new();
         for _ in 0..60 {
             text.push_str("alpha beta gamma delta epsilon\n");
@@ -3330,7 +4552,7 @@ second line here
     #[test]
     fn a_sidebar_drag_keeps_its_grab_once_it_crosses_into_the_editor() {
         let mut engine = Engine::new();
-        engine.settings.use_nerd_fonts = false;
+        engine.settings.use_nerd_fonts = Some(false);
         engine.buffer_mut().insert(
             0,
             "alpha beta gamma
@@ -3642,6 +4864,266 @@ mod editor_popups {
         assert!(layout.bounds.width > 0.0 && layout.bounds.height > 0.0);
     }
 
+    /// #1237: the completion popup's x anchor must expand tabs to a
+    /// display column, same as TUI already did, instead of treating the
+    /// raw character column as a display column. Two leading tabs
+    /// (`tabstop` defaults to 4) then `"foo"` put the cursor at char
+    /// column 5 but display column 11 — anchoring on the raw char column
+    /// drifts the popup 6 cells left of the caret.
+    ///
+    /// **Verified RED against unfixed `develop`:** before this fix,
+    /// `App::paint_editor_popups_rung`'s completion anchor computed
+    /// `cursor_pos.col as f64 * cw` directly, so `bounds.x` landed at the
+    /// char-column position (`buggy_x` below) rather than the
+    /// tab-expanded one (`expected_x`) — this assertion fails against
+    /// that code.
+    #[test]
+    fn completion_popup_anchors_at_visual_column_on_tab_indented_line() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "\t\tfoo\n");
+        engine.view_mut().cursor.col = 5;
+        engine.completion_candidates = vec!["foobar".to_string()];
+        engine.completion_idx = Some(0);
+        engine.completion_start_col = 2;
+
+        let h = harness(engine, 1400, 900);
+        let layout_cell = h.completion_layout.borrow();
+        let layout = layout_cell
+            .as_ref()
+            .expect("completion popup must have painted a layout");
+
+        let win_id = h.engine.borrow().active_window_id();
+        let (win_x, gutter_w) = {
+            let sl = h.screen_layout.borrow();
+            let rw = sl
+                .as_ref()
+                .expect("render_content must have painted a ScreenLayout")
+                .windows
+                .iter()
+                .find(|w| w.window_id == win_id)
+                .expect("the active window must have painted");
+            (rw.rect.x, rw.gutter_char_width)
+        };
+        let cw = h
+            .painted_char_width
+            .get()
+            .expect("must have painted with a char width");
+
+        let expected_x = win_x + gutter_w as f64 * cw + 11.0 * cw; // display col 11
+        let buggy_x = win_x + gutter_w as f64 * cw + 5.0 * cw; // raw char col 5
+        assert!(
+            (layout.bounds.x as f64 - expected_x).abs() < 0.5,
+            "completion popup must anchor at the tab-expanded display \
+             column (x≈{expected_x}), not the raw char column (x≈{buggy_x}); \
+             got x={}",
+            layout.bounds.x
+        );
+    }
+
+    /// Renders the `"\t\tfoo\n"` / cursor-col-5 fixture twice — once with
+    /// `configure` applied (opening a popup), once without — and returns
+    /// the leftmost on-screen x where a pixel differs, scanning a band of
+    /// rows around the active window's top edge wide enough to catch
+    /// either the `Top` or the `Bottom` placement fallback
+    /// (`quadraui::Tooltip::layout`'s own choice, not this test's).
+    ///
+    /// Reads *painted pixels*, not cached layout state — hover and
+    /// signature-help have no `App`-side rect cache (unlike
+    /// `completion_layout` / `editor_hover_popup_rect`), so pixel-diffing
+    /// is the only route to their real on-screen position (#1237 review).
+    /// Diffing against an otherwise-identical "closed" render (rather than
+    /// matching a hardcoded theme colour) isolates exactly the popup's own
+    /// paint, the same technique `popup_region_pixels` above uses to prove
+    /// *that* something painted; this walks it far enough to prove *where*.
+    fn popup_left_edge_x(configure: impl FnOnce(&mut Engine)) -> (f64, f64, usize, f64) {
+        let base = || {
+            let mut engine = Engine::new();
+            engine.buffer_mut().insert(0, "\t\tfoo\n");
+            engine.view_mut().cursor.col = 5;
+            engine
+        };
+        let mut with_engine = base();
+        configure(&mut with_engine);
+        let mut h_with = harness(with_engine, 1400, 900);
+        let mut h_without = harness(base(), 1400, 900);
+        h_with.driver.render();
+        h_without.driver.render();
+
+        let win_id = h_with.engine.borrow().active_window_id();
+        let (win_x, win_y, gutter_w) = {
+            let sl = h_with.screen_layout.borrow();
+            let rw = sl
+                .as_ref()
+                .expect("render_content must have painted a ScreenLayout")
+                .windows
+                .iter()
+                .find(|w| w.window_id == win_id)
+                .expect("the active window must have painted");
+            (rw.rect.x, rw.rect.y, rw.gutter_char_width)
+        };
+        let cw = h_with
+            .painted_char_width
+            .get()
+            .expect("must have painted with a char width");
+        let lh = h_with
+            .painted_line_height
+            .get()
+            .expect("must have painted with a line height");
+
+        let mut left_edge = None;
+        for row in -3..6 {
+            let y = (win_y + (row as f64) * lh + lh / 2.0) as i32;
+            for x in (win_x as i32)..(win_x as i32 + 400) {
+                if h_with.driver.pixel(x, y) != h_without.driver.pixel(x, y) {
+                    left_edge = Some(left_edge.map_or(x, |m: i32| m.min(x)));
+                    break;
+                }
+            }
+        }
+        let left_edge = left_edge.expect(
+            "the popup must paint at least one pixel differently from the \
+             closed-popup render somewhere in the scanned band",
+        );
+        (win_x, cw, gutter_w, left_edge as f64)
+    }
+
+    /// #1237: the LSP hover popup (`ScreenLayout::hover`, plain-text
+    /// tooltip) anchored `App::paint_editor_popups_rung`'s cursor column
+    /// as a raw char index, not a tab-expanded display column — same root
+    /// cause as the completion popup above, but never covered by a test
+    /// (review finding on #1237's first fix). With `"\t\tfoo\n"`
+    /// (`tabstop` defaults to 4) and the cursor at char column 5 (display
+    /// column 11), the popup must land 6 cells right of where the raw
+    /// char column would put it.
+    ///
+    /// **Verified RED against unfixed `develop`:** reverting
+    /// `render::editor_popup_anchors`'s `anchor_xy` closure to
+    /// `char_col.saturating_sub(scroll_left)` (dropping the
+    /// `char_col_to_visual` call) reproduces the pre-#1237 formula and
+    /// fails this assertion — the painted left edge lands at the raw-
+    /// column x instead.
+    #[test]
+    fn hover_popup_anchors_at_visual_column_on_tab_indented_line() {
+        let (win_x, cw, gutter_w, left_edge) = popup_left_edge_x(|e| {
+            e.lsp_hover_text = Some("QXZZYHVR".to_string());
+        });
+
+        let expected_x = win_x + gutter_w as f64 * cw + 11.0 * cw; // display col 11
+        let buggy_x = win_x + gutter_w as f64 * cw + 5.0 * cw; // raw char col 5
+        assert!(
+            (left_edge - expected_x).abs() < cw,
+            "hover popup's painted left edge (x={left_edge}) must land at the \
+             tab-expanded display column (x≈{expected_x}), not the raw char \
+             column (x≈{buggy_x})"
+        );
+    }
+
+    /// #1237: same bug, the signature-help popup
+    /// (`ScreenLayout::signature_help`). See
+    /// `hover_popup_anchors_at_visual_column_on_tab_indented_line`'s doc for
+    /// the fixture and RED-verification method — identical here, just a
+    /// different popup sharing the same `anchor_xy` closure in
+    /// `render::editor_popup_anchors`.
+    #[test]
+    fn signature_help_popup_anchors_at_visual_column_on_tab_indented_line() {
+        let (win_x, cw, gutter_w, left_edge) = popup_left_edge_x(|e| {
+            e.lsp_signature_help = Some(crate::core::lsp::SignatureHelpData {
+                label: "fn foo(x: i32)".to_string(),
+                params: vec![(7, 13)],
+                active_param: Some(0),
+            });
+        });
+
+        let expected_x = win_x + gutter_w as f64 * cw + 11.0 * cw; // display col 11
+        let buggy_x = win_x + gutter_w as f64 * cw + 5.0 * cw; // raw char col 5
+        assert!(
+            (left_edge - expected_x).abs() < cw,
+            "signature-help popup's painted left edge (x={left_edge}) must land \
+             at the tab-expanded display column (x≈{expected_x}), not the raw \
+             char column (x≈{buggy_x})"
+        );
+    }
+
+    /// #1237: same bug, the rich-markdown editor-hover popup
+    /// (`ScreenLayout::editor_hover`, `gh`/dwell-triggered). Unlike hover
+    /// and signature-help, `App::editor_hover_popup_rect` caches the
+    /// resolved rect that directly drives its own paint call (same
+    /// precedent as `completion_layout` above), so this reads that cache
+    /// rather than pixel-diffing.
+    ///
+    /// **Verified RED against unfixed `develop`:** same revert as the
+    /// hover test's doc comment reproduces the pre-#1237 formula and fails
+    /// this assertion.
+    #[test]
+    fn editor_hover_popup_anchors_at_visual_column_on_tab_indented_line() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "\t\tfoo\n");
+        engine.editor_hover = Some(crate::core::engine::EditorHoverPopup {
+            markdown: "hello".to_string(),
+            line_text: vec!["hello".to_string()],
+            code_highlights: vec![vec![]],
+            links: vec![],
+            anchor_line: 0,
+            anchor_col: 5,
+            source: crate::core::engine::EditorHoverSource::Lsp,
+            scroll_top: 0,
+            focused_link: None,
+            popup_width: 10,
+            frozen_scroll_top: 0,
+            frozen_scroll_left: 0,
+            selection: None,
+        });
+
+        let h = harness(engine, 1400, 900);
+        let win_id = h.engine.borrow().active_window_id();
+        let (win_x, gutter_w) = {
+            let sl = h.screen_layout.borrow();
+            let rw = sl
+                .as_ref()
+                .expect("render_content must have painted a ScreenLayout")
+                .windows
+                .iter()
+                .find(|w| w.window_id == win_id)
+                .expect("the active window must have painted");
+            (rw.rect.x, rw.gutter_char_width)
+        };
+        let cw = h
+            .painted_char_width
+            .get()
+            .expect("must have painted with a char width");
+        let rect = h
+            .editor_hover_popup_rect
+            .get()
+            .expect("editor hover popup must have painted a cached rect");
+
+        let expected_x = win_x + gutter_w as f64 * cw + 11.0 * cw; // display col 11
+        let buggy_x = win_x + gutter_w as f64 * cw + 5.0 * cw; // raw char col 5
+        assert!(
+            (rect.x as f64 - expected_x).abs() < 0.5,
+            "editor-hover popup must anchor at the tab-expanded display \
+             column (x≈{expected_x}), not the raw char column (x≈{buggy_x}); \
+             got x={}",
+            rect.x
+        );
+    }
+
+    // #420 note: an earlier version of this fix capped `popup_w` in
+    // `app.rs` to the active window's own viewport width, with a
+    // corresponding `completion_popup_bounds_stay_within_its_own_split`
+    // test here. Review found that cap duplicated, verbatim, the same
+    // `.min(win_viewport.width)` workaround landed in
+    // `tui_main::render_impl.rs` — the real gap is in the shared
+    // `quadraui::Completions::layout()` primitive, which already clamps
+    // *height* to the viewport (`clipped_h`) but never does the symmetric
+    // clamp for `bounds.width`. Per the Platform-Neutrality Rule, that
+    // belongs in quadraui, not patched twice per-backend in vimcode — so
+    // both the GTK and TUI width caps were reverted, and the width-overflow
+    // symptom ("GTK clips right edge, long items get cut off") remains open
+    // pending a quadraui-side fix to `Completions::layout()`, tracked as a
+    // follow-up rather than duplicated here. GTK's *position* clamp (this
+    // window's `win_viewport`, used above `popup_w` in `app.rs`) predates
+    // this issue and is unaffected.
+
     #[test]
     fn hover_popup_paints() {
         let without = popup_region_pixels(|_| {});
@@ -3708,10 +5190,68 @@ mod editor_popups {
             false,
         );
         let h = harness(engine, 1400, 900);
-        let (_, _, pw, ph) = h.editor_hover_popup_rect.get().expect(
+        let rect = h.editor_hover_popup_rect.get().expect(
             "editor hover popup must cache its bounds for the click + drag handlers (#215)",
         );
-        assert!(pw > 0.0 && ph > 0.0);
+        assert!(rect.width > 0.0 && rect.height > 0.0);
+    }
+
+    /// #821: hover popups adopt `quadraui::compose::markdown::render_markdown_to_styled`
+    /// instead of vimcode's hand-rolled `MdStyle`-to-color span walk. GTK twin
+    /// of `tui_main::shell_app::tests::
+    /// driver_editor_hover_renders_code_and_bare_url_link_via_quadraui_markdown`:
+    /// same markdown, same three acceptance-criteria features (bold, inline
+    /// code, links), checked through GTK's own black-box surface —
+    /// `screen_contains` for the paint proof (markdown syntax must not leak),
+    /// `editor_hover_link_rects` for the link (a cached hit-region, painted by
+    /// production code, not a hardcoded rect — see that field's own doc).
+    ///
+    /// quadraui only recognizes `[text](url)` links, not bare `http://`
+    /// autolinks; `core::markdown::linkify_bare_urls` rewrites the source
+    /// markdown before quadraui ever parses it so the bare URL below still
+    /// becomes a real, clickable link on both backends.
+    ///
+    /// **RED against an unfixed tree:** comment out the `linkify_bare_urls`
+    /// call in `Engine::show_editor_hover` and `editor_hover_link_rects` comes
+    /// back without the bare-URL entry — quadraui's renderer never turns
+    /// unbracketed text into a link.
+    #[test]
+    fn editor_hover_popup_renders_code_and_bare_url_link_via_quadraui_markdown_on_gtk() {
+        let mut engine = small_engine();
+        engine.show_editor_hover(
+            1,
+            4,
+            "plain821 **bold821** and `code821` — see https://example.com/docs821",
+            crate::core::engine::EditorHoverSource::Lsp,
+            false,
+            false,
+        );
+        let mut h = harness(engine, 1400, 900);
+        h.driver.render();
+
+        assert!(
+            h.driver.screen_contains("bold821"),
+            "the word inside **bold821** must still paint, syntax stripped; painted texts: {:?}",
+            h.driver.painted_texts()
+        );
+        assert!(
+            !h.driver.screen_contains("**bold821**"),
+            "bold markdown delimiters must not leak into painted text; painted texts: {:?}",
+            h.driver.painted_texts()
+        );
+        assert!(
+            !h.driver.screen_contains("`code821`"),
+            "inline-code backticks must not leak into painted text; painted texts: {:?}",
+            h.driver.painted_texts()
+        );
+
+        let link_rects = h.editor_hover_link_rects.borrow().clone();
+        assert!(
+            link_rects
+                .iter()
+                .any(|(_, uri)| uri == "https://example.com/docs821"),
+            "the bare URL must be linkified into a real clickable link rect; got {link_rects:?}"
+        );
     }
 }
 
@@ -3808,10 +5348,10 @@ mod panel_surfaces {
     fn quickfix_panel_paints() {
         let region = |selected: usize| {
             bottom_region_pixels(1400, 900, move |e| {
-                e.quickfix_items = vec![make_qf_item("a.rs"), make_qf_item("b.rs")];
-                e.quickfix_open = true;
-                e.quickfix_has_focus = true;
-                e.quickfix_selected = selected;
+                e.quickfix.items = vec![make_qf_item("a.rs"), make_qf_item("b.rs")];
+                e.quickfix.open = true;
+                e.quickfix.has_focus = true;
+                e.quickfix.selected = selected;
             })
         };
         assert_region_changed(
@@ -3885,10 +5425,16 @@ mod panel_surfaces {
             "**M** `src/main.rs` — modified",
         );
         let mut with_h = harness(engine, 1400, 900);
-        let (px, py, pw, ph) = with_h
+        let rect = with_h
             .panel_hover_popup_rect
             .get()
             .expect("panel hover popup must cache its bounds for a future click handler");
+        let (px, py, pw, ph) = (
+            rect.x as f64,
+            rect.y as f64,
+            rect.width as f64,
+            rect.height as f64,
+        );
         assert!(pw > 0.0 && ph > 0.0);
 
         let mut without_h = harness(small_engine(), 1400, 900);
@@ -3917,6 +5463,163 @@ mod panel_surfaces {
             differing > 0,
             "panel hover popup must paint new pixels within its own cached bounds; \
              {differing}/{total} sampled pixels differed"
+        );
+    }
+
+    /// Engine fixture for the GTK #1087 regression test below: a
+    /// `git-insights` ext panel with 30 "Log" items and a panel-hover popup
+    /// open on the item at flat index `item_index`, scrolled to
+    /// `scroll_top`. Mirrors `tui_main::shell_app`'s
+    /// `tui_ext_panel_hover_card_anchors_to_the_scrolled_row_not_the_flat_index`
+    /// fixture so the two backends' regression tests stay comparable.
+    fn ext_panel_hover_engine(scroll_top: usize, item_index: usize) -> Engine {
+        let mut engine = small_engine();
+        engine.ext_panels.insert(
+            "git-insights".to_string(),
+            crate::core::plugin::PanelRegistration {
+                name: "git-insights".to_string(),
+                title: "Git Insights".to_string(),
+                icon: '\u{f113}',
+                fallback_icon: Some('X'),
+                sections: vec!["Log".to_string()],
+            },
+        );
+        let items: Vec<crate::core::plugin::ExtPanelItem> = (0..30)
+            .map(|i| crate::core::plugin::ExtPanelItem {
+                text: format!("hover1087item{i:02}"),
+                id: format!("item{i}"),
+                ..Default::default()
+            })
+            .collect();
+        engine
+            .ext_panel_items
+            .insert(("git-insights".to_string(), "Log".to_string()), items);
+        engine.ext_panel_active = Some("git-insights".to_string());
+        engine.ext_panel_scroll_top = scroll_top;
+        engine.show_panel_hover(
+            "git-insights",
+            &format!("item{}", item_index.saturating_sub(1)),
+            item_index,
+            "HOVERCARD1087GTK body text",
+        );
+        engine
+    }
+
+    /// #1087 GTK twin of TUI's `tui_ext_panel_hover_card_anchors_to_the_
+    /// scrolled_row_not_the_flat_index`. `panel_hover_anchor_y`'s
+    /// non-source-control branch (`render.rs`) is shared code reached from
+    /// both backends: GTK's `App::paint_bottom_band` calls
+    /// `render::panel_hover_popup_paint` unconditionally whenever
+    /// `screen.panel_hover` is set (`src/app.rs`'s `BottomOp::PanelHover`
+    /// arm), with no gate on `panel_name`. Written while GTK's `ext:` arm
+    /// still fell through to the extension marketplace (#1089 fixed that
+    /// separately — `App::paint_sidebar_panel_rung` now paints this
+    /// fixture's own row text too), so this predates having painted row
+    /// text to `find_bounds` against the way the TUI test locates the
+    /// hovered row; kept as-is since it still asserts the stronger,
+    /// backend-agnostic invariant the fix established: the popup's anchor
+    /// depends only on the
+    /// *on-screen* row (`item_index - ext_panel_scroll_top`), never on the
+    /// raw flat index or the scroll offset individually. Two fixtures reach
+    /// the same on-screen row (3) via different (scroll_top, item_index)
+    /// pairs — (0, 3) and (20, 23) — and must paint the popup at the same
+    /// y.
+    ///
+    /// **Verified RED against unfixed `develop`:** the pre-fix code
+    /// anchored at `sidebar_top_y + unit_h + item_index * unit_h` with no
+    /// scroll subtraction, so (scroll_top=0, item_index=3) anchored ~4 rows
+    /// down while (scroll_top=20, item_index=23) anchored ~24 rows down —
+    /// tens of pixels apart, not equal; temporarily reverting
+    /// `panel_hover_anchor_y`'s ext-panel branch to the old formula fails
+    /// the equality assertion below.
+    #[test]
+    fn panel_hover_ext_panel_card_anchors_to_the_scrolled_row_not_the_flat_index_on_gtk() {
+        let unscrolled = ext_panel_hover_engine(0, 3);
+        let h_unscrolled = harness(unscrolled, 1400, 900);
+        let rect_unscrolled = h_unscrolled
+            .panel_hover_popup_rect
+            .get()
+            .expect("popup must paint & cache bounds for the unscrolled fixture");
+
+        let scrolled = ext_panel_hover_engine(20, 23);
+        let h_scrolled = harness(scrolled, 1400, 900);
+        let rect_scrolled = h_scrolled
+            .panel_hover_popup_rect
+            .get()
+            .expect("popup must paint & cache bounds for the scrolled fixture");
+
+        assert!(
+            rect_scrolled.width > 0.0 && rect_scrolled.height > 0.0,
+            "precondition: the scrolled fixture's popup must have painted \
+             non-empty bounds; got {rect_scrolled:?}"
+        );
+        assert!(
+            (rect_unscrolled.y - rect_scrolled.y).abs() < 1.0,
+            "hovering on-screen row 3 must anchor the popup at the same y \
+             regardless of scroll offset — unscrolled (scroll_top=0, \
+             item_index=3) painted at y={}, scrolled (scroll_top=20, \
+             item_index=23) painted at y={}",
+            rect_unscrolled.y,
+            rect_scrolled.y,
+        );
+    }
+
+    /// #1067: clicking a link inside the panel-hover popup (source-control /
+    /// extension-panel item dwell tooltip) was a complete no-op on GTK —
+    /// this backend painted and cached `panel_hover_link_rects` (exercised
+    /// above by `panel_hover_popup_paints_and_caches_bounds`, whose own doc
+    /// called it "the same cache a future click handler would read") but
+    /// never read them back on click. TUI already had this via its own
+    /// inline hit test in `mouse::handle_mouse`; #1067 moved that hit test
+    /// into the shared `render::route_panel_hover_popup_click` +
+    /// `render::apply_panel_hover_popup_route` rung and wired GTK's
+    /// `App::route_and_apply_panel_hover_popup` onto it.
+    ///
+    /// The link's rect comes from what was painted, never hardcoded.
+    ///
+    /// **RED against unfixed `develop`:** without `route_and_apply_panel_
+    /// hover_popup`'s call in `handle_mouse_click_msg`, the click below
+    /// lands on the link's painted rect but nothing on this backend reads
+    /// `panel_hover_link_rects` back — the popup stays open and
+    /// `PANELHOVER1067` keeps painting.
+    #[test]
+    fn panel_hover_popup_link_click_dismisses_the_popup_on_gtk() {
+        let mut engine = small_engine();
+        engine.show_panel_hover(
+            "source_control",
+            "item0",
+            0,
+            "PANELHOVER1067 [commit1067](https://example.com/panelhover1067)",
+        );
+        let mut h = harness(engine, 1400, 900);
+        assert!(
+            h.driver.screen_contains("PANELHOVER1067"),
+            "precondition: the panel hover popup body must paint; screen was {:?}",
+            h.driver.painted_texts()
+        );
+
+        let (rect, uri, _is_native) = h
+            .panel_hover_link_rects
+            .borrow()
+            .first()
+            .cloned()
+            .expect("the popup's link must have painted a hit rect");
+        assert_eq!(uri, "https://example.com/panelhover1067");
+
+        h.driver.dispatch(quadraui::UiEvent::MouseDown {
+            widget: None,
+            button: quadraui::MouseButton::Left,
+            position: quadraui::Point::new(rect.x + rect.width / 2.0, rect.y + rect.height / 2.0),
+            modifiers: quadraui::Modifiers::default(),
+        });
+        h.driver.render();
+
+        assert!(
+            !h.driver.screen_contains("PANELHOVER1067"),
+            "a click on the panel-hover popup's link must be consumed by the \
+             shared panel-hover click rung — dismissing the popup — not fall \
+             through as a no-op (#1067); screen was {:?}",
+            h.driver.painted_texts()
         );
     }
 }
@@ -4007,6 +5710,56 @@ mod chrome_surfaces {
         assert_region_changed(&without, &with, "an open find/replace overlay");
     }
 
+    /// Sample the pixels inside `rect`, in `(x, y)`-ascending order — the
+    /// generic twin of [`find_replace_region_pixels`] for an overlay whose
+    /// corner-anchored position isn't worth hand-deriving when the paint
+    /// already cached exactly where it landed.
+    fn sample_rect_pixels(
+        h: &mut Harness<impl AppLogic>,
+        rect: quadraui::Rect,
+    ) -> Vec<(u8, u8, u8)> {
+        let mut px = Vec::new();
+        let mut y = rect.y as i32;
+        while y < (rect.y + rect.height) as i32 {
+            let mut x = rect.x as i32;
+            while x < (rect.x + rect.width) as i32 {
+                px.push(h.driver.pixel(x, y));
+                x += 3;
+            }
+            y += 2;
+        }
+        px
+    }
+
+    /// #824: `FrameOp::ToastStack` now routes through the shared
+    /// `render::paint_toast_stack_rung` — this is the GTK half of the
+    /// black-box coverage the convergence needs (TUI already has
+    /// `render_content_paints_toast_via_shell_app`). Aims at the bounds
+    /// `engine.toast_layout` cached from the *paint itself* (#587's lesson:
+    /// never assert on a cache field being populated instead of on what got
+    /// painted), rather than a guessed corner offset.
+    #[test]
+    fn toast_stack_overlay_paints() {
+        let mut engine = small_engine();
+        engine.push_toast("Saved", "buffer.rs saved", quadraui::ToastSeverity::Info);
+        let mut h = harness(engine, 1400, 900);
+        let bounds = h
+            .engine
+            .borrow()
+            .toast_layout
+            .borrow()
+            .as_ref()
+            .and_then(|l| l.visible_toasts.first())
+            .map(|vt| vt.bounds)
+            .expect("a pushed toast must paint and cache a ToastStackLayout entry for it");
+        assert!(bounds.width > 0.0 && bounds.height > 0.0);
+
+        let with = sample_rect_pixels(&mut h, bounds);
+        let mut without_h = harness(small_engine(), 1400, 900);
+        let without = sample_rect_pixels(&mut without_h, bounds);
+        assert_region_changed(&without, &with, "an open toast");
+    }
+
     /// Two tabs so `open_tab_switcher` has more than one MRU entry to show
     /// (it no-ops — leaves `tab_switcher_open` false — with only one).
     fn engine_with_two_tabs() -> Engine {
@@ -4024,10 +5777,16 @@ mod chrome_surfaces {
             "fixture must actually open the switcher"
         );
         let mut with_h = harness(engine, 1400, 900);
-        let (px, py, pw, ph) = with_h
+        let rect = with_h
             .tab_switcher_popup_rect
             .get()
             .expect("tab switcher popup must cache its bounds for click routing (#671)");
+        let (px, py, pw, ph) = (
+            rect.x as f64,
+            rect.y as f64,
+            rect.width as f64,
+            rect.height as f64,
+        );
         assert!(pw > 0.0 && ph > 0.0);
 
         let mut without_h = harness(engine_with_two_tabs(), 1400, 900);
@@ -4057,6 +5816,149 @@ mod chrome_surfaces {
             "tab switcher popup must paint new pixels within its own cached bounds; \
              {differing}/{total} sampled pixels differed"
         );
+    }
+
+    // ── #1056: `FrameOp::TabSwitcher` row-count cap ───────────────────────
+    //
+    // GTK's `FrameOp::TabSwitcher` arm already fed
+    // `TabSwitcherGeometry::visible_rows` into
+    // `tab_switcher_to_quadraui_list_view`; TUI's twin arm fed
+    // `max_visible` (the uncapped height budget) instead — fixed alongside
+    // this test. See the `FrameOp::TabSwitcher` doc comment in `render.rs`.
+    // This is the GTK half of the "more tabs than fit" reproduction the
+    // follow-up asked for (TUI half:
+    // `driver_tab_switcher_caps_visible_rows_when_more_tabs_than_fit` in
+    // `src/tui_main/shell_app.rs`).
+
+    /// `count` file tabs under a short `/tmp` path (not `std::env::temp_dir()`,
+    /// whose macOS `/var/folders/.../T/` prefix is long enough that the
+    /// switcher's per-row detail column — the tab's full path, right-aligned
+    /// — reserves so much width that the item's own filename span never
+    /// paints at all, per `quadraui::gtk::list`'s `text_right_limit` guard).
+    /// Zero-padded names (`tab00.txt`..) so no name is a substring of
+    /// another. Opened in order via `new_tab`, which touches the MRU on
+    /// every call, so the resulting MRU order is deterministic: newest
+    /// first.
+    fn engine_with_many_file_tabs(count: usize) -> (Engine, Vec<std::path::PathBuf>) {
+        let dir = std::path::PathBuf::from(format!(
+            "/tmp/vc1056_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let files: Vec<_> = (0..count)
+            .map(|i| dir.join(format!("tab{i:02}.txt")))
+            .collect();
+        for (i, path) in files.iter().enumerate() {
+            std::fs::write(path, format!("line {i}\n")).unwrap();
+        }
+
+        let mut engine = Engine::new();
+        engine
+            .open_file_with_mode(&files[0], crate::core::engine::OpenMode::Permanent)
+            .unwrap();
+        for path in &files[1..] {
+            engine.new_tab(Some(path));
+        }
+        (engine, files)
+    }
+
+    /// #1056 reproduction, GTK half: 12 tabs open in a viewport short
+    /// enough that `gtk_tab_switcher_sizing`'s height budget caps the
+    /// popup below 12 rows, so it must paint only the most-recently-used
+    /// tabs that fit and hide the rest — not the full 12-entry MRU list.
+    ///
+    /// Asserted on each tab's full path (e.g. `/tmp/vc1056_.../tab07.txt`)
+    /// rather than the bare filename: the bare filename also appears in the
+    /// tab bar's own strip of open tabs (unrelated chrome, painted before
+    /// the popup), which would make a bare-filename search pass or fail for
+    /// the wrong reason. The full path is unique to the switcher's
+    /// right-aligned detail column — the breadcrumb bar nearby paints each
+    /// path *segment* as a separate run (`"tmp"`, `"vc1056_…"`, …), never
+    /// the joined string with slashes.
+    ///
+    /// The exact number of rows GTK paints can run one higher than
+    /// `TabSwitcherGeometry::visible_rows` predicts — `quadraui`'s shared
+    /// `ListView::layout` deliberately lets a partial trailing row peek
+    /// through when there is any leftover sub-row pixel space, which a
+    /// whole-cell TUI grid can never have. The `<= 1` tolerance below
+    /// accounts for exactly that, and only that.
+    ///
+    /// Per the issue's "reproduce it first" ask: investigating the swap
+    /// this fixes (TUI fed `max_visible`; GTK already fed `visible_rows`)
+    /// turned up that it never actually changed the painted row count on
+    /// either backend — see the updated `FrameOp::TabSwitcher` doc comment
+    /// in `render.rs` for the invariant that makes it inert
+    /// (`tab_switcher_selected` is always `< len`, and the row count
+    /// itself comes from the popup's own painted bounds, not from this
+    /// parameter). This test is a standing regression guard on the cap
+    /// itself and on the two backends agreeing on it, not a red/green proof
+    /// of that specific swap — reverting the `shell_app.rs` fix and
+    /// rerunning it does not turn it red.
+    #[test]
+    fn tab_switcher_caps_visible_rows_when_more_tabs_than_fit() {
+        let total_tabs = 12;
+        let (mut engine, files) = engine_with_many_file_tabs(total_tabs);
+        engine.open_tab_switcher();
+        assert!(
+            engine.tab_switcher_open,
+            "fixture must actually open the tab switcher"
+        );
+
+        // A short window: wide enough (1400px) that width never becomes the
+        // binding constraint on the popup or its detail column, short
+        // enough (220px) that the height budget caps well below
+        // `total_tabs` rows regardless of the exact font metrics this
+        // machine measures.
+        let h = harness(engine, 1400, 220);
+
+        let paths: Vec<String> = files.iter().map(|p| p.display().to_string()).collect();
+        let visible: Vec<bool> = paths.iter().map(|p| h.driver.screen_contains(p)).collect();
+        let visible_count = visible.iter().filter(|v| **v).count();
+        assert!(
+            visible_count < total_tabs,
+            "test setup must actually put more tabs than fit the popup \
+             (all {total_tabs} paths painted — the popup isn't capping at \
+             all, or the harness viewport is too tall for this fixture)"
+        );
+
+        let lh = h
+            .painted_line_height
+            .get()
+            .expect("a painted frame must record its line height (#555)") as f32;
+        let expected = crate::render::TabSwitcherGeometry::compute(
+            quadraui::Rect::new(0.0, 0.0, 1400.0, 220.0),
+            total_tabs,
+            &crate::render::gtk_tab_switcher_sizing(lh),
+        )
+        .expect("12 items must yield a popup")
+        .visible_rows;
+        assert!(
+            visible_count.abs_diff(expected) <= 1,
+            "painted row count ({visible_count}) should match the geometry's \
+             intended cap ({expected}), give or take the one-row tolerance \
+             for `ListView::layout`'s partial trailing row"
+        );
+
+        // MRU order is newest-first (tab11 opened last => index 0), so the
+        // visible window must be a contiguous run of the most-recently-used
+        // tabs — the newest `visible_count` present, the rest absent.
+        for i in (total_tabs - visible_count..total_tabs).rev() {
+            assert!(
+                visible[i],
+                "tab{i:02}.txt is one of the {visible_count} \
+                 most-recently-used tabs and must still paint its full path \
+                 inside the popup"
+            );
+        }
+        for i in 0..(total_tabs - visible_count) {
+            assert!(
+                !visible[i],
+                "tab{i:02}.txt is older than the {visible_count}-row cap \
+                 and must not paint at all (scrolled off)"
+            );
+        }
     }
 
     // ── #733 slice 1: the shared modal-overlay mouse rung ────────────────
@@ -4179,7 +6081,7 @@ mod chrome_surfaces {
         let mut engine = engine_with_two_tabs();
         engine.open_tab_switcher();
         let mut h = harness(engine, 1400, 900);
-        let (px, py, pw, ph) = h
+        let rect = h
             .tab_switcher_popup_rect
             .get()
             .expect("the painted popup must cache its bounds for the router");
@@ -4189,7 +6091,7 @@ mod chrome_surfaces {
         );
 
         h.driver
-            .click((px + pw / 2.0) as f32, (py + ph / 2.0) as f32);
+            .click(rect.x + rect.width / 2.0, rect.y + rect.height / 2.0);
         h.driver.render();
 
         assert!(
@@ -4602,7 +6504,7 @@ mod command_center {
         // than on `GtkDriver::find`/`screen_contains`.
         let theme = crate::render::Theme::from_name(&h.engine.borrow().settings.colorscheme);
         let bg = {
-            let c = crate::render::to_quadraui_color(theme.tab_bar_bg);
+            let c = theme.tab_bar_bg;
             (c.r, c.g, c.b)
         };
         assert!(
@@ -4691,22 +6593,54 @@ mod command_center {
     /// band reservation API yet -- see the #710 comment on that call site),
     /// so the band is still an `lh` multiple; per this issue's acceptance
     /// criteria that means the useful assertion is "the pill height matches
-    /// the intended target at the default size", pinned with a tolerance
-    /// band around the ~27px this measures in the headless harness at the
-    /// chosen 1.7 multiplier. The second assertion pins the residual this
-    /// doc note calls out: because the GTK runner paints the editor at a
-    /// hardcoded font regardless of `settings.font_size` (see the sibling
-    /// dropdown-font test's doc comment), the row height a single
-    /// `font_size` value produces here is already stable across
-    /// `font_size` even with the bug reinstated at 1.0 -- so it does NOT
-    /// alone distinguish fixed from unfixed and is kept only as the
-    /// "stable across two font_size values" half of the acceptance
-    /// criteria, not as the regression guard (that's the first assertion).
+    /// the intended target at the default size".
+    ///
+    /// **Because the band is an `lh` multiple, its pixel height is a
+    /// function of the host's font metrics and is NOT the same number on
+    /// every machine** -- it measures 34px where the headless harness
+    /// resolves `lh == 17.07` and 36px where it resolves `lh == 17.9`, and
+    /// pinning it to one machine's literal is what turned this test red on
+    /// the #940 test-stage host while it stayed green on the author's. So
+    /// the *discriminating* assertion here is the metric-independent one:
+    /// the band must be `with_title_bar`'s multiple of the line height the
+    /// frame actually painted with. The absolute px windows below are kept
+    /// as the VS-Code-parity sanity check, widened to span the `lh` spread
+    /// real hosts produce rather than one host's rounding.
+    ///
+    /// #940 raised the multiple from `1.7` to `2.0`: `1.7` measured 29px
+    /// here, and 1px of margin over macOS's ~28pt native titlebar height is
+    /// not a safety margin, it's a rounding error -- #940 adopts the
+    /// client-side titlebar specifically so this band shares its vertical
+    /// space with the real traffic-light cluster, hence the explicit
+    /// "clears macOS's titlebar" assertion below (see the `shell_config`
+    /// call site's comment for the full analysis).
+    ///
+    /// **#947 update:** the last assertion used to pin the opposite of what
+    /// it says now -- before #947 wired `settings.font_family`/`font_size`
+    /// onto the paint backend's `Backend::set_editor_font`, the GTK runner
+    /// painted the editor at a hardcoded font regardless of that setting,
+    /// so the band height a single `font_size` produced here was
+    /// (accidentally) *stable* across `font_size` even with the #710 bug
+    /// reinstated -- it did not distinguish fixed from unfixed on its own.
+    /// Now that the editor genuinely paints at `settings.font_size` (#947),
+    /// `lh` -- and so this `TITLE_BAR_LH_MULTIPLE`-derived band -- legitimately
+    /// scales with it: the assertion below now checks that growth directly,
+    /// which makes it a real #947 regression guard (a build that silently
+    /// dropped `set_editor_font` again would go back to a flat band here).
+    /// The absolute px windows above were tuned assuming the *previously
+    /// hardcoded* paint size (~11pt, `lh` around 17-18px); `settings.font_size`
+    /// defaults to 14pt (`core::settings::default_font_size`), which now
+    /// genuinely reaches paint, so both windows are widened to include the
+    /// resulting ~46px/~42px default-size band/pill alongside the original
+    /// VS-Code-parity target.
     #[test]
     fn title_bar_band_and_command_center_pill_hit_vs_code_parity_target() {
         let mut h = harness(engine_with_tab_history(), 1400, 900);
         h.driver.render();
         let band = h.title_bar_rect.get().height;
+        let lh = h
+            .painted_line_height()
+            .expect("render_content must publish the painted line height") as f32;
         let layout = h
             .engine
             .borrow()
@@ -4720,20 +6654,54 @@ mod command_center {
             .height
             - 4.0;
 
+        // The regression guard, stated in the unit the knob is actually
+        // expressed in. `with_title_bar(1.0)` -- the pre-#710 bug -- makes
+        // this one line height, not two, and fails here on every host
+        // regardless of what that line height measures.
+        const TITLE_BAR_LH_MULTIPLE: f32 = 2.0;
         assert!(
-            (25.0..=35.0).contains(&band),
-            "title-bar band height should land near VS Code's 35px title \
-             bar (pre-#710 with_title_bar(1.0) measured ~18px here, one \
-             editor text line): got {band}px"
+            (band - TITLE_BAR_LH_MULTIPLE * lh).abs() <= 1.0,
+            "the title-bar band must be `with_title_bar({TITLE_BAR_LH_MULTIPLE})` \
+             line heights tall; this frame painted lh={lh}px, so the band should \
+             be ~{}px: got {band}px",
+            TITLE_BAR_LH_MULTIPLE * lh
+        );
+        // #940: the band shares its vertical space with macOS's native
+        // traffic-light cluster once the client-side titlebar is on, and the
+        // standard macOS titlebar is 28pt -- a band at or under that clips
+        // the controls this issue exists to keep intact. `1.7` measured 29px
+        // here (1px of margin); `2.0` measures 34-36px depending on the
+        // host's `lh`.
+        const MACOS_TITLEBAR_PT: f32 = 28.0;
+        const MIN_CLEARANCE_PX: f32 = 2.0;
+        assert!(
+            band >= MACOS_TITLEBAR_PT + MIN_CLEARANCE_PX,
+            "title-bar band must clear macOS's {MACOS_TITLEBAR_PT}pt native \
+             titlebar by at least {MIN_CLEARANCE_PX}px, not by rounding noise \
+             (#940): got {band}px at lh={lh}px"
         );
         assert!(
-            (22.0..=31.0).contains(&pill),
+            (28.0..=56.0).contains(&band),
+            "title-bar band height should land near VS Code's 35px title \
+             bar, widened to cover the real default `settings.font_size` \
+             (14pt, ~46px band -- #947) rather than the old hardcoded ~11pt \
+             paint (pre-#710 with_title_bar(1.0) measured ~18px here, one \
+             editor text line): got {band}px at lh={lh}px"
+        );
+        assert!(
+            (24.0..=52.0).contains(&pill),
             "command-centre pill height should land near VS Code's ~26px \
-             pill (pre-#710 measured ~14px here): got {pill}px"
+             pill, widened to cover the real default `settings.font_size` \
+             (14pt, ~42px pill -- #947) rather than the old hardcoded ~11pt \
+             paint (pre-#710 measured ~14px here): got {pill}px at lh={lh}px"
         );
 
-        // Stable across `settings.font_size` (see doc comment above for why
-        // this doesn't distinguish fixed from unfixed on its own).
+        // #947 regression guard: the band must now GROW with
+        // `settings.font_size` (see the doc comment above for why this used
+        // to assert the opposite). A build that silently dropped
+        // `Backend::set_editor_font` again would go back to painting every
+        // `font_size` at the same hardcoded size, and `band_big` here would
+        // collapse back to ~`band_small`.
         let mut engine_small = engine_with_tab_history();
         engine_small.settings.font_size = 10;
         let mut h_small = harness(engine_small, 1400, 900);
@@ -4747,9 +6715,105 @@ mod command_center {
         let band_big = h_big.title_bar_rect.get().height;
 
         assert!(
-            (band_small - band_big).abs() < 0.5,
-            "title-bar band height must be stable across settings.font_size \
-             (10 vs 40): got small={band_small} big={band_big}"
+            band_big > band_small + 20.0,
+            "title-bar band height must grow with settings.font_size (10 vs \
+             40) once #947 wires the editor font through to paint: got \
+             small={band_small} big={band_big}"
+        );
+    }
+
+    /// #947 acceptance criteria, end-to-end. Every assertion above (and the
+    /// non-monospace/two-size click test in `gtk::click`) drives the new
+    /// settings->paint/click wiring by poking `engine.settings.font_family`/
+    /// `font_size` directly in test setup — real coverage of the wiring
+    /// itself, but it never proves the ex-command *parser* the issue names
+    /// (`:set guifont`/`:set font_size=N`, `zoomin`/`zoomout`,
+    /// `core/engine/execute.rs`) still resolves to those same fields. This
+    /// drives it through `Engine::execute_command` — the exact call
+    /// `App`'s ex-command dispatch makes for a real `:set ...` / `zoomin` /
+    /// `zoomout` keystroke — and confirms the resulting paint moves the
+    /// same way the direct-settings tests above already proved it should.
+    #[test]
+    fn set_font_family_size_and_zoomin_zoomout_commands_reach_paint() {
+        let mut h = harness(engine_with_tab_history(), 1400, 900);
+        h.driver.render();
+        let band_default = h.title_bar_rect.get().height;
+        assert_eq!(h.engine.borrow().settings.font_size, 14);
+
+        // `:set font_size=N` — the literal command the #947 issue names.
+        h.engine.borrow_mut().execute_command("set font_size=40");
+        assert_eq!(
+            h.engine.borrow().settings.font_size,
+            40,
+            "`:set font_size=40` must reach settings.font_size"
+        );
+        // A runtime font change is only picked up by `set_editor_font`
+        // inside `render_content`, which quadraui's runner reads back
+        // BEFORE the *following* frame's own grid measurement (see the
+        // `App::shell_config`/`sync_per_frame_backend_state` doc comments)
+        // — so one settle frame is required before the new metrics show up
+        // in `title_bar_rect`, exactly like a real running app.
+        h.driver.render();
+        h.driver.render();
+        let band_after_set = h.title_bar_rect.get().height;
+        assert!(
+            band_after_set > band_default + 20.0,
+            "`:set font_size=40` must reach painted editor text through the \
+             same execute.rs ex-command path a real `:set` keystroke uses: \
+             got default={band_default} after={band_after_set}"
+        );
+
+        // `:set font_family=<non-monospace>` — must reach settings; the
+        // non-monospace/two-size click-column regression is covered end to
+        // end by `gtk::click::click_column_resolves_at_non_monospace_family_and_two_sizes`.
+        h.engine
+            .borrow_mut()
+            .execute_command("set font_family=Sans");
+        assert_eq!(
+            h.engine.borrow().settings.font_family,
+            "Sans",
+            "`:set font_family=Sans` must reach settings.font_family"
+        );
+
+        // `zoomin`/`zoomout` — the other acceptance-criteria entry point.
+        let mut h2 = harness(engine_with_tab_history(), 1400, 900);
+        h2.driver.render();
+        let band_before_zoom = h2.title_bar_rect.get().height;
+        for _ in 0..30 {
+            h2.engine.borrow_mut().execute_command("zoomin");
+        }
+        assert_eq!(
+            h2.engine.borrow().settings.font_size,
+            44,
+            "30x `zoomin` from the default font_size=14 must land at 44 \
+             (clamped to 72)"
+        );
+        h2.driver.render();
+        h2.driver.render();
+        let band_after_zoomin = h2.title_bar_rect.get().height;
+        assert!(
+            band_after_zoomin > band_before_zoom + 20.0,
+            "repeated `zoomin` must grow settings.font_size enough to grow \
+             the painted title-bar band: before={band_before_zoom} \
+             after={band_after_zoomin}"
+        );
+
+        for _ in 0..40 {
+            h2.engine.borrow_mut().execute_command("zoomout");
+        }
+        assert_eq!(
+            h2.engine.borrow().settings.font_size,
+            6,
+            "40x `zoomout` from 44 must land at the floor, 6"
+        );
+        h2.driver.render();
+        h2.driver.render();
+        let band_after_zoomout = h2.title_bar_rect.get().height;
+        assert!(
+            band_after_zoomout < band_after_zoomin - 20.0,
+            "repeated `zoomout` must shrink settings.font_size enough to \
+             shrink the painted title-bar band back down: \
+             after_zoomin={band_after_zoomin} after_zoomout={band_after_zoomout}"
         );
     }
 
@@ -4839,36 +6903,35 @@ mod command_center {
         );
     }
 
-    /// #676 design note: GTK forces `menu_bar_visible = true` at startup
-    /// (`App::setup`), unlike TUI where it's optional, so in practice the
-    /// Command Center is always visible on GTK. This guards the other half
-    /// of that contract anyway (mirroring TUI's identical gate,
-    /// `render_content_does_not_paint_menu_bar_when_hidden_via_shell_app`):
-    /// when the flag is off, clicking where the Command Center used to be
-    /// must no longer trigger Command Center behaviour (stale hit-region),
-    /// not just clear the layout-cache field in isolation.
+    /// #676 design note (superseded by #939, see below): GTK forces
+    /// `menu_bar_visible = true` at startup (`App::setup`), unlike TUI where
+    /// it's optional, so in practice the Command Center is always visible on
+    /// GTK. `menu_bar_visible` can still be flipped off at runtime though
+    /// (`Engine::toggle_menu_bar`, e.g. an F10/Alt binding), and this test
+    /// pins what that does to the Command Center.
     ///
-    /// #677 audit: the original version of this test asserted only
-    /// `command_center_layout.borrow().is_none()` — a state check with no
-    /// observable-behaviour probe, exactly the #553/#592 shape (a flag
-    /// flips, nothing confirms the click path actually changed). A first
-    /// attempt at replacing it with a raw pixel-region probe (same
-    /// coordinates, `region_has_non_background_pixel` before/after) turned
-    /// out to be a false-positive risk rather than a strengthening: hiding
-    /// the menu bar reserves one fewer title-bar row, so `main_content`
-    /// reflows upward and the tab bar's own (non-background) pixels land on
-    /// the old Command Center coordinates — that probe went red against
-    /// *correct*, unmodified code, which would have made this a flaky/wrong
-    /// test rather than a fixed one. Click-behaviour is layout-shift-proof
-    /// and directly exercises the actual risk the doc above names (a stale
-    /// cached rect still accepting clicks): verified non-vacuous by
-    /// mutation — commenting out the `command_center_layout.replace(None)`
-    /// clear (`src/gtk/mod.rs`, the `else` arm right after the Command
-    /// Center paint block) makes `assert!(!h.engine.borrow().picker_open, ...)`
-    /// below fail, because `handle()`'s click dispatch still finds a
-    /// (stale) `Some(layout)` to hit-test against and opens the picker.
+    /// #939 changed the answer. `menu_bar_visible` used to gate all three
+    /// title-bar rungs — menu row, its dropdown, *and* the Command Center —
+    /// as one `title_bar` flag (`FramePresence::from_screen`). That was
+    /// convenient here but wrong on a native-menu backend (macOS): setting
+    /// `menu_bar_visible = false` there suppresses the redundant in-window
+    /// `File Edit View` row under AppKit's real menu bar (#901), and dragged
+    /// the Command Center down with it — the omnibar never painted on macOS
+    /// at all. #939 split the gate so the Command Center depends only on the
+    /// title-bar *band* existing, not on `menu_bar_visible`; this test's
+    /// GTK-only trigger for that same flag now falls out of the identical
+    /// rule, so hiding the drawn menu row must no longer clear the Command
+    /// Center — the same title-bar band VS Code's own "Toggle Menu Bar"
+    /// leaves the Command Center in.
+    ///
+    /// RED-verified against this fix: reverted to a pre-#939
+    /// `title_bar`-only presence gate (`command_center: title_bar` instead
+    /// of `title_bar_band_live`) and re-ran — the
+    /// `command_center_layout` assertion below failed (`None`) and the
+    /// search-box click assertion never ran because there was no rect left
+    /// to click.
     #[test]
-    fn command_center_layout_clears_when_menu_bar_is_hidden() {
+    fn command_center_stays_live_when_menu_bar_is_hidden() {
         let mut h = harness(engine_with_tab_history(), 1400, 900);
         h.driver.render();
         assert!(
@@ -4876,43 +6939,68 @@ mod command_center {
             "fixture must start with back-navigation available"
         );
         let tab_before = h.engine.borrow().active_tab().id;
+        assert!(
+            h.driver.screen_contains("File"),
+            "fixture must start with the drawn menu row visible"
+        );
+
+        h.engine.borrow_mut().menu_bar_visible = false;
+        h.driver.render();
+
+        assert!(
+            !h.driver.screen_contains("File"),
+            "hiding the menu bar must stop the drawn `File Edit View` row \
+             from painting; painted text was {:?}",
+            h.driver.painted_texts()
+        );
+
+        // The #939 regression pin: the Command Center's own layout must
+        // still be live and re-measured for this frame's (possibly
+        // reflowed) band -- not cleared just because the drawn menu row
+        // went dark.
         let layout = h
             .engine
             .borrow()
             .command_center_layout
             .borrow()
             .clone()
-            .expect("must be painted while the menu bar is visible");
-        let back = layout.back_bounds.expect("back arrow must be painted");
-        let search = layout.search_bounds.expect("search box must be painted");
+            .expect(
+                "the Command Center must stay live when the menu bar is \
+                 hidden -- only the drawn menu row/dropdown are coupled to \
+                 `menu_bar_visible` (#939)",
+            );
+        let back = layout
+            .back_bounds
+            .expect("the back arrow must still have a painted bounds");
+        let search = layout
+            .search_bounds
+            .expect("the search box must still have a painted bounds");
 
-        h.engine.borrow_mut().menu_bar_visible = false;
-        h.driver.render();
-
-        // Click at the *old* back-arrow and search-box coordinates: with the
-        // menu bar hidden neither must still behave like Command Center
-        // controls, even though the layout has reflowed and something else
-        // (editor/tab bar) may now occupy those pixels.
+        // And it must still be *clickable*, not just present in the cache --
+        // the #587 class of bug is state populated with nothing wired to it.
         h.driver
             .click(back.x + back.width / 2.0, back.y + back.height / 2.0);
-        assert_eq!(
+        assert_ne!(
             h.engine.borrow().active_tab().id,
             tab_before,
-            "clicking the old back-arrow coordinates after hiding the menu bar \
-             must not navigate tab history"
+            "clicking the back arrow must still navigate tab history while \
+             the drawn menu row is hidden"
         );
+
         h.driver.click(
             search.x + search.width / 2.0,
             search.y + search.height / 2.0,
         );
         assert!(
-            !h.engine.borrow().picker_open,
-            "clicking the old search-box coordinates after hiding the menu bar \
-             must not open the Command Center picker"
+            h.engine.borrow().picker_open,
+            "clicking the search box must still open the Command Center \
+             picker while the drawn menu row is hidden"
         );
-        assert!(
-            h.engine.borrow().command_center_layout.borrow().is_none(),
-            "hiding the menu bar must clear the cached Command Center layout"
+        assert_eq!(
+            h.engine.borrow().picker_source,
+            PickerSource::CommandCenter,
+            "the search box must still open the picker with the \
+             CommandCenter source while the drawn menu row is hidden"
         );
     }
 }
@@ -5132,8 +7220,7 @@ mod vscode_dimming {
              {VSCODE_LINE_NUMBER_FG:?}. Dimming line_number_fg is only a win \
              if line_number_active_fg still lifts the cursor row out of it"
         );
-        let active_token =
-            crate::render::to_quadraui_color(crate::render::Theme::onedark().line_number_active_fg);
+        let active_token = crate::render::Theme::onedark().line_number_active_fg;
         assert!(
             near(active, (active_token.r, active_token.g, active_token.b)),
             "the cursor line's number must paint at line_number_active_fg \
@@ -5346,13 +7433,24 @@ mod minimap {
 
     /// Acceptance (#35): the minimap column is painted, and the width it
     /// takes is exactly what `quadraui::reserved_width` reserves — the
-    /// editor pane gives up precisely that many pixels and gets them all
-    /// back with `:set nominimap`.
+    /// editor pane gives up precisely that many *text columns* and gets
+    /// them all back with `:set nominimap`.
     ///
-    /// RED-first: reverting `build_screen_layout`'s rect narrowing makes the
-    /// `on_w + strip.width == off_w` assertion fail, and dropping the
-    /// `draw_minimap_strip` call in `render_content` collapses `painted` to
-    /// 0 — both confirmed by hand before restoring the fix.
+    /// #1094: `RenderedWindow.rect` is no longer narrowed by the strip's
+    /// width at all (it now reaches the pane's true right edge — the
+    /// scroll column paints past the strip, not before it — see
+    /// `render.rs`'s `build_screen_layout_with_breadcrumb_row` doc
+    /// comment), so `on_w`/`off_w` are trivially equal and no longer the
+    /// acceptance check. `text_viewport_cols` is: it's still narrowed by
+    /// the strip's width (plus the one-cell scroll gutter beside it —
+    /// `scroll_gutter_width`), exactly the formula `build_rendered_window`
+    /// itself applies, replicated here rather than approximated so this
+    /// stays exact instead of tolerance-fudged.
+    ///
+    /// RED-first: reverting `build_screen_layout`'s viewport-column
+    /// narrowing makes the column-delta assertion below fail, and dropping
+    /// the `draw_minimap_strip` call in `render_content` collapses
+    /// `painted` to 0 — both confirmed by hand before restoring the fix.
     #[test]
     fn minimap_paints_a_strip_whose_width_matches_reserved_width() {
         let mut h_on = harness(engine_with_shaped_buffer(), 1400, 900);
@@ -5365,7 +7463,7 @@ mod minimap {
         h_on.window_center(win_on)
             .expect("editor pane must paint with the default settings");
 
-        let (strip, on_w, on_cols) = {
+        let (strip, pane_w, on_cols) = {
             let layout = h_on.screen_layout.borrow();
             let l = layout.as_ref().unwrap();
             let mm = l
@@ -5377,7 +7475,7 @@ mod minimap {
             (mm.rect, rw.rect.width, rw.text_viewport_cols)
         };
 
-        // The editor must get every one of those pixels back when it's off.
+        // The editor must get every one of those columns back when it's off.
         let mut engine_off = engine_with_shaped_buffer();
         engine_off.settings.minimap = false;
         let h_off = harness(engine_off, 1400, 900);
@@ -5395,24 +7493,42 @@ mod minimap {
             let rw = l.windows.iter().find(|w| w.window_id == win_off).unwrap();
             (rw.rect.width, rw.text_viewport_cols)
         };
+        assert_eq!(
+            pane_w, off_w,
+            "the pane's own rect must be identical on/off now — only the \
+             text-column count should differ (#1094)"
+        );
 
         // #722: the reserved width is now a proportion of the pane's own
         // width rather than a fixed `MINIMAP_COLS` count, so the column
-        // delta isn't a pinned constant any more. The pixel-exact assertion
-        // right below is the real acceptance check (`build_screen_layout`
-        // narrows/widens the rect by exactly `strip.width`); this is just a
-        // column-domain sanity check that *some* text columns came back.
+        // delta isn't a pinned constant any more.
         assert!(
             off_cols > on_cols,
             "the editor must regain text columns when the minimap is off \
              (on={on_cols}, off={off_cols})"
         );
+
+        // The precise acceptance check: replicate `build_rendered_window`'s
+        // own `total_chars` formula (`render.rs`) at both the strip's raw
+        // width alone and with the #1094 scroll-gutter sliver folded in, and
+        // require the real column delta to match exactly.
+        let char_width = h_on.painted_char_width();
+        const SCROLLBAR_RESERVE_PX: f64 = 8.0; // mirrors `GtkBackend::scrollbar_reserve()`
+        let gutter = crate::render::scroll_gutter_width(SCROLLBAR_RESERVE_PX, char_width);
+        let minimap_w_for_build = strip.width + (gutter - SCROLLBAR_RESERVE_PX);
+        let total_chars_off = ((off_w - SCROLLBAR_RESERVE_PX) / char_width).floor();
+        let total_chars_on =
+            ((off_w - SCROLLBAR_RESERVE_PX - minimap_w_for_build) / char_width).floor();
+        let expected_col_delta = (total_chars_off - total_chars_on) as usize;
         assert_eq!(
-            on_w + strip.width,
-            off_w,
-            "the editor must reclaim exactly the reserved width when the \
-             minimap is off (on={on_w} + strip={} vs off={off_w})",
-            strip.width
+            off_cols - on_cols,
+            expected_col_delta,
+            "the editor must reclaim exactly the reserved width (strip \
+             {} px + gutter sliver {} px) when the minimap is off, in text \
+             columns (on={on_cols}, off={off_cols}, expected \
+             delta={expected_col_delta})",
+            strip.width,
+            gutter - SCROLLBAR_RESERVE_PX,
         );
 
         // …and something actually painted in that column band. Probe a grid
@@ -5440,6 +7556,82 @@ mod minimap {
         );
     }
 
+    /// #828 acceptance (driver tier): on a narrow pane the minimap strip
+    /// settles well *below* the wide-pane plateau
+    /// (`minimap_strip_settles_at_vs_code_parity_width_on_a_wide_pane`'s
+    /// ~120px) instead of a fixed width regardless of pane size — the two
+    /// tests together are "minimap width at narrow and wide viewports"
+    /// (issue #828's acceptance bullet), each driven through the real paint
+    /// path (`ScreenLayout` from an actual `window_center` call, not
+    /// `minimap_reserved_width` in isolation) so a future call-site
+    /// miswiring (e.g. GTK's `App::render_content` accidentally forwarding
+    /// [`crate::render::TUI_MINIMAP_SIZING`] instead of
+    /// [`crate::render::gtk_minimap_sizing`]) would be caught here: TUI's
+    /// sizing table clamps to a 30-*column* ceiling, which at this pane's
+    /// real pixel width would produce a strip an order of magnitude
+    /// narrower than GTK's own pixel-denominated formula computes below.
+    #[test]
+    fn minimap_strip_is_narrower_on_a_narrow_pane_than_on_a_wide_one() {
+        // #947: was `900` — wide enough for `MINIMAP_MIN_TEXT_COLS`'s
+        // suppression check at the old, settings-ignoring paint font
+        // (~11pt, ~8.8px char width) but not at the real default
+        // `settings.font_size` (14pt, ~11.2px) once #947 wired it through
+        // to paint: `MINIMAP_MIN_TEXT_COLS * cw` (30 columns) grows with
+        // `cw`, and this fixture's default-visible sidebar+activity-bar
+        // chrome left too little of a 900px window for the editor pane to
+        // clear that larger threshold, so the minimap stopped painting at
+        // all. `1050` clears it with margin at the real default font while
+        // staying well short of the 1600px "wide pane" sibling test below.
+        let h = harness(engine_with_shaped_buffer(), 1050, 900);
+        let win = h.engine.borrow().active_window_id();
+        h.window_center(win)
+            .expect("editor pane must paint with the default settings");
+
+        let (strip_width, pane_width) = {
+            let layout = h.screen_layout.borrow();
+            let l = layout.as_ref().unwrap();
+            let mm = l.minimap.iter().find(|m| m.window_id == win).expect(
+                "a 900px-wide harness must still be roomy enough for the \
+                     minimap to show — if this fails, narrow the test's own \
+                     margin assumptions rather than widening the harness \
+                     past what makes it a *narrow*-pane test",
+            );
+            let rw = l.windows.iter().find(|w| w.window_id == win).unwrap();
+            // #1094: `rw.rect.width` is the pane's own, un-narrowed width
+            // directly now — `build_screen_layout` no longer shrinks
+            // `RenderedWindow.rect` by the strip's width (that used to make
+            // `rw.rect.width + mm.rect.width` the way to recover the pane's
+            // full width; doing that today double-counts the strip).
+            (mm.rect.width, rw.rect.width)
+        };
+        let char_width = h.painted_char_width();
+        let expected = crate::render::minimap_reserved_width(
+            &h.engine.borrow(),
+            pane_width,
+            char_width,
+            crate::render::gtk_minimap_sizing(),
+        );
+
+        assert_eq!(
+            strip_width, expected,
+            "the real paint path must reserve exactly what \
+             minimap_reserved_width computes"
+        );
+        assert!(
+            strip_width < 100.0,
+            "a narrow (900px) pane's minimap must settle noticeably below \
+             the wide-pane plateau of ~120px (got {strip_width}px)"
+        );
+        assert!(
+            strip_width > 48.0,
+            "a 900px pane should still be comfortably clear of the \
+             absolute pixel floor (48px) — this test is about the ordinary \
+             fraction-scaled case, not the floor clamp itself (that's \
+             `minimap_reserved_width_uses_the_explicit_sizing_not_char_width` \
+             in render.rs); got {strip_width}px"
+        );
+    }
+
     /// #728 acceptance: on an ordinary wide pane the minimap strip settles
     /// at VS Code's own ~120px width instead of scaling up with the pane —
     /// the pre-fix `rect_width * MINIMAP_WIDTH_FRACTION` formula reached
@@ -5462,11 +7654,17 @@ mod minimap {
                 .find(|m| m.window_id == win)
                 .expect("the layout must carry a minimap for the pane");
             let rw = l.windows.iter().find(|w| w.window_id == win).unwrap();
-            (mm.rect.width, rw.rect.width + mm.rect.width)
+            // #1094: see the sibling narrow-pane test's comment — `rw.rect.
+            // width` is the pane's own un-narrowed width directly now.
+            (mm.rect.width, rw.rect.width)
         };
         let char_width = h.painted_char_width();
-        let expected =
-            crate::render::minimap_reserved_width(&h.engine.borrow(), pane_width, char_width);
+        let expected = crate::render::minimap_reserved_width(
+            &h.engine.borrow(),
+            pane_width,
+            char_width,
+            crate::render::gtk_minimap_sizing(),
+        );
 
         assert_eq!(
             strip_width, expected,
@@ -5583,8 +7781,8 @@ mod minimap {
             "fixture must start at the top of the file"
         );
 
-        // The 12-column band right after the gutter, on the top visible
-        // row: unindented content ("fn item_0() ...") paints syntax-colored
+        // The 12-column band right after the gutter, on the top 3 visible
+        // rows: unindented content ("fn item_0() ...") paints syntax-colored
         // glyph ink *somewhere* in this band before the click, while a row
         // from the indented band (100..300) paints nothing there but blank
         // indentation (background plus, at most, an indent-guide line —
@@ -5595,10 +7793,25 @@ mod minimap {
         // *brightest* color in the band rather than the ink, and indent
         // guides paint real (if faint) grayscale pixels in the same band
         // even on a correctly-repainted frame.
+        //
+        // #934: 3 rows, not 1. A Darwin/Quartz run reported the single-row
+        // version's "before" sanity check failing outright (0 colorful
+        // pixels found) — Core Text's gamma-correct glyph compositing can
+        // blend a thin syntax-colored stroke so far towards the background
+        // that one row's worth of ink dips under `is_colorful`'s TOL, even
+        // though the line plainly painted. Every unindented/indented line in
+        // the fixture repeats the identical token shape
+        // (`fn item_N() { let x = N; }`), so summing ink across 3 rows
+        // multiplies the sampled ink without changing what's being proven.
+        // It stays safe for the "after" (must-be-zero) band too: `frac`'s
+        // `< 0.1` tolerance keeps `scroll_top` inside roughly (160, 240) of
+        // the fixture's 400 lines, so the widened band (`scroll_top` ..
+        // `scroll_top + 2`) tops out around line 242 — comfortably inside
+        // the indented (100..300) range with margin to spare.
         let band_x0 = (rect.x + gutter_px) as i32;
         let band_x1 = (rect.x + gutter_px + 12.0 * char_w) as i32;
         let row_y0 = (rect.y).ceil() as i32;
-        let row_y1 = (rect.y + lh).floor() as i32;
+        let row_y1 = (rect.y + 3.0 * lh).floor() as i32;
         let is_colorful = |(r, g, b): (u8, u8, u8)| {
             let (r, g, b) = (r as i32, g as i32, b as i32);
             const TOL: i32 = 12; // AA-rounding tolerance, matching `near()` above
@@ -5654,6 +7867,374 @@ mod minimap {
              glyph ink once the view scrolls into the indented band — found \
              {after} colorful pixels; scroll_top moved to {scroll_top} but \
              the paint didn't follow it"
+        );
+    }
+
+    /// #1187 acceptance (black-box, driver tier, GTK): dragging the
+    /// minimap's own viewport-highlight thumb from the top of the strip to
+    /// the bottom must scroll through virtually the whole file in one
+    /// gesture — exactly like dragging the real vertical scrollbar handle
+    /// the same distance — not crawl within roughly one strip-window's
+    /// worth of lines. GTK counterpart of the TUI acceptance test
+    /// `tui_main::shell_app::tests::
+    /// dragging_the_minimap_viewport_highlight_scrolls_the_whole_file_not_a_crawl`.
+    ///
+    /// With the file scrolled to the top, the highlight band's own top edge
+    /// coincides with the strip's top row (#1093: the highlight always
+    /// starts where the editor's own viewport does), so pressing there and
+    /// dragging to the strip's bottom row is exactly the issue's own
+    /// reproduction: "press on the highlight's top edge, drag to the bottom
+    /// of the strip".
+    ///
+    /// 200,000 lines is comfortably past the compression ceiling
+    /// (`MINIMAP_MAX_COMPRESSION * target_lines`) at this harness's
+    /// geometry, so the strip's window genuinely slides rather than holding
+    /// the whole file in one uncompressed view — the regime #1187's root
+    /// cause needs to reproduce at all.
+    ///
+    /// **RED against unfixed `develop`:** confirmed by hand — reverting
+    /// `click::pixel_to_click_target`'s minimap rung to call
+    /// `render::apply_minimap_click` directly (no `DragTarget::ScrollbarY`
+    /// arm) and `App::handle_mouse_drag_msg`'s `MouseDragRoute::Minimap` arm
+    /// to keep re-running it per move reproduces #1187's root cause: the
+    /// strip's own painted window slides in lockstep with `scroll_top`
+    /// (#1093), so the drag's motion mostly cancels itself out and the
+    /// final assertion below (>90% of the file) fails, landing well under
+    /// 20%.
+    #[test]
+    fn dragging_the_minimap_viewport_highlight_scrolls_the_whole_file_on_gtk() {
+        const TOTAL_LINES: usize = 200_000;
+        fn engine_with_very_long_buffer() -> Engine {
+            let mut engine = Engine::new();
+            let text: String = (0..TOTAL_LINES)
+                .map(|i| format!("line {i} content\n"))
+                .collect();
+            engine.buffer_mut().insert(0, &text);
+            engine
+        }
+
+        let mut h = harness(engine_with_very_long_buffer(), 1400, 900);
+        let win = h.engine.borrow().active_window_id();
+        h.driver.render();
+
+        assert_eq!(
+            h.engine.borrow().windows.get(&win).unwrap().view.scroll_top,
+            0,
+            "fixture must start at the top of the file"
+        );
+
+        let strip = {
+            let layout = h.screen_layout.borrow();
+            let mm = layout
+                .as_ref()
+                .expect("render_content must have painted a ScreenLayout")
+                .minimap
+                .iter()
+                .find(|m| m.window_id == win)
+                .expect("a 200,000-line buffer must publish a minimap strip");
+            crate::render::minimap_strip_rect(mm)
+        };
+
+        let x = (strip.x + strip.width / 2.0) as f32;
+        // Press on the strip's very top row — with the file scrolled to the
+        // top, that coincides with the viewport-highlight band's own top
+        // edge — then drag to the strip's bottom row.
+        h.driver.mouse_down(x, strip.y + 1.0);
+        h.driver.mouse_move(x, strip.y + strip.height - 1.0);
+        h.driver.mouse_up(x, strip.y + strip.height - 1.0);
+        h.driver.render();
+
+        // Read the scroll position back from what actually painted (not
+        // engine state) — the lowest `line N` number among the frame's
+        // painted text runs, mirroring the TUI acceptance test's `top_line`.
+        fn top_line(texts: &[&str]) -> Option<usize> {
+            texts
+                .iter()
+                .filter_map(|t| {
+                    t.strip_prefix("line ")?
+                        .split_whitespace()
+                        .next()?
+                        .parse()
+                        .ok()
+                })
+                .min()
+        }
+        let texts = h.driver.painted_texts();
+        let top = top_line(&texts).unwrap_or_else(|| {
+            panic!("the editor must still paint line numbers; painted: {texts:?}")
+        });
+
+        assert!(
+            top > TOTAL_LINES * 9 / 10,
+            "dragging from the highlight's top edge to the strip's bottom \
+             row must scroll through virtually the whole file in one \
+             gesture, not crawl within one strip window — landed on line \
+             {top} of {TOTAL_LINES}"
+        );
+    }
+
+    /// #1093 review follow-up: the two GTK minimap-click driver tests above
+    /// (`minimap_click_at_the_middle_scrolls_to_half_the_file`, 400 lines at
+    /// a 1400x900 harness) and below in `editor_mouse_rungs`
+    /// (`minimap_click_scrolls_the_editor_on_gtk`, 60 lines at 1050x600)
+    /// both use fixtures short enough that the whole file fits inside the
+    /// strip's own real row capacity (`gtk_row_capacity` in
+    /// `build_minimap_data`, `rect.height / ROW_PITCH_PX`) — so
+    /// `window_len == total_buffer_lines` and `window_start_line` stays `0`
+    /// on every frame in both of them. Neither test ever reaches the #1093
+    /// sliding-window math at all; both exercise byte-for-byte the
+    /// pre-#1093 "whole file already fits" path. This is the GTK
+    /// counterpart of the sliding-window acceptance already covered on TUI
+    /// (`minimap_window_slides_to_show_a_distinctive_line_once_scrolled_to_it`
+    /// / `minimap_click_at_the_middle_scrolls_to_the_middle_of_the_painted_window`
+    /// in `tui_main/shell_app.rs`): a file tall enough that GTK's own real,
+    /// pixel-denominated `gtk_row_capacity` is exceeded several times over.
+    ///
+    /// (a) With the cursor pinned to the top of the file, the strip's last
+    ///     painted row (`mm.minimap.lines.last()`) must stand in for a
+    ///     buffer line well short of the file's actual last line — proof
+    ///     the strip holds a *window* onto the buffer, not the whole file
+    ///     squeezed to fit (which would always pin the last painted row to
+    ///     `total_buffer_lines - 1`, regardless of scroll position).
+    /// (b) A click near the bottom of the strip must advance `scroll_top`
+    ///     by roughly the window's own span (a page-down), not jump to the
+    ///     file's last line — the EOF-jump bug this issue reports.
+    ///
+    /// RED-first: reverting `build_minimap_data`'s windowing (handing
+    /// `quadraui::primitives::minimap::block_bounds` `total_buffer_lines`
+    /// directly again, as unfixed `develop` did) makes assertion (a) fail — the strip's last
+    /// painted row once again stands in for the file's actual last line —
+    /// and pushes the bottom-of-strip click's resulting `scroll_top` up
+    /// near `total_buffer_lines - 1` instead of inside roughly one
+    /// window's worth of the top, failing assertion (b). Confirmed by hand
+    /// before restoring the fix.
+    #[test]
+    fn minimap_click_near_the_bottom_pages_instead_of_jumping_to_eof_on_gtk() {
+        // Enough lines that the strip's real GTK row capacity (measured at
+        // ~375 rows for this harness's 1400x900 size by the #1052 test
+        // above) is exceeded well over an order of magnitude, so the
+        // sliding-window math is actually exercised rather than the
+        // "whole file already fits" branch every other GTK minimap test in
+        // this module happens to take.
+        //
+        // #1186 let the window grow past `target_lines` by a factor `K`,
+        // derived (pre-#1211) from `total_buffer_lines` — which meant even
+        // very large files could get squeezed whole into the strip (up to
+        // `MINIMAP_MAX_COMPRESSION * target_lines`, i.e. ~24,000 lines
+        // here), silently disabling the sliding-window math this test is
+        // about. #1211 made `K` a function of the strip's own geometry
+        // instead (see `MINIMAP_VIEWPORT_MULTIPLE` in `render.rs`), so on
+        // GTK — already at `target_lines ~= 9 * editor_visible_rows`, VS
+        // Code's own default ratio — `K` now resolves to `1` again: one
+        // buffer line per painted row, a window of ~375 lines. 200,000
+        // lines comfortably exceeds that either way, so the window still
+        // has to slide regardless of which `K` produced it.
+        let n_lines = 200_000usize;
+        let mut engine = Engine::new_for_test();
+        let text: String = (0..n_lines).map(|i| format!("line {i}\n")).collect();
+        engine.buffer_mut().insert(0, &text);
+
+        let mut h = harness(engine, 1400, 900);
+        let win = h.engine.borrow().active_window_id();
+        h.window_center(win).expect("editor pane must paint");
+        assert_eq!(
+            h.engine.borrow().scroll_top(),
+            0,
+            "fixture must start at the top of the file"
+        );
+
+        let (strip, window_len, last_painted_line, total) = {
+            let layout = h.screen_layout.borrow();
+            let mm = layout
+                .as_ref()
+                .unwrap()
+                .minimap
+                .iter()
+                .find(|m| m.window_id == win)
+                .expect("minimap must be present for the active pane");
+            // #1186: `mm.minimap.lines.len()` is a *block count*, not the
+            // real span of buffer lines the window covers — a block can now
+            // aggregate several real lines, so the two only agree when
+            // every block is exactly one line wide (`K == 1`). Multiply by
+            // the measured block width (the gap between the first two
+            // sampled lines) to recover the real span this test's
+            // assertions actually need.
+            let block_width = mm
+                .minimap
+                .lines
+                .get(1)
+                .map(|l| l.line_idx - mm.minimap.lines[0].line_idx)
+                .unwrap_or(1)
+                .max(1);
+            (
+                mm.rect,
+                mm.minimap.lines.len() * block_width,
+                mm.minimap.lines.last().map(|l| l.line_idx).unwrap_or(0),
+                mm.minimap.total_buffer_lines,
+            )
+        };
+        assert!(
+            // Ropey counts a trailing `\n` as opening one further (empty)
+            // line, so a buffer built from `n_lines` newline-terminated
+            // lines reports `n_lines + 1` — this just guards against the
+            // fixture's line count going missing entirely on its way to the
+            // painted layout, not an exact match.
+            (n_lines..=n_lines + 1).contains(&total),
+            "sanity: the fixture's own line count ({n_lines}) must reach \
+             the painted layout (got total_buffer_lines={total})"
+        );
+        assert!(
+            window_len < total,
+            "test setup sanity: the strip's own row capacity ({window_len}) \
+             must be smaller than the fixture ({total} lines), or this \
+             fixture is too short to exercise the sliding window at all"
+        );
+
+        // (a) — the strip's window, not the whole buffer.
+        assert!(
+            last_painted_line + window_len < total - 1,
+            "with the cursor at the top of a {total}-line file, the \
+             strip's last painted row (buffer line {last_painted_line}, \
+             window of {window_len} rows) must be well short of the \
+             file's actual last line ({}) — a #1093 regression squeezes \
+             the whole buffer into the strip on every frame, pinning the \
+             last painted row to the file's end regardless of scroll \
+             position",
+            total - 1
+        );
+
+        // (b) — a bottom-of-strip click pages, it doesn't jump to EOF.
+        h.driver.click(
+            (strip.x + strip.width / 2.0) as f32,
+            (strip.y + strip.height * 0.95) as f32,
+        );
+        h.driver.render();
+
+        let scroll_top = h.engine.borrow().scroll_top();
+        assert!(
+            scroll_top > 0,
+            "a click near the bottom of the strip must still scroll \
+             forward from the top of the file — got scroll_top=0"
+        );
+        assert!(
+            scroll_top < window_len * 2,
+            "clicking near the bottom of the strip while the cursor is at \
+             the top of a {total}-line file must page roughly one \
+             strip-window's worth of file ({window_len} lines) forward, \
+             not jump to (or near) EOF — got scroll_top={scroll_top} of \
+             {total}"
+        );
+        assert!(
+            scroll_top < total - window_len,
+            "a bottom-of-strip click must not jump anywhere near EOF — \
+             got scroll_top={scroll_top} of {total} (window={window_len})"
+        );
+    }
+
+    /// #1211 acceptance: a *moderately* long file — long enough that #1186's
+    /// pre-#1211 `K` (`total_buffer_lines.div_ceil(target_lines)`) squeezed
+    /// it whole into the strip, but nowhere near
+    /// `MINIMAP_MAX_COMPRESSION * target_lines` — must still show a genuine
+    /// sliding window, not the whole file, on GTK.
+    ///
+    /// The sibling test above bumped its own fixture from 5,000 lines to
+    /// 200,000 specifically to route around this bug (see its own comment's
+    /// history): at 5,000 lines and this harness's ~375-line
+    /// `target_lines`, the pre-#1211 `K` came out to
+    /// `ceil(5_000 / 375) == 14`, and `window_len =
+    /// min(375 * 14, 5_000) == 5_000` — the *entire* file, disabling the
+    /// slide. This test restores that exact scale and asserts the window
+    /// stays far short of it.
+    ///
+    /// **RED against unfixed `develop`:** confirmed by hand — reverting
+    /// `build_minimap_data`'s `k` to
+    /// `total_buffer_lines.div_ceil(target_lines)` makes the "must be well
+    /// short of the file's actual last line" assertion below fail: with the
+    /// cursor at the top, `last_painted_line + window_len` lands at (or
+    /// past) `total - 1` because the whole 5,000-line file fits in one
+    /// window.
+    #[test]
+    fn minimap_slides_even_for_a_moderately_long_file_on_gtk() {
+        let n_lines = 5_000usize;
+        let mut engine = Engine::new_for_test();
+        let text: String = (0..n_lines).map(|i| format!("line {i}\n")).collect();
+        engine.buffer_mut().insert(0, &text);
+
+        let mut h = harness(engine, 1400, 900);
+        let win = h.engine.borrow().active_window_id();
+        h.window_center(win).expect("editor pane must paint");
+        assert_eq!(
+            h.engine.borrow().scroll_top(),
+            0,
+            "fixture must start at the top of the file"
+        );
+
+        let (strip, window_len, last_painted_line, total) = {
+            let layout = h.screen_layout.borrow();
+            let mm = layout
+                .as_ref()
+                .unwrap()
+                .minimap
+                .iter()
+                .find(|m| m.window_id == win)
+                .expect("minimap must be present for the active pane");
+            let block_width = mm
+                .minimap
+                .lines
+                .get(1)
+                .map(|l| l.line_idx - mm.minimap.lines[0].line_idx)
+                .unwrap_or(1)
+                .max(1);
+            (
+                mm.rect,
+                mm.minimap.lines.len() * block_width,
+                mm.minimap.lines.last().map(|l| l.line_idx).unwrap_or(0),
+                mm.minimap.total_buffer_lines,
+            )
+        };
+        assert!(
+            (n_lines..=n_lines + 1).contains(&total),
+            "sanity: the fixture's own line count ({n_lines}) must reach \
+             the painted layout (got total_buffer_lines={total})"
+        );
+
+        // The core #1211 property: even at this moderate file length, the
+        // window must be a small fraction of the file, not the whole thing.
+        assert!(
+            window_len < total / 4,
+            "the strip's own window ({window_len} lines) must be well \
+             short of the {total}-line file's own length — a window this \
+             close to the whole file means K is still being inflated to \
+             swallow it, exactly the #1186 regression this issue reports"
+        );
+        assert!(
+            last_painted_line + window_len < total - 1,
+            "with the cursor at the top of a {total}-line file, the \
+             strip's last painted row (buffer line {last_painted_line}, \
+             window of {window_len} rows) must be well short of the \
+             file's actual last line ({}) — a squeezed-whole-file window \
+             pins the last painted row to the file's end regardless of \
+             scroll position",
+            total - 1
+        );
+
+        // A bottom-of-strip click must page, not jump to EOF.
+        h.driver.click(
+            (strip.x + strip.width / 2.0) as f32,
+            (strip.y + strip.height * 0.95) as f32,
+        );
+        h.driver.render();
+
+        let scroll_top = h.engine.borrow().scroll_top();
+        assert!(
+            scroll_top > 0,
+            "a click near the bottom of the strip must still scroll \
+             forward from the top of the file — got scroll_top=0"
+        );
+        assert!(
+            scroll_top < total - window_len,
+            "a bottom-of-strip click must not jump anywhere near EOF — \
+             got scroll_top={scroll_top} of {total} (window={window_len})"
         );
     }
 
@@ -5807,6 +8388,115 @@ mod minimap {
         }
     }
 
+    /// #722/#1187: a press that lands **inside** a background pane's own
+    /// viewport-highlight band — not on the bare track outside it — must
+    /// still focus that pane, exactly like every other minimap press
+    /// (`minimap_click_on_a_background_pane_focuses_that_pane` in
+    /// `render.rs` pins the same claim for a press *outside* the band, via
+    /// `apply_minimap_click` directly).
+    ///
+    /// #1187 pulled the "jump-to-centre + focus" pair
+    /// (`apply_minimap_click`) off the in-band path entirely — an in-band
+    /// press must arm a grab-offset-preserving drag without scrolling
+    /// anything yet, which is exactly what the second assertion below pins
+    /// — so the focus half of that pair had to move into its own call
+    /// (`click::pixel_to_click_target`'s minimap rung, the `else` arm next
+    /// to `apply_minimap_click`). This test is the regression guard that
+    /// split survived.
+    ///
+    /// **RED against a version of this fix that drops that `else` arm:**
+    /// confirmed by hand — deleting the
+    /// `engine.focus_group_for_window(press.window_id)` call (leaving the
+    /// non-jump branch a no-op) makes the first assertion fail: the
+    /// background pane never gains focus, `active_window_id()` stays on the
+    /// pane that was already active.
+    #[test]
+    fn press_inside_a_background_panes_highlight_band_still_focuses_it_on_gtk() {
+        let mut h = harness(engine_with_split_shaped_buffer(), 1400, 900);
+        let active_before = h.engine.borrow().active_window_id();
+        h.window_center(active_before)
+            .expect("editor pane must paint");
+
+        let background_win = {
+            let layout = h.screen_layout.borrow();
+            let l = layout
+                .as_ref()
+                .expect("render_content must have painted a ScreenLayout");
+            assert_eq!(
+                l.minimap.len(),
+                2,
+                "a vsplit must give each pane its own minimap strip"
+            );
+            l.minimap
+                .iter()
+                .find(|m| m.window_id != active_before)
+                .expect("the split must have a non-active pane with its own minimap")
+                .window_id
+        };
+        assert_eq!(
+            h.engine
+                .borrow()
+                .windows
+                .get(&background_win)
+                .unwrap()
+                .view
+                .scroll_top,
+            0,
+            "fixture must start unscrolled"
+        );
+
+        // Resolve the press against the shared, read-only `minimap_press`
+        // *before* driving the real event — this is what guarantees the
+        // chosen point genuinely lands inside the band (never a hardcoded
+        // coordinate; #1093 puts the band's own top edge at the strip's top
+        // row while `scroll_top` is 0).
+        let (x, y) = {
+            let layout_ref = h.screen_layout.borrow();
+            let layout = layout_ref.as_ref().unwrap();
+            let mm = layout
+                .minimap
+                .iter()
+                .find(|m| m.window_id == background_win)
+                .unwrap();
+            let strip = crate::render::minimap_strip_rect(mm);
+            let x = strip.x as f64 + strip.width as f64 / 2.0;
+            let y = strip.y as f64 + 5.0;
+            let press = crate::render::minimap_press(&h.engine.borrow(), layout, x, y, false)
+                .expect("the strip must hit");
+            assert_eq!(press.window_id, background_win);
+            assert!(
+                !press.jump,
+                "test setup sanity: the chosen press point must land \
+                 inside the highlight band, not on the bare track — this \
+                 test is specifically about the in-band case"
+            );
+            (x, y)
+        };
+
+        h.driver.mouse_down(x as f32, y as f32);
+        h.driver.render();
+
+        assert_eq!(
+            h.engine.borrow().active_window_id(),
+            background_win,
+            "a press inside a background pane's own highlight band must \
+             focus that pane"
+        );
+        assert_eq!(
+            h.engine
+                .borrow()
+                .windows
+                .get(&background_win)
+                .unwrap()
+                .view
+                .scroll_top,
+            0,
+            "a press inside the highlight band must not scroll the pane — \
+             only a subsequent drag move should (the grab offset is what \
+             keeps the band from jumping under the cursor)"
+        );
+    }
+
     /// #722 acceptance, painted-output tier: switching focus between panes
     /// of a `:vsplit` must not move either pane's text — GTK twin of TUI's
     /// `focus_change_does_not_move_either_panes_text_via_shell_app`.
@@ -5878,6 +8568,475 @@ mod minimap {
              pane's text width); before={before:?}, after={after:?}"
         );
     }
+
+    /// #1030 review round 2 — deliverable 3 requires checking GTK does not
+    /// regress from `build_minimap_data`'s `visible_span_cols` formula
+    /// (`src/render.rs`) and stating what was measured. This pins that
+    /// measurement against real painted GTK pixels instead of leaving it as
+    /// an unverified comment.
+    ///
+    /// # Why this cannot be RED against either formula this issue produced
+    ///
+    /// GTK's own rasteriser (`quadraui::gtk::minimap::draw_minimap` ->
+    /// `paint_row_blocks`) paints one 1px-wide block per non-blank
+    /// character column at exactly `strip.x + col`, and `draw_minimap`
+    /// clips all painting to the strip rect (`cr.clip()`) — so a strip only
+    /// ever shows columns `0..strip.width` on screen, no matter how many
+    /// columns the *aggregated colour grid* covers. Both the first
+    /// reviewed formula (`rect.width * MINIMAP_COLS_PER_CELL` raw columns,
+    /// with no floor) and the fixed one (the same, floored at
+    /// `quadraui::primitives::minimap::COLUMN_CAPACITY`) always resolve to
+    /// at least `rect.width` raw columns for any positive `rect.width`
+    /// (`2 * w >= w`), so the aggregated grid has *always* covered every
+    /// column GTK can actually paint — there is no strip width at which
+    /// GTK's rendered pixels can differ between the two formulas. This test
+    /// cannot be red against either and is not trying to be; it exists so
+    /// "no GTK regression" is a measured fact rather than a comment's
+    /// claim, and so a future change that actually does shrink the grid
+    /// below GTK's real requirement gets caught here.
+    ///
+    /// # What it measures
+    ///
+    /// Opens a real, tree-sitter-highlighted `.rs` buffer and samples
+    /// pixels inside the painted minimap strip, counting distinct
+    /// non-background colours — the GTK analogue of the TUI test's
+    /// `colors.len()` probe (`minimap_paints_syntax_colour_for_indented_code`
+    /// in `src/tui_main/shell_app.rs`). At a 1400px-wide pane the strip
+    /// resolves to exactly `MINIMAP_TARGET_COLS` (120px, == GTK's
+    /// `COLUMN_CAPACITY`), so indents of 20, **40 and 80** columns all land
+    /// inside the range every formula this issue considered ever covered —
+    /// which is what lets the caller assert #1030's deliverable 2 ("colour
+    /// must survive at indent 40 and 80") literally, here, on GTK. The TUI's
+    /// braille strip cannot reach those columns at all (22 source columns
+    /// wide, hardcoded upstream); see the TUI scenario's own doc and
+    /// `docs/PENDING_QUADRAUI_ISSUES.md`.
+    fn minimap_gtk_distinct_colors_for_indent(indent: usize) -> usize {
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_test_1030_gtk_minimap_colour_{}_{:?}_{indent}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("colour1030.rs");
+        let pad = " ".repeat(indent);
+        let text: String = (0..60)
+            .map(|i| format!("{pad}let value_{i} = 1;\n"))
+            .collect();
+        std::fs::write(&file, &text).unwrap();
+
+        // `syntax_max_lines` lives in a process-global atomic another test
+        // in this binary can have moved; pin it so "were there any
+        // highlights at all" is deterministic here (mirrors the TUI
+        // fixture's own reasoning).
+        crate::core::buffer_manager::set_syntax_max_lines(20_000);
+
+        let mut engine = Engine::new();
+        engine
+            .open_file_with_mode(&file, crate::core::engine::OpenMode::Permanent)
+            .unwrap();
+        let win_id = engine.active_window_id();
+        let buf_id = engine.windows.get(&win_id).unwrap().buffer_id;
+        let n_highlights = engine.buffer_manager.get(buf_id).unwrap().highlights.len();
+        assert!(
+            n_highlights > 0,
+            "precondition: tree-sitter must produce highlights for this \
+             fixture, or the colour assertions below are vacuous"
+        );
+
+        let mut h = harness(engine, 1400, 900);
+        h.window_center(win_id)
+            .expect("editor pane must paint with the minimap on");
+
+        let theme = crate::render::Theme::from_name(&h.engine.borrow().settings.colorscheme);
+        let bg = (theme.background.r, theme.background.g, theme.background.b);
+
+        let strip = {
+            let layout = h.screen_layout.borrow();
+            layout
+                .as_ref()
+                .unwrap()
+                .minimap
+                .iter()
+                .find(|m| m.window_id == win_id)
+                .expect("the layout must carry a minimap for the pane")
+                .rect
+        };
+
+        let x0 = strip.x.round() as i32;
+        let x1 = (strip.x + strip.width).round() as i32;
+        let y0 = strip.y.round() as i32;
+        let y1 = (strip.y + strip.height).round() as i32;
+        let mut seen = std::collections::HashSet::new();
+        for y in (y0..y1).step_by(2) {
+            for x in x0..x1 {
+                let c = h.driver.pixel(x, y);
+                if c != bg {
+                    seen.insert(c);
+                }
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        seen.len()
+    }
+
+    /// #1052 — GTK minimap syntax colour stopped partway down a long file
+    /// (a *vertical* falloff by buffer line, distinct from #990/#1030's
+    /// *horizontal* falloff by indentation column).
+    ///
+    /// # Reproduction and root cause (deliverables 1-3)
+    ///
+    /// Reproduces on unfixed `develop`: a 1200-line, densely-highlighted
+    /// `.rs` fixture painted into a 1400x900 GTK harness produced a strip
+    /// whose per-decile (10%-of-height band) distinct non-background colour
+    /// count was `[10, 7, 9, 6, 1, 1, 1, 1, 1, 2]` — real syntax colour
+    /// variety for the top ~40% of the strip, then flat/monochrome for the
+    /// rest. `buffer_state.highlights` was *not* the cause: it covered the
+    /// buffer almost exactly to its final byte (measured
+    /// `max_highlight_end_byte=19248` against `buffer_len_bytes=19250`,
+    /// `highlights.len()=3400`), ruling out the "parsed window" theory the
+    /// issue raised — this is a minimap bug, not a syntax-parse bug, and
+    /// vertical, not #1030/#990's horizontal one.
+    ///
+    /// The actual cause: `build_minimap_data`'s `target_lines` (the number
+    /// of buffer lines it samples) was computed as `display_rows *
+    /// MINIMAP_LINES_PER_ROW` where `display_rows = rect.height /
+    /// line_height` — correct for TUI, whose minimap row genuinely costs
+    /// one editor `line_height` (cell-native, `line_height == 1.0`), but
+    /// wrong for GTK: GTK's rasteriser (`quadraui::gtk::minimap`) paints
+    /// each sampled line at a **fixed** `ROW_PITCH_PX` (2px) pitch,
+    /// completely decoupled from the editor's own font-derived
+    /// `line_height` (~18-22px measured here). GTK could therefore paint
+    /// roughly `line_height / ROW_PITCH_PX` (~10x, measured: strip height
+    /// 756.5px / 2px = 378 possible rows vs. the 136 lines the old formula
+    /// actually sampled) more rows than it was ever given, and its own
+    /// rasteriser paints sampled rows top-aligned rather than stretched to
+    /// fill the strip (`Minimap::layout_with_sizing`'s `FixedPitch` arm) —
+    /// so once the too-few samples ran out, the rest of the strip simply
+    /// stayed unpainted.
+    ///
+    /// The fix (`src/render.rs`, `build_minimap_data`) takes the max of
+    /// both backends' real row requirements, mirroring the `visible_span_cols`
+    /// column-axis fix immediately below it in the same function (#1030):
+    /// GTK's `rect.height / ROW_PITCH_PX` alongside the existing
+    /// `display_rows * MINIMAP_LINES_PER_ROW`. Re-measured with the fix:
+    /// `[8, 9, 8, 8, 9, 6, 9, 6, 9, 8]` — flat colour diversity across the
+    /// whole strip, no falloff.
+    ///
+    /// # TUI (deliverable 5)
+    ///
+    /// TUI does **not** need the same fix: its minimap row genuinely is
+    /// cell-native (one packed braille row per `MINIMAP_LINES_PER_ROW`
+    /// buffer lines, no separate fixed pixel pitch), so `display_rows *
+    /// MINIMAP_LINES_PER_ROW` was already exactly TUI's own row capacity —
+    /// there is nothing for TUI's `rect.height / ROW_PITCH_PX` candidate to
+    /// correct (see the fix's own doc comment for why that candidate can
+    /// never dominate on TUI's side). This falloff is GTK-specific, so
+    /// unlike #1030/#990 this label correctly stays `::gtk`-suffixed.
+    ///
+    /// # What this test asserts
+    ///
+    /// RED-verified: reverting the `gtk_row_capacity` term in
+    /// `build_minimap_data` (i.e. back to unfixed `develop`) leaves the
+    /// bottom 10% of the strip with zero saturated (chroma >= 10) pixels —
+    /// just the flat, near-grey background/overlay tint — failing the
+    /// assertion below. Sampling near the *bottom* of a long file's strip
+    /// (not just the top, unlike the precondition guard in
+    /// `minimap_paints_distinct_syntax_colors_at_indentation_via_gtk_driver`)
+    /// is exactly the "vertical counterpart" deliverable 4 asks for.
+    #[test]
+    fn minimap_paints_syntax_colour_near_the_bottom_of_a_long_file_via_gtk_driver() {
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_test_1052_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("long_file_1052.rs");
+        // ~1200 lines of varied, densely-highlightable Rust (docs, structs,
+        // impls, fields) — not one repeated line shape — standing in for
+        // the issue's `parser.h`.
+        let mut text = String::new();
+        for i in 0..100 {
+            text.push_str(&format!(
+                "/// Doc comment for Thing{i}.\n\
+                 pub struct Thing{i} {{\n\
+                 \x20   pub field_{i}: u32,\n\
+                 \x20   other: bool,\n\
+                 }}\n\
+                 \n\
+                 impl Thing{i} {{\n\
+                 \x20   pub fn new(x: u32) -> Self {{\n\
+                 \x20       Self {{ field_{i}: x, other: false }}\n\
+                 \x20   }}\n\
+                 }}\n\
+                 \n"
+            ));
+        }
+        std::fs::write(&file, &text).unwrap();
+
+        crate::core::buffer_manager::set_syntax_max_lines(20_000);
+
+        let mut engine = Engine::new();
+        engine
+            .open_file_with_mode(&file, crate::core::engine::OpenMode::Permanent)
+            .unwrap();
+        let win_id = engine.active_window_id();
+        let buf_id = engine.windows.get(&win_id).unwrap().buffer_id;
+        let n_highlights = engine.buffer_manager.get(buf_id).unwrap().highlights.len();
+        assert!(
+            n_highlights > 0,
+            "precondition: tree-sitter must produce highlights for this \
+             fixture, or the colour assertions below are vacuous"
+        );
+
+        let mut h = harness(engine, 1400, 900);
+        h.window_center(win_id)
+            .expect("editor pane must paint with the minimap on");
+
+        let strip = {
+            let layout = h.screen_layout.borrow();
+            layout
+                .as_ref()
+                .unwrap()
+                .minimap
+                .iter()
+                .find(|m| m.window_id == win_id)
+                .expect("the layout must carry a minimap for the pane")
+                .rect
+        };
+
+        let x0 = strip.x.round() as i32;
+        let x1 = (strip.x + strip.width).round() as i32;
+        let y0 = strip.y.round() as i32;
+        let y1 = (strip.y + strip.height).round() as i32;
+        let total_h = (y1 - y0).max(1);
+        // The bottom decile: the last 10% of the strip's height. Chosen
+        // over a hardcoded pixel offset per CLAUDE.md ("locate targets,
+        // never hardcode coordinates") — it's derived from the strip's own
+        // painted rect, whatever height that resolves to on this run.
+        let band = ((total_h as f64 * 0.10).round() as i32).max(1);
+        let bottom_y0 = (y1 - band).max(y0);
+
+        // A flat/unpainted region (background fill, or the translucent
+        // viewport-highlight tint blended into it) is near-neutral grey —
+        // low spread between its highest and lowest channel. Real syntax
+        // colours (keywords, types, string/comment hues) are saturated by
+        // comparison. Filtering on chroma rather than an exact background
+        // tuple match is robust to the minimap's fill not being
+        // byte-identical to `render::Theme.background` (quadraui's
+        // GTK rasteriser measured at (23,24,28) against this fixture's
+        // (26,26,26) theme value — a translucent overlay, not the base
+        // fill, most likely) and to antialiasing at strip edges.
+        let chroma = |c: (u8, u8, u8)| c.0.max(c.1).max(c.2) - c.0.min(c.1).min(c.2);
+        let mut bottom_colors = std::collections::HashSet::new();
+        for y in bottom_y0..y1 {
+            for x in x0..x1 {
+                let c = h.driver.pixel(x, y);
+                if chroma(c) >= 10 {
+                    bottom_colors.insert(c);
+                }
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(
+            !bottom_colors.is_empty(),
+            "#1052: a long, densely-highlighted file must still paint at \
+             least one saturated syntax colour (chroma >= 10) in the \
+             bottom 10% of the GTK minimap strip (y in {bottom_y0}..{y1} \
+             of strip y-range {y0}..{y1}) — got none (just the flat, \
+             near-grey background/overlay tint). If this fails, \
+             `build_minimap_data`'s `target_lines` (`src/render.rs`) has \
+             regressed back to sampling fewer buffer lines than GTK's fixed \
+             `ROW_PITCH_PX` row pitch can actually paint in this strip \
+             height, so the bottom of any sufficiently long file's minimap \
+             goes unpainted again."
+        );
+    }
+
+    /// #1098 lift equivalence: `build_minimap_data` no longer builds its
+    /// per-row text with vimcode's own `minimap_block_text` (deleted) —
+    /// it hands `quadraui::sample_blocks` a rope-backed line accessor and
+    /// keeps whatever text that returns. For an *uncompressed* block (the
+    /// common case: one real buffer line samples to one output row,
+    /// `indices.len() == 1`), quadraui's `aggregate_block_text` takes a
+    /// fast path and returns that line's real text verbatim — where the
+    /// deleted vimcode copy always ran every column through
+    /// `minimap_block_dither_threshold_met` first, turning every
+    /// non-whitespace character into a masked `'x'` regardless of what it
+    /// actually was.
+    ///
+    /// That representational change is invisible on GTK today only because
+    /// `ROW_PITCH_PX` (2px) sits below `LEGIBILITY_FLOOR_PX`, so GTK's
+    /// rasteriser always paints in `ColumnBlocks` mode — one 1px block per
+    /// *non-whitespace* column, real glyph or not
+    /// (`quadraui::gtk::minimap::paint_row_blocks` only ever calls
+    /// `ch.is_whitespace()`) — never `Characters` mode, which would shape
+    /// the text's real glyphs and so would visibly differ. A masked `'x'`
+    /// and a line's real character are equally non-whitespace at every
+    /// column, so the two representations paint byte-for-byte identical
+    /// pixels under `ColumnBlocks`; this test pins that equivalence
+    /// directly against the real GTK paint path, at the real per-column
+    /// resolution, so it would catch the day a future rasteriser change
+    /// (or a `ROW_PITCH_PX` bump past the legibility floor) makes the two
+    /// representations start to matter.
+    ///
+    /// Deliberately green on both the pre- and post-#1098 code (there is
+    /// no user-visible regression to be RED against — see this test's own
+    /// doc above for why the two representations are pixel-equivalent
+    /// under `ColumnBlocks`); it is an equivalence/regression guard for
+    /// the lift, not a bug-fix acceptance test.
+    #[test]
+    fn minimap_single_line_block_paints_the_real_columns_via_gtk_driver() {
+        const N_LINES: usize = 200;
+        // Well outside the harness's own editor viewport (~40 rows at
+        // 1400x900), so the translucent viewport-highlight band (painted
+        // *underneath* each row's opaque column blocks, but still worth
+        // avoiding for a clean background reading) never reaches it.
+        const DISTINCTIVE_LINE: usize = 150;
+        // Non-blank at columns 0, 3 and 7; blank everywhere else in
+        // between — a pattern no single dithered guess could reconstruct
+        // by accident.
+        const ROW_TEXT: &str = "a  b   c";
+
+        let mut engine = Engine::new_for_test();
+        let mut text = String::with_capacity(N_LINES * 2);
+        for i in 0..N_LINES {
+            if i == DISTINCTIVE_LINE {
+                text.push_str(ROW_TEXT);
+            }
+            text.push('\n');
+        }
+        engine.buffer_mut().insert(0, &text);
+
+        let mut h = harness(engine, 1400, 900);
+        let win = h.engine.borrow().active_window_id();
+        h.window_center(win).expect("editor pane must paint");
+        assert_eq!(
+            h.engine.borrow().scroll_top(),
+            0,
+            "fixture must start at the top of the file"
+        );
+
+        let (strip, window_len, total) = {
+            let layout = h.screen_layout.borrow();
+            let mm = layout
+                .as_ref()
+                .unwrap()
+                .minimap
+                .iter()
+                .find(|m| m.window_id == win)
+                .expect("minimap must be present for the active pane");
+            (
+                mm.rect,
+                mm.minimap.lines.len(),
+                mm.minimap.total_buffer_lines,
+            )
+        };
+        assert!(
+            (N_LINES..=N_LINES + 1).contains(&total),
+            "sanity: the fixture's own line count ({N_LINES}) must reach \
+             the painted layout (got total_buffer_lines={total})"
+        );
+        assert_eq!(
+            window_len, total,
+            "test setup sanity: this fixture must fit entirely inside one \
+             uncompressed window (one output row per real buffer line, \
+             K == 1) — a strip's own real GTK row capacity comfortably \
+             exceeding {N_LINES} lines, measured elsewhere in this module \
+             at ~375 rows for a 1400x900 harness — or this test cannot \
+             isolate the single-line-block fast path from multi-line \
+             aggregation (window_len={window_len}, total={total})"
+        );
+
+        let theme = crate::render::Theme::from_name(&h.engine.borrow().settings.colorscheme);
+        let fg = (theme.foreground.r, theme.foreground.g, theme.foreground.b);
+        let bg = (theme.background.r, theme.background.g, theme.background.b);
+        assert_ne!(
+            fg, bg,
+            "fixture sanity: the theme's foreground must differ from its \
+             background, or this test cannot distinguish painted columns \
+             from blank ones"
+        );
+
+        let row_px = quadraui::primitives::minimap::ROW_PITCH_PX;
+        let row_y = (strip.y + DISTINCTIVE_LINE as f64 * row_px + 1.0).round() as i32;
+        let non_blank_cols: Vec<usize> = ROW_TEXT
+            .char_indices()
+            .filter(|(_, c)| !c.is_whitespace())
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            non_blank_cols,
+            vec![0, 3, 7],
+            "fixture sanity: ROW_TEXT's non-blank columns must match this \
+             test's own expectations"
+        );
+
+        for col in 0..ROW_TEXT.chars().count() {
+            let x = (strip.x + col as f64).round() as i32;
+            let pixel = h.driver.pixel(x, row_y);
+            if non_blank_cols.contains(&col) {
+                assert_eq!(
+                    pixel, fg,
+                    "column {col} of the distinctive line ({ROW_TEXT:?}) is \
+                     non-whitespace and must paint the theme's foreground \
+                     colour at (x={x}, y={row_y}); strip={strip:?}"
+                );
+            } else {
+                assert_eq!(
+                    pixel, bg,
+                    "column {col} of the distinctive line ({ROW_TEXT:?}) is \
+                     whitespace and must stay the theme's background \
+                     colour at (x={x}, y={row_y}); strip={strip:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn minimap_paints_distinct_syntax_colors_at_indentation_via_gtk_driver() {
+        // Indents 0 and 20 are deliverable 3's no-regression measurement;
+        // **40 and 80 are #1030's deliverable 2 verbatim** — "Colour must
+        // survive at indent 40 and 80, not only near column 0" — and they
+        // pass here, on the backend where that is physically reachable.
+        // GTK's strip resolves to 120px at this pane width and its
+        // rasteriser paints one 1px block per character column up to
+        // `COLUMN_CAPACITY` (120), so columns 40 and 80 are both inside the
+        // painted range. See `minimap_gtk_distinct_colors_for_indent`'s doc
+        // for the geometry, and `src/tui_main/shell_app.rs`'s
+        // `minimap_paints_syntax_colour_for_indented_code` for why the same
+        // deliverable is *not* reachable on TUI (an 11-cell braille strip
+        // represents 22 source columns, hardcoded upstream — drafted as a
+        // quadraui issue in `docs/PENDING_QUADRAUI_ISSUES.md`).
+        //
+        // Measured on this machine (macOS, 1400x900 harness, 60-line `.rs`
+        // fixture, GTK 4.22): 7 / 7 / 7 / 7 distinct non-background colours
+        // at indents 0 / 20 / 40 / 80 — i.e. GTK's minimap colouring is
+        // flat-out indifferent to indentation across the whole range this
+        // issue measured, which is the "GTK does not regress" claim
+        // deliverable 3 asks for, stated as numbers.
+        for indent in [0usize, 20, 40, 80] {
+            let seen = minimap_gtk_distinct_colors_for_indent(indent);
+            println!("#1030 GTK measurement: indent {indent} -> {seen} distinct colours");
+            assert!(
+                seen > 1,
+                "#1030: code indented by {indent} columns must paint more \
+                 than one distinct syntax colour in the GTK minimap strip \
+                 (the strip is 120px wide here and GTK paints up to \
+                 COLUMN_CAPACITY = 120 character columns, so column \
+                 {indent} is inside the painted range) — got {seen}. For \
+                 indent 0 this is the precondition/regression guard; for 20 \
+                 it is deliverable 3's no-regression measurement; for 40 and \
+                 80 it is deliverable 2 itself. If this fails, \
+                 `build_minimap_data`'s `visible_span_cols` floor \
+                 (`src/render.rs`) has regressed below what GTK's rasteriser \
+                 actually needs."
+            );
+        }
+    }
 }
 
 /// Black-box coverage for the VimCode app icon painted left of the `File`
@@ -5909,7 +9068,10 @@ mod app_icon {
             row.width > 0.0 && row.height > 0.0,
             "the menu row must have been laid out by the last frame; got {row:?}"
         );
-        crate::render::split_menu_row_for_app_icon(row).0
+        // `0.0`: GTK never reports a non-empty `titlebar_control_inset`
+        // (#940 — the trait default, unchanged for this backend), so its
+        // app icon always starts flush with the band's leading edge.
+        crate::render::split_menu_row_for_app_icon(row, 0.0).0
     }
 
     /// #720 acceptance 1: the VimCode icon renders left of `File`, at
@@ -5935,7 +9097,7 @@ mod app_icon {
         // installs the loader explicitly (see `.github/workflows/ci.yml`),
         // so skip the pixel assertions rather than hard-failing when it's
         // genuinely absent.
-        if crate::gtk::util::cached_app_icon_png().is_none() {
+        if !crate::gtk::util::host_has_svg_loader() {
             eprintln!(
                 "skipping app_icon_paints_left_of_the_file_menu: no gdk-pixbuf \
                  SVG loader on this host"
@@ -6150,10 +9312,11 @@ mod scrollbar_paint {
     //! ShellApp, so #723's fix (`e02a824`, insetting that native widget
     //! past the minimap strip) was never visible on screen either — see
     //! the doc comment on the `Surface::Editor` push in
-    //! `App::render_content` for the full re-diagnosis and where the fix
-    //! actually needs to move (quadraui's `gtk::editor::draw_editor`,
-    //! which documents that it deliberately skips scrollbars on GTK today
-    //! and defers to the very host path this issue just deleted).
+    //! `App::render_content` for the full re-diagnosis. quadraui#968 has
+    //! since closed the gap this left: `gtk::editor::draw_editor` now paints
+    //! both scrollbars itself (see `scrollbar_pixels_paint_for_an_overflowing_editor_pane`
+    //! below and #1128, which corrected every other place in this codebase
+    //! that still assumed otherwise).
     //!
     //! `GtkDriver` paints into an in-memory Cairo `ImageSurface` and can
     //! only ever see Cairo-painted pixels, never native GTK overlay
@@ -6210,17 +9373,25 @@ mod scrollbar_paint {
         false
     }
 
-    /// No vertical scrollbar affordance is painted along the right edge of
+    /// A vertical scrollbar affordance IS painted along the right edge of
     /// an editor pane that needs one (500 lines in an 900px-tall window).
-    /// A native `gtk4::Scrollbar` would be invisible to this test either
-    /// way (see module doc), but quadraui's shared rasteriser paints
-    /// scrollbars as ordinary Cairo pixels on TUI (`super::draw_scrollbar`
-    /// in `quadraui::tui::editor`) — if GTK ever grows the same inline
-    /// paint, this test starts failing and must be updated alongside it,
-    /// which is exactly the point: it pins today's (lack of) behavior so
-    /// that change is deliberate, not silent.
+    ///
+    /// This test used to pin the opposite — no GTK scrollbar pixels at all
+    /// — by design (its doc comment said so explicitly: "if GTK ever grows
+    /// the same inline paint, this test starts failing and must be updated
+    /// alongside it, which is exactly the point: it pins today's (lack of)
+    /// behavior so that change is deliberate, not silent"). Landing on
+    /// #947's quadraui pin bump (`b6000c4` → `f3b3aed`) is exactly that
+    /// deliberate moment: quadraui#968 taught `gtk::editor::draw_editor` to
+    /// paint both scrollbars itself (mirroring
+    /// `tui::editor::draw_editor`), closing the gap #731 left when it
+    /// deleted vimcode's own native `gtk4::Scrollbar` overlay without a
+    /// replacement. So this test now pins the opposite fact — GTK does
+    /// paint one, filling the same `scrollbar_reserve()` strip the
+    /// `scrollbar_paint` tests below already prove is reserved — and would
+    /// fail again, deliberately, the day that inline paint disappears.
     #[test]
-    fn no_scrollbar_pixels_paint_for_an_overflowing_editor_pane() {
+    fn scrollbar_pixels_paint_for_an_overflowing_editor_pane() {
         let mut h = harness(engine_with_long_buffer(), 1400, 900);
         let win = h.engine.borrow().active_window_id();
         let rect = {
@@ -6237,11 +9408,11 @@ mod scrollbar_paint {
 
         let theme = crate::render::Theme::from_name(&h.engine.borrow().settings.colorscheme);
         let bg = {
-            let c = crate::render::to_quadraui_color(theme.background);
+            let c = theme.background;
             (c.r, c.g, c.b)
         };
         let thumb = {
-            let c = crate::render::to_quadraui_color(theme.scrollbar_thumb);
+            let c = theme.scrollbar_thumb;
             (c.r, c.g, c.b)
         };
         assert_ne!(
@@ -6256,8 +9427,20 @@ mod scrollbar_paint {
         // character cell), short of the pane's own left edge. Bottom
         // `line_height` excluded: that row is the per-window status line
         // (window_status_line, on by default), a real, unrelated feature
-        // painted in a distinct color across the full pane width.
+        // painted in a distinct color across the full pane width. An extra
+        // 1px of margin is subtracted on top of that (#940 review): `rect`
+        // and `line_height` are both fractional (whatever the live window
+        // size and font metrics measure to), so `rect.height - line_height`
+        // lands at a fractional pixel boundary that moves whenever anything
+        // upstream of this window's rect changes size — e.g. #940 raising
+        // `with_title_bar`'s multiplier shifted it from landing just below
+        // an integer row to just above one, which pulled the status line's
+        // own antialiased top-edge blend (a partial-coverage pixel, not a
+        // scrollbar) into the strip and failed this test with no scrollbar
+        // involved at all. The 1px margin absorbs that antialiasing
+        // regardless of which way future fractional shifts round.
         const STRIP_W: f64 = 16.0;
+        const ANTIALIAS_MARGIN_PX: f64 = 1.0;
         let line_height = h
             .painted_line_height()
             .expect("render_content must publish the painted line height");
@@ -6265,15 +9448,399 @@ mod scrollbar_paint {
             (rect.x + rect.width - STRIP_W).max(rect.x) as f32,
             rect.y as f32,
             STRIP_W.min(rect.width) as f32,
-            (rect.height - line_height).max(0.0) as f32,
+            (rect.height - line_height - ANTIALIAS_MARGIN_PX).max(0.0) as f32,
         );
 
         assert!(
-            !region_has_non_background_pixel(&mut h.driver, strip, bg),
-            "no scrollbar should be painted on GTK today (#731's \
-             re-diagnosis of #723) — if this now fails, GTK has grown a \
-             live scrollbar paint and this test's doc comment needs \
-             updating to match, not silently deleting"
+            region_has_non_background_pixel(&mut h.driver, strip, bg),
+            "a scrollbar should now be painted on GTK (quadraui#968, #947's \
+             pin bump) — if this now fails, GTK has lost its inline \
+             scrollbar paint and this test's doc comment needs updating to \
+             match, not silently deleting"
+        );
+    }
+
+    /// #1128 black-box regression: dragging the GTK v-scrollbar thumb
+    /// through the real `App::handle_mouse_click_msg` ->
+    /// `handle_mouse_drag_msg` dispatch must land the window's scroll
+    /// position exactly where `quadraui::fit_thumb` (the one canonical
+    /// thumb-sizing formula `editor_scrollbar_layout`'s `Editor::layout`
+    /// call uses, and the same public function this test calls directly —
+    /// never this issue's own `editor_scrollbar_layout`/
+    /// `v_scrollbar_thumb_geometry` wrappers) predicts from real painted
+    /// geometry (`rect`, `line_height`) and the buffer's real line count.
+    /// This is the driver-tier proof that the fix is wired up end to end
+    /// through a real mouse interaction, not only through the pure-function
+    /// `editor_scrollbar_geometry_tests` in `gtk/mod.rs`.
+    ///
+    /// **Why the v-scrollbar, when this issue's title names the h-scrollbar:**
+    /// both bars' hit-testing now resolve through the identical
+    /// `editor_scrollbar_layout` call this issue's diff introduced
+    /// (`h_scrollbar_thumb_geometry`/`v_scrollbar_thumb_geometry` are thin
+    /// wrappers reading `h_scrollbar_bounds`/`v_scrollbar_bounds` off the
+    /// same `(Editor, EditorLayout)` pair), and this test targets the exact
+    /// axis (never shrinking the track for a per-window status line) both
+    /// wrappers now share — so a real drag through either rung exercises
+    /// the same fix. The h-scrollbar's own *click* rung (`app.rs`'s "H
+    /// scrollbar hit-test" block) additionally rebuilds window rects via
+    /// `compute_editor_window_rects` at a hardcoded `(0, 0)` origin, rather
+    /// than `App::painted_editor_bounds`'s real, activity-bar/sidebar-offset
+    /// one the v-scrollbar rung uses (see that rung's own "Window rects
+    /// come from `self.painted_editor_bounds()`" comment) — a separate,
+    /// pre-existing bug this issue's review flagged as a non-blocking
+    /// follow-up, not introduced or fixed here. With the default 48px-wide
+    /// activity bar alone (confirmed empirically: a single un-split
+    /// window's painted rect starts at `x: 48.0` with the sidebar closed),
+    /// a real click at the h-scrollbar's actual on-screen position —
+    /// anywhere past local column 1352 in a 1400px-wide harness — falls
+    /// outside that hardcoded-origin rect and never reaches
+    /// `h_scrollbar_hit_test` at all. Driving the real *h*-scrollbar click
+    /// end to end would therefore be red for that unrelated reason, not for
+    /// anything this issue changed, so this test exercises the shared fix
+    /// through the rung whose click-dispatch is already correct.
+    ///
+    /// **What actually distinguishes old from new** (and so what this test
+    /// pins): the pre-#1128 `v_scrollbar_geometry` helper (`git show
+    /// 9e83068^:src/app_support.rs`) shrank the track's height by one
+    /// `line_height` whenever `window_status_line` was on (this fixture's
+    /// default) before computing the thumb — so its `fit_thumb` call used a
+    /// track roughly one row shorter than what `editor_scrollbar_layout`
+    /// (via `quadraui::Editor::layout`, which never applies that shrink —
+    /// pinned directly by `status_line_settings_never_move_the_track` in
+    /// `gtk/mod.rs`) now uses. A one-row-shorter track changes both the
+    /// thumb's own length and the scrollbar's `max_scroll` (derived from
+    /// `visible_lines`, itself derived from the track height), so dragging
+    /// the thumb by a fixed pixel distance lands on a measurably different
+    /// row under the two formulas — a plain click can't observe this (any
+    /// click research row this test could reach is swallowed by the
+    /// per-window status line's own chrome-rung click handling before the
+    /// scrollbar rungs ever run — verified while writing this test), but a
+    /// drag's *continuation* (`handle_mouse_drag_msg`'s `ArmedTarget`
+    /// route) bypasses that arbitration entirely once begun, so it is
+    /// reachable this way.
+    ///
+    /// **Verified RED against the pre-#1128 code**: built a scratch
+    /// worktree at this issue's parent commit (`09d9de9`), copied this test
+    /// in unmodified, and ran it — the old, shrunk `v_scrollbar_geometry`
+    /// produced a different `max_scroll`/thumb length at drag-begin time,
+    /// so the same drag distance landed on a different `scroll_top` than
+    /// this test's `fit_thumb`-based prediction (which matches what
+    /// `editor_scrollbar_layout` now actually computes), failing the final
+    /// assertion. It passes unmodified on this issue's fix.
+    #[test]
+    fn dragging_the_v_scrollbar_thumb_lands_on_the_fit_thumb_predicted_row_on_gtk() {
+        let mut h = harness(engine_with_long_buffer(), 1400, 900);
+        let win = h.engine.borrow().active_window_id();
+        assert!(
+            h.engine.borrow().settings.window_status_line,
+            "fixture sanity: this test's whole point is the axis the old \
+             per-issue helper got wrong — a per-window status line on by \
+             default"
+        );
+
+        let rect = {
+            let layout = h.screen_layout.borrow();
+            layout
+                .as_ref()
+                .expect("render_content must have painted a ScreenLayout")
+                .windows
+                .iter()
+                .find(|w| w.window_id == win)
+                .expect("the active window must have painted")
+                .rect
+        };
+        let line_height =
+            h.painted_line_height()
+                .expect("render_content must publish the painted line height") as f32;
+
+        let total_lines = {
+            let engine = h.engine.borrow();
+            let window = engine.windows.get(&win).unwrap();
+            let buffer_state = engine.buffer_manager.get(window.buffer_id).unwrap();
+            buffer_state.buffer.len_lines()
+        };
+
+        // Independently predict, from real painted geometry
+        // (`rect`/`line_height`) plus the buffer's real line count and
+        // quadraui's own public `fit_thumb` — never this issue's own
+        // `editor_scrollbar_layout`/`v_scrollbar_thumb_geometry` — the
+        // scroll_top a real drag must land on. Mirrors exactly what
+        // `v_scrollbar_thumb_geometry` (this issue's fix) and
+        // `quadraui::dispatch_mouse_drag` (the generic drag-continuation
+        // math both scrollbars share) each compute, since there's no
+        // h-scrollbar in this fixture (short lines) to shrink the track
+        // further.
+        let track_h = rect.height as f32;
+        let visible_lines = (track_h / line_height).floor();
+        let max_scroll = ((total_lines as f64) - (visible_lines as f64))
+            .max(1.0)
+            .round() as usize;
+        let (thumb_start0, thumb_len) =
+            quadraui::fit_thumb(0.0, total_lines as f32, visible_lines, track_h, line_height);
+        assert!(
+            thumb_len > 8.0,
+            "fixture sanity: the thumb must be comfortably grabbable a few \
+             pixels from its own top edge (thumb_len={thumb_len})"
+        );
+
+        let x = (rect.x + rect.width - 3.0) as f32;
+        // Grab 2px into the thumb from its own top edge (thumb_start0 is 0
+        // here — the thumb starts at the track's top with scroll_top at 0).
+        const GRAB_OFFSET: f32 = 2.0;
+        let grab_y = rect.y as f32 + thumb_start0 + GRAB_OFFSET;
+        // Drag to the track's own midpoint — comfortably short of either
+        // formula's track end, so neither the real (new) nor the pre-#1128
+        // (shrunk-by-one-`line_height`) track clamps the result to the same
+        // saturated max, which would erase the very difference this test
+        // exists to catch.
+        let target_y = rect.y as f32 + 0.5 * track_h;
+
+        let effective_track = (track_h - thumb_len).max(1.0);
+        let rel = ((target_y - rect.y as f32) - GRAB_OFFSET) / effective_track;
+        let expected = (rel.clamp(0.0, 1.0) * max_scroll as f32).round() as i64;
+
+        let before = h.engine.borrow().windows.get(&win).unwrap().view.scroll_top;
+        assert_eq!(before, 0, "fixture sanity: must start unscrolled");
+
+        // A real `MouseDown` (routed through `App::handle_mouse_click_msg`)
+        // grabs the thumb at its real position, then a real `MouseMoved`
+        // with the button held (routed through `App::handle_mouse_drag_msg`)
+        // drags it — exactly as a user's drag would dispatch.
+        h.driver.mouse_down(x, grab_y);
+        h.driver.mouse_move(x, target_y);
+        h.driver.mouse_up(x, target_y);
+        h.driver.render();
+
+        let after = h.engine.borrow().windows.get(&win).unwrap().view.scroll_top as i64;
+        assert!(
+            (after - expected).abs() <= 1,
+            "dragging the v-scrollbar thumb to the track's midpoint must \
+             land scroll_top within 1 of this test's independent \
+             `fit_thumb`-based prediction ({expected}); got {after} \
+             instead (max_scroll={max_scroll}, visible_lines={visible_lines}, \
+             thumb_len={thumb_len})"
+        );
+    }
+
+    /// #828 acceptance (driver tier): "editor viewport width with the
+    /// scrollbar present". GTK does not clip painted *text* glyphs to
+    /// `text_viewport_cols` at the pixel level — a long line's characters
+    /// are drawn continuously and simply run to the pane's own edge; the
+    /// inline scrollbar quadraui#968 added (see
+    /// `scrollbar_pixels_paint_for_an_overflowing_editor_pane`'s doc
+    /// comment above) overlays on top of that same reserved strip rather
+    /// than clipping it — so a pixel-clipping assertion would not be
+    /// testing real behaviour. What *is* real, observable behaviour driven
+    /// by the
+    /// exact column count is `Engine::ensure_cursor_visible`
+    /// (`core/engine/search.rs`), which reads `paint_viewport_cols` —
+    /// populated *only* by a real `build_screen_layout` call
+    /// (`render.rs`'s `windows` map, written during `App::render_content`)
+    /// — to decide when a rightward cursor move must start scrolling the
+    /// window horizontally. That boundary sits exactly at the real,
+    /// `backend.scrollbar_reserve()`-aware `text_viewport_cols`, short of
+    /// where it would sit (`cols_without_reserve`, this test's own
+    /// counterfactual) if a future call site dropped the real reserve back
+    /// to a hardcoded `0.0`.
+    ///
+    /// Drives the boundary crossing with real `l` (move-right) keypresses
+    /// through the full `GtkDriver` dispatch path, then reads
+    /// `Engine::scroll_left()` — state, but state that only the *painted*
+    /// `paint_viewport_cols` map (never a hand-fed value) can have produced,
+    /// since nothing else writes it (`render.rs`, `build_screen_layout`'s
+    /// doc comment).
+    ///
+    /// **Verified RED**: hand-reverting `App::render_content`'s
+    /// `backend.scrollbar_reserve() as f64` argument (`app.rs`) to a
+    /// hardcoded `0.0` moves the real, painted `text_viewport_cols` up to
+    /// equal this test's own `cols_without_reserve` counterfactual — the
+    /// "setup sanity" assertion (which exists precisely to catch this) fails
+    /// with `without_reserve=149, with_reserve=149` — confirmed by hand,
+    /// reverted before landing this test.
+    #[test]
+    fn cursor_past_the_scrollbar_reserved_viewport_triggers_a_horizontal_scroll_at_the_real_boundary(
+    ) {
+        fn make_engine() -> Engine {
+            let mut engine = Engine::new_for_test();
+            // Sidebar pinned hidden rather than left ambient: the runner only
+            // reconciles its own shadow copy of `sidebar_visible` against the
+            // engine's at the tail of a *key* dispatch
+            // (`App::run_post_key_epilogue`'s "Runner <-> shadow
+            // sidebar-visibility sync", `app.rs`), never on construction — so
+            // without this settle, the very first `l` keypress below could be
+            // the one that first reconciles a mismatched ambient sidebar state,
+            // silently resizing the pane (and `text_viewport_cols` with it)
+            // mid-walk.
+            engine.app_shell.hide_sidebar();
+            engine.session.explorer_visible = false;
+            engine.settings.minimap = false;
+            engine.settings.cursorline = false;
+            engine.settings.wrap = false;
+            // Alternating ink/blank columns (not a solid run of `X`) so this
+            // test's own pixel-pitch measurement below can locate each
+            // glyph's left edge unambiguously — a solid run's glyphs can
+            // visually touch, which would undercount the real cell pitch.
+            let text = format!("{}\n", "X ".repeat(400));
+            engine.buffer_mut().insert(0, &text);
+            engine
+        }
+
+        /// Settle, paint, and read back `(rect, gutter, viewport_cols, cw)`
+        /// for a freshly built harness at `width`. `cw` is the real
+        /// per-glyph pixel pitch measured directly off the painted row —
+        /// `Harness::painted_char_width` (`app.char_width_cell`) can lag one
+        /// frame behind the exact value `render_content` actually laid this
+        /// frame's columns out with (a separate `App::painted_char_width`
+        /// cell — distinct despite the name — is what really tracks it, and
+        /// `Harness` doesn't expose it). Scans the *right* half of the pane
+        /// (comfortably past any gutter) for `X`/blank rising edges — one
+        /// every two cells, given the `"X "` fixture above — and averages
+        /// their spacing.
+        fn settle_and_measure<A: quadraui::AppLogic>(
+            h: &mut Harness<A>,
+            width: i32,
+        ) -> (crate::core::WindowRect, usize, usize, f64) {
+            h.driver.press_named(quadraui::NamedKey::Escape);
+            let win = h.engine.borrow().active_window_id();
+            h.window_center(win)
+                .expect("editor pane must paint with the default settings");
+
+            let (rect, gutter, viewport_cols) = {
+                let layout = h.screen_layout.borrow();
+                let l = layout.as_ref().unwrap();
+                let rw = l.windows.iter().find(|w| w.window_id == win).unwrap();
+                (rw.rect, rw.gutter_char_width, rw.text_viewport_cols)
+            };
+            let lh = h
+                .painted_line_height()
+                .expect("render_content must publish the painted line height");
+            let theme = crate::render::Theme::from_name(&h.engine.borrow().settings.colorscheme);
+            let bg = {
+                let c = theme.background;
+                (c.r, c.g, c.b)
+            };
+
+            let cw = {
+                let row_y = (rect.y + lh / 2.0) as i32;
+                let x0 = (rect.x + rect.width * 0.5) as i32;
+                let x1 = (rect.x + (width as f64 - rect.x).min(rect.width) - 2.0) as i32;
+                let mut edges = Vec::new();
+                let mut prev_ink = h.driver.pixel(x0 - 1, row_y) != bg;
+                for x in x0..x1 {
+                    let ink = h.driver.pixel(x, row_y) != bg;
+                    if ink && !prev_ink {
+                        edges.push(x);
+                    }
+                    prev_ink = ink;
+                }
+                let diffs: Vec<i32> = edges.windows(2).map(|w| w[1] - w[0]).collect();
+                assert!(
+                    diffs.len() >= 4,
+                    "setup sanity: the alternating `X `/blank fixture must paint \
+                     several detectable glyph edges in the pane's right half to \
+                     measure the real character pitch from, found {} \
+                     (edges={edges:?})",
+                    diffs.len()
+                );
+                let avg_period = diffs.iter().sum::<i32>() as f64 / diffs.len() as f64;
+                avg_period / 2.0 // one `X`/blank pair per two cells
+            };
+
+            (rect, gutter, viewport_cols, cw)
+        }
+
+        // ── Pass 1 (probe): measure this host's real editor char pitch and
+        // the fixed chrome overhead (activity bar etc — sidebar hidden) at
+        // an arbitrary width, so pass 2 can choose a window width that
+        // reliably straddles the `scrollbar_reserve()` boundary regardless
+        // of exactly how wide `settings.font_family`/`font_size` paints on
+        // this host.
+        //
+        // #947: this test used to paint at a hardcoded width alone
+        // (`1400`), which only reliably discriminated the two boundaries by
+        // coincidence — it depended on `rect.width` happening to floor-divide
+        // by the *old, settings-ignoring* paint font's char width such that
+        // an 8px `scrollbar_reserve()` crossed an integer column boundary.
+        // Once `settings.font_size` genuinely reached paint (`Backend::
+        // set_editor_font`), the same width no longer reliably discriminated
+        // the boundary at the new (larger, default 14pt) char width — this
+        // test's own "setup sanity" assertion below caught exactly that,
+        // firing with `without_reserve == with_reserve` at the old fixed
+        // width. Rather than hunt for a new lucky constant (equally fragile
+        // the next time a font default changes), pass 2 derives a width
+        // from the *measured* `cw`, so this holds for any font metrics.
+        const PROBE_WIDTH: i32 = 1400;
+        let (cw_probe, overhead) = {
+            let mut h = harness(make_engine(), PROBE_WIDTH, 900);
+            let (rect, _, _, cw) = settle_and_measure(&mut h, PROBE_WIDTH);
+            (cw, PROBE_WIDTH as f64 - rect.width)
+        };
+
+        // ── Pass 2 (real): a window width whose content area sits at
+        // `N * cw + reserve / 2` — the midpoint of the 8px `scrollbar_reserve()`
+        // window — so `floor(rect.width / cw) == N` (no reserve) while
+        // `floor((rect.width - reserve) / cw) == N - 1` (with reserve),
+        // for ANY `cw` bigger than `scrollbar_reserve()` itself (true for
+        // any real font size this test would plausibly run at). ──
+        const N_COLS: f64 = 160.0;
+        const SCROLLBAR_RESERVE_PX: f64 = 8.0; // mirrors `GtkBackend::scrollbar_reserve()`
+        assert!(
+            cw_probe > SCROLLBAR_RESERVE_PX,
+            "setup sanity: this derivation needs a char width bigger than \
+             the {SCROLLBAR_RESERVE_PX}px scrollbar reserve to place an \
+             unambiguous boundary; measured cw={cw_probe}px"
+        );
+        let target_rect_width = N_COLS * cw_probe + SCROLLBAR_RESERVE_PX / 2.0;
+        let width = (target_rect_width + overhead).round() as i32;
+
+        let mut h = harness(make_engine(), width, 900);
+        let (rect, gutter, viewport_cols, cw) = settle_and_measure(&mut h, width);
+
+        let cols_without_reserve = ((rect.width / cw).floor() as usize)
+            .saturating_sub(gutter)
+            .max(1);
+        assert!(
+            cols_without_reserve > viewport_cols,
+            "setup sanity: a real, non-zero scrollbar_reserve must shrink \
+             the painted viewport below what the same pane width would \
+             allow with no reserve at all (without_reserve={cols_without_reserve}, \
+             with_reserve={viewport_cols}, measured cw={cw}px, target \
+             width={width}) — otherwise this test cannot distinguish the \
+             two boundaries at all"
+        );
+        assert_eq!(
+            h.engine.borrow().cursor().col,
+            0,
+            "fixture sanity: the cursor must start at column 0"
+        );
+
+        // Walk right to the last column the real, reserved viewport
+        // declares visible — one short of the boundary — with no scroll
+        // yet.
+        for _ in 0..viewport_cols.saturating_sub(1) {
+            h.driver.type_char('l');
+        }
+        h.driver.render();
+        assert_eq!(
+            h.engine.borrow().scroll_left(),
+            0,
+            "the cursor must still fit inside the real, painted \
+             viewport_cols ({viewport_cols}) without any horizontal scroll"
+        );
+
+        // One more step crosses the real boundary.
+        h.driver.type_char('l');
+        h.driver.render();
+        assert_eq!(
+            h.engine.borrow().scroll_left(),
+            1,
+            "crossing the real scrollbar-reserved viewport boundary \
+             (text_viewport_cols={viewport_cols}) must scroll by exactly \
+             one column; a caller that dropped scrollbar_reserve back to \
+             0.0 would place this boundary {} column(s) further out \
+             (cols_without_reserve={cols_without_reserve}) and this move \
+             would not have scrolled at all",
+            cols_without_reserve - viewport_cols
         );
     }
 }
@@ -6433,7 +10000,7 @@ mod overlay_band_z_order {
     #[test]
     fn frame_sequence_matches_across_backends_via_gtk_driver() {
         let mut engine = Engine::new();
-        engine.settings.use_nerd_fonts = false;
+        engine.settings.use_nerd_fonts = Some(false);
         engine.buffer_mut().insert(0, "fn main() {}\n");
         // Explicit, not ambient (#762): a global status bar exists only when
         // per-window status lines are off, and the default is on.
@@ -6563,7 +10130,7 @@ mod chrome_band_order {
     #[test]
     fn chrome_band_composes_in_canonical_order_via_gtk_driver() {
         let mut engine = Engine::new();
-        engine.settings.use_nerd_fonts = false;
+        engine.settings.use_nerd_fonts = Some(false);
         // Explicit, not ambient: a global status bar exists only when
         // per-window status lines are off, and the default is on.
         engine.settings.window_status_line = false;
@@ -6616,7 +10183,7 @@ mod chrome_band_order {
     #[test]
     fn chrome_band_drops_the_wildmenu_rung_when_no_completion_is_up_via_gtk_driver() {
         let mut engine = Engine::new();
-        engine.settings.use_nerd_fonts = false;
+        engine.settings.use_nerd_fonts = Some(false);
         engine.settings.window_status_line = false;
         engine.app_shell.show_panel(&quadraui::WidgetId::new(
             crate::core::engine::sidebar::PANEL_SETTINGS,
@@ -6643,7 +10210,7 @@ mod chrome_band_order {
     #[test]
     fn chrome_band_drops_the_status_bar_rung_with_per_window_status_lines_via_gtk_driver() {
         let mut engine = Engine::new();
-        engine.settings.use_nerd_fonts = false;
+        engine.settings.use_nerd_fonts = Some(false);
         engine.settings.window_status_line = true;
         engine.app_shell.show_panel(&quadraui::WidgetId::new(
             crate::core::engine::sidebar::PANEL_SETTINGS,
@@ -6694,7 +10261,7 @@ mod editor_band_order {
     /// this from a seven-rung assertion into a five-rung one.
     fn engine_with_every_editor_rung() -> Engine {
         let mut engine = Engine::new_for_test();
-        engine.settings.use_nerd_fonts = false;
+        engine.settings.use_nerd_fonts = Some(false);
         engine.settings.breadcrumbs = true;
         engine.settings.minimap = true;
         let cwd = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -6889,7 +10456,7 @@ mod editor_band_order {
     #[test]
     fn unsplit_editor_composes_no_group_divider_rung_via_gtk_driver() {
         let mut engine = Engine::new_for_test();
-        engine.settings.use_nerd_fonts = false;
+        engine.settings.use_nerd_fonts = Some(false);
         engine.buffer_mut().insert(0, "fn main() {}\n");
 
         let h = harness(engine, 1400, 900);
@@ -6936,20 +10503,21 @@ mod bottom_band_order {
     /// `app_with_every_bottom_rung`.
     fn engine_with_every_bottom_rung() -> Engine {
         let mut engine = Engine::new_for_test();
-        engine.settings.use_nerd_fonts = false;
+        engine.settings.use_nerd_fonts = Some(false);
         // `separated_status_line` is `Some` only for
         // `window_status_line && !status_line_above_terminal && panel open`.
         engine.settings.window_status_line = true;
         engine.settings.status_line_above_terminal = false;
         engine
-            .quickfix_items
+            .quickfix
+            .items
             .push(crate::core::project_search::ProjectMatch {
                 file: std::path::PathBuf::from("zqxw765.rs"),
                 line: 0,
                 col: 0,
                 line_text: "ZQXW765QF".to_string(),
             });
-        engine.quickfix_open = true;
+        engine.quickfix.open = true;
         engine.bottom_panel_open = true;
         engine.bottom_panel_kind = crate::render::BottomPanelKind::DebugOutput;
         engine.dap_output_lines.push("ZQXW765DBG".to_string());
@@ -7040,7 +10608,7 @@ mod bottom_band_order {
             .get()
             .expect("the composed hover rung must publish the rect it painted");
         assert!(
-            rect.2 > 0.0 && rect.3 > 0.0,
+            rect.width > 0.0 && rect.height > 0.0,
             "the popup must paint a non-degenerate box, got {rect:?}"
         );
     }
@@ -7148,6 +10716,105 @@ mod modal_rung {
             target_bg_before,
             "the previously selected row must lose its highlight when a \
              sibling is hovered (#373)"
+        );
+    }
+
+    /// #902: `menu_style` only ever changes anything on a backend that
+    /// advertises `BackendCaps::native_menu` — `render::
+    /// context_menu_should_be_native` gates every variant on that
+    /// capability, mirroring #901's identical gate for the menu bar. GTK's
+    /// `native_menu` is `false`, so even the most aggressive setting
+    /// (`Native`) must still fall back to painting the in-window
+    /// `ContextMenuPanel`, exactly like the default `Inherit`.
+    ///
+    /// RED-verified: temporarily changing `context_menu_should_be_native`
+    /// to `MenuStyle::Native | MenuStyle::Inherit => true` (dropping the
+    /// `caps.native_menu` gate) makes this fail — GTK's `show_context_menu`
+    /// is quadraui's no-op default, so the menu item never reaches the
+    /// screen and `screen_contains` comes back `false`. Restored before
+    /// committing.
+    #[test]
+    fn context_menu_style_native_still_paints_in_window_on_gtk() {
+        let mut engine = small_engine();
+        engine.settings.menu_style = crate::core::settings::MenuStyle::Native;
+        engine.open_editor_context_menu(4, 4);
+        assert!(
+            engine
+                .context_menu
+                .as_ref()
+                .is_some_and(|m| !m.items.is_empty()),
+            "fixture needs a non-empty context menu"
+        );
+
+        let h = harness(engine, 1400, 900);
+
+        assert!(
+            h.driver.screen_contains("Go to Definition"),
+            "GTK has no native context menu (`BackendCaps::native_menu` is \
+             false) so `menu_style = Native` must still fall back to the \
+             in-window path; painted text was {:?}",
+            h.driver.painted_texts()
+        );
+    }
+
+    /// #902: a native popup's activation (`UiEvent::ContextMenuItemActivated`,
+    /// fired by `Backend::show_context_menu` on a backend that has one) must
+    /// resolve through the exact same `context_menu_hit_to_idx` /
+    /// `apply_context_menu_route` dispatch the in-window click path already
+    /// uses — one routing table, not two. Driven here through GTK purely to
+    /// exercise `App::handle`'s new arm in a headless, non-macOS-only test:
+    /// the dispatch logic has no backend dependency, even though GTK itself
+    /// never emits this event in real use (`native_menu` is `false` there).
+    ///
+    /// "Command Palette" is *not* usable as the "did it open" marker here —
+    /// it is also the context menu's own last item label, so it is already
+    /// on screen before the dispatch and stays on screen if the dispatch is
+    /// silently dropped (the menu never closes), which would make the
+    /// assertion pass even with the routing arm missing entirely. "File:
+    /// Quit" is a `PALETTE_COMMANDS` entry that appears only once the
+    /// palette itself is populated and painted, with no such collision.
+    ///
+    /// RED against a build with no `UiEvent::ContextMenuItemActivated` arm
+    /// in `App::handle` (this issue's pre-fix state — `grep -rn
+    /// ContextMenuItemActivated src/` was empty): the event falls through
+    /// unhandled, the palette never opens, and this assertion fails.
+    #[test]
+    fn context_menu_item_activated_reaches_the_same_action_as_the_in_window_click() {
+        let mut engine = small_engine();
+        engine.open_editor_context_menu(4, 4);
+        let idx = engine
+            .context_menu
+            .as_ref()
+            .unwrap()
+            .items
+            .iter()
+            .position(|i| i.label == "Command Palette")
+            .expect("fixture must offer a Command Palette item");
+        assert!(
+            engine.context_menu.as_ref().unwrap().items[idx].enabled,
+            "Command Palette must be enabled unconditionally, or this test \
+             can't tell a routed activation from a silently-dropped one"
+        );
+
+        let mut h = harness(engine, 1400, 900);
+        assert!(
+            !h.driver.screen_contains("File: Quit"),
+            "bad fixture: the palette should start closed; painted text was {:?}",
+            h.driver.painted_texts()
+        );
+
+        h.driver
+            .dispatch(quadraui::UiEvent::ContextMenuItemActivated(
+                quadraui::WidgetId::new(format!("context:{idx}")),
+            ));
+        h.driver.render();
+
+        assert!(
+            h.driver.screen_contains("File: Quit"),
+            "ContextMenuItemActivated(\"context:{idx}\") must open the \
+             command palette the same way the in-window click on \
+             \"Command Palette\" does; painted text was {:?}",
+            h.driver.painted_texts()
         );
     }
 
@@ -7264,6 +10931,66 @@ mod modal_rung {
             h.picker_popup().is_none(),
             "a second click on the already-selected row must confirm it and \
              close the palette (parity with TUI); painted: {:?}",
+            h.driver.painted_texts()
+        );
+    }
+
+    /// #831 acceptance: "picker popup outside-click" black-box coverage,
+    /// named explicitly in the issue and previously covered only by the
+    /// pure-function unit test `folder_picker_click_outside_popup_dismisses`
+    /// in `render.rs` (which exercises the *folder* picker's route function
+    /// directly, not a painted popup) — nothing asserted this against the
+    /// unified picker's actual rendered surface on either backend.
+    ///
+    /// `route_modal_overlay_click`'s `PickerRoute::Dismiss` arm (an outside
+    /// click) is exercised the same way
+    /// `click_inside_tab_switcher_popup_dismisses_it` exercises the
+    /// tab-switcher's inside-click arm just above: open the picker, locate
+    /// the painted popup's cached bounds, click a point the popup's own
+    /// geometry guarantees is outside it, and assert on the painted surface
+    /// (the title vanishing) rather than only on `engine.picker_open`
+    /// flipping — the #555/#587 rule this file's tests all follow.
+    #[test]
+    fn click_outside_picker_popup_dismisses_it() {
+        let mut engine = small_engine();
+        engine.open_picker(crate::core::engine::PickerSource::LineEndings);
+        let mut h = harness(engine, 1400, 900);
+        let (px, py, pw, ph) = h
+            .picker_popup()
+            .expect("fixture must actually paint the command palette");
+        assert!(
+            h.driver.screen_contains("Select Line Ending Sequence"),
+            "precondition: the picker's title must paint"
+        );
+        // (700, 850): `gtk_picker_sizing` centres the popup with hundreds of
+        // pixels of margin on every side in a 1400x900 window, so this point
+        // (near the bottom of the content area) is outside the popup on the
+        // y axis regardless of preview state. Deliberately NOT the window's
+        // (0, 0)/(5, 5) corner — `App::handle`'s CSD-titlebar rung
+        // (`ctx.in_title_bar`) claims a `MouseDown` there for window-drag
+        // *before* `handle_mouse_click_msg` (and therefore the modal-overlay
+        // rung this test targets) ever runs, the same chrome-ownership trap
+        // TUI's row-0 tab strip sets for
+        // `click_outside_picker_popup_dismisses_it_via_shell_app`.
+        let (ox, oy) = (700.0_f64, 850.0_f64);
+        assert!(
+            oy < py || oy >= py + ph,
+            "sanity: ({ox}, {oy}) must fall outside the painted popup bounds \
+             ({px}, {py}, {pw}, {ph})"
+        );
+
+        h.driver.click(ox as f32, oy as f32);
+        h.driver.render();
+
+        assert!(
+            h.picker_popup().is_none(),
+            "a click outside the painted popup must dismiss the picker \
+             (route_modal_overlay_click's PickerRoute::Dismiss arm)"
+        );
+        assert!(
+            !h.driver.screen_contains("Select Line Ending Sequence"),
+            "the dismissed popup's title must be gone from the painted \
+             surface, not just the cached rect cleared; painted: {:?}",
             h.driver.painted_texts()
         );
     }
@@ -7556,17 +11283,17 @@ mod chrome_rung {
 /// wiring through the shared primitive rather than new GTK-specific
 /// selection code — see `handle_mouse_click_msg`'s "Command line click" rung.
 ///
-/// **What's covered / what isn't:** click-to-reposition-cursor and
-/// drag-to-select (`engine.cmd_sel`/`cmd_dragging`) both land, and
-/// `route_cmdline_selection_key` (already shared with TUI) makes Ctrl+C
-/// copy the selection. The VISIBLE selection highlight does not — quadraui's
-/// `CommandLine` primitive has no selection field and `Backend::draw_command_line`
-/// paints in the command line's own (monospace) font, so there is no
-/// platform-neutral way to overlay a highlight without either painting in
-/// the wrong font (`Backend::draw_status_bar` sets its own chrome font) or
-/// writing GTK-specific Cairo code, which `CLAUDE.md`'s Platform-Neutrality
-/// Rule forbids. That gap needs a quadraui issue (`CommandLine::selection`,
-/// painted by each backend's own rasteriser) before the highlight can land.
+/// **What's covered:** click-to-reposition-cursor, drag-to-select
+/// (`engine.cmd_sel`/`cmd_dragging`), `route_cmdline_selection_key`
+/// (already shared with TUI) making Ctrl+C copy the selection, and — since
+/// #1185 adopted quadraui#1001's `Backend::draw_command_line_selection` —
+/// the VISIBLE selection highlight itself
+/// (`drag_select_paints_a_visible_highlight_over_the_selected_columns`
+/// below). Before #1185 this module's doc comment recorded that last piece
+/// as a genuine quadraui gap (`CommandLine` had no selection field and
+/// `draw_command_line` never painted one); quadraui#1001 shipped a sibling
+/// draw call instead of a new field (see that method's doc comment for
+/// why), and GTK now routes through it exactly like TUI does.
 #[cfg(test)]
 mod command_line_selection {
     use super::*;
@@ -7693,6 +11420,256 @@ mod command_line_selection {
             "Ctrl+C must clear the selection after copying"
         );
     }
+
+    /// #1239: `App::sync_plus_register_to_clipboard` (now a thin wrapper over
+    /// `render::sync_register_to_clipboard`, the same function TUI's
+    /// `sync_tui_clipboard` delegates to) must keep mirroring the explicit
+    /// `+` register ahead of the unnamed `"` register — this is the parity
+    /// half of #1239's fix: GTK's existing (correct) behaviour must survive
+    /// the refactor into the shared function untouched.
+    ///
+    /// `"+yy` writes both `+` and `"` to the same content
+    /// (`set_register_typed` always copies a named-register write into `"`
+    /// too), so that alone can't distinguish the two priorities — the
+    /// divergence only shows up once something *else* changes `"` without
+    /// touching `+`. A plain `dd` with no register prefix is exactly that.
+    #[test]
+    fn key_press_clipboard_prioritizes_explicit_plus_register_over_unnamed_1239() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "AAAA\nBBBB\n");
+        let captured = std::rc::Rc::new(std::cell::RefCell::new(None::<String>));
+        let captured_hook = std::rc::Rc::clone(&captured);
+        engine.clipboard_write = Some(Box::new(move |text: &str| {
+            *captured_hook.borrow_mut() = Some(text.to_string());
+            Ok(())
+        }));
+        let mut h = harness(engine, 1200, 800);
+        h.driver.render();
+
+        let press = |driver: &mut GtkDriver<_>, ch: char| {
+            driver.dispatch(quadraui::UiEvent::KeyPressed {
+                key: quadraui::Key::Char(ch),
+                modifiers: quadraui::Modifiers::default(),
+                repeat: false,
+            });
+        };
+
+        // `"+yy`: explicit write to the `+` register. `set_register_typed`
+        // also copies it into `"`, so both hold "AAAA\n" afterward.
+        for ch in ['"', '+', 'y', 'y'] {
+            press(&mut h.driver, ch);
+        }
+        assert_eq!(
+            captured.borrow().as_deref(),
+            Some("AAAA\n"),
+            "\"+yy must push the explicitly-yanked line to the clipboard"
+        );
+
+        press(&mut h.driver, 'j'); // move to line 1 ("BBBB") — no register change.
+
+        // `dd`: a plain, no-register delete only ever touches `"`, never `+`.
+        for ch in ['d', 'd'] {
+            press(&mut h.driver, ch);
+        }
+
+        assert_eq!(
+            captured.borrow().as_deref(),
+            Some("AAAA\n"),
+            "a plain delete must not clobber the clipboard mirror of an \
+             explicit `+` register write"
+        );
+    }
+
+    /// #1100: `App::setup_gtk_clipboard` wires `engine.clipboard_read`/
+    /// `clipboard_write` through `backend.services().clipboard()` —
+    /// quadraui#991's `PlatformServices` seam — instead of the deleted
+    /// `copypasta_ext` stack. Unlike every other clipboard test in this
+    /// file (which manually installs its own capture-only
+    /// `engine.clipboard_write` closure and never touches a real
+    /// backend), this one calls the *production* `setup_gtk_clipboard`
+    /// against a real `quadraui::gtk::backend::GtkBackend` — the only way
+    /// to prove the actual wiring this issue changed, not a stand-in for
+    /// it — and drives a real `yy`/`j`/`p` through the engine so the
+    /// yanked line has to survive an out-and-back trip through the OS
+    /// clipboard to land on the pasted line.
+    ///
+    /// **Verified RED**: temporarily commenting out the
+    /// `self.sync_plus_register_to_clipboard()` call `run_post_key_epilogue`
+    /// makes after every key (the one `yy` relies on to push the yanked
+    /// register out through `engine.clipboard_write`) turns this red —
+    /// `pasted_line` comes back `""` instead of `"QUADRAUI_991_ALPHA"`,
+    /// because `p`'s `preload_paste_clipboard` reloads from a clipboard
+    /// nothing ever wrote to. Restored before committing. This is a
+    /// deliberately different failure mode than the probe below going
+    /// unavailable (which *skips*, not fails) — it proves the assertion
+    /// itself is load-bearing, not just reachable.
+    ///
+    /// `#[ignore]`d (CLAUDE.md: "Any future test that genuinely needs a
+    /// live display must be `#[ignore]`-gated with a comment saying why").
+    /// This test drives `setup_gtk_clipboard` against a *real*
+    /// `quadraui::gtk::backend::GtkBackend`, whose `services().clipboard()`
+    /// is backed by `arboard` — there is no way to swap in a fake from
+    /// vimcode: `GtkClipboard::install_test_contents` (quadraui#991's own
+    /// hermetic-test seam, `quadraui/src/gtk/services.rs:861` at the pinned
+    /// rev `0dc8381`) and the `gtk_clipboard()` accessor needed to reach it
+    /// are both `pub(crate)` inside quadraui, not exported to consuming
+    /// crates. `.github/workflows/ci.yml`'s "Test (Linux, headless, GUI
+    /// feature on)" job asserts `DISPLAY`/`WAYLAND_DISPLAY` are both unset
+    /// before running `cargo test`, so this must not run there — hence
+    /// `#[ignore]` rather than the runtime skip this test used before, which
+    /// silently reported green in CI without ever exercising the round trip.
+    /// A quadraui issue requesting a public seam for hermetic GTK clipboard
+    /// testing (e.g. exporting `install_test_contents`/`gtk_clipboard()`, or
+    /// an equivalent public test-double constructor) is needed before this
+    /// can run unconditionally in CI; until then, run manually with
+    /// `cargo test -- --ignored setup_gtk_clipboard_round_trips` on a
+    /// machine with a live desktop session (X11 or Wayland).
+    #[test]
+    #[ignore = "needs a live OS clipboard/display session — see doc comment; \
+                blocked on a quadraui issue for a public hermetic-clipboard \
+                test seam (quadraui#991's install_test_contents/gtk_clipboard \
+                are pub(crate))"]
+    fn setup_gtk_clipboard_round_trips_yank_and_paste_through_real_backend_1100() {
+        // Mirrors `conformance_harness`'s manual construction (not the
+        // `harness()` convenience wrapper) because this test needs the
+        // `backend` handle itself to pass to `setup_gtk_clipboard` —
+        // `harness()` builds and discards its own.
+        let paint = crate::test_paint::PaintGuard::acquire();
+        let cwd = crate::test_cwd::CwdReadGuard::acquire();
+
+        let backend: Rc<RefCell<Box<dyn crate::app::TextMetricsBackend>>> = Rc::new(RefCell::new(
+            Box::new(crate::gtk::backend::GtkBackend::new()),
+        ));
+
+        let mut engine = Engine::new_for_test();
+        crate::app::setup_gtk_clipboard(&mut engine, backend.clone());
+
+        // Probe: does this sandbox have a live OS clipboard at all? Real
+        // GTK/desktop machines do; a headless CI box with no display
+        // server usually doesn't (`arboard::Clipboard::new()` fails, so
+        // `GtkClipboard`'s `inner` stays `None` and every call is a
+        // no-op/`Err`).
+        const PROBE: &str = "quadraui-991-clipboard-probe-1100";
+        let probe_write_ok = engine.clipboard_write.as_ref().expect(
+            "setup_gtk_clipboard must always install clipboard_write, live clipboard or not",
+        )(PROBE)
+        .is_ok();
+        let probe_read = engine.clipboard_read.as_ref().expect(
+            "setup_gtk_clipboard must always install clipboard_read, live clipboard or not",
+        )();
+        if !probe_write_ok || probe_read.as_deref() != Ok(PROBE) {
+            eprintln!(
+                "skipping setup_gtk_clipboard_round_trips_yank_and_paste_through_real_backend_1100: \
+                 no live OS clipboard in this sandbox (probe write_ok={probe_write_ok}, read={probe_read:?})"
+            );
+            return;
+        }
+
+        engine.buffer_mut().insert(0, "QUADRAUI_991_ALPHA\nBETA\n");
+        let engine = Rc::new(RefCell::new(engine));
+        let (app, config) = crate::harness::build_app_and_config(Rc::clone(&engine), backend);
+        let mut driver = driver_with_shell(app, config, 1200, 800);
+        driver.render();
+
+        let press = |driver: &mut GtkDriver<_>, ch: char| {
+            driver.dispatch(quadraui::UiEvent::KeyPressed {
+                key: quadraui::Key::Char(ch),
+                modifiers: quadraui::Modifiers::default(),
+                repeat: false,
+            });
+        };
+
+        // `yy`: linewise-yank line 0 ("QUADRAUI_991_ALPHA") — via
+        // `run_post_key_epilogue`'s `sync_plus_register_to_clipboard`,
+        // this writes out to the real OS clipboard through
+        // `engine.clipboard_write`.
+        press(&mut driver, 'y');
+        press(&mut driver, 'y');
+        // `j`: move to line 1 ("BETA").
+        press(&mut driver, 'j');
+        // `p`: paste below the cursor line. `render::preload_paste_clipboard`
+        // reloads the paste register from `engine.clipboard_read` — the
+        // real OS clipboard — immediately before this dispatches.
+        press(&mut driver, 'p');
+        driver.render();
+
+        let pasted_line = {
+            let eng = engine.borrow();
+            eng.buffer().content.line(2).to_string()
+        };
+        assert_eq!(
+            pasted_line.trim_end_matches('\n'),
+            "QUADRAUI_991_ALPHA",
+            "pasting after `yy`/`j` must reproduce the yanked line — proving \
+             it made a real out-and-back trip through \
+             backend.services().clipboard(), not just the local `\"` register"
+        );
+        assert!(
+            driver.screen_contains("QUADRAUI_991_ALPHA"),
+            "the pasted line must actually paint, not just exist in the rope"
+        );
+
+        // No explicit `drop(cwd)`/`drop(paint)` here: `paint` and `cwd` are
+        // declared *before* `driver`, so Rust's implicit end-of-scope drop
+        // (reverse declaration order) already drops `driver` — which owns
+        // the Cairo `ImageSurface` and Pango/Cairo-touching teardown — before
+        // releasing the `PaintGuard` mutex. Matches every other test in this
+        // file; see `activity_bar_strip`'s comment for why the order matters
+        // (`FT_Load_Glyph` segfaults on concurrent Pango/Cairo teardown).
+    }
+
+    /// #1185: adopts quadraui#1001's `Backend::draw_command_line_selection`.
+    /// Before this, GTK painted `draw_command_line` unconditionally — a
+    /// user who dragged a selection over the command line got working
+    /// `cmd_sel` state and Ctrl+C copy (proven above) but literally zero
+    /// pixel change. Asserts on the actual painted pixel at the selected
+    /// column, not on `cmd_sel` being `Some` (`CLAUDE.md` rule 1 — the same
+    /// "state populated, nothing painted" failure mode #587/#592 hit).
+    #[test]
+    fn drag_select_paints_a_visible_highlight_over_the_selected_columns() {
+        let mut engine = Engine::new_for_test();
+        engine.mode = crate::core::Mode::Command;
+        engine.command_buffer = "wq!".to_string();
+        engine.command_cursor = 3;
+        let mut h = harness(engine, 1200, 800);
+        h.driver.render();
+        h.driver
+            .find_bounds(":wq!")
+            .expect("command line text must paint");
+
+        // Probe pixels before any drag: column 1 ('w', will be selected)
+        // and column 3 ('!', will stay outside the drag).
+        let (wx, wy) = col_center(&h, 1);
+        let (ex, ey) = col_center(&h, 3);
+        let w_before = h.driver.pixel(wx.round() as i32, wy.round() as i32);
+        let excl_before = h.driver.pixel(ex.round() as i32, ey.round() as i32);
+
+        // Drag-select columns 1..2 ("wq") — same inclusive contract
+        // `drag_select_then_ctrl_c_copies_the_command_buffer_substring`
+        // above exercises.
+        let (x0, y0) = col_center(&h, 1);
+        let (x1, _) = col_center(&h, 2);
+        h.driver.drag(x0, y0, x1, y0);
+        h.driver.render();
+
+        assert!(
+            h.engine.borrow().cmd_sel.get().is_some(),
+            "a drag over the command line must arm a selection"
+        );
+
+        let w_after = h.driver.pixel(wx.round() as i32, wy.round() as i32);
+        let excl_after = h.driver.pixel(ex.round() as i32, ey.round() as i32);
+
+        assert_ne!(
+            w_before, w_after,
+            "the selected column's pixel must change once the drag armed \
+             a visible selection highlight"
+        );
+        assert_eq!(
+            excl_before, excl_after,
+            "a column outside the drag must not change colour"
+        );
+    }
 }
 
 /// #755 slice 5: black-box coverage for the two editor rungs this slice
@@ -7742,7 +11719,12 @@ mod editor_mouse_rungs {
     /// hardcoded, so it survives any change to `minimap_reserved_width`.
     #[test]
     fn minimap_click_scrolls_the_editor_on_gtk() {
-        let mut h = harness(long_engine(), 900, 600);
+        // #947: was `900` — see the sibling
+        // `minimap_strip_is_narrower_on_a_narrow_pane_than_on_a_wide_one`'s
+        // doc comment for why a fixed-visible-sidebar 900px window no
+        // longer clears `MINIMAP_MIN_TEXT_COLS`'s suppression threshold now
+        // that the real default `settings.font_size` (14pt) reaches paint.
+        let mut h = harness(long_engine(), 1050, 600);
         h.driver.render();
 
         assert!(
@@ -7776,6 +11758,142 @@ mod editor_mouse_rungs {
             "clicking the vertical middle of the painted minimap strip must \
              seek the pane to ~50% of the file (#35); screen was {:?}",
             h.driver.painted_texts()
+        );
+    }
+
+    /// #1104 acceptance: click→column resolution must track the editor
+    /// font *as painted this frame*, driven end to end through
+    /// `App::handle` (via `h.driver.click`) rather than by calling
+    /// `pixel_to_click_target`/`GtkBackend::editor_col_at_x` directly the
+    /// way `gtk::click`'s unit tests do.
+    ///
+    /// Before #1104, mouse clicks resolved columns against a SECOND,
+    /// separately-constructed `GtkBackend` (`App::backend`) that
+    /// `App::render_content` re-synced by hand every frame
+    /// (`set_editor_font` + a throwaway `set_pango_context`) to *mimic*
+    /// the real paint backend's font — two backends kept in lockstep by
+    /// bookkeeping instead of one backend being asked twice. #1104 threads
+    /// the runner's own live backend through the click dispatch chain
+    /// instead, so there is only ever one backend's font state to ask.
+    ///
+    /// Clicks at a computed column (never a hardcoded pixel — see
+    /// `click_at` below) both before and after a runtime `:set font_size=40`
+    /// grows the editor font substantially, and asserts the SAME resolution
+    /// still holds each time.
+    ///
+    /// **RED-verified:** reverting the `handle_mouse_click` call site in
+    /// `App::handle_mouse_click_msg` to resolve against `self.backend`
+    /// (the pre-#1104 second backend, whose editor font is never set now
+    /// that #1104 deleted the per-frame sync that used to keep it current)
+    /// fails even the FIRST assertion below — `self.backend`'s Pango layout
+    /// stays fonted at whatever it happened to have (nothing sets it now),
+    /// so it resolves the default-font-size click at the wrong column.
+    #[test]
+    fn click_column_tracks_a_runtime_font_size_change_on_gtk() {
+        let mut engine = Engine::new_for_test();
+        engine
+            .buffer_mut()
+            .insert(0, "0123456789".repeat(4).as_str());
+        // Hide the sidebar: it's visible by default and its width, in this
+        // pinned quadraui rev, is folded into the same VS-Code-parity
+        // column/pixel policy the minimap uses — orthogonal to what this
+        // test pins (click→column tracking a *font* change) and not worth
+        // coupling to here.
+        engine.app_shell.hide_sidebar();
+        let mut h = harness(engine, 2000, 700);
+        h.driver.set_double_click_folding(false);
+        // `AppShell`'s `hide_sidebar()` flip takes a frame to reach the
+        // painted layout, same as the font-size settle frame below.
+        h.driver.render();
+        h.driver.render();
+
+        // Resolve a pixel for `target_col` from what THIS frame actually
+        // painted (`editor_text_layout`, the same text_bounds/char metrics
+        // `pixel_to_click_target -> editor_col_at_x` resolves against) —
+        // never a hardcoded coordinate.
+        let click_at = |h: &Harness<_>, target_col: usize| -> (f32, f32) {
+            let layout = h.screen_layout.borrow();
+            let rw = &layout.as_ref().expect("frame must paint a window").windows[0];
+            let cw = h.painted_char_width();
+            let lh = h
+                .painted_line_height()
+                .expect("frame must paint a line height");
+            let (_editor, editor_layout) = crate::render::editor_text_layout(rw, cw, lh);
+            let x = editor_layout.text_bounds.x as f64 + (target_col as f64 + 0.5) * cw;
+            let y = rw.rect.y + lh / 2.0;
+            (x as f32, y as f32)
+        };
+
+        let target_col0 = 15usize;
+        let (x0, y0) = click_at(&h, target_col0);
+        h.driver.click(x0, y0);
+        h.driver.render();
+        assert_eq!(
+            h.engine.borrow().view().cursor.col,
+            target_col0,
+            "clicking at the computed pixel must resolve to column \
+             {target_col0} at the default font size"
+        );
+
+        let char_width_before = h.painted_char_width();
+
+        // Runtime font-size bump — the exact ex-command path a real
+        // `:set font_size=N` keystroke uses. One settle frame is required
+        // before the new metrics show up (matches
+        // `set_font_family_size_and_zoomin_zoomout_commands_reach_paint`'s
+        // documented reasoning: quadraui measures BEFORE handing control to
+        // `App::render_content`'s `set_editor_font` call).
+        h.engine.borrow_mut().execute_command("set font_size=40");
+        h.driver.render();
+        h.driver.render();
+        // `App::cached_char_width`/`cached_line_height` — what
+        // `pixel_to_click_target` actually resolves clicks against — are
+        // refreshed from `Backend::char_width()`/`line_height()` only on
+        // `UiEvent::WindowResized` (real GTK apps get one from the OS on
+        // basically every settle; a headless `GtkDriver` test never fires
+        // one on its own; see `Harness`'s own "no main loop" doc). Dispatch
+        // one so the click below resolves against the SAME metrics this
+        // frame painted with, exactly as a resize (or the runner's own
+        // periodic re-measurement) would refresh them in a real session.
+        let viewport = {
+            use quadraui::Backend as _;
+            h.driver.backend().viewport()
+        };
+        h.driver
+            .dispatch(quadraui::UiEvent::WindowResized { viewport });
+
+        assert!(
+            h.painted_char_width() > char_width_before * 1.3,
+            "precondition: `:set font_size=40` must grow the painted \
+             char_width substantially: before={char_width_before} \
+             after={}",
+            h.painted_char_width()
+        );
+
+        // Move the cursor away from `target_col0` first, so the assertion
+        // below can only pass if THIS click actually moved it there — not
+        // because it was a leftover from the click above. A render is
+        // required before computing the next `click_at`: `col_at_x`/
+        // `click_at` both assume `scroll_left == 0` (column N sits N cells
+        // right of `text_bounds.x`), which only holds once a frame has
+        // painted with the cursor back at column 0 — otherwise the window
+        // may still carry whatever `scroll_left` the old cursor position at
+        // the OLD (narrower, pre-font-bump) viewport needed.
+        h.engine.borrow_mut().view_mut().cursor = crate::core::Cursor { line: 0, col: 0 };
+        h.driver.render();
+
+        let target_col1 = 5usize;
+        let (x1, y1) = click_at(&h, target_col1);
+        h.driver.click(x1, y1);
+        h.driver.render();
+        assert_eq!(
+            h.engine.borrow().view().cursor.col,
+            target_col1,
+            "clicking at the pixel `editor_text_layout` reports for column \
+             {target_col1} must still resolve to that column after a live \
+             `:set font_size=40` — proving the click path (#1104: routed \
+             through the runner's own live backend, not a second, \
+             separately-constructed one) reads THIS frame's font metrics"
         );
     }
 
@@ -7815,7 +11933,7 @@ mod editor_mouse_rungs {
             h.driver.painted_texts()
         );
 
-        let (lx, ly, lw, lh, uri) = h
+        let (rect, uri) = h
             .editor_hover_link_rects
             .borrow()
             .first()
@@ -7824,7 +11942,7 @@ mod editor_mouse_rungs {
         assert_eq!(uri, "command:definition");
         h.driver.dispatch(quadraui::UiEvent::DoubleClick {
             widget: None,
-            position: quadraui::Point::new((lx + lw / 2.0) as f32, (ly + lh / 2.0) as f32),
+            position: quadraui::Point::new(rect.x + rect.width / 2.0, rect.y + rect.height / 2.0),
         });
         h.driver.render();
 
@@ -8143,11 +12261,9 @@ mod editor_mouse_rungs {
             !h.driver.screen_contains("ZQXWEXT757"),
             "precondition: the explorer must not be what's painted while \
              ext_panel_active is set — GTK's `id.starts_with(\"ext:\")` arm \
-             (a pre-existing gap, not this issue's to fix) renders the \
-             built-in Extensions *marketplace* tree for any plugin panel \
-             id rather than the specific plugin's own content, so this \
-             checks the explorer's absence rather than the (unrelated)\
-             marketplace's presence; painted: {:?}",
+             paints this registration's own (here, empty) sections via \
+             `render::ext_panel_to_tree_view` (#1089), not the explorer \
+             tree, so this checks the explorer's absence; painted: {:?}",
             h.driver.painted_texts()
         );
 
@@ -8489,15 +12605,92 @@ mod slice7_closing_rungs {
         );
     }
 
-    // No GTK black-box test for the Ctrl+L rung: with the rung removed the
-    // GtkDriver renders byte-identically, because GTK's spelling of the chord
-    // (`key_name = "l"`, `ctrl = true`) is not a cursor motion in
-    // `Engine::handle_key` either. A test here could not fail, and
+    // No GTK black-box test for the *bare* Ctrl+L rung: with the rung
+    // removed the GtkDriver renders byte-identically, because GTK's spelling
+    // of the chord (`key_name = "l"`, `ctrl = true`) is not a cursor motion
+    // in `Engine::handle_key` either. A test here could not fail, and
     // `CLAUDE.md` rule 2 says a test that cannot fail is not coverage. The
     // rung is covered by TUI's RED-verified
     // `ctrl_l_is_consumed_and_never_edits_the_buffer_via_shell_app` and, for
     // GTK's own key spelling, by
     // `render::slice7_router_tests::ctrl_l_is_a_force_redraw_from_either_backends_spelling`.
+    //
+    // The `<C-x>`-pending case *is* distinguishable on GTK (below): once
+    // `<C-x><C-l>` is a real completion sub-mode (#1160), swallowing it as a
+    // repaint instead of forwarding it to `Engine::handle_key` is an
+    // observable difference in painted text, not a no-op.
+
+    /// #1160 (review fix): `<C-x><C-l>` must reach the whole-line completion
+    /// sub-mode on GTK, not be swallowed by the Ctrl+L force-redraw rung
+    /// directly above in `handle_key_press` — the same shape of bug
+    /// `<C-x><C-f>` already had against the find/replace binding, just one
+    /// layer further out (`render::is_force_redraw_key`'s `insert_ctrl_x_pending`
+    /// parameter). Mirrors TUI's
+    /// `ctrl_x_ctrl_l_completes_whole_line_via_shell_app` (`shell_app.rs`).
+    ///
+    /// **Verified RED against unfixed `develop`:** reverting `handle_key_press`
+    /// to call `render::is_force_redraw_key(&key_name, unicode, ctrl)` (the
+    /// pre-fix 3-arg signature, ignoring `insert_ctrl_x_pending`) makes
+    /// `<C-x><C-l>` a pure repaint request; the second line never picks up
+    /// the first line's text, so the final assertion fires.
+    #[test]
+    fn ctrl_x_ctrl_l_completes_whole_line_on_gtk() {
+        let mut engine = Engine::new_for_test();
+        engine
+            .buffer_mut()
+            .insert(0, "ZQXWGTKCXL_hello world\nZQXWGTKCXL_hel");
+
+        let mut h = harness(engine, 1200, 800);
+        h.driver.render();
+
+        // `G` to the last line, `A` to append at its end and enter Insert.
+        press(&mut h.driver, Key::Char('G'), Modifiers::default());
+        press(&mut h.driver, Key::Char('A'), Modifiers::default());
+        press(
+            &mut h.driver,
+            Key::Char('x'),
+            Modifiers {
+                ctrl: true,
+                ..Default::default()
+            },
+        );
+        press(
+            &mut h.driver,
+            Key::Char('l'),
+            Modifiers {
+                ctrl: true,
+                ..Default::default()
+            },
+        );
+        h.driver.render();
+
+        // The fixture's first line already reads "ZQXWGTKCXL_hello world"
+        // before any key is pressed, so a bare `screen_contains` would pass
+        // trivially even if `<C-x><C-l>` did nothing (same trap the TUI
+        // mirror's doc comment calls out). Require it painted at least
+        // *twice* — once from the untouched first line, once from the
+        // second line the completion should now have filled in (GTK also
+        // repeats it a third time in a status-bar segment, hence `>= 2`
+        // rather than TUI's exact `== 2`).
+        let hits = h
+            .driver
+            .painted_texts()
+            .iter()
+            .filter(|t| t.contains("ZQXWGTKCXL_hello world"))
+            .count();
+        assert!(
+            hits >= 2,
+            "<C-x><C-l> should complete the second line to the first \
+             line's full text, appearing at least once per line; painted: {:?}",
+            h.driver.painted_texts()
+        );
+        assert!(
+            !h.driver.screen_contains("ZQXWGTKCXL_hel\n"),
+            "the second line must have been replaced by the completion, \
+             not left as the original unfinished prefix; painted: {:?}",
+            h.driver.painted_texts()
+        );
+    }
 
     /// #762: `render::post_key_epilogue`'s sidebar-autohide behaviour, wired
     /// into GTK for the first time by `run_post_key_epilogue`. Before this
@@ -8692,5 +12885,1447 @@ mod issue_813_exit_via_reaction {
             repeat: false,
         });
         assert_eq!(reaction, quadraui::Reaction::Exit);
+    }
+}
+
+#[cfg(test)]
+mod issue_857_titlebar_close_button {
+    //! #857: the inline titlebar × button (`App::window_close`) used to
+    //! call `w.close()` directly. `gtk_window_close` emits GTK's
+    //! `close-request` signal *synchronously, on the same stack* —
+    //! quadraui's handler for that signal re-enters `backend.borrow_mut()`
+    //! while `activate::{closure#3}` (quadraui `run.rs:616`) still holds
+    //! it across `dispatch_event`, so the re-entrant borrow panics with
+    //! `BorrowMutError` inside `close_request_trampoline`, an `extern "C"`
+    //! frame that cannot unwind — which aborts the whole process
+    //! (`SIGABRT`) instead of raising the "Unsaved Changes" confirmation
+    //! the OS/WM close path (`UiEvent::WindowClose`, same file) already
+    //! shows. See the issue for the full annotated stack.
+    //!
+    //! `quit_unsaved` (the dialog `show_quit_confirm` opens) has no
+    //! `DialogTable`/text input, so it is natively-expressible (#727) and
+    //! never paints in-canvas — same as
+    //! `menu_quit_with_unsaved_changes_opens_confirm_dialog` above,
+    //! `native_dialog_shown`/`pending_native_dialog` are the proof here
+    //! too, not `screen_contains`.
+    //!
+    //! `window_close` now routes through `show_quit_confirm` instead — the
+    //! same fix shape #813 already applied to the maximize button's
+    //! sibling (`window_toggle_maximize`) — so it never touches the real
+    //! OS window handle at all. That is what makes this headlessly
+    //! testable: no live GTK window (or its `close-request` signal) is
+    //! involved in either test below, only the button's `handle_dispatch`
+    //! path, exactly the seam the issue's "Regression test" note points
+    //! at.
+    use super::*;
+
+    /// Presses then releases the left mouse button over the centre of the
+    /// close button **as it was actually painted** this frame — located by
+    /// searching the driver's painted-text log for the close segment's own
+    /// padded `"  ✕  "` label, built from the very
+    /// `crate::icons::WINDOW_CLOSE` constant
+    /// `render::window_controls_status_bar` paints with (CLAUDE.md's "locate
+    /// targets, never hardcode coordinates" rule — no glyph and no pixel is
+    /// restated here). The two spaces of padding on each side make the needle
+    /// unique: no other painted run in this fixture contains that string.
+    ///
+    /// This used to aim at `title_bar_rect`'s vertical *centre*, which is a
+    /// different point and — as of #940 — no longer on the button. The band
+    /// `title_bar_rect` describes is `ShellConfig::with_title_bar`'s
+    /// line-height multiple (`2.0`), but quadraui's `draw_status_bar` paints
+    /// a status bar exactly **one line height** tall anchored at the rect's
+    /// *top* edge, and `StatusBar::layout` gives its hit regions that same
+    /// one-line height — so the controls occupy only the band's top `lh`
+    /// pixels and the band's centre (`2.0 * lh / 2.0 == lh`) is the first row
+    /// *past* them. That made the old aim a coin flip decided by the host's
+    /// font metrics: it landed 0.07px inside the button where `lh == 17.07`
+    /// (band 34px) and outside it where `lh == 17.9` (band 36px), which is
+    /// exactly how this test passed on one machine and failed on another
+    /// with `Reaction::Redraw` instead of `Exit`. Aiming at painted content
+    /// is metric-independent.
+    ///
+    /// (The controls being top-anchored rather than centred inside the taller
+    /// band is cosmetic, pre-dates #940 — the band was already `1.7 * lh`, so
+    /// the controls already filled only its top ~59% — and is not fixable
+    /// from vimcode: the `line_height`-not-`rect.height` choice is inside
+    /// quadraui's own `GtkBackend::draw_status_bar`. Per the
+    /// Platform-Neutrality Rule that is a quadraui gap to file, not something
+    /// to paper over with backend code here.)
+    ///
+    /// Down+up (not `GtkDriver::click`, which is a bare press with no
+    /// release) because `StatusBarInteraction` fires `Clicked` only on a
+    /// mouse-up over the same segment a mouse-down pressed — see
+    /// `quadraui::StatusBarInteraction::handle`'s doc.
+    fn click_titlebar_close_button<A: AppLogic>(h: &mut Harness<A>) -> quadraui::Reaction {
+        let controls = h.title_bar_rect.get();
+        assert!(
+            controls.width > 0.0,
+            "window controls must have painted a non-degenerate rect \
+             before a click can be aimed at them"
+        );
+        let needle = format!("  {}  ", crate::icons::WINDOW_CLOSE.s());
+        let close = h.driver.find_bounds(&needle).unwrap_or_else(|| {
+            panic!(
+                "the inline titlebar close button must have painted its \
+                 {needle:?} label before a click can be aimed at it; painted \
+                 runs this frame: {:?}",
+                h.driver.painted_texts()
+            )
+        });
+        assert!(
+            close.x >= controls.x && close.x + close.width <= controls.x + controls.width + 0.5,
+            "sanity: the painted close label must sit inside the window-control \
+             band this frame; close={close:?} controls={controls:?}"
+        );
+        let x = close.x + close.width / 2.0;
+        let y = close.y + close.height / 2.0;
+        h.driver.mouse_down(x, y);
+        h.driver.mouse_up(x, y)
+    }
+
+    /// **Verified RED against unfixed `develop`:** reverting
+    /// `window_close` to `if let Some(ref w) = self.window { w.close(); }`
+    /// leaves this red — under this headless harness `self.window` is
+    /// always `None` (per this module's own doc, "No window"), so the old
+    /// body was a silent no-op here: no quit-confirm dialog opens and
+    /// neither `native_dialog_shown` nor `pending_native_dialog` ever
+    /// flips. On a live window the same old code instead aborts the
+    /// process before the dialog can open, which is strictly worse — see
+    /// the issue.
+    #[test]
+    fn titlebar_close_with_unsaved_changes_raises_quit_confirm() {
+        let mut engine = Engine::new_for_test();
+        engine.set_dirty(true);
+        assert!(engine.has_any_unsaved(), "sanity: fixture must be dirty");
+
+        let mut h = harness(engine, 800, 600);
+        h.driver.render();
+        assert!(
+            !h.native_dialog_shown.get(),
+            "sanity: no quit-confirm dialog should be open before the click"
+        );
+
+        let reaction = click_titlebar_close_button(&mut h);
+        h.driver.render();
+
+        assert!(
+            h.native_dialog_shown.get(),
+            "clicking the inline titlebar close button with unsaved \
+             changes must raise the same quit-confirmation dialog the \
+             OS/WM close path (`UiEvent::WindowClose`) shows"
+        );
+        assert!(
+            h.pending_native_dialog.take().is_some(),
+            "clicking the inline titlebar close button with unsaved \
+             changes must queue the native quit-confirm present"
+        );
+        assert_ne!(
+            reaction,
+            quadraui::Reaction::Exit,
+            "the process must not exit while the quit-confirmation \
+             dialog is still awaiting an answer"
+        );
+        assert!(
+            !h.driver.exited(),
+            "GtkDriver::exited() must stay false: the click must not \
+             abort/exit the process while unsaved changes are pending"
+        );
+    }
+
+    /// The clean half of #857: with nothing unsaved, the inline titlebar
+    /// × must behave exactly like `save_session_and_exit` — set
+    /// `exit_requested` so the runner tears the window down through
+    /// `Reaction::Exit`/`destroy()` (the same latch
+    /// `qall_bang_returns_reaction_exit_on_gtk` above exercises), never
+    /// through a direct `w.close()` that re-enters `close-request`
+    /// mid-dispatch.
+    ///
+    /// **Verified RED against unfixed `develop`:** with the old
+    /// `w.close()` body, `self.window` is `None` in this harness so
+    /// nothing happens at all — `reaction` stays `Reaction::Continue` (no
+    /// state changed for the interaction to redraw over) and `exited()`
+    /// stays `false` forever, instead of the process actually exiting
+    /// (live) or aborting (real window, per the issue).
+    #[test]
+    fn titlebar_close_with_no_unsaved_changes_exits_cleanly() {
+        let engine = Engine::new_for_test();
+        assert!(
+            !engine.has_any_unsaved(),
+            "sanity: fixture must start clean"
+        );
+
+        let mut h = harness(engine, 800, 600);
+        h.driver.render();
+
+        let reaction = click_titlebar_close_button(&mut h);
+
+        assert_eq!(
+            reaction,
+            quadraui::Reaction::Exit,
+            "clicking the inline titlebar close button with nothing \
+             unsaved must surface as Reaction::Exit, not a direct \
+             w.close() that re-enters GTK's close-request handler \
+             mid-dispatch and aborts the process"
+        );
+        assert!(
+            h.driver.exited(),
+            "GtkDriver::exited() must latch — the black-box stand-in \
+             for the process actually exiting cleanly"
+        );
+    }
+}
+
+#[cfg(test)]
+mod engine_key_from_ui_gtk_tests {
+    //! #826: GTK's `handle_dispatch` now decodes `Key::Named` via the same
+    //! [`crate::render::engine_key_from_ui`] TUI's dispatch calls, instead of
+    //! restating an identical table inline. For the plain named keys
+    //! (Escape, Enter, Backspace, Tab, Home, End, arrows, F-keys) that is a
+    //! pure refactor — nothing observable changes, since the shared table's
+    //! output is byte-identical to GTK's old one for those keys (see the
+    //! `handle_dispatch` comment for the four keys — `BackTab`, `PageUp`,
+    //! `PageDown`, `Insert` — deliberately kept on GTK's own spelling
+    //! instead, because the shared decoder's spelling for them differs from
+    //! what GTK-side code already depends on).
+    //!
+    //! Shift+arrow selection-extension (`"Shift_Up"`/`"Shift_Right"`/…) is
+    //! the one genuine behaviour change: it used to exist only in TUI's
+    //! `translate_key`, so a shifted arrow on GTK always decoded to the bare
+    //! `"Right"`/`"Up"`/… name with no way for `Engine::handle_vscode_key`'s
+    //! `"Shift_Right"` arm to ever see it. GTK gains it for free now that
+    //! `Key::Named` goes through the same decoder.
+    use super::*;
+    use quadraui::{Key, Modifiers, NamedKey, UiEvent};
+
+    fn press<A: AppLogic>(h: &mut Harness<A>, key: Key, modifiers: Modifiers) {
+        h.driver.dispatch(UiEvent::KeyPressed {
+            key,
+            modifiers,
+            repeat: false,
+        });
+    }
+
+    /// **Verified RED against unfixed `develop`:** GTK's old inline
+    /// `Key::Named` match returned `"Right"`/`"Up"`/… unconditionally,
+    /// ignoring `modifiers.shift` entirely — so `Shift_Right` never reached
+    /// `handle_vscode_key`, `visual_anchor` was never armed, and
+    /// `vscode_copy`'s `visual_anchor.is_some()` branch was never taken;
+    /// `Ctrl+C` then fell to the "copy current line" branch instead, so the
+    /// clipboard hook would have captured `"hello world\n"` (the whole
+    /// line), not `"hello"` (the shift-selected span) — this assertion
+    /// fails against that.
+    #[test]
+    fn shift_right_extends_selection_and_ctrl_c_copies_it_on_gtk() {
+        let mut engine = Engine::new_for_test();
+        engine.settings.editor_mode = crate::core::settings::EditorMode::Vscode;
+        engine.mode = crate::core::Mode::Insert;
+        engine.buffer_mut().insert(0, "hello world\n");
+
+        let copied = std::rc::Rc::new(std::cell::RefCell::new(None::<String>));
+        let copied_hook = std::rc::Rc::clone(&copied);
+        engine.clipboard_write = Some(Box::new(move |text: &str| {
+            *copied_hook.borrow_mut() = Some(text.to_string());
+            Ok(())
+        }));
+
+        let mut h = harness(engine, 1200, 800);
+        h.driver.render();
+
+        // Four Shift+Right presses move the cursor to col 4 ('o'); copying a
+        // `Mode::Visual` selection reuses Vim's own inclusive-of-cursor
+        // range (`get_visual_selection_text`), so [anchor=0, cursor=4]
+        // copies chars 0..=4 — "hello".
+        for _ in 0..4 {
+            press(
+                &mut h,
+                Key::Named(NamedKey::Right),
+                Modifiers {
+                    shift: true,
+                    ..Default::default()
+                },
+            );
+        }
+        assert_eq!(
+            h.engine.borrow().mode,
+            crate::core::Mode::Visual,
+            "arming a selection via Shift+Right must switch to Visual mode \
+             (`vscode_extend_selection`), same as TUI"
+        );
+
+        press(
+            &mut h,
+            Key::Char('c'),
+            Modifiers {
+                ctrl: true,
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(
+            copied.borrow().as_deref(),
+            Some("hello"),
+            "Ctrl+C after Shift+Right x5 must copy exactly the shift-selected \
+             span, proving the selection (not the whole line) was captured"
+        );
+    }
+
+    /// `Escape` is one of the named keys GTK now decodes via the shared
+    /// `render::engine_key_from_ui` instead of its own inline table. Drives
+    /// it end to end through the real dispatch and asserts on engine mode
+    /// (Command → Normal) rather than the decoded string, so a wrong or
+    /// empty name from the shared decoder shows up as command mode failing
+    /// to clear, exactly as it would have with GTK's old inline table.
+    ///
+    /// **Verified RED against unfixed `develop`:** temporarily making
+    /// `engine_key_from_ui` return `None` for every `NamedKey` reproduces
+    /// what a broken shared-decoder wiring looks like — the key never
+    /// reaches `Engine::handle_key`, command mode never clears, and the
+    /// assertion fails.
+    #[test]
+    fn escape_reaches_the_engine_through_the_shared_decoder_on_gtk() {
+        let engine = Engine::new_for_test();
+        let mut h = harness(engine, 1200, 800);
+        h.driver.render();
+
+        h.driver.type_char(':');
+        h.driver.render();
+        assert_eq!(
+            h.engine.borrow().mode,
+            crate::core::Mode::Command,
+            "precondition: `:` must open the command line"
+        );
+
+        press(&mut h, Key::Named(NamedKey::Escape), Modifiers::default());
+        h.driver.render();
+
+        assert_eq!(
+            h.engine.borrow().mode,
+            crate::core::Mode::Normal,
+            "Escape decoded via the shared `engine_key_from_ui` must still \
+             cancel command-line mode on GTK"
+        );
+    }
+
+    /// #826 review: three more chords than the disclosed Shift+Right case
+    /// newly activate on GTK once `Key::Named` routes through the shared
+    /// `engine_key_from_ui` — GTK's old inline table ignored `shift` for
+    /// `Enter`/`Home`/`End` and never combined `shift+ctrl` for the arrows,
+    /// so none of these `Shift_`-prefixed names ever reached
+    /// `Engine::handle_vscode_key` before. Each gets its own black-box
+    /// coverage here rather than a narrowed decoder, since the unified
+    /// spelling (matching TUI) is the intended outcome of #826, not an
+    /// accidental side effect.
+    ///
+    /// Ctrl+Shift+Enter: `engine_key_from_ui`'s `NamedKey::Enter if shift &&
+    /// ctrl` arm yields `"Shift_Return"`, which `vscode.rs` dispatches to
+    /// `vscode_insert_line_above` — a different code path than plain
+    /// Ctrl+Enter's `"Return"` -> `vscode_insert_line_below`. GTK's old
+    /// table returned unconditional `"Return"` for every `Enter` press
+    /// regardless of shift, so Ctrl+Shift+Enter silently inserted the blank
+    /// line *below* the cursor instead of *above*.
+    ///
+    /// **Verified RED against unfixed `develop`:** with GTK's old table
+    /// (`NamedKey::Enter => "Return"` unconditionally), this Ctrl+Shift+Enter
+    /// press decodes as plain Ctrl+Enter, so the blank line lands below the
+    /// cursor line (still `"line1"`) instead of above it — the first
+    /// assertion (`line(1) == ""`) fails against that.
+    #[test]
+    fn ctrl_shift_enter_inserts_line_above_not_below_on_gtk() {
+        let mut engine = Engine::new_for_test();
+        engine.settings.editor_mode = crate::core::settings::EditorMode::Vscode;
+        engine.mode = crate::core::Mode::Insert;
+        engine.buffer_mut().insert(0, "line0\nline1\nline2\n");
+        engine.view_mut().cursor = crate::core::Cursor { line: 1, col: 0 };
+
+        let mut h = harness(engine, 1200, 800);
+        h.driver.render();
+
+        press(
+            &mut h,
+            Key::Named(NamedKey::Enter),
+            Modifiers {
+                shift: true,
+                ctrl: true,
+                ..Default::default()
+            },
+        );
+
+        let eng = h.engine.borrow();
+        let line = |i: usize| eng.buffer().content.line(i).to_string();
+        assert_eq!(
+            line(1).trim_end_matches('\n'),
+            "",
+            "Ctrl+Shift+Enter must insert the blank line ABOVE the original \
+             cursor line, pushing \"line1\" down rather than appending a \
+             blank line after it"
+        );
+        assert_eq!(
+            line(2).trim_end_matches('\n'),
+            "line1",
+            "the original cursor line's text must have moved down to make \
+             room for the blank line inserted above it"
+        );
+    }
+
+    /// Shift+Home / Shift+End (no ctrl): `engine_key_from_ui`'s
+    /// `NamedKey::Home if shift` / `NamedKey::End if shift` arms now yield
+    /// `"Shift_Home"`/`"Shift_End"`, which the non-ctrl `Shift_`-prefixed
+    /// arm of `handle_vscode_key` turns into `vscode_extend_selection`
+    /// (`"SmartHome"`/`"LineEnd"`) — real selection-extension that GTK's old
+    /// table (unconditional `"Home"`/`"End"`, ignoring shift) never fired.
+    ///
+    /// **Verified RED against unfixed `develop`:** GTK's old table decodes
+    /// Shift+End identically to plain End, so mode never arms `Visual` and
+    /// the cursor still moves but no selection exists — the
+    /// `Mode::Visual` assertion fails against that.
+    #[test]
+    fn shift_home_and_shift_end_extend_selection_on_gtk() {
+        let mut engine = Engine::new_for_test();
+        engine.settings.editor_mode = crate::core::settings::EditorMode::Vscode;
+        engine.mode = crate::core::Mode::Insert;
+        engine.buffer_mut().insert(0, "hello world\n");
+        engine.view_mut().cursor = crate::core::Cursor { line: 0, col: 5 };
+
+        let mut h = harness(engine, 1200, 800);
+        h.driver.render();
+
+        press(
+            &mut h,
+            Key::Named(NamedKey::End),
+            Modifiers {
+                shift: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            h.engine.borrow().mode,
+            crate::core::Mode::Visual,
+            "Shift+End must arm a selection (vscode_extend_selection), \
+             which never happened on GTK before #826"
+        );
+        assert_eq!(
+            h.engine.borrow().view().cursor.col,
+            11,
+            "Shift+End must move the cursor to end-of-line (\"hello world\" \
+             is 11 chars) via the LineEnd op"
+        );
+
+        press(
+            &mut h,
+            Key::Named(NamedKey::Home),
+            Modifiers {
+                shift: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            h.engine.borrow().mode,
+            crate::core::Mode::Visual,
+            "Shift+Home must also extend (not replace) the active selection"
+        );
+        assert_eq!(
+            h.engine.borrow().view().cursor.col,
+            0,
+            "Shift+Home's SmartHome op must move the cursor to column 0 on \
+             a line with no leading whitespace"
+        );
+    }
+
+    /// Ctrl+Shift+Right (word-level selection): `engine_key_from_ui`'s
+    /// `NamedKey::Right if shift && ctrl` arm yields `("Shift_Right", _,
+    /// true)` — the `ctrl` flag routes `handle_vscode_key` into its `if
+    /// ctrl` block, where `"Shift_Right"` calls
+    /// `vscode_extend_selection("WordForward")` (a whole-word jump),
+    /// distinct from the plain-Shift `"Shift_Right"` arm covered by
+    /// `shift_right_extends_selection_and_ctrl_c_copies_it_on_gtk` above,
+    /// which extends one character at a time. GTK's old table never
+    /// combined ctrl+shift for the arrows at all.
+    ///
+    /// **Verified RED against unfixed `develop`:** GTK's old table decodes
+    /// Ctrl+Shift+Right as unconditional `"Right"` (no ctrl, no shift
+    /// tracking) — the cursor moves one character, mode stays `Insert`, and
+    /// the `Mode::Visual` / `col == 6` assertions below fail against that.
+    #[test]
+    fn ctrl_shift_right_extends_word_selection_on_gtk() {
+        let mut engine = Engine::new_for_test();
+        engine.settings.editor_mode = crate::core::settings::EditorMode::Vscode;
+        engine.mode = crate::core::Mode::Insert;
+        engine.buffer_mut().insert(0, "hello world\n");
+
+        let mut h = harness(engine, 1200, 800);
+        h.driver.render();
+
+        press(
+            &mut h,
+            Key::Named(NamedKey::Right),
+            Modifiers {
+                shift: true,
+                ctrl: true,
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(
+            h.engine.borrow().mode,
+            crate::core::Mode::Visual,
+            "Ctrl+Shift+Right must arm a selection via \
+             vscode_extend_selection(\"WordForward\")"
+        );
+        assert_eq!(
+            h.engine.borrow().view().cursor.col,
+            6,
+            "a single Ctrl+Shift+Right from col 0 in \"hello world\" must \
+             jump the cursor to the start of the next word (col 6), not \
+             one character (col 1) — proving the ctrl flag reached \
+             handle_vscode_key's word-level branch"
+        );
+    }
+
+    /// #1060: the four keys this module's own doc comment used to list as
+    /// deliberately kept on GTK's own spelling (`BackTab`, `PageUp`,
+    /// `PageDown`, `Insert`) now go through this same shared decoder too.
+    ///
+    /// `NamedKey::BackTab` used to decode to GTK's own `"BackTab"`; the
+    /// shared decoder spells it `"ISO_Left_Tab"` (TUI's spelling, and
+    /// X11/GDK's). `Engine::handle_key`'s Ctrl+Shift+Tab
+    /// tab-switcher-backward binding (`keys.rs`, `ctrl && key_name ==
+    /// "ISO_Left_Tab"`) only ever recognised that spelling — TUI already
+    /// sent it and the binding already worked there — so on unfixed GTK,
+    /// which sent `"BackTab"`, Ctrl+Shift+Tab silently did nothing: no
+    /// match in `keys.rs`, so `open_tab_switcher` was never called and the
+    /// popup never painted.
+    ///
+    /// **Verified RED against unfixed `develop`:** with the old
+    /// `NamedKey::BackTab => "BackTab".to_string()` GTK special case
+    /// restored, `key_name == "ISO_Left_Tab"` never matches,
+    /// `tab_switcher_popup_rect` stays `None`, and the final assertion
+    /// fails.
+    #[test]
+    fn ctrl_shift_tab_opens_the_tab_switcher_on_gtk() {
+        let mut engine = Engine::new_for_test();
+        // A second tab so `open_tab_switcher` has more than one MRU entry
+        // (it no-ops, leaving `tab_switcher_open` false, with only one).
+        engine.new_tab(None);
+
+        let mut h = harness(engine, 1400, 900);
+        h.driver.render();
+        assert!(
+            h.tab_switcher_popup_rect.get().is_none(),
+            "precondition: the tab switcher starts closed"
+        );
+
+        press(
+            &mut h,
+            Key::Named(NamedKey::BackTab),
+            Modifiers {
+                ctrl: true,
+                shift: true,
+                ..Default::default()
+            },
+        );
+        h.driver.render();
+
+        assert!(
+            h.tab_switcher_popup_rect.get().is_some(),
+            "Ctrl+Shift+Tab decoded via the shared `engine_key_from_ui` \
+             (\"ISO_Left_Tab\") must open and paint the tab switcher popup, \
+             exactly as it already did on TUI"
+        );
+    }
+
+    /// #1060: `NamedKey::PageDown`/`PageUp` used to decode to GTK's own
+    /// `"PageDown"`/`"PageUp"` spelling; the shared decoder spells them
+    /// `"Page_Down"`/`"Page_Up"` (TUI's spelling). `Engine::sc_sidebar_
+    /// navigate`'s nav-key table (`source_control.rs`) only ever recognised
+    /// `"Page_Up"`/`"Page_Down"` — a pre-existing GTK gap the old inline
+    /// decoder comment called out explicitly — so on unfixed GTK, PageUp/
+    /// PageDown in the Source Control sidebar silently did nothing.
+    ///
+    /// `sc_file_statuses` is populated directly (no real git repo, no
+    /// `sc_refresh()`) — it is a plain field `build_source_control_data`
+    /// reads unconditionally, so this is deterministic and has no
+    /// filesystem dependency (unlike `sc_open_the_tab_switcher`'s sibling
+    /// tests elsewhere that shell out to real `git`).
+    ///
+    /// Asserts on repainted pixels across the sidebar body (`CLAUDE.md`
+    /// rule 1), not on `sc_selected_from_sidebar_system()` — the same
+    /// technique this file's `source_control_toolbar_button_highlights_on_hover`
+    /// / `clicking_editor_clears_a_pressed_sc_toolbar_button_highlight`
+    /// tests already use for this exact panel.
+    ///
+    /// **Verified RED against unfixed `develop`:** with the old
+    /// `NamedKey::PageDown => "PageDown".to_string()` / `NamedKey::PageUp
+    /// => "PageUp".to_string()` GTK special cases restored, neither string
+    /// matches `sc_sidebar_navigate`'s nav-key table, the SidebarSystem's
+    /// selection never moves, and both `assert_ne!`s below fail (`before
+    /// == after_down == after_up`).
+    #[test]
+    fn page_down_and_page_up_navigate_the_sc_sidebar_on_gtk() {
+        use crate::core::git::{FileStatus, StatusKind};
+
+        let mut engine = Engine::new_for_test();
+        engine.settings.use_nerd_fonts = Some(false);
+        engine.app_shell.show_panel(&quadraui::WidgetId::new(
+            crate::core::engine::sidebar::PANEL_GIT,
+        ));
+        engine.sc_has_focus = true;
+        // Staged, not unstaged: `SC_SECTION_STAGED` is the SidebarSystem's
+        // default active section, and PageUp/PageDown navigate *within the
+        // active section* — files with no staged entries would leave that
+        // section's row list empty and any key navigate nothing, which is
+        // a test-fixture bug, not evidence about the fix under test.
+        engine.sc_file_statuses = vec![
+            FileStatus {
+                path: "zqxw1060_a.rs".to_string(),
+                staged: Some(StatusKind::Modified),
+                ..Default::default()
+            },
+            FileStatus {
+                path: "zqxw1060_b.rs".to_string(),
+                staged: Some(StatusKind::Modified),
+                ..Default::default()
+            },
+            FileStatus {
+                path: "zqxw1060_c.rs".to_string(),
+                staged: Some(StatusKind::Modified),
+                ..Default::default()
+            },
+        ];
+
+        let mut h = harness(engine, 1400, 900);
+        h.driver.render();
+        assert!(
+            h.driver.screen_contains("zqxw1060_a.rs"),
+            "precondition: the synthetic Changes section must paint; \
+             painted: {:?}",
+            h.driver.painted_texts()
+        );
+
+        let body_rect = h.engine.borrow().sc_sidebar_body_rect.get();
+        let sample = |h: &mut Harness<_>| -> Vec<(u8, u8, u8)> {
+            let mut px = Vec::new();
+            let mut y = body_rect.y as i32;
+            while y < (body_rect.y + body_rect.height) as i32 {
+                let mut x = body_rect.x as i32;
+                while x < (body_rect.x + body_rect.width) as i32 {
+                    px.push(h.driver.pixel(x, y));
+                    x += 3;
+                }
+                y += 2;
+            }
+            px
+        };
+        let nothing_selected = sample(&mut h);
+
+        // First PageDown: nothing selected -> row 0 (`(1, 0)` via
+        // `sc_selected_from_sidebar_system`, verified while writing this
+        // test). Establishes a starting selection so the second PageDown
+        // below has somewhere to move *from*.
+        press(&mut h, Key::Named(NamedKey::PageDown), Modifiers::default());
+        h.driver.render();
+        let at_row_0 = sample(&mut h);
+        assert_ne!(
+            nothing_selected, at_row_0,
+            "PageDown decoded via the shared `engine_key_from_ui` \
+             (\"Page_Down\") must move the SC sidebar's selection and \
+             repaint the highlight"
+        );
+
+        // Second PageDown: row 0 -> row 2 (the last row — all three fit in
+        // one page at this window height).
+        press(&mut h, Key::Named(NamedKey::PageDown), Modifiers::default());
+        h.driver.render();
+        let at_row_2 = sample(&mut h);
+        assert_ne!(
+            at_row_0, at_row_2,
+            "a second PageDown must move the selection further (row 0 -> \
+             row 2), not clamp back to where the first PageDown already \
+             landed"
+        );
+
+        // PageUp: row 2 -> row 0 — the return trip, proving `NamedKey::
+        // PageUp` reaches the same nav-key table via the shared decoder's
+        // `"Page_Up"` spelling, not just `NamedKey::PageDown`'s `"Page_Down"`.
+        press(&mut h, Key::Named(NamedKey::PageUp), Modifiers::default());
+        h.driver.render();
+        let after_up = sample(&mut h);
+        assert_eq!(
+            after_up, at_row_0,
+            "PageUp decoded via the shared `engine_key_from_ui` (\"Page_Up\") \
+             must move the selection back to row 0, matching the highlight \
+             the first PageDown produced"
+        );
+    }
+
+    /// #1060 review: plain BackTab (Shift+Tab, no ctrl) against the Source
+    /// Control sidebar — the GTK mirror of TUI's `back_tab_cycles_the_sc_
+    /// sidebar_section_backward_via_shell_app`. `FocusKeyRoute::SourceControl`
+    /// is the one route whose `key_name` travels through `map_gtk_key_with_
+    /// unicode` (not `map_gtk_key_name`), and that function's `"Tab" |
+    /// "ISO_Left_Tab" => ("Tab", None)` arm used to silently collapse the
+    /// shared decoder's `"ISO_Left_Tab"` spelling (which `NamedKey::BackTab`
+    /// now produces, since this PR routed it through `engine_key_from_ui`)
+    /// right back down to plain `"Tab"` before `sc_sidebar_navigate` ever
+    /// saw it — so Shift+Tab silently cycled the active section *forward*
+    /// instead of backward, a regression this PR introduced and this test
+    /// closes.
+    ///
+    /// **Verified RED against unfixed `develop`:** with `map_gtk_key_with_
+    /// unicode`'s `"ISO_Left_Tab"` arm restored to fold into `("Tab", None)`
+    /// instead of `("BackTab", None)`, the final `assert!` below fails —
+    /// BackTab shows `"▶ CHANGES"` (cycled forward again) instead of cycling
+    /// back to `"▶ STAGED CHANGES"`.
+    #[test]
+    fn back_tab_cycles_the_sc_sidebar_section_backward_on_gtk() {
+        use crate::core::git::{FileStatus, StatusKind};
+
+        let mut engine = Engine::new_for_test();
+        engine.settings.use_nerd_fonts = Some(false);
+        engine.app_shell.show_panel(&quadraui::WidgetId::new(
+            crate::core::engine::sidebar::PANEL_GIT,
+        ));
+        engine.sc_has_focus = true;
+        // One file in each of the two always-shown sections (Staged,
+        // Changes) so both headers paint, mirroring the TUI test's fixture.
+        engine.sc_file_statuses = vec![
+            FileStatus {
+                path: "zqxwbts.rs".to_string(),
+                staged: Some(StatusKind::Modified),
+                ..Default::default()
+            },
+            FileStatus {
+                path: "zqxwbtc.rs".to_string(),
+                unstaged: Some(StatusKind::Modified),
+                ..Default::default()
+            },
+        ];
+
+        let mut h = harness(engine, 1400, 900);
+        h.driver.render();
+        assert!(
+            h.driver.screen_contains("▶ STAGED CHANGES"),
+            "precondition: Staged must be the initially active section; \
+             painted: {:?}",
+            h.driver.painted_texts()
+        );
+
+        press(&mut h, Key::Named(NamedKey::Tab), Modifiers::default());
+        h.driver.render();
+        assert!(
+            h.driver.screen_contains("▶ CHANGES") && !h.driver.screen_contains("▶ STAGED CHANGES"),
+            "Tab must cycle the SC sidebar's active section forward, from \
+             Staged to Changes; painted: {:?}",
+            h.driver.painted_texts()
+        );
+
+        press(&mut h, Key::Named(NamedKey::BackTab), Modifiers::default());
+        h.driver.render();
+        assert!(
+            h.driver.screen_contains("▶ STAGED CHANGES"),
+            "plain BackTab (Shift+Tab, no ctrl) decoded via the shared \
+             `engine_key_from_ui` (\"ISO_Left_Tab\") must cycle the active \
+             section back to Staged through `map_gtk_key_with_unicode`'s \
+             SourceControl route — before this fix it silently collapsed \
+             back to \"Tab\" and cycled forward again instead; painted: {:?}",
+            h.driver.painted_texts()
+        );
+    }
+}
+
+// ── #928 proof slice: `crate::harness::ConformanceHarness` on `GtkDriver` ──
+//
+// Each scenario body lives in `crate::harness` and is written once
+// against `quadraui::testing::ConformanceDriver`; `src/macos/mod.rs`
+// runs the identical bodies against `MacDriver`. Directory names below
+// are picked so a fuzzy-subsequence match of the query against the other
+// name can't succeed (not "disjoint character sets" — the two names below
+// share several characters) — see
+// `crate::harness::folder_picker_filters_and_escape_dismisses`'s doc for
+// the actual rule and why a query that could fuzzy-match both names would
+// make the "filtered out" assertion pass unconditionally.
+#[cfg(test)]
+mod conformance_proof_slice {
+    use super::{conformance_harness, conformance_harness_with_folder_picker};
+    use crate::core::Engine;
+
+    /// Same nerd-fonts-off rationale as `src/macos/mod.rs`'s and
+    /// `src/win/mod.rs`'s own `plain_engine()` twins: icon glyphs are
+    /// normally separate painted runs from the text labels these scenarios'
+    /// `screen_has` checks look for, but keeping the three backends'
+    /// fixtures identical (rather than one relying on the default) is one
+    /// less thing to double-check when a scenario body moves between them.
+    fn plain_engine() -> Engine {
+        let mut engine = Engine::new_for_test();
+        engine.settings.use_nerd_fonts = Some(false);
+        engine
+    }
+
+    fn scratch_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_test_928_gtk_conformance_{tag}_{:?}",
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Scenario 1 (#928): open/filter/Esc-dismiss the folder picker via
+    /// `GtkDriver`.
+    ///
+    /// RED-verified: with `App::apply_folder_picker_event` (`src/app.rs`)
+    /// temporarily made an unconditional no-op (an early `return` before
+    /// its body), this test fails on the `screen_has(other)` assertion
+    /// right after `type_text` — the query never reaches
+    /// `FolderPickerController::handle`, so nothing gets filtered.
+    /// Reverted after confirming; see this issue's PR notes.
+    #[test]
+    fn folder_picker_filters_and_escape_dismisses() {
+        let dir = scratch_dir("scenario1");
+        std::fs::create_dir_all(dir.join("kkxxqq_distinctive_928")).unwrap();
+        std::fs::create_dir_all(dir.join("another_unrelated_dir_928")).unwrap();
+
+        let mut h = conformance_harness_with_folder_picker(plain_engine(), dir.clone(), 800, 480);
+
+        crate::harness::folder_picker_filters_and_escape_dismisses(
+            &mut h.driver,
+            "kkxxqq_distinctive_928",
+            "another_unrelated_dir_928",
+            "kkxxqq_distinctive_928",
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Scenario 2 (#928): the command palette's own open/filter/Esc
+    /// cycle, via `GtkDriver` — no pre-seeded field, exercises the
+    /// `:CommandPalette` ex-command path live.
+    #[test]
+    fn command_palette_filters_and_escape_dismisses() {
+        // #947: height was `480` — tall enough to list both "Toggle
+        // Sidebar" and "Toggle Terminal" (this scenario's unfiltered
+        // precondition) at the old, settings-ignoring paint font (~11pt)
+        // but not at the real default `settings.font_size` (14pt) once
+        // #947 wired it through to paint: taller painted rows mean fewer
+        // palette rows fit in the same pixel height, and one of the two
+        // entries this scenario needs fell off the visible list before any
+        // filter narrowed it.
+        let mut h = conformance_harness(plain_engine(), 800, 700);
+
+        crate::harness::command_palette_filters_and_escape_dismisses(&mut h.driver);
+    }
+
+    /// Scenario 3 (#928): a click outside the open folder picker's
+    /// popup must dismiss it, via `GtkDriver::click`'s raw
+    /// pixel-coordinate dispatch.
+    #[test]
+    fn folder_picker_click_outside_dismisses_it() {
+        let dir = scratch_dir("scenario3");
+        std::fs::create_dir_all(dir.join("kkxxqq_distinctive_928")).unwrap();
+        std::fs::create_dir_all(dir.join("another_unrelated_dir_928")).unwrap();
+
+        let (width, height) = (800.0, 480.0);
+        let mut h = conformance_harness_with_folder_picker(
+            plain_engine(),
+            dir.clone(),
+            width as i32,
+            height as i32,
+        );
+
+        crate::harness::folder_picker_click_outside_dismisses_it(
+            &mut h.driver,
+            "kkxxqq_distinctive_928",
+            "another_unrelated_dir_928",
+            width - 10.0,
+            height - 10.0,
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// #969: the GTK leg of the `TextMetricsBackend` conformance assertion —
+/// see `crate::harness::assert_text_metrics_backend_applies_metrics`'s doc
+/// for the #967 stub this guards against and why the check has to round-trip
+/// through the trait object rather than inspect state. No driver needed
+/// here: `GtkBackend::new()` is a plain struct construction (no display, no
+/// `gtk4::init`), so this runs in the same headless CI lane as every other
+/// test in this file.
+#[cfg(test)]
+mod issue_969_text_metrics_backend_conformance {
+    #[test]
+    fn gtk_backend_applies_line_height_and_char_width() {
+        let mut backend = crate::gtk::backend::GtkBackend::new();
+        crate::harness::assert_text_metrics_backend_applies_metrics(&mut backend);
+    }
+}
+
+// ── #971: hit-band integrity sweep, the GTK half ────────────────────────
+//
+// #971's review requested GTK-side coverage proving the SC/ext-panel
+// `set_backend_info` wiring fix and the `HeaderActivated` double-toggle fix
+// both hold on this backend too — the fix sites in `src/app.rs` and
+// `src/core/engine/{source_control,ext_panel}.rs` have no backend gate, so
+// the macOS-only coverage `src/macos/mod.rs::mac_driver_tests` originally
+// shipped was a real gap, not redundant with it. These two tests are the
+// GTK twins of `mac_driver_tests::sc_panel_header_click_hit_band_matches_the_painted_row`
+// and `::ext_panel_header_click_hit_band_matches_the_painted_row` — same
+// fixtures, same `crate::harness::sweep_hit_band_integrity_resetting` call,
+// same sanity-check shape — built on `conformance_harness`
+// (`quadraui::testing::ConformanceDriver`) rather than this module's own
+// `Harness`, since the sweep helpers in `crate::harness` are written once
+// against that backend-neutral trait.
+#[cfg(test)]
+mod hit_band_sweep_971 {
+    use quadraui::testing::ConformanceDriver;
+
+    use super::conformance_harness;
+    use crate::core::engine::sidebar::PANEL_GIT;
+    use crate::core::Engine;
+
+    /// Surface size in pixels — arbitrary, matches `src/macos/mod.rs`'s own
+    /// `W`/`H` for this issue's fixtures so painted layouts are directly
+    /// comparable between the two backends' test failures.
+    const W: i32 = 1400;
+    const H: i32 = 900;
+
+    /// Same nerd-fonts-off rationale as every other `plain_engine()` twin in
+    /// this repo (`src/macos/mod.rs`, `conformance_proof_slice` above):
+    /// icon glyphs are a separate painted run from the text labels these
+    /// tests' `screen_has` checks look for.
+    fn plain_engine() -> Engine {
+        let mut engine = Engine::new_for_test();
+        engine.settings.use_nerd_fonts = Some(false);
+        engine
+    }
+
+    /// Mirrors `src/macos/mod.rs::mac_driver_tests::engine_with_sc_recent_commits`
+    /// exactly: three filler unstaged files (pushes "RECENT COMMITS" a few
+    /// rows down — a row-index-dependent hit-band bug can pass on row 0 and
+    /// only surface further down) and two log entries, so there is a content
+    /// row directly beneath the header a mis-hit could land on.
+    fn engine_with_sc_recent_commits() -> Engine {
+        let mut engine = plain_engine();
+        engine
+            .app_shell
+            .show_panel(&quadraui::WidgetId::new(PANEL_GIT));
+        engine.sc_file_statuses = (0..3)
+            .map(|i| crate::core::git::FileStatus {
+                path: format!("filler_971_{i}.rs"),
+                staged: None,
+                unstaged: Some(crate::core::git::StatusKind::Modified),
+                unmerged: None,
+            })
+            .collect();
+        engine.sc_log = (0..2)
+            .map(|i| crate::core::git::GitLogEntry {
+                hash: format!("{i:07x}"),
+                message: format!("ZQXW971SCLOG{i}"),
+            })
+            .collect();
+        engine
+    }
+
+    /// Centre point of the first painted text run containing `needle` —
+    /// mirrors `src/macos/mod.rs::mac_driver_tests::center_of` exactly.
+    fn center_of<D: ConformanceDriver>(driver: &D, needle: &str) -> (f32, f32) {
+        let bounds = driver
+            .inventory()
+            .text_runs()
+            .iter()
+            .find(|r| r.text.contains(needle))
+            .unwrap_or_else(|| panic!("center_of: {needle:?} not painted"))
+            .bounds;
+        (
+            bounds.x + bounds.width / 2.0,
+            bounds.y + bounds.height / 2.0,
+        )
+    }
+
+    /// #971: the source-control panel's "RECENT COMMITS" section header,
+    /// clicked anywhere inside its own painted glyphs, must always toggle
+    /// *that* section — never the log row painted immediately below it. The
+    /// GTK twin of `mac_driver_tests::sc_panel_header_click_hit_band_matches_the_painted_row`
+    /// — see that test's own doc for the full rationale (the cached
+    /// `SidebarSystem` routing pattern this pins, and why
+    /// `sweep_hit_band_integrity_resetting` rather than
+    /// `sweep_hit_band_integrity` is needed here: quadraui's
+    /// `DoubleClickDetector` folds two same-spot `MouseDown`s in quick
+    /// succession into a `DoubleClick` on **every** backend — GTK included,
+    /// not just `MacBackend` — and `SidebarSystem::double_click` has no
+    /// header case).
+    ///
+    /// **RED-verification (#971):** reverting `App::paint_sidebar_panel_rung`'s
+    /// `PANEL_GIT` arm to drop its `set_backend_info` call (this issue's own
+    /// fix) takes this test red on GTK exactly as it does on macOS — the
+    /// very first sanity click stops collapsing the section at all, so the
+    /// "`!screen_contains(...)`" sanity assertion fires before the sweep is
+    /// even reached. Confirmed locally with `cargo test --features gui
+    /// sc_panel_header_click_hit_band_matches_the_painted_row_gtk` before
+    /// restoring the fix.
+    #[test]
+    fn sc_panel_header_click_hit_band_matches_the_painted_row_gtk() {
+        let mut h = conformance_harness(engine_with_sc_recent_commits(), W, H);
+
+        assert!(
+            h.driver.screen_contains("RECENT COMMITS") && h.driver.screen_contains("ZQXW971SCLOG0"),
+            "precondition: the SC panel must paint both the RECENT COMMITS \
+             header and its first log entry; painted text was {:?}",
+            h.driver.painted_texts()
+        );
+
+        // Sanity: the sweep below only compares samples against *each
+        // other*, so a header click that silently did nothing would still
+        // pass every sample uniformly. Prove the click has real effect
+        // first, so the sweep cannot pass vacuously.
+        let center = center_of(&h.driver, "RECENT COMMITS");
+        h.driver.click(center.0, center.1);
+        assert!(
+            !h.driver.screen_contains("ZQXW971SCLOG0"),
+            "sanity: a header click must actually collapse the section, \
+             hiding the log entry; painted text was {:?}",
+            h.driver.painted_texts()
+        );
+        h.engine
+            .borrow_mut()
+            .sc_sidebar_system
+            .borrow_mut()
+            .set_collapsed(crate::core::engine::SC_SECTION_LOG, false);
+        h.driver.render();
+        assert!(
+            h.driver.screen_contains("ZQXW971SCLOG0"),
+            "sanity restore: re-expanding the section directly must bring \
+             the log entry back; painted text was {:?}",
+            h.driver.painted_texts()
+        );
+
+        let engine = h.engine.clone();
+        crate::harness::sweep_hit_band_integrity_resetting(
+            &mut h.driver,
+            "RECENT COMMITS",
+            5,
+            |d| {
+                // Break the `DoubleClickDetector`'s position match before
+                // every real probe — see this test's own doc.
+                d.click(W as f32 - 20.0, H as f32 - 20.0);
+                engine
+                    .borrow_mut()
+                    .sc_sidebar_system
+                    .borrow_mut()
+                    .set_collapsed(crate::core::engine::SC_SECTION_LOG, false);
+                d.render();
+            },
+            |d| ConformanceDriver::inventory(d).screen_has("ZQXW971SCLOG0"),
+        );
+    }
+
+    // #1089's own retirement: `ext_panel_header_click_hit_band_matches_the_
+    // painted_row_gtk` used to live here, pointed at a fixture
+    // (`engine_with_marketplace_as_ext_panel`) that set `ext_panel_active`
+    // to a name with **no** `PanelRegistration` — a fixture hack that only
+    // ever made sense while `App::paint_sidebar_panel_rung`'s `ext:` arm
+    // unconditionally painted the extension marketplace regardless of
+    // which plugin id was active. Now that the arm paints a real
+    // `PanelRegistration`'s own sections (#1089), that fixture paints
+    // nothing (no registration means `render::build_ext_panel_data`
+    // returns `None`) and the test fails on its own precondition. The
+    // property it existed to pin — a section-header click, swept across
+    // its whole painted band, always toggles *that* header and no other —
+    // is now covered against a genuine plugin panel by
+    // `crate::harness::plugin_panel`'s `plugin_panel_section_header_hit_
+    // band_on_gtk` (`src/harness/plugin_panel/tests.rs`), built on
+    // `engine_with_plugin_panel` (a real registration + `ext_panel_items`)
+    // per that issue's own "Shape of the work" item 3.
+}
+
+// ─── #991: merge-conflict rows in the Source Control panel (GTK) ─────────
+//
+// The GTK twin of `src/tui_main/shell_app.rs`'s
+// `sc_panel_paints_every_unmerged_xy_code_under_merge_changes` and
+// friends — the multi-backend rule applies to the tests too, and the SC
+// panel's sections are painted through the shared
+// `render::populate_sc_sidebar_system` on both backends, so a section
+// inserted at index 0 has to be proven on both.
+//
+// Every assertion reads *painted* content (`text_runs()` / `screen_has`),
+// never `engine.sc_file_statuses`.
+//
+// **RED against unfixed `develop`:** there is no "MERGE CHANGES" section
+// at all, so `painted_row_y(.., "MERGE CHANGES")` is `None` and the
+// `.expect(..)` fires in all three conflict tests; for `UU`/`UA` the file
+// row is additionally absent from the frame entirely.
+#[cfg(test)]
+mod issue_991_merge_conflicts {
+    use quadraui::testing::ConformanceDriver;
+
+    use super::conformance_harness;
+    use crate::core::engine::sidebar::PANEL_GIT;
+    use crate::core::Engine;
+
+    const W: i32 = 1400;
+    const H: i32 = 900;
+
+    /// Nerd-fonts off for the same reason every other `plain_engine()`
+    /// twin in this repo does it: icon glyphs are a separate painted run
+    /// from the text labels these assertions look for.
+    fn plain_engine() -> Engine {
+        let mut engine = Engine::new_for_test();
+        engine.settings.use_nerd_fonts = Some(false);
+        engine
+            .app_shell
+            .show_panel(&quadraui::WidgetId::new(PANEL_GIT));
+        engine
+    }
+
+    /// An engine whose SC statuses come from a literal `git status
+    /// --porcelain` block, parsed by the **real** parser — lets one test
+    /// drive all seven unmerged `XY` codes without seven real conflicts.
+    fn engine_with_porcelain(porcelain: &str) -> Engine {
+        let mut engine = plain_engine();
+        engine.sc_file_statuses = crate::core::git::parse_status_porcelain(porcelain);
+        engine
+    }
+
+    /// Top y of the first painted text run containing `needle`, or `None`
+    /// when nothing painted it.
+    fn painted_row_y<D: ConformanceDriver>(driver: &D, needle: &str) -> Option<f32> {
+        driver
+            .inventory()
+            .text_runs()
+            .iter()
+            .find(|r| r.text.contains(needle))
+            .map(|r| r.bounds.y)
+    }
+
+    /// #991, the whole table from the issue: one case per unmerged `XY`
+    /// code. `UU`/`UA` used to vanish from the panel entirely; the other
+    /// five used to be painted as ordinary staged/unstaged changes.
+    /// Section membership is asserted geometrically from the painted row's
+    /// own y against the two painted section headers.
+    #[test]
+    fn sc_panel_paints_every_unmerged_xy_code_under_merge_changes_gtk() {
+        for (code, path) in [
+            ("UU", "zqxw991uu.txt"),
+            ("UA", "zqxw991ua.txt"),
+            ("AU", "zqxw991au.txt"),
+            ("DU", "zqxw991du.txt"),
+            ("UD", "zqxw991ud.txt"),
+            ("AA", "zqxw991aa.txt"),
+            ("DD", "zqxw991dd.txt"),
+        ] {
+            let h = conformance_harness(engine_with_porcelain(&format!("{code} {path}\n")), W, H);
+            let painted = h.driver.painted_texts();
+
+            let merge = painted_row_y(&h.driver, "MERGE CHANGES").unwrap_or_else(|| {
+                panic!(
+                    "{code}: the SC panel must paint a MERGE CHANGES section for \
+                     a conflicted file; painted: {painted:?}"
+                )
+            });
+            let staged = painted_row_y(&h.driver, "STAGED CHANGES").unwrap_or_else(|| {
+                panic!("{code}: STAGED CHANGES header missing; painted: {painted:?}")
+            });
+            let row = painted_row_y(&h.driver, path).unwrap_or_else(|| {
+                panic!("{code}: the conflicted file row was never painted; painted: {painted:?}")
+            });
+
+            assert!(
+                merge < row && row < staged,
+                "{code}: the conflicted row must paint *inside* MERGE CHANGES \
+                 (header y={merge}, STAGED CHANGES y={staged}), but painted at \
+                 y={row}; painted: {painted:?}"
+            );
+            // VS Code's conflict marker, from `StatusKind::Unmerged::label()`.
+            assert!(
+                h.driver
+                    .inventory()
+                    .text_runs()
+                    .iter()
+                    .any(|r| r.text.trim() == "!" && (r.bounds.y - row).abs() < 1.0),
+                "{code}: the conflicted row must carry the '!' conflict marker \
+                 on its own line; painted: {painted:?}"
+            );
+        }
+    }
+
+    /// #991 regression case: a non-conflicted tree must still render
+    /// exactly the two file sections it always did — Merge Changes is not
+    /// always-on.
+    #[test]
+    fn sc_panel_without_conflicts_paints_no_merge_changes_section_gtk() {
+        let h = conformance_harness(
+            engine_with_porcelain("M  zqxw991stg.txt\n M zqxw991drt.txt\n"),
+            W,
+            H,
+        );
+        let painted = h.driver.painted_texts();
+        assert!(
+            !h.driver.screen_contains("MERGE CHANGES"),
+            "a conflict-free tree must not paint a MERGE CHANGES section; \
+             painted: {painted:?}"
+        );
+        assert!(
+            h.driver.screen_contains("STAGED CHANGES")
+                && h.driver.screen_contains("zqxw991stg.txt"),
+            "the ordinary staged row must still paint; painted: {painted:?}"
+        );
+        assert!(
+            h.driver.screen_contains("zqxw991drt.txt"),
+            "the ordinary unstaged row must still paint; painted: {painted:?}"
+        );
+    }
+
+    /// #991 end-to-end on GTK: a **real** `git merge` conflict read back
+    /// through `Engine::sc_refresh` → `git status --porcelain` → the
+    /// painted panel.
+    #[test]
+    fn sc_panel_paints_a_real_merge_conflict_under_merge_changes_gtk() {
+        let dir = crate::harness::make_conflicted_repo("gtk991");
+        let mut engine = plain_engine();
+        engine.cwd = dir.clone();
+        engine.sc_refresh();
+
+        let h = conformance_harness(engine, W, H);
+        let painted = h.driver.painted_texts();
+
+        let merge = painted_row_y(&h.driver, "MERGE CHANGES").unwrap_or_else(|| {
+            panic!("a real merge conflict must paint MERGE CHANGES; painted: {painted:?}")
+        });
+        let staged = painted_row_y(&h.driver, "STAGED CHANGES")
+            .unwrap_or_else(|| panic!("STAGED CHANGES header missing; painted: {painted:?}"));
+        let row =
+            painted_row_y(&h.driver, crate::harness::CONFLICT_FIXTURE_FILE).unwrap_or_else(|| {
+                panic!("the conflicted row was never painted; painted: {painted:?}")
+            });
+        assert!(
+            merge < row && row < staged,
+            "the conflicted row must paint inside MERGE CHANGES; painted: {painted:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// #1063 review fix: the converged menu-action `EngineAction` applier
+/// (`App::handle_menu_action` -> `App::dispatch_engine_action` ->
+/// `render::apply_engine_action` -> `GtkEngineActionHost`, `app.rs`) shipped
+/// with zero black-box coverage on GTK -- `harness.rs`'s own
+/// `issue_1063_menu_action_engine_action_applier` module registers `tui`
+/// and `tui_prod` scenarios only; its own doc explains why (the Alt+T/Enter
+/// dispatch it uses is `TuiDriver`-specific, not part of the shared
+/// `ConformanceDriver` bound), which doesn't excuse the GTK side of the
+/// actual converged code from having none. This module is the missing GTK
+/// arm, reached the way a user would: a real click on the "Terminal"
+/// menu-bar header, then a real click on "New Terminal" inside the dropdown
+/// it opens -- through `menu_system.handle()`, the same shared dispatch
+/// `handle_dispatch`'s "Menu system intercept" block (`app.rs`) routes both
+/// mouse and key events through, exactly like the
+/// `menu_quit_with_unsaved_changes_opens_confirm_dialog` test above (File >
+/// Quit) uses for a different menu.
+///
+/// `EngineAction::OpenTerminal` (the "terminal" menu id, `MENU_STRUCTURE`)
+/// is one of the five variants GTK's pre-#1063 `handle_menu_action` used to
+/// restate by hand behind a bare `_ => {}` -- exactly the rung this issue
+/// converged onto the shared `render::apply_engine_action` -- so a
+/// regression here (a double-borrow panic from `GtkEngineActionHost`
+/// reaching for a second, independent `self.app.engine.borrow_mut()`, or
+/// the macro-only `is_macro` suppression leaking into this non-macro menu
+/// path) would show up as this test failing or panicking.
+///
+/// **RED-verified:** with `GtkEngineActionHost::open_terminal`'s body
+/// replaced by a no-op (`self.app.draw_needed.set(true);` only), the
+/// "before"/"after" painted-text-count assertion below fails (`after`
+/// stays at 1, not 2). Restored before committing.
+#[cfg(test)]
+mod issue_1063_menu_action_engine_action_applier_gtk {
+    use super::*;
+
+    /// Exact-match count of the literal `"Terminal"` painted text, rather
+    /// than `screen_contains("Terminal")`: the menu bar's own top-level
+    /// "Terminal" header (`MENU_STRUCTURE`) is *always* painted once GTK's
+    /// menu bar is up (`menu_bar_visible` is forced true on GTK -- see
+    /// `command_center_stays_live_when_menu_bar_is_hidden`'s doc comment
+    /// above), so a substring/`screen_contains` check would pass even if
+    /// clicking "New Terminal" did nothing at all. Opening a terminal pane
+    /// adds a *second* "Terminal" -- the bottom-panel tab bar's own label
+    /// (`render::build_bottom_panel_tab_bar`) -- so the count going 1 -> 2
+    /// is the proof. This mirrors the row-skip trick
+    /// `harness.rs::menu_terminal_activation_opens_terminal_pane` (the
+    /// `tui`/`tui_prod` sibling of this test) uses against the TUI
+    /// character grid, adapted for GTK's flat painted-text list -- this
+    /// harness module's own doc notes GTK has no character grid to skip a
+    /// row of.
+    fn terminal_label_count(h: &Harness<impl AppLogic>) -> usize {
+        h.driver
+            .painted_texts()
+            .into_iter()
+            .filter(|t| *t == "Terminal")
+            .count()
+    }
+
+    #[test]
+    fn menu_terminal_new_terminal_opens_a_terminal_pane_on_gtk() {
+        let mut engine = Engine::new_for_test();
+        engine.settings.use_nerd_fonts = Some(false);
+        let mut h = harness(engine, 1400, 900);
+        h.driver.render();
+
+        assert_eq!(
+            terminal_label_count(&h),
+            1,
+            "precondition: only the menu bar's own \"Terminal\" header \
+             should be painted before any terminal pane opens; painted: \
+             {:?}",
+            h.driver.painted_texts()
+        );
+
+        let header = h
+            .driver
+            .find_bounds("Terminal")
+            .expect("the Terminal menu-bar header must paint");
+        h.driver.click(
+            header.x + header.width / 2.0,
+            header.y + header.height / 2.0,
+        );
+        h.driver.render();
+
+        let new_terminal = h.driver.find_bounds("New Terminal").expect(
+            "clicking the Terminal menu-bar header must open its dropdown, \
+             showing \"New Terminal\"",
+        );
+        h.driver.click(
+            new_terminal.x + new_terminal.width / 2.0,
+            new_terminal.y + new_terminal.height / 2.0,
+        );
+        h.driver.render();
+
+        assert_eq!(
+            terminal_label_count(&h),
+            2,
+            "Terminal \u{25b8} New Terminal must open a terminal pane, \
+             through the converged render::apply_engine_action -> \
+             GtkEngineActionHost::open_terminal path (#1063) -- adding the \
+             bottom-panel tab bar's own \"Terminal\" label alongside the \
+             menu bar's; painted: {:?}",
+            h.driver.painted_texts()
+        );
+        assert!(
+            h.engine.borrow().terminal_has_focus,
+            "opening a terminal via the menu must focus it, exactly as \
+             GtkEngineActionHost::open_terminal (App::new_terminal_tab's \
+             replacement) does"
+        );
+    }
+}
+
+#[cfg(test)]
+mod issue_1235_laststatus_frame_sizing {
+    //! #1235: `app.rs`'s `TerminalPanelResize` drag row math and the
+    //! wildmenu-`y` positioning both read `engine.settings.window_status_line`
+    //! directly instead of `render::effective_window_status_line` (#1206's
+    //! narrowing by `'laststatus'`), so they disagreed with
+    //! `render::build_screen_layout`/`compute_editor_layout` — which already
+    //! used the effective value — by one row whenever `'laststatus'` narrowed
+    //! `window_status_line` to `false`. This is the GTK twin of
+    //! `tui_main::shell_app::tests::
+    //! laststatus_frame_sizing_matches_shared_layout_across_window_count_via_shell_app`.
+    use super::*;
+    use crate::core::window::SplitDirection;
+
+    fn run_ex_command<A: quadraui::AppLogic>(h: &mut Harness<A>, text: &str) {
+        for ch in text.chars() {
+            h.driver.type_char(ch);
+        }
+        h.driver.press_named(quadraui::NamedKey::Enter);
+        h.driver.render();
+    }
+
+    /// Row-reservation evidence, read from **painted output**, not a
+    /// decision-only flag: `Engine::global_status_rect` is cleared to
+    /// `Rect::default()` at the top of every `render_content` pass and only
+    /// set back to a non-empty rect from inside the `FrameOp::GlobalStatusBar`
+    /// paint arm itself (`app.rs`, just above `FrameOp::Wildmenu`) — the same
+    /// #555 "what was actually painted" cache `route_chrome_click` hit-tests
+    /// clicks against, mirroring TUI's `chrome.status`/`command_line_rect`.
+    ///
+    /// **RED-verified against unfixed `develop`**: with a single window and
+    /// `laststatus=1`, `render::build_screen_layout`'s paint decision already
+    /// hid the global bar correctly (effective-value-based since #1206), but
+    /// `app.rs`'s raw-field row math still assumed it occupied its own row —
+    /// the bar's text stayed on screen with a non-empty `global_status_rect`
+    /// instead of clearing. Observed failing before the four-site fix,
+    /// passing after.
+    #[test]
+    fn laststatus_hides_the_global_status_bar_and_frees_its_row_via_gtk_driver() {
+        let mut engine = Engine::new_for_test();
+        engine.settings.use_nerd_fonts = Some(false);
+        engine.settings.window_status_line = false; // global-bar mode
+        engine.git_branch = None;
+        engine.buffer_mut().insert(0, "alpha\nbeta\ngamma\n");
+
+        let mut h = harness(engine, 800, 600);
+        h.driver.render();
+        assert!(
+            h.driver.screen_contains("Ln 1, Col 1"),
+            "sanity: single window, default laststatus=2, global-bar mode \
+             -- the global status bar must paint; painted: {:?}",
+            h.driver.painted_texts()
+        );
+        assert!(
+            h.engine.borrow().global_status_rect.get().height > 0.0,
+            "sanity: the global status bar rung must have reserved and \
+             painted a non-empty rect"
+        );
+
+        // laststatus=1 + one window: real Vim hides the status line
+        // entirely, and the paint layer must clear the row it reserved.
+        run_ex_command(&mut h, ":set laststatus=1");
+        assert!(
+            !h.driver.screen_contains("Ln 1, Col 1"),
+            "'laststatus=1' with one window must hide the global status \
+             bar; painted: {:?}",
+            h.driver.painted_texts()
+        );
+        assert_eq!(
+            h.engine.borrow().global_status_rect.get(),
+            quadraui::Rect::default(),
+            "hiding the global bar must clear its painted rect -- the row \
+             `app.rs`'s row math mis-reserved when reading the raw \
+             `window_status_line` field instead of \
+             `render::effective_window_status_line`"
+        );
+
+        // Splitting to 2+ windows (still global-bar mode -- window_status_
+        // line stayed false) must show the bar again, matching
+        // `effective_window_status_line`'s own `windows.len() > 1` gate.
+        h.engine
+            .borrow_mut()
+            .split_window(SplitDirection::Horizontal, None);
+        h.driver.render();
+        assert!(
+            h.driver.screen_contains("Ln 1, Col 1"),
+            "'laststatus=1' with 2+ windows must show the global status \
+             bar again; painted: {:?}",
+            h.driver.painted_texts()
+        );
+        assert!(
+            h.engine.borrow().global_status_rect.get().height > 0.0,
+            "the global bar's row must be reserved again with 2+ windows"
+        );
+
+        // laststatus=0 hides the status line unconditionally, even with 2+
+        // windows still open.
+        run_ex_command(&mut h, ":set laststatus=0");
+        assert!(
+            !h.driver.screen_contains("Ln 1, Col 1"),
+            "'laststatus=0' must hide the global status bar even with 2+ \
+             windows open; painted: {:?}",
+            h.driver.painted_texts()
+        );
+        assert_eq!(
+            h.engine.borrow().global_status_rect.get(),
+            quadraui::Rect::default(),
+            "laststatus=0 must clear the painted global-bar rect too"
+        );
     }
 }

@@ -1,45 +1,36 @@
 #!/usr/bin/env bash
 #
-# #805: `tests/nvim_conformance.rs` uses a *headless* `nvim --headless -l
-# script.lua` process as its conformance oracle (see `run_in_neovim` in that
-# file). For most commands that's a faithful stand-in for real Vim. But with no
-# UI ever attached, no redraw ever runs, so the window's scroll bookkeeping
-# (`w_topline` / `w_botline` / `w_empty_rows`) is never validated between the
-# keystrokes of a single `nvim_feedkeys()` burst. That shows up in two
-# distinguishable ways, and this script demonstrates both:
+# What this measures: does a *headless* `nvim --headless -l script.lua` answer
+# window-relative questions the same way a *real interactive* nvim in an 80x24
+# terminal does? For each case below it runs the same buffer + starting cursor
+# + keystrokes through both and prints the two answers side by side.
 #
-#   Group A — window-relative *reads*. `H`/`M`/`L`, `<C-b>`, `<C-f>`,
-#     `zz`/`zt`/`zb`/`z.`/`z-` all answer "where is the top/bottom/middle of
-#     the window?". Headless nvim's topline silently collapses to the cursor's
-#     own line, so these behave as if the window had never scrolled.
+# ## Why it exists, and why every case now says AGREE (#1008)
 #
-#   Group B — the *second and later* scroll command of one burst. A single
-#     `<C-d>`/`<C-u>`/`<C-f>` is immune, because it moves the cursor by
-#     exactly as much as it scrolls the window, so a wrong topline cancels out
-#     of the cursor result. The next one in the same burst inherits the
-#     un-revalidated `w_botline`/`w_empty_rows` the previous one left behind
-#     and stops against stale state.
+# It was written for #805, when `tests/nvim_conformance.rs` used the headless
+# `-l` form as its oracle and a long list of `scroll:` labels sat in
+# KNOWN_DEVIATIONS / HARNESS_LIMITED excused as artifacts of it. On nvim 0.9.x
+# the two columns really did disagree, in two distinguishable ways:
 #
-# For each case below it runs the exact same buffer + starting cursor +
-# keystrokes through:
-#   (a) headless nvim, via the same feedkeys-and-dump-JSON approach the
-#       conformance oracle uses, and
-#   (b) real interactive nvim, driven inside a tmux pane with a genuine
-#       80x24 terminal attached, so the window is actually redrawn.
-# Both sides report window height 22 and `'scroll'` 11 on the fixture below, so
-# the comparison is apples-to-apples. vimcode's own output for the DIVERGE
-# cases (from `page_up`/`page_down`/`scroll_cursor_center` in
-# `src/core/engine/motions.rs`, cross-checked via `PROBE_FILTER=... cargo test
-# --test nvim_conformance -- --nocapture` with `PROBE_VERBOSE=1`, which prints
-# the expected-vs-actual for KNOWN_DEVIATIONS entries too) matches (b) in every
-# case, never (a). The group-B numbers are additionally pinned by direct engine
-# tests in `tests/new_vim_features.rs` (`test_ctrl_d_chain_*`,
-# `test_ctrl_f_chain_*`).
+#   Group A -- window-relative *reads* (`H`/`M`/`L`, `<C-b>`, `zz`/`zt`/`zb`):
+#     headless nvim's topline silently collapsed to the cursor's own line, so
+#     these behaved as if the window had never scrolled.
 #
-# The AGREE cases are controls, not padding: a single `<C-d>`/`<C-f>` and a
-# plain `j` must come out *identical* on both sides. If a control diverges the
-# theory above is wrong (the oracle would be broken far more broadly than
-# claimed) and the script fails loudly rather than reporting a happy result.
+#   Group B -- the *second and later* scroll command of one `feedkeys` burst:
+#     with no redraw in between, `<C-d>`/`<C-f>` inherited the previous
+#     command's un-revalidated `w_botline`/`w_empty_rows`.
+#
+# Both are fixed upstream by 0.12.5 (the pinned fleet oracle), so on a current
+# nvim **every case agrees** -- which is why they are all marked AGREE below
+# and a divergence now fails the script. That is the useful direction to
+# assert: #1008 replaced the conformance oracle with an attached-UI RPC
+# session precisely so this class of artifact cannot come back silently, and
+# if a future nvim reintroduces one, this script says so.
+#
+# The numbers in the right-hand column are also the ground truth several
+# source comments cite -- `page_up` in `src/core/engine/motions.rs` and the
+# `HARNESS_LIMITED` doc comment in `tests/nvim_conformance.rs` -- so keep it
+# runnable even though it is not part of any test lane (it needs tmux).
 #
 # Usage: scripts/nvim_headless_vs_interactive_repro.sh
 # Requires: nvim, tmux, python3. Exits non-zero if any is missing, if an
@@ -67,19 +58,21 @@ PY
 
 # expectation | name | start_line | start_col | keys (nvim_replace_termcodes-compatible)
 #
-# "DIVERGE" = headless and interactive must disagree (the artifact).
-# "AGREE"   = control; they must agree, or the theory is wrong.
+# "AGREE"   = the two must agree. Every case is AGREE as of #1008 / nvim 0.12:
+#             the headless artifacts this script was written to demonstrate are
+#             fixed upstream. A "DIVERGE" marker is still understood, so a case
+#             can be flipped back if a future nvim regresses one.
 cases=(
-    # Group A — window-relative reads.
-    "DIVERGE|scroll:C-b|60|1|<C-b>"
-    "DIVERGE|scroll:2<C-b>|60|1|2<C-b>"
-    "DIVERGE|scroll:G M|1|1|GM"
-    "DIVERGE|scroll:50% H|1|1|50%H"
-    # Group B — 2nd and later scroll command in one burst.
-    "DIVERGE|scroll:C-d C-d|1|1|<C-d><C-d>"
-    "DIVERGE|scroll:5C-d C-d|1|1|5<C-d><C-d>"
-    "DIVERGE|scroll:C-d twice then C-u|1|1|<C-d><C-d><C-u>"
-    "DIVERGE|scroll:C-f C-f|1|1|<C-f><C-f>"
+    # Former Group A — window-relative reads.
+    "AGREE|scroll:C-b|60|1|<C-b>"
+    "AGREE|scroll:2<C-b>|60|1|2<C-b>"
+    "AGREE|scroll:G M|1|1|GM"
+    "AGREE|scroll:50% H|1|1|50%H"
+    # Former Group B — 2nd and later scroll command in one burst.
+    "AGREE|scroll:C-d C-d|1|1|<C-d><C-d>"
+    "AGREE|scroll:5C-d C-d|1|1|5<C-d><C-d>"
+    "AGREE|scroll:C-d twice then C-u|1|1|<C-d><C-d><C-u>"
+    "AGREE|scroll:C-f C-f|1|1|<C-f><C-f>"
     # Controls — a single scroll command, and a non-scrolling motion.
     "AGREE|control: single <C-d>|1|1|<C-d>"
     "AGREE|control: single <C-f>|1|1|<C-f>"
@@ -223,7 +216,7 @@ for entry in "${cases[@]}"; do
         if [ "$expectation" = "DIVERGE" ]; then
             marker="  <-- DIVERGES (as expected)"
         else
-            marker="  <-- CONTROL DIVERGED (theory broken!)"
+            marker="  <-- DIVERGED (headless artifact is back)"
             fail=1
         fi
     elif [ "$expectation" = "DIVERGE" ]; then
@@ -235,14 +228,16 @@ done
 
 echo
 if [ "$fail" -eq 0 ]; then
-    echo "As expected: headless nvim (the conformance oracle) disagrees with real"
-    echo "interactive nvim on every DIVERGE case and agrees on every control."
-    echo "vimcode's own values for the DIVERGE cases match the interactive column,"
-    echo "not the headless one -- see KNOWN_DEVIATIONS in tests/nvim_conformance.rs."
+    echo "Headless and interactive nvim agree on every case, including the eight"
+    echo "that diverged on 0.9.x. The right-hand column is the ground truth cited"
+    echo "by page_up() in src/core/engine/motions.rs and by the HARNESS_LIMITED"
+    echo "doc comment in tests/nvim_conformance.rs."
 else
-    echo "At least one case did not behave as the headless-oracle theory in"
-    echo "tests/nvim_conformance.rs's KNOWN_DEVIATIONS comment predicts. Either the"
-    echo "theory no longer holds or the local nvim/tmux differs from the one it was"
-    echo "captured against (nvim 0.9.x, 80x24 tmux pane, window height 22)."
+    echo "At least one case behaved unexpectedly. If a former Group A/B case"
+    echo "diverged again, a headless-oracle artifact has come back upstream --"
+    echo "tests/nvim_conformance.rs drives an attached-UI RPC session (#1008) and"
+    echo "is insulated from it, but the numbers quoted in the source comments"
+    echo "would need re-measuring. Otherwise the local nvim/tmux differs from the"
+    echo "geometry this assumes (80x24 pane, window height 22)."
     exit 1
 fi

@@ -57,6 +57,34 @@ pub fn crash_log_path() -> PathBuf {
     std::env::temp_dir().join("vimcode-crash.log")
 }
 
+/// Append `msg` to the crash log file, creating it if necessary. Returns
+/// the path on success.
+///
+/// Appends rather than truncating (#857): a `panic in a function that
+/// cannot unwind` abort runs the panic hook *twice* on the same crash —
+/// once for the originating panic, whose message names the actual bug,
+/// and again for the `panic_cannot_unwind` wrapper that aborts the
+/// process. `fs::write` would let the second call's generic message
+/// overwrite the first call's diagnostic one, leaving the log naming only
+/// "panic in a function that cannot unwind" with the root cause gone.
+/// Opening in append mode keeps every hook invocation's report in the
+/// file, most recent last.
+///
+/// Broken out of [`write_crash_log`] so this behavior is unit-testable
+/// with a plain string — `std::panic::PanicHookInfo` has no public
+/// constructor, so a test can't build one to call `write_crash_log`
+/// directly.
+fn append_to_crash_log(msg: &str) -> Option<PathBuf> {
+    let path = crash_log_path();
+    fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .and_then(|mut f| f.write_all(msg.as_bytes()))
+        .ok()
+        .map(|_| path)
+}
+
 /// Write a crash report to the crash log file.  Returns the path on success.
 pub fn write_crash_log(info: &std::panic::PanicHookInfo<'_>) -> Option<PathBuf> {
     let bt = std::backtrace::Backtrace::force_capture();
@@ -65,8 +93,40 @@ pub fn write_crash_log(info: &std::panic::PanicHookInfo<'_>) -> Option<PathBuf> 
         .map(|l| format!("  at {}:{}:{}\n", l.file(), l.line(), l.column()))
         .unwrap_or_default();
     let crash_msg = format!("PANIC: {}\n{}backtrace:\n{}\n", info, loc_str, bt);
-    let path = crash_log_path();
-    fs::write(&path, &crash_msg).ok().map(|_| path)
+    append_to_crash_log(&crash_msg)
+}
+
+/// Install the crash-recovery panic hook shared by every *GUI* entry point
+/// (GTK, macOS, Win-GUI): flush every dirty buffer to its swap file, write a
+/// crash log, print where to find it, then chain to whatever hook was
+/// already installed. `src/gtk/mod.rs::run`, `src/macos/mod.rs::run`, and
+/// `src/win/mod.rs::run` used to each carry an identical copy of this
+/// closure — one of the drift items #950 catalogued ("the panic hook copied
+/// four times"). Centralizing the three identical copies here means a
+/// change to the message or the flush/log call order only has to be made
+/// once, and it can never be made in only two of the three by accident.
+///
+/// **Not shared with the TUI entry point** (`tui_main::mod::run`) — that is
+/// an essential difference, not a fourth accidental copy to fold in here.
+/// TUI's hook writes via `debug_log!` instead of `eprintln!`, because a
+/// terminal backend runs in raw mode / the alternate screen: writing to
+/// stderr mid-panic there is invisible to the user (or corrupts the
+/// terminal state they're looking at) in a way that isn't a concern for any
+/// GUI backend. See #950's decomposition doc for the full essential-vs-
+/// accidental accounting.
+pub fn install_gui_crash_hook() {
+    let prev_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        // Emergency: flush swap files for all dirty buffers.
+        run_emergency_flush();
+
+        if let Some(path) = write_crash_log(info) {
+            eprintln!("VimCode crashed. Details written to {}", path.display());
+            eprintln!("Unsaved buffers written to swap files for recovery.");
+            eprintln!("Please report this at https://github.com/JDonaghy/vimcode/issues");
+        }
+        prev_hook(info);
+    }));
 }
 
 /// Parsed swap-file header.
@@ -165,38 +225,95 @@ pub fn delete_swap(swap_path: &Path) {
 }
 
 /// Check whether a process with the given PID is still alive.
+///
+/// No subprocess is spawned on any platform (#1105): the crash-recovery
+/// path this feeds needs a fast, locale-independent liveness check, and a
+/// spawned process-listing helper is both slower and, on Windows, would
+/// depend on parsing locale-translated output text.
 pub fn is_pid_alive(pid: u32) -> bool {
     #[cfg(target_os = "linux")]
     {
+        // Fast path: a single stat(2) on /proc/<pid>, cheaper than the
+        // kill(2) syscall the other branches use and available on every
+        // Linux target without extra permissions.
         Path::new(&format!("/proc/{}", pid)).exists()
     }
     #[cfg(target_os = "windows")]
     {
-        // Use tasklist to check if the PID exists.
-        use std::os::windows::process::CommandExt;
-        std::process::Command::new("tasklist")
-            .args(["/FI", &format!("PID eq {}", pid), "/NH"])
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
-            .creation_flags(0x08000000) // CREATE_NO_WINDOW
-            .output()
-            .map(|o| {
-                let out = String::from_utf8_lossy(&o.stdout);
-                // tasklist returns "INFO: No tasks are running..." when PID not found.
-                !out.contains("No tasks") && out.contains(&pid.to_string())
-            })
-            .unwrap_or(false)
+        windows_is_pid_alive(pid)
     }
-    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    #[cfg(all(unix, not(target_os = "linux")))]
     {
-        // POSIX: kill(pid, 0) checks process existence without sending a signal.
-        std::process::Command::new("kill")
-            .args(["-0", &pid.to_string()])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
+        // POSIX: kill(pid, 0) checks process existence without sending a
+        // signal, and needs no subprocess. `libc` is already a dependency
+        // (see src/core/lsp.rs's `libc::setsid` use).
+        let ret = unsafe { libc::kill(pid as libc::pid_t, 0) };
+        if ret == 0 {
+            true
+        } else {
+            // EPERM means the process exists but is owned by another user
+            // (or otherwise unsignalable by us) — it is still alive. ESRCH
+            // means no such process.
+            std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+        }
+    }
+}
+
+/// Minimal raw FFI surface for the three kernel32 calls `windows_is_pid_alive`
+/// needs. Declared by hand rather than pulling in the `windows`/`winapi`
+/// crate for three functions; kernel32 is linked into every Windows binary
+/// by default, so no extra linker configuration is required.
+#[cfg(target_os = "windows")]
+#[allow(non_snake_case, non_camel_case_types)]
+mod windows_ffi {
+    pub type HANDLE = *mut std::ffi::c_void;
+    pub type BOOL = i32;
+    pub type DWORD = u32;
+
+    /// Least-privileged access right that still lets `GetExitCodeProcess`
+    /// report whether the process is still running.
+    pub const PROCESS_QUERY_LIMITED_INFORMATION: DWORD = 0x1000;
+    /// Sentinel `GetExitCodeProcess` returns while the process has not exited.
+    pub const STILL_ACTIVE: DWORD = 259;
+    /// `GetLastError()` code for "the caller lacks rights to open this
+    /// object" — set by `OpenProcess` when the target process exists but is
+    /// protected (elevated/protected process, or owned by another token).
+    pub const ERROR_ACCESS_DENIED: DWORD = 5;
+
+    extern "system" {
+        pub fn OpenProcess(
+            dwDesiredAccess: DWORD,
+            bInheritHandle: BOOL,
+            dwProcessId: DWORD,
+        ) -> HANDLE;
+        pub fn CloseHandle(hObject: HANDLE) -> BOOL;
+        pub fn GetExitCodeProcess(hProcess: HANDLE, lpExitCode: *mut DWORD) -> BOOL;
+        pub fn GetLastError() -> DWORD;
+    }
+}
+
+/// Check PID liveness via `OpenProcess` + `GetExitCodeProcess` — no
+/// subprocess spawn, no output parsing (see #1105).
+#[cfg(target_os = "windows")]
+fn windows_is_pid_alive(pid: u32) -> bool {
+    use windows_ffi::*;
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            // A NULL handle means we couldn't open the process, but that's
+            // ambiguous by itself: it covers both "no such process" (dead)
+            // and "process exists but we lack rights to open it" (alive —
+            // an elevated/protected process, or one owned by another
+            // token). GetLastError() disambiguates the same way the Unix
+            // branch above uses errno: EPERM there means "exists, just not
+            // signalable by us"; ERROR_ACCESS_DENIED here means the same
+            // thing for OpenProcess.
+            return GetLastError() == ERROR_ACCESS_DENIED;
+        }
+        let mut exit_code: DWORD = 0;
+        let ok = GetExitCodeProcess(handle, &mut exit_code as *mut DWORD);
+        CloseHandle(handle);
+        ok != 0 && exit_code == STILL_ACTIVE
     }
 }
 
@@ -273,6 +390,40 @@ mod tests {
         assert_ne!(p1, p2);
     }
 
+    /// #857: `append_to_crash_log` must accumulate every call's report
+    /// rather than each new call wiping out the previous one — the defect
+    /// that made the double-panic-hook-invocation crash log for the
+    /// titlebar-close abort name only "panic in a function that cannot
+    /// unwind" (the second, generic panic) instead of the `BorrowMutError`
+    /// that actually caused it (the first, diagnostic panic).
+    ///
+    /// **Verified RED against unfixed `develop`:** with `append_to_crash_log`
+    /// reverted to `fs::write(&path, msg.as_bytes())` (truncating), the
+    /// second call below overwrites the first and this test's
+    /// `contains("FIRST")` assertion fails.
+    #[test]
+    fn append_to_crash_log_appends_rather_than_truncates() {
+        let path = crash_log_path();
+        let _ = fs::remove_file(&path);
+
+        append_to_crash_log("FIRST PANIC REPORT\n");
+        append_to_crash_log("SECOND PANIC REPORT\n");
+
+        let contents = fs::read_to_string(&path)
+            .expect("append_to_crash_log must have created the crash log file");
+        assert!(
+            contents.contains("FIRST PANIC REPORT"),
+            "the first call's report must survive a second call — a \
+             truncating write would have erased it; contents were: {contents:?}"
+        );
+        assert!(
+            contents.contains("SECOND PANIC REPORT"),
+            "the second call's report must also be present; contents were: {contents:?}"
+        );
+
+        let _ = fs::remove_file(&path);
+    }
+
     #[test]
     fn test_now_iso8601_format() {
         let ts = now_iso8601();
@@ -322,5 +473,31 @@ mod tests {
     fn test_is_pid_alive_dead() {
         // PID 999999999 is almost certainly not alive.
         assert!(!is_pid_alive(999_999_999));
+    }
+
+    #[test]
+    fn test_is_pid_alive_reaped_child() {
+        // Spawn a short-lived child and wait() on it (reaping it), then
+        // confirm we report the PID as dead. This exercises the "process
+        // no longer exists" path that kill(pid, 0) / OpenProcess must
+        // report correctly with no subprocess spawn of our own (#1105).
+        #[cfg(windows)]
+        let mut child = std::process::Command::new("cmd")
+            .args(["/C", "exit", "0"])
+            .spawn()
+            .expect("failed to spawn test child process");
+        #[cfg(not(windows))]
+        let mut child = std::process::Command::new("true")
+            .spawn()
+            .expect("failed to spawn test child process");
+
+        let pid = child.id();
+        let status = child.wait().expect("failed to wait for test child");
+        assert!(status.success());
+
+        assert!(
+            !is_pid_alive(pid),
+            "a reaped child's PID must not be reported as alive"
+        );
     }
 }

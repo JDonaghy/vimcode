@@ -14,6 +14,42 @@ pub fn save_revision() -> u64 {
     SAVE_REVISION.load(Ordering::Acquire)
 }
 
+/// Test-only seam (#949 review) — see [`Settings::settings_file_path`]'s
+/// doc for why this is a thread-local rather than a `$HOME` mutation.
+#[cfg(test)]
+thread_local! {
+    static TEST_SETTINGS_PATH_OVERRIDE: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// RAII installer for the [`Settings::settings_file_path`] test override —
+/// mirrors `crate::test_cwd::CwdReadGuard`/`crate::test_paint::PaintGuard`'s
+/// "acquire on construct, restore on `Drop`" shape, so a test that panics
+/// mid-assertion still clears the thread-local instead of leaking the
+/// override into whatever other `#[test]` fn Rust's runner schedules next
+/// on the same pooled thread.
+#[cfg(test)]
+pub(crate) struct TestSettingsPathGuard {
+    _private: (),
+}
+
+#[cfg(test)]
+impl TestSettingsPathGuard {
+    /// Point `settings_file_path()` at `path` for the calling test thread
+    /// only until the returned guard drops.
+    pub(crate) fn install(path: PathBuf) -> Self {
+        TEST_SETTINGS_PATH_OVERRIDE.with(|cell| *cell.borrow_mut() = Some(path));
+        Self { _private: () }
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestSettingsPathGuard {
+    fn drop(&mut self) {
+        TEST_SETTINGS_PATH_OVERRIDE.with(|cell| *cell.borrow_mut() = None);
+    }
+}
+
 /// Which editing paradigm the editor uses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -23,6 +59,37 @@ pub enum EditorMode {
     Vim,
     /// VSCode-style always-insert editing (Shift+Arrow select, Ctrl-C/X/V/Z/Y/A).
     Vscode,
+}
+
+/// How right-click context menus are presented — platform look-and-feel,
+/// **not** a keybinding paradigm (that's [`EditorMode`]; the two are
+/// orthogonal and must not be folded together).
+///
+/// Mirrors VS Code's `window.menuStyle` (v1.101), which the release notes
+/// describe as controlling "the menu style ... for context menus on
+/// macOS" specifically — the macOS menu *bar* is always native and has no
+/// such setting (see `native_menu`/`install_menu_bar`, vimcode#901); this
+/// setting only ever changes anything on a backend that advertises
+/// `quadraui::BackendCaps::native_menu` (macOS's `MacBackend` today). GTK
+/// and TUI report `native_menu: false`, so every variant here resolves to
+/// the same in-window `paint_context_menu_rung` path on those backends —
+/// see `render::context_menu_should_be_native`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum MenuStyle {
+    /// Always use the backend's native context menu when it has one
+    /// (`BackendCaps::native_menu`); fall back to the in-window rasteriser
+    /// on a backend that doesn't (GTK, TUI never draw nothing).
+    Native,
+    /// Always paint the in-window `ContextMenuPanel`, even on a backend
+    /// that could show a native one.
+    Custom,
+    /// Follow the window's title-bar style, matching VS Code. vimcode has
+    /// no `titleBarStyle` setting yet, so until it does this resolves the
+    /// same as `Native` (capability-gated) — revisit this arm once
+    /// `titleBarStyle` exists.
+    #[default]
+    Inherit,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -79,6 +146,34 @@ pub struct Settings {
     #[serde(default = "default_auto_indent")]
     pub auto_indent: bool,
 
+    /// C-ish auto-indent on newline, layered on top of `'autoindent'`:
+    /// indent one `'shiftwidth'` further after a line ending in `{`, dedent
+    /// a line whose first non-blank character is `}`, and put a `#`
+    /// preprocessor line at column 0 unconditionally. Corresponds to Vim's
+    /// `'smartindent'` / `'si'`. Superseded by `'cindent'` when both are set
+    /// (`:h 'cindent'`: "'cindent' ... overrules 'smartindent'"). Default
+    /// off, matching Vim. #1207.
+    #[serde(default)]
+    pub smartindent: bool,
+
+    /// Stricter C-aware indenting; when set, takes precedence over
+    /// `'smartindent'` (both may be on at once — `'cindent'` wins). This
+    /// implementation is a simplified subset: indent after `{`, dedent a
+    /// line whose first non-blank character is `}`, `#` to column 0,
+    /// otherwise copy the previous non-blank line's indent. Corresponds to
+    /// Vim's `'cindent'` / `'cin'`. Default off, matching Vim. #1207.
+    #[serde(default)]
+    pub cindent: bool,
+
+    /// In Insert mode, briefly move the cursor to the matching opening
+    /// bracket when a closing `)`, `]` or `}` is typed, then move it back.
+    /// Corresponds to Vim's `'showmatch'` / `'sm'`. `'matchtime'` (how long
+    /// the cursor stays on the match) is a value option and out of scope —
+    /// see [`crate::core::engine::Engine::showmatch_flash`]. Default off,
+    /// matching Vim. #1207.
+    #[serde(default)]
+    pub showmatch: bool,
+
     /// Insert spaces instead of a literal tab character on Tab key press
     #[serde(default = "default_expand_tab")]
     pub expand_tab: bool,
@@ -132,6 +227,13 @@ pub struct Settings {
     #[serde(default)]
     pub editor_mode: EditorMode,
 
+    /// How right-click context menus are presented (native OS popup vs.
+    /// the in-window rasteriser). See [`MenuStyle`] — orthogonal to
+    /// `editor_mode`, only observable on a backend with
+    /// `BackendCaps::native_menu` (macOS today).
+    #[serde(default)]
+    pub menu_style: MenuStyle,
+
     /// Single character used as the leader key prefix in normal mode.
     /// Default is Space (' '). Override in settings.json: { "leader": "\\" }
     #[serde(default = "default_leader")]
@@ -142,6 +244,15 @@ pub struct Settings {
     /// visual row. Corresponds to Vim's `:set wrap` / `:set nowrap`.
     #[serde(default)]
     pub wrap: bool,
+
+    /// When `'wrap'` is also on, break a soft-wrapped line at a word
+    /// boundary (whitespace) at or before the wrap column instead of
+    /// splitting mid-word. Purely a display-time choice of wrap point —
+    /// never touches what's stored in the buffer. No-op when `'wrap'` is
+    /// off. Corresponds to Vim's `'linebreak'` / `'lbr'`. Default off,
+    /// matching Vim. #1207.
+    #[serde(default)]
+    pub linebreak: bool,
 
     /// When true, highlights misspelled words with underlines.
     /// Corresponds to Vim's `:set spell` / `:set nospell`.
@@ -160,13 +271,33 @@ pub struct Settings {
     #[serde(default)]
     pub disabled_plugins: Vec<String>,
 
-    /// User-defined key mappings. Each entry is `"mode keys :command"`.
-    /// Mode: `n` (normal), `v` (visual), `i` (insert), `c` (command).
-    /// Keys: single char (`x`), modifier (`<C-/>`, `<A-c>`), or sequence (`gcc`, `gc`).
-    /// Action: ex command prefixed with `:`.
-    /// Example: `["n <C-/> :Commentary", "v <C-/> :Commentary"]`
+    /// User-defined key mappings, persisted in vimcode's internal storage
+    /// format: `"mode[!] keys rhs"`.
+    /// Mode: `n v x o i c s` (vim's `:map-modes` letters); a trailing `!`
+    /// on the mode marks the entry `noremap` (no recursive expansion).
+    /// Keys (lhs): single char (`x`), modifier (`<C-/>`, `<A-c>`), or
+    /// sequence (`gcc`, `gc`), in vim key notation.
+    /// Rhs: either an ex command prefixed with `:` (`":Commentary"`), or a
+    /// raw key sequence fed back through the normal key path (`"<Esc>"`,
+    /// `"<C-w>h"`) — vim's key-to-keys remapping (#1151).
+    ///
+    /// This array is populated by the `:map` family of ex commands
+    /// (`:nnoremap`, `:imap`, `:vnoremap`, …), which parse vim's own
+    /// `:{cmd} {lhs} {rhs}` syntax and translate it into this storage
+    /// format — the format itself, and pre-#1151 entries written in it
+    /// (`"n keys :command"`, always non-`noremap`, always an ex-command
+    /// rhs), keep parsing and working unmigrated.
+    /// Example: `["i! jk <Esc>", "n <C-/> :Commentary"]`
     #[serde(default)]
     pub keymaps: Vec<String>,
+
+    /// User-defined Vim-style abbreviations (`:h abbreviations`), persisted
+    /// alongside `keymaps`. Each entry is `"mode lhs rhs"`: mode is `i`
+    /// (Insert-only, `:iabbrev`), `c` (Command-line-only, `:cabbrev`), or `a`
+    /// (both, `:abbreviate`/`:noreabbrev`). `rhs` may itself contain spaces.
+    /// Example: `["i teh the", "a @@ me@example.com"]`
+    #[serde(default)]
+    pub abbreviations: Vec<String>,
 
     /// Highlight all search matches (default true). Disable with `:set nohlsearch`.
     #[serde(default = "default_hlsearch")]
@@ -181,9 +312,162 @@ pub struct Settings {
     #[serde(default)]
     pub smartcase: bool,
 
+    /// Which regex metacharacters need backslash-escaping to be special vs.
+    /// literal, in search patterns / `:s` / `*`/`#`. Corresponds to Vim's
+    /// `'magic'` (`:h 'magic'`). Default **on**, matching Vim: `.`, `*`,
+    /// `[`, `~`, `^`, `$` are special unescaped ([`crate::core::vim_regex::Magic::Magic`]).
+    /// With `nomagic`, only `^`/`$` stay special unescaped — `.`, `*`, `[`,
+    /// `~` become literal unless backslash-escaped, at which point they
+    /// regain their special meaning ([`crate::core::vim_regex::Magic::NoMagic`]).
+    /// A pattern's own inline `\v`/`\V`/`\m`/`\M` override always wins over
+    /// this setting, exactly as it wins over a literal `:h /magic` line in
+    /// real Vim. #1207.
+    #[serde(default = "default_true")]
+    pub magic: bool,
+
     /// Number of lines to keep visible above/below the cursor (default 0).
     #[serde(default)]
     pub scrolloff: usize,
+
+    /// When true, commands that move the cursor to a different line
+    /// (`<C-d>`, `<C-u>`, `<C-b>`, `<C-f>`, `G`, `gg`, `H`, `M`, `L`) park the
+    /// cursor on the first non-blank column of the destination line instead
+    /// of keeping the current column. Corresponds to Vim's `'startofline'` /
+    /// `'sol'`. Default **false**, matching Neovim (real Vim defaults this
+    /// **on** — see `:h 'startofline'`); vimcode's existing hardcoded
+    /// column-preserving behavior for these commands already matched
+    /// Neovim's default before this option existed, so flipping the default
+    /// would silently change behavior for every user who never touches this
+    /// setting.
+    #[serde(default)]
+    pub startofline: bool,
+
+    /// When true, `J` (join) inserts two spaces instead of one after a line
+    /// ending in `.`, `!` or `?`. Corresponds to Vim's `'joinspaces'` /
+    /// `'js'`. Default **false**, matching Neovim (real Vim defaults this
+    /// **on** — see `:h 'joinspaces'`). `gJ` is unaffected regardless of this
+    /// setting: it never inserts a space.
+    #[serde(default)]
+    pub joinspaces: bool,
+
+    /// When true, `<Tab>` at or before the first non-blank column of a line
+    /// advances by `'shiftwidth'` (rounded to its next stop) instead of
+    /// `'tabstop'`, and `<BS>` over leading whitespace deletes a whole
+    /// `'shiftwidth'` worth of blanks instead of one character. Corresponds
+    /// to Vim's `'smarttab'` / `'sta'`. Default **true**, matching Neovim
+    /// (real Vim defaults this **off** — see `:h 'smarttab'`); vimcode's
+    /// existing hardcoded Insert-mode Tab/BS behavior already matched
+    /// Neovim's default before this option existed, so flipping the default
+    /// would silently change behavior for every user who never touches this
+    /// setting.
+    #[serde(default = "default_smarttab")]
+    pub smarttab: bool,
+
+    /// Which numeral formats `<C-a>`/`<C-x>` (and Visual-mode `g<C-a>`)
+    /// recognize besides plain decimal: any of `"bin"`, `"octal"`, `"hex"`,
+    /// `"alpha"`. Corresponds to Vim's `'nrformats'` / `'nf'`. Default
+    /// `["bin", "hex"]`, matching Neovim (real Vim's default additionally
+    /// includes `"octal"` — see `:h 'nrformats'`).
+    #[serde(default = "default_nrformats")]
+    pub nrformats: Vec<String>,
+
+    /// Characters `w`/`b`/`e`/`ge`, `*`/`#`/`g*`/`g#`, the `iw`/`aw` text
+    /// objects, and the `\k`/`\K` regex classes treat as part of a "word".
+    /// Corresponds to Vim's `'iskeyword'` / `'isk'`. Comma-separated list of
+    /// single characters, `c1-c2` character ranges, decimal character codes,
+    /// decimal code ranges, or `@` (every Unicode alphabetic character —
+    /// vim's "`@` means alphabetic for the current encoding", and vimcode is
+    /// always UTF-8); a leading `^` on an item excludes it instead of
+    /// including it. Default `"@,48-57,_,192-255"`, matching Neovim's UTF-8
+    /// default (`:h 'iskeyword'`) — every Unicode letter, digit, underscore,
+    /// and the Latin-1 supplement block. `w`/`b`/`e`/etc. are ASCII-only
+    /// before this option is consulted (#1191); this also fixes that,
+    /// because the default already includes `@`.
+    #[serde(default = "default_iskeyword")]
+    pub iskeyword: String,
+
+    /// How folds are found: `"manual"` (only `zf`-created folds — nothing is
+    /// closeable until the user explicitly folds a range), `"indent"`
+    /// (folds are derived from indentation and recomputed on demand), or
+    /// `"marker"` (folds are derived from the literal `'foldmarker'` pair,
+    /// #1159). Corresponds to Vim's `'foldmethod'` / `'fdm'`. Default
+    /// `"manual"`, matching Vim (`:h 'foldmethod'`) — a fresh buffer has no
+    /// folds at all until one is created. `"syntax"`/`"expr"`/`"diff"` are
+    /// not implemented (#1159 scoped them out — see the issue).
+    #[serde(default = "default_foldmethod")]
+    pub foldmethod: String,
+
+    /// When `'foldmethod'` is `"indent"` or `"marker"`, folds nested deeper
+    /// than this level start closed; folds at or above it start open.
+    /// Corresponds to Vim's `'foldlevel'` / `'fdl'`. Default `0`, matching
+    /// Vim: every computed fold starts closed until raised (`:h
+    /// 'foldlevel'`).
+    #[serde(default)]
+    pub foldlevel: usize,
+
+    /// The open/close marker pair used when `'foldmethod'` is `"marker"`: a
+    /// literal-text scan for these two strings, not a regex (`:h
+    /// 'foldmarker'`). Format is `"{open},{close}"`; default `"{{{,}}}"`,
+    /// matching Vim. A following digit on a marker in the text (Vim's
+    /// explicit-fold-level refinement, e.g. `{{{2`) is not parsed specially
+    /// here — the marker is still found as a literal-prefix match, but the
+    /// digit doesn't set an explicit level (#1159 scoped that out: marker
+    /// folding's core value is "a scan for a literal pair").
+    #[serde(default = "default_foldmarker")]
+    pub foldmarker: String,
+
+    /// Maximum fold nesting depth for `'foldmethod'` `"indent"` (Vim also
+    /// documents `"syntax"`, which vimcode doesn't implement — `:h
+    /// 'foldnestmax'`). Deeper levels are absorbed into their `foldnestmax`
+    /// ancestor instead of becoming their own closeable fold. Does **not**
+    /// apply to `"marker"` folds, matching Vim (marker nesting is either the
+    /// literal pair depth or an explicit numbered level, neither of which
+    /// `'foldnestmax'` caps — verified against `nvim --headless`). Default
+    /// `20`, matching Vim.
+    #[serde(default = "default_foldnestmax")]
+    pub foldnestmax: usize,
+
+    /// Whether `/` and `?` search wrap around the end/start of the buffer
+    /// when no more matches are found in the current direction. Corresponds
+    /// to Vim's `'wrapscan'` / `'ws'`. Default **true**, matching Vim
+    /// (`:h 'wrapscan'`).
+    #[serde(default = "default_true")]
+    pub wrapscan: bool,
+
+    /// When true, `>>`/`<<` (and their operator/count forms) round the
+    /// resulting indent to a multiple of `'shiftwidth'` instead of adding or
+    /// removing exactly one `'shiftwidth'`. Corresponds to Vim's
+    /// `'shiftround'` / `'sr'`. Default **false**, matching Vim (`:h
+    /// 'shiftround'`).
+    #[serde(default)]
+    pub shiftround: bool,
+
+    /// When true, inverts the meaning of the `:substitute` command's `g`
+    /// flag: every match on a line is replaced by default, and a `g` flag
+    /// toggles that off (replace only the first match per line). Corresponds
+    /// to Vim's `'gdefault'` / `'gd'`. Default **false**, matching Vim (`:h
+    /// 'gdefault'`).
+    #[serde(default)]
+    pub gdefault: bool,
+
+    /// Number of columns a `<Tab>`/`<BS>` "feels like" in Insert mode,
+    /// independent of `'tabstop'`. `0` (the default) disables this — Tab/BS
+    /// use `'tabstop'` as usual. A negative value is a documented Vim idiom
+    /// meaning "use `'shiftwidth'` instead" (`:h 'softtabstop'`). Only takes
+    /// effect when `'expandtab'` is on; mixed tab/space soft-tabs
+    /// (`noexpandtab` + `softtabstop`) are not modeled. Corresponds to Vim's
+    /// `'softtabstop'` / `'sts'`.
+    #[serde(default)]
+    pub softtabstop: i32,
+
+    /// Where the cursor may go past the end of a line, in Normal/Visual
+    /// mode. Corresponds to Vim's `'virtualedit'` / `'ve'`. Only the
+    /// documented "one column past the last character" effect of `"all"` /
+    /// `"onemore"` is implemented (applied to `l`/`<Right>`/`$`) — full
+    /// virtual-column placement anywhere in blank space (`"all"`'s complete
+    /// behavior) is not modeled. Default `""` (off), matching Vim.
+    #[serde(default)]
+    pub virtualedit: String,
 
     /// Highlight the line the cursor is on (default true).
     #[serde(default = "default_cursorline")]
@@ -278,6 +562,30 @@ pub struct Settings {
     #[serde(default = "default_updatetime")]
     pub updatetime: u32,
 
+    // ── Undo persistence (#1156) ─────────────────────────────────────────────
+    /// Maximum number of live undo-tree states kept per buffer, across every
+    /// branch. Corresponds to Vim's `'undolevels'` / `'ul'`. Once exceeded,
+    /// the globally-oldest branch tip not on the buffer's active path is
+    /// pruned first (see `buffer_manager::UndoTree::enforce_undolevels`).
+    /// Default `1000`, matching Vim/Neovim.
+    #[serde(default = "default_undolevels")]
+    pub undolevels: usize,
+
+    /// Persist each buffer's undo tree to a file under `'undodir'` on save,
+    /// and reload it the next time that file is opened — undo history then
+    /// survives quitting and reopening. Corresponds to Vim's `'undofile'`.
+    /// Default off, matching Vim/Neovim.
+    #[serde(default)]
+    pub undofile: bool,
+
+    /// Directory undofiles are written to when `'undofile'` is on. Empty
+    /// string (the default) means `~/.config/vimcode/undo/` (see
+    /// `undofile::default_undo_dir`) — unlike Vim's `'undodir'`, this is a
+    /// single directory rather than a priority list, since vimcode has no
+    /// per-directory-unwritable fallback logic to drive a list with.
+    #[serde(default)]
+    pub undodir: String,
+
     /// Show breadcrumbs bar (file path + symbol hierarchy) below the tab bar.
     #[serde(default = "default_breadcrumbs")]
     pub breadcrumbs: bool,
@@ -320,9 +628,31 @@ pub struct Settings {
     pub hover_delay: u32,
 
     /// Use Nerd Font icons in the UI (activity bar, file explorer, panels).
-    /// Disable if your terminal/font lacks Nerd Font glyphs to get ASCII fallbacks.
-    #[serde(default = "default_use_nerd_fonts")]
-    pub use_nerd_fonts: bool,
+    ///
+    /// Backend-derived (issue #999): `None` means "inherit from the running
+    /// backend" and is resolved live by the [`Settings::use_nerd_fonts`]
+    /// accessor method — GTK and macOS bundle Symbols Nerd Font 3.5.1 and
+    /// register it in-process at startup (`render::register_nerd_font_
+    /// fallback`, #1130), so the glyphs are guaranteed
+    /// available regardless of what the user has installed, on every OS —
+    /// those two backends therefore inherit `true` unconditionally. Win-GUI
+    /// shares the same bundled font in principle but has two open,
+    /// unverified bugs (vimcode#178, vimcode#161) suggesting its font
+    /// resolution path may not actually work yet, and there is no Windows
+    /// host in this project's fleet to check — so it keeps the conservative
+    /// guess until those are confirmed fixed. The TUI renders through the
+    /// user's terminal emulator, which uses its own configured font; there
+    /// is no reliable way to detect that font's glyph coverage from inside
+    /// the terminal (a CSI-6n width probe measures advance, not whether a
+    /// real glyph painted — see the issue), so the TUI also keeps the
+    /// previous conservative `target_os`-based guess and offers
+    /// `:CheckNerdFonts` for the user to check by eye instead. `Some(_)` is
+    /// an explicit user override that always wins, including across a
+    /// later backend change, and persists across restarts. Never read this
+    /// field directly; call the accessor method
+    /// (`self.settings.use_nerd_fonts()`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub use_nerd_fonts: Option<bool>,
 
     /// What Ctrl+F does: "find" opens the find/replace overlay, "page_down"
     /// is traditional Vim Ctrl+F page-down behavior.
@@ -345,6 +675,146 @@ pub struct Settings {
     /// highlighting for huge files.
     #[serde(default = "default_syntax_max_lines")]
     pub syntax_max_lines: usize,
+
+    /// Allow switching away from a modified buffer (`:edit`, `:bnext`,
+    /// `:bprevious`, `:bfirst`, `:blast`, `:buffer`, `:enew`, ...) without
+    /// saving or forcing with `!` — the abandoned buffer stays loaded,
+    /// just not shown in any window. Without it those commands refuse
+    /// with "No write since last change (add ! to override)" unless
+    /// another window still shows the buffer (`:h 'hidden'`, `:h E37`).
+    ///
+    /// Default **on** — historical Vim defaults this off, but Neovim (this
+    /// repo's oracle, per `tests/nvim_conformance.rs`) defaults it on;
+    /// confirmed by hand with `nvim --headless -u NONE -c 'set hidden?'`.
+    /// #1190.
+    #[serde(default = "default_true")]
+    pub hidden: bool,
+
+    /// Show a partially-typed Normal-mode command (count/register/operator
+    /// prefix, e.g. `"a2d`) in the last line while it's being typed.
+    /// Corresponds to Vim's `'showcmd'` / `'sc'`. Default on, matching
+    /// Neovim. #1190.
+    #[serde(default = "default_true")]
+    pub showcmd: bool,
+
+    /// Show the cursor's line/column (and file percentage) in the status
+    /// line. Corresponds to Vim's `'ruler'` / `'ru'`. Default on, matching
+    /// Neovim. #1190.
+    #[serde(default = "default_true")]
+    pub ruler: bool,
+
+    /// Render unprintable characters as glyphs instead of their normal
+    /// whitespace effect: a tab displays as literal `^I` instead of
+    /// expanding to `'tabstop'` width, and the true end of each line gets
+    /// a trailing `$`. Corresponds to Vim's `'list'`. This is the on/off
+    /// switch only — the exact glyphs are hardcoded to Vim's own
+    /// no-`'listchars'`-item fallback (`:h 'listchars'`) until `'listchars'`
+    /// itself lands (sibling value-option tranche). Default off, matching
+    /// Vim. #1190.
+    #[serde(default)]
+    pub list: bool,
+
+    /// Which characters `'list'` mode uses for otherwise-invisible glyphs.
+    /// Corresponds to Vim's `'listchars'` / `'lcs'`. Comma-separated
+    /// `item:chars` pairs. Recognised-and-wired items: `eol`, `tab`
+    /// (two or three characters), `trail`, `nbsp`, `space` (each a single
+    /// character). Recognised-and-*validated*-but-not-painted:
+    /// `extends`/`precedes` (`'wrap'`-off horizontal-scroll clipping isn't
+    /// glyph-annotated here) and `multispace`/`lead`/`leadmultispace`/
+    /// `leadtab`/`conceal` (real Vim items with no vimcode rendering path
+    /// yet — accepted so a pasted vimrc line doesn't read as a typo, exactly
+    /// like `UNIMPLEMENTED_VALUE_OPTIONS`, but scoped per-item rather than
+    /// per-option since the *option* itself is otherwise fully implemented).
+    /// Default `"tab:> ,trail:-,nbsp:+"`, matching Neovim (`:h 'listchars'`)
+    /// — note this has no `eol` item, so `'list'` does **not** show a
+    /// trailing `$` out of the box (#1190's hardcoded always-`$`/`^I`
+    /// fallback only matched classic Vim's *empty*-`'listchars'` behavior,
+    /// not Neovim's real default).
+    #[serde(default = "default_listchars")]
+    pub listchars: String,
+
+    /// Comma-separated list of Vim's per-key wrap tokens governing which
+    /// motions may cross a line boundary instead of stopping at column 0 /
+    /// the last column: `b` (`<BS>`), `s` (`<Space>`), `h`, `l`, `<`, `>`
+    /// (Left/Right arrows, Normal and Visual mode), `[`, `]` (Left/Right
+    /// arrows, Insert/Replace mode), `~` (the `~` command — accepted but not
+    /// wired; `~` never advances past end-of-line here regardless of this
+    /// setting). Corresponds to Vim's `'whichwrap'` / `'ww'`. Default
+    /// `"b,s"`, matching Neovim (`:h 'whichwrap'`).
+    #[serde(default = "default_whichwrap")]
+    pub whichwrap: String,
+
+    /// Comma-separated list of what Insert-mode `<BS>` may delete across:
+    /// `"indent"` (autoindent — accepted but not distinctly wired; the
+    /// existing autoindent-aware BackSpace behavior doesn't yet gate on
+    /// this token), `"eol"` (the start of a line, joining with the previous
+    /// line), `"start"` (the position where the current Insert session
+    /// began). `"nostop"` is accepted (real Vim item, an `"eol"` variant)
+    /// but not distinctly wired. A legacy numeric value (`0`-`3`, pre-7.4
+    /// Vim) is also accepted and expanded to the equivalent list on write.
+    /// Corresponds to Vim's `'backspace'` / `'bs'`. Default
+    /// `"indent,eol,start"`, matching Neovim (`:h 'backspace'`) — this also
+    /// matches vimcode's own pre-existing (hardcoded, unconditional)
+    /// BackSpace behavior, so the default changes nothing out of the box.
+    #[serde(default = "default_backspace")]
+    pub backspace: String,
+
+    /// Milliseconds to wait, after typing a keystroke that's an ambiguous
+    /// prefix of a key-to-keys mapping (#1151), for a further keystroke that
+    /// resolves it before giving up and replaying the buffered keys as
+    /// typed. `0` disables the wait — the buffered keys are replayed as soon
+    /// as nothing else could still match, matching vimcode's pre-existing
+    /// (untimed) behavior. Corresponds to Vim's `'timeoutlen'` / `'tm'`.
+    /// Default `1000`, matching Neovim (`:h 'timeoutlen'`).
+    #[serde(default = "default_timeoutlen")]
+    pub timeoutlen: u32,
+
+    /// Command-line completion behavior for repeated `<Tab>`. Corresponds
+    /// to Vim's `'wildmode'` / `'wim'`. Validated against Vim's documented
+    /// comma/colon grammar (`full`/`longest`/`list`/`longest:full`/etc, `:h
+    /// 'wildmode'`) and — as of #1206 — drives real, observably different
+    /// Tab-completion behavior per [`WildmodeStage`]/`wildmode_stage_at`:
+    /// `longest` fills only the common prefix without selecting an item,
+    /// `list`-only leaves the command line untouched (the item list is
+    /// shown either way — vimcode's wildmenu is unconditionally on, see
+    /// `'wildmenu'` in `set_bool_option`), and stages advance one per
+    /// `<Tab>` press the way `:h 'wildmode'` describes. The bare default
+    /// value `"full"` is the one exception: it keeps vimcode's
+    /// pre-existing UX (common-prefix on the first press, full-match
+    /// cycling from the second press on) rather than switching to Vim's
+    /// literal "select the first full match immediately" `full` semantics,
+    /// so the already-covered `tests/wildmenu.rs` suite keeps passing
+    /// unchanged — see `Settings::wildmode_is_plain_full`'s doc comment.
+    /// `noselect`/`lastused` parse but are not distinctly wired (see
+    /// `WildmodeStage`). Default `"full"`, matching Neovim.
+    #[serde(default = "default_wildmode")]
+    pub wildmode: String,
+
+    /// When the per-window status line is shown: `0` never, `1` only when
+    /// there are 2+ windows, `2` always. `3` (one global status line instead
+    /// of per-window) is accepted but not modeled — falls back to `2`'s
+    /// behavior (`render::effective_window_status_line`), since vimcode's
+    /// status line is architecturally per-window
+    /// (`Settings::window_status_line`). Corresponds to Vim's `'laststatus'`
+    /// / `'ls'`. Default `2`, matching Neovim (`:h 'laststatus'`).
+    #[serde(default = "default_laststatus")]
+    pub laststatus: u8,
+
+    /// Horizontal counterpart to `'scrolloff'`: minimum number of screen
+    /// columns to keep to the left/right of the cursor when `'wrap'` is
+    /// off. Corresponds to Vim's `'sidescrolloff'` / `'siso'`. Default `0`,
+    /// matching Neovim (`:h 'sidescrolloff'`).
+    #[serde(default)]
+    pub sidescrolloff: usize,
+
+    /// Minimum number of lines to scroll when the cursor moves off the top
+    /// or bottom of the window. Corresponds to Vim's `'scrolljump'` /
+    /// `'sj'`. Default `1`, matching Neovim (`:h 'scrolljump'`) — the
+    /// minimum needed to bring the cursor back into view, i.e. vimcode's
+    /// pre-existing behavior. Vim's documented "negative value is a
+    /// percentage of the window height" is not modeled.
+    #[serde(default = "default_scrolljump")]
+    pub scrolljump: usize,
 }
 
 /// Mode-derived default for `ctrl_f_action` — see the field doc comment on
@@ -387,13 +857,50 @@ fn default_hover_delay() -> u32 {
     300
 }
 
-fn default_use_nerd_fonts() -> bool {
-    // On Windows, terminal fonts (Consolas, Cascadia Mono) don't include Nerd
-    // Font glyphs by default. Use ASCII fallback icons instead.  Users who
-    // install a Nerd Font can enable via `:set nerdfonts`.  On Linux/macOS,
-    // the GTK backend bundles a Nerd Font subset and TUI terminals commonly
-    // have Nerd Font support.
-    !cfg!(target_os = "windows")
+/// Backend-derived default for `use_nerd_fonts` — see the field doc on
+/// [`Settings::use_nerd_fonts`].
+///
+/// `gui` is `crate::icons::is_gui_backend()`, set once at startup by every
+/// GUI entry point (`App::new`, `App::new_portable`,
+/// `App::new_headless_with_backend`) right where they already call
+/// `icons::set_nerd_fonts(...)`; it defaults to `false` (the conservative,
+/// TUI assumption) so a caller that forgets to opt in gets today's
+/// behavior rather than a false "glyphs available".
+///
+/// GUI is uniform across GTK/macOS/Win-GUI *except* on Windows itself:
+/// `App`'s `impl quadraui::ShellApp` is the one shared implementation all
+/// three GUI backends run (`src/app.rs`), so there is no per-backend hook
+/// to special-case just Win-GUI without adding per-backend code — this
+/// `cfg!(target_os = "windows")` check lives here in core, mirroring the
+/// TUI branch below, rather than in `src/gtk/`/`src/tui_main/`, so it does
+/// not run afoul of this repo's Platform-Neutrality Rule. The reason it
+/// exists at all: vimcode#178 (diff toolbar arrows render as `?`) and
+/// vimcode#161 (tree-sized icon font) are open evidence that Win-GUI's
+/// DirectWrite fallback path may not fully resolve the bundled font yet,
+/// and there is no Windows host anywhere in this project's fleet to verify
+/// it either way. Per the issue: "if Win-GUI genuinely can't resolve it
+/// yet, leave it off and say so" — so Win-GUI keeps the pre-#999
+/// conservative guess until #178/#161 confirm the font path actually
+/// works, while GTK/macOS (verified to bundle and resolve the font) get
+/// the new `true` default on every OS they run on.
+fn default_use_nerd_fonts(gui: bool) -> bool {
+    if gui && cfg!(target_os = "windows") {
+        // Win-GUI: see the doc comment above — #178/#161 are open,
+        // unverified evidence that the bundled font may not resolve here,
+        // so don't claim it's available until they're confirmed fixed.
+        false
+    } else if gui {
+        // GTK/macOS bundle the font (`app_support::ICON_FONT_BYTES`) and
+        // install/register it at startup — always available.
+        true
+    } else {
+        // TUI: on Windows, terminal fonts (Consolas, Cascadia Mono) don't
+        // include Nerd Font glyphs by default. Use ASCII fallback icons
+        // instead. Users who install a Nerd Font can enable via
+        // `:set nerdfonts` or `:CheckNerdFonts`. On Linux/macOS, TUI
+        // terminals commonly have Nerd Font support.
+        !cfg!(target_os = "windows")
+    }
 }
 
 fn default_swap_file() -> bool {
@@ -406,6 +913,10 @@ fn default_breadcrumbs() -> bool {
 
 fn default_updatetime() -> u32 {
     4000
+}
+
+fn default_undolevels() -> usize {
+    1000
 }
 
 fn default_explorer_visible() -> bool {
@@ -480,6 +991,30 @@ fn default_extension_registries() -> Vec<String> {
     vec![crate::core::registry::DEFAULT_REGISTRY_URL.to_string()]
 }
 
+fn default_smarttab() -> bool {
+    true
+}
+
+fn default_nrformats() -> Vec<String> {
+    vec!["bin".to_string(), "hex".to_string()]
+}
+
+fn default_foldmethod() -> String {
+    "manual".to_string()
+}
+
+fn default_foldmarker() -> String {
+    "{{{,}}}".to_string()
+}
+
+fn default_foldnestmax() -> usize {
+    20
+}
+
+fn default_iskeyword() -> String {
+    "@,48-57,_,192-255".to_string()
+}
+
 fn default_colorscheme() -> String {
     "onedark".to_string()
 }
@@ -512,6 +1047,50 @@ pub enum ExplorerAction {
     Delete,
     Rename,
     MoveFile,
+}
+
+impl ExplorerAction {
+    /// Resolve an explorer context-menu/keyboard-shortcut action id string
+    /// to the `ExplorerAction` both backends dispatch through
+    /// `Engine::dispatch_explorer_crud`.
+    ///
+    /// #823 item 6: GTK's `App::explorer_action` (`app.rs`) and TUI's
+    /// `handle_explorer_context_action` (`tui_main/mod.rs`) map this same
+    /// 5-string table, but they are no longer safe to fully collapse — they
+    /// were re-verified against current `HEAD` per this issue's own
+    /// instruction, not just the line numbers recorded when the issue was
+    /// filed, and the two functions have drifted past what a mechanical
+    /// merge could do without changing behavior:
+    ///
+    /// * TUI's "delete" arm calls `Engine::confirm_delete_file` directly
+    ///   with the context menu's explicit target path; GTK's routes
+    ///   through `dispatch_explorer_crud(Delete)`, which acts on
+    ///   `explorer_tree`'s *selected row* instead — forcing GTK onto TUI's
+    ///   explicit-path behavior (or vice versa) is a real behavior change,
+    ///   not a refactor, and picks the wrong file if a context-menu click
+    ///   and the tree's selection ever disagree.
+    /// * TUI's match has no `"move_file"` arm at all — it silently no-ops
+    ///   today. Wiring it up via this table would be a new capability, not
+    ///   a dedup, and needs its own test/issue.
+    ///
+    /// What both sides still agree on byte-for-byte is the `new_file` /
+    /// `new_folder` / `rename` subset, both feeding the identical
+    /// `dispatch_explorer_crud` call — that's what this function shares.
+    /// `delete` / `move_file` are included for GTK's benefit (its own
+    /// `explorer_action` handles all five through one call to
+    /// `dispatch_explorer_crud`) but TUI's caller never reaches this
+    /// function for those two strings — its own arms handle `"delete"`
+    /// first and it has no `"move_file"` arm to reach here at all.
+    pub fn from_action_str(s: &str) -> Option<Self> {
+        Some(match s {
+            "new_file" => Self::NewFile,
+            "new_folder" => Self::NewFolder,
+            "rename" => Self::Rename,
+            "delete" => Self::Delete,
+            "move_file" => Self::MoveFile,
+            _ => return None,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -778,6 +1357,23 @@ pub fn parse_key_binding_named(s: &str) -> Option<(bool, bool, bool, String)> {
     Some((ctrl, shift, alt, key_str))
 }
 
+/// #1069 branched this on `target_os == "macos"` via `cfg!` ("Menlo" on
+/// macOS, "Monospace" everywhere else) because `"Monospace"` is a fontconfig
+/// *generic alias* — GTK/Pango on Linux resolves it, and Win-GUI's
+/// DirectWrite has an equivalent, but at the time CoreText had no such
+/// alias and `MacBackend::set_editor_font` -> `make_font_exact` rejected
+/// it outright, leaving `current_font` at `None` and the editor painting
+/// at quadraui's placeholder metrics (`current_char_width: 8.0pt`,
+/// `current_line_height: 16.0pt`) forever on macOS.
+///
+/// #1129: removed once quadraui#1023 added [`quadraui::GenericFamily`]
+/// and taught `MacBackend::set_editor_font` to resolve the Pango alias
+/// `"Monospace"` straight to `system_monospace_font` (CoreText's
+/// `kCTFontUserFixedPitchFontType`) instead of routing it through
+/// `make_font_exact`'s installed-family lookup — so one shared value
+/// now resolves a real face on every backend and the `cfg!` branch is
+/// no longer needed (Platform-Neutrality Rule; matches the `UI_FONT_FAMILY`
+/// fix in `src/app_support.rs`).
 fn default_font_family() -> String {
     "Monospace".to_string()
 }
@@ -790,6 +1386,34 @@ fn default_ui_font_size() -> u8 {
     10
 }
 
+fn default_listchars() -> String {
+    "tab:> ,trail:-,nbsp:+".to_string()
+}
+
+fn default_whichwrap() -> String {
+    "b,s".to_string()
+}
+
+fn default_backspace() -> String {
+    "indent,eol,start".to_string()
+}
+
+fn default_timeoutlen() -> u32 {
+    1000
+}
+
+fn default_wildmode() -> String {
+    "full".to_string()
+}
+
+fn default_laststatus() -> u8 {
+    2
+}
+
+fn default_scrolljump() -> usize {
+    1
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Settings {
@@ -800,6 +1424,9 @@ impl Default for Settings {
             explorer_visible_on_startup: default_explorer_visible(),
             incremental_search: default_incremental_search(),
             auto_indent: default_auto_indent(),
+            smartindent: false,
+            cindent: false,
+            showmatch: false,
             expand_tab: default_expand_tab(),
             tabstop: default_tabstop(),
             shift_width: default_shift_width(),
@@ -812,17 +1439,35 @@ impl Default for Settings {
             panel_keys: PanelKeys::default(),
             completion_keys: CompletionKeys::default(),
             editor_mode: EditorMode::Vim,
+            menu_style: MenuStyle::Inherit,
             leader: default_leader(),
             wrap: false,
+            linebreak: false,
             spell: false,
             spelllang: default_spelllang(),
             plugins_enabled: default_plugins_enabled(),
             disabled_plugins: Vec::new(),
             keymaps: Vec::new(),
+            abbreviations: Vec::new(),
             hlsearch: default_hlsearch(),
             ignorecase: false,
             smartcase: false,
+            magic: default_true(),
             scrolloff: 0,
+            startofline: false,
+            joinspaces: false,
+            smarttab: default_smarttab(),
+            nrformats: default_nrformats(),
+            iskeyword: default_iskeyword(),
+            foldmethod: default_foldmethod(),
+            foldlevel: 0,
+            foldmarker: default_foldmarker(),
+            foldnestmax: default_foldnestmax(),
+            wrapscan: default_true(),
+            shiftround: false,
+            gdefault: false,
+            softtabstop: 0,
+            virtualedit: String::new(),
             cursorline: default_cursorline(),
             window_status_line: default_window_status_line(),
             status_line_above_terminal: default_status_line_above_terminal(),
@@ -843,6 +1488,9 @@ impl Default for Settings {
             explorer_sort_case_insensitive: true,
             swap_file: default_swap_file(),
             updatetime: default_updatetime(),
+            undolevels: default_undolevels(),
+            undofile: false,
+            undodir: String::new(),
             breadcrumbs: default_breadcrumbs(),
             hide_single_tab: false,
             autohide_panels: false,
@@ -851,11 +1499,527 @@ impl Default for Settings {
             match_brackets: default_match_brackets(),
             auto_pairs: None, // mode-derived — see Settings::auto_pairs()
             hover_delay: default_hover_delay(),
-            use_nerd_fonts: default_use_nerd_fonts(),
-            ctrl_f_action: None, // mode-derived — see Settings::ctrl_f_action()
+            use_nerd_fonts: None, // backend-derived — see Settings::use_nerd_fonts()
+            ctrl_f_action: None,  // mode-derived — see Settings::ctrl_f_action()
             syntax_max_lines: default_syntax_max_lines(),
+            hidden: default_true(),
+            showcmd: default_true(),
+            ruler: default_true(),
+            list: false,
+            listchars: default_listchars(),
+            whichwrap: default_whichwrap(),
+            backspace: default_backspace(),
+            timeoutlen: default_timeoutlen(),
+            wildmode: default_wildmode(),
+            laststatus: default_laststatus(),
+            sidescrolloff: 0,
+            scrolljump: default_scrolljump(),
         }
     }
+}
+
+/// Real vim **boolean** options `:set` recognises by name (so a vimrc line
+/// naming one doesn't read as an unrecognised typo) but does not yet wire to
+/// any behaviour. `(long_name, short_name)`. #1153 — extend this table (and
+/// implement) as each is picked up; see the issue for the full missing-option
+/// audit and rough priority order.
+///
+/// Empty as of #1207, which implemented the last five entries (`magic`,
+/// `showmatch`, `linebreak`, `smartindent`, `cindent` — #1190's tranche
+/// before it cleared `hidden`, `list`, `showcmd`, `ruler`). Kept as `&[]`
+/// rather than removed, per #1207's own note: the "recognised but not
+/// implemented" mechanism (#1153) is meant to be reused by the next Vim
+/// option that lands here recognised-but-unwired.
+const UNIMPLEMENTED_BOOL_OPTIONS: &[(&str, &str)] = &[];
+
+/// Real vim **value** options `:set` recognises by name but does not yet
+/// wire to any behaviour. See [`UNIMPLEMENTED_BOOL_OPTIONS`]'s doc — same
+/// rationale, same table shape.
+const UNIMPLEMENTED_VALUE_OPTIONS: &[(&str, &str)] = &[("clipboard", "cb")];
+
+/// Shared "recognised, not implemented" message for both option tables
+/// (#1153) — deliberately distinct wording from `"Unknown option: {opt}"` so
+/// a user (or a vimrc author) can tell "this is a typo" from "this is a real
+/// vim option vimcode hasn't wired up yet" at a glance.
+fn not_implemented_message(opt: &str) -> String {
+    format!("Option '{opt}' is recognised but not implemented yet")
+}
+
+// ── 'iskeyword' (#1191) ──────────────────────────────────────────────────
+//
+// Vim's char-list grammar, shared (per `:h 'isfname'`) by 'iskeyword',
+// 'isident', 'isprint' and 'isfname': a comma-separated list of items, each
+// either a single character, a `c1-c2` character range, a decimal character
+// code, a decimal `n1-n2` code range, or `@` ("every alphabetic character
+// for the current encoding" — vimcode is always UTF-8, so this means every
+// Unicode alphabetic `char`). A leading `^` on an item excludes it from the
+// set built so far instead of adding it. Later items win over earlier ones
+// for the same character, exactly like Vim evaluates the list in order.
+
+/// One `'iskeyword'`-list item's character-set half (include/exclude is
+/// tracked separately in [`IskeywordEntry`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IskeywordItem {
+    /// Bare `@` — every Unicode alphabetic character.
+    AllAlpha,
+    /// A single literal character.
+    Char(char),
+    /// A `c1-c2` character range (order-independent).
+    Range(char, char),
+    /// A single decimal character code.
+    Code(u32),
+    /// A decimal `n1-n2` code range (order-independent).
+    CodeRange(u32, u32),
+}
+
+#[derive(Debug, Clone, Copy)]
+struct IskeywordEntry {
+    item: IskeywordItem,
+    include: bool,
+}
+
+/// Parse one comma-separated token (after an optional leading `^`, already
+/// stripped by the caller) into an [`IskeywordItem`].
+fn parse_iskeyword_token(tok: &str) -> Result<IskeywordItem, String> {
+    if tok == "@" {
+        return Ok(IskeywordItem::AllAlpha);
+    }
+    // A range is `left-right` with a `-` that isn't the whole token (so a
+    // lone "-" is still the literal dash character, and "@-@" is the
+    // literal '@' via the char-range branch, not the bare-`@` branch above).
+    if tok.len() > 1 {
+        if let Some(dash) = tok.char_indices().skip(1).find(|&(_, c)| c == '-') {
+            let (left, right) = (&tok[..dash.0], &tok[dash.0 + 1..]);
+            if !left.is_empty() && !right.is_empty() {
+                if let (Ok(n1), Ok(n2)) = (left.parse::<u32>(), right.parse::<u32>()) {
+                    return Ok(IskeywordItem::CodeRange(n1, n2));
+                }
+                let (lchars, rchars): (Vec<char>, Vec<char>) =
+                    (left.chars().collect(), right.chars().collect());
+                if lchars.len() == 1 && rchars.len() == 1 {
+                    return Ok(IskeywordItem::Range(lchars[0], rchars[0]));
+                }
+                return Err(format!("bad range '{tok}'"));
+            }
+        }
+    }
+    if let Ok(n) = tok.parse::<u32>() {
+        return Ok(IskeywordItem::Code(n));
+    }
+    let chars: Vec<char> = tok.chars().collect();
+    if chars.len() == 1 {
+        return Ok(IskeywordItem::Char(chars[0]));
+    }
+    Err(format!("bad token '{tok}'"))
+}
+
+/// Parse a full `'iskeyword'` value into its ordered entry list. Empty
+/// tokens (e.g. a trailing comma) are skipped, matching Vim.
+fn parse_iskeyword(spec: &str) -> Result<Vec<IskeywordEntry>, String> {
+    let mut entries = Vec::new();
+    for raw in spec.split(',') {
+        let raw = raw.trim();
+        if raw.is_empty() {
+            continue;
+        }
+        let (include, tok) = match raw.strip_prefix('^') {
+            Some(rest) if !rest.is_empty() => (false, rest),
+            _ => (true, raw),
+        };
+        let item = parse_iskeyword_token(tok)?;
+        entries.push(IskeywordEntry { item, include });
+    }
+    Ok(entries)
+}
+
+/// Does `c` belong to the character class described by `entries`? Order-
+/// sensitive: later entries override earlier ones for the same character,
+/// exactly like Vim evaluates the 'iskeyword' list.
+fn iskeyword_matches(entries: &[IskeywordEntry], c: char) -> bool {
+    let cp = c as u32;
+    let mut result = false;
+    for e in entries {
+        let hit = match e.item {
+            IskeywordItem::AllAlpha => c.is_alphabetic(),
+            IskeywordItem::Char(ch) => c == ch,
+            IskeywordItem::Range(a, b) => {
+                let (lo, hi) = (a.min(b) as u32, a.max(b) as u32);
+                cp >= lo && cp <= hi
+            }
+            IskeywordItem::Code(n) => cp == n,
+            IskeywordItem::CodeRange(n1, n2) => {
+                let (lo, hi) = (n1.min(n2), n1.max(n2));
+                cp >= lo && cp <= hi
+            }
+        };
+        if hit {
+            result = e.include;
+        }
+    }
+    result
+}
+
+/// Escape `c` so it's safe as a literal inside a `[...]` Rust-regex class
+/// body (used by [`iskeyword_regex_class_body`]).
+fn push_class_char(out: &mut String, c: char) {
+    if matches!(c, '\\' | ']' | '^' | '-' | '&') {
+        out.push('\\');
+    }
+    out.push(c);
+}
+
+/// Build the `[...]`-body fragment for `\k` (`'iskeyword'`-driven, `:h
+/// /\k`) from a parsed 'iskeyword' spec.
+///
+/// Vim's real semantics are order-sensitive include/exclude
+/// ([`iskeyword_matches`]), which a single regex character class can't
+/// losslessly represent — a `-=`/`^=`-based *exclusion* is dropped here
+/// (only additive items are represented). That's exact for the default
+/// spec and every `+=`-only customization — the common case — and only
+/// under-covers `\k` relative to real word motions for an explicit
+/// exclusion. Falls back to the historical ASCII-only class if the spec is
+/// somehow unparsable (defensive — `set_value_option` already validates on
+/// write).
+fn iskeyword_regex_class_body(entries: &[IskeywordEntry]) -> String {
+    let mut body = String::new();
+    for e in entries {
+        if !e.include {
+            continue;
+        }
+        match e.item {
+            IskeywordItem::AllAlpha => body.push_str("\\p{Alphabetic}"),
+            IskeywordItem::Char(c) => push_class_char(&mut body, c),
+            IskeywordItem::Range(a, b) => {
+                push_class_char(&mut body, a);
+                body.push('-');
+                push_class_char(&mut body, b);
+            }
+            IskeywordItem::Code(n) => {
+                if let Some(c) = char::from_u32(n) {
+                    push_class_char(&mut body, c);
+                }
+            }
+            IskeywordItem::CodeRange(n1, n2) => {
+                if let (Some(a), Some(b)) = (char::from_u32(n1), char::from_u32(n2)) {
+                    push_class_char(&mut body, a);
+                    body.push('-');
+                    push_class_char(&mut body, b);
+                }
+            }
+        }
+    }
+    if body.is_empty() {
+        body.push_str("0-9A-Za-z_");
+    }
+    body
+}
+
+/// `+=`/`-=`/`^=` combine mode for either shape of value option `:set`
+/// accepts an operator on: a comma-separated list-style option (`:h :set`,
+/// "List of items" — `Append`/`Remove`/`Prepend` act on whole comma-
+/// separated tokens) or a numeric option (`:h :set`, "For number options" —
+/// `Append`/`Remove`/`Prepend` mean add/subtract/multiply). #1191 added this
+/// for `'iskeyword'` alone; #1206 generalised it to every list- and number-
+/// shaped option (`parse_set_option`'s combine loop).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ListOp {
+    Append,
+    Remove,
+    Prepend,
+}
+
+/// Apply `op` with `value` (a comma-separated list of items) to `current`
+/// (also comma-separated), returning the new combined string. Used for
+/// `:set iskeyword+=X` / `-=X` / `^=X`, and (#1206) every other list-style
+/// value option (`'whichwrap'`, `'backspace'`, `'wildmode'`, `'listchars'`).
+fn combine_csv_list(current: &str, value: &str, op: ListOp) -> String {
+    match op {
+        ListOp::Append => {
+            if current.is_empty() {
+                value.to_string()
+            } else {
+                format!("{current},{value}")
+            }
+        }
+        ListOp::Prepend => {
+            if current.is_empty() {
+                value.to_string()
+            } else {
+                format!("{value},{current}")
+            }
+        }
+        ListOp::Remove => {
+            let removed: Vec<&str> = value.split(',').map(|s| s.trim()).collect();
+            current
+                .split(',')
+                .filter(|tok| !removed.contains(&tok.trim()))
+                .collect::<Vec<_>>()
+                .join(",")
+        }
+    }
+}
+
+/// `:h 'whichwrap'`'s real per-key wrap-token characters. Anything else in a
+/// `'whichwrap'` value is a malformed token.
+const WHICHWRAP_TOKENS: &[char] = &['b', 's', 'h', 'l', '<', '>', '~', '[', ']'];
+
+/// Validate a `'whichwrap'` value: comma-separated, each token one of
+/// [`WHICHWRAP_TOKENS`].
+fn parse_whichwrap(spec: &str) -> Result<(), String> {
+    for tok in spec.split(',') {
+        let tok = tok.trim();
+        if tok.is_empty() {
+            continue;
+        }
+        let chars: Vec<char> = tok.chars().collect();
+        if chars.len() != 1 || !WHICHWRAP_TOKENS.contains(&chars[0]) {
+            return Err(format!("bad token '{tok}'"));
+        }
+    }
+    Ok(())
+}
+
+/// `:h 'backspace'`'s real list-form tokens (`"nostop"` is a real Vim 8.2+
+/// item — an `"eol"` variant that also disables `'start'`-style stopping
+/// when crossing into the previous line — accepted here but not distinctly
+/// wired; see the field doc comment).
+const BACKSPACE_TOKENS: &[&str] = &["indent", "eol", "start", "nostop"];
+
+/// Validate and normalise a `'backspace'` value. Accepts both the modern
+/// comma-list form and Vim's legacy pre-7.4 numeric shorthand (`0`-`3`),
+/// expanding the latter to its equivalent list form so every other call
+/// site only ever has to deal with one shape (`:h 'backspace'`).
+fn parse_backspace(spec: &str) -> Result<String, String> {
+    match spec {
+        "0" => return Ok(String::new()),
+        "1" => return Ok("indent,eol".to_string()),
+        "2" => return Ok("indent,eol,start".to_string()),
+        "3" => return Ok("indent,eol,nostop".to_string()),
+        _ => {}
+    }
+    for tok in spec.split(',') {
+        let tok = tok.trim();
+        if tok.is_empty() {
+            continue;
+        }
+        if !BACKSPACE_TOKENS.contains(&tok) {
+            return Err(format!("bad token '{tok}'"));
+        }
+    }
+    Ok(spec.to_string())
+}
+
+/// `:h 'wildmode'`'s real per-stage keywords, each comma-separated stage
+/// optionally a colon-separated sequence of these. `"noselect"` and
+/// `"lastused"` parse as valid (real Vim tokens, `:h 'wildmode'`) but are
+/// not distinctly wired by [`WildmodeStage`] — see its doc comment.
+const WILDMODE_TOKENS: &[&str] = &[
+    "full", "longest", "list", "lastused", "noselect",
+    "", // "" — an empty stage, e.g. leading `,`
+];
+
+/// Validate a `'wildmode'` value: comma-separated stages, each stage a
+/// colon-separated sequence of [`WILDMODE_TOKENS`].
+fn parse_wildmode(spec: &str) -> Result<(), String> {
+    for stage in spec.split(',') {
+        for tok in stage.split(':') {
+            if !WILDMODE_TOKENS.contains(&tok) {
+                return Err(format!("bad token '{tok}'"));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// One comma-separated stage of `'wildmode'` — the behavior flags active on
+/// a single `<Tab>` press (`:h 'wildmode'`, #1206). Multiple colon-joined
+/// flags in the same stage combine (`"longest:full"` sets both); per the
+/// docs, when `longest` and `full` are both set on the *same* stage,
+/// `longest` wins and the stage does not cycle full matches — callers
+/// implement that by checking `longest` before `full`.
+///
+/// `lastused` (sort buffer-name matches by recency) and `noselect` (show
+/// the menu without preselecting the first item) parse as valid stage
+/// tokens but have no vimcode-side hook to attach to: this codebase's
+/// wildmenu list is unconditionally shown regardless of `'wildmode'` (see
+/// `'wildmenu'`'s `set_bool_option` arm), so `noselect`'s distinction from
+/// plain `full` has nothing to change, and there is no buffer-name
+/// completion sort order to key off `lastused`. Both are accepted rather
+/// than rejected (matching real Vim's grammar) but produce the same
+/// behavior as the stage's other flags alone.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct WildmodeStage {
+    /// `""` — an empty stage: complete the first match once, then stop
+    /// (never cycle or list on repeat presses of *this* stage).
+    pub only_first: bool,
+    pub full: bool,
+    pub longest: bool,
+    #[allow(dead_code)] // parsed for grammar completeness; see struct doc
+    pub list: bool,
+}
+
+/// Parse `'wildmode'` into its ordered stages. `:h 'wildmode'`: "a comma
+/// separated list of up to four parts, corresponding to the first, second,
+/// third, and fourth presses of 'wildchar'" — Vim holds on the last
+/// configured stage for every press beyond that, so callers should clamp
+/// a press index to `stages.len() - 1` (see [`Settings::wildmode_stage_at`])
+/// rather than treating a missing stage as "no more completion".
+fn wildmode_stages(spec: &str) -> Vec<WildmodeStage> {
+    spec.split(',')
+        .map(|stage| {
+            if stage.is_empty() {
+                return WildmodeStage {
+                    only_first: true,
+                    ..Default::default()
+                };
+            }
+            let mut s = WildmodeStage::default();
+            for tok in stage.split(':') {
+                match tok {
+                    "full" => s.full = true,
+                    "longest" => s.longest = true,
+                    "list" => s.list = true,
+                    _ => {} // lastused / noselect — not distinctly wired
+                }
+            }
+            s
+        })
+        .collect()
+}
+
+/// `:h 'listchars'`'s real item keys. `Fixed(n)` items take exactly `n`
+/// characters; `Tab` takes two or three; `Cyclic` (`multispace`,
+/// `leadmultispace`) takes one or more.
+enum ListcharsItemShape {
+    Fixed(usize),
+    Tab,
+    Cyclic,
+}
+
+/// `(key, shape, is_wired)` — `is_wired` items are the ones
+/// `render::apply_list_glyphs` actually paints; the rest are accepted (real
+/// Vim items) but not rendered specially — see the `listchars` field doc.
+const LISTCHARS_ITEMS: &[(&str, ListcharsItemShape, bool)] = &[
+    ("eol", ListcharsItemShape::Fixed(1), true),
+    ("tab", ListcharsItemShape::Tab, true),
+    ("trail", ListcharsItemShape::Fixed(1), true),
+    ("nbsp", ListcharsItemShape::Fixed(1), true),
+    ("space", ListcharsItemShape::Fixed(1), true),
+    ("extends", ListcharsItemShape::Fixed(1), false),
+    ("precedes", ListcharsItemShape::Fixed(1), false),
+    ("multispace", ListcharsItemShape::Cyclic, false),
+    ("lead", ListcharsItemShape::Fixed(1), false),
+    ("leadmultispace", ListcharsItemShape::Cyclic, false),
+    ("leadtab", ListcharsItemShape::Tab, false),
+    ("conceal", ListcharsItemShape::Fixed(1), false),
+];
+
+/// Validate a `'listchars'` value: comma-separated `item:chars` pairs, each
+/// `item` one of [`LISTCHARS_ITEMS`] and `chars` matching that item's shape.
+fn parse_listchars(spec: &str) -> Result<(), String> {
+    // Deliberately does NOT trim each comma-split token (unlike every other
+    // list option in this file): a trailing space can be a meaningful part
+    // of an item's `chars` — Neovim's own default value is `"tab:> ,..."`,
+    // where the tab glyph's second character *is* a space — so trimming it
+    // away here would silently corrupt the parse.
+    for tok in spec.split(',') {
+        if tok.is_empty() {
+            continue;
+        }
+        let Some((key, chars)) = tok.split_once(':') else {
+            return Err(format!("bad item '{tok}' (expected 'item:chars')"));
+        };
+        let Some((_, shape, _)) = LISTCHARS_ITEMS.iter().find(|(k, ..)| *k == key) else {
+            return Err(format!("unknown listchars item '{key}'"));
+        };
+        let n = chars.chars().count();
+        let ok = match shape {
+            ListcharsItemShape::Fixed(want) => n == *want,
+            ListcharsItemShape::Tab => n == 2 || n == 3,
+            ListcharsItemShape::Cyclic => n >= 1,
+        };
+        if !ok {
+            return Err(format!("bad value '{chars}' for listchars item '{key}'"));
+        }
+    }
+    Ok(())
+}
+
+/// Look up the single-character glyph configured for `item` in `listchars`
+/// (`self.settings.listchars`), falling back to `default_char` if the item
+/// isn't present. Used by `render::apply_list_glyphs` for `'list'`'s
+/// `eol`/`trail`/`nbsp`/`space` glyphs.
+///
+/// No `.trim()` on each comma-split token — see [`parse_listchars`]'s doc
+/// comment; a trailing space can be the configured glyph itself.
+pub(crate) fn listchars_char(
+    listchars: &str,
+    item: &str,
+    default_char: Option<char>,
+) -> Option<char> {
+    for tok in listchars.split(',') {
+        if let Some(chars) = tok.strip_prefix(&format!("{item}:")) {
+            return chars.chars().next();
+        }
+    }
+    default_char
+}
+
+/// A parsed `'listchars'` `tab:xy` or `tab:xyz` item (`:h lcs-tab`). The two
+/// forms fill a tabstop-width gap differently — see [`Self::render`] — so
+/// this keeps them distinct rather than collapsing `xy` into `(x, y, y)`,
+/// which would get the width-1 case wrong (the 2-char form always shows
+/// `x` for a single-column gap; the 3-char form always shows `z`).
+pub(crate) enum TabGlyph {
+    /// `tab:xy` — `x` is always used first, then `y` fills the rest.
+    Two(char, char),
+    /// `tab:xyz` — `z` is always used last, `x` first, `y` fills the middle.
+    Three(char, char, char),
+}
+
+impl TabGlyph {
+    /// Render this glyph to fill a `width`-column gap (`width >= 1`).
+    pub(crate) fn render(&self, width: usize) -> String {
+        let width = width.max(1);
+        match *self {
+            TabGlyph::Two(x, y) => {
+                let mut s = String::new();
+                s.push(x);
+                for _ in 1..width {
+                    s.push(y);
+                }
+                s
+            }
+            TabGlyph::Three(x, y, z) => {
+                if width == 1 {
+                    return z.to_string();
+                }
+                let mut s = String::new();
+                s.push(x);
+                for _ in 0..width.saturating_sub(2) {
+                    s.push(y);
+                }
+                s.push(z);
+                s
+            }
+        }
+    }
+}
+
+/// Look up the `'listchars'` `tab:xy[z]` item, if present. No `.trim()` on
+/// each comma-split token — see [`parse_listchars`]'s doc comment.
+pub(crate) fn listchars_tab(listchars: &str) -> Option<TabGlyph> {
+    for tok in listchars.split(',') {
+        if let Some(spec) = tok.strip_prefix("tab:") {
+            let chars: Vec<char> = spec.chars().collect();
+            return match chars.len() {
+                2 => Some(TabGlyph::Two(chars[0], chars[1])),
+                3 => Some(TabGlyph::Three(chars[0], chars[1], chars[2])),
+                _ => None,
+            };
+        }
+    }
+    None
 }
 
 impl Settings {
@@ -893,6 +2057,108 @@ impl Settings {
     pub fn auto_pairs(&self) -> bool {
         self.auto_pairs
             .unwrap_or_else(|| default_auto_pairs(self.editor_mode))
+    }
+
+    /// Resolve the effective `use_nerd_fonts`: an explicit override if set,
+    /// otherwise the backend-derived default (issue #999) — see the field
+    /// doc on [`Settings::use_nerd_fonts`]. Unlike `ctrl_f_action`/
+    /// `auto_pairs`, which are derived from `self.editor_mode` (a stored,
+    /// user-configurable field), the dimension here — GUI vs TUI — isn't a
+    /// `Settings` field at all: it's a fact about which binary is running,
+    /// recorded via `crate::icons::set_gui_backend`/`is_gui_backend` the
+    /// same way `icons::set_nerd_fonts` already threads the resolved
+    /// glyph-vs-fallback flag through this module (see that thread-local's
+    /// doc for why thread-local, not process-global).
+    pub fn use_nerd_fonts(&self) -> bool {
+        self.use_nerd_fonts
+            .unwrap_or_else(|| default_use_nerd_fonts(crate::icons::is_gui_backend()))
+    }
+
+    /// Does `'virtualedit'` include the "one column past the last character"
+    /// effect (`"all"` or `"onemore"`)? The only subset of `'virtualedit'`
+    /// vimcode implements — see the field doc comment on
+    /// [`Settings::virtualedit`] (#1153).
+    pub(crate) fn virtualedit_allows_onemore(&self) -> bool {
+        self.virtualedit
+            .split(',')
+            .any(|t| t == "all" || t == "onemore")
+    }
+
+    /// The `'wildmode'` flags active on the `press`'th `<Tab>` press of the
+    /// current command-line completion round (0-indexed). Clamps to the
+    /// last configured stage once `press` runs past the configured list,
+    /// matching Vim holding on the last stage for every press beyond it
+    /// (#1206). See [`WildmodeStage`] for which flags are distinctly wired.
+    pub(crate) fn wildmode_stage_at(&self, press: usize) -> WildmodeStage {
+        let stages = wildmode_stages(&self.wildmode);
+        match stages.len() {
+            0 => WildmodeStage {
+                full: true,
+                ..Default::default()
+            },
+            n => stages[press.min(n - 1)],
+        }
+    }
+
+    /// True when `'wildmode'` is (equivalent to) the bare default
+    /// `"full"` — a single stage whose only flag is `full`. vimcode's
+    /// pre-existing Tab-completion UX (common-prefix on the first press,
+    /// then full-match cycling from the second press on) predates this
+    /// option being wired and is kept exactly as-is for this one
+    /// configuration, rather than switched to Vim's literal "select the
+    /// first full match immediately" reading of `'full'` — see the
+    /// `wildmode` field doc comment for why, and `handle_command_key`'s
+    /// `"Tab"` arm for where this carve-out is consulted. Every other
+    /// configuration (`longest`, `list`, multiple stages, …) drives Tab
+    /// completion through [`wildmode_stage_at`](Self::wildmode_stage_at)
+    /// instead, so changing `'wildmode'` away from the default now
+    /// produces genuinely different, observable completion behavior.
+    pub(crate) fn wildmode_is_plain_full(&self) -> bool {
+        let stages = wildmode_stages(&self.wildmode);
+        stages.len() == 1
+            && stages[0]
+                == WildmodeStage {
+                    full: true,
+                    ..Default::default()
+                }
+    }
+
+    /// Does `'backspace'` include `token` (`"indent"`, `"eol"`, `"start"`,
+    /// or `"nostop"`)? #1206 — see the field doc comment on
+    /// [`Settings::backspace`] for which tokens are distinctly wired.
+    pub(crate) fn backspace_allows(&self, token: &str) -> bool {
+        self.backspace.split(',').any(|t| t.trim() == token)
+    }
+
+    /// Is `c` a "word" character per `'iskeyword'` (#1191)? Drives
+    /// `w`/`b`/`e`/`ge`, `*`/`#`/`g*`/`g#`, and the `iw`/`aw` text objects.
+    ///
+    /// Reparses `self.iskeyword` on every call rather than caching a parsed
+    /// form — deliberately: the spec is short (a handful of comma-separated
+    /// items) and per-call cost is dominated by matching against those few
+    /// items, not by string splitting, so a cache would trade a real
+    /// invalidation-correctness risk (stale entries after `:set
+    /// iskeyword+=...`) for a speedup on a path that isn't hot (word
+    /// motions touch tens of characters, not the whole buffer, per
+    /// keystroke). Falls back to the old ASCII+Unicode-alphanumeric default
+    /// if the stored spec is somehow unparsable (defensive only —
+    /// `set_value_option` validates on write).
+    pub(crate) fn is_keyword_char(&self, c: char) -> bool {
+        match parse_iskeyword(&self.iskeyword) {
+            Ok(entries) => iskeyword_matches(&entries, c),
+            Err(_) => c.is_alphanumeric() || c == '_',
+        }
+    }
+
+    /// The `[...]`-body fragments for `\k` / `\K` (`:h /\k`), derived from
+    /// the current `'iskeyword'`. See [`iskeyword_regex_class_body`] for the
+    /// include/exclude caveat.
+    pub(crate) fn iskeyword_regex_class_bodies(&self) -> (String, String) {
+        let entries = parse_iskeyword(&self.iskeyword).unwrap_or_default();
+        let k = iskeyword_regex_class_body(&entries);
+        // `\K` is `\k` excluding (ASCII) digits — `:h /\K`.
+        let big_k = format!("{k}&&[^0-9]");
+        (k, big_k)
     }
 
     /// Load settings from ~/.config/vimcode/settings.json
@@ -1002,10 +2268,62 @@ impl Settings {
 
         // Set a value option (contains '=').
         if let Some(eq_pos) = arg.find('=') {
-            let name = arg[..eq_pos].trim();
+            let raw_name = arg[..eq_pos].trim();
             let value = arg[eq_pos + 1..].trim();
-            self.set_value_option(name, value)?;
-            return Ok(format!("{name}={value}"));
+
+            // `+=`/`-=`/`^=` (#1191, generalised #1206): Vim's option-modify
+            // syntax. For a comma-separated list-style option, append,
+            // remove, or prepend items rather than replacing the whole
+            // value (`:h :set`, "List of items"). For a number option, add,
+            // subtract, or multiply (same section, "For number options").
+            //
+            // #1191 handled only 'iskeyword'; every other base fell through
+            // to the plain `=` path *with the operator still attached to its
+            // name* (`raw_name` was e.g. `"whichwrap+"`), so
+            // `set_value_option` did an exact-name match against that and
+            // reported "Unknown option: whichwrap+" instead of recognising
+            // the real option. Stripping the suffix unconditionally here —
+            // for every base, not just the ones with a combine helper below
+            // — fixes that: an option with no list/numeric handling still
+            // falls through to `set_value_option(base, value)`, which now
+            // sees the real name and reports its real status (implemented,
+            // "recognised but not implemented" for 'clipboard', or a genuine
+            // "Unknown option" for an actual typo).
+            for (suffix, combine) in [
+                ('+', ListOp::Append),
+                ('-', ListOp::Remove),
+                ('^', ListOp::Prepend),
+            ] {
+                if let Some(base) = raw_name.strip_suffix(suffix) {
+                    let base = base.trim();
+                    if let Some(current) = self.current_numeric_value(base) {
+                        let delta: i64 = value
+                            .parse()
+                            .map_err(|_| format!("Invalid value for {base}: '{value}'"))?;
+                        let new_val = match combine {
+                            ListOp::Append => current + delta,
+                            ListOp::Remove => current - delta,
+                            ListOp::Prepend => current * delta,
+                        };
+                        self.set_value_option(base, &new_val.to_string())?;
+                        // Re-read rather than trust `new_val` verbatim: some
+                        // numeric options clamp on write (e.g. `font_size`),
+                        // so the displayed message must match what's
+                        // actually stored, not the raw arithmetic result.
+                        return self.query_option(base);
+                    }
+                    if let Some(current) = self.current_list_value(base) {
+                        let combined = combine_csv_list(&current, value, combine);
+                        self.set_value_option(base, &combined)?;
+                        return self.query_option(base);
+                    }
+                    self.set_value_option(base, value)?;
+                    return Ok(format!("{base}={value}"));
+                }
+            }
+
+            self.set_value_option(raw_name, value)?;
+            return Ok(format!("{raw_name}={value}"));
         }
 
         // Enable a boolean option.
@@ -1099,13 +2417,18 @@ impl Settings {
         } else {
             "nosmartcase"
         };
-        let nf = if self.use_nerd_fonts {
+        let nf = if self.use_nerd_fonts() {
             "nerdfonts"
         } else {
             "nonerdfonts"
         };
+        let sol = if self.startofline {
+            "startofline"
+        } else {
+            "nostartofline"
+        };
         format!(
-            "{}  {}  ts={}  sw={}  {}  {}  {}  {}  {}  {}  {}  {}  {}  {}  so={}  tw={}  {}",
+            "{}  {}  ts={}  sw={}  {}  {}  {}  {}  {}  {}  {}  {}  {}  {}  so={}  tw={}  {}  {}",
             num,
             et,
             self.tabstop,
@@ -1122,7 +2445,8 @@ impl Settings {
             sc,
             self.scrolloff,
             self.textwidth,
-            nf
+            nf,
+            sol
         )
     }
 
@@ -1163,6 +2487,9 @@ impl Settings {
             "hlsearch" | "hls" => self.hlsearch = enable,
             "ignorecase" | "ic" => self.ignorecase = enable,
             "smartcase" | "scs" => self.smartcase = enable,
+            "startofline" | "sol" => self.startofline = enable,
+            "joinspaces" | "js" => self.joinspaces = enable,
+            "smarttab" | "sta" => self.smarttab = enable,
             "cursorline" | "cul" => self.cursorline = enable,
             "windowstatusline" | "wsl" => self.window_status_line = enable,
             "statuslineaboveterminal" | "slat" => self.status_line_above_terminal = enable,
@@ -1174,6 +2501,13 @@ impl Settings {
             "showhiddenfiles" | "shf" => self.show_hidden_files = enable,
             "explorersortcaseinsensitive" | "esci" => self.explorer_sort_case_insensitive = enable,
             "swapfile" => self.swap_file = enable,
+            "undofile" | "udf" => {
+                self.undofile = enable;
+                crate::core::undofile::set_enabled(enable);
+            }
+            "wrapscan" | "ws" => self.wrapscan = enable,
+            "shiftround" | "sr" => self.shiftround = enable,
+            "gdefault" | "gd" => self.gdefault = enable,
             "breadcrumbs" => self.breadcrumbs = enable,
             "hidesingletab" | "hst" => self.hide_single_tab = enable,
             "autohidepanels" => self.autohide_panels = enable,
@@ -1181,9 +2515,44 @@ impl Settings {
             "minimap" => self.minimap = enable,
             "matchbrackets" => self.match_brackets = enable,
             "autopairs" => self.auto_pairs = Some(enable),
-            "nerdfonts" | "nf" => {
-                self.use_nerd_fonts = enable;
+            "hidden" | "hid" => self.hidden = enable,
+            "showcmd" | "sc" => self.showcmd = enable,
+            "ruler" | "ru" => self.ruler = enable,
+            "list" => self.list = enable,
+            "magic" => self.magic = enable,
+            "showmatch" | "sm" => self.showmatch = enable,
+            "linebreak" | "lbr" => self.linebreak = enable,
+            "smartindent" | "si" => self.smartindent = enable,
+            "cindent" | "cin" => self.cindent = enable,
+            // `"nf"` is Vim's real abbreviation for `'nrformats'` (a
+            // value-option, handled in `set_value_option` below) — nerdfonts
+            // (a vimcode-only setting with no real-Vim counterpart) keeps
+            // only its full name here to avoid claiming that abbreviation.
+            "nerdfonts" => {
+                self.use_nerd_fonts = Some(enable);
                 crate::icons::set_nerd_fonts(enable);
+            }
+            // `:h 'wildmenu'` describes an enhanced command-line completion
+            // menu — vimcode already has one, unconditionally, for every
+            // `:` command line (`wildmenu_items`/`wildmenu_selected` in
+            // `src/core/engine/keys.rs`, painted by both backends). It isn't
+            // gated by any setting, so unlike the genuinely-missing options
+            // below, rejecting `set wildmenu` as "not implemented" would be
+            // the wrong lie: the requested behavior is already there. Accept
+            // both spellings as a no-op (#1153 review).
+            "wildmenu" | "wmnu" => {}
+            // #1153: real vim boolean options vimcode recognises but does not
+            // yet implement. Accepted (never "Unknown option") so a pasted
+            // vimrc line doesn't read as a typo, but rejected rather than
+            // silently no-op'd, per the issue's "reject with a 'recognised
+            // but not implemented' message" deliverable — a silent accept
+            // would be a worse lie than a loud one (the user would believe
+            // the behavior changed).
+            _ if UNIMPLEMENTED_BOOL_OPTIONS
+                .iter()
+                .any(|(n, a)| *n == opt || *a == opt) =>
+            {
+                return Err(not_implemented_message(opt));
             }
             _ => {
                 // Settings panel shows snake_case keys (e.g. `window_status_line`)
@@ -1253,6 +2622,13 @@ impl Settings {
                     .filter(|s| !s.is_empty())
                     .collect();
             }
+            "nrformats" | "nf" => {
+                self.nrformats = value
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+            }
             "hover_delay" | "hd" => {
                 let n: u32 = value
                     .parse()
@@ -1281,6 +2657,177 @@ impl Settings {
                 self.syntax_max_lines = n;
                 crate::core::buffer_manager::set_syntax_max_lines(n);
             }
+            "undolevels" | "ul" => {
+                let n: usize = value
+                    .parse()
+                    .map_err(|_| format!("Invalid value for {name}: '{value}'"))?;
+                self.undolevels = n;
+                crate::core::buffer_manager::set_undo_levels(n);
+            }
+            "undodir" | "udir" => {
+                self.undodir = value.to_string();
+                crate::core::undofile::set_dir(value);
+            }
+            "softtabstop" | "sts" => {
+                let n: i32 = value
+                    .parse()
+                    .map_err(|_| format!("Invalid value for {name}: '{value}'"))?;
+                self.softtabstop = n;
+            }
+            "virtualedit" | "ve" => {
+                // `:h 'virtualedit'`: a comma-separated list of `all`,
+                // `block`, `insert`, `onemore`, or the empty string (off).
+                // Only `all`/`onemore`'s "one column past end of line"
+                // effect is implemented — see the field doc comment — but
+                // every real token is still accepted so `:set ve=all`
+                // doesn't read as invalid input.
+                if !value.is_empty() {
+                    for tok in value.split(',') {
+                        if !matches!(tok, "all" | "block" | "insert" | "onemore") {
+                            return Err(format!(
+                                "Invalid value for {name}: '{value}' (expected a comma-separated \
+                                 list of all/block/insert/onemore, or empty)"
+                            ));
+                        }
+                    }
+                }
+                self.virtualedit = value.to_string();
+            }
+            "foldmethod" | "fdm" => {
+                if !matches!(value, "manual" | "indent" | "marker") {
+                    return Err(format!(
+                        "Invalid value for {name}: '{value}' (only 'manual'/'indent'/'marker' \
+                         are implemented)"
+                    ));
+                }
+                self.foldmethod = value.to_string();
+            }
+            "foldlevel" | "fdl" => {
+                let n: usize = value
+                    .parse()
+                    .map_err(|_| format!("Invalid value for {name}: '{value}'"))?;
+                self.foldlevel = n;
+            }
+            // `:h 'foldmarker'`: exactly two non-empty, comma-separated
+            // strings — "the two markers must be different, in order to
+            // avoid ambiguity" is Vim's own wording, but Vim doesn't
+            // actually enforce that (a same-string pair just never closes a
+            // fold, since every occurrence looks like an open), so this
+            // doesn't either.
+            "foldmarker" | "fmr" => {
+                let Some((open, close)) = value.split_once(',') else {
+                    return Err(format!(
+                        "Invalid value for {name}: '{value}' (expected \
+                         'open,close', e.g. '{{{{{{,}}}}}}')"
+                    ));
+                };
+                if open.is_empty() || close.is_empty() || close.contains(',') {
+                    return Err(format!(
+                        "Invalid value for {name}: '{value}' (expected 'open,close', e.g. \
+                         '{{{{{{,}}}}}}')"
+                    ));
+                }
+                self.foldmarker = value.to_string();
+            }
+            "foldnestmax" | "fdn" => {
+                let n: usize = value
+                    .parse()
+                    .map_err(|_| format!("Invalid value for {name}: '{value}'"))?;
+                if n == 0 {
+                    return Err(format!(
+                        "Invalid value for {name}: '{value}' (must be at least 1)"
+                    ));
+                }
+                self.foldnestmax = n;
+            }
+            // #1191: validate eagerly (rather than storing an unparsable
+            // spec and only failing later, per-character, in
+            // `is_keyword_char`) so a typo'd vimrc line is rejected the way
+            // Vim rejects it, not silently downgraded to the ASCII default.
+            "iskeyword" | "isk" => {
+                parse_iskeyword(value).map_err(|e| {
+                    format!(
+                        "Invalid value for {name}: '{value}' ({e}; expected a comma-separated \
+                         list of characters, 'c1-c2' ranges, decimal codes, decimal 'n1-n2' \
+                         ranges, or '@', each optionally prefixed with '^' to exclude)"
+                    )
+                })?;
+                self.iskeyword = value.to_string();
+            }
+            // #1206
+            "whichwrap" | "ww" => {
+                parse_whichwrap(value).map_err(|e| {
+                    format!(
+                        "Invalid value for {name}: '{value}' ({e}; expected a comma-separated \
+                         list of b/s/h/l/</>/~/[/])"
+                    )
+                })?;
+                self.whichwrap = value.to_string();
+            }
+            "backspace" | "bs" => {
+                let normalized = parse_backspace(value).map_err(|e| {
+                    format!(
+                        "Invalid value for {name}: '{value}' ({e}; expected a comma-separated \
+                         list of indent/eol/start/nostop, or the legacy 0-3)"
+                    )
+                })?;
+                self.backspace = normalized;
+            }
+            "timeoutlen" | "tm" => {
+                let n: u32 = value
+                    .parse()
+                    .map_err(|_| format!("Invalid value for {name}: '{value}'"))?;
+                self.timeoutlen = n;
+            }
+            "wildmode" | "wim" => {
+                parse_wildmode(value).map_err(|e| {
+                    format!(
+                        "Invalid value for {name}: '{value}' ({e}; expected comma-separated \
+                         stages of colon-separated full/longest/list/lastused)"
+                    )
+                })?;
+                self.wildmode = value.to_string();
+            }
+            "laststatus" | "ls" => {
+                let n: u8 = value
+                    .parse()
+                    .map_err(|_| format!("Invalid value for {name}: '{value}'"))?;
+                if n > 3 {
+                    return Err(format!(
+                        "Invalid value for {name}: '{value}' (expected 0-3)"
+                    ));
+                }
+                self.laststatus = n;
+            }
+            "sidescrolloff" | "siso" => {
+                let n: usize = value
+                    .parse()
+                    .map_err(|_| format!("Invalid value for {name}: '{value}'"))?;
+                self.sidescrolloff = n;
+            }
+            "scrolljump" | "sj" => {
+                let n: usize = value
+                    .parse()
+                    .map_err(|_| format!("Invalid value for {name}: '{value}'"))?;
+                self.scrolljump = n;
+            }
+            "listchars" | "lcs" => {
+                parse_listchars(value).map_err(|e| {
+                    format!(
+                        "Invalid value for {name}: '{value}' ({e}; expected comma-separated \
+                         item:chars pairs, e.g. 'tab:> ,trail:-')"
+                    )
+                })?;
+                self.listchars = value.to_string();
+            }
+            // #1153: see `UNIMPLEMENTED_BOOL_OPTIONS`'s doc comment — same
+            // rationale, value-option side.
+            _ if UNIMPLEMENTED_VALUE_OPTIONS
+                .iter()
+                .any(|(n, a)| *n == name || *a == name) =>
+            {
+                return Err(not_implemented_message(name));
+            }
             _ => {
                 // Snake_case → packed-name fallback (see `set_bool_option`).
                 if name.contains('_') {
@@ -1293,6 +2840,74 @@ impl Settings {
             }
         }
         Ok(())
+    }
+
+    /// The current value of `base` as an `i64`, if `base` names a numeric
+    /// value option — used by `parse_set_option`'s `+=`/`-=`/`^=` handling
+    /// (#1206) to compute add/subtract/multiply without a second, parallel
+    /// name-to-field match. Deliberately narrow: only options whose
+    /// `set_value_option` arm does a plain integer parse belong here — a
+    /// list-style option (even one that happens to look numeric, like the
+    /// legacy `'backspace'` shorthand) must go through
+    /// [`Self::current_list_value`] instead, or it would silently reinterpret
+    /// `:set bs+=1` as arithmetic instead of the list append Vim performs.
+    fn current_numeric_value(&self, base: &str) -> Option<i64> {
+        match base {
+            "tabstop" | "ts" => Some(self.tabstop as i64),
+            "shiftwidth" | "sw" => Some(self.shift_width as i64),
+            "scrolloff" | "so" => Some(self.scrolloff as i64),
+            "textwidth" | "tw" => Some(self.textwidth as i64),
+            "updatetime" | "ut" => Some(self.updatetime as i64),
+            "hover_delay" | "hd" => Some(self.hover_delay as i64),
+            "font_size" => Some(self.font_size as i64),
+            "ui_font_size" => Some(self.ui_font_size as i64),
+            "syntax_max_lines" | "syntaxmaxlines" => Some(self.syntax_max_lines as i64),
+            "undolevels" | "ul" => Some(self.undolevels as i64),
+            "softtabstop" | "sts" => Some(self.softtabstop as i64),
+            "foldlevel" | "fdl" => Some(self.foldlevel as i64),
+            "foldnestmax" | "fdn" => Some(self.foldnestmax as i64),
+            "timeoutlen" | "tm" => Some(self.timeoutlen as i64),
+            "laststatus" | "ls" => Some(self.laststatus as i64),
+            "sidescrolloff" | "siso" => Some(self.sidescrolloff as i64),
+            "scrolljump" | "sj" => Some(self.scrolljump as i64),
+            _ => None,
+        }
+    }
+
+    /// The current value of `base` as a raw comma-separated string, if
+    /// `base` names a list-style value option — used by
+    /// `parse_set_option`'s `+=`/`-=`/`^=` handling (#1206) the same way
+    /// [`Self::current_numeric_value`] is. `'clipboard'` deliberately has no
+    /// arm: it's list-shaped in real Vim, but vimcode has no stored value to
+    /// combine against (it's in `UNIMPLEMENTED_VALUE_OPTIONS`) — leaving it
+    /// out here means its `+=`/`-=`/`^=` case falls through to the plain
+    /// `set_value_option(base, value)` call, which is what reports the
+    /// "recognised but not implemented" message.
+    fn current_list_value(&self, base: &str) -> Option<String> {
+        match base {
+            "iskeyword" | "isk" => Some(self.iskeyword.clone()),
+            "whichwrap" | "ww" => Some(self.whichwrap.clone()),
+            "wildmode" | "wim" => Some(self.wildmode.clone()),
+            "listchars" | "lcs" => Some(self.listchars.clone()),
+            // Pre-existing list-style options #1206 didn't add but whose
+            // `+=`/`-=`/`^=` this same generalisation now has to get right
+            // too — without an arm here, the generic strip above would
+            // silently reinterpret e.g. `:set nrformats+=octal` as `:set
+            // nrformats=octal` (replacing, not appending), which is a worse
+            // outcome than #1191's old "Unknown option: nrformats+" error.
+            "nrformats" | "nf" => Some(self.nrformats.join(",")),
+            "colorcolumn" | "cc" => Some(self.colorcolumn.clone()),
+            "virtualedit" | "ve" => Some(self.virtualedit.clone()),
+            // 'backspace' also accepts a legacy *numeric* shorthand
+            // (0-3, expanded by `parse_backspace`), which would collide with
+            // `current_numeric_value`'s arithmetic if it were listed there
+            // too — it belongs here, as a list option, because `:h :set`
+            // classifies `'backspace'` itself as a list-of-items string
+            // option, and Vim's own `+=`/`-=`/`^=` on it does list
+            // append/remove/prepend, not arithmetic on the legacy digit.
+            "backspace" | "bs" => Some(self.backspace.clone()),
+            _ => None,
+        }
     }
 
     fn query_option(&self, opt: &str) -> Result<String, String> {
@@ -1375,6 +2990,22 @@ impl Settings {
                 "nosmartcase".to_string()
             }),
             "scrolloff" | "so" => Ok(format!("scrolloff={}", self.scrolloff)),
+            "startofline" | "sol" => Ok(if self.startofline {
+                "startofline".to_string()
+            } else {
+                "nostartofline".to_string()
+            }),
+            "joinspaces" | "js" => Ok(if self.joinspaces {
+                "joinspaces".to_string()
+            } else {
+                "nojoinspaces".to_string()
+            }),
+            "smarttab" | "sta" => Ok(if self.smarttab {
+                "smarttab".to_string()
+            } else {
+                "nosmarttab".to_string()
+            }),
+            "nrformats" | "nf" => Ok(format!("nrformats={}", self.nrformats.join(","))),
             "cursorline" | "cul" => Ok(if self.cursorline {
                 "cursorline".to_string()
             } else {
@@ -1458,18 +3089,112 @@ impl Settings {
             } else {
                 "noautopairs".to_string()
             }),
+            "hidden" | "hid" => Ok(if self.hidden {
+                "hidden".to_string()
+            } else {
+                "nohidden".to_string()
+            }),
+            "showcmd" | "sc" => Ok(if self.showcmd {
+                "showcmd".to_string()
+            } else {
+                "noshowcmd".to_string()
+            }),
+            "ruler" | "ru" => Ok(if self.ruler {
+                "ruler".to_string()
+            } else {
+                "noruler".to_string()
+            }),
+            "list" => Ok(if self.list {
+                "list".to_string()
+            } else {
+                "nolist".to_string()
+            }),
+            "magic" => Ok(if self.magic {
+                "magic".to_string()
+            } else {
+                "nomagic".to_string()
+            }),
+            "showmatch" | "sm" => Ok(if self.showmatch {
+                "showmatch".to_string()
+            } else {
+                "noshowmatch".to_string()
+            }),
+            "linebreak" | "lbr" => Ok(if self.linebreak {
+                "linebreak".to_string()
+            } else {
+                "nolinebreak".to_string()
+            }),
+            "smartindent" | "si" => Ok(if self.smartindent {
+                "smartindent".to_string()
+            } else {
+                "nosmartindent".to_string()
+            }),
+            "cindent" | "cin" => Ok(if self.cindent {
+                "cindent".to_string()
+            } else {
+                "nocindent".to_string()
+            }),
             "extension_registries" => Ok(format!(
                 "extension_registries={}",
                 self.extension_registries.join(",")
             )),
             "hover_delay" | "hd" => Ok(format!("hover_delay={}", self.hover_delay)),
-            "nerdfonts" | "nf" => Ok(if self.use_nerd_fonts {
+            "nerdfonts" => Ok(if self.use_nerd_fonts() {
                 "nerdfonts".to_string()
             } else {
                 "nonerdfonts".to_string()
             }),
             "syntax_max_lines" | "syntaxmaxlines" => {
                 Ok(format!("syntax_max_lines={}", self.syntax_max_lines))
+            }
+            "undolevels" | "ul" => Ok(format!("undolevels={}", self.undolevels)),
+            "undofile" | "udf" => Ok(if self.undofile {
+                "undofile".to_string()
+            } else {
+                "noundofile".to_string()
+            }),
+            "undodir" | "udir" => Ok(format!("undodir={}", self.undodir)),
+            "wrapscan" | "ws" => Ok(if self.wrapscan {
+                "wrapscan".to_string()
+            } else {
+                "nowrapscan".to_string()
+            }),
+            "shiftround" | "sr" => Ok(if self.shiftround {
+                "shiftround".to_string()
+            } else {
+                "noshiftround".to_string()
+            }),
+            "gdefault" | "gd" => Ok(if self.gdefault {
+                "gdefault".to_string()
+            } else {
+                "nogdefault".to_string()
+            }),
+            "softtabstop" | "sts" => Ok(format!("softtabstop={}", self.softtabstop)),
+            "virtualedit" | "ve" => Ok(format!("virtualedit={}", self.virtualedit)),
+            "foldmethod" | "fdm" => Ok(format!("foldmethod={}", self.foldmethod)),
+            "foldlevel" | "fdl" => Ok(format!("foldlevel={}", self.foldlevel)),
+            "foldmarker" | "fmr" => Ok(format!("foldmarker={}", self.foldmarker)),
+            "foldnestmax" | "fdn" => Ok(format!("foldnestmax={}", self.foldnestmax)),
+            "iskeyword" | "isk" => Ok(format!("iskeyword={}", self.iskeyword)),
+            // Always on — see the `set_bool_option` "wildmenu" | "wmnu" arm.
+            "wildmenu" | "wmnu" => Ok("wildmenu".to_string()),
+            // #1206
+            "whichwrap" | "ww" => Ok(format!("whichwrap={}", self.whichwrap)),
+            "backspace" | "bs" => Ok(format!("backspace={}", self.backspace)),
+            "timeoutlen" | "tm" => Ok(format!("timeoutlen={}", self.timeoutlen)),
+            "wildmode" | "wim" => Ok(format!("wildmode={}", self.wildmode)),
+            "laststatus" | "ls" => Ok(format!("laststatus={}", self.laststatus)),
+            "sidescrolloff" | "siso" => Ok(format!("sidescrolloff={}", self.sidescrolloff)),
+            "scrolljump" | "sj" => Ok(format!("scrolljump={}", self.scrolljump)),
+            "listchars" | "lcs" => Ok(format!("listchars={}", self.listchars)),
+            _ if UNIMPLEMENTED_BOOL_OPTIONS
+                .iter()
+                .any(|(n, a)| *n == opt || *a == opt)
+                || UNIMPLEMENTED_VALUE_OPTIONS
+                    .iter()
+                    .any(|(n, a)| *n == opt || *a == opt) =>
+            {
+                Err(not_implemented_message(opt))
             }
             _ => {
                 // Snake_case → packed-name fallback (see `set_bool_option`).
@@ -1514,7 +3239,28 @@ impl Settings {
         Ok(())
     }
 
+    /// Where `settings.json` lives — `~/.config/vimcode/settings.json`
+    /// (or the platform equivalent, see [`super::paths::vimcode_config_dir`]).
+    ///
+    /// Under `#[cfg(test)]`, a per-thread override installed via
+    /// [`TestSettingsPathGuard::install`] takes priority when set (#949
+    /// review).
+    /// This is a `thread_local`, not a `$HOME` env-var mutation, precisely
+    /// because `std::env::set_var` is process-global: Rust's default test
+    /// runner executes tests in parallel on multiple threads within the
+    /// same process, so mutating `$HOME` from one test would race every
+    /// other concurrently-running test that (transitively, via
+    /// `Engine::new`/`check_settings_reload`) also resolves this path.
+    /// A thread-local override carries no such risk — each test thread
+    /// gets its own slot — and needs no `serial_test`/lock discipline this
+    /// codebase doesn't otherwise have.
     pub fn settings_file_path() -> PathBuf {
+        #[cfg(test)]
+        {
+            if let Some(p) = TEST_SETTINGS_PATH_OVERRIDE.with(|cell| cell.borrow().clone()) {
+                return p;
+            }
+        }
         super::paths::vimcode_config_dir().join("settings.json")
     }
 
@@ -1544,6 +3290,23 @@ impl Settings {
             "spell" => self.spell.to_string(),
             "spelllang" => self.spelllang.clone(),
             "scrolloff" => self.scrolloff.to_string(),
+            "startofline" | "sol" => self.startofline.to_string(),
+            "joinspaces" | "js" => self.joinspaces.to_string(),
+            "hidden" | "hid" => self.hidden.to_string(),
+            "showcmd" | "sc" => self.showcmd.to_string(),
+            "ruler" | "ru" => self.ruler.to_string(),
+            "list" => self.list.to_string(),
+            "listchars" | "lcs" => self.listchars.clone(),
+            "whichwrap" | "ww" => self.whichwrap.clone(),
+            "backspace" | "bs" => self.backspace.clone(),
+            "timeoutlen" | "tm" => self.timeoutlen.to_string(),
+            "wildmode" | "wim" => self.wildmode.clone(),
+            "laststatus" | "ls" => self.laststatus.to_string(),
+            "sidescrolloff" | "siso" => self.sidescrolloff.to_string(),
+            "scrolljump" | "sj" => self.scrolljump.to_string(),
+            "smarttab" | "sta" => self.smarttab.to_string(),
+            "nrformats" | "nf" => self.nrformats.join(","),
+            "iskeyword" | "isk" => self.iskeyword.clone(),
             "colorcolumn" => self.colorcolumn.clone(),
             "textwidth" => self.textwidth.to_string(),
             "hlsearch" => self.hlsearch.to_string(),
@@ -1553,6 +3316,11 @@ impl Settings {
             "editor_mode" => match self.editor_mode {
                 EditorMode::Vim => "vim".to_string(),
                 EditorMode::Vscode => "vscode".to_string(),
+            },
+            "menu_style" => match self.menu_style {
+                MenuStyle::Native => "native".to_string(),
+                MenuStyle::Custom => "custom".to_string(),
+                MenuStyle::Inherit => "inherit".to_string(),
             },
             "explorer_visible_on_startup" => self.explorer_visible_on_startup.to_string(),
             "autoread" => self.autoread.to_string(),
@@ -1573,6 +3341,9 @@ impl Settings {
             }
             "swapfile" | "swap_file" => self.swap_file.to_string(),
             "updatetime" | "ut" => self.updatetime.to_string(),
+            "undolevels" | "ul" => self.undolevels.to_string(),
+            "undofile" | "udf" => self.undofile.to_string(),
+            "undodir" | "udir" => self.undodir.clone(),
             "breadcrumbs" => self.breadcrumbs.to_string(),
             "hide_single_tab" | "hidesingletab" | "hst" => self.hide_single_tab.to_string(),
             "autohide_panels" | "autohidepanels" => self.autohide_panels.to_string(),
@@ -1581,7 +3352,7 @@ impl Settings {
             "match_brackets" | "matchbrackets" => self.match_brackets.to_string(),
             "auto_pairs" | "autopairs" => self.auto_pairs().to_string(),
             "hover_delay" => self.hover_delay.to_string(),
-            "use_nerd_fonts" | "nerdfonts" | "nf" => self.use_nerd_fonts.to_string(),
+            "use_nerd_fonts" | "nerdfonts" => self.use_nerd_fonts().to_string(),
             "ctrl_f_action" => self.ctrl_f_action(),
             "extension_registries" => self.extension_registries.join(", "),
             "syntax_max_lines" | "syntaxmaxlines" => self.syntax_max_lines.to_string(),
@@ -1639,6 +3410,21 @@ impl Settings {
                     .parse()
                     .map_err(|_| format!("Invalid scrolloff: {value}"))?;
             }
+            "startofline" | "sol" => self.startofline = value == "true",
+            "joinspaces" | "js" => self.joinspaces = value == "true",
+            "smarttab" | "sta" => self.smarttab = value == "true",
+            "nrformats" | "nf" => {
+                self.nrformats = value
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+            }
+            "iskeyword" | "isk" => {
+                parse_iskeyword(value)
+                    .map_err(|e| format!("Invalid iskeyword: '{value}' ({e})"))?;
+                self.iskeyword = value.to_string();
+            }
             "colorcolumn" => self.colorcolumn = value.to_string(),
             "textwidth" => {
                 self.textwidth = value
@@ -1654,6 +3440,14 @@ impl Settings {
                     "vim" => EditorMode::Vim,
                     "vscode" => EditorMode::Vscode,
                     _ => return Err(format!("Unknown editor_mode: {value}")),
+                };
+            }
+            "menu_style" => {
+                self.menu_style = match value {
+                    "native" => MenuStyle::Native,
+                    "custom" => MenuStyle::Custom,
+                    "inherit" => MenuStyle::Inherit,
+                    _ => return Err(format!("Unknown menu_style: {value}")),
                 };
             }
             "explorer_visible_on_startup" => self.explorer_visible_on_startup = value == "true",
@@ -1688,6 +3482,20 @@ impl Settings {
                     .parse()
                     .map_err(|_| format!("Invalid updatetime: {value}"))?;
             }
+            "undolevels" | "ul" => {
+                self.undolevels = value
+                    .parse()
+                    .map_err(|_| format!("Invalid undolevels: {value}"))?;
+                crate::core::buffer_manager::set_undo_levels(self.undolevels);
+            }
+            "undofile" | "udf" => {
+                self.undofile = value == "true";
+                crate::core::undofile::set_enabled(self.undofile);
+            }
+            "undodir" | "udir" => {
+                self.undodir = value.to_string();
+                crate::core::undofile::set_dir(&self.undodir);
+            }
             "breadcrumbs" => self.breadcrumbs = value == "true",
             "hide_single_tab" | "hidesingletab" | "hst" => self.hide_single_tab = value == "true",
             "autohide_panels" | "autohidepanels" => self.autohide_panels = value == "true",
@@ -1700,9 +3508,9 @@ impl Settings {
                     .parse()
                     .map_err(|_| format!("Invalid hover_delay: {value}"))?;
             }
-            "use_nerd_fonts" | "nerdfonts" | "nf" => {
-                self.use_nerd_fonts = value == "true";
-                crate::icons::set_nerd_fonts(self.use_nerd_fonts);
+            "use_nerd_fonts" | "nerdfonts" => {
+                self.use_nerd_fonts = Some(value == "true");
+                crate::icons::set_nerd_fonts(self.use_nerd_fonts());
             }
             "ctrl_f_action" => match value {
                 "find" | "page_down" => self.ctrl_f_action = Some(value.to_string()),
@@ -1936,9 +3744,44 @@ pub static SETTING_DEFS: &[SettingDef] = &[
         setting_type: SettingType::Integer { min: 0, max: 30 },
     },
     SettingDef {
+        key: "startofline",
+        label: "Start Of Line",
+        description: "Land on the first non-blank column after G, gg, H, M, L, <C-d>, <C-u>, <C-b>, <C-f> (Vim's default; Neovim's is off)",
+        category: "Editor",
+        setting_type: SettingType::Bool,
+    },
+    SettingDef {
+        key: "joinspaces",
+        label: "Join Spaces",
+        description: "Insert two spaces instead of one when J joins a line ending in '.', '!' or '?' (Vim's default; Neovim's is off)",
+        category: "Editor",
+        setting_type: SettingType::Bool,
+    },
+    SettingDef {
+        key: "smarttab",
+        label: "Smart Tab",
+        description: "Tab/Backspace at the start of a line use 'shift_width' instead of 'tabstop' (Vim's default is off; Neovim's is on)",
+        category: "Editor",
+        setting_type: SettingType::Bool,
+    },
+    SettingDef {
+        key: "nrformats",
+        label: "Number Formats",
+        description: "Extra numeral formats <C-a>/<C-x> recognize besides decimal: bin, octal, hex, alpha (comma-separated; Neovim's default is \"bin,hex\")",
+        category: "Editor",
+        setting_type: SettingType::StringVal,
+    },
+    SettingDef {
         key: "colorcolumn",
         label: "Color Column",
         description: "Columns to highlight as rulers (e.g. \"80,120\")",
+        category: "Editor",
+        setting_type: SettingType::StringVal,
+    },
+    SettingDef {
+        key: "iskeyword",
+        label: "Keyword Characters",
+        description: "Characters word motions (w/b/e, */#, iw/aw) treat as part of a word",
         category: "Editor",
         setting_type: SettingType::StringVal,
     },
@@ -1965,6 +3808,30 @@ pub static SETTING_DEFS: &[SettingDef] = &[
             min: 100,
             max: 60000,
         },
+    },
+    SettingDef {
+        key: "undolevels",
+        label: "Undo Levels",
+        description: "Maximum number of undo states kept per buffer, across every branch (like Vim's undolevels option)",
+        category: "Editor",
+        setting_type: SettingType::Integer {
+            min: 1,
+            max: 1_000_000,
+        },
+    },
+    SettingDef {
+        key: "undofile",
+        label: "Persistent Undo",
+        description: "Save undo history to disk so it survives closing and reopening a file (like Vim's undofile option)",
+        category: "Editor",
+        setting_type: SettingType::Bool,
+    },
+    SettingDef {
+        key: "undodir",
+        label: "Undo Directory",
+        description: "Directory undo history is saved to when Persistent Undo is on (default: ~/.config/vimcode/undo/)",
+        category: "Editor",
+        setting_type: SettingType::StringVal,
     },
     SettingDef {
         key: "syntax_max_lines",
@@ -2026,6 +3893,15 @@ pub static SETTING_DEFS: &[SettingDef] = &[
         description: "Vim (modal) or VSCode (always-insert) key bindings",
         category: "Workspace",
         setting_type: SettingType::Enum(&["vim", "vscode"]),
+    },
+    SettingDef {
+        key: "menu_style",
+        label: "Context Menu Style",
+        description: "Native OS context menu, the in-window one, or inherit \
+                       from the window style (only observable on a backend \
+                       with a native context menu, e.g. macOS)",
+        category: "Workspace",
+        setting_type: SettingType::Enum(&["native", "custom", "inherit"]),
     },
     SettingDef {
         key: "explorer_visible_on_startup",
@@ -2229,6 +4105,9 @@ mod tests {
     fn test_settings_default() {
         let settings = Settings::default();
         assert_eq!(settings.line_numbers, LineNumberMode::None);
+        // #1129: one value on every platform now that quadraui#1023
+        // resolves the `"Monospace"` generic alias per-backend (see
+        // `default_font_family`'s doc comment) — no more macOS special case.
         assert_eq!(settings.font_family, "Monospace");
         assert_eq!(settings.font_size, 14);
         // #700 item 6: VS Code draws indent guides by default; nothing
@@ -2469,6 +4348,59 @@ mod tests {
         assert_eq!(s.tabstop, 8);
     }
 
+    // ── #1156: 'undolevels' / 'undofile' / 'undodir' ────────────────────────
+
+    #[test]
+    fn test_set_undolevels_and_alias() {
+        let mut s = Settings::default();
+        assert_eq!(s.undolevels, 1000);
+        let msg = s.parse_set_option("undolevels=50").unwrap();
+        assert_eq!(msg, "undolevels=50");
+        assert_eq!(s.undolevels, 50);
+        s.parse_set_option("ul=10").unwrap();
+        assert_eq!(s.undolevels, 10);
+        assert_eq!(s.parse_set_option("ul?").unwrap(), "undolevels=10");
+    }
+
+    #[test]
+    fn test_set_undofile_and_alias_toggle_and_query() {
+        let mut s = Settings::default();
+        assert!(!s.undofile);
+        s.parse_set_option("undofile").unwrap();
+        assert!(s.undofile);
+        assert_eq!(s.parse_set_option("udf?").unwrap(), "undofile");
+        s.parse_set_option("noundofile").unwrap();
+        assert!(!s.undofile);
+        assert_eq!(s.parse_set_option("undofile?").unwrap(), "noundofile");
+    }
+
+    #[test]
+    fn test_set_undodir_round_trips() {
+        let mut s = Settings::default();
+        assert_eq!(s.undodir, "");
+        s.parse_set_option("undodir=/tmp/myundo").unwrap();
+        assert_eq!(s.undodir, "/tmp/myundo");
+        assert_eq!(s.parse_set_option("udir?").unwrap(), "undodir=/tmp/myundo");
+    }
+
+    #[test]
+    fn undolevels_undofile_undodir_round_trip_through_get_set_by_key() {
+        let mut s = Settings::default();
+        s.set_value_str("undolevels", "42").unwrap();
+        assert_eq!(s.get_value_str("undolevels"), "42");
+        s.set_value_str("undofile", "true").unwrap();
+        assert_eq!(s.get_value_str("undofile"), "true");
+        s.set_value_str("undodir", "/tmp/u").unwrap();
+        assert_eq!(s.get_value_str("undodir"), "/tmp/u");
+    }
+
+    #[test]
+    fn undo_settings_appear_in_the_settings_registry() {
+        assert!(SETTING_DEFS.iter().any(|d| d.key == "undolevels"));
+        assert!(SETTING_DEFS.iter().any(|d| d.key == "undofile"));
+        assert!(SETTING_DEFS.iter().any(|d| d.key == "undodir"));
+    }
+
     #[test]
     fn test_set_tabstop_zero_is_error() {
         let mut s = Settings::default();
@@ -2522,11 +4454,154 @@ mod tests {
     }
 
     #[test]
+    fn test_set_smarttab() {
+        let mut s = Settings::default();
+        assert!(s.smarttab);
+        s.parse_set_option("nosmarttab").unwrap();
+        assert!(!s.smarttab);
+        s.parse_set_option("sta").unwrap();
+        assert!(s.smarttab);
+    }
+
+    #[test]
+    fn test_set_nrformats_default_and_nf_alias() {
+        let mut s = Settings::default();
+        assert_eq!(s.nrformats, vec!["bin".to_string(), "hex".to_string()]);
+        let msg = s.parse_set_option("nf=bin,octal,hex").unwrap();
+        assert_eq!(msg, "nf=bin,octal,hex");
+        assert_eq!(
+            s.nrformats,
+            vec!["bin".to_string(), "octal".to_string(), "hex".to_string()]
+        );
+        let query = s.parse_set_option("nrformats?").unwrap();
+        assert_eq!(query, "nrformats=bin,octal,hex");
+    }
+
+    #[test]
+    fn test_nf_abbreviation_is_nrformats_not_nerdfonts() {
+        // `"nf"` is Vim's real 'nrformats' abbreviation. vimcode's own
+        // nerdfonts setting predates this option and had claimed "nf" for
+        // itself; that alias was dropped in favor of the real-Vim meaning —
+        // `:set nf=...` must go to `nrformats`, not toggle `nerdfonts`.
+        let mut s = Settings::default();
+        s.parse_set_option("nf=alpha").unwrap();
+        assert_eq!(s.nrformats, vec!["alpha".to_string()]);
+        assert!(s.use_nerd_fonts()); // untouched
+    }
+
+    #[test]
     fn test_set_unknown_option_is_error() {
         let mut s = Settings::default();
         assert!(s.parse_set_option("unknownoption").is_err());
         assert!(s.parse_set_option("nounknown").is_err());
         assert!(s.parse_set_option("foo=42").is_err());
+    }
+
+    // ── 'iskeyword' (#1191) ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_iskeyword_default_and_isk_alias_readback() {
+        let mut s = Settings::default();
+        assert_eq!(s.iskeyword, "@,48-57,_,192-255");
+        let query = s.parse_set_option("isk?").unwrap();
+        assert_eq!(query, "iskeyword=@,48-57,_,192-255");
+    }
+
+    #[test]
+    fn test_iskeyword_plain_assignment_replaces_value() {
+        let mut s = Settings::default();
+        let msg = s.parse_set_option("iskeyword=@,_").unwrap();
+        assert_eq!(msg, "iskeyword=@,_");
+        assert_eq!(s.iskeyword, "@,_");
+    }
+
+    #[test]
+    fn test_iskeyword_rejects_malformed_value() {
+        // Before #1191, `iskeyword` was in `UNIMPLEMENTED_VALUE_OPTIONS`, so
+        // *every* value (valid or not) was rejected with the same
+        // "recognised but not implemented" message. Now a well-formed value
+        // is accepted (see the other tests in this section) and only a
+        // genuinely malformed one is rejected — with a different message.
+        let mut s = Settings::default();
+        let err = s.parse_set_option("iskeyword=abc-").unwrap_err();
+        assert!(err.contains("Invalid value for iskeyword"), "{err}");
+        // The stored value must be untouched by the rejected attempt.
+        assert_eq!(s.iskeyword, "@,48-57,_,192-255");
+    }
+
+    #[test]
+    fn test_iskeyword_plus_equals_appends() {
+        // Before #1191 this failed outright — `iskeyword` (in any spelling,
+        // any operator) was unconditionally "recognised but not
+        // implemented", so `+=` could never even be attempted.
+        let mut s = Settings::default();
+        let msg = s.parse_set_option("iskeyword+=-").unwrap();
+        assert_eq!(msg, "iskeyword=@,48-57,_,192-255,-");
+        assert_eq!(s.iskeyword, "@,48-57,_,192-255,-");
+    }
+
+    #[test]
+    fn test_iskeyword_caret_equals_prepends() {
+        let mut s = Settings::default();
+        s.parse_set_option("isk^=$").unwrap();
+        assert_eq!(s.iskeyword, "$,@,48-57,_,192-255");
+    }
+
+    #[test]
+    fn test_iskeyword_minus_equals_removes() {
+        let mut s = Settings::default();
+        s.parse_set_option("iskeyword-=_").unwrap();
+        assert_eq!(s.iskeyword, "@,48-57,192-255");
+    }
+
+    #[test]
+    fn test_iskeyword_is_keyword_char_default_is_unicode_aware() {
+        // #1191: the underlying motion/regex bug this issue exists to fix —
+        // before it, word-char classification for anything beyond the
+        // hardcoded ASCII set was wrong for `\k`/`\K` (see vim_regex.rs's
+        // `keyword_class_is_unicode_aware_with_the_default_iskeyword`).
+        // `Settings::is_keyword_char` is the motion-side half of the same
+        // fix: it must treat every Unicode letter as a keyword char under
+        // the default spec, exactly like real Vim's `@` token promises.
+        let s = Settings::default();
+        assert!(s.is_keyword_char('a'));
+        assert!(s.is_keyword_char('_'));
+        assert!(s.is_keyword_char('5'));
+        assert!(s.is_keyword_char('é'));
+        assert!(s.is_keyword_char('Я'));
+        assert!(s.is_keyword_char('北'));
+        assert!(!s.is_keyword_char(' '));
+        assert!(!s.is_keyword_char('.'));
+        assert!(!s.is_keyword_char('-'));
+    }
+
+    #[test]
+    fn test_iskeyword_custom_spec_add_hyphen_as_keyword() {
+        let mut s = Settings::default();
+        s.parse_set_option("iskeyword+=-").unwrap();
+        assert!(s.is_keyword_char('-'));
+        assert!(s.is_keyword_char('a'));
+    }
+
+    #[test]
+    fn test_iskeyword_exclusion_removes_a_default_class() {
+        // `^_` excludes underscore from the (still-present) `@` alphabetic
+        // class — order-sensitive, matching real Vim.
+        let mut s = Settings::default();
+        s.parse_set_option("iskeyword=@,^_").unwrap();
+        assert!(s.is_keyword_char('a'));
+        assert!(!s.is_keyword_char('_'));
+    }
+
+    #[test]
+    fn test_iskeyword_code_range_and_single_char_and_code() {
+        let mut s = Settings::default();
+        s.parse_set_option("iskeyword=65-90,35,36").unwrap();
+        assert!(s.is_keyword_char('A')); // 65
+        assert!(s.is_keyword_char('Z')); // 90
+        assert!(!s.is_keyword_char('a')); // outside 65-90, lowercase not included
+        assert!(s.is_keyword_char('#')); // 35
+        assert!(s.is_keyword_char('$')); // 36
     }
 
     #[test]
@@ -2631,6 +4706,89 @@ mod tests {
         let msg = s.parse_set_option("nowrap!").unwrap();
         assert_eq!(msg, "nowrap");
         assert!(!s.wrap);
+    }
+
+    // ── #1207: the last five `UNIMPLEMENTED_BOOL_OPTIONS` (#1190 tranche 2) ──
+    //
+    // RED against unfixed `develop`: before #1207, every one of `magic`,
+    // `showmatch`, `linebreak`, `smartindent`, `cindent` was listed in
+    // `UNIMPLEMENTED_BOOL_OPTIONS`, so `parse_set_option` rejected all of
+    // them with "recognised but not implemented yet" instead of setting the
+    // field — every assertion below that a field flips would have failed
+    // (the `unwrap()` on `parse_set_option` would have panicked on the
+    // `Err`).
+
+    #[test]
+    fn test_settings_magic_defaults_on_and_round_trips() {
+        let mut s = Settings::default();
+        assert!(s.magic, "'magic' defaults on, matching real Vim");
+        let msg = s.parse_set_option("nomagic").unwrap();
+        assert_eq!(msg, "nomagic");
+        assert!(!s.magic);
+        let msg = s.parse_set_option("magic").unwrap();
+        assert_eq!(msg, "magic");
+        assert!(s.magic);
+        assert_eq!(s.parse_set_option("magic?").unwrap(), "magic");
+    }
+
+    #[test]
+    fn test_settings_showmatch_defaults_off_and_round_trips_via_abbrev() {
+        let mut s = Settings::default();
+        assert!(!s.showmatch);
+        let msg = s.parse_set_option("sm").unwrap();
+        assert_eq!(msg, "sm");
+        assert!(s.showmatch);
+        assert_eq!(s.parse_set_option("showmatch?").unwrap(), "showmatch");
+        let msg = s.parse_set_option("nosm").unwrap();
+        assert_eq!(msg, "nosm");
+        assert!(!s.showmatch);
+    }
+
+    #[test]
+    fn test_settings_linebreak_defaults_off_and_round_trips_via_abbrev() {
+        let mut s = Settings::default();
+        assert!(!s.linebreak);
+        let msg = s.parse_set_option("lbr").unwrap();
+        assert_eq!(msg, "lbr");
+        assert!(s.linebreak);
+        assert_eq!(s.parse_set_option("linebreak?").unwrap(), "linebreak");
+        let msg = s.parse_set_option("nolbr").unwrap();
+        assert_eq!(msg, "nolbr");
+        assert!(!s.linebreak);
+    }
+
+    #[test]
+    fn test_settings_smartindent_defaults_off_and_round_trips_via_abbrev() {
+        let mut s = Settings::default();
+        assert!(!s.smartindent);
+        let msg = s.parse_set_option("si").unwrap();
+        assert_eq!(msg, "si");
+        assert!(s.smartindent);
+        assert_eq!(s.parse_set_option("smartindent?").unwrap(), "smartindent");
+        let msg = s.parse_set_option("nosi").unwrap();
+        assert_eq!(msg, "nosi");
+        assert!(!s.smartindent);
+    }
+
+    #[test]
+    fn test_settings_cindent_defaults_off_and_round_trips_via_abbrev() {
+        let mut s = Settings::default();
+        assert!(!s.cindent);
+        let msg = s.parse_set_option("cin").unwrap();
+        assert_eq!(msg, "cin");
+        assert!(s.cindent);
+        assert_eq!(s.parse_set_option("cindent?").unwrap(), "cindent");
+        let msg = s.parse_set_option("nocin").unwrap();
+        assert_eq!(msg, "nocin");
+        assert!(!s.cindent);
+    }
+
+    #[test]
+    fn test_unimplemented_bool_options_is_now_empty() {
+        // #1207 implemented the last five entries #1190 left behind
+        // (`magic`, `showmatch`, `linebreak`, `smartindent`, `cindent`).
+        // Kept as `&[]` rather than removed — see the constant's own doc.
+        assert!(UNIMPLEMENTED_BOOL_OPTIONS.is_empty());
     }
 
     #[test]
@@ -2949,12 +5107,17 @@ mod tests {
             !json.contains("\"accept\""),
             "unset completion_keys.accept must be omitted from serialized settings"
         );
+        assert!(
+            !json.contains("\"use_nerd_fonts\""),
+            "unset use_nerd_fonts must be omitted from serialized settings"
+        );
 
         // Round-trip: deserializing that JSON must still resolve unset.
         let s2: Settings = serde_json::from_str(&json).unwrap();
         assert!(s2.ctrl_f_action.is_none());
         assert!(s2.auto_pairs.is_none());
         assert!(s2.completion_keys.accept.is_none());
+        assert!(s2.use_nerd_fonts.is_none());
     }
 
     #[test]
@@ -2963,11 +5126,348 @@ mod tests {
         s.ctrl_f_action = Some("find".to_string());
         s.auto_pairs = Some(true);
         s.completion_keys.accept = Some("<C-y>".to_string());
+        s.use_nerd_fonts = Some(false);
 
         let json = serde_json::to_string(&s).unwrap();
         let s2: Settings = serde_json::from_str(&json).unwrap();
         assert_eq!(s2.ctrl_f_action, Some("find".to_string()));
         assert_eq!(s2.auto_pairs, Some(true));
         assert_eq!(s2.completion_keys.accept, Some("<C-y>".to_string()));
+        assert_eq!(s2.use_nerd_fonts, Some(false));
+    }
+
+    // ── Backend-derived contested default: `use_nerd_fonts` (#999) ──────────
+    // Unlike the mode-derived trio above, this one derives from which
+    // *backend* is running (GUI vs TUI) rather than `editor_mode` — see the
+    // field doc on `Settings::use_nerd_fonts`. `crate::icons::
+    // is_gui_backend`/`set_gui_backend` is thread-local (it sits next to
+    // `nerd_fonts_enabled`/`set_nerd_fonts`, for the same #618 reason), so
+    // each test here saves and restores the ambient value to avoid leaking
+    // into whatever other test Rust's runner schedules next on the same
+    // worker thread.
+
+    #[test]
+    fn use_nerd_fonts_unset_is_true_on_gui_backend() {
+        let prev = crate::icons::is_gui_backend();
+        crate::icons::set_gui_backend(true);
+        let s = Settings::default();
+        assert!(s.use_nerd_fonts.is_none(), "must start unset");
+        assert!(
+            s.use_nerd_fonts(),
+            "GUI bundles the icon font, so an unset setting must resolve true on every OS"
+        );
+        crate::icons::set_gui_backend(prev);
+    }
+
+    #[test]
+    fn use_nerd_fonts_unset_is_conservative_guess_on_tui_backend() {
+        let prev = crate::icons::is_gui_backend();
+        crate::icons::set_gui_backend(false);
+        let s = Settings::default();
+        assert!(s.use_nerd_fonts.is_none(), "must start unset");
+        assert_eq!(
+            s.use_nerd_fonts(),
+            !cfg!(target_os = "windows"),
+            "TUI keeps the previous target_os-based guess"
+        );
+        crate::icons::set_gui_backend(prev);
+    }
+
+    #[test]
+    fn use_nerd_fonts_explicit_override_survives_backend_change() {
+        let prev = crate::icons::is_gui_backend();
+
+        let mut s = Settings::default();
+        s.use_nerd_fonts = Some(false);
+        crate::icons::set_gui_backend(true);
+        assert!(
+            !s.use_nerd_fonts(),
+            "explicit false must win even on a GUI backend that would default true"
+        );
+
+        let mut s2 = Settings::default();
+        s2.use_nerd_fonts = Some(true);
+        crate::icons::set_gui_backend(false);
+        assert!(
+            s2.use_nerd_fonts(),
+            "explicit true must win even on a TUI backend that might default false"
+        );
+
+        crate::icons::set_gui_backend(prev);
+    }
+
+    /// #902: `menu_style` defaults to `Inherit`, matching VS Code's
+    /// `window.menuStyle` default.
+    #[test]
+    fn menu_style_defaults_to_inherit() {
+        assert_eq!(Settings::default().menu_style, MenuStyle::Inherit);
+    }
+
+    /// #902: `get_value_str`/`set_value_str` round-trip every `MenuStyle`
+    /// variant, the same contract every other `SETTING_DEFS` `Enum` entry
+    /// (e.g. `editor_mode`, `line_numbers`) already has to hold for the
+    /// Settings sidebar UI to read/write it.
+    #[test]
+    fn menu_style_round_trips_through_value_str() {
+        let mut s = Settings::default();
+        for (text, variant) in [
+            ("native", MenuStyle::Native),
+            ("custom", MenuStyle::Custom),
+            ("inherit", MenuStyle::Inherit),
+        ] {
+            s.set_value_str("menu_style", text).unwrap();
+            assert_eq!(s.menu_style, variant);
+            assert_eq!(s.get_value_str("menu_style"), text);
+        }
+
+        assert!(s.set_value_str("menu_style", "bogus").is_err());
+    }
+
+    // ── #1206: generic `+=`/`-=`/`^=` strip ──────────────────────────────
+
+    /// RED against unfixed `develop`: before #1206, only `'iskeyword'` had
+    /// its `+=`/`-=`/`^=` suffix stripped before the name lookup — every
+    /// other option's raw name still carried the operator into
+    /// `set_value_option`'s exact-name match, so `whichwrap+` (not
+    /// `whichwrap`) is what got looked up and reported as unknown.
+    #[test]
+    fn plus_equals_on_a_list_option_other_than_iskeyword_no_longer_names_the_option_wrong() {
+        let mut s = Settings::default();
+        let err = s.parse_set_option("clipboard+=unnamed").unwrap_err();
+        assert_eq!(
+            err, "Option 'clipboard' is recognised but not implemented yet",
+            "must name the real option 'clipboard', not 'clipboard+'"
+        );
+    }
+
+    #[test]
+    fn plus_equals_on_whichwrap_appends_to_the_list() {
+        let mut s = Settings::default();
+        let msg = s.parse_set_option("whichwrap+=h,l").unwrap();
+        assert_eq!(msg, "whichwrap=b,s,h,l");
+        assert_eq!(s.whichwrap, "b,s,h,l");
+    }
+
+    #[test]
+    fn minus_equals_on_whichwrap_removes_from_the_list() {
+        let mut s = Settings::default();
+        s.parse_set_option("ww-=b").unwrap();
+        assert_eq!(s.whichwrap, "s");
+    }
+
+    #[test]
+    fn caret_equals_on_backspace_prepends_to_the_list() {
+        let mut s = Settings::default();
+        s.parse_set_option("bs^=nostop").unwrap();
+        assert_eq!(s.backspace, "nostop,indent,eol,start");
+    }
+
+    /// Numeric options also take `+=`/`-=`/`^=` in real Vim (add/subtract/
+    /// multiply) — #1206 generalised the same strip loop to cover them too,
+    /// not just list options.
+    #[test]
+    fn plus_equals_on_a_numeric_option_adds() {
+        let mut s = Settings::default();
+        let msg = s.parse_set_option("scrolloff+=3").unwrap();
+        assert_eq!(msg, "scrolloff=3");
+        assert_eq!(s.scrolloff, 3);
+        s.parse_set_option("so+=2").unwrap();
+        assert_eq!(s.scrolloff, 5);
+    }
+
+    #[test]
+    fn minus_equals_on_a_numeric_option_subtracts() {
+        let mut s = Settings::default();
+        s.scrolljump = 5;
+        s.parse_set_option("scrolljump-=2").unwrap();
+        assert_eq!(s.scrolljump, 3);
+    }
+
+    #[test]
+    fn caret_equals_on_a_numeric_option_multiplies() {
+        let mut s = Settings::default();
+        s.parse_set_option("timeoutlen=100").unwrap();
+        s.parse_set_option("tm^=3").unwrap();
+        assert_eq!(s.timeoutlen, 300);
+    }
+
+    /// A pre-existing list option #1206 didn't add (`'nrformats'`) must
+    /// also get real list append/remove, not silent overwrite — see the
+    /// `current_list_value` doc comment for why this would otherwise be a
+    /// worse regression than the bug #1206 fixes.
+    #[test]
+    fn plus_equals_on_a_pre_existing_list_option_appends_not_overwrites() {
+        let mut s = Settings::default();
+        assert_eq!(s.nrformats, vec!["bin", "hex"]);
+        s.parse_set_option("nrformats+=octal").unwrap();
+        assert_eq!(s.nrformats, vec!["bin", "hex", "octal"]);
+    }
+
+    // ── #1206: 'whichwrap' ───────────────────────────────────────────────
+
+    #[test]
+    fn whichwrap_default_matches_neovim() {
+        assert_eq!(Settings::default().whichwrap, "b,s");
+    }
+
+    #[test]
+    fn whichwrap_rejects_bad_token() {
+        let mut s = Settings::default();
+        let err = s.parse_set_option("whichwrap=x").unwrap_err();
+        assert!(err.contains("Invalid value for whichwrap"), "{err}");
+    }
+
+    #[test]
+    fn whichwrap_accepts_every_real_token() {
+        let mut s = Settings::default();
+        s.parse_set_option("ww=b,s,h,l,<,>,~,[,]").unwrap();
+        assert_eq!(s.whichwrap, "b,s,h,l,<,>,~,[,]");
+    }
+
+    // ── #1206: 'backspace' ───────────────────────────────────────────────
+
+    #[test]
+    fn backspace_default_matches_neovim() {
+        assert_eq!(Settings::default().backspace, "indent,eol,start");
+    }
+
+    #[test]
+    fn backspace_rejects_bad_token() {
+        let mut s = Settings::default();
+        let err = s.parse_set_option("backspace=bogus").unwrap_err();
+        assert!(err.contains("Invalid value for backspace"), "{err}");
+    }
+
+    #[test]
+    fn backspace_legacy_numeric_values_expand_to_the_list_form() {
+        let mut s = Settings::default();
+        s.parse_set_option("bs=0").unwrap();
+        assert_eq!(s.backspace, "");
+        s.parse_set_option("bs=1").unwrap();
+        assert_eq!(s.backspace, "indent,eol");
+        s.parse_set_option("bs=2").unwrap();
+        assert_eq!(s.backspace, "indent,eol,start");
+        s.parse_set_option("bs=3").unwrap();
+        assert_eq!(s.backspace, "indent,eol,nostop");
+    }
+
+    // ── #1206: 'timeoutlen' ──────────────────────────────────────────────
+
+    #[test]
+    fn timeoutlen_default_matches_neovim() {
+        assert_eq!(Settings::default().timeoutlen, 1000);
+    }
+
+    #[test]
+    fn timeoutlen_set_and_query() {
+        let mut s = Settings::default();
+        let msg = s.parse_set_option("timeoutlen=250").unwrap();
+        assert_eq!(msg, "timeoutlen=250");
+        assert_eq!(s.parse_set_option("tm?").unwrap(), "timeoutlen=250");
+    }
+
+    // ── #1206: 'wildmode' ────────────────────────────────────────────────
+
+    #[test]
+    fn wildmode_default_matches_neovim() {
+        assert_eq!(Settings::default().wildmode, "full");
+    }
+
+    #[test]
+    fn wildmode_accepts_documented_stage_grammar() {
+        let mut s = Settings::default();
+        s.parse_set_option("wildmode=longest:full,full").unwrap();
+        assert_eq!(s.wildmode, "longest:full,full");
+    }
+
+    #[test]
+    fn wildmode_rejects_bad_token() {
+        let mut s = Settings::default();
+        let err = s.parse_set_option("wildmode=bogus").unwrap_err();
+        assert!(err.contains("Invalid value for wildmode"), "{err}");
+    }
+
+    // ── #1206: 'laststatus' ──────────────────────────────────────────────
+
+    #[test]
+    fn laststatus_default_matches_neovim() {
+        assert_eq!(Settings::default().laststatus, 2);
+    }
+
+    #[test]
+    fn laststatus_rejects_out_of_range() {
+        let mut s = Settings::default();
+        let err = s.parse_set_option("laststatus=4").unwrap_err();
+        assert!(err.contains("Invalid value for laststatus"), "{err}");
+    }
+
+    #[test]
+    fn laststatus_accepts_0_through_3() {
+        let mut s = Settings::default();
+        for n in 0..=3 {
+            s.parse_set_option(&format!("ls={n}")).unwrap();
+            assert_eq!(s.laststatus, n);
+        }
+    }
+
+    // ── #1206: 'sidescrolloff' / 'scrolljump' ────────────────────────────
+
+    #[test]
+    fn sidescrolloff_and_scrolljump_defaults_match_neovim() {
+        let s = Settings::default();
+        assert_eq!(s.sidescrolloff, 0);
+        assert_eq!(s.scrolljump, 1);
+    }
+
+    #[test]
+    fn sidescrolloff_set_and_query() {
+        let mut s = Settings::default();
+        s.parse_set_option("siso=8").unwrap();
+        assert_eq!(s.sidescrolloff, 8);
+        assert_eq!(
+            s.parse_set_option("sidescrolloff?").unwrap(),
+            "sidescrolloff=8"
+        );
+    }
+
+    #[test]
+    fn scrolljump_accepts_zero() {
+        // Neovim itself accepts `scrolljump=0` (verified against
+        // `nvim --headless`) — must not be rejected here.
+        let mut s = Settings::default();
+        s.parse_set_option("sj=0").unwrap();
+        assert_eq!(s.scrolljump, 0);
+    }
+
+    // ── #1206: 'listchars' ───────────────────────────────────────────────
+
+    #[test]
+    fn listchars_default_matches_neovim() {
+        assert_eq!(Settings::default().listchars, "tab:> ,trail:-,nbsp:+");
+    }
+
+    #[test]
+    fn listchars_rejects_unknown_item() {
+        let mut s = Settings::default();
+        let err = s.parse_set_option("listchars=bogus:x").unwrap_err();
+        assert!(err.contains("Invalid value for listchars"), "{err}");
+    }
+
+    #[test]
+    fn listchars_rejects_wrong_length_value() {
+        let mut s = Settings::default();
+        assert!(s.parse_set_option("lcs=eol:$$").is_err());
+        assert!(s.parse_set_option("lcs=tab:x").is_err());
+        assert!(s.parse_set_option("lcs=tab:wxyz").is_err());
+    }
+
+    #[test]
+    fn listchars_accepts_three_char_tab_and_unwired_real_items() {
+        let mut s = Settings::default();
+        // 'multispace'/'lead'/etc are real Vim items with no vimcode glyph
+        // yet — must be accepted, not rejected as a typo.
+        s.parse_set_option("lcs=tab:<->,multispace:-+,lead:.,conceal:x")
+            .unwrap();
+        assert_eq!(s.listchars, "tab:<->,multispace:-+,lead:.,conceal:x");
     }
 }

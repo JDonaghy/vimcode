@@ -199,6 +199,20 @@ impl Engine {
     }
 
     pub fn delete_visual_selection(&mut self, changed: &mut bool) {
+        self.delete_visual_selection_impl(changed, true);
+    }
+
+    /// Shared implementation behind [`delete_visual_selection`](Self::delete_visual_selection).
+    ///
+    /// `finish_group` controls whether the undo group opened for the delete
+    /// is closed here. A plain `d`/`x`/`D` finishes it immediately (this is
+    /// the whole change). `c`/`s`/`C`/`S`/`R` delete then drop straight into
+    /// Insert mode to type the replacement — Vim's `u` afterwards undoes
+    /// *both* the deletion and the typed text as one step, so those callers
+    /// pass `false` and let Insert mode's own `Escape` handler close the
+    /// group once the typing is done (mirrors the Normal-mode `cw`/`ciw`
+    /// "don't finish_undo_group — let insert mode do it" pattern; #887).
+    pub(crate) fn delete_visual_selection_impl(&mut self, changed: &mut bool, finish_group: bool) {
         if let Some((text, ty)) = self.get_visual_selection_text() {
             // Store in register
             let reg = self.selected_register.unwrap_or('"');
@@ -208,7 +222,10 @@ impl Engine {
             // Delete the selection
             let (start, end) = self.get_visual_selection_range().unwrap();
 
-            self.start_undo_group();
+            // `u` restores the cursor to the start of the deleted selection,
+            // not wherever the (real) cursor was sitting when `d` was
+            // pressed — which, for a forward selection, is the end (#886).
+            self.start_undo_group_at(start);
 
             match self.mode {
                 Mode::VisualLine => {
@@ -244,8 +261,17 @@ impl Engine {
 
                     self.delete_with_undo(start_char, end_char.min(self.buffer().len_chars()));
 
-                    // Position cursor at start
-                    self.view_mut().cursor = start;
+                    // Position cursor at start — clamped to the (possibly
+                    // shrunk) line count: a charwise delete that consumes
+                    // every line at or after `start.line` (e.g. `vapd` on
+                    // the buffer's last paragraph) can leave `start.line`
+                    // pointing past the end of the buffer (#887, "vis:v ap
+                    // trailing").
+                    let last = self.buffer().len_lines().saturating_sub(1);
+                    self.view_mut().cursor = Cursor {
+                        line: start.line.min(last),
+                        col: start.col,
+                    };
                 }
                 Mode::VisualBlock => {
                     // Delete rectangular block (work backwards to avoid offset issues)
@@ -264,7 +290,9 @@ impl Engine {
                 _ => {}
             }
 
-            self.finish_undo_group();
+            if finish_group {
+                self.finish_undo_group();
+            }
             *changed = true;
             self.clamp_cursor_col();
             // Vim collapses `'<`/`'>` onto the start of a Visual delete, so a
@@ -438,7 +466,10 @@ impl Engine {
                     // on its own (empty) line.
                     self.insert_with_undo(start_char, "\n");
                 }
-                self.finish_undo_group();
+                // Deliberately not finished here: the group stays open so the
+                // Insert-mode typing that follows merges into it, and `u`
+                // undoes the delete and the typed replacement as one step,
+                // same as Normal-mode `cc`/`S` (#887, "vis:vjc then u").
                 *changed = true;
                 self.view_mut().cursor.line = start.line;
                 self.view_mut().cursor.col = 0;
@@ -463,7 +494,9 @@ impl Engine {
             } else {
                 None
             };
-            self.delete_visual_selection(changed);
+            // `false`: keep the undo group open so the Insert-mode typing
+            // that follows merges into it (#887, "vis:vjc then u").
+            self.delete_visual_selection_impl(changed, false);
             if let Some((start_line, end_line, left_col)) = block_info {
                 self.visual_block_insert_info =
                     // `None` park column: a blockwise `c` leaves the cursor
@@ -479,9 +512,10 @@ impl Engine {
             }
         }
 
-        // The delete already finished the undo group and set mode to Normal
-        // Now start a new undo group for the insert mode typing
-        self.start_undo_group();
+        // The delete above left its undo group open on purpose (see the
+        // comments at each call site) — starting a fresh one here would
+        // immediately close it (`start_undo_group` always finishes whatever
+        // is active first), splitting the change back into two undo steps.
         self.insert_text_buffer.clear();
         self.mode = Mode::Insert;
     }
@@ -765,10 +799,9 @@ impl Engine {
             if !word_bounded {
                 return true;
             }
-            let before_ok =
-                sb == 0 || !Self::is_word_char(text[..sb].chars().last().unwrap_or(' '));
+            let before_ok = sb == 0 || !self.is_word_char(text[..sb].chars().last().unwrap_or(' '));
             let after_ok =
-                eb >= text.len() || !Self::is_word_char(text[eb..].chars().next().unwrap_or(' '));
+                eb >= text.len() || !self.is_word_char(text[eb..].chars().next().unwrap_or(' '));
             before_ok && after_ok
         };
 
@@ -827,10 +860,10 @@ impl Engine {
                     let sb = byte_pos + found;
                     let eb = sb + pattern.len();
                     let ok = if word_bounded {
-                        let before_ok = sb == 0
-                            || !Self::is_word_char(text[..sb].chars().last().unwrap_or(' '));
+                        let before_ok =
+                            sb == 0 || !self.is_word_char(text[..sb].chars().last().unwrap_or(' '));
                         let after_ok = eb >= text.len()
-                            || !Self::is_word_char(text[eb..].chars().next().unwrap_or(' '));
+                            || !self.is_word_char(text[eb..].chars().next().unwrap_or(' '));
                         before_ok && after_ok
                     } else {
                         true
@@ -1021,8 +1054,12 @@ impl Engine {
             let cur = self.char_idx_to_cursor(idx);
             let text = if expand {
                 let line_start = self.buffer().line_to_char(cur.line);
-                let front_of_line = (0..cur.col)
-                    .all(|i| matches!(self.buffer().content.char(line_start + i), ' ' | '\t'));
+                // `:h smarttab` (#1001): only used to pick 'shiftwidth' vs
+                // 'tabstop' when 'smarttab' is on — see the single-cursor
+                // `Tab` handler in `keys.rs` for the full rule.
+                let front_of_line = self.settings.smarttab
+                    && (0..cur.col)
+                        .all(|i| matches!(self.buffer().content.char(line_start + i), ' ' | '\t'));
                 let stop = if front_of_line {
                     self.effective_shift_width().max(1)
                 } else {

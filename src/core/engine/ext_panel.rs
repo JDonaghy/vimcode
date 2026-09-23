@@ -147,13 +147,29 @@ impl Engine {
     }
 
     /// Find the flat index of an item by its ID within a specific section.
-    /// Returns `None` if the panel, section, or item is not found.
+    ///
+    /// Match precedence:
+    ///   1. An exact `id` match (empty ids never match — a query is never empty
+    ///      either, so this alone rules out the empty-id separator/header rows
+    ///      that `git_log_panel.lua` emits).
+    ///   2. Failing that, a single unambiguous hash-prefix match against a
+    ///      top-level row (`parent_id` empty, not a separator) whose `id`
+    ///      starts with `item_id`. A `<hash>:<path>` child row never qualifies
+    ///      here even if its id happens to share the prefix, and if more than
+    ///      one top-level row matches the prefix the result is ambiguous and
+    ///      treated as no match — guessing would silently select the wrong
+    ///      commit.
+    ///
+    /// Returns `None` if the panel, section, or a unique match is not found.
     pub fn ext_panel_find_flat_index(
         &self,
         panel_name: &str,
         section_name: &str,
         item_id: &str,
     ) -> Option<usize> {
+        if item_id.is_empty() {
+            return None;
+        }
         let reg = self.ext_panels.get(panel_name)?;
         let expanded = self.ext_panel_sections_expanded.get(panel_name);
         let mut pos = 0;
@@ -165,12 +181,24 @@ impl Engine {
                 if let Some(items) = self.ext_panel_items.get(&key) {
                     let visible = self.ext_panel_visible_indices(panel_name, items);
                     if section == section_name {
-                        for &vi in &visible {
-                            if items[vi].id == item_id
-                                || items[vi].id.starts_with(item_id)
-                                || item_id.starts_with(&items[vi].id)
-                            {
-                                return Some(pos + visible.iter().position(|&x| x == vi).unwrap());
+                        // Pass 1: exact id match (any visible row).
+                        if let Some(offset) = visible
+                            .iter()
+                            .position(|&vi| !items[vi].id.is_empty() && items[vi].id == item_id)
+                        {
+                            return Some(pos + offset);
+                        }
+                        // Pass 2: unambiguous hash-prefix match against a
+                        // top-level (commit) row only.
+                        let mut prefix_matches = visible.iter().enumerate().filter(|&(_, &vi)| {
+                            !items[vi].id.is_empty()
+                                && !items[vi].is_separator
+                                && items[vi].parent_id.is_empty()
+                                && items[vi].id.starts_with(item_id)
+                        });
+                        if let Some((offset, _)) = prefix_matches.next() {
+                            if prefix_matches.next().is_none() {
+                                return Some(pos + offset);
                             }
                         }
                     }
@@ -200,10 +228,19 @@ impl Engine {
             }
         }
         // Find the flat index and set selection
-        if let Some(flat_idx) = self.ext_panel_find_flat_index(panel_name, section_name, item_id) {
-            self.ext_panel_selected = flat_idx;
-            // Center the item in the viewport
-            self.ext_panel_scroll_top = flat_idx.saturating_sub(5);
+        match self.ext_panel_find_flat_index(panel_name, section_name, item_id) {
+            Some(flat_idx) => {
+                self.ext_panel_selected = flat_idx;
+                // Center the item in the viewport
+                self.ext_panel_scroll_top = flat_idx.saturating_sub(5);
+            }
+            None => {
+                // A reveal that quietly lands on the wrong row is worse than one that
+                // reports it couldn't find a unique match — leave the selection as-is
+                // and say so instead of silently falling back to row 0.
+                self.message =
+                    format!("Could not find \"{item_id}\" in {section_name} — selection unchanged");
+            }
         }
     }
 
@@ -628,12 +665,15 @@ impl Engine {
         item_index: usize,
         markdown: &str,
     ) {
-        let rendered = crate::core::markdown::render_markdown(markdown);
-        let links = Self::extract_hover_links(&rendered);
+        let markdown = crate::core::markdown::linkify_bare_urls(markdown);
+        let (line_text, links, code_highlights) =
+            crate::core::markdown::hover_markdown_structure(&markdown);
         // Dismiss any active editor hover to avoid overlapping popups.
         self.dismiss_editor_hover();
         self.panel_hover = Some(PanelHoverPopup {
-            rendered,
+            markdown,
+            line_text,
+            code_highlights,
             links,
             panel_name: panel_name.to_string(),
             item_id: item_id.to_string(),
@@ -767,11 +807,14 @@ impl Engine {
 
     /// Generate hover markdown for a Source Control panel item at the given flat index.
     pub(crate) fn sc_hover_markdown(&self, flat_index: usize) -> Option<String> {
+        use crate::core::engine::{
+            SC_SECTION_CHANGES, SC_SECTION_LOG, SC_SECTION_MERGE, SC_SECTION_STAGED,
+        };
         let (section, idx) = self.sc_flat_to_section_idx(flat_index);
 
-        // Section headers: show branch info on the "Staged Changes" header (section 0)
+        // Section headers: show branch info on the "Staged Changes" header.
         if idx == usize::MAX {
-            if section == 0 {
+            if section == SC_SECTION_STAGED {
                 // Branch info hover
                 return self.sc_hover_branch_info();
             }
@@ -779,25 +822,14 @@ impl Engine {
         }
 
         match section {
-            // Staged/Unstaged file items
-            0 | 1 => {
-                let is_staged = section == 0;
-                let files: Vec<&git::FileStatus> = if is_staged {
-                    self.sc_file_statuses
-                        .iter()
-                        .filter(|f| f.staged.is_some())
-                        .collect()
-                } else {
-                    self.sc_file_statuses
-                        .iter()
-                        .filter(|f| f.unstaged.is_some())
-                        .collect()
-                };
+            // Merge / Staged / Unstaged file items
+            SC_SECTION_MERGE | SC_SECTION_STAGED | SC_SECTION_CHANGES => {
+                let files = self.sc_section_files(section);
                 let file = files.get(idx)?;
-                self.sc_hover_file(file, is_staged)
+                self.sc_hover_file(file, section == SC_SECTION_STAGED)
             }
             // Log items
-            3 => {
+            SC_SECTION_LOG => {
                 let entry = self.sc_log.get(idx)?;
                 self.sc_hover_log_entry(entry)
             }
@@ -832,23 +864,22 @@ impl Engine {
 
     /// File hover: show status and diff stats.
     pub(crate) fn sc_hover_file(&self, file: &git::FileStatus, staged: bool) -> Option<String> {
-        let status = if staged {
-            file.staged.unwrap_or(git::StatusKind::Modified)
-        } else {
-            file.unstaged.unwrap_or(git::StatusKind::Modified)
-        };
-        let status_label = match status {
-            git::StatusKind::Added => "Added",
-            git::StatusKind::Modified => "Modified",
-            git::StatusKind::Deleted => "Deleted",
-            git::StatusKind::Renamed => "Renamed",
-            git::StatusKind::Untracked => "Untracked",
+        // #991: a conflicted file reports the conflict (and git's own
+        // wording for which side did what) rather than a staged/unstaged
+        // change it isn't.
+        let (status, where_) = match file.unmerged {
+            Some(kind) => (git::StatusKind::Unmerged, kind.description()),
+            None if staged => (file.staged.unwrap_or(git::StatusKind::Modified), "staged"),
+            None => (
+                file.unstaged.unwrap_or(git::StatusKind::Modified),
+                "unstaged",
+            ),
         };
         let mut md = format!("### {}\n\n", file.path);
         md.push_str(&format!(
             "**Status:** {} ({})\n\n",
-            status_label,
-            if staged { "staged" } else { "unstaged" }
+            status.description(),
+            where_
         ));
         // Get diff stats (blocking but fast for a single file)
         let cwd = std::env::current_dir().ok()?;
@@ -1135,46 +1166,30 @@ impl Engine {
         take_focus: bool,
         add_goto_links: bool,
     ) {
-        let mut rendered = crate::core::markdown::render_markdown(markdown);
-        let mut links = Self::extract_hover_links(&rendered);
+        let mut full_markdown = markdown.to_string();
 
         // Append "Go to" navigation links after actual LSP content (vim mode only).
+        // Emitted as real `[label](url)` markdown — quadraui's renderer
+        // (adopted below, #821) parses these into clickable links itself,
+        // so no manual span bookkeeping is needed here.
         if add_goto_links && !self.is_vscode_mode() {
             let goto = self.lsp_goto_links();
             if !goto.is_empty() {
-                use crate::core::markdown::{MdSpan, MdStyle};
-                // Separator line.
-                rendered.lines.push(String::new());
-                rendered.spans.push(Vec::new());
-                rendered.code_highlights.push(Vec::new());
-                // Build: "Go to Definition (:gd) | Type Definition (:gy) | ..."
-                // "Go to" is default fg; labels are link-colored and clickable.
-                let nav_line_idx = rendered.lines.len();
-                let mut nav_text = String::from("Go to ");
-                let mut nav_spans = Vec::new();
+                full_markdown.push_str("\n\nGo to ");
                 for (i, (label, keybind, url)) in goto.iter().enumerate() {
                     if i > 0 {
-                        nav_text.push_str(" | ");
+                        full_markdown.push_str(" | ");
                     }
-                    let start = nav_text.len();
-                    nav_text.push_str(label);
-                    let end = nav_text.len();
-                    nav_spans.push(MdSpan {
-                        start_byte: start,
-                        end_byte: end,
-                        style: MdStyle::Link,
-                    });
-                    links.push((nav_line_idx, start, end, url.to_string()));
-                    nav_text.push_str(&format!(" (:{})", keybind));
+                    full_markdown.push_str(&format!("[{label}]({url}) (:{keybind})"));
                 }
-                rendered.lines.push(nav_text);
-                rendered.spans.push(nav_spans);
-                rendered.code_highlights.push(Vec::new());
             }
         }
 
-        let popup_width = rendered
-            .lines
+        let full_markdown = crate::core::markdown::linkify_bare_urls(&full_markdown);
+        let (line_text, links, code_highlights) =
+            crate::core::markdown::hover_markdown_structure(&full_markdown);
+
+        let popup_width = line_text
             .iter()
             .map(|l| l.chars().count())
             .max()
@@ -1187,7 +1202,9 @@ impl Engine {
         // Dismiss any active panel hover to avoid overlapping popups.
         self.dismiss_panel_hover_now();
         self.editor_hover = Some(EditorHoverPopup {
-            rendered,
+            markdown: full_markdown,
+            line_text,
+            code_highlights,
             links,
             anchor_line,
             anchor_col,
@@ -1283,7 +1300,7 @@ impl Engine {
             "j" | "Down" => {
                 // Scroll down — stop when last line is visible
                 if let Some(hover) = &mut self.editor_hover {
-                    let max_scroll = hover.rendered.lines.len().saturating_sub(20);
+                    let max_scroll = hover.line_text.len().saturating_sub(20);
                     if hover.scroll_top < max_scroll {
                         hover.scroll_top += 1;
                     }
@@ -1413,7 +1430,7 @@ impl Engine {
     /// Returns true if the popup was scrolled.
     pub fn editor_hover_scroll(&mut self, delta: i32) -> bool {
         if let Some(hover) = &mut self.editor_hover {
-            let max_scroll = hover.rendered.lines.len().saturating_sub(20);
+            let max_scroll = hover.line_text.len().saturating_sub(20);
             if delta > 0 {
                 let new = (hover.scroll_top + delta as usize).min(max_scroll);
                 if new != hover.scroll_top {
@@ -1437,7 +1454,7 @@ impl Engine {
     /// from `quadraui::dispatch_mouse_drag` into this call (#215).
     pub fn editor_hover_set_scroll(&mut self, new_offset: usize) -> bool {
         if let Some(hover) = &mut self.editor_hover {
-            let max_scroll = hover.rendered.lines.len().saturating_sub(20);
+            let max_scroll = hover.line_text.len().saturating_sub(20);
             let clamped = new_offset.min(max_scroll);
             if clamped != hover.scroll_top {
                 hover.scroll_top = clamped;
@@ -1459,9 +1476,9 @@ impl Engine {
     pub fn hover_selection_text(&self) -> Option<String> {
         let hover = self.editor_hover.as_ref()?;
         let text = if let Some(ref sel) = hover.selection {
-            sel.extract_text(&hover.rendered.lines)
+            sel.extract_text(&hover.line_text)
         } else {
-            hover.rendered.lines.join("\n")
+            hover.line_text.join("\n")
         };
         if text.is_empty() {
             None
@@ -1590,30 +1607,18 @@ impl Engine {
         false
     }
 
-    /// Open a URL in the default browser.
-    pub(crate) fn open_url(&self, url: &str) {
+    /// Open a URL in the default browser. Validates the URL scheme via
+    /// `is_safe_url` and, if safe, queues a
+    /// [`PendingPlatformAction::OpenUrl`] for the runner to carry out
+    /// through `PlatformServices` (#1134) — see
+    /// `Engine::pending_platform_actions`'s doc for why this can't shell
+    /// out directly from here.
+    pub(crate) fn open_url(&mut self, url: &str) {
         if !is_safe_url(url) {
             return;
         }
-        #[cfg(not(test))]
-        {
-            #[cfg(target_os = "macos")]
-            {
-                let _ = std::process::Command::new("open")
-                    .arg(url)
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .spawn();
-            }
-            #[cfg(not(target_os = "macos"))]
-            {
-                let _ = std::process::Command::new("xdg-open")
-                    .arg(url)
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .spawn();
-            }
-        }
+        self.pending_platform_actions
+            .push(PendingPlatformAction::OpenUrl(url.to_string()));
     }
 
     /// Get the file path of the active buffer (if it has one).
@@ -1720,12 +1725,14 @@ impl Engine {
                 self.ext_sidebar_input_active = false;
                 true
             }
-            quadraui::SidebarEvent::HeaderActivated { section } => {
-                let mut sys = self.ext_sidebar_system.borrow_mut();
-                let collapsed = sys.is_collapsed(section);
-                sys.set_collapsed(section, !collapsed);
-                true
-            }
+            // #971: `SidebarSystem::click` already flips `collapsed[section]`
+            // itself before returning this event — see
+            // `Engine::dispatch_sc_sidebar_event`'s identical fix for the
+            // full story (same double-toggle-cancels-out bug, same fix,
+            // caught by this panel's own
+            // `ext_panel_header_click_hit_band_matches_the_painted_row`
+            // sanity check in `src/macos/mod.rs`).
+            quadraui::SidebarEvent::HeaderActivated { .. } => true,
             quadraui::SidebarEvent::Ignored => false,
             _ => true,
         }
@@ -1986,7 +1993,11 @@ impl Engine {
                         "Down" => Some(Key::Named(NamedKey::Down)),
                         "Up" => Some(Key::Named(NamedKey::Up)),
                         "Tab" => Some(Key::Named(NamedKey::Tab)),
-                        "BackTab" => Some(Key::Named(NamedKey::BackTab)),
+                        // "ISO_Left_Tab" is TUI's (and, since #1060, GTK's
+                        // own) `render::engine_key_from_ui` spelling for
+                        // Shift+Tab; "BackTab" is kept for any caller still
+                        // on the pre-#1060 name.
+                        "BackTab" | "ISO_Left_Tab" => Some(Key::Named(NamedKey::BackTab)),
                         "Home" => Some(Key::Named(NamedKey::Home)),
                         "End" => Some(Key::Named(NamedKey::End)),
                         "Page_Up" => Some(Key::Named(NamedKey::PageUp)),
@@ -2552,19 +2563,30 @@ impl Engine {
         // Build content: header comment + one keymap per line
         let mut content = String::from(
             "# User keymaps — one per line.  :w to save.\n\
-             # Format: mode keys :command\n\
-             # Modes: n (normal), v (visual), i (insert), c (command)\n\
-             # Keys:  single char (x), modifier (<C-x>, <A-x>), sequence (gcc)\n\
+             # Format: mode[!] keys rhs\n\
+             # Modes: n (normal) v (visual) x (visual-only) o (operator-pending)\n\
+             #        i (insert) c (command) s (select, unused)\n\
+             # A trailing '!' on mode is noremap (rhs is not re-expanded).\n\
+             # Keys:  single char (x), modifier (<C-x>), sequence (gcc), vim\n\
+             #        notation (<Esc> <CR> <Tab> <leader> <Plug>...)\n\
+             # Rhs:   an ex command prefixed with ':' (:Commentary), or a raw\n\
+             #        key sequence fed back through the normal key path (<Esc>)\n\
+             #\n\
+             # This buffer is edited directly in vimcode's storage format; day\n\
+             # to day, prefer the vim ex commands instead — :nnoremap, :imap,\n\
+             # :vnoremap, :onoremap, :unmap, :mapclear, etc. — which write to\n\
+             # this same list.\n\
              #\n\
              # In VSCode mode, \"n\" keymaps apply (use modifiers like <C-x>, <A-x>).\n\
              # Run :Keybindings to see all built-in keybindings and command names.\n\
              #\n\
              # Examples:\n\
-             # n <C-/> :Commentary\n\
-             # v <C-/> :Commentary\n\
-             # n gcc   :Commentary\n\
-             # n <A-j> :move +1\n\
-             # n <A-k> :move -1\n\
+             # n <C-/>  :Commentary\n\
+             # v <C-/>  :Commentary\n\
+             # n gcc    :Commentary\n\
+             # n <A-j>  :move +1\n\
+             # n <A-k>  :move -1\n\
+             # i! jk    <Esc>\n\
              #\n",
         );
         for km in &self.settings.keymaps {
@@ -2588,7 +2610,7 @@ impl Engine {
         self.active_group_mut().active_tab = self.active_group().tabs.len() - 1;
 
         self.settings_has_focus = false;
-        self.message = "Edit keymaps (one per line: mode keys :command). :w to save.".to_string();
+        self.message = "Edit keymaps (one per line: mode[!] keys rhs). :w to save.".to_string();
     }
 
     /// Save keymaps buffer content back to settings.
@@ -2605,7 +2627,7 @@ impl Engine {
             // Validate the keymap definition
             if parse_keymap_def(trimmed).is_none() {
                 return Err(format!(
-                    "Invalid keymap on line {}: \"{}\" (expected: mode keys :command)",
+                    "Invalid keymap on line {}: \"{}\" (expected: mode[!] keys rhs)",
                     line_idx + 1,
                     trimmed
                 ));
@@ -2656,13 +2678,26 @@ impl Engine {
             });
         }
 
+        // Neovim opens the command-line window as a horizontal split in the
+        // *current* tabpage (`:h cmdwin`), not a new tab (#1297) — push a
+        // new window into the active tab's layout instead of a new `Tab`.
+        // Per `:h cmdwin`, the window is "always ... positioned just above
+        // the command-line" — i.e. always at the bottom, unlike an ordinary
+        // horizontal split, which honors 'splitbelow'. `new_first: false`
+        // pins it there unconditionally (confirmed against a live,
+        // UI-attached `nvim` — `winlayout()` puts the cmdwin leaf second).
+        let current_window_id = self.active_window_id();
         let window_id = self.new_window_id();
         let window = Window::new(window_id, buf_id);
         self.windows.insert(window_id, window);
-        let tab_id = self.new_tab_id();
-        let tab = Tab::new(tab_id, window_id);
-        self.active_group_mut().tabs.push(tab);
-        self.active_group_mut().active_tab = self.active_group().tabs.len() - 1;
+        let tab = self.active_tab_mut();
+        tab.layout.split_at(
+            current_window_id,
+            SplitDirection::Horizontal,
+            window_id,
+            false,
+        );
+        tab.focus_window(window_id);
 
         // Move cursor to last line (the empty line for new entry)
         let total = self.buffer().len_lines();
@@ -2691,8 +2726,9 @@ impl Engine {
             return EngineAction::None;
         }
 
-        // Close the cmdline window
-        self.close_tab();
+        // Close the cmdline window — it's a split in the current tab
+        // (#1297), not a whole tab, so close just the window.
+        self.close_window();
 
         if is_search {
             // Execute as a forward search
