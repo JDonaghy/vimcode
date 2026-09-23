@@ -10300,30 +10300,23 @@ const KNOWN_DEVIATIONS: &[&str] = &[
     // (`Engine::confirm_sub`, `execute.rs`) and all 11 now pass, alongside
     // the 5 new cases #1031 itself added right after them in `CASES_EX`.
     //
-    // ── #1280: "scroll:so=5 30G H", "scroll:so=5 30G L" ──
+    // ── RESOLVED (#1293): "scroll:so=5 30G H", "scroll:so=5 30G L" ──
     //
-    // Both cases predate this issue and passed on every prior run — because
-    // `run_in_vimcode` never set `'wrap'`, so every case ran against
-    // vimcode's actual default (`Settings::default().wrap == false`) even
-    // though the oracle's default (and Neovim's) is `'wrap'` on. #1280 fixes
-    // that mismatch (`run_in_vimcode`/`oracle_probe` now both force
-    // `wrap=true`, matching Neovim, since screen-line motions like `g$`
-    // otherwise can't be tested meaningfully at all), and that is a real,
-    // previously-hidden gap: `ensure_cursor_visible_wrap` — the vertical
-    // scroll-to-cursor path used when `'wrap'` is on — never reads
-    // `self.settings.scrolloff` at all, unlike the `'wrap'`-off path a few
-    // lines above it in the same file (`ensure_cursor_visible` in
-    // `src/core/engine/search.rs`), which does. `:set so=5` then `30GH`/
-    // `30GL` land one scrolloff-margin short of Neovim as a result. Fixing
-    // it means porting `scrolloff` into the wrap path's visual-row-counting
-    // loop, which is a real feature addition (scrolloff needs to be
-    // expressed in *visual* rows there, not buffer lines) rather than a
-    // small in-scope fix — left here rather than attempted blind. Filed as
-    // #1293; the full issue text that was drafted verbatim lived in
-    // `docs/PENDING_VIMCODE_ISSUES.md` and has been removed now that it's
-    // filed.
-    "scroll:so=5 30G H",
-    "scroll:so=5 30G L",
+    // #1280 surfaced these (see that issue's history: `run_in_vimcode` used
+    // to never set `'wrap'`, so every case ran against vimcode's actual
+    // default of `wrap=false` regardless of the oracle's `wrap=true`; once
+    // #1280 forced both sides to match Neovim's default, this became a real,
+    // previously-hidden gap). `ensure_cursor_visible_wrap` — the vertical
+    // scroll-to-cursor path used when `'wrap'` is on, in
+    // `src/core/engine/search.rs` — never read `self.settings.scrolloff` at
+    // all, unlike the `'wrap'`-off path a few lines above it in the same
+    // file (`ensure_cursor_visible`), which does. #1293 ported `scrolloff`
+    // into the wrap path, expressed in *visual* rows (a wrapped logical line
+    // can span more than one screen row, so a flat buffer-line margin like
+    // the no-wrap path's isn't equivalent) via the new
+    // `Engine::visual_rows_for_range` helper and margin-aware top/bottom
+    // branches in `ensure_cursor_visible_wrap`. Both cases pass now; deleted
+    // per this list's own bidirectional-gate policy.
 ];
 
 // ---------------------------------------------------------------------------

@@ -16518,6 +16518,113 @@ fn test_ensure_cursor_visible_wrap_scrolls_up() {
     assert_eq!(engine.view().scroll_top, 5);
 }
 
+/// #1293: `ensure_cursor_visible_wrap` must honor `'scrolloff'` on the
+/// downward scroll, the same as the `'wrap'`-off path (`ensure_cursor_visible`
+/// a few lines above it in `search.rs`) already does. Mirrors the no-wrap
+/// path's own arithmetic on a buffer of single-row lines (no soft-wrap in
+/// play), so this is the direct regression test for the "one scrolloff-margin
+/// short of Neovim" bug `nvim_conformance`'s "scroll:so=5 30G H"/"...L" cases
+/// reproduced. Confirmed RED against unfixed `develop`: without this fix,
+/// `ensure_cursor_visible_wrap` never reads `scrolloff` at all, so scroll_top
+/// lands at 20 here (the same as the `scrolloff = 0` case), not 25.
+#[test]
+fn test_ensure_cursor_visible_wrap_respects_scrolloff_downward() {
+    let mut engine = Engine::new();
+    engine.settings.wrap = true;
+    engine.settings.scrolloff = 5;
+    let text = (0..60).map(|i| format!("line {i}\n")).collect::<String>();
+    engine.buffer_mut().content = ropey::Rope::from_str(&text);
+    engine.view_mut().viewport_lines = 10;
+    engine.view_mut().viewport_cols = 80;
+    engine.view_mut().scroll_top = 0;
+    // Cursor at buffer line 29 (30th line, matching the "30G" conformance
+    // case), same as the no-wrap path's own scrolloff test would use.
+    engine.view_mut().cursor.line = 29;
+    engine.view_mut().cursor.col = 0;
+    engine.ensure_cursor_visible();
+    // Matches `ensure_cursor_visible`'s no-wrap formula for the same inputs:
+    // minimal = cursor_line + scrolloff + 1 - viewport_lines = 29+5+1-10 = 25.
+    assert_eq!(engine.view().scroll_top, 25);
+}
+
+/// #1293 companion: the upward direction of the same fix. Confirmed RED
+/// against unfixed `develop`: without the fix, scroll_top lands at 10
+/// (`cursor_line`, no margin), not 5.
+#[test]
+fn test_ensure_cursor_visible_wrap_respects_scrolloff_upward() {
+    let mut engine = Engine::new();
+    engine.settings.wrap = true;
+    engine.settings.scrolloff = 5;
+    let text = (0..60).map(|i| format!("line {i}\n")).collect::<String>();
+    engine.buffer_mut().content = ropey::Rope::from_str(&text);
+    engine.view_mut().viewport_lines = 10;
+    engine.view_mut().viewport_cols = 80;
+    engine.view_mut().scroll_top = 20;
+    // Cursor entirely above the current viewport.
+    engine.view_mut().cursor.line = 10;
+    engine.view_mut().cursor.col = 0;
+    engine.ensure_cursor_visible();
+    // Matches the no-wrap formula: minimal = cursor_line.saturating_sub(scrolloff) = 10-5 = 5.
+    assert_eq!(engine.view().scroll_top, 5);
+}
+
+/// #1293: the margin must be counted in *visual* rows, not buffer lines —
+/// the reason this needed a real fix rather than copying the no-wrap path's
+/// line-count arithmetic verbatim. Buffer line 4 is a long line that
+/// soft-wraps into 3 screen rows at `viewport_cols = 10`; the cursor sits on
+/// its last (3rd) wrapped segment. With `scrolloff = 1` the one buffer line
+/// after the cursor's line (line 5) must remain visible below it. A
+/// buffer-line-counting implementation (equivalent to ignoring wrap, or to
+/// this same code with `scrolloff = 0`) instead lands scroll_top on 2, one
+/// line short — confirmed by asserting the `scrolloff = 0` control case
+/// below lands there, which is exactly what unfixed `ensure_cursor_visible_wrap`
+/// (ignoring scrolloff entirely) would also produce for the `scrolloff = 1`
+/// case, making this RED against unfixed `develop`.
+#[test]
+fn test_ensure_cursor_visible_wrap_scrolloff_counts_visual_rows_not_buffer_lines() {
+    let lines: Vec<String> = (0..10)
+        .map(|i| {
+            if i == 4 {
+                // 25 chars -> ceil(25/10) = 3 wrapped rows.
+                "wwwwwwwwwwwwwwwwwwwwwwwww".to_string()
+            } else {
+                format!("l{i}")
+            }
+        })
+        .collect();
+    let text = lines.iter().map(|l| format!("{l}\n")).collect::<String>();
+
+    let mut engine = Engine::new();
+    engine.settings.wrap = true;
+    engine.settings.scrolloff = 1;
+    engine.buffer_mut().content = ropey::Rope::from_str(&text);
+    engine.view_mut().viewport_lines = 5;
+    engine.view_mut().viewport_cols = 10;
+    engine.view_mut().scroll_top = 0;
+    engine.view_mut().cursor.line = 4;
+    engine.view_mut().cursor.col = 22; // third wrapped segment (chars 20..25)
+    engine.ensure_cursor_visible();
+    assert_eq!(
+        engine.view().scroll_top,
+        3,
+        "scrolloff=1 must reserve one *visual* row (line 5) below the cursor's \
+         last wrapped segment, landing scroll_top on line 3 (short line 3, then \
+         line 4's 3 wrapped rows fill the rest of the 5-row viewport, leaving \
+         line 5 as the single row of margin)"
+    );
+
+    // Control: with scrolloff = 0 (no margin required) the same layout
+    // lands one line earlier — this is the value unfixed
+    // `ensure_cursor_visible_wrap` (which never reads scrolloff at all)
+    // would also produce for the scrolloff=1 case above, i.e. one row short.
+    engine.settings.scrolloff = 0;
+    engine.view_mut().scroll_top = 0;
+    engine.view_mut().cursor.line = 4;
+    engine.view_mut().cursor.col = 22;
+    engine.ensure_cursor_visible();
+    assert_eq!(engine.view().scroll_top, 2);
+}
+
 #[test]
 fn test_dap_add_remove_watch() {
     let mut engine = Engine::new();
