@@ -1063,6 +1063,7 @@ impl Engine {
             if self.windows.contains_key(&left_win) {
                 let left_buf = self.windows[&left_win].buffer_id;
                 self.windows.remove(&left_win);
+                self.forget_closed_panel_window(left_win);
                 self.prune_jump_list_windows(&[left_win]);
                 // Remove from layout.
                 let tab = self.active_tab_mut();
@@ -1235,6 +1236,7 @@ impl Engine {
             if self.windows.contains_key(&left_win) {
                 let left_buf = self.windows[&left_win].buffer_id;
                 self.windows.remove(&left_win);
+                self.forget_closed_panel_window(left_win);
                 self.prune_jump_list_windows(&[left_win]);
                 let tab = self.active_tab_mut();
                 if let Some(new_layout) = tab.layout.remove(left_win) {

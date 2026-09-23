@@ -3190,6 +3190,24 @@ pub struct Engine {
     /// Per-window location lists — the `:l*` family's target. A window with
     /// no entry here behaves like Vim's "no location list" (`E776`).
     pub location_lists: HashMap<WindowId, QuickfixList>,
+    /// Real `WindowLayout` leaves opened by `qf_open`/`qf_window` for a
+    /// quickfix/location-list panel (#1307) — keyed by `qf_get`'s own `win`
+    /// shape (`None` = the global quickfix panel, `Some(owner)` = window
+    /// `owner`'s location-list panel). Matches Neovim's own `:copen`/`:lopen`:
+    /// the panel is a genuine split window, so `winnr("$")` grows and
+    /// `CTRL-W` navigation reaches it, unlike the sidebar/terminal overlay
+    /// panels. Advisory, not authoritative — an entry can outlive the window
+    /// it names if that window closed through a path other than `qf_close`
+    /// (`CTRL-W q`, `:only`, ...); every reader checks `self.windows` before
+    /// trusting it, and `forget_closed_panel_window` prunes the entry the
+    /// next time any window-close path removes that id. `QuickfixList::open`/
+    /// `has_focus` remain the flags most existing code reads/writes — a
+    /// target with no entry here (e.g. `qf_set_list`'s implicit `:grep`
+    /// auto-open, or any test that pokes `open`/`has_focus` directly without
+    /// going through `qf_open`) still renders via the legacy overlay band in
+    /// `render.rs`, which only self-suppresses for a target that *does* have
+    /// a real window here.
+    pub qf_panel_windows: HashMap<Option<WindowId>, WindowId>,
     /// Whether the debug sidebar has keyboard focus.
     pub dap_sidebar_has_focus: bool,
 
@@ -4471,6 +4489,7 @@ impl Engine {
             quickfix_stack: Vec::new(),
             quickfix_stack_pos: 0,
             location_lists: HashMap::new(),
+            qf_panel_windows: HashMap::new(),
             dap_sidebar_has_focus: false,
             picker_open: false,
             picker_source: PickerSource::Files,

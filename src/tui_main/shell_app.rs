@@ -18643,6 +18643,134 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// #1307: `:copen` must open the quickfix panel as a genuine
+    /// `WindowLayout` leaf — `CTRL-W` reachable, not the sidebar/terminal-
+    /// style overlay it used to be. Painted screen *text* alone can't tell
+    /// the two apart (`quickfix_list_to_panel`'s overlay and the new real
+    /// window's scratch buffer render near-identical content in the same
+    /// spot by design — see `Engine::qf_has_real_window`'s doc comment), so
+    /// this drives the one behaviour that genuinely depends on window
+    /// *count*. A click back into the file pane first clears
+    /// `QuickfixList::has_focus` (pre-existing, unrelated to #1307 — while
+    /// set, it intercepts *every* key, `CTRL-W` chords included, regardless
+    /// of whether a real window backs the panel, which would otherwise mask
+    /// the discriminator entirely): with only the file window open, `CTRL-W
+    /// w` is then a self-cycle no-op (`WindowLayout::next_window` on a
+    /// single leaf returns that same leaf) and further typing lands right
+    /// back in the file buffer; with a real second (quickfix) window open,
+    /// the same `CTRL-W w` moves focus onto it, and further typing is
+    /// swallowed instead — `qf_panel_target` routes it to `qf_handle_key`
+    /// purely by *window identity* now (no `has_focus` involved), and
+    /// nothing in `qf_handle_key`'s `match` handles a bare letter.
+    ///
+    /// **Verified RED against unfixed `develop`** (confirmed by hand:
+    /// reverting `qf_open` to only flip `QuickfixList::open`/`has_focus`,
+    /// as it did before #1307, with no `qf_ensure_panel_window` call):
+    /// `engine.windows.len()` stays `1` through `:copen`, so after the
+    /// click-back-in clears `has_focus`, `CTRL-W w` keeps focus on the file
+    /// window, and the `i`/`Z`/`Escape` below inserts `Z` into it — the
+    /// final `!screen.contains("ZCOPEN1307_000")` assertion fails, catching
+    /// exactly the corruption this test guards against.
+    #[test]
+    fn copen_opens_a_real_window_ctrl_w_reaches_via_shell_app() {
+        const WIDTH: u16 = 100;
+        const HEIGHT: u16 = 32;
+
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_test_1307_copen_real_window_{:?}",
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("copen1307.txt");
+        let content: String = (0..5).map(|i| format!("COPEN1307_{i:03}\n")).collect();
+        std::fs::write(&file, &content).unwrap();
+
+        let mut app = TuiShellApp::new(None);
+        app.engine.settings.autohide_panels = false;
+        app.engine.app_shell.hide_sidebar();
+        app.engine.session.explorer_visible = false;
+        app.engine
+            .open_file_with_mode(&file, crate::core::engine::OpenMode::Permanent)
+            .unwrap();
+        app.engine
+            .quickfix
+            .items
+            .push(crate::core::project_search::ProjectMatch {
+                file: PathBuf::from("qfmarker1307.rs"),
+                line: 0,
+                col: 0,
+                line_text: "MARKERTEXT1307".to_string(),
+            });
+
+        let mut driver = driver_with_shell(app, config(), WIDTH, HEIGHT);
+        driver.render();
+
+        let screen_before = driver.screen();
+        assert!(
+            screen_before.contains("COPEN1307_000"),
+            "test setup sanity: the opened file's first line must paint \
+             before `:copen` runs;\nscreen:\n{screen_before}"
+        );
+
+        for c in ":copen".chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
+        driver.render();
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("COPEN1307_000"),
+            "`:copen` must keep the original file's window painted \
+             alongside the quickfix panel, not replace it;\nscreen:\n{screen}"
+        );
+        assert!(
+            screen.contains("qfmarker1307.rs") && screen.contains("MARKERTEXT1307"),
+            "the quickfix panel's own content must paint at the same time \
+             as the original file above;\nscreen:\n{screen}"
+        );
+
+        // Click back into the file pane first: `:copen` leaves the panel
+        // with `QuickfixList::has_focus` set, which intercepts *every* key
+        // (including a `CTRL-W` chord) on its own regardless of whether a
+        // real window backs it — that's pre-existing, unrelated to #1307,
+        // and would mask the discriminator below. A click on the file's own
+        // content clears `has_focus` (`Engine::mouse_click`) and returns
+        // keys to ordinary dispatch, exactly like a user clicking back into
+        // their buffer after `:copen`.
+        let (fx, fy) = driver
+            .find("COPEN1307_000")
+            .expect("file's first line must still be locatable to click on");
+        driver.click(fx, fy);
+        driver.render();
+
+        // The discriminating step: cycle windows, then type into whatever
+        // is now focused.
+        driver.ctrl_char('w');
+        driver.type_char('w');
+        driver.type_char('i');
+        driver.type_char('Z');
+        driver.press_named(quadraui::NamedKey::Escape);
+        driver.render();
+
+        let screen_after = driver.screen();
+        assert!(
+            !screen_after.contains("ZCOPEN1307_000"),
+            "`CTRL-W w` after `:copen` must move focus onto the real \
+             quickfix window, not stay on the file — typing `iZ<Esc>` \
+             afterward must not corrupt the file's first line;\n\
+             screen:\n{screen_after}"
+        );
+        assert!(
+            screen_after.contains("COPEN1307_000"),
+            "the file's first line must still be painted, unmodified, \
+             after the CTRL-W cycle + typing above;\nscreen:\n{screen_after}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// #35: `render_content` must paint the minimap through the shell path,
     /// as braille — not just populate `ScreenLayout.minimap`.
     ///

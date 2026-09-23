@@ -157,6 +157,45 @@ impl WindowLayout {
         }
     }
 
+    /// Wrap the **whole** layout in a new split, unlike [`Self::split_at`]
+    /// (which splits one target leaf in place). `new_window_id` becomes one
+    /// side of a fresh top-level `Split`, the entire previous tree becomes
+    /// the other — so the new window spans the full width/height of
+    /// whatever was here before, regardless of how many leaves or nested
+    /// splits it already contained.
+    ///
+    /// This is what Neovim's `:copen` does for the quickfix window (`:h
+    /// copen`; confirmed against a live oracle, #1307): it's a full-width
+    /// split of the *entire tabpage*, positioned at the bottom, even when
+    /// the tab already has several `:vsplit` panes side by side — not an
+    /// ordinary split of whichever pane happened to be active. [`Self::
+    /// split_at`]'s cmdline-window precedent (#1297) doesn't apply here
+    /// because a cmdline window only ever opens from a single active pane,
+    /// where "split the current window" and "split the whole tab" already
+    /// coincide; the quickfix window's own oracle-confirmed shape does not.
+    pub fn wrap_full(
+        &mut self,
+        direction: SplitDirection,
+        new_window_id: WindowId,
+        new_first: bool,
+        ratio: f64,
+    ) {
+        let old = std::mem::replace(self, WindowLayout::Leaf(new_window_id));
+        let new_leaf = Box::new(WindowLayout::Leaf(new_window_id));
+        let old_tree = Box::new(old);
+        let (first, second) = if new_first {
+            (new_leaf, old_tree)
+        } else {
+            (old_tree, new_leaf)
+        };
+        *self = WindowLayout::Split {
+            direction,
+            ratio,
+            first,
+            second,
+        };
+    }
+
     /// Remove a window from the layout.
     /// Returns Some(remaining_layout) if successful, None if window not found.
     /// If removing the window leaves an empty split, the sibling is promoted.
@@ -1126,6 +1165,47 @@ mod tests {
 
         assert!(!layout.is_single_window());
         assert_eq!(layout.window_ids(), vec![WindowId(1), WindowId(2)]);
+    }
+
+    #[test]
+    fn test_wrap_full_spans_an_existing_multi_leaf_tree_1307() {
+        // Two side-by-side leaves (like a `:vsplit`) before wrapping —
+        // `wrap_full` must put the new leaf *around* both, not nested inside
+        // either one (unlike `split_at`, which would only ever touch one
+        // target leaf).
+        let mut layout = WindowLayout::leaf(WindowId(1));
+        layout.split_at(WindowId(1), SplitDirection::Vertical, WindowId(2), false);
+        assert_eq!(layout.window_ids(), vec![WindowId(1), WindowId(2)]);
+
+        layout.wrap_full(SplitDirection::Horizontal, WindowId(3), false, 0.7);
+
+        // Top-level split is now the new (Horizontal, id 3) wrap, with the
+        // original (Vertical, [1, 2]) subtree intact as its first child.
+        match &layout {
+            WindowLayout::Split {
+                direction,
+                ratio,
+                first,
+                second,
+            } => {
+                assert_eq!(*direction, SplitDirection::Horizontal);
+                assert_eq!(*ratio, 0.7);
+                assert_eq!(second.window_ids(), vec![WindowId(3)]);
+                assert_eq!(first.window_ids(), vec![WindowId(1), WindowId(2)]);
+            }
+            other => panic!("expected a top-level Split, got {other:?}"),
+        }
+        assert_eq!(
+            layout.window_ids(),
+            vec![WindowId(1), WindowId(2), WindowId(3)]
+        );
+
+        // Removing the wrapped leaf restores exactly the original subtree —
+        // the `close_window`/`qf_close_panel_window` precedent this exists
+        // to support relies on `remove` already handling a root-level wrap
+        // (#1307), not a new special case.
+        let after_remove = layout.remove(WindowId(3)).expect("removable leaf");
+        assert_eq!(after_remove.window_ids(), vec![WindowId(1), WindowId(2)]);
     }
 
     #[test]

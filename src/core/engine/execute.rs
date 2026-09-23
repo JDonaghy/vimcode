@@ -1647,35 +1647,35 @@ impl Engine {
             return self.qf_open(None);
         }
         if cmd == "lopen" {
-            let win = self.active_window_id();
+            let win = self.qf_loc_target_window();
             return self.qf_open(Some(win));
         }
         if cmd == "cclose" {
             return self.qf_close(None);
         }
         if cmd == "lclose" {
-            let win = self.active_window_id();
+            let win = self.qf_loc_target_window();
             return self.qf_close(Some(win));
         }
         if cmd == "cwindow" {
             return self.qf_window(None);
         }
         if cmd == "lwindow" {
-            let win = self.active_window_id();
+            let win = self.qf_loc_target_window();
             return self.qf_window(Some(win));
         }
         if cmd == "cnext" {
             return self.qf_next(None);
         }
         if cmd == "lnext" {
-            let win = self.active_window_id();
+            let win = self.qf_loc_target_window();
             return self.qf_next(Some(win));
         }
         if cmd == "cprevious" || cmd == "cN" {
             return self.qf_prev(None);
         }
         if cmd == "lprevious" || cmd == "lN" {
-            let win = self.active_window_id();
+            let win = self.qf_loc_target_window();
             return self.qf_prev(Some(win));
         }
         if let Some(n_str) = cmd.strip_prefix("cc ") {
@@ -1685,7 +1685,7 @@ impl Engine {
         }
         if let Some(n_str) = cmd.strip_prefix("ll ") {
             if let Some(n) = n_str.trim().parse::<usize>().ok().filter(|&n| n > 0) {
-                let win = self.active_window_id();
+                let win = self.qf_loc_target_window();
                 return self.qf_go(Some(win), n - 1);
             }
         }
@@ -1704,7 +1704,7 @@ impl Engine {
             return self.qf_jump(None);
         }
         if cmd == "ll" {
-            let win = self.active_window_id();
+            let win = self.qf_loc_target_window();
             if self.qf_get(Some(win)).is_none_or(|l| l.items.is_empty()) {
                 self.message = Self::qf_empty_msg(Some(win));
                 return EngineAction::None;
@@ -1720,7 +1720,7 @@ impl Engine {
             return self.qf_go(None, 0);
         }
         if cmd == "lfirst" {
-            let win = self.active_window_id();
+            let win = self.qf_loc_target_window();
             if self.qf_get(Some(win)).is_none_or(|l| l.items.is_empty()) {
                 self.message = Self::qf_empty_msg(Some(win));
                 return EngineAction::None;
@@ -1736,7 +1736,7 @@ impl Engine {
             return self.qf_go(None, self.quickfix.items.len() - 1);
         }
         if cmd == "llast" {
-            let win = self.active_window_id();
+            let win = self.qf_loc_target_window();
             let Some(len) = self
                 .qf_get(Some(win))
                 .map(|l| l.items.len())
@@ -1752,7 +1752,7 @@ impl Engine {
             return self.qf_list_cmd(None);
         }
         if cmd == "llist" {
-            let win = self.active_window_id();
+            let win = self.qf_loc_target_window();
             return self.qf_list_cmd(Some(win));
         }
         // Handle :colder / :cnewer — walk the quickfix stack.
@@ -1782,11 +1782,11 @@ impl Engine {
             return self.qf_do(None, rest, true);
         }
         if let Some(rest) = cmd.strip_prefix("ldo ") {
-            let win = self.active_window_id();
+            let win = self.qf_loc_target_window();
             return self.qf_do(Some(win), rest, false);
         }
         if let Some(rest) = cmd.strip_prefix("lfdo ") {
-            let win = self.active_window_id();
+            let win = self.qf_loc_target_window();
             return self.qf_do(Some(win), rest, true);
         }
         if matches!(cmd, "cdo" | "cfdo" | "ldo" | "lfdo") {
@@ -1809,7 +1809,7 @@ impl Engine {
             .or_else(|| cmd.strip_prefix("lvimgrep "))
         {
             let cwd = self.cwd.clone();
-            let win = self.active_window_id();
+            let win = self.qf_loc_target_window();
             return self.qf_run_grep(Some(win), pat.trim(), cwd);
         }
         if cmd == "lgrep" || cmd == "lvimgrep" {

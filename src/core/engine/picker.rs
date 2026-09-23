@@ -2340,6 +2340,14 @@ impl Engine {
         if win.is_none() {
             self.qf_push_history();
         }
+        // #1307: this flips `open` unconditionally (existing behaviour,
+        // unrelated to #1307) but deliberately does *not* call
+        // `qf_ensure_panel_window` — a plain `:grep`/`:vimgrep` re-run must
+        // not conjure a real split window out of nowhere; only `:copen`/
+        // `:lopen`/`:cwindow`/`:lwindow` do that. If one is *already* open
+        // (from an earlier `:copen`), keep it live instead of leaving it
+        // showing stale entries.
+        self.qf_refresh_panel_if_open(win);
     }
 
     /// Snapshot the (just-updated) global quickfix list onto
@@ -2369,6 +2377,7 @@ impl Engine {
         }
         self.quickfix_stack_pos = self.quickfix_stack_pos.saturating_sub(count);
         self.quickfix = self.quickfix_stack[self.quickfix_stack_pos].clone();
+        self.qf_refresh_panel_if_open(None);
         self.message = format!(
             "list {} of {}",
             self.quickfix_stack_pos + 1,
@@ -2390,12 +2399,115 @@ impl Engine {
         self.quickfix_stack_pos =
             (self.quickfix_stack_pos + count).min(self.quickfix_stack.len() - 1);
         self.quickfix = self.quickfix_stack[self.quickfix_stack_pos].clone();
+        self.qf_refresh_panel_if_open(None);
         self.message = format!(
             "list {} of {}",
             self.quickfix_stack_pos + 1,
             self.quickfix_stack.len()
         );
         EngineAction::None
+    }
+
+    /// Format one entry the way a real panel window's buffer displays it:
+    /// `"file.rs:12: line text"` — no directory, matching real Neovim's
+    /// quickfix buffer lines (`:h quickfix-window-function`'s default
+    /// formatter).
+    fn qf_format_item(m: &ProjectMatch) -> String {
+        let f = m.file.file_name().and_then(|n| n.to_str()).unwrap_or("?");
+        let snippet: String = m.line_text.trim().chars().take(80).collect();
+        format!("{}:{}: {}", f, m.line + 1, snippet)
+    }
+
+    /// Format every entry in `list` (see [`Self::qf_format_item`]).
+    fn qf_format_items(list: &QuickfixList) -> Vec<String> {
+        list.items.iter().map(Self::qf_format_item).collect()
+    }
+
+    /// If a real panel window is currently open for `target` (#1307),
+    /// refresh its buffer text from the list's current items and move its
+    /// cursor to the list's current `selected` index — call after anything
+    /// that mutates a `QuickfixList`'s `items`/`selected` so an already-open
+    /// panel window stays live, the way Neovim's own quickfix buffer does.
+    /// A no-op when no real window is open for `target` (the common case for
+    /// `qf_set_list`'s implicit `:grep`/`:vimgrep` auto-open, which only
+    /// ever flips the legacy overlay flags — see that method's own doc).
+    fn qf_refresh_panel_if_open(&mut self, target: Option<WindowId>) {
+        let Some(&win_id) = self.qf_panel_windows.get(&target) else {
+            return;
+        };
+        if !self.windows.contains_key(&win_id) {
+            return;
+        }
+        let (lines, selected) = match self.qf_get(target) {
+            Some(list) => (Self::qf_format_items(list), list.selected),
+            None => return,
+        };
+        self.qf_refresh_panel_window(win_id, &lines);
+        self.qf_set_panel_cursor(win_id, selected);
+    }
+
+    /// Does `target` have a real `WindowLayout` leaf open for it right now
+    /// (#1307)? `render.rs`'s legacy overlay-band renderer
+    /// (`quickfix_panel_rows`, `compute_editor_layout`, `build_screen_
+    /// layout_with_breadcrumb_row`'s `screen.quickfix` builder) calls this
+    /// to self-suppress for a target that already has a real window —
+    /// painting both at once would double up the same content in two
+    /// places. Any caller that still drives `QuickfixList::open`/
+    /// `has_focus` directly (most of this codebase's own rendering tests,
+    /// and `qf_set_list`'s implicit `:grep` auto-open) never populates
+    /// `qf_panel_windows`, so this stays `false` for them and the overlay
+    /// keeps rendering exactly as it always has.
+    pub fn qf_has_real_window(&self, target: Option<WindowId>) -> bool {
+        self.qf_panel_windows
+            .get(&target)
+            .is_some_and(|id| self.windows.contains_key(id))
+    }
+
+    /// The window id `execute_command`'s `:l*` family should pass as
+    /// `qf_get`'s `win` — ordinarily just the active window, *except* when
+    /// the active window is itself a location-list panel window (#1307): a
+    /// real Neovim location-list window keeps a hidden reference to the
+    /// window it was opened for (`getloclist(0, {'filewinid': 0})`), so
+    /// `:lclose`/`:lnext`/... typed *while inside* the panel still target
+    /// that owner, not the panel window itself. Every `:l*` ex-command
+    /// handler in `execute.rs` calls this instead of `active_window_id()`
+    /// directly.
+    pub(crate) fn qf_loc_target_window(&self) -> WindowId {
+        match self.qf_panel_target(self.active_window_id()) {
+            Some(Some(owner)) => owner,
+            _ => self.active_window_id(),
+        }
+    }
+
+    /// If `id` is a quickfix/location-list panel window (#1307), the list it
+    /// targets (`qf_get`'s `win` shape: `None` = global, `Some(owner)` =
+    /// window `owner`'s location list). `None` if `id` isn't a panel window.
+    pub(crate) fn qf_panel_target(&self, id: WindowId) -> Option<Option<WindowId>> {
+        self.qf_panel_windows
+            .iter()
+            .find(|(_, &w)| w == id)
+            .map(|(&target, _)| target)
+    }
+
+    /// Undo `qf_open`'s bookkeeping when `window_id` — possibly a quickfix/
+    /// location-list panel window (#1307) — is removed from `self.windows`
+    /// through *any* window-close path, not just `qf_close`/
+    /// `qf_close_panel_window` (`CTRL-W q`/`CTRL-W c` on a focused panel
+    /// window, `:only`, closing its owning tab/group, a diff-pair cleanup,
+    /// ...). Every one of those already removes the window correctly on its
+    /// own — a panel window is now an entirely ordinary `Window`/
+    /// `WindowLayout` leaf — so this only keeps `QuickfixList::open`/
+    /// `has_focus` from lying about a window that no longer exists, and
+    /// drops the now-stale `qf_panel_windows` entry. A no-op for any id that
+    /// isn't a panel window (the overwhelmingly common case, since
+    /// `qf_panel_windows` rarely holds more than one or two entries).
+    pub(crate) fn forget_closed_panel_window(&mut self, window_id: WindowId) {
+        if let Some(target) = self.qf_panel_target(window_id) {
+            self.qf_panel_windows.remove(&target);
+            let list = self.qf_get_mut(target);
+            list.open = false;
+            list.has_focus = false;
+        }
     }
 
     /// Open the target panel and give it focus.
@@ -2411,19 +2523,33 @@ impl Engine {
     /// autovivify) is what distinguishes "never created" from "empty",
     /// unlike `qf_get_mut`'s `entry(..).or_default()` this used to check
     /// against, which collapsed both into the same wrong refusal.
+    ///
+    /// #1307: also opens (or reuses) the panel's real `WindowLayout` leaf
+    /// (`qf_ensure_panel_window`) — the reason `:copen`/`:lopen` are the
+    /// entry points that get a real window at all, unlike `qf_set_list`'s
+    /// implicit auto-open, which only flips the flags below.
     pub fn qf_open(&mut self, win: Option<WindowId>) -> EngineAction {
         if win.is_some() && self.qf_get(win).is_none() {
             self.message = Self::qf_empty_msg(win);
             return EngineAction::None;
         }
+        let lines = Self::qf_format_items(self.qf_get(win).expect("checked above"));
+        let scratch_name = if win.is_some() {
+            "[Location List]"
+        } else {
+            "[Quickfix List]"
+        };
+        self.qf_ensure_panel_window(win, &lines, scratch_name);
         let list = self.qf_get_mut(win);
         list.open = true;
         list.has_focus = true;
         EngineAction::None
     }
 
-    /// Close the target panel.
+    /// Close the target panel, including its real `WindowLayout` leaf if one
+    /// is open (#1307).
     pub fn qf_close(&mut self, win: Option<WindowId>) -> EngineAction {
+        self.qf_close_panel_window(win);
         let list = self.qf_get_mut(win);
         list.open = false;
         list.has_focus = false;
@@ -2447,11 +2573,20 @@ impl Engine {
             return EngineAction::None;
         }
         let empty = self.qf_get_mut(win).items.is_empty();
-        let list = self.qf_get_mut(win);
         if empty {
+            self.qf_close_panel_window(win);
+            let list = self.qf_get_mut(win);
             list.open = false;
             list.has_focus = false;
         } else {
+            let lines = Self::qf_format_items(self.qf_get(win).expect("checked above"));
+            let scratch_name = if win.is_some() {
+                "[Location List]"
+            } else {
+                "[Quickfix List]"
+            };
+            self.qf_ensure_panel_window(win, &lines, scratch_name);
+            let list = self.qf_get_mut(win);
             list.open = true;
             list.has_focus = true;
         }
@@ -2527,6 +2662,11 @@ impl Engine {
             self.set_cursor_for_window(win_id, m.line, m.col);
             self.ensure_cursor_visible();
         }
+        // #1307: the panel window (if open) stays open after a jump — real
+        // Neovim leaves the quickfix window in place after `<CR>` too — but
+        // its own cursor should still land on the entry that was just
+        // jumped to, so tabbing back into it later starts on the right row.
+        self.qf_refresh_panel_if_open(win);
         EngineAction::None
     }
 
@@ -2642,21 +2782,25 @@ impl Engine {
             "Down" | "j" => {
                 let list = self.qf_get_mut(win);
                 list.selected = (list.selected + 1).min(list.items.len().saturating_sub(1));
+                self.qf_refresh_panel_if_open(win);
                 EngineAction::None
             }
             "Up" | "k" => {
                 let list = self.qf_get_mut(win);
                 list.selected = list.selected.saturating_sub(1);
+                self.qf_refresh_panel_if_open(win);
                 EngineAction::None
             }
             "n" if ctrl => {
                 let list = self.qf_get_mut(win);
                 list.selected = (list.selected + 1).min(list.items.len().saturating_sub(1));
+                self.qf_refresh_panel_if_open(win);
                 EngineAction::None
             }
             "p" if ctrl => {
                 let list = self.qf_get_mut(win);
                 list.selected = list.selected.saturating_sub(1);
+                self.qf_refresh_panel_if_open(win);
                 EngineAction::None
             }
             _ => EngineAction::None,
