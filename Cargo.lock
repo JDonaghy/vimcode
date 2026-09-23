@@ -2650,7 +2650,7 @@ checksum = "d55d956fa96f5ec02be2e13af0e20391a5aa83d6a074e3ad368959d0fab299ea"
 [[package]]
 name = "quadraui"
 version = "0.0.1"
-source = "git+https://github.com/JDonaghy/quadraui.git?rev=0dc838134a407061e7e937c2515900c27b300f72#0dc838134a407061e7e937c2515900c27b300f72"
+source = "git+https://github.com/JDonaghy/quadraui.git?rev=215e9e4159011d6074245520dad24e187a5bd430#215e9e4159011d6074245520dad24e187a5bd430"
 dependencies = [
  "arboard",
  "core-foundation 0.9.4",
@@ -2660,6 +2660,7 @@ dependencies = [
  "foreign-types",
  "gtk4",
  "keyring",
+ "libc",
  "objc2",
  "objc2-app-kit",
  "objc2-foundation",
