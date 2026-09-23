@@ -18055,6 +18055,105 @@ mod tests {
         );
     }
 
+    /// #1326 acceptance, painted-output tier: a fresh `<C-w>v` must reserve
+    /// exactly one blank screen column for the vertical divider bar itself,
+    /// matching Neovim (a fresh 80-column `<C-w>v` gives `40`/`39`, never
+    /// `40`/`40`) — not paint the two panes' content flush against each
+    /// other with the divider glyph squeezed into the left pane's own last
+    /// column.
+    ///
+    /// Minimap off, so the left pane's own right-edge scrollbar track (`'█'`
+    /// thumb / `'░'` track, per `draw_editor`) is unambiguous — with the
+    /// minimap on, its braille density pattern can coincidentally contain
+    /// the same glyphs used elsewhere on the row, at the wrong column.
+    ///
+    /// Asserts the one fact that genuinely distinguishes "the divider has
+    /// its own reserved column" from "the divider shares the left pane's
+    /// own last column": **the scrollbar strip and the divider glyph paint
+    /// on the very same row, in adjacent-but-distinct columns.** Before
+    /// #1326 the two were mutually exclusive on any given row — `render_
+    /// impl.rs`'s old `vertical_separator_cells` only painted the divider
+    /// glyph into the shared cell when the left window had *no* scrollbar
+    /// (`has_scroll`'s guard, needed because both used to compete for the
+    /// same cell when there was no real gap between the panes) — so a row
+    /// with a visible scrollbar strip could never also show a divider glyph
+    /// immediately beside it. Both panes share `app_with_shaped_buffer`'s
+    /// 240-line fixture, taller than any test viewport here, so every
+    /// content row overflows and paints a scrollbar strip.
+    ///
+    /// RED-verified against unfixed `develop`: temporarily restoring
+    /// `develop`'s `src/core/window.rs` (`layout_snapped`'s `Vertical` arm,
+    /// zero reserved divider thickness — so `a.rect`/`b.rect` touch exactly,
+    /// `gap == 0`) and `src/tui_main/render_impl.rs` (`vertical_separator_
+    /// cells`'s pre-#1326 zero-gap-only logic) over the fix and re-running
+    /// finds no row where a `'█'`/`'░'` scrollbar cell is immediately
+    /// followed by `'│'` at all — every content row's own scrollbar
+    /// (`has_scroll` is true throughout this fixture) suppresses the
+    /// divider glyph entirely in that shared cell.
+    #[test]
+    fn ctrl_w_v_reserves_one_column_for_the_divider_via_shell_app() {
+        let mut app = app_with_split_shaped_buffer();
+        app.engine.settings.minimap = false;
+        let mut driver = driver_with_shell(app, config(), 120, 30);
+        // Same precondition as the other `app_with_split_shaped_buffer`
+        // tests above (see `ctrl_w_resize_moves_the_split_boundary_by_an_
+        // absolute_count_via_shell_app`'s doc comment): the sidebar-hide
+        // this fixture sets on the engine only reconciles into the
+        // runner's own painted `AppShell` at the tail of a dispatch, never
+        // on the very first frame.
+        driver.tick();
+        driver.tick();
+        let screen = driver.screen();
+
+        // A row must paint both panes' `"line "` text (proving it's inside
+        // the split's content area, not sidebar/tab-bar chrome) *and* carry
+        // a scrollbar cell immediately followed by the divider glyph.
+        let mut found: Option<(usize, String)> = None;
+        for line in screen.lines() {
+            if line.match_indices("line ").count() < 2 {
+                continue;
+            }
+            let chars: Vec<char> = line.chars().collect();
+            let Some(div_col) = chars
+                .windows(2)
+                .position(|w| matches!(w[0], '█' | '░') && w[1] == '│')
+                .map(|i| i + 1)
+            else {
+                continue;
+            };
+            found = Some((div_col, line.to_string()));
+            break;
+        }
+
+        let (div_col, row) = found.unwrap_or_else(|| {
+            panic!(
+                "expected a content row painting both panes' \"line \" text \
+                 with a scrollbar cell ('█'/'░') immediately followed by \
+                 the '│' window-divider glyph — i.e. the divider in its \
+                 own reserved column, not sharing the left pane's own last \
+                 column; screen:\n{screen}"
+            )
+        });
+
+        // Sanity: the divider sits strictly between the two panes' text,
+        // not before the left pane's own content or past the right pane's.
+        let text_cols: Vec<usize> = row
+            .char_indices()
+            .filter(|&(_, c)| c == 'l')
+            .filter_map(|(byte_i, _)| {
+                row[byte_i..]
+                    .starts_with("line ")
+                    .then(|| row[..byte_i].chars().count())
+            })
+            .collect();
+        assert!(
+            text_cols.len() >= 2 && text_cols[0] < div_col && div_col < text_cols[1],
+            "the divider (col {div_col}) must sit strictly between the \
+             left and right panes' own \"line \" text columns {text_cols:?}; \
+             row:\n{row}"
+        );
+    }
+
     /// #722 acceptance, painted-output tier: a `:vsplit` must paint **two**
     /// independent minimap strips, one over each pane's own buffer — not a
     /// single strip pinned to whichever pane happens to be active.

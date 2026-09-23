@@ -188,9 +188,12 @@ fn wincmd_maximize_actually_widens_window_split() {
     exec(&mut e, "wincmd |");
     assert_eq!(
         window_split_ratio(&e),
-        Some(79.0 / 80.0),
+        Some(78.0 / 79.0),
         "wincmd | must shrink the other window to its 1-column 'winminwidth' \
-         floor (79/80), not a fixed 0.9 ratio"
+         floor, not a fixed 0.9 ratio — #1326: a fresh vertical split \
+         reserves one column for the divider bar (matching Neovim), so the \
+         80-column default's content total is 79, not 80, and the floor is \
+         78/79, not 79/80"
     );
 }
 
