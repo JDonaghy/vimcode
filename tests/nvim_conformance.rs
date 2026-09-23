@@ -9915,12 +9915,24 @@ fn nvim_conformance_cross_file_ex() {
 //      *before* the builtin table when Neovim always lists them *after*.
 //      Confirmed byte-for-byte against a live oracle; its case label is
 //      deleted from `KNOWN_DEVIATIONS_MESSAGE` below.
-//   5. (#1303) "msg:ex::changes lists a change" — title: "`:changes`: add the
-//      `text` column, fix `change_list`'s 0- vs 1-based numbering and the
-//      marker row". `"changes"`'s arm's header has no `text` column, and
-//      the body loop's `i` (the *index*, starting at 0) is printed as the
-//      change number instead of `i + 1`; Neovim's marker (`>`) also lands
-//      on a real entry, not a trailing empty row.
+//   5. (#1303 — FIXED) "msg:ex::changes lists a change" — title: "`:changes`:
+//      add the `text` column, fix `change_list`'s 0- vs 1-based numbering
+//      and the marker row". `"changes"`'s arm's header had no `text`
+//      column, and the body loop printed the raw 0-based index as the
+//      change number. A live-oracle probe with a multi-entry change list
+//      (not just the single-entry case this file covers) showed the real
+//      rule is not `i + 1`: like `:jumps`' `w_jumplistidx`-relative jump
+//      number, Neovim's change number is `w_changelistidx`-relative — it
+//      counts *distance from the current position* in the list (0 at the
+//      current entry, counting up on both sides), and the marker (`>`)
+//      lands on that same current entry, falling through to a bare
+//      trailing `>` line only when no `g;` has been done since the last
+//      change (`change_list_pos == change_list.len()`) — same shape as
+//      `:jumps`. Now: the header gets a `text` column previewing the
+//      changed line via the shared `preview_line_text` helper, and the
+//      body mirrors `:jumps`' `i.abs_diff(idx)` numbering and marker logic.
+//      Confirmed against a live oracle; its case label is deleted from
+//      `KNOWN_DEVIATIONS_MESSAGE` below.
 //   6. (#1304, hermeticity — FIXED, formatting gap it was masking — not yet
 //      filed) "msg:ex::history lists prior ex commands". #1304 was a
 //      hermeticity bug, not a message-formatting one: `HistoryState::load()`
@@ -9943,10 +9955,7 @@ fn nvim_conformance_cross_file_ex() {
 //      `KNOWN_DEVIATIONS_MESSAGE` below — the case still fails — pending a
 //      follow-up formatting-fix issue (same non-trivial-rewrite reasoning
 //      as the others).
-const KNOWN_DEVIATIONS_MESSAGE: &[&str] = &[
-    "msg:ex::changes lists a change",
-    "msg:ex::history lists prior ex commands",
-];
+const KNOWN_DEVIATIONS_MESSAGE: &[&str] = &["msg:ex::history lists prior ex commands"];
 
 #[test]
 fn nvim_conformance_messages() {

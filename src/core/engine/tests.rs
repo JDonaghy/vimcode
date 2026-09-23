@@ -11010,6 +11010,82 @@ fn test_ex_jumps_drops_tab_column_and_shows_file_text_preview() {
     );
 }
 
+/// `:changes` must match Neovim's real columns and numbering (#1303): a
+/// `text` column previewing the changed line, the change number counting
+/// *distance from the current position* in the list (not the raw 0-based
+/// index — `i.abs_diff(change_list_pos)`, same as `:jumps`' relative
+/// numbering), and the current-entry marker (`>`) landing on the entry at
+/// `change_list_pos` rather than always trailing the list (confirmed
+/// against a live oracle).
+#[test]
+fn test_ex_changes_shows_text_column_and_relative_numbering() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "alpha\nbeta\ngamma\n");
+
+    // Two changes on different lines build a real multi-entry list.
+    send_keys(&mut engine, "ceONE<Esc>"); // change_list: [(0, col)]
+    send_keys(&mut engine, "jceTWO<Esc>"); // change_list: [(0, col), (1, col)]
+    assert_eq!(
+        engine.change_list.len(),
+        2,
+        "two changes on different lines must both be recorded"
+    );
+
+    engine.execute_command("changes");
+    let header = engine.message.lines().next().unwrap();
+    assert!(
+        header.contains("text"),
+        ":changes header must contain Neovim's `text` column; message:\n{}",
+        engine.message
+    );
+    assert!(
+        engine.message.contains("TWO"),
+        ":changes should preview the changed line's text; message:\n{}",
+        engine.message
+    );
+    // No `g;` has been done since the last change, so `change_list_pos ==
+    // change_list.len()` and Neovim trails the list with a bare `>` line
+    // instead of marking either real entry (confirmed against a live
+    // oracle) — vimcode used to mark the newest real entry instead.
+    let last_line = engine.message.lines().last().unwrap();
+    assert_eq!(
+        last_line, ">",
+        ":changes must trail with a bare `>` line when no g; has been done; message:\n{}",
+        engine.message
+    );
+    let entry_lines: Vec<&str> = engine.message.lines().collect();
+    for line in &entry_lines[1..entry_lines.len() - 1] {
+        assert!(
+            !line.starts_with('>'),
+            "no real entry should carry the marker before any g; navigation; message:\n{}",
+            engine.message
+        );
+    }
+
+    // g; steps back to the newest change — now its row (not the header or a
+    // trailing line) must carry the marker, with change number 0.
+    send_keys(&mut engine, "g;");
+    engine.execute_command("changes");
+    let marked_row = engine
+        .message
+        .lines()
+        .find(|l| l.starts_with('>'))
+        .unwrap_or_else(|| panic!("expected a marked row; message:\n{}", engine.message));
+    assert!(
+        marked_row.contains("TWO"),
+        "the marked row after g; must be the newest change (TWO's line); row: {:?}",
+        marked_row
+    );
+    assert!(
+        marked_row
+            .trim_start_matches('>')
+            .trim_start()
+            .starts_with('0'),
+        "the current entry's change number must be 0 (distance from itself); row: {:?}",
+        marked_row
+    );
+}
+
 // =======================================================================
 // Tests: Indent / Dedent (>> / <<)
 // =======================================================================
