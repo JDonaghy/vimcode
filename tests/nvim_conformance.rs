@@ -361,8 +361,18 @@ impl NvimRpc {
     /// unconditional: none of the buffer/cursor-comparing cases read
     /// `last_message`, so there is no reason to widen what every one of
     /// those 1,400+ spawns has to negotiate and this harness has to decode.
-    fn spawn(capture_messages: bool) -> Option<Self> {
-        let mut child = Command::new("nvim")
+    ///
+    /// `cwd`, when given, becomes the spawned process's working directory
+    /// (#1328): the window-layout harness (`run_win_in_neovim`) opens real
+    /// files by path and needs relative-path resolution (`fnameescape`,
+    /// swap-file naming were it not for `-n`) to agree with vimcode's own
+    /// `Engine::cwd` for that probe. The buffer/cursor harnesses never open a
+    /// real file — every one of their probes lives entirely in the unnamed
+    /// buffer — so they pass `None` and inherit the test binary's own cwd,
+    /// unchanged from before this parameter existed.
+    fn spawn(capture_messages: bool, cwd: Option<&Path>) -> Option<Self> {
+        let mut command = Command::new("nvim");
+        command
             .arg("--headless")
             .arg("--embed")
             .arg("-u")
@@ -383,9 +393,11 @@ impl NvimRpc {
             // Deliberately discarded rather than piped-and-ignored: an unread
             // pipe fills and blocks nvim. Anything that matters comes back as
             // an RPC error instead.
-            .stderr(Stdio::null())
-            .spawn()
-            .ok()?;
+            .stderr(Stdio::null());
+        if let Some(dir) = cwd {
+            command.current_dir(dir);
+        }
+        let mut child = command.spawn().ok()?;
         let stdin = child.stdin.take()?;
         let mut stdout = BufReader::new(child.stdout.take()?);
         let (tx, frames) = std::sync::mpsc::channel();
@@ -739,7 +751,7 @@ fn oracle_probe(
     setup: &str,
 ) -> Result<NvimResult, String> {
     let mut nvim =
-        NvimRpc::spawn(false).ok_or_else(|| "could not spawn `nvim --embed`".to_string())?;
+        NvimRpc::spawn(false, None).ok_or_else(|| "could not spawn `nvim --embed`".to_string())?;
     let mut lua = String::new();
     // Neovim ships *default mappings* (`:h default-mappings`) that redefine
     // keys this corpus probes — `Y` is `y$`, `&` is `:&&<CR>`. The `-l` oracle
@@ -868,7 +880,7 @@ fn oracle_probe_message(
     setup: &str,
 ) -> Result<String, String> {
     let mut nvim =
-        NvimRpc::spawn(true).ok_or_else(|| "could not spawn `nvim --embed`".to_string())?;
+        NvimRpc::spawn(true, None).ok_or_else(|| "could not spawn `nvim --embed`".to_string())?;
     let mut lua = String::new();
     lua.push_str("vim.cmd('mapclear')\nvim.cmd('mapclear!')\n");
     lua.push_str("vim.o.inccommand = ''\n");
@@ -2870,24 +2882,44 @@ end\n\
 local result = { tabs = tabs }\n\
 ";
 
-fn run_win_in_neovim(
+/// Drive the window-layout probe's oracle over the same attached-UI RPC
+/// transport [`oracle_probe`] uses (#1008), reporting *why* a spawn/RPC
+/// failure happened rather than collapsing it to `None` — same contract as
+/// [`oracle_probe`], and for the same reason.
+///
+/// This replaced `nvim --headless -l script.lua` + one `nvim_feedkeys` burst
+/// (#1328). That oracle attached no UI, so Neovim's own `:h cmdwin` — `q:`,
+/// `q/`, `q?` — silently refused to open (confirmed empirically: `winlayout()`
+/// and `nvim_list_wins()` came back completely unchanged) and every case
+/// exercising it compared vimcode against a harness gap, not against real
+/// Neovim behaviour. Typing through `nvim_input` one key at a time, the same
+/// way [`oracle_probe`] does, is also what lets a command's window/tab side
+/// effects (a split, a cmdwin) exist by the time the snapshot below reads
+/// them — a single `nvim_feedkeys` burst runs inside `exec_normal`, which
+/// never returns to the main loop that would apply them.
+fn oracle_probe_win(
     main_path: &Path,
     start_line: usize,
     start_col: usize,
     keys: &str,
     cwd: &Path,
-) -> Option<serde_json::Value> {
-    let id = probe_id();
+) -> Result<serde_json::Value, String> {
+    let mut nvim = NvimRpc::spawn(false, Some(cwd))
+        .ok_or_else(|| "could not spawn `nvim --embed`".to_string())?;
     let mut lua = String::new();
+    // Same interactive-behaviour opt-outs as `oracle_probe`'s fixture
+    // preamble (#1008's module doc table) — typing for real through an
+    // attached UI brings Neovim's default mappings and live `:s` preview with
+    // it, neither of which any `CASES_WIN`/`CASES_XFILE` case means to
+    // exercise.
+    lua.push_str("vim.cmd('mapclear')\nvim.cmd('mapclear!')\n");
+    lua.push_str("vim.o.inccommand = ''\n");
     lua.push_str("vim.o.compatible = false\n");
     lua.push_str("vim.o.hidden = true\n");
-    // #1162: pin the screen size explicitly rather than relying on nvim's
-    // own default (also 80x24 today, per the single-buffer harness's
-    // UI_WIDTH/UI_HEIGHT) — CTRL-W resize/maximize/equalize are meaningless
-    // without an agreed total size, and pinning here means a future nvim
-    // changing its own default cannot silently drift this harness.
-    lua.push_str("vim.o.lines = 24\n");
-    lua.push_str("vim.o.columns = 80\n");
+    // No explicit `vim.o.lines`/`vim.o.columns` here (unlike the `-l` oracle
+    // this replaced): `NvimRpc::spawn`'s own `nvim_ui_attach(UI_WIDTH,
+    // UI_HEIGHT, ..)` already pins the same 80x24 screen `CTRL-W` resize/
+    // maximize/equalize cases need agreement on (#1162).
     let escaped_start = main_path
         .to_string_lossy()
         .replace('\\', "\\\\")
@@ -2900,54 +2932,42 @@ fn run_win_in_neovim(
         start_line,
         start_col.saturating_sub(1)
     ));
-    let escaped_keys = keys.replace('\\', "\\\\").replace('"', "\\\"");
-    lua.push_str(&format!(
-        "pcall(function() vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes(\"{escaped_keys}\", true, false, true), \"ntx\", false) end)\n"
-    ));
-    lua.push_str(WIN_SNAPSHOT_LUA);
-    let result_path = std::env::temp_dir().join(format!("vimcode_win_nvim_probe_{id}.json"));
-    let result_path_str = result_path.to_string_lossy().replace('\\', "/");
-    lua.push_str(&format!(
-        "local f = io.open(\"{result_path_str}\", \"w\")\n\
-         f:write(vim.fn.json_encode(result))\n\
-         f:close()\n\
-         vim.cmd(\"qa!\")\n"
-    ));
-    let script_path = std::env::temp_dir().join(format!("vimcode_win_nvim_probe_{id}.lua"));
-    {
-        let mut f = std::fs::File::create(&script_path).ok()?;
-        f.write_all(lua.as_bytes()).ok()?;
+    nvim.request_pumped(
+        "nvim_exec_lua",
+        vec![Value::from(lua.as_str()), Value::Array(Vec::new())],
+    )?;
+
+    // One key at a time via `nvim_input`, never `nvim_feedkeys` — see this
+    // function's own doc comment for why.
+    for key in nvim_key_tokens(keys) {
+        nvim.type_key(&key)?;
     }
-    let _ = std::fs::remove_file(&result_path);
-    let output = std::process::Command::new("nvim")
-        .arg("--headless")
-        .arg("-u")
-        .arg("NONE")
-        .arg("-i")
-        .arg("NONE")
-        .arg("-l")
-        .arg(script_path.to_string_lossy().as_ref())
-        .current_dir(cwd)
-        .output()
-        .ok();
-    let raw: Option<serde_json::Value> = match &output {
-        Some(o) => {
-            let raw: Option<serde_json::Value> = std::fs::read_to_string(&result_path)
-                .ok()
-                .and_then(|json| serde_json::from_str(&json).ok());
-            if raw.is_none() && !o.status.success() {
-                eprintln!(
-                    "nvim stderr (window-layout probe): {}",
-                    String::from_utf8_lossy(&o.stderr)
-                );
-            }
-            raw
+
+    let dump = format!("{WIN_SNAPSHOT_LUA}return vim.fn.json_encode(result)\n");
+    let json = nvim.request_pumped(
+        "nvim_exec_lua",
+        vec![Value::from(dump.as_str()), Value::Array(Vec::new())],
+    )?;
+    let json = json
+        .as_str()
+        .ok_or_else(|| format!("window-layout oracle dump was not a string: {json}"))?;
+    serde_json::from_str(json).map_err(|e| format!("window-layout oracle dump {json:?}: {e}"))
+}
+
+fn run_win_in_neovim(
+    main_path: &Path,
+    start_line: usize,
+    start_col: usize,
+    keys: &str,
+    cwd: &Path,
+) -> Option<serde_json::Value> {
+    match oracle_probe_win(main_path, start_line, start_col, keys, cwd) {
+        Ok(v) => Some(v),
+        Err(why) => {
+            eprintln!("oracle (window-layout probe) failed for keys={keys:?}: {why}");
+            None
         }
-        None => None,
-    };
-    let _ = std::fs::remove_file(&script_path);
-    let _ = std::fs::remove_file(&result_path);
-    raw
+    }
 }
 
 fn node_from_json(v: &serde_json::Value, paths: &FixturePaths, check_size: bool) -> WinNode {
@@ -9278,19 +9298,16 @@ const CASES_XFILE: &[WinCase] = &[
         1,
         ":e {F1}<CR><C-^>",
     ),
-    // --- Command-line window (other:) — #1162-style finding, not a pass:
-    // Vim opens this in the current tab as a small split (`:h cmdwin`), and
-    // as of #1297 `Engine::open_cmdline_window` does too (confirmed against
-    // a live, *UI-attached* `nvim` RPC session — see KNOWN_DEVIATIONS_XFILE
-    // for the detail). This case stays red anyway: `run_win_case`
-    // (`run_win_in_neovim`) still drives its oracle over the old `nvim
-    // --headless -l script.lua` + `nvim_feedkeys` transport the module doc's
-    // "attached-UI RPC session (#1008)" section describes leaving behind for
-    // `CASES`/`KNOWN_DEVIATIONS` — `CASES_XFILE`/`KNOWN_DEVIATIONS_XFILE`
-    // never got that migration. `:h cmdwin` silently refuses to open without
-    // an attached UI (confirmed empirically), so this oracle reports a
-    // single, unchanged window no matter what vimcode does — a harness gap,
-    // not a vimcode one. See KNOWN_DEVIATIONS_XFILE.
+    // --- Command-line window (other:) — Vim opens this in the current tab
+    // as a small split (`:h cmdwin`), and as of #1297
+    // `Engine::open_cmdline_window` does too. These three passed against the
+    // live oracle the moment `run_win_case` gained one (#1328): before that,
+    // `run_win_in_neovim` drove its oracle over `nvim --headless -l
+    // script.lua` + a single `nvim_feedkeys` burst, and `:h cmdwin` silently
+    // refuses to open without an attached UI (confirmed empirically), so that
+    // oracle reported a static, unchanged single window no matter what
+    // vimcode did — a harness gap, not a vimcode one. See
+    // KNOWN_DEVIATIONS_XFILE's history for the confirmed repro.
     wc(
         "win:q: opens the command-line window",
         XFILE_MAIN,
@@ -9579,11 +9596,13 @@ const CASES_XFILE: &[WinCase] = &[
 // ## Follow-up issue status (read before editing any entry below)
 //
 // Same policy as KNOWN_DEVIATIONS_WIN: no `gh` access from a worker session.
-// Follow-up #1 below was filed as #1297 (filed 2026-09-22) and is now fixed
-// at the vimcode level, though its three case labels stay listed — read that
-// entry's writeup for why. Follow-up #2 ("reuse the pristine scratch
-// buffer", filed as #1298) was fixed — see git history for the writeup that
-// used to live here; the case labels it gated are back in CASES_XFILE above.
+// Follow-up #1 below was filed as #1297 (filed 2026-09-22), fixed at the
+// vimcode level, and its own harness-transport remainder was filed as #1328
+// (filed 2026-09-23) and is now *also* fixed — its three case labels are
+// deleted below (the shrink-only gate again). Follow-up #2 ("reuse the
+// pristine scratch buffer", filed as #1298) was fixed — see git history for
+// the writeup that used to live here; the case labels it gated are back in
+// CASES_XFILE above.
 // Follow-up #3 was filed as #1307 (filed 2026-09-22) and is now fixed —
 // its one case label is deleted below (the shrink-only gate: a
 // KNOWN_DEVIATIONS_XFILE entry that starts passing is removed, not kept for
@@ -9592,16 +9611,16 @@ const CASES_XFILE: &[WinCase] = &[
 // why), so there is nothing to delete from the array; only its writeup below
 // is updated.
 //
-//   1. (#1297, FIXED at the vimcode level — entries below stay red for a
-//      different reason, read on) "win:q: opens the command-line window" /
-//      "win:q/ ..." / "win:q? ...". `Engine::open_cmdline_window`
-//      (src/core/engine/ext_panel.rs) used to push a whole new `Tab` for the
-//      scratch history buffer; it now pushes a horizontal-split `Window`
-//      into the *active tab's* layout instead — positioned last (below),
-//      per `:h cmdwin`'s "positioned just above the command-line" (always
-//      last, unlike an ordinary split, which honors 'splitbelow') — and
-//      `cmdline_window_execute`/the in-window `q` handler in
-//      `src/core/engine/keys.rs` now call `close_window()`, not
+//   1. (#1297, FIXED at the vimcode level; #1328, FIXED at the harness
+//      level — its three case labels are deleted below) "win:q: opens the
+//      command-line window" / "win:q/ ..." / "win:q? ...".
+//      `Engine::open_cmdline_window` (src/core/engine/ext_panel.rs) used to
+//      push a whole new `Tab` for the scratch history buffer; it now pushes
+//      a horizontal-split `Window` into the *active tab's* layout instead —
+//      positioned last (below), per `:h cmdwin`'s "positioned just above the
+//      command-line" (always last, unlike an ordinary split, which honors
+//      'splitbelow') — and `cmdline_window_execute`/the in-window `q`
+//      handler in `src/core/engine/keys.rs` now call `close_window()`, not
 //      `close_tab()`. Verified two ways: `normal_audit_matches_the_live_engine`
 //      (`na("q:", ...)` etc. in NORM_AUDIT below, pure — no nvim needed) now
 //      records `"(h0.50 1 2*) tabs=1/1"` instead of `"1* tabs=2/2"`; and a
@@ -9611,24 +9630,25 @@ const CASES_XFILE: &[WinCase] = &[
 //      cmdwin]]]` — a `col` (`SplitDirection::Horizontal`) group with the
 //      cmdwin leaf second, current. That match is what "fixed" means here.
 //
-//      The three case labels below stay in `KNOWN_DEVIATIONS_XFILE` anyway,
-//      because `run_win_case` (`run_win_in_neovim`) cannot observe *any* of
-//      this: it still drives its oracle over the old `nvim --headless -l
-//      script.lua` + single-burst `nvim_feedkeys` transport that this file's
-//      own module doc ("attached-UI RPC session (#1008)") describes
-//      replacing for `CASES`/`KNOWN_DEVIATIONS` precisely because it attaches
-//      no UI — `CASES_XFILE`/`KNOWN_DEVIATIONS_XFILE` never got that same
-//      migration. `:h cmdwin` silently refuses to open the command-line
-//      window with no UI attached (reproduced directly: `nvim_input`/
-//      `nvim_feedkeys` inside an `-l` script leaves `winlayout()` and
-//      `nvim_list_wins()` completely unchanged after `q:`; the identical
-//      keystroke over an attached-UI RPC session opens the split every
-//      time). So this oracle reports a static single window for `q:`/`q/`/
-//      `q?` no matter what vimcode does on the other side — a `run_win_case`
-//      transport gap, not a live behavioural disagreement, and not one to
-//      fix inline here (that is `run_win_case`'s own #1008-style migration,
-//      out of scope for this fix). Do **not** delete these three entries
-//      until that migration lands and they actually go green.
+//      The three case labels stayed listed after #1297 anyway, because
+//      `run_win_case` (`run_win_in_neovim`) could not observe *any* of this:
+//      it drove its oracle over `nvim --headless -l script.lua` + a
+//      single-burst `nvim_feedkeys`, and `:h cmdwin` silently refuses to open
+//      the command-line window with no UI attached (reproduced directly:
+//      `nvim_input`/`nvim_feedkeys` inside an `-l` script left `winlayout()`
+//      and `nvim_list_wins()` completely unchanged after `q:`; the identical
+//      keystroke over an attached-UI RPC session opened the split every
+//      time) — a `run_win_case` transport gap, not a live behavioural
+//      disagreement. #1328 closed that gap: `run_win_in_neovim`
+//      (`oracle_probe_win`) now spawns the same `NvimRpc` attached-UI
+//      transport `oracle_probe` uses for `CASES`/`KNOWN_DEVIATIONS`, typing
+//      `keys` one token at a time via `nvim_input` exactly like that
+//      function, instead of one `nvim_feedkeys` burst over `-l script.lua`.
+//      All three cases now PASS against the live oracle — confirmed by
+//      running them (not assumed): `nvim v0.12.5`'s `winlayout()` after
+//      `q:`/`q/`/`q?` matches vimcode's own layout byte-for-byte, same
+//      `col`-group, cmdwin-leaf-current shape the live-session repro above
+//      already established.
 //   3. (#1283, filed as #1307, FIXED — its case label is deleted below, not
 //      kept) "quickfix/location-list panels should be real split windows,
 //      not overlay panels". `Engine::qf_open`/`qf_close`/`qf_window`
@@ -9678,32 +9698,29 @@ const CASES_XFILE: &[WinCase] = &[
 //      `Case` to gate it.
 //
 // Follow-up #1 was not attempted in #1281 itself for the same reason #1162
-// gave for its own 5 (it since landed as #1297 — see that entry above for
-// why its three case labels are still listed below despite the fix); #3 was
-// not attempted in #1283 for the same reason again (it has since landed as
-// #1307 — its case label is gone below, not kept, since `run_win_case`
-// *can* observe this one: no attached-UI transport gap like follow-up #1's,
-// just a genuine structural mismatch that #1307 closed); and #4 was left as
-// vimcode's existing (documented) behaviour rather than narrowed inline, now
-// filed as #1308 and fixed by that issue directly (see its writeup above).
+// gave for its own 5 (it since landed as #1297 for the vimcode-level fix and
+// #1328 for its harness-transport remainder — see that entry above; its
+// three case labels are gone below, not kept, now that both have landed);
+// #3 was not attempted in #1283 for the same reason again (it has since
+// landed as #1307 — its case label is gone below, not kept, since
+// `run_win_case` *can* observe this one: no attached-UI transport gap like
+// follow-up #1's, just a genuine structural mismatch that #1307 closed); and
+// #4 was left as vimcode's existing (documented) behaviour rather than
+// narrowed inline, now filed as #1308 and fixed by that issue directly (see
+// its writeup above).
 // ---------------------------------------------------------------------------
 
 const KNOWN_DEVIATIONS_XFILE: &[&str] = &[
-    // Follow-up #1 above ("cmdwin as a split, not a new tab") — fixed by
-    // #1297, but these three stay listed: `run_win_case`'s oracle transport
-    // (`nvim --headless -l script.lua` + `nvim_feedkeys`, no UI attached)
-    // can't observe Neovim's own `q:`/`q/`/`q?` opening a window either —
-    // see the follow-up #1 writeup above for the confirmed repro. Deleting
-    // these needs `run_win_case` migrated to the attached-UI RPC transport
-    // `CASES`/`KNOWN_DEVIATIONS` already use (#1008), not another
-    // `open_cmdline_window` change.
-    "win:q: opens the command-line window",
-    "win:q/ opens the search-history command-line window",
-    "win:q? opens the reverse-search-history command-line window",
-    // Follow-up #3's "qf:copen opens the quickfix window even on an empty
-    // list" is gone from here — #1307 fixed it and it now passes against the
-    // live oracle (shrink-only gate: a passing case is deleted, not kept for
-    // history).
+    // Empty (#1328): the last three entries — "win:q: opens the command-line
+    // window" / "win:q/ ..." / "win:q? ..." — are gone. #1297 fixed the
+    // vimcode-level behaviour; `run_win_case` (`run_win_in_neovim`) still
+    // could not observe it because its oracle attached no UI, so `:h cmdwin`
+    // silently refused to open on the oracle side. #1328 moved
+    // `run_win_in_neovim` onto the same attached-UI `NvimRpc` transport
+    // `oracle_probe` uses for `CASES`/`KNOWN_DEVIATIONS` (#1008) — see the
+    // follow-up #1 writeup above for the confirmed repro and the live-run
+    // PASS. Do not add a new entry here without a confirmed live-oracle
+    // finding, same bar every other entry in this file has met.
 ];
 
 #[test]
