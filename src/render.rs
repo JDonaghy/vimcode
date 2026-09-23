@@ -17761,6 +17761,73 @@ pub fn ext_panel_to_tree_view(panel: &ExtPanelData, theme: &Theme) -> quadraui::
     }
 }
 
+// ─── Sidebar-panel-body composition (quadraui#1041, vimcode#1242) ─────────
+//
+// `quadraui::compose::sidebar_panel_body::SidebarPanelBody` composes
+// "background fill, optional header/search chrome, body, optional
+// scrollbar gutter" — the layer order sidebar-panel renderers used to
+// hand-roll per backend (`docs/TUI_AUDIT_R2.md` §2.9). Its `render()`
+// convenience method takes the body as `&dyn BackendWidget`, which
+// requires `Self: Send + 'static` — a bound vimcode's *stateful* sidebar
+// bodies (`TreeController`/`FormController`, `Rc<RefCell<_>>`-backed on
+// the `!Send` `Engine`) can't satisfy: they're mutated in place by
+// `populate_*` and read back through a live `&Engine` borrow, never
+// rebuilt as an owned value. [`paint_sidebar_panel_chrome`] is `render()`'s
+// background+chrome half, factored out so those callers still share the
+// primitive's layer order and row-slicing, painting their own body into
+// the returned [`SidebarPanelBodyLayout::body_rect`]. [`ExtPanelTreeBody`]
+// is the one rung with a genuinely owned per-frame body
+// (`ext_panel_to_tree_view`'s fresh `TreeView`), so it uses the real
+// `SidebarPanelBody::render` path directly.
+pub use quadraui::compose::sidebar_panel_body::{
+    SidebarPanelBody, SidebarPanelBodyLayout, SidebarPanelChrome,
+};
+
+/// [`SidebarPanelBody::render`]'s background+chrome half, for hosts whose
+/// body can't be a `&dyn BackendWidget` — see the module note above.
+/// Returns the layout so the caller paints its own body into `body_rect`.
+pub fn paint_sidebar_panel_chrome(
+    backend: &mut dyn quadraui::Backend,
+    panel: &SidebarPanelBody,
+    rect: quadraui::Rect,
+) -> SidebarPanelBodyLayout {
+    let layout = panel.layout(rect, backend.line_height());
+    if let Some(bg) = panel.background {
+        backend.draw_solid_fill(rect, bg);
+    }
+    if let Some(chrome_rect) = layout.chrome_rect {
+        match &panel.chrome {
+            SidebarPanelChrome::None => {}
+            SidebarPanelChrome::Header(text) => {
+                backend.draw_settings_chrome(chrome_rect, text, "", "", false);
+            }
+            SidebarPanelChrome::HeaderAndSearch {
+                header,
+                query,
+                placeholder,
+                active,
+            } => {
+                backend.draw_settings_chrome(chrome_rect, header, query, placeholder, *active);
+            }
+        }
+    }
+    layout
+}
+
+/// Owned per-frame body for the plugin extension panel (`ext:<name>`) —
+/// unlike the stateful controllers [`paint_sidebar_panel_chrome`] exists
+/// for, [`ext_panel_to_tree_view`]'s output is already a fresh, owned
+/// `quadraui::TreeView`, so it satisfies `BackendWidget: Send + 'static`.
+/// Public field so a caller can read the `TreeView` back out after the
+/// borrow ends (e.g. to feed `Backend::tree_layout`).
+pub struct ExtPanelTreeBody(pub quadraui::TreeView);
+
+impl quadraui::BackendWidget for ExtPanelTreeBody {
+    fn render(&self, backend: &mut dyn quadraui::Backend, rect: quadraui::Rect) {
+        backend.draw_tree(rect, &self.0);
+    }
+}
+
 /// Adapt the engine-side `ExtSidebarData` into a `quadraui::MultiSectionView`
 /// (#293).
 ///
