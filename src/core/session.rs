@@ -86,28 +86,47 @@ impl HistoryState {
     /// Load history from history.json.
     /// If history.json is absent, attempts a one-time migration from session.json.
     pub fn load() -> Self {
-        if loads_suppressed() {
-            return Self::default();
-        }
-        let path = Self::history_path();
-        if let Ok(contents) = std::fs::read_to_string(&path) {
-            if let Ok(state) = serde_json::from_str(&contents) {
-                return state;
+        // In-crate unit tests (`cargo test --lib`) never call
+        // `suppress_disk_loads()` — that runtime flag exists for *integration*
+        // tests, which are compiled without `#[cfg(test)]`. So the `#1304`
+        // hazard `save()` already guards against (below) still applied in the
+        // read direction here: `Engine::new()` inside a lib unit test seeded
+        // `engine.history` from whatever was sitting in the developer
+        // machine's real `~/.config/vimcode/history.json`. On a machine whose
+        // history had reached the 100-entry cap that made
+        // `q_colon_opens_a_split_not_a_new_tab_via_shell_app` fail: the marker
+        // command the test appends landed at line 101 of the `[Command
+        // History]` buffer and scrolled off the rendered cmdline window.
+        // Mirror `save()`'s `#[cfg(test)]` no-op so the in-crate lane is
+        // hermetic too, regardless of the host's config dir.
+        #[cfg(test)]
+        return Self::default();
+
+        #[cfg_attr(test, allow(unreachable_code))]
+        {
+            if loads_suppressed() {
+                return Self::default();
             }
-        }
-        // history.json not found — try migrating from legacy session.json
-        let session_path = Self::legacy_session_path();
-        if let Ok(contents) = std::fs::read_to_string(&session_path) {
-            if let Ok(legacy) = serde_json::from_str::<LegacySession>(&contents) {
-                if !legacy.command_history.is_empty() || !legacy.search_history.is_empty() {
-                    return Self {
-                        command_history: legacy.command_history,
-                        search_history: legacy.search_history,
-                    };
+            let path = Self::history_path();
+            if let Ok(contents) = std::fs::read_to_string(&path) {
+                if let Ok(state) = serde_json::from_str(&contents) {
+                    return state;
                 }
             }
+            // history.json not found — try migrating from legacy session.json
+            let session_path = Self::legacy_session_path();
+            if let Ok(contents) = std::fs::read_to_string(&session_path) {
+                if let Ok(legacy) = serde_json::from_str::<LegacySession>(&contents) {
+                    if !legacy.command_history.is_empty() || !legacy.search_history.is_empty() {
+                        return Self {
+                            command_history: legacy.command_history,
+                            search_history: legacy.search_history,
+                        };
+                    }
+                }
+            }
+            Self::default()
         }
-        Self::default()
     }
 
     /// Save history to history.json using an atomic write.
