@@ -9271,10 +9271,18 @@ const CASES_XFILE: &[WinCase] = &[
         ":e {F1}<CR><C-^>",
     ),
     // --- Command-line window (other:) — #1162-style finding, not a pass:
-    // Vim opens this in the current tab as a small split (`:h cmdwin`);
-    // vimcode's `open_cmdline_window` opens it in a brand-new TAB instead
-    // (already documented as a Partial row in NORM_AUDIT/`na("q:", ...)`
-    // above). See KNOWN_DEVIATIONS_XFILE.
+    // Vim opens this in the current tab as a small split (`:h cmdwin`), and
+    // as of #1297 `Engine::open_cmdline_window` does too (confirmed against
+    // a live, *UI-attached* `nvim` RPC session — see KNOWN_DEVIATIONS_XFILE
+    // for the detail). This case stays red anyway: `run_win_case`
+    // (`run_win_in_neovim`) still drives its oracle over the old `nvim
+    // --headless -l script.lua` + `nvim_feedkeys` transport the module doc's
+    // "attached-UI RPC session (#1008)" section describes leaving behind for
+    // `CASES`/`KNOWN_DEVIATIONS` — `CASES_XFILE`/`KNOWN_DEVIATIONS_XFILE`
+    // never got that migration. `:h cmdwin` silently refuses to open without
+    // an attached UI (confirmed empirically), so this oracle reports a
+    // single, unchanged window no matter what vimcode does — a harness gap,
+    // not a vimcode one. See KNOWN_DEVIATIONS_XFILE.
     wc(
         "win:q: opens the command-line window",
         XFILE_MAIN,
@@ -9563,23 +9571,51 @@ const CASES_XFILE: &[WinCase] = &[
 // ## Follow-up issue status (read before editing any entry below)
 //
 // Same policy as KNOWN_DEVIATIONS_WIN: no `gh` access from a worker session.
-// Follow-up #1 below is now filed, as #1297 (filed 2026-09-22); #3 and #4
-// remain unfiled and each entry still names the exact gap so the coordinator
-// can file it verbatim. Follow-up #2 ("reuse the pristine scratch buffer",
-// filed as #1298) was fixed — see git history for the writeup that used to
-// live here; the case labels it gated are back in CASES_XFILE above.
+// Follow-up #1 below was filed as #1297 (filed 2026-09-22) and is now fixed
+// at the vimcode level, though its three case labels stay listed — read that
+// entry's writeup for why. #3 and #4 remain unfiled and each entry still
+// names the exact gap so the coordinator can file it verbatim. Follow-up #2
+// ("reuse the pristine scratch buffer", filed as #1298) was fixed — see git
+// history for the writeup that used to live here; the case labels it gated
+// are back in CASES_XFILE above.
 //
-//   1. (#1297) "win:q: opens the command-line window" / "win:q/ ..." / "win:q? ..."
-//      — title: "cmdwin: open the command-line window as a split in the
-//      current tab, not a new tab". `Engine::open_cmdline_window`
-//      (src/core/engine/ext_panel.rs) pushes a whole new `Tab` for the
-//      scratch history buffer; Neovim opens a small horizontal split in the
-//      *current* tabpage (`:h cmdwin`). Already documented as a Partial row
-//      in this file's NORM_AUDIT table (`na("q:", ...)` etc.) — this is that
-//      same gap, now with a live oracle case proving it. Fix needs a new
-//      window (not tab) pushed into the active tab's layout, plus
-//      `cmdline_window_execute`'s `self.close_tab()` changed to close the
-//      window it actually opened.
+//   1. (#1297, FIXED at the vimcode level — entries below stay red for a
+//      different reason, read on) "win:q: opens the command-line window" /
+//      "win:q/ ..." / "win:q? ...". `Engine::open_cmdline_window`
+//      (src/core/engine/ext_panel.rs) used to push a whole new `Tab` for the
+//      scratch history buffer; it now pushes a horizontal-split `Window`
+//      into the *active tab's* layout instead — positioned last (below),
+//      per `:h cmdwin`'s "positioned just above the command-line" (always
+//      last, unlike an ordinary split, which honors 'splitbelow') — and
+//      `cmdline_window_execute`/the in-window `q` handler in
+//      `src/core/engine/keys.rs` now call `close_window()`, not
+//      `close_tab()`. Verified two ways: `normal_audit_matches_the_live_engine`
+//      (`na("q:", ...)` etc. in NORM_AUDIT below, pure — no nvim needed) now
+//      records `"(h0.50 1 2*) tabs=1/1"` instead of `"1* tabs=2/2"`; and a
+//      live, **UI-attached** `nvim --headless --embed` RPC session (`nvim
+//      --server <sock> --remote-send 'q:'`, then `winlayout()`) confirms
+//      real Neovim's own shape: `['col', [['leaf', mainwin], ['leaf',
+//      cmdwin]]]` — a `col` (`SplitDirection::Horizontal`) group with the
+//      cmdwin leaf second, current. That match is what "fixed" means here.
+//
+//      The three case labels below stay in `KNOWN_DEVIATIONS_XFILE` anyway,
+//      because `run_win_case` (`run_win_in_neovim`) cannot observe *any* of
+//      this: it still drives its oracle over the old `nvim --headless -l
+//      script.lua` + single-burst `nvim_feedkeys` transport that this file's
+//      own module doc ("attached-UI RPC session (#1008)") describes
+//      replacing for `CASES`/`KNOWN_DEVIATIONS` precisely because it attaches
+//      no UI — `CASES_XFILE`/`KNOWN_DEVIATIONS_XFILE` never got that same
+//      migration. `:h cmdwin` silently refuses to open the command-line
+//      window with no UI attached (reproduced directly: `nvim_input`/
+//      `nvim_feedkeys` inside an `-l` script leaves `winlayout()` and
+//      `nvim_list_wins()` completely unchanged after `q:`; the identical
+//      keystroke over an attached-UI RPC session opens the split every
+//      time). So this oracle reports a static single window for `q:`/`q/`/
+//      `q?` no matter what vimcode does on the other side — a `run_win_case`
+//      transport gap, not a live behavioural disagreement, and not one to
+//      fix inline here (that is `run_win_case`'s own #1008-style migration,
+//      out of scope for this fix). Do **not** delete these three entries
+//      until that migration lands and they actually go green.
 //   3. "qf:copen opens the quickfix window even on an empty list" (#1283) —
 //      title: "quickfix/location-list panels should be real split windows,
 //      not overlay panels". `Engine::qf_open`/`qf_close`/`qf_window`
@@ -9615,18 +9651,25 @@ const CASES_XFILE: &[WinCase] = &[
 //      `src/core/engine/tests.rs` for the reproduction.
 //
 // Follow-up #1 was not attempted in #1281 itself for the same reason #1162
-// gave for its own 5, #3 was not attempted in #1283 for the same reason
-// again, and #4 is deliberately left as vimcode's existing (documented)
-// behaviour rather than narrowed inline: each is a bigger, more
-// failure-prone, or more clearly out-of-slice change (a real split-based
-// command-line window; quickfix panels becoming real split windows; a
-// message-suppression behaviour change with no oracle case to gate it) than
-// "backfill N rows" should carry in the same slice.
+// gave for its own 5 (it since landed as #1297 — see that entry above for
+// why its three case labels are still listed below despite the fix), #3 was
+// not attempted in #1283 for the same reason again, and #4 is deliberately
+// left as vimcode's existing (documented) behaviour rather than narrowed
+// inline: each is a bigger, more failure-prone, or more clearly out-of-slice
+// change (a real split-based command-line window; quickfix panels becoming
+// real split windows; a message-suppression behaviour change with no oracle
+// case to gate it) than "backfill N rows" should carry in the same slice.
 // ---------------------------------------------------------------------------
 
 const KNOWN_DEVIATIONS_XFILE: &[&str] = &[
-    // Follow-up #1 above ("cmdwin as a split, not a new tab") — filed as
-    // #1297.
+    // Follow-up #1 above ("cmdwin as a split, not a new tab") — fixed by
+    // #1297, but these three stay listed: `run_win_case`'s oracle transport
+    // (`nvim --headless -l script.lua` + `nvim_feedkeys`, no UI attached)
+    // can't observe Neovim's own `q:`/`q/`/`q?` opening a window either —
+    // see the follow-up #1 writeup above for the confirmed repro. Deleting
+    // these needs `run_win_case` migrated to the attached-UI RPC transport
+    // `CASES`/`KNOWN_DEVIATIONS` already use (#1008), not another
+    // `open_cmdline_window` change.
     "win:q: opens the command-line window",
     "win:q/ opens the search-history command-line window",
     "win:q? opens the reverse-search-history command-line window",
@@ -25378,15 +25421,19 @@ const NORMAL_AUDIT: &[NormAudit] = &[
             1,
             1,
             "",
-            "1* tabs=2/2",
+            "(h0.50 1 2*) tabs=1/1",
         )),
         Some(Label("cmdwin:q: opens the history window")),
         concat!(
             "Vim opens the command-line window *in the current tab*, filled ",
-            "with the `:` history, and `:h cmdwin` semantics apply. vimcode ",
-            "opens an empty command-line buffer **in a new tab** (\"Press ",
-            "Enter to execute, q to close\"), so the keystroke is bound but ",
-            "the window is not Vim's.",
+            "with the `:` history, and `:h cmdwin` semantics apply. As of ",
+            "#1297, vimcode does too: `q:` pushes a horizontal-split window ",
+            "(not a new tab) into the active tab, positioned last per `:h ",
+            "cmdwin`'s \"positioned just above the command-line\" (always ",
+            "last, unlike an ordinary split, which honors 'splitbelow'). ",
+            "Still Partial: no `cmdwinheight` (the split is an even 0.5 ",
+            "ratio, not Vim's default 7-line window), no E1292 nesting ",
+            "guard, and no `cmdwin-char` type indicator in the left column.",
         ),
     ),
     na(
@@ -25405,13 +25452,13 @@ const NORMAL_AUDIT: &[NormAudit] = &[
             1,
             1,
             "",
-            "1* tabs=2/2",
+            "(h0.50 1 2*) tabs=1/1",
         )),
         Some(Label("cmdwin:q/ opens the search history window")),
         concat!(
             "Same as `q:` — and the recording is byte-identical to it, i.e. ",
             "vimcode does not distinguish the `/` history from the `:` ",
-            "history.",
+            "history in this empty-history recording.",
         ),
     ),
     na(
@@ -25430,7 +25477,7 @@ const NORMAL_AUDIT: &[NormAudit] = &[
             1,
             1,
             "",
-            "1* tabs=2/2",
+            "(h0.50 1 2*) tabs=1/1",
         )),
         Some(Label("cmdwin:q? opens the reverse-search history window")),
         "Same as `q/`.",

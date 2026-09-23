@@ -2678,13 +2678,26 @@ impl Engine {
             });
         }
 
+        // Neovim opens the command-line window as a horizontal split in the
+        // *current* tabpage (`:h cmdwin`), not a new tab (#1297) — push a
+        // new window into the active tab's layout instead of a new `Tab`.
+        // Per `:h cmdwin`, the window is "always ... positioned just above
+        // the command-line" — i.e. always at the bottom, unlike an ordinary
+        // horizontal split, which honors 'splitbelow'. `new_first: false`
+        // pins it there unconditionally (confirmed against a live,
+        // UI-attached `nvim` — `winlayout()` puts the cmdwin leaf second).
+        let current_window_id = self.active_window_id();
         let window_id = self.new_window_id();
         let window = Window::new(window_id, buf_id);
         self.windows.insert(window_id, window);
-        let tab_id = self.new_tab_id();
-        let tab = Tab::new(tab_id, window_id);
-        self.active_group_mut().tabs.push(tab);
-        self.active_group_mut().active_tab = self.active_group().tabs.len() - 1;
+        let tab = self.active_tab_mut();
+        tab.layout.split_at(
+            current_window_id,
+            SplitDirection::Horizontal,
+            window_id,
+            false,
+        );
+        tab.focus_window(window_id);
 
         // Move cursor to last line (the empty line for new entry)
         let total = self.buffer().len_lines();
@@ -2713,8 +2726,9 @@ impl Engine {
             return EngineAction::None;
         }
 
-        // Close the cmdline window
-        self.close_tab();
+        // Close the cmdline window — it's a split in the current tab
+        // (#1297), not a whole tab, so close just the window.
+        self.close_window();
 
         if is_search {
             // Execute as a forward search

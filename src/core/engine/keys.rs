@@ -913,7 +913,9 @@ impl Engine {
                 return self.cmdline_window_execute();
             }
             if unicode == Some('q') && self.pending_key.is_none() {
-                self.close_tab();
+                // #1297: the cmdline window is a split in the current tab,
+                // not a whole tab — close just the window.
+                self.close_window();
                 return EngineAction::None;
             }
         }

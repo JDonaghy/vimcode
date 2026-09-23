@@ -18505,6 +18505,100 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// #1297: `q:` must open the command-line window as a horizontal split
+    /// in the *current* tabpage (`:h cmdwin`), not push a whole new `Tab`.
+    /// Reads the answer off the painted screen, not off `Engine` state
+    /// (CLAUDE.md "Testing (CRITICAL)" rule 1): a `Tab` and a split are
+    /// indistinguishable by inspecting `is_cmdline_buf` alone, but a tab
+    /// swap makes the *previous* tab's buffer stop painting entirely, while
+    /// a split keeps painting both windows at once. So the fix's signature
+    /// is that the original file's content and the new cmdline window's
+    /// history content are simultaneously on screen after `q:` — something
+    /// a new-tab implementation can never produce.
+    ///
+    /// **Verified RED against the pre-fix shape** (confirmed by hand,
+    /// reverting `open_cmdline_window` to push a new `Tab`/`close_tab`
+    /// instead of a split window/`close_window`): the original file's line
+    /// disappears from the screen the moment `q:` runs (the new tab
+    /// replaces it entirely), so the first `screen_contains` assertion
+    /// below fails. Restored, green again.
+    #[test]
+    fn q_colon_opens_a_split_not_a_new_tab_via_shell_app() {
+        const WIDTH: u16 = 100;
+        const HEIGHT: u16 = 32;
+
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_test_1297_cmdwin_split_{:?}",
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("cmdwin1297.txt");
+        let content: String = (0..10).map(|i| format!("CMDWIN1297_{i:03}\n")).collect();
+        std::fs::write(&file, &content).unwrap();
+
+        let mut app = TuiShellApp::new(None);
+        app.engine.settings.autohide_panels = false;
+        app.engine.app_shell.hide_sidebar();
+        app.engine.session.explorer_visible = false;
+        app.engine
+            .open_file_with_mode(&file, crate::core::engine::OpenMode::Permanent)
+            .unwrap();
+        // Seed command history so the cmdline window's buffer paints
+        // distinctive text of its own, not just a blank line.
+        app.engine.history.add_command("set cmdwin1297marker");
+
+        let mut driver = driver_with_shell(app, config(), WIDTH, HEIGHT);
+        driver.render();
+
+        let screen_before = driver.screen();
+        assert!(
+            driver.screen_contains("CMDWIN1297_000"),
+            "test setup sanity: the opened file's first line must paint \
+             before `q:` runs;\nscreen:\n{screen_before}"
+        );
+
+        driver.type_char('q');
+        driver.type_char(':');
+        driver.render();
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("CMDWIN1297_000"),
+            "`q:` must open the command-line window as a split in the \
+             current tab — the original file's content must still be \
+             painted alongside it, not replaced by a whole new tab's \
+             content;\nscreen:\n{screen}"
+        );
+        assert!(
+            screen.contains("set cmdwin1297marker"),
+            "the cmdline window's own history buffer must also be painted \
+             at the same time as the original file above — proof both are \
+             live windows in one split layout, not two mutually-exclusive \
+             tabs;\nscreen:\n{screen}"
+        );
+
+        // `q` in the cmdline window closes just that split, not the whole
+        // tab it lives in.
+        driver.type_char('q');
+        driver.render();
+
+        let screen_after_close = driver.screen();
+        assert!(
+            screen_after_close.contains("CMDWIN1297_000"),
+            "closing the cmdline window with `q` must leave the original \
+             file's window in place (and now filling the tab again);\n\
+             screen:\n{screen_after_close}"
+        );
+        assert!(
+            !screen_after_close.contains("set cmdwin1297marker"),
+            "closing the cmdline window with `q` must remove its pane from \
+             the screen;\nscreen:\n{screen_after_close}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// #35: `render_content` must paint the minimap through the shell path,
     /// as braille — not just populate `ScreenLayout.minimap`.
     ///
