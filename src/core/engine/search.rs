@@ -187,6 +187,19 @@ impl Engine {
         }
     }
 
+    /// Buffer line `line`'s length in chars, excluding its trailing
+    /// newline — the input `engine_visual_rows_for_line` expects. Small
+    /// private helper factoring out a `.len_chars().saturating_sub(1)` that
+    /// was duplicated across `ensure_cursor_visible_wrap`'s margin/top/
+    /// bottom walks (#1293 review nit).
+    fn wrap_line_len(&self, line: usize) -> usize {
+        self.buffer()
+            .content
+            .line(line)
+            .len_chars()
+            .saturating_sub(1)
+    }
+
     /// Sum of visual rows occupied by buffer lines `[start, end)`. Used by
     /// `ensure_cursor_visible_wrap` to measure `'scrolloff'` margins in
     /// visual rows rather than buffer lines (#1293).
@@ -195,10 +208,7 @@ impl Engine {
             return 0;
         }
         (start..end)
-            .map(|r| {
-                let line_len = self.buffer().content.line(r).len_chars().saturating_sub(1);
-                engine_visual_rows_for_line(line_len, viewport_cols)
-            })
+            .map(|r| engine_visual_rows_for_line(self.wrap_line_len(r), viewport_cols))
             .sum()
     }
 
@@ -230,13 +240,8 @@ impl Engine {
             cursor_seg + self.visual_rows_for_range(0, cursor_line, viewport_cols);
         let top_margin = scrolloff.min(rows_above_cursor);
 
-        let cursor_line_len = self
-            .buffer()
-            .content
-            .line(cursor_line)
-            .len_chars()
-            .saturating_sub(1);
-        let cursor_line_segs = engine_visual_rows_for_line(cursor_line_len, viewport_cols);
+        let cursor_line_segs =
+            engine_visual_rows_for_line(self.wrap_line_len(cursor_line), viewport_cols);
         let rows_below_cursor = cursor_line_segs.saturating_sub(cursor_seg + 1)
             + self.visual_rows_for_range(cursor_line + 1, total_lines, viewport_cols);
         let bottom_margin = scrolloff.min(rows_below_cursor);
@@ -262,8 +267,7 @@ impl Engine {
                     if rows_used >= top_margin {
                         break;
                     }
-                    let line_len = self.buffer().content.line(r).len_chars().saturating_sub(1);
-                    rows_used += engine_visual_rows_for_line(line_len, viewport_cols);
+                    rows_used += engine_visual_rows_for_line(self.wrap_line_len(r), viewport_cols);
                     new_scroll_top = r;
                 }
             }
@@ -279,9 +283,8 @@ impl Engine {
         // visual row within cursor_line.
         let mut visual_rows: usize = 0;
         for r in scroll_top..=cursor_line {
-            let line_len = self.buffer().content.line(r).len_chars().saturating_sub(1);
             if r < cursor_line {
-                visual_rows += engine_visual_rows_for_line(line_len, viewport_cols);
+                visual_rows += engine_visual_rows_for_line(self.wrap_line_len(r), viewport_cols);
             } else {
                 // Partial count: only up to the cursor's visual segment.
                 visual_rows += cursor_seg + 1;
@@ -302,8 +305,7 @@ impl Engine {
         let mut new_scroll_top = cursor_line;
         if rows_used < target_rows && cursor_line > 0 {
             for r in (0..cursor_line).rev() {
-                let line_len = self.buffer().content.line(r).len_chars().saturating_sub(1);
-                let vrows = engine_visual_rows_for_line(line_len, viewport_cols);
+                let vrows = engine_visual_rows_for_line(self.wrap_line_len(r), viewport_cols);
                 if rows_used + vrows > target_rows {
                     break;
                 }
