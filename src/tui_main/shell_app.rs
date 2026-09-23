@@ -12464,6 +12464,58 @@ mod tests {
         );
     }
 
+    /// #1303: `:changes` must paint Neovim's real `change line  col text`
+    /// header — with the `text` column the pre-fix arm omitted entirely —
+    /// and must reach the ex `"changes"` branch at all.
+    ///
+    /// Per `build_command_line`'s "strip newlines so the command line never
+    /// exceeds one row" rule (see `marks_paints_nvim_header_via_shell_app`'s
+    /// doc comment above), a one-row command line can only show the
+    /// message's *first* line, i.e. the header. The full multi-row listing —
+    /// the change-number/line/col/text columns and the marker row — is
+    /// covered by `test_ex_changes_shows_text_column_and_relative_numbering`
+    /// in `src/core/engine/tests.rs`, this test's engine-tier twin.
+    ///
+    /// **Verified RED against unfixed `develop`:** with `execute.rs`
+    /// reverted to develop's `"changes"` arm, the header paints
+    /// `change line  col` (no `text` column) and the assertion below fails.
+    #[test]
+    fn changes_paints_nvim_header_via_shell_app() {
+        const HEIGHT: u16 = 24;
+        let app = TuiShellApp::new_for_test();
+        let mut driver = driver_with_shell(app, config(), 100, HEIGHT);
+        run_ex_command(&mut driver, ":changes");
+
+        let screen = driver.screen();
+        let (_, y) = driver.find("change line  col text").unwrap_or_else(|| {
+            panic!(
+                "`:changes` must reach the ex parser and paint Neovim's \
+                 real `change line  col text` header on the command line \
+                 (#1303); screen:\n{screen}"
+            )
+        });
+        assert_eq!(
+            y as u16,
+            HEIGHT - 1,
+            "the changes listing's header must paint on the command line \
+             (last row), not in the document body — a hit anywhere else \
+             means the keystrokes were swallowed as normal/insert-mode \
+             edits instead of reaching the ex `:changes` branch; \
+             screen:\n{screen}"
+        );
+        assert!(
+            !screen.contains("Not an editor command"),
+            "`:changes` must not be rejected as an unknown command; \
+             screen:\n{screen}"
+        );
+        let header_row = screen.lines().nth(y as usize).unwrap_or_default();
+        assert!(
+            header_row.trim_end().ends_with("text"),
+            "the pre-#1303 header omitted the `text` column entirely; \
+             row:\n{header_row}"
+        );
+    }
+
     /// #1302: `:digraphs` (no bang) must paint Neovim's real digraph table
     /// on the command line, not a blank row.
     ///
