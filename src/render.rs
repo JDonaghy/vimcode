@@ -26276,13 +26276,10 @@ mod tests {
             // case, where truncating instead of ceiling disagreed with
             // `build_screen_layout`'s real reclaimed width by exactly one
             // column.
-            let expected_cols = (minimap_reserved_width(
-                &e,
-                w_without.rect.width,
-                1.0,
-                TUI_MINIMAP_SIZING,
-            ) + scroll_gutter_width(0.0, 1.0))
-            .ceil() as usize;
+            let expected_cols =
+                (minimap_reserved_width(&e, w_without.rect.width, 1.0, TUI_MINIMAP_SIZING)
+                    + scroll_gutter_width(0.0, 1.0))
+                .ceil() as usize;
             assert_eq!(
                 w_without.text_viewport_cols - w_with.text_viewport_cols,
                 expected_cols,
