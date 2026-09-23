@@ -12902,7 +12902,7 @@ fn nvim_conformance_jumplist_multi_file() {
 //      — WindowLayout::calculate_rects (SplitTreeMeasure::new(0.0)) rounded
 //      each child's share of a split independently instead of giving one
 //      side the exact remainder, so an odd-sized 50/50 split landed 11/11
-//      instead of Neovim's 11/10. FIXED: `calculate_rects`/`dividers` now
+//      instead of Neovim's 12/11. FIXED: `calculate_rects`/`dividers` now
 //      round the split *boundary* once and derive both children's extents
 //      from that single value (moved off `quadraui::SplitTree::layout`
 //      entirely for `WindowLayout`, since that primitive's float division
