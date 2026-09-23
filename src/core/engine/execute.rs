@@ -2553,14 +2553,37 @@ impl Engine {
             // Display change list
             "changes" => {
                 let mut lines: Vec<String> = Vec::new();
-                lines.push("change line  col".to_string());
+                // Neovim's `:changes` header carries a `text` column (a
+                // preview of the changed line, same idea as `:jumps`'
+                // `file/text`), which the old header omitted entirely
+                // (confirmed against a live oracle, #1303).
+                lines.push("change line  col text".to_string());
+                let idx = self.change_list_pos;
                 for (i, (line, col)) in self.change_list.iter().enumerate() {
-                    let marker = if i + 1 == self.change_list_pos {
-                        ">"
-                    } else {
-                        " "
-                    };
-                    lines.push(format!("{} {:4}  {:4}  {:3}", marker, i, line + 1, col));
+                    let marker = if i == idx { ">" } else { " " };
+                    // Change number counts *distance from the current
+                    // position* in the list, not the raw index — same
+                    // `w_changelistidx`-relative numbering `:jumps` uses for
+                    // `w_jumplistidx` (confirmed against a live oracle,
+                    // #1303; the old code printed the raw 0-based index).
+                    let change_num = i.abs_diff(idx);
+                    let text = self.preview_line_text(*line);
+                    lines.push(format!(
+                        "{}{:>4}{:>6}{:>5} {}",
+                        marker,
+                        change_num,
+                        line + 1,
+                        col,
+                        text
+                    ));
+                }
+                // When the current position is past the end of the recorded
+                // list (no `g;` has been done since the last change),
+                // Neovim prints a bare trailing `>` line with no entry data
+                // — same shape as `:jumps` (confirmed against a live
+                // oracle, #1303).
+                if idx == self.change_list.len() {
+                    lines.push(">".to_string());
                 }
                 self.message = lines.join("\n");
                 EngineAction::None

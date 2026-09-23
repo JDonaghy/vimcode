@@ -6974,6 +6974,25 @@ impl Engine {
                     self.view_mut().cursor.col = col;
                     self.clamp_cursor_col();
                 }
+                // `changed` (line ~708) pushes a `:changes`/`g;` entry on
+                // every insert-mode keystroke, recorded *before* the
+                // cursor-one-left adjustment just above — so it's left
+                // pointing one column past where Neovim's own changelist
+                // entry lands (confirmed against a live oracle, #1303).
+                // Sync the list's tail entry to the now-final cursor
+                // position, but only when this session actually inserted
+                // text (`insert_text_buffer` non-empty, same proxy used for
+                // `last_inserted_text` above) — an insert session with no
+                // typing (e.g. bare `i<Esc>`) must not retouch whatever
+                // change list entry happens to already be on this line.
+                if !self.insert_text_buffer.is_empty() {
+                    let cur = self.view().cursor;
+                    if let Some(last) = self.change_list.last_mut() {
+                        if last.0 == cur.line {
+                            *last = (cur.line, cur.col);
+                        }
+                    }
+                }
                 // Dismiss signature help when leaving insert mode
                 self.lsp_signature_help = None;
                 // Collapse all extra cursors.
