@@ -298,6 +298,24 @@ impl Engine {
         self.prune_jump_list_windows(&[window_id]);
         self.scroll_bind_pairs
             .retain(|&(a, b)| a != window_id && b != window_id);
+        // #1297: closing an ordinary (non-diff) window can orphan a scratch
+        // buffer — e.g. the command-line window (`q:`/`q/`/`q?`) — with no
+        // other window left referencing it. `close_tab()` evicts unreferenced
+        // buffers via `remove_tab_raw`, but this generic single-window-removal
+        // path had no equivalent sweep, so such scratch buffers leaked into
+        // `buffer_manager` forever (visible in `:ls`, cycled by `:bn`/`:bp`).
+        // Mirror the diff-window-pair cleanup below: delete the buffer only
+        // if it's an unlisted scratch buffer and no window still uses it.
+        if let Some(buf_id) = closed_buf_id {
+            let still_used = self.windows.values().any(|w| w.buffer_id == buf_id);
+            if !still_used {
+                if let Some(state) = self.buffer_manager.get(buf_id) {
+                    if state.scratch_name.is_some() {
+                        let _ = self.buffer_manager.delete(buf_id, true);
+                    }
+                }
+            }
+        }
         if let Some((a, b)) = self.diff_window_pair.take() {
             if a == window_id || b == window_id {
                 self.clear_diff_labels(a, b);
