@@ -698,7 +698,25 @@ fn test_reg_shows_registers() {
     press(&mut e, 'y');
     press(&mut e, 'w'); // yank 'hello'
     exec(&mut e, "reg");
-    assert!(e.message.contains("Registers") || e.message.contains('"'));
+    // #1299: Neovim's real `Type Name Content` table. The old assertion here
+    // was `contains("Registers") || contains('"')`, which passed against any
+    // listing at all — including the pre-#1299 invented header.
+    assert!(
+        e.message.starts_with("Type Name Content\n"),
+        ":reg header: {:?}",
+        e.message
+    );
+    // `yw` is charwise, so the unnamed and `0` rows both use the `c` type.
+    assert!(
+        e.message.contains("  c  \"\"   hello"),
+        ":reg unnamed row: {:?}",
+        e.message
+    );
+    assert!(
+        e.message.contains("  c  \"0   hello"),
+        ":reg yank row: {:?}",
+        e.message
+    );
 }
 
 // ── :tabmove ────────────────────────────────────────────────────────────────
