@@ -271,14 +271,24 @@ impl Engine {
             return EngineAction::None;
         }
 
-        // Quickfix / active window's location-list panel intercepts all
-        // keys when either has focus (#1155; at most one is focused at a
-        // time — see `qf_open`/`qf_close`).
+        // Quickfix / active window's location-list panel intercepts all keys
+        // while it has focus. Two ways that can be true: the legacy
+        // `has_focus` flag (#1155; still how any caller that flips
+        // `open`/`has_focus` directly without a real window signals it —
+        // see `Engine::qf_open`'s #1307 doc comment), or — since #1307 —
+        // the active window simply *being* the panel's own real
+        // `WindowLayout` leaf, the same way any other Neovim window has
+        // focus by being current, with no separate flag at all.
+        // `qf_panel_target` resolves that second case; at most one of the
+        // three can name a *different* target than the others in practice
+        // (`qf_open`/`qf_close` keep them in lock-step), so any one being
+        // `Some`/`true` is enough to intercept.
+        let panel_target = self.qf_panel_target(self.active_window_id());
         let loc_has_focus = self
             .location_lists
             .get(&self.active_window_id())
             .is_some_and(|l| l.has_focus);
-        if self.quickfix.has_focus || loc_has_focus {
+        if self.quickfix.has_focus || loc_has_focus || panel_target.is_some() {
             // TUI sends printable keys as `key_name=""` + `unicode=Some(c)`;
             // GTK sends `key_name="j"`. Normalise so `j`/`k`/`q` close and
             // navigate consistently across backends (mirrors the pattern
@@ -288,10 +298,10 @@ impl Engine {
             } else {
                 key_name.to_string()
             };
-            let win = if loc_has_focus {
-                Some(self.active_window_id())
-            } else {
-                None
+            let win = match panel_target {
+                Some(target) => target,
+                None if loc_has_focus => Some(self.active_window_id()),
+                None => None,
             };
             return self.qf_handle_key(win, &qf_key, ctrl);
         }

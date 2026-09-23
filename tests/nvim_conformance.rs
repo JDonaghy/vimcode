@@ -9573,11 +9573,14 @@ const CASES_XFILE: &[WinCase] = &[
 // Same policy as KNOWN_DEVIATIONS_WIN: no `gh` access from a worker session.
 // Follow-up #1 below was filed as #1297 (filed 2026-09-22) and is now fixed
 // at the vimcode level, though its three case labels stay listed — read that
-// entry's writeup for why. #3 and #4 remain unfiled and each entry still
-// names the exact gap so the coordinator can file it verbatim. Follow-up #2
-// ("reuse the pristine scratch buffer", filed as #1298) was fixed — see git
-// history for the writeup that used to live here; the case labels it gated
-// are back in CASES_XFILE above.
+// entry's writeup for why. Follow-up #2 ("reuse the pristine scratch
+// buffer", filed as #1298) was fixed — see git history for the writeup that
+// used to live here; the case labels it gated are back in CASES_XFILE above.
+// Follow-up #3 was filed as #1307 (filed 2026-09-22) and is now fixed —
+// its one case label is deleted below (the shrink-only gate: a
+// KNOWN_DEVIATIONS_XFILE entry that starts passing is removed, not kept for
+// history). Follow-up #4 was filed as #1308 and remains open/unfixed (it has
+// no case label to gate — see its own entry below for why).
 //
 //   1. (#1297, FIXED at the vimcode level — entries below stay red for a
 //      different reason, read on) "win:q: opens the command-line window" /
@@ -9616,27 +9619,36 @@ const CASES_XFILE: &[WinCase] = &[
 //      fix inline here (that is `run_win_case`'s own #1008-style migration,
 //      out of scope for this fix). Do **not** delete these three entries
 //      until that migration lands and they actually go green.
-//   3. "qf:copen opens the quickfix window even on an empty list" (#1283) —
-//      title: "quickfix/location-list panels should be real split windows,
+//   3. (#1283, filed as #1307, FIXED — its case label is deleted below, not
+//      kept) "quickfix/location-list panels should be real split windows,
 //      not overlay panels". `Engine::qf_open`/`qf_close`/`qf_window`
-//      (src/core/engine/picker.rs) only ever flip `QuickfixList::open`/
-//      `has_focus`; nothing inserts or removes a leaf from `WindowLayout`.
-//      Real Neovim's `:copen` opens the quickfix list as a genuine
-//      horizontal split — `winlayout()` grows a leaf, `winnr("$")` goes up
-//      by one, `CTRL-W` navigation reaches it like any other window.
-//      vimcode's quickfix panel is architecturally the same kind of overlay
-//      as the sidebar/terminal panels (`src/tui_main/panels.rs`), rendered
-//      alongside the window layout rather than inside it. Fixing this means
-//      `qf_open`/`qf_close` inserting/removing an actual split — a
-//      `WindowLayout` change with both-backend rendering fallout (GTK panel
-//      placement, TUI panel placement, mouse/click regions for the
-//      quickfix list, `CTRL-W` focus-cycling reaching it) — not something to
-//      attempt inline alongside backfilling the other 22 ids in this same
-//      issue's slice, same reasoning as follow-ups #1/#2 above.
+//      (src/core/engine/picker.rs) used to only ever flip `QuickfixList::
+//      open`/`has_focus`; nothing inserted or removed a leaf from
+//      `WindowLayout`. `qf_open`/`qf_window` now call
+//      `Engine::qf_ensure_panel_window` (src/core/engine/windows.rs), which
+//      backs the panel with a real scratch buffer + `Window` and inserts it
+//      into the active tab's `WindowLayout` — a full-tab `wrap_full` (not
+//      `split_at`) for the global quickfix window, matching Neovim's own
+//      full-width-at-the-bottom `:copen` shape even with existing `:vsplit`
+//      panes (confirmed against a live, UI-attached oracle), and an ordinary
+//      `split_at` of the owner window for a location-list panel (`:lopen`,
+//      same shape as the #1297 command-line window). `qf_close`/`qf_window`
+//      call `Engine::qf_close_panel_window`, which removes the leaf and
+//      restores focus to `Tab::prev_window` (also confirmed against a live
+//      oracle — `:cclose` returns to whichever window was current before
+//      `:copen`, not simply "the first window"). `winnr("$")` now grows,
+//      `CTRL-W` navigation reaches the panel window like any other, and
+//      `render.rs`'s legacy overlay-band renderer self-suppresses for any
+//      target with a real window open (`Engine::qf_has_real_window`) so the
+//      two never double-paint. Every caller that still pokes `open`/
+//      `has_focus` directly without going through `qf_open` (most of this
+//      codebase's own rendering tests, and `qf_set_list`'s implicit `:grep`
+//      auto-open) is untouched — see `qf_has_real_window`'s doc comment.
 //
-//   4. (no case label — this scenario isn't reachable through the oracle
-//      `Case` harness at all, so it cannot be a `KNOWN_DEVIATIONS_XFILE`
-//      entry the way #3 is; it's tracked here purely as a follow-up.)
+//   4. (#1308, unfixed — no case label, since this scenario isn't reachable
+//      through the oracle `Case` harness at all, so it cannot be a
+//      `KNOWN_DEVIATIONS_XFILE` entry the way #3 was; it's tracked here
+//      purely as a follow-up.)
 //      Title: "`:cdo`/`:cfdo`/`:ldo`/`:lfdo` should be silent no-ops on an
 //      empty quickfix/location list, not set a message". Confirmed against a
 //      live `nvim --headless -u NONE`: real Neovim's `:cdo {cmd}` (etc.) on
@@ -9652,13 +9664,13 @@ const CASES_XFILE: &[WinCase] = &[
 //
 // Follow-up #1 was not attempted in #1281 itself for the same reason #1162
 // gave for its own 5 (it since landed as #1297 — see that entry above for
-// why its three case labels are still listed below despite the fix), #3 was
-// not attempted in #1283 for the same reason again, and #4 is deliberately
-// left as vimcode's existing (documented) behaviour rather than narrowed
-// inline: each is a bigger, more failure-prone, or more clearly out-of-slice
-// change (a real split-based command-line window; quickfix panels becoming
-// real split windows; a message-suppression behaviour change with no oracle
-// case to gate it) than "backfill N rows" should carry in the same slice.
+// why its three case labels are still listed below despite the fix); #3 was
+// not attempted in #1283 for the same reason again (it has since landed as
+// #1307 — its case label is gone below, not kept, since `run_win_case`
+// *can* observe this one: no attached-UI transport gap like follow-up #1's,
+// just a genuine structural mismatch that #1307 closed); and #4 is
+// deliberately left as vimcode's existing (documented) behaviour rather than
+// narrowed inline, now filed as #1308 and still open.
 // ---------------------------------------------------------------------------
 
 const KNOWN_DEVIATIONS_XFILE: &[&str] = &[
@@ -9673,9 +9685,10 @@ const KNOWN_DEVIATIONS_XFILE: &[&str] = &[
     "win:q: opens the command-line window",
     "win:q/ opens the search-history command-line window",
     "win:q? opens the reverse-search-history command-line window",
-    // Follow-up #3 above ("quickfix panels as real split windows") — not yet
-    // filed.
-    "qf:copen opens the quickfix window even on an empty list",
+    // Follow-up #3's "qf:copen opens the quickfix window even on an empty
+    // list" is gone from here — #1307 fixed it and it now passes against the
+    // live oracle (shrink-only gate: a passing case is deleted, not kept for
+    // history).
 ];
 
 #[test]

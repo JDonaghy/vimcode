@@ -6860,6 +6860,16 @@ pub fn apply_scroll_offset(
 /// location list — the two share one bottom "list rung"
 /// ([`QuickfixPanel::title`]).
 pub fn quickfix_panel_rows(engine: &Engine) -> u16 {
+    // #1307: a target with a real `WindowLayout` leaf reserves its own
+    // space via the split tree, exactly like any other window — this
+    // overlay band must not *also* reserve rows for it, or the two would
+    // double up. `qf_has_real_window` is `false` for every existing caller
+    // that only ever pokes `open`/`items` directly (see its own doc
+    // comment), so this stays exactly as before for them.
+    if engine.qf_has_real_window(None) || engine.qf_has_real_window(Some(engine.active_window_id()))
+    {
+        return 0;
+    }
     let loc_open = engine
         .location_lists
         .get(&engine.active_window_id())
@@ -15018,7 +15028,20 @@ pub fn build_screen_layout_with_breadcrumb_row(
     // location list when both happen to be open — matching how `:copen`
     // and `:lopen` share this one bottom "list rung" (#1155;
     // `QuickfixPanel::title` doc comment has the full rationale).
-    let quickfix = if engine.quickfix.open && !engine.quickfix.items.is_empty() {
+    //
+    // #1307: this overlay is superseded for any target that already has a
+    // real `WindowLayout` leaf — that leaf paints through the ordinary
+    // per-window content path (`windows`, below) like any other window, so
+    // painting it *again* here would double it up. `qf_has_real_window` is
+    // `false` for every caller that still drives `open`/`items` directly
+    // without going through `qf_open` (most of this codebase's own
+    // rendering tests, and `qf_set_list`'s implicit `:grep` auto-open), so
+    // this stays exactly as before for them.
+    let quickfix = if engine.qf_has_real_window(None)
+        || engine.qf_has_real_window(Some(engine.active_window_id()))
+    {
+        None
+    } else if engine.quickfix.open && !engine.quickfix.items.is_empty() {
         Some(quickfix_list_to_panel(&engine.quickfix, "QUICKFIX"))
     } else {
         engine
@@ -22985,12 +23008,16 @@ pub fn compute_editor_layout(
     let debug_toolbar_h = debug_toolbar_height_px(lh, engine.debug_toolbar_visible);
     // Shares one bottom "list rung" with the active window's location list
     // (#1155) — see `quickfix_panel_rows`, the TUI-side equivalent of this
-    // same rule.
-    let qf_or_loc_open = (engine.quickfix.open && !engine.quickfix.items.is_empty())
-        || engine
-            .location_lists
-            .get(&engine.active_window_id())
-            .is_some_and(|l| l.open && !l.items.is_empty());
+    // same rule. #1307: a target with a real `WindowLayout` leaf takes its
+    // own space from the split tree, so this overlay band must not reserve
+    // rows for it too — see `quickfix_panel_rows`'s matching guard.
+    let qf_or_loc_open = !engine.qf_has_real_window(None)
+        && !engine.qf_has_real_window(Some(engine.active_window_id()))
+        && ((engine.quickfix.open && !engine.quickfix.items.is_empty())
+            || engine
+                .location_lists
+                .get(&engine.active_window_id())
+                .is_some_and(|l| l.open && !l.items.is_empty()));
     let quickfix_h = if qf_or_loc_open { 6.0 * lh } else { 0.0 };
     let has_separated = per_window && !engine.settings.status_line_above_terminal && bp_open;
     let separated_status_h = separated_status_height_px(lh, has_separated);

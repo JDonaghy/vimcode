@@ -292,6 +292,10 @@ impl Engine {
         // Remove window from windows map and any scroll-bind pairs that referenced it.
         let closed_buf_id = self.windows.get(&window_id).map(|w| w.buffer_id);
         self.windows.remove(&window_id);
+        // #1307: keep `QuickfixList::open`/`has_focus` honest if `window_id`
+        // was itself a quickfix/location-list panel window closed via this
+        // generic path (e.g. `CTRL-W q`) rather than `qf_close`.
+        self.forget_closed_panel_window(window_id);
         // #1155: CTRL-W window-close drops the window's location list — it
         // has no meaning once the window it was scoped to is gone.
         self.location_lists.remove(&window_id);
@@ -335,6 +339,7 @@ impl Engine {
                         }
                     }
                     self.windows.remove(&partner);
+                    self.forget_closed_panel_window(partner);
                     self.location_lists.remove(&partner);
                     self.prune_jump_list_windows(&[partner]);
                     self.scroll_bind_pairs
@@ -374,6 +379,203 @@ impl Engine {
         true
     }
 
+    // ─── Quickfix/location-list panel windows (#1307) ─────────────────────
+    //
+    // `qf_open`/`qf_window` (`src/core/engine/picker.rs`) call these to make
+    // the quickfix/location-list panel a real `WindowLayout` leaf instead of
+    // the sidebar/terminal-style overlay it used to be — so `winnr("$")`
+    // grows and `CTRL-W` navigation reaches it, matching Neovim. Mechanics
+    // live here, alongside `close_window`/`split_window_with_new_first`;
+    // `QuickfixList`-level bookkeeping (`open`/`has_focus`/`items`) stays in
+    // `picker.rs`.
+
+    /// Open (or reuse) the real split window that shows a quickfix/
+    /// location-list panel's content. `target` is `qf_get`'s own `win` shape
+    /// (`None` = global quickfix, `Some(owner)` = window `owner`'s location
+    /// list); `lines` is the panel's current formatted content. Returns the
+    /// window's id.
+    ///
+    /// If `target` already has a real window *in the active tab*, this just
+    /// refreshes its buffer text and returns the existing id — `:copen`
+    /// twice in a row must not open a second window. ("In the active tab"
+    /// because `qf_panel_windows` is a single engine-wide map with no
+    /// per-tab awareness — a known, deliberately out-of-scope simplification
+    /// for #1307: re-running `:copen` from a *different* tab than the one
+    /// the panel was opened in opens a second, independently-tracked window
+    /// rather than reusing the first, the same way most of this codebase's
+    /// window bookkeeping doesn't attempt full cross-tab tracking.)
+    pub(crate) fn qf_ensure_panel_window(
+        &mut self,
+        target: Option<WindowId>,
+        lines: &[String],
+        scratch_name: &'static str,
+    ) -> WindowId {
+        if let Some(&win_id) = self.qf_panel_windows.get(&target) {
+            if self.active_tab().layout.window_ids().contains(&win_id) {
+                self.qf_refresh_panel_window(win_id, lines);
+                return win_id;
+            }
+            // Stale (closed through some other path, or lives in a
+            // different tab — see this method's doc) — recreate below.
+            self.qf_panel_windows.remove(&target);
+        }
+
+        let buf_id = self.buffer_manager.create();
+        if let Some(state) = self.buffer_manager.get_mut(buf_id) {
+            state.buffer.content = ropey::Rope::from_str(&lines.join("\n"));
+            state.dirty = false;
+            state.scratch_name = Some(scratch_name.to_string());
+        }
+        let win_id = self.new_window_id();
+        self.windows.insert(win_id, Window::new(win_id, buf_id));
+
+        // Real Vim's default quickfix/location-list window height (`:h
+        // copen`), confirmed against a live oracle (#1307).
+        const QF_DEFAULT_ROWS: f64 = 10.0;
+
+        match target {
+            None => {
+                // The global quickfix window spans the *entire* tabpage,
+                // full width, at the bottom (`:h copen`) — confirmed against
+                // a live oracle: `:vsplit` then `:copen` still puts the
+                // quickfix window across the full width beneath both vsplit
+                // panes, not nested inside whichever was active. `wrap_full`
+                // (not `split_at`) is what gives it that shape.
+                let total_raw = self
+                    .windows
+                    .get(&self.active_window_id())
+                    .map(|w| raw_axis_extent(&w.view, SplitDirection::Horizontal))
+                    .unwrap_or(0.0);
+                let ratio = if total_raw > QF_DEFAULT_ROWS {
+                    (total_raw - QF_DEFAULT_ROWS) / total_raw
+                } else {
+                    0.5
+                };
+                let tab = self.active_tab_mut();
+                tab.layout
+                    .wrap_full(SplitDirection::Horizontal, win_id, false, ratio);
+                tab.focus_window(win_id);
+            }
+            Some(owner) => {
+                // A location-list window is scoped to its owner window's
+                // own subtree — an ordinary split, same shape as the
+                // command-line window (#1297) — not a full-tab wrap.
+                // Confirmed against a live oracle (#1307).
+                let total_raw = self
+                    .windows
+                    .get(&owner)
+                    .map(|w| raw_axis_extent(&w.view, SplitDirection::Horizontal))
+                    .unwrap_or(0.0);
+                let tab = self.active_tab_mut();
+                tab.layout
+                    .split_at(owner, SplitDirection::Horizontal, win_id, false);
+                tab.focus_window(win_id);
+                if total_raw > 1.0 {
+                    let qf_raw = QF_DEFAULT_ROWS.min(total_raw - 1.0).max(1.0);
+                    let owner_raw = (total_raw - qf_raw).max(1.0);
+                    if let Some(w) = self.windows.get_mut(&owner) {
+                        set_raw_axis_extent(&mut w.view, SplitDirection::Horizontal, owner_raw);
+                    }
+                    if let Some(w) = self.windows.get_mut(&win_id) {
+                        set_raw_axis_extent(&mut w.view, SplitDirection::Horizontal, qf_raw);
+                    }
+                }
+            }
+        }
+
+        self.qf_panel_windows.insert(target, win_id);
+        win_id
+    }
+
+    /// Overwrite an already-open panel window's buffer text — called
+    /// whenever the underlying `QuickfixList`'s items change while its
+    /// window is open (`:grep` re-run, `:colder`/`:cnewer`, ...), so the
+    /// window stays live the way Neovim's own quickfix buffer does.
+    pub(crate) fn qf_refresh_panel_window(&mut self, win_id: WindowId, lines: &[String]) {
+        let Some(window) = self.windows.get(&win_id) else {
+            return;
+        };
+        let buf_id = window.buffer_id;
+        if let Some(state) = self.buffer_manager.get_mut(buf_id) {
+            state.buffer.content = ropey::Rope::from_str(&lines.join("\n"));
+            state.dirty = false;
+        }
+    }
+
+    /// Move a panel window's own cursor to line `selected` (clamped to the
+    /// buffer's line count) — keeps the window's visible cursor row in sync
+    /// with `QuickfixList::selected` the way a real Neovim quickfix window's
+    /// cursor always sits on the current entry.
+    pub(crate) fn qf_set_panel_cursor(&mut self, win_id: WindowId, selected: usize) {
+        let Some(window) = self.windows.get(&win_id) else {
+            return;
+        };
+        let buf_id = window.buffer_id;
+        let len_lines = self
+            .buffer_manager
+            .get(buf_id)
+            .map(|s| s.buffer.content.len_lines())
+            .unwrap_or(1);
+        let line = selected.min(len_lines.saturating_sub(1));
+        if let Some(w) = self.windows.get_mut(&win_id) {
+            w.view.cursor.line = line;
+            w.view.cursor.col = 0;
+        }
+    }
+
+    /// Close the real split window for `target` (see
+    /// [`Self::qf_ensure_panel_window`]), restoring focus to whichever
+    /// window was active *before* the panel was opened (`Tab::prev_window`)
+    /// when the panel window was itself the active one — confirmed against a
+    /// live oracle (#1307): `:cclose` returns to the window that was current
+    /// before `:copen`, not simply "the first window in the layout" the way
+    /// the generic `close_window`'s fallback does. A no-op if `target` has
+    /// no real window (the common case — most `:cclose`/`:lclose` calls
+    /// target an already-closed or never-opened panel).
+    pub(crate) fn qf_close_panel_window(&mut self, target: Option<WindowId>) {
+        let Some(win_id) = self.qf_panel_windows.remove(&target) else {
+            return;
+        };
+        if !self.windows.contains_key(&win_id) {
+            return;
+        }
+        let was_active = self.active_window_id() == win_id;
+        let prev = self.active_tab().prev_window;
+        {
+            let tab = self.active_tab_mut();
+            if let Some(new_layout) = tab.layout.remove(win_id) {
+                tab.layout = new_layout;
+            }
+        }
+        if was_active {
+            let ids = self.active_tab().layout.window_ids();
+            let restore = prev
+                .filter(|p| ids.contains(p))
+                .or_else(|| ids.first().copied());
+            if let Some(id) = restore {
+                self.active_tab_mut().focus_window(id);
+            }
+        }
+        let buf_id = self.windows.get(&win_id).map(|w| w.buffer_id);
+        self.windows.remove(&win_id);
+        // `target`'s `qf_panel_windows` entry is already gone (removed
+        // above) — no `forget_closed_panel_window` call needed here, unlike
+        // the generic window-close paths, since the caller (`Engine::
+        // qf_close`) sets `list.open`/`has_focus` itself right after this
+        // returns.
+        self.location_lists.remove(&win_id);
+        self.prune_jump_list_windows(&[win_id]);
+        self.scroll_bind_pairs
+            .retain(|&(a, b)| a != win_id && b != win_id);
+        if let Some(buf_id) = buf_id {
+            let still_used = self.windows.values().any(|w| w.buffer_id == buf_id);
+            if !still_used {
+                let _ = self.buffer_manager.delete(buf_id, true);
+            }
+        }
+        self.repair_active_window();
+    }
+
     /// Close all windows except the active one in the current tab.
     pub fn close_other_windows(&mut self) {
         let active_window_id = self.active_window_id();
@@ -394,6 +596,7 @@ impl Engine {
         self.prune_jump_list_windows(&windows_to_close);
         for id in windows_to_close {
             self.windows.remove(&id);
+            self.forget_closed_panel_window(id);
             self.location_lists.remove(&id);
             self.scroll_bind_pairs.retain(|&(a, b)| a != id && b != id);
             if let Some((a, b)) = self.diff_window_pair {
@@ -643,6 +846,7 @@ impl Engine {
         // Remove all windows in this tab
         for window_id in &window_ids {
             self.windows.remove(window_id);
+            self.forget_closed_panel_window(*window_id);
             self.location_lists.remove(window_id);
             self.scroll_bind_pairs
                 .retain(|&(a, b)| a != *window_id && b != *window_id);
@@ -805,6 +1009,7 @@ impl Engine {
                 self.prune_jump_list_windows(&window_ids);
                 for wid in window_ids {
                     self.windows.remove(&wid);
+                    self.forget_closed_panel_window(wid);
                 }
             }
             self.editor_groups.remove(&group_id);
@@ -2493,6 +2698,7 @@ impl Engine {
             self.prune_jump_list_windows(&window_ids);
             for wid in window_ids {
                 self.windows.remove(&wid);
+                self.forget_closed_panel_window(wid);
             }
         }
         self.editor_groups.remove(&closing);
@@ -2722,6 +2928,7 @@ impl Engine {
             self.prune_jump_list_windows(&window_ids);
             for wid in window_ids {
                 self.windows.remove(&wid);
+                self.forget_closed_panel_window(wid);
             }
         }
         self.editor_groups.remove(&group_id);
