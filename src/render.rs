@@ -11893,6 +11893,24 @@ pub struct RenderedMinimap {
     /// eagerly-aggregated `syntax_spans`) so there is exactly one place
     /// aggregation ever happens, not two that could silently drift.
     pub raw_syntax_spans: Vec<quadraui::SyntaxSpan>,
+    /// Backend-resolved layout from this frame's [`draw_minimap_strip`] paint
+    /// of this strip, if any (#1253) — read back by [`minimap_click_line`]
+    /// and [`minimap_press`] instead of each re-deriving its own
+    /// `layout_with_sizing` call. Mirrors [`BreadcrumbBar::draw_layout`]'s
+    /// same paint-then-read-back shape: `RefCell` because `draw_minimap_strip`
+    /// only ever sees `&ScreenLayout` (this `RenderedMinimap` is already
+    /// behind the shared `cached_screen_layout` `RefCell` by the time
+    /// painting runs) and still needs to fill this field in after paint.
+    ///
+    /// `None` until the first paint of a given frame's `ScreenLayout`, and
+    /// permanently `None` for any `ScreenLayout` a caller builds without ever
+    /// calling `draw_minimap_strip` — most of this module's own unit tests,
+    /// which click-test geometry directly off `build_screen_layout`'s output.
+    /// Both click resolvers fall back to re-deriving via `layout_with_sizing`
+    /// in that case (this field's pre-#1253 behaviour verbatim), so a missing
+    /// paint can only ever cost the recompute this issue exists to skip —
+    /// never a dropped or misrouted click.
+    pub resolved_layout: std::cell::RefCell<Option<quadraui::MinimapLayout>>,
 }
 
 /// Width the minimap reserves alongside the editor, in the caller's units.
@@ -12342,12 +12360,20 @@ pub fn build_minimap_data(
             total_buffer_lines,
         },
         raw_syntax_spans,
+        resolved_layout: std::cell::RefCell::new(None),
     })
 }
 
 /// Paint every entry in `screen.minimap` (#722 — one per editor pane, not
-/// just the active one) through the backend's own rasteriser and return the
-/// resolved layouts for click routing, in the same order.
+/// just the active one) through the backend's own rasteriser and stash each
+/// strip's resolved layout on its own `RenderedMinimap::resolved_layout`
+/// (#1253) for [`minimap_click_line`]/[`minimap_press`] to read back at click
+/// time instead of re-deriving via `layout_with_sizing`. No return value:
+/// before #1253 this returned `Vec<quadraui::MinimapLayout>` in `screen.minimap`
+/// order for the caller to zip back up itself, but every call site (both
+/// backends' `render_content`) discarded it rather than doing that — the
+/// per-strip cache is both the fix and a simpler contract, since a caller
+/// can no longer get the pairing wrong.
 ///
 /// This is the *entire* backend-side contract for the minimap: GTK's font
 /// scaling and TUI's braille packing are quadraui's implementations of
@@ -12392,39 +12418,33 @@ pub fn build_minimap_data(
 /// native widget is inset past the strip by `native_scrollbar_margin_start`
 /// in `src/gtk/mod.rs`, which reads the strip width from
 /// [`minimap_reserved_width`] — the same call that reserved it here.
-pub fn draw_minimap_strip(
-    backend: &mut dyn quadraui::Backend,
-    screen: &ScreenLayout,
-) -> Vec<quadraui::MinimapLayout> {
-    screen
-        .minimap
-        .iter()
-        .map(|mm| {
-            let rect = minimap_strip_rect(mm);
-            // No-paint probe: `mm.minimap.syntax_spans` is still empty
-            // here, which is fine — `minimap_layout` (both backends' own
-            // `Backend` impls) only ever reads `.lines` to resolve its
-            // scale.
-            let cols_per_cell = backend
-                .minimap_layout(rect, &mm.minimap)
-                .cols_per_cell
-                .max(1);
-            let grid = quadraui::MinimapGrid {
-                rows: mm
-                    .minimap
-                    .lines
-                    .len()
-                    .div_ceil(MINIMAP_LINES_PER_ROW)
-                    .max(1),
-                cols: minimap_grid_cols(mm.rect.width, cols_per_cell),
-                lines_per_row: MINIMAP_LINES_PER_ROW,
-                cols_per_cell,
-            };
-            let mut minimap = mm.minimap.clone();
-            minimap.syntax_spans = quadraui::aggregate_spans(&mm.raw_syntax_spans, grid);
-            backend.draw_minimap(rect, &minimap).layout
-        })
-        .collect()
+pub fn draw_minimap_strip(backend: &mut dyn quadraui::Backend, screen: &ScreenLayout) {
+    for mm in &screen.minimap {
+        let rect = minimap_strip_rect(mm);
+        // No-paint probe: `mm.minimap.syntax_spans` is still empty
+        // here, which is fine — `minimap_layout` (both backends' own
+        // `Backend` impls) only ever reads `.lines` to resolve its
+        // scale.
+        let cols_per_cell = backend
+            .minimap_layout(rect, &mm.minimap)
+            .cols_per_cell
+            .max(1);
+        let grid = quadraui::MinimapGrid {
+            rows: mm
+                .minimap
+                .lines
+                .len()
+                .div_ceil(MINIMAP_LINES_PER_ROW)
+                .max(1),
+            cols: minimap_grid_cols(mm.rect.width, cols_per_cell),
+            lines_per_row: MINIMAP_LINES_PER_ROW,
+            cols_per_cell,
+        };
+        let mut minimap = mm.minimap.clone();
+        minimap.syntax_spans = quadraui::aggregate_spans(&mm.raw_syntax_spans, grid);
+        let layout = backend.draw_minimap(rect, &minimap).layout;
+        *mm.resolved_layout.borrow_mut() = Some(layout);
+    }
 }
 
 /// Raw-column budget (`MinimapGrid::cols`) for a strip `cols_per_cell`
@@ -12479,6 +12499,42 @@ pub fn minimap_strip_rect(mm: &RenderedMinimap) -> quadraui::Rect {
     )
 }
 
+/// The `MinimapLayout` to hit-test `mm` against: [`draw_minimap_strip`]'s
+/// backend-resolved paint-time layout if this frame has already painted this
+/// strip (#1253, `mm.resolved_layout`), else re-derived via
+/// `layout_with_sizing` exactly as every call site here did before #1253.
+///
+/// The fallback exists for callers that build a `ScreenLayout` without ever
+/// calling `draw_minimap_strip` — most of this module's own unit tests,
+/// which click-test geometry directly off `build_screen_layout`'s output —
+/// so a missing paint can only ever cost the recompute this cache exists to
+/// skip, never a dropped or misrouted click.
+///
+/// `FixedPitch(1.0)` is the fallback's sizing rather than
+/// `MinimapSizing::Fill` (used to be #1093's choice) because it is safe for
+/// *both* real rasterisers' own pitches: it never overestimates the strip's
+/// real row pitch, so `rows_that_fit` can only come out larger than reality,
+/// never smaller — and since `mm.minimap.lines` is already host-windowed to
+/// fit the strip's real capacity (`build_minimap_data`), `rows_that_fit >=
+/// lines.len() / lines_per_row` holds regardless, so `layout_with_sizing`
+/// never re-slides on top of the host-side window already computed. This is
+/// also why swapping in the *real* paint-time layout above never disagrees
+/// with the fallback it replaces: TUI's own rasteriser already resolves at
+/// this exact `FixedPitch(1.0)` (`quadraui::tui::minimap::tui_minimap_layout`),
+/// and GTK's real `ROW_PITCH_PX` pitch only ever narrows `rows_shown` below
+/// `row_count`, which the host-side windowing above already keeps from
+/// happening in the first place.
+fn minimap_layout_for_click(mm: &RenderedMinimap) -> quadraui::MinimapLayout {
+    if let Some(layout) = mm.resolved_layout.borrow().as_ref() {
+        return layout.clone();
+    }
+    mm.minimap.layout_with_sizing(
+        minimap_strip_rect(mm),
+        MINIMAP_LINES_PER_ROW,
+        quadraui::MinimapSizing::FixedPitch(1.0),
+    )
+}
+
 /// Resolve a click/drag at `(x, y)` (backend units, same space as
 /// [`minimap_strip_rect`]) against every pane's minimap track (#722),
 /// returning the window it hit plus the buffer line to scroll that window
@@ -12502,20 +12558,12 @@ pub fn minimap_strip_rect(mm: &RenderedMinimap) -> quadraui::Rect {
 /// against the rows actually on screen rather than against
 /// `total_buffer_lines` — so this now has to agree with whichever pitch the
 /// real rasteriser painted with, or the two would resolve different windows.
-/// `FixedPitch(1.0)` is safe for *both* backends here: it never overestimates
-/// the strip's real row pitch (TUI's own pitch), so `rows_that_fit` can only
-/// come out larger than reality, never smaller — and since `mm.minimap.lines`
-/// is already host-windowed to fit the strip's real capacity
-/// (`build_minimap_data`), `rows_that_fit >= lines.len() / lines_per_row`
-/// holds regardless, so `layout_with_sizing` never re-slides on top of the
-/// host-side window already computed.
+/// See [`minimap_layout_for_click`]'s doc comment (#1253) for why the paint-time
+/// layout it prefers and the `FixedPitch(1.0)` fallback it falls back to always
+/// agree here.
 pub fn minimap_click_line(screen: &ScreenLayout, x: f64, y: f64) -> Option<(WindowId, usize)> {
     for mm in &screen.minimap {
-        let layout = mm.minimap.layout_with_sizing(
-            minimap_strip_rect(mm),
-            MINIMAP_LINES_PER_ROW,
-            quadraui::MinimapSizing::FixedPitch(1.0),
-        );
+        let layout = minimap_layout_for_click(mm);
         if let quadraui::MinimapHit::Seek { fraction } = layout.hit_test(x as f32, y as f32) {
             return Some((
                 mm.window_id,
@@ -12657,11 +12705,10 @@ pub fn minimap_press(
 ) -> Option<MinimapPress> {
     for mm in &screen.minimap {
         let bounds = minimap_strip_rect(mm);
-        let layout = mm.minimap.layout_with_sizing(
-            bounds,
-            MINIMAP_LINES_PER_ROW,
-            quadraui::MinimapSizing::FixedPitch(1.0),
-        );
+        // #1253: same paint-time-layout-first, `FixedPitch(1.0)`-fallback
+        // resolution `minimap_click_line` uses — see
+        // `minimap_layout_for_click`'s doc comment.
+        let layout = minimap_layout_for_click(mm);
         if matches!(
             layout.hit_test(x as f32, y as f32),
             quadraui::MinimapHit::None
@@ -27372,6 +27419,94 @@ mod tests {
             minimap_click_line(&screen, mm.rect.x - 1.0, mm.rect.y + 5.0),
             None,
             "a point outside the strip must not be treated as a minimap click"
+        );
+    }
+
+    /// #1253: `minimap_click_line`/`minimap_press` must resolve against the
+    /// **paint-time** `MinimapLayout` a prior `draw_minimap_strip` call
+    /// cached on `RenderedMinimap::resolved_layout`, not re-derive their own
+    /// via `layout_with_sizing` every click — the cache is only proven wired
+    /// up if a cached layout whose `bounds` genuinely disagrees with what a
+    /// fresh `layout_with_sizing(minimap_strip_rect(mm), ...)` call would
+    /// produce wins the hit-test.
+    ///
+    /// Stashes a `MinimapLayout` whose `bounds` is shifted 1000px away from
+    /// the strip's real `mm.rect` (impossible for any real paint to
+    /// produce — this is a synthetic probe, not a realistic backend
+    /// scale/pitch difference) directly into `resolved_layout`. A point at
+    /// the real strip's centre must then MISS (the cached, shifted bounds
+    /// don't cover it) while the same point offset into the shifted bounds
+    /// must HIT — the opposite of what a from-scratch `layout_with_sizing`
+    /// recompute against the real, unshifted `mm.rect` would ever report,
+    /// so this can only pass if the cached layout is what actually got
+    /// consulted.
+    ///
+    /// **RED without the #1253 wiring:** confirmed by hand — reverting
+    /// `minimap_layout_for_click` to unconditionally call
+    /// `mm.minimap.layout_with_sizing(minimap_strip_rect(mm), ...)` (the
+    /// pre-#1253 body of both `minimap_click_line` and `minimap_press`,
+    /// ignoring `resolved_layout` entirely) makes the real-strip-centre
+    /// assertion below fail (`Some` where the shifted cache must report
+    /// `None`) and the shifted-point assertion fail the opposite way.
+    #[test]
+    fn minimap_click_and_press_resolve_against_the_cached_paint_time_layout() {
+        let e = windowed_minimap_engine(50_000);
+        let screen = render_engine(&e, 120.0, 30.0);
+        let win_id = screen.windows[0].window_id;
+        let mm = screen.minimap.first().expect("minimap present");
+
+        let real_bounds = minimap_strip_rect(mm);
+        let shift = 1000.0_f32;
+        let mut shifted_layout = mm.minimap.layout_with_sizing(
+            quadraui::Rect::new(
+                real_bounds.x + shift,
+                real_bounds.y,
+                real_bounds.width,
+                real_bounds.height,
+            ),
+            MINIMAP_LINES_PER_ROW,
+            quadraui::MinimapSizing::FixedPitch(1.0),
+        );
+        // Keep `visible_lines` non-empty (needed for a `Seek` hit to resolve
+        // a line at all) but leave `bounds` shifted — that's the only field
+        // `hit_test` reads.
+        assert!(
+            !shifted_layout.visible_lines.is_empty(),
+            "test setup sanity: the shifted layout must still have rows to resolve a hit against"
+        );
+        shifted_layout.bounds = quadraui::Rect::new(
+            real_bounds.x + shift,
+            real_bounds.y,
+            real_bounds.width,
+            real_bounds.height,
+        );
+        *mm.resolved_layout.borrow_mut() = Some(shifted_layout);
+
+        let real_mid_x = real_bounds.x as f64 + real_bounds.width as f64 / 2.0;
+        let real_mid_y = real_bounds.y as f64 + real_bounds.height as f64 / 2.0;
+        assert_eq!(
+            minimap_click_line(&screen, real_mid_x, real_mid_y),
+            None,
+            "a click at the real strip's own centre must MISS once the cache \
+             holds a layout whose bounds live 1000px away — proves the \
+             recompute-against-mm.rect path is NOT what answered this"
+        );
+
+        let shifted_mid_x = real_mid_x + shift as f64;
+        let (hit_win, _line) = minimap_click_line(&screen, shifted_mid_x, real_mid_y)
+            .expect("a click inside the cached layout's shifted bounds must HIT");
+        assert_eq!(hit_win, win_id);
+
+        // `minimap_press` shares the same resolution path — same proof,
+        // same shifted-bounds probe.
+        assert!(
+            minimap_press(&e, &screen, real_mid_x, real_mid_y, false).is_none(),
+            "minimap_press must also miss at the real strip's centre once \
+             the cache holds the shifted layout"
+        );
+        assert!(
+            minimap_press(&e, &screen, shifted_mid_x, real_mid_y, false).is_some(),
+            "minimap_press must hit inside the cached layout's shifted bounds"
         );
     }
 

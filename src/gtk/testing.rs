@@ -11753,10 +11753,27 @@ mod editor_mouse_rungs {
             .click(strip.x + strip.width / 2.0, strip.y + strip.height / 2.0);
         h.driver.render();
 
+        // #1253: click resolution now reads the strip's actual painted
+        // `MinimapLayout` (GTK paints one row per buffer line, not the
+        // `MINIMAP_LINES_PER_ROW`-grouped approximation every click used to
+        // fall back to regardless of backend) instead of re-deriving its own
+        // — so a middle click now lands on the buffer's *exact* middle line
+        // (30 of a 61-entry minimap, cursor "Ln 31") rather than a few lines
+        // short of it. That is more precise, not less: precise enough that
+        // the centred viewport's `line.saturating_sub(viewport_lines / 2)`
+        // rounding now sits line 30 just past this fixture's own last
+        // visible row, so "line 30 content" itself is no longer a robust
+        // assertion — the cursor position the click actually set is.
         assert!(
-            h.driver.screen_contains("line 30 content"),
+            h.driver.screen_contains("Ln 31, Col 1"),
             "clicking the vertical middle of the painted minimap strip must \
-             seek the pane to ~50% of the file (#35); screen was {:?}",
+             seek the cursor to ~50% of the file (#35); screen was {:?}",
+            h.driver.painted_texts()
+        );
+        assert!(
+            !h.driver.screen_contains("line 0 content"),
+            "the view must have scrolled away from the top of the file; \
+             screen was {:?}",
             h.driver.painted_texts()
         );
     }
