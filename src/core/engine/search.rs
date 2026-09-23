@@ -187,8 +187,27 @@ impl Engine {
         }
     }
 
+    /// Sum of visual rows occupied by buffer lines `[start, end)`. Used by
+    /// `ensure_cursor_visible_wrap` to measure `'scrolloff'` margins in
+    /// visual rows rather than buffer lines (#1293).
+    fn visual_rows_for_range(&self, start: usize, end: usize, viewport_cols: usize) -> usize {
+        if start >= end {
+            return 0;
+        }
+        (start..end)
+            .map(|r| {
+                let line_len = self.buffer().content.line(r).len_chars().saturating_sub(1);
+                engine_visual_rows_for_line(line_len, viewport_cols)
+            })
+            .sum()
+    }
+
     /// Wrap-aware scroll-to-cursor. Counts visual rows (accounting for
-    /// soft-wrapped buffer lines) to determine when to adjust `scroll_top`.
+    /// soft-wrapped buffer lines) to determine when to adjust `scroll_top`,
+    /// honoring `'scrolloff'` (#1293) — the `'wrap'`-off counterpart above
+    /// (`ensure_cursor_visible`) does this in buffer lines; here the margin
+    /// has to be counted in *visual* rows instead, since a single wrapped
+    /// buffer line can span more than one screen row.
     pub(crate) fn ensure_cursor_visible_wrap(&mut self) {
         let viewport_cols = self.view().viewport_cols;
         // #185: use effective viewport (accounts for bottom chrome like
@@ -198,10 +217,57 @@ impl Engine {
         let cursor_col = self.view().cursor.col;
         let scroll_top = self.view().scroll_top;
         let total_lines = self.buffer().len_lines();
+        let scrolloff = self.settings.scrolloff;
 
-        // Scroll up if cursor is above the viewport.
-        if cursor_line < scroll_top {
-            self.view_mut().scroll_top = cursor_line;
+        // Only ever called with viewport_cols > 0 (see `ensure_cursor_visible`'s
+        // guard), so `cursor_col / viewport_cols` below is safe.
+        let cursor_seg = cursor_col / viewport_cols;
+
+        // How many visual rows of margin the buffer can actually supply
+        // above/below the cursor — same clamping Vim does: no margin is
+        // forced within `scrolloff` rows of the start/end of the file.
+        let rows_above_cursor =
+            cursor_seg + self.visual_rows_for_range(0, cursor_line, viewport_cols);
+        let top_margin = scrolloff.min(rows_above_cursor);
+
+        let cursor_line_len = self
+            .buffer()
+            .content
+            .line(cursor_line)
+            .len_chars()
+            .saturating_sub(1);
+        let cursor_line_segs = engine_visual_rows_for_line(cursor_line_len, viewport_cols);
+        let rows_below_cursor = cursor_line_segs.saturating_sub(cursor_seg + 1)
+            + self.visual_rows_for_range(cursor_line + 1, total_lines, viewport_cols);
+        let bottom_margin = scrolloff.min(rows_below_cursor);
+
+        // Visual rows currently visible above the cursor's segment, i.e.
+        // from `scroll_top` up to (but not including) the cursor's own
+        // segment. Zero when the cursor has scrolled entirely above
+        // `scroll_top` (handled uniformly by the branch below).
+        let visible_rows_above = if cursor_line >= scroll_top {
+            self.visual_rows_for_range(scroll_top, cursor_line, viewport_cols) + cursor_seg
+        } else {
+            0
+        };
+
+        if cursor_line < scroll_top || visible_rows_above < top_margin {
+            // Scroll up: walk backward from the cursor to find the
+            // closest scroll_top that leaves `top_margin` visual rows
+            // above the cursor's segment (or reaches buffer start).
+            let mut rows_used = cursor_seg;
+            let mut new_scroll_top = cursor_line;
+            if rows_used < top_margin && cursor_line > 0 {
+                for r in (0..cursor_line).rev() {
+                    if rows_used >= top_margin {
+                        break;
+                    }
+                    let line_len = self.buffer().content.line(r).len_chars().saturating_sub(1);
+                    rows_used += engine_visual_rows_for_line(line_len, viewport_cols);
+                    new_scroll_top = r;
+                }
+            }
+            self.view_mut().scroll_top = new_scroll_top;
             return;
         }
 
@@ -218,26 +284,27 @@ impl Engine {
                 visual_rows += engine_visual_rows_for_line(line_len, viewport_cols);
             } else {
                 // Partial count: only up to the cursor's visual segment.
-                visual_rows += cursor_col / viewport_cols + 1;
+                visual_rows += cursor_seg + 1;
             }
         }
 
-        // If cursor fits within the viewport, nothing to adjust.
-        if visual_rows <= viewport_lines {
+        // If cursor plus its `bottom_margin` rows of scrolloff fit within
+        // the viewport, nothing to adjust.
+        if visual_rows + bottom_margin <= viewport_lines {
             return;
         }
 
-        // Cursor is below the viewport — walk backwards from cursor_line
-        // to find the new scroll_top that makes the cursor visible.
-        let cursor_visual_row_within_line = cursor_col / viewport_cols;
-        // Rows the cursor's line contributes, up to and including cursor segment.
-        let mut rows_used = cursor_visual_row_within_line + 1;
+        // Cursor (or its scrolloff margin) is below the viewport — walk
+        // backwards from cursor_line to find the new scroll_top that
+        // leaves `bottom_margin` visual rows free below the cursor.
+        let target_rows = viewport_lines.saturating_sub(bottom_margin);
+        let mut rows_used = cursor_seg + 1;
         let mut new_scroll_top = cursor_line;
-        if rows_used < viewport_lines && cursor_line > 0 {
+        if rows_used < target_rows && cursor_line > 0 {
             for r in (0..cursor_line).rev() {
                 let line_len = self.buffer().content.line(r).len_chars().saturating_sub(1);
                 let vrows = engine_visual_rows_for_line(line_len, viewport_cols);
-                if rows_used + vrows > viewport_lines {
+                if rows_used + vrows > target_rows {
                     break;
                 }
                 rows_used += vrows;
