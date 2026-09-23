@@ -22912,17 +22912,17 @@ pub fn apply_gutter_action(
             engine.dap_toggle_breakpoint(&file, line as u64 + 1);
         }
         Some(GutterAction::DiffPeek(line)) => {
-            engine.active_tab_mut().active_window = window_id;
+            engine.active_tab_mut().focus_window(window_id);
             engine.view_mut().cursor.line = line;
             engine.open_diff_peek();
         }
         Some(GutterAction::DiagnosticHover(line)) => {
-            engine.active_tab_mut().active_window = window_id;
+            engine.active_tab_mut().focus_window(window_id);
             engine.view_mut().cursor.line = line;
             engine.trigger_editor_hover_for_line(line);
         }
         Some(GutterAction::CodeAction(line)) => {
-            engine.active_tab_mut().active_window = window_id;
+            engine.active_tab_mut().focus_window(window_id);
             engine.view_mut().cursor.line = line;
             engine.show_code_actions_popup();
         }
@@ -26243,6 +26243,55 @@ mod tests {
             background_mm.window_id,
             "clicking a background pane's minimap must focus that pane, \
              not just scroll it while leaving focus on {active_before:?}"
+        );
+    }
+
+    /// #1292 review (blocking finding): `apply_gutter_action`'s `DiffPeek`,
+    /// `DiagnosticHover` and `CodeAction` arms used to assign
+    /// `engine.active_tab_mut().active_window = window_id` directly instead
+    /// of routing through `Tab::focus_window`, so clicking a gutter icon
+    /// (diagnostic squiggle, code-action lightbulb, or diff-peek marker) on
+    /// a *background* split pane moved focus there but left
+    /// `Tab::prev_window` stale — a following `CTRL-W p` would then recall
+    /// whatever was previously active before the click, not the pane the
+    /// click itself came from, diverging from Neovim's `prevwin`.
+    ///
+    /// **Verified RED against the pre-fix shape:** reverting the three
+    /// `apply_gutter_action` arms back to a direct `active_window =`
+    /// assignment makes this fail — `prev_window` stays `None` (or
+    /// whatever it held before the click) instead of recording
+    /// `active_before`.
+    #[test]
+    fn gutter_diagnostic_hover_on_a_background_pane_focuses_it_and_records_prev_window() {
+        let mut e = Engine::new_for_test();
+        e.split_window(SplitDirection::Vertical, None);
+        let active_before = e.active_window_id();
+        let background = e
+            .active_tab()
+            .window_ids()
+            .into_iter()
+            .find(|&w| w != active_before)
+            .expect("split must produce a second, non-active window");
+
+        let mut rw = fixture_window(WindowRect::new(0.0, 0.0, 40.0, 10.0), 4, 10, 0, 30, 0.0);
+        rw.window_id = background;
+        rw.diagnostic_gutter
+            .insert(2, crate::core::lsp::DiagnosticSeverity::Error);
+
+        apply_gutter_action(&mut e, &rw, background, 2, 0, "");
+
+        assert_eq!(
+            e.active_window_id(),
+            background,
+            "test setup sanity: the gutter click must focus the background pane"
+        );
+        assert_eq!(
+            e.active_tab().prev_window,
+            Some(active_before),
+            "a gutter click that moves focus to a background pane must \
+             record the previously-active window as Tab::prev_window, \
+             exactly like every other focus-changing call site, so a \
+             following CTRL-W p recalls it"
         );
     }
 
