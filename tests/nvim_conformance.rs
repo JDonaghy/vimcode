@@ -9883,12 +9883,20 @@ fn nvim_conformance_cross_file_ex() {
 //      whitespace trimmed). The header's `col`/`file/text` gap was also off
 //      by one space. Confirmed against a live oracle; its case label is
 //      deleted from `KNOWN_DEVIATIONS_MESSAGE` below.
-//   3. (#1301) "msg:ex::jumps lists a jump" — title: "`:jumps`: drop the
-//      vimcode-only `tab` column, add the `file/text` preview column
-//      Neovim has instead". `"jumps"`'s arm prints a header/column vimcode
-//      added on its own (`" jump line  col  tab  file/text"`) — Neovim's is
-//      `" jump line  col file/text"`, no tab column, but *with* a preview
-//      of the target line's text that vimcode's version omits entirely.
+//   3. (#1301 — FIXED) "msg:ex::jumps lists a jump" — title: "`:jumps`: drop
+//      the vimcode-only `tab` column, add the `file/text` preview column
+//      Neovim has instead". `"jumps"`'s arm printed a header/column vimcode
+//      added on its own (`" jump line  col  tab  file/text"`) instead of
+//      Neovim's `" jump line  col file/text"` (no tab column), and never
+//      previewed the target line's text at all. Now: the `tab` column is
+//      gone, the jump number is `w_jumplistidx`-relative (counts down to 0
+//      at the current entry, then back up for entries past it — Vim/Neovim's
+//      own numbering, not the raw list index), and `file/text` previews the
+//      target line's text (leading whitespace trimmed, via the new shared
+//      `preview_line_text` helper also used by `:marks`) when the jump is
+//      within the current buffer, falling back to the file path otherwise —
+//      all confirmed against a live oracle. Its case label is deleted from
+//      `KNOWN_DEVIATIONS_MESSAGE` below.
 //   4. (#1302) "msg:ex::digraphs lists the digraph table" — title: "`:digraphs`:
 //      match Neovim's default digraph table and its column-wrapped grid
 //      layout". `src/core/digraphs.rs`'s table (#1160) was built against
@@ -9924,7 +9932,6 @@ fn nvim_conformance_cross_file_ex() {
 //      follow-up formatting-fix issue (same non-trivial-rewrite reasoning
 //      as the others).
 const KNOWN_DEVIATIONS_MESSAGE: &[&str] = &[
-    "msg:ex::jumps lists a jump",
     "msg:ex::digraphs lists the digraph table",
     "msg:ex::changes lists a change",
     "msg:ex::history lists prior ex commands",

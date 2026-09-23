@@ -10967,42 +10967,45 @@ fn test_jump_list_prunes_entry_on_tab_close() {
     );
 }
 
-/// `:jumps` must reflect the widened entries: a `tab` column showing the
-/// still-alive pane's `TabId`, or `x` once that pane has been closed.
+/// `:jumps` must match Neovim's real columns (#1301): no vimcode-invented
+/// `tab` column, and a `file/text` column previewing the target line's text
+/// when the jump is within the *current* buffer, or the file path when it's
+/// a different buffer (confirmed against a live oracle).
 #[test]
-fn test_ex_jumps_shows_tab_identity() {
-    let mut engine = Engine::new();
-    engine.buffer_mut().insert(0, "one\ntwo\nthree\n");
-    press_char(&mut engine, 'G');
-    let tab_a_id = engine.active_tab().id;
+fn test_ex_jumps_drops_tab_column_and_shows_file_text_preview() {
+    let dir = std::env::temp_dir().join("vimcode_jumps_file_text_preview");
+    std::fs::create_dir_all(&dir).unwrap();
+    let file_a = dir.join("file_a.txt");
+    std::fs::write(&file_a, "one\ntwo\nthree\n").unwrap();
+    let file_b = dir.join("file_b.txt");
+    std::fs::write(&file_b, "four\nfive\nsix\n").unwrap();
 
-    engine.new_tab(None);
-    engine.buffer_mut().insert(0, "four\nfive\nsix\n");
-    press_char(&mut engine, 'G');
+    let mut engine = Engine::new();
+    engine
+        .open_file_with_mode(&file_a, OpenMode::Permanent)
+        .unwrap();
+    press_char(&mut engine, 'G'); // pushes (file_a, line 0) onto the jumplist
+
+    engine.new_tab(Some(&file_b)); // switching buffer is jump-worthy too
+    press_char(&mut engine, 'G'); // cursor now on "six" (file_b's last line)
+    press_char(&mut engine, 'g');
+    press_char(&mut engine, 'g'); // gg pushes (file_b, "six") onto the jumplist
 
     engine.execute_command("jumps");
+    let header = engine.message.lines().next().unwrap();
     assert!(
-        engine.message.contains(&format!("{}", tab_a_id.0)),
-        ":jumps should list tab A's TabId while it's alive; message:\n{}",
+        !header.contains("tab"),
+        ":jumps header must not contain vimcode's invented tab column; message:\n{}",
         engine.message
     );
-
-    // A pane that's gone (normally pruned away entirely on close — see
-    // `test_jump_list_prunes_entry_on_tab_close`) must still render safely
-    // as "x" rather than crashing or claiming a dead pane is reachable.
-    // Fabricate one directly to pin down that defensive display path.
-    engine.jump_list.push(JumpEntry {
-        file: None,
-        line: 0,
-        col: 0,
-        group_id: GroupId(9999),
-        tab_id: TabId(9999),
-        window_id: WindowId(9999),
-    });
-    engine.execute_command("jumps");
     assert!(
-        engine.message.contains(" x  "),
-        ":jumps should mark an unreachable pane's entry as dead; message:\n{}",
+        engine.message.contains("file_a.txt"),
+        ":jumps should preview a cross-buffer entry with its file name; message:\n{}",
+        engine.message
+    );
+    assert!(
+        engine.message.contains("six"),
+        ":jumps should preview a same-buffer entry with the target line's text; message:\n{}",
         engine.message
     );
 }

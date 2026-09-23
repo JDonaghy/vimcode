@@ -2459,22 +2459,7 @@ impl Engine {
                 let mut lines: Vec<String> = Vec::new();
                 lines.push("mark line  col file/text".to_string());
 
-                // Preview text for a mark's target line: leading whitespace
-                // trimmed, no trailing newline — matches Neovim's `:marks`
-                // `file/text` column (confirmed against a live oracle, #1300).
-                let line_text = |engine: &Self, line_idx: usize| -> String {
-                    let clamped =
-                        line_idx.min(engine.buffer().content.len_lines().saturating_sub(1));
-                    engine
-                        .buffer()
-                        .content
-                        .line(clamped)
-                        .chars()
-                        .collect::<String>()
-                        .trim_end_matches(['\n', '\r'])
-                        .trim_start()
-                        .to_string()
-                };
+                let line_text = |engine: &Self, line_idx: usize| engine.preview_line_text(line_idx);
 
                 // Neovim's `:marks` always lists the three automatic marks
                 // alongside any user-set ones (#1300): `'` (previous
@@ -2519,39 +2504,50 @@ impl Engine {
             // Display jump list
             "jumps" => {
                 let mut lines: Vec<String> = Vec::new();
-                lines.push(" jump line  col  tab  file/text".to_string());
+                // Neovim's `:jumps` header has no `tab` column — vimcode
+                // invented one — and *does* carry a `file/text` preview of
+                // the target line, which the old header omitted entirely
+                // (confirmed against a live oracle, #1301).
+                lines.push(" jump line  col file/text".to_string());
+                let current_file = self.file_path().cloned();
+                let idx = self.jump_list_pos;
                 for (i, entry) in self.jump_list.iter().enumerate() {
-                    let marker = if i == self.jump_list_pos { ">" } else { " " };
-                    let path_str = entry
-                        .file
-                        .as_ref()
-                        .map(|p| {
-                            p.file_name()
-                                .map(|n| n.to_string_lossy().into_owned())
-                                .unwrap_or_default()
-                        })
-                        .unwrap_or_default();
-                    // "tab" column: the recorded pane's TabId when it still
-                    // exists (i.e. `Ctrl-O`/`Ctrl-I` would switch to it),
-                    // or "x" when that tab/split has since been closed and
-                    // this entry would fall back to reopening `file` (#674).
-                    let tab_str = if self
-                        .locate_jump_pane(entry.group_id, entry.tab_id, entry.window_id)
-                        .is_some()
-                    {
-                        entry.tab_id.0.to_string()
+                    let marker = if i == idx { ">" } else { " " };
+                    // Jump number counts *distance from the current
+                    // position* in the list, not the raw index — entries
+                    // older than `idx` count down to 0, entries newer than
+                    // `idx` count up from 1 (matches Neovim/Vim's own
+                    // `w_jumplistidx`-relative numbering, confirmed against
+                    // a live oracle).
+                    let jump_num = i.abs_diff(idx);
+                    // `file/text`: Neovim previews the target line's text
+                    // when the jump is within the *current* buffer, and
+                    // falls back to the file path when it's a different
+                    // buffer (confirmed against a live oracle, #1301).
+                    let text = if entry.file == current_file {
+                        self.preview_line_text(entry.line)
                     } else {
-                        "x".to_string()
+                        entry
+                            .file
+                            .as_ref()
+                            .map(|p| p.to_string_lossy().into_owned())
+                            .unwrap_or_default()
                     };
                     lines.push(format!(
-                        "{} {:4}  {:4}  {:3}  {:>3}  {}",
+                        "{}{:>3}{:>6}{:>5} {}",
                         marker,
-                        i,
+                        jump_num,
                         entry.line + 1,
                         entry.col,
-                        tab_str,
-                        path_str
+                        text
                     ));
+                }
+                // When the current position is past the end of the recorded
+                // list (no `Ctrl-O` has been done since the last jump),
+                // Neovim prints a bare trailing `>` line with no entry data
+                // (confirmed against a live oracle).
+                if idx == self.jump_list.len() {
+                    lines.push(">".to_string());
                 }
                 self.message = lines.join("\n");
                 EngineAction::None
@@ -2995,6 +2991,21 @@ impl Engine {
                 EngineAction::Error
             }
         }
+    }
+
+    /// Preview text for a `file/text`-column target line (`:marks`, `:jumps`):
+    /// leading whitespace trimmed, no trailing newline — matches Neovim's
+    /// listing commands (confirmed against a live oracle, #1300, #1301).
+    fn preview_line_text(&self, line_idx: usize) -> String {
+        let clamped = line_idx.min(self.buffer().content.len_lines().saturating_sub(1));
+        self.buffer()
+            .content
+            .line(clamped)
+            .chars()
+            .collect::<String>()
+            .trim_end_matches(['\n', '\r'])
+            .trim_start()
+            .to_string()
     }
 
     /// `:[range]norm[al][!] {keys}` — the range is a full ex range, so
