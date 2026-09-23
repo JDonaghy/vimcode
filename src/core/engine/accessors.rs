@@ -79,7 +79,7 @@ impl Engine {
         let layout_wids = self.active_tab().layout.window_ids();
         for candidate in &layout_wids {
             if self.windows.contains_key(candidate) {
-                self.active_tab_mut().active_window = *candidate;
+                self.active_tab_mut().focus_window(*candidate);
                 return;
             }
         }
@@ -92,7 +92,7 @@ impl Engine {
         self.windows.insert(new_wid, window);
         let tab = self.active_tab_mut();
         tab.layout = crate::core::window::WindowLayout::leaf(new_wid);
-        tab.active_window = new_wid;
+        tab.focus_window(new_wid);
     }
 
     pub fn active_tab(&self) -> &Tab {

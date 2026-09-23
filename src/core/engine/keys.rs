@@ -10194,7 +10194,7 @@ impl Engine {
         // Ensure this window's group and tab are active.
         self.focus_group_for_window(window_id);
         if self.windows.contains_key(&window_id) {
-            self.active_tab_mut().active_window = window_id;
+            self.active_tab_mut().focus_window(window_id);
         }
 
         if !self.mouse_drag_active {

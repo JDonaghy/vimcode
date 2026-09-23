@@ -1083,7 +1083,7 @@ impl Engine {
                 .contains(&self.active_tab().active_window)
             {
                 if let Some(first) = self.active_tab().layout.window_ids().first().copied() {
-                    self.active_tab_mut().active_window = first;
+                    self.active_tab_mut().focus_window(first);
                 }
             }
         }
@@ -1155,7 +1155,7 @@ impl Engine {
 
         // Focus the right (working copy) window.
         let tab = self.active_tab_mut();
-        tab.active_window = right_win;
+        tab.focus_window(right_win);
 
         // Bind scroll and set up diff.
         self.scroll_bind_pairs.push((left_win, right_win));
@@ -1252,7 +1252,7 @@ impl Engine {
                 .contains(&self.active_tab().active_window)
             {
                 if let Some(first) = self.active_tab().layout.window_ids().first().copied() {
-                    self.active_tab_mut().active_window = first;
+                    self.active_tab_mut().focus_window(first);
                 }
             }
         }
@@ -1275,7 +1275,7 @@ impl Engine {
         if let Some((gid, ti)) = target {
             self.active_group = gid;
             self.active_group_mut().active_tab = ti;
-            self.active_tab_mut().active_window = right_win;
+            self.active_tab_mut().focus_window(right_win);
         }
 
         // Create scratch buffer with HEAD content.
@@ -1307,7 +1307,7 @@ impl Engine {
 
         // Focus the right (working copy) window.
         let tab = self.active_tab_mut();
-        tab.active_window = right_win;
+        tab.focus_window(right_win);
 
         // Bind scroll and set up diff.
         self.scroll_bind_pairs.push((left_win, right_win));
@@ -1397,7 +1397,7 @@ impl Engine {
         }
 
         // Focus the right (after) window
-        self.active_tab_mut().active_window = right_win;
+        self.active_tab_mut().focus_window(right_win);
 
         // Bind scroll and compute diff
         self.scroll_bind_pairs.push((left_win, right_win));

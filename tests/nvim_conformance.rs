@@ -2653,9 +2653,10 @@ fn run_jumps_case(case: &MultiJumpsCase) -> Outcome {
 // `CTRL-W H`/`J`/`K`/`L`/`T`/`e`/`E`/`d` are not covered by any
 // [`CASES_WIN`] entry — see the "Deliberate semantic divergence" block in
 // [`COVERAGE_EXEMPT`] for why each is permanent, not debt. Every other id
-// with a case in [`KNOWN_DEVIATIONS_WIN`] (`-`/`<`/`>`/`\|`/`=`/`r`/`R`/`p`)
-// is a real, non-vacuous finding, not a permanent divergence — each one's
-// own comment there names the fix it's waiting on. Cross-file/cross-tab
+// with a case in [`KNOWN_DEVIATIONS_WIN`] (currently just `<`/`>`/`\|`,
+// after `-`/`=`/`r`/`R`/`p` each got fixed and removed) is a real,
+// non-vacuous finding, not a permanent divergence — each one's own comment
+// there names the fix it's waiting on. Cross-file/cross-tab
 // commands (`gf`, `gt`, `CTRL-^`, buffer/tab/window ex commands) that could
 // reuse this same harness are #1281, chained after this one.
 // ---------------------------------------------------------------------------
@@ -8930,10 +8931,11 @@ const CASES_MULTI_JUMPS_LIST: &[MultiJumpsCase] = &[
 //
 // See the harness's own module doc above (`WinCase`/`run_win_case`) for the
 // comparison model. `CTRL-W H`/`J`/`K`/`L`/`T`/`e`/`E`/`d` have no entry here
-// at all — permanently exempt, see `COVERAGE_EXEMPT`. `CTRL-W p`/`+`/`-`/`<`/
-// `>`/`_`/`\|` do have real cases below but are listed in
-// `KNOWN_DEVIATIONS_WIN`, not expected to pass — each case's own comment
-// explains the finding.
+// at all — permanently exempt, see `COVERAGE_EXEMPT`. `CTRL-W <`/`>`/`\|` do
+// have real cases below but are listed in `KNOWN_DEVIATIONS_WIN`, not
+// expected to pass — each case's own comment explains the finding. `CTRL-W
+// p`/`+`/`-`/`_` are real cases too, but each has since been fixed (#1288,
+// #1292) and is expected to pass like everything else not in that list.
 
 const WIN_TWO_LINES: &[&str] = &["first line", "second line", "third line"];
 
@@ -9157,11 +9159,13 @@ const CASES_WIN: &[WinCase] = &[
         1,
         "<C-w>v<C-w>|",
     ),
-    // #1162 finding: `CTRL-W p` only tracks "previously active editor
-    // group", never "previously active window within one group" — the
-    // common single-group case every other CASES_WIN entry lives in. RED:
-    // Neovim returns to the first window, vimcode stays on the second (`p`
-    // is a no-op with a single editor group). See KNOWN_DEVIATIONS_WIN.
+    // #1162 finding, filed and FIXED as #1292: `CTRL-W p` used to track
+    // only "previously active editor group", never "previously active
+    // window within one group" — the common single-group case every other
+    // CASES_WIN entry lives in. `Tab::prev_window` now tracks the latter,
+    // updated at every focus-changing call site (`Tab::focus_window`), and
+    // `execute_wincmd`'s `'p'` arm prefers it. PASS: no longer in
+    // KNOWN_DEVIATIONS_WIN.
     wc(
         "win:CTRL-W p returns to the previously active window",
         WIN_TWO_LINES,
@@ -13007,8 +13011,14 @@ const KNOWN_DEVIATIONS_WIN: &[&str] = &[
     // focus follows the window. "win:CTRL-W r/R rotate windows
     // downward/rightward"/"upward/leftward" are now real, non-vacuous
     // passes and were removed from this list.
-    // Follow-up #5 above ("track Tab::prev_window") — filed as #1292.
-    "win:CTRL-W p returns to the previously active window",
+    // Follow-up #5 above ("track Tab::prev_window") — filed and FIXED as
+    // #1292: `Tab::prev_window` now records the window that was active
+    // before the current one at every focus-changing call site
+    // (`Tab::focus_window`), and `execute_wincmd`'s `'p'` arm prefers it
+    // over the pre-existing `prev_active_group` editor-group toggle
+    // whenever the current tab has a valid (still-open) previous window.
+    // "win:CTRL-W p returns to the previously active window" is now a
+    // real, non-vacuous pass and was removed from this list.
 ];
 
 #[test]

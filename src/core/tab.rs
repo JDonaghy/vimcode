@@ -13,6 +13,15 @@ pub struct Tab {
     pub layout: WindowLayout,
     /// The currently focused window in this tab.
     pub active_window: WindowId,
+    /// The window that was active immediately before the current one, at
+    /// the *tab* (vim-split) level — distinct from `Engine::prev_active_group`,
+    /// which tracks the VSCode-style editor-group toggle. Backs `CTRL-W p`
+    /// (`:h CTRL-W_p`) within a single editor group (#1292). `None` until the
+    /// active window has changed at least once in this tab, or once the
+    /// recorded window has left the tab (closed, or moved elsewhere) —
+    /// `execute_wincmd`'s `'p'` arm treats either as "no previous window",
+    /// matching Neovim's no-op/fallback rather than reviving a stale id.
+    pub prev_window: Option<WindowId>,
 }
 
 impl Tab {
@@ -21,7 +30,20 @@ impl Tab {
             id,
             layout: WindowLayout::leaf(initial_window),
             active_window: initial_window,
+            prev_window: None,
         }
+    }
+
+    /// Make `window_id` the active window, recording the window that *was*
+    /// active as `prev_window` so `CTRL-W p` can recall it (#1292). Every
+    /// call site that reassigns `active_window` should route through this
+    /// rather than setting the field directly — the #1292 audit is the
+    /// list of sites that used to skip it.
+    pub fn focus_window(&mut self, window_id: WindowId) {
+        if self.active_window != window_id {
+            self.prev_window = Some(self.active_window);
+        }
+        self.active_window = window_id;
     }
 
     /// Get all window IDs in this tab.
@@ -38,14 +60,14 @@ impl Tab {
     /// Cycle to the next window in this tab.
     pub fn cycle_next_window(&mut self) {
         if let Some(next) = self.layout.next_window(self.active_window) {
-            self.active_window = next;
+            self.focus_window(next);
         }
     }
 
     /// Cycle to the previous window in this tab.
     pub fn cycle_prev_window(&mut self) {
         if let Some(prev) = self.layout.prev_window(self.active_window) {
-            self.active_window = prev;
+            self.focus_window(prev);
         }
     }
 }
