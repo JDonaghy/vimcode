@@ -2369,6 +2369,18 @@ impl Engine {
             return self.ex_registers(args, prev_ex_command.as_deref());
         }
 
+        // Handle `:history`/`:his` (`:h :history`, #1327): with no
+        // arguments, lists the `:` command history (Neovim's own default —
+        // confirmed against a live oracle); with a `{name}` and/or
+        // `{first}[,{last}]` index-range argument, restricts which history
+        // and which entries are listed (`:h :history-indexing`). Both are
+        // plain keyword/integer arguments, not Vim expressions, so no
+        // expression evaluator is needed to cover them.
+        if cmd == "history" || cmd.starts_with("history ") {
+            let args = cmd.strip_prefix("history").unwrap_or("").trim();
+            return self.ex_history(args);
+        }
+
         match cmd {
             "write" => {
                 let _ = self.save_with_format(false);
@@ -2584,16 +2596,6 @@ impl Engine {
                 // oracle, #1303).
                 if idx == self.change_list.len() {
                     lines.push(">".to_string());
-                }
-                self.message = lines.join("\n");
-                EngineAction::None
-            }
-            // Display command history
-            "history" => {
-                let mut lines: Vec<String> = Vec::new();
-                lines.push("--- Command History ---".to_string());
-                for (i, cmd) in self.history.command_history.iter().enumerate() {
-                    lines.push(format!("{:4}  {}", i + 1, cmd));
                 }
                 self.message = lines.join("\n");
                 EngineAction::None
@@ -6120,6 +6122,82 @@ impl Engine {
             _ => self.registers.get(&r).cloned(),
         }
     }
+
+    /// `:history`/`:his` (`:h :history`, #1327). `args` is everything after
+    /// the command word, e.g. `""`, `"/"`, `"all"`, `"cmd 2,5"`.
+    ///
+    /// The leading token, if present, selects a [`HistoryKind`] (`:`/`cmd`,
+    /// `/`/`?`/`search`, `all`, plus `=`/`expr`, `@`/`input`, `>`/`debug` —
+    /// vimcode tracks none of the latter three, see [`HistoryKind::entries`]).
+    /// When the leading token doesn't name a kind (e.g. it's a bare number),
+    /// it is instead the index-range argument and the kind defaults to
+    /// `Cmd` — Neovim's own default (confirmed against a live oracle: typing
+    /// two prior commands then bare `:history` lists the `:` history, not
+    /// `all`).
+    ///
+    /// A trailing `{first}[,{last}]` restricts *which entries* of the
+    /// selected kind(s) are printed (`:h :history-indexing`): a bare number
+    /// means `first == last`; a negative number counts back from the newest
+    /// entry (`-1` is the newest). All confirmed against a live oracle,
+    /// including that `:history {kind} 0` / `... 99` (out of range) print
+    /// just the header with no rows rather than erroring.
+    pub(crate) fn ex_history(&mut self, args: &str) -> EngineAction {
+        let args = args.trim();
+        let mut tokens = args.split_whitespace();
+        let mut kind = HistoryKind::Cmd;
+        let mut range_tok: Option<&str> = None;
+        if let Some(first_tok) = tokens.next() {
+            if let Some(k) = HistoryKind::parse(first_tok) {
+                kind = k;
+                range_tok = tokens.next();
+            } else {
+                range_tok = Some(first_tok);
+            }
+        }
+
+        let kinds: &[HistoryKind] = if kind == HistoryKind::All {
+            &[
+                HistoryKind::Cmd,
+                HistoryKind::Search,
+                HistoryKind::Expr,
+                HistoryKind::Input,
+                HistoryKind::Debug,
+            ]
+        } else {
+            std::slice::from_ref(&kind)
+        };
+
+        // A single explicitly-named history with zero entries ever recorded
+        // errors instead of listing an empty table (confirmed against a
+        // live oracle: `:history search`/`:history expr` with nothing
+        // recorded print `'history' option is zero`) — `:history all` never
+        // errors this way, even when every section is empty.
+        if kinds.len() == 1 {
+            let entries = kinds[0].entries(self);
+            if entries.is_empty() {
+                self.message = "'history' option is zero".to_string();
+                return EngineAction::Error;
+            }
+        }
+
+        let mut lines: Vec<String> = Vec::new();
+        for k in kinds {
+            let entries = k.entries(self);
+            lines.push(format!("      #  {} history", k.label()));
+            let (first, last) = parse_history_range(range_tok.unwrap_or(""), entries.len());
+            let current = entries.len(); // 1-based position of the newest entry.
+            for (i, entry) in entries.iter().enumerate() {
+                let pos = (i + 1) as i64;
+                if pos < first || pos > last {
+                    continue;
+                }
+                let marker = if pos as usize == current { ">" } else { " " };
+                lines.push(format!("{marker}{pos:>6}  {entry}"));
+            }
+        }
+        self.message = lines.join("\n");
+        EngineAction::None
+    }
 }
 
 /// Canonical `:registers` iteration order — unnamed, numbered, named, then
@@ -6132,6 +6210,128 @@ const REGISTERS_DISPLAY_ORDER: &[char] = &[
     'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z', '-',
     '*', '+', '.', ':', '%', '#', '/', '=',
 ];
+
+/// Which `:history` list a `{name}` argument selects (`:h :history`). Every
+/// variant but `All` is a valid `{name}`; `All` only ever appears as the
+/// *parsed* result of the literal `all` argument and is expanded back out
+/// to the other five before use (see [`Engine::ex_history`]).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HistoryKind {
+    Cmd,
+    Search,
+    Expr,
+    Input,
+    Debug,
+    All,
+}
+
+impl HistoryKind {
+    /// Parses a `:history` `{name}` token: the one-character symbol
+    /// spellings (`:`, `/`, `?`, `=`, `@`, `>`) and any non-empty lowercase
+    /// prefix of the word spelling (`c`..`cmd`, `s`..`search`, `e`..`expr`,
+    /// `i`..`input`, `d`..`debug`, `a`..`all` — `:h :history` gives each as
+    /// `x[yz]`, meaning the bracketed part is optional). Returns `None` for
+    /// anything else (a bare index-range token has no letters, or isn't
+    /// lowercase-only, and falls through to this).
+    fn parse(tok: &str) -> Option<Self> {
+        match tok {
+            ":" => Some(Self::Cmd),
+            "/" | "?" => Some(Self::Search),
+            "=" => Some(Self::Expr),
+            "@" => Some(Self::Input),
+            ">" => Some(Self::Debug),
+            _ if !tok.is_empty() && tok.bytes().all(|b| b.is_ascii_lowercase()) => {
+                if "cmd".starts_with(tok) {
+                    Some(Self::Cmd)
+                } else if "search".starts_with(tok) {
+                    Some(Self::Search)
+                } else if "expr".starts_with(tok) {
+                    Some(Self::Expr)
+                } else if "input".starts_with(tok) {
+                    Some(Self::Input)
+                } else if "debug".starts_with(tok) {
+                    Some(Self::Debug)
+                } else if "all".starts_with(tok) {
+                    Some(Self::All)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// The word Neovim's header prints, e.g. `"cmd"` in `"      #  cmd
+    /// history"` (confirmed against a live oracle). Never called with `All`
+    /// — [`Engine::ex_history`] expands it to the other five first.
+    fn label(self) -> &'static str {
+        match self {
+            Self::Cmd => "cmd",
+            Self::Search => "search",
+            Self::Expr => "expr",
+            Self::Input => "input",
+            Self::Debug => "debug",
+            Self::All => "all",
+        }
+    }
+
+    /// This kind's entries, oldest first. vimcode has no expression
+    /// register, input-line or debug-command history at all, so those three
+    /// are always empty — which, via [`Engine::ex_history`]'s zero-entries
+    /// check, naturally reproduces the same `'history' option is zero` error
+    /// a live oracle gives for those (they're never populated there either
+    /// in a fresh session).
+    fn entries(self, engine: &Engine) -> Vec<String> {
+        match self {
+            Self::Cmd => engine.history.command_history.clone(),
+            Self::Search => engine.history.search_history.clone(),
+            Self::Expr | Self::Input | Self::Debug | Self::All => Vec::new(),
+        }
+    }
+}
+
+/// Resolves one `:history-indexing` number against a history of `len`
+/// entries: positive numbers are an absolute 1-based position, negative
+/// numbers count back from the newest entry (`-1` is the newest, `-2` the
+/// one before it, ...). Out-of-range results (e.g. `0`, or beyond `len`)
+/// are returned as-is — [`parse_history_range`]'s caller simply finds no
+/// entries at that position, which matches a live oracle's `:history 0` /
+/// `:history 99` (empty listing, no error).
+fn resolve_history_index(n: i64, len: usize) -> i64 {
+    if n < 0 {
+        len as i64 + n + 1
+    } else {
+        n
+    }
+}
+
+/// Parses a `:history` `{first}[,{last}]` range argument against a history
+/// of `len` entries (`:h :history-indexing`). An empty `spec` (no range
+/// given at all) means "everything". A single number with no comma means
+/// `first == last`. Either side of a comma may be empty, meaning "default
+/// to the start" / "default to the end" respectively (`:history 2,` lists
+/// from position 2 to the end; `:history ,2` lists from the start to
+/// position 2) — all confirmed against a live oracle.
+fn parse_history_range(spec: &str, len: usize) -> (i64, i64) {
+    let spec = spec.trim();
+    if spec.is_empty() {
+        return (1, len as i64);
+    }
+    if let Some((first, last)) = spec.split_once(',') {
+        let first = first.trim();
+        let last = last.trim();
+        let first_n = first.parse::<i64>().unwrap_or(1);
+        let last_n = last.parse::<i64>().unwrap_or(len as i64);
+        (
+            resolve_history_index(first_n, len),
+            resolve_history_index(last_n, len),
+        )
+    } else {
+        let n = spec.parse::<i64>().unwrap_or(1);
+        let resolved = resolve_history_index(n, len);
+        (resolved, resolved)
+    }
+}
 
 /// One candidate match `:s///c` offers to confirm — everything about it is
 /// derived from the *original*, unmodified buffer text once, up front (see
