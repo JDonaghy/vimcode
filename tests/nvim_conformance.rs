@@ -22079,9 +22079,9 @@ fn visual_audit_gates_are_bidirectional() {
 //                                      ───
 //                                      376 index rows, tagged as 370 entries
 //
-//     ✅ Implemented       216
+//     ✅ Implemented       217
 //     🟡 Partial            17
-//     ❌ Not implemented   113
+//     ❌ Not implemented   112
 //     ⏭️  Skipped            24   (each carrying a reason from SKIP_REASONS)
 //                          ───
 //                          370
@@ -27762,7 +27762,7 @@ const NORMAL_AUDIT: &[NormAudit] = &[
     na(
         "CTRL-W p",
         "CTRL-W_p",
-        NotImplemented,
+        Implemented,
         Some(nlive(
             NA_TXT,
             (1, 1),
@@ -27775,14 +27775,18 @@ const NORMAL_AUDIT: &[NormAudit] = &[
             1,
             1,
             "",
-            "(h0.50 2* 1) tabs=1/1",
+            "(h0.50 2 1*) tabs=1/1",
         )),
         Some(Label("win:C-w p goes to the previous window")),
         concat!(
-            "Vim goes to the last accessed window. vimcode leaves the focus ",
-            "alone — it keeps no last-accessed-window record. Worth ",
-            "implementing: `CTRL-W p` is the fastest two-window toggle there ",
-            "is.",
+            "matches Vim: goes to the last accessed window (#1292). ",
+            "`<C-w>s` splits and focuses the new window 2, so `<C-w>p` ",
+            "returns to window 1 — the recording's focus marker moves from ",
+            "`2*` to `1*`. Before #1292 vimcode kept only a previously-",
+            "active *editor group* record, so with a single group `CTRL-W p` ",
+            "was a no-op and the focus stayed on `2*`; `Tab::prev_window` ",
+            "now records the previously active window at every ",
+            "`Tab::focus_window` call site.",
         ),
     ),
     na(
@@ -30815,7 +30819,7 @@ fn normal_audit_is_internally_consistent() {
             tally(|e| matches!(e.status, OptStatus::Skipped(_))),
             tally(|e| e.live.is_some()),
         ),
-        (216, 17, 113, 24, 323),
+        (217, 17, 112, 24, 323),
         "the audit tally moved: (implemented, partial, missing, skipped, \
          replayed). Update the section doc's table in the same commit."
     );
