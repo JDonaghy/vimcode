@@ -4404,12 +4404,18 @@ pub fn dispatch_sidebar_panel_key(
 /// the legacy TUI loop had and GTK never did — GTK carried no Ctrl+L tier at
 /// all, so the chord was dispatched like any other Ctrl-modified `l`.
 ///
-/// Neither backend can honour the *full* semantics yet — the TUI shell runner
-/// owns the `ratatui::Terminal` whose previous-frame buffer would have to be
-/// reset, and neither `Backend` nor `ShellApp` exposes a
-/// `request_full_repaint`-shaped hook. Tracked as an upstream gap alongside
-/// the popup-disappearance clear in `TuiShellApp::render_content`; until it
-/// lands, both backends do the honest thing and request an ordinary redraw.
+/// #1243: TUI now honours the *full* semantics via
+/// `quadraui::Backend::request_full_repaint` (quadraui#1037) —
+/// `TuiShellApp::handle_key_pressed` calls it on this chord before returning
+/// `Reaction::Redraw`, and `tui::run::run_inner`'s frame loop clears
+/// `ratatui::Terminal`'s previous-frame buffer the next time it paints. GTK's
+/// `DrawingArea` repaints in full every frame via Cairo (no incremental diff
+/// to desync in the first place), so `GtkBackend` never overrides the hook
+/// and `App::handle_key_press` requests only an ordinary redraw — see
+/// `Backend::request_full_repaint`'s own doc for why that default is
+/// correct rather than a gap. The same hook also covers the
+/// popup-disappearance clear this comment used to point at —
+/// `TuiShellApp::render_content`'s `had_popup_overlay` transition check.
 ///
 /// `insert_ctrl_x_pending` is `engine.insert_ctrl_x_pending` (only ever true
 /// in the one-keystroke window right after `<C-x>` in Insert mode): right
@@ -4430,6 +4436,27 @@ pub fn is_force_redraw_key(
         return false;
     }
     ctrl && (matches!(unicode, Some('l') | Some('L')) || key_name == "l" || key_name == "L")
+}
+
+/// Did an editor-anchored popup (the completions/hover-doc picker or the
+/// modal folder picker) that was visible last frame close this frame?
+/// (#1243, TUI-only — `TuiShellApp::render_content`'s `had_popup_overlay`.)
+///
+/// The transition that must call `quadraui::Backend::request_full_repaint`
+/// (quadraui#1037): a popup staying open, staying closed, or newly opening
+/// all paint their own content this frame regardless of ratatui's diff
+/// cache, so only the *closing* transition can leave stale glyphs — ones
+/// the popup itself painted last frame, in cells nothing repaints this
+/// frame — for that cache to wrongly believe are still correct and skip.
+/// Pulled out as its own pure function (mirroring [`is_force_redraw_key`]
+/// just above) because `quadraui::Backend` is a sealed trait and
+/// `quadraui::tui::testing::TuiDriver`'s internals are private to that
+/// crate, so a vimcode-side driver test cannot itself observe
+/// `request_full_repaint` being called or its effect on a real diff cache
+/// — the one thing outside this module that *is* directly testable from
+/// here is the edge-detection logic that decides to call it.
+pub fn popup_overlay_closed_this_frame(was_open: bool, is_open_now: bool) -> bool {
+    was_open && !is_open_now
 }
 
 /// Popup rect for the folder-picker modal (`quadraui::FolderPickerController`,
@@ -31680,6 +31707,34 @@ mod slice7_router_tests {
     fn ctrl_l_falls_through_when_ctrl_x_completion_is_pending() {
         assert!(!is_force_redraw_key("", Some('l'), true, true));
         assert!(!is_force_redraw_key("l", None, true, true));
+    }
+
+    /// #1243: only the popup-was-up-last-frame-and-is-gone-this-frame edge
+    /// must fire `Backend::request_full_repaint` — every other transition
+    /// (staying open, staying closed, or newly opening) repaints its own
+    /// content this frame regardless of the diff cache, so requesting a
+    /// full repaint there would just be wasted work, not a correctness bug,
+    /// but pinning all four keeps the predicate from drifting into
+    /// "request it whenever a popup isn't open" (which would fire on every
+    /// popup-free frame forever).
+    #[test]
+    fn popup_overlay_closed_this_frame_fires_only_on_the_closing_edge() {
+        assert!(
+            popup_overlay_closed_this_frame(true, false),
+            "open → closed must fire"
+        );
+        assert!(
+            !popup_overlay_closed_this_frame(true, true),
+            "staying open must not fire"
+        );
+        assert!(
+            !popup_overlay_closed_this_frame(false, false),
+            "staying closed must not fire"
+        );
+        assert!(
+            !popup_overlay_closed_this_frame(false, true),
+            "newly opening must not fire"
+        );
     }
 
     #[test]
