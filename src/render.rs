@@ -12524,6 +12524,15 @@ pub fn minimap_strip_rect(mm: &RenderedMinimap) -> quadraui::Rect {
 /// and GTK's real `ROW_PITCH_PX` pitch only ever narrows `rows_shown` below
 /// `row_count`, which the host-side windowing above already keeps from
 /// happening in the first place.
+///
+/// CLAUDE.md's black-box test exemption, invoked explicitly: TUI ships no
+/// new/updated `TuiDriver` test for this change because there is no
+/// TUI-visible behaviour to cover — TUI's resolved paint-time layout and the
+/// pre-#1253 `FixedPitch(1.0)` fallback it now caches are mathematically
+/// identical (previous paragraph), and TUI's `shell_app.rs`/`render_impl.rs`
+/// call sites already discarded `draw_minimap_strip`'s old `Vec` return
+/// value, so no TUI wiring changed either (`scripts/prod_lines.py
+/// src/tui_main` delta: 0). This is an internal refactor on the TUI side.
 fn minimap_layout_for_click(mm: &RenderedMinimap) -> quadraui::MinimapLayout {
     if let Some(layout) = mm.resolved_layout.borrow().as_ref() {
         return layout.clone();

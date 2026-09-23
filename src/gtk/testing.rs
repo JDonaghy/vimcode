@@ -11764,6 +11764,12 @@ mod editor_mouse_rungs {
         // rounding now sits line 30 just past this fixture's own last
         // visible row, so "line 30 content" itself is no longer a robust
         // assertion — the cursor position the click actually set is.
+        //
+        // RED-verified: confirmed by hand — temporarily reverting
+        // `minimap_layout_for_click` (src/render.rs) to unconditionally call
+        // `mm.minimap.layout_with_sizing(...)`, ignoring `resolved_layout`
+        // (this test's pre-#1253 codepath), makes this exact assertion fail:
+        // the click instead lands on "Ln 33, Col 1", not "Ln 31, Col 1".
         assert!(
             h.driver.screen_contains("Ln 31, Col 1"),
             "clicking the vertical middle of the painted minimap strip must \
