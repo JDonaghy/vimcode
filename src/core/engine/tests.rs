@@ -13324,6 +13324,52 @@ fn test_copen_cclose() {
     assert!(!engine.quickfix.has_focus);
 }
 
+/// #1307 review: `:cclose` (or `:copen` again) run from a *different* tab
+/// than the one that owns the quickfix panel window must not corrupt that
+/// other tab's window state. `qf_panel_windows` has no per-tab scoping, so
+/// `qf_close_panel_window` used to always mutate `active_tab_mut()` — the
+/// *currently* active tab, not necessarily the one actually holding the
+/// panel window — leaving the owning tab's `active_window` pointing at a
+/// removed `WindowId`. The very next `Engine::active_window()` call once
+/// that tab becomes active again used to panic.
+///
+/// **Verified RED against unfixed `develop`** (confirmed by hand: reverting
+/// `qf_close_panel_window` to unconditionally use `self.active_tab_mut()`
+/// reproduces the crash below via exactly this `:copen` / `:tabnew` /
+/// `:cclose` / `:tabprevious` sequence — `active_window()`'s explicit `BUG:
+/// active_window ... not in windows map` panic fires on the final call).
+#[test]
+fn test_cclose_from_a_different_tab_does_not_corrupt_owning_tab_1307() {
+    let mut engine = Engine::new();
+    engine.quickfix.items = vec![make_qf_item("test.rs")];
+
+    // `:copen` in tab 1 — auto-focuses the new panel window, so tab 1's
+    // `active_window` becomes the panel window's id.
+    engine.execute_command("copen");
+    assert!(engine.quickfix.open);
+    let tab1_idx = engine.active_group().active_tab;
+
+    // Switch to a brand-new tab 2.
+    engine.execute_command("tabnew");
+    assert_ne!(engine.active_group().active_tab, tab1_idx);
+
+    // `:cclose` from tab 2 — must remove the panel window from *tab 1*'s
+    // layout (where it actually lives), not silently no-op against tab 2's
+    // layout and leave tab 1's `active_window` dangling.
+    engine.execute_command("cclose");
+    assert!(!engine.quickfix.open);
+
+    // Switching back to tab 1 and reading its active window must not panic.
+    engine.execute_command("tabprevious");
+    assert_eq!(engine.active_group().active_tab, tab1_idx);
+    let _ = engine.active_window(); // must not panic (#1307 review)
+    assert!(
+        engine.windows.contains_key(&engine.active_window_id()),
+        "tab 1's active_window must resolve to a live window after the \
+         cross-tab :cclose"
+    );
+}
+
 #[test]
 fn test_cn_cp_navigation() {
     let mut engine = Engine::new();

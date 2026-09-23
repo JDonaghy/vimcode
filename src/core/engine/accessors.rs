@@ -95,6 +95,80 @@ impl Engine {
         tab.focus_window(new_wid);
     }
 
+    /// Which (group, tab index) currently has `window_id` somewhere in its
+    /// layout — searched across *every* editor group/tab, not just the
+    /// active one. Needed by any window-removal path that can be driven from
+    /// a tab other than the currently active one (`qf_close_panel_window`,
+    /// #1307 review): `qf_panel_windows` is a single engine-wide map with no
+    /// per-tab scoping, so the panel window named by a `:cclose`/`:copen`
+    /// call may live in a tab the user isn't currently looking at.
+    pub(crate) fn find_window_tab(&self, window_id: WindowId) -> Option<(GroupId, usize)> {
+        for (&group_id, group) in self.editor_groups.iter() {
+            for (tab_idx, tab) in group.tabs.iter().enumerate() {
+                if tab.contains_window(window_id) {
+                    return Some((group_id, tab_idx));
+                }
+            }
+        }
+        None
+    }
+
+    /// Like [`Self::repair_active_window`], but for an arbitrary `(group,
+    /// tab_idx)` pair rather than always the currently active one. Every
+    /// other window-removal path in this codebase derives the tab to repair
+    /// from `active_tab_mut()`, which silently does nothing for a *different*
+    /// tab's now-dangling `active_window` — leaving it to panic the next time
+    /// that tab becomes active and [`Self::active_window`] is called
+    /// (#1307 review: `:copen` in tab 1, `:tabnew`, `:cclose` from tab 2).
+    /// A no-op if `(group_id, tab_idx)` no longer exists.
+    pub(crate) fn repair_window_in_tab(&mut self, group_id: GroupId, tab_idx: usize) {
+        let Some(wid) = self
+            .editor_groups
+            .get(&group_id)
+            .and_then(|g| g.tabs.get(tab_idx))
+            .map(|t| t.active_window)
+        else {
+            return;
+        };
+        if self.windows.contains_key(&wid) {
+            return; // already valid
+        }
+
+        let layout_wids = self
+            .editor_groups
+            .get(&group_id)
+            .and_then(|g| g.tabs.get(tab_idx))
+            .map(|t| t.layout.window_ids())
+            .unwrap_or_default();
+        for candidate in &layout_wids {
+            if self.windows.contains_key(candidate) {
+                if let Some(tab) = self
+                    .editor_groups
+                    .get_mut(&group_id)
+                    .and_then(|g| g.tabs.get_mut(tab_idx))
+                {
+                    tab.focus_window(*candidate);
+                }
+                return;
+            }
+        }
+
+        // No valid windows left in this tab — create a scratch window.
+        let buf_id = self.buffer_manager.create();
+        let new_wid = crate::core::window::WindowId(self.next_window_id);
+        self.next_window_id += 1;
+        let window = crate::core::window::Window::new(new_wid, buf_id);
+        self.windows.insert(new_wid, window);
+        if let Some(tab) = self
+            .editor_groups
+            .get_mut(&group_id)
+            .and_then(|g| g.tabs.get_mut(tab_idx))
+        {
+            tab.layout = crate::core::window::WindowLayout::leaf(new_wid);
+            tab.focus_window(new_wid);
+        }
+    }
+
     pub fn active_tab(&self) -> &Tab {
         self.active_group().active_tab()
     }

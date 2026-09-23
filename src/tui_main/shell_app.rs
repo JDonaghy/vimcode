@@ -18771,6 +18771,100 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// #1307 review: `CTRL-W` must be able to *leave* the quickfix panel
+    /// window, not just enter it — the previous test above deliberately
+    /// clicks back into the file pane before pressing `CTRL-W` specifically
+    /// to route around `QuickfixList::has_focus` swallowing every key
+    /// (including a `CTRL-W` chord) while focus is inside the panel. That
+    /// left the exact scenario the issue is about — a keyboard-only user
+    /// doing `:copen` then trying `CTRL-W` to get back to their file —
+    /// uncovered. This test presses `CTRL-W` immediately after `:copen`,
+    /// with no click in between, so focus starts out genuinely inside the
+    /// panel (`QuickfixList::has_focus` still set, exactly as `:copen`
+    /// leaves it).
+    ///
+    /// **Verified RED against unfixed `develop`** (confirmed by hand: with
+    /// `Engine::handle_key`'s quickfix-interception block routing `CTRL-W`
+    /// to `qf_handle_key` like every other key, its `_ => EngineAction::None`
+    /// fallback swallows the chord — focus never leaves the panel, so
+    /// `iZ<Esc>` below inserts into the quickfix scratch buffer instead of
+    /// the file, and the final `screen.contains("ZCOPEN1307B_000")`
+    /// assertion fails).
+    #[test]
+    fn copen_ctrl_w_from_inside_panel_reaches_file_window_via_shell_app() {
+        const WIDTH: u16 = 100;
+        const HEIGHT: u16 = 32;
+
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_test_1307_copen_ctrl_w_from_inside_{:?}",
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("copen1307b.txt");
+        let content: String = (0..5).map(|i| format!("COPEN1307B_{i:03}\n")).collect();
+        std::fs::write(&file, &content).unwrap();
+
+        let mut app = TuiShellApp::new(None);
+        app.engine.settings.autohide_panels = false;
+        app.engine.app_shell.hide_sidebar();
+        app.engine.session.explorer_visible = false;
+        app.engine
+            .open_file_with_mode(&file, crate::core::engine::OpenMode::Permanent)
+            .unwrap();
+        app.engine
+            .quickfix
+            .items
+            .push(crate::core::project_search::ProjectMatch {
+                file: PathBuf::from("qfmarker1307b.rs"),
+                line: 0,
+                col: 0,
+                line_text: "MARKERTEXT1307B".to_string(),
+            });
+
+        let mut driver = driver_with_shell(app, config(), WIDTH, HEIGHT);
+        driver.render();
+
+        for c in ":copen".chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
+        driver.render();
+
+        // Sanity: the quickfix panel's content painted, confirming `:copen`
+        // ran and (per its own doc comment) left focus inside the panel —
+        // this is the state the fix must be able to navigate *out of* via
+        // `CTRL-W`, not around.
+        let screen_before = driver.screen();
+        assert!(
+            screen_before.contains("qfmarker1307b.rs") && screen_before.contains("MARKERTEXT1307B"),
+            "test setup sanity: `:copen` must paint the quickfix panel \
+             before the CTRL-W chord under test runs;\nscreen:\n{screen_before}"
+        );
+
+        // The discriminating step: CTRL-W directly from inside the panel,
+        // no click in between. The quickfix window sits at the bottom of a
+        // full-width wrap, so `CTRL-W k` (move up) must reach the file
+        // window above it.
+        driver.ctrl_char('w');
+        driver.type_char('k');
+        driver.type_char('i');
+        driver.type_char('Z');
+        driver.press_named(quadraui::NamedKey::Escape);
+        driver.render();
+
+        let screen_after = driver.screen();
+        assert!(
+            screen_after.contains("ZCOPEN1307B_000"),
+            "`CTRL-W k` pressed from *inside* the quickfix panel must move \
+             focus onto the file window above it, so `iZ<Esc>` afterward \
+             edits the file, not the quickfix scratch buffer;\n\
+             screen:\n{screen_after}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// #35: `render_content` must paint the minimap through the shell path,
     /// as braille — not just populate `ScreenLayout.minimap`.
     ///

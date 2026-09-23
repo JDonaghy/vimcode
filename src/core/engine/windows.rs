@@ -532,6 +532,17 @@ impl Engine {
     /// the generic `close_window`'s fallback does. A no-op if `target` has
     /// no real window (the common case — most `:cclose`/`:lclose` calls
     /// target an already-closed or never-opened panel).
+    ///
+    /// #1307 review: `target`'s panel window can be a different *tab* than
+    /// whichever one is currently active — e.g. `:copen` in tab 1
+    /// (auto-focusing the panel there), `:tabnew` to tab 2, then `:cclose`
+    /// from tab 2. `qf_panel_windows` has no per-tab scoping, so this must
+    /// look up the (group, tab) that actually contains `win_id` via
+    /// `find_window_tab` and mutate *that* tab's layout/`active_window` —
+    /// never blindly `self.active_tab_mut()`, which would silently no-op
+    /// against the wrong tab's layout and leave the owning tab's
+    /// `active_window` dangling (a later panic in `Engine::active_window`
+    /// once that tab becomes active again).
     pub(crate) fn qf_close_panel_window(&mut self, target: Option<WindowId>) {
         let Some(win_id) = self.qf_panel_windows.remove(&target) else {
             return;
@@ -539,21 +550,34 @@ impl Engine {
         if !self.windows.contains_key(&win_id) {
             return;
         }
-        let was_active = self.active_window_id() == win_id;
-        let prev = self.active_tab().prev_window;
+        let Some((group_id, tab_idx)) = self.find_window_tab(win_id) else {
+            // Not in any tab's layout (shouldn't happen for a live panel
+            // window, but stay defensive rather than mutate the wrong tab).
+            self.windows.remove(&win_id);
+            self.location_lists.remove(&win_id);
+            self.prune_jump_list_windows(&[win_id]);
+            self.scroll_bind_pairs
+                .retain(|&(a, b)| a != win_id && b != win_id);
+            return;
+        };
+        let tab_ref = &self.editor_groups[&group_id].tabs[tab_idx];
+        let was_active = tab_ref.active_window == win_id;
+        let prev = tab_ref.prev_window;
         {
-            let tab = self.active_tab_mut();
+            let tab = &mut self.editor_groups.get_mut(&group_id).unwrap().tabs[tab_idx];
             if let Some(new_layout) = tab.layout.remove(win_id) {
                 tab.layout = new_layout;
             }
         }
         if was_active {
-            let ids = self.active_tab().layout.window_ids();
+            let ids = self.editor_groups[&group_id].tabs[tab_idx]
+                .layout
+                .window_ids();
             let restore = prev
                 .filter(|p| ids.contains(p))
                 .or_else(|| ids.first().copied());
             if let Some(id) = restore {
-                self.active_tab_mut().focus_window(id);
+                self.editor_groups.get_mut(&group_id).unwrap().tabs[tab_idx].focus_window(id);
             }
         }
         let buf_id = self.windows.get(&win_id).map(|w| w.buffer_id);
@@ -573,7 +597,7 @@ impl Engine {
                 let _ = self.buffer_manager.delete(buf_id, true);
             }
         }
-        self.repair_active_window();
+        self.repair_window_in_tab(group_id, tab_idx);
     }
 
     /// Close all windows except the active one in the current tab.

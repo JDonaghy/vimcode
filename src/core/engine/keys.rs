@@ -288,6 +288,62 @@ impl Engine {
             .location_lists
             .get(&self.active_window_id())
             .is_some_and(|l| l.has_focus);
+
+        // #1307 review: when the active window *is* a quickfix/location-list
+        // panel's own real `WindowLayout` leaf, `CTRL-W` must be able to
+        // leave it exactly the way it can enter it — a real Neovim quickfix
+        // window is an ordinary window as far as `CTRL-W` navigation is
+        // concerned, even though the block below intercepts everything else
+        // (j/k/Enter/Escape/q/...) as panel-specific navigation. Handle the
+        // chord here, before that catch-all, using the same `pending_key`
+        // sentinel and `execute_wincmd` dispatch `handle_normal_key` uses for
+        // every other window — otherwise `qf_handle_key`'s `_ => None`
+        // fallback silently swallows it and the panel becomes a one-way
+        // door (enterable, not leaveable). Scoped to `panel_target.is_some()`
+        // (a *real* window) rather than the legacy `has_focus`-only overlay
+        // case, which has no `WindowLayout` leaf for `CTRL-W` to reach.
+        if panel_target.is_some() {
+            if ctrl && (key_name == "w" || unicode == Some('w')) {
+                self.pending_key = Some('\x17');
+                return EngineAction::None;
+            }
+            if self.pending_key == Some('\x17') {
+                self.pending_key = None;
+                // Clear the legacy `has_focus` flag for whichever list this
+                // panel window serves *before* dispatching: the sub-command
+                // below can move focus off the panel (or close it outright)
+                // without going through `qf_close`/`Engine::mouse_click` —
+                // otherwise the only two places that clear it — which is
+                // exactly what left it stale and swallowing every
+                // subsequent keystroke system-wide even after focus had
+                // genuinely moved elsewhere (#1307 review). Harmless when
+                // the sub-command keeps focus in the panel (e.g. a resize):
+                // the intercept check below re-derives from `panel_target`
+                // independently, using whichever window ends up active.
+                match panel_target {
+                    Some(None) => self.quickfix.has_focus = false,
+                    Some(Some(owner)) => {
+                        if let Some(list) = self.location_lists.get_mut(&owner) {
+                            list.has_focus = false;
+                        }
+                    }
+                    None => {}
+                }
+                if let Some(ch) = unicode {
+                    let count = self.take_count().max(1);
+                    return self.execute_wincmd(ch, count);
+                }
+                match key_name {
+                    "Left" => self.focus_window_direction(SplitDirection::Vertical, false),
+                    "Down" => self.focus_window_direction(SplitDirection::Horizontal, true),
+                    "Up" => self.focus_window_direction(SplitDirection::Horizontal, false),
+                    "Right" => self.focus_window_direction(SplitDirection::Vertical, true),
+                    _ => {}
+                }
+                return EngineAction::None;
+            }
+        }
+
         if self.quickfix.has_focus || loc_has_focus || panel_target.is_some() {
             // TUI sends printable keys as `key_name=""` + `unicode=Some(c)`;
             // GTK sends `key_name="j"`. Normalise so `j`/`k`/`q` close and
