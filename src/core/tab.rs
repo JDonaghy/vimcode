@@ -54,7 +54,6 @@ impl Tab {
     }
 
     /// Check if this tab contains a specific window.
-    #[allow(dead_code)]
     pub fn contains_window(&self, window_id: WindowId) -> bool {
         self.layout.window_ids().contains(&window_id)
     }
