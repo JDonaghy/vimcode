@@ -772,8 +772,17 @@ mod tests {
 
     #[cfg(unix)]
     fn spawn_fixture(extra_env: &[(&str, &str)]) -> AcpClient {
-        let (shell, _flag) = crate::core::terminal::shell_command();
-        let argv = vec![shell, fixture_path().to_string_lossy().into_owned()];
+        // Deliberately NOT `core::terminal::shell_command()`: that seam picks
+        // an interpreter to run a *user-supplied command string* via `-c`
+        // ("the user's shell"). Here we're invoking a fixed, checked-in
+        // script (`fake_acp_agent.sh`) that is itself `#!/bin/sh` and
+        // documents its use of POSIX-only features (`case...esac`, `sed`,
+        // shell functions) — it is not portable to `$SHELL` being e.g. fish
+        // or csh/tcsh. "sh" must stay hardcoded here (see #1255).
+        let argv = vec![
+            "sh".to_string(),
+            fixture_path().to_string_lossy().into_owned(),
+        ];
         let cwd = std::env::temp_dir();
         AcpClient::spawn_with_env(&argv, &cwd, extra_env).expect("fixture agent should spawn")
     }
