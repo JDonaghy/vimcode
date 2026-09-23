@@ -21965,12 +21965,21 @@ pub fn build_command_line(engine: &Engine) -> CommandLineData {
         _ => (engine.message.clone(), false, false, String::new()),
     };
 
-    // Safety: strip newlines so the command line never exceeds one row
-    let text = if let Some(first) = text.lines().next() {
-        first.to_string()
-    } else {
-        text
-    };
+    // Safety: strip newlines so the command line never exceeds one row.
+    // A message that *starts* with a blank line (Neovim's `:digraphs`, no
+    // bang, deliberately leads with one to mirror `listdigraphs` —
+    // `format_digraph_table`, #1302) would otherwise make `.lines().next()`
+    // yield `""` and paint nothing at all, even though the message holds
+    // real content on its second line — so skip past any leading empty
+    // lines first and show the first line that actually has something in
+    // it. `trim_start_matches` only strips a *leading* run, so a message
+    // that never had a blank line (every other caller) is unaffected.
+    let text = text
+        .trim_start_matches('\n')
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .to_string();
 
     CommandLineData {
         text,

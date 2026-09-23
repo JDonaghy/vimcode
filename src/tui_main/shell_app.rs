@@ -12464,6 +12464,62 @@ mod tests {
         );
     }
 
+    /// #1302: `:digraphs` (no bang) must paint Neovim's real digraph table
+    /// on the command line, not a blank row.
+    ///
+    /// `format_digraph_table` deliberately prepends a leading blank line to
+    /// `engine.message` to mirror Neovim's `listdigraphs` (`digraph.c`'s
+    /// `msg_putchar('\n')` before the loop) — but `build_command_line`
+    /// collapses a multi-line message to one row for display, and naively
+    /// taking `.lines().next()` of a string that *starts* with `\n` yields
+    /// `""`, painting nothing at all even though the message holds the real
+    /// table on its second line. `build_command_line` must skip past that
+    /// leading blank line and show the first line with actual content
+    /// (here, the `NU ^@  10 ...` row) instead.
+    ///
+    /// **Verified RED against unfixed `develop`:** with `render.rs` reverted
+    /// to plain `text.lines().next()`, the command line row is empty and
+    /// the `driver.find` below panics.
+    #[test]
+    fn digraphs_paints_first_table_row_not_a_blank_line_via_shell_app() {
+        const HEIGHT: u16 = 24;
+        let app = TuiShellApp::new_for_test();
+        let mut driver = driver_with_shell(app, config(), 100, HEIGHT);
+        run_ex_command(&mut driver, ":digraphs");
+
+        let screen = driver.screen();
+        let (_, y) = driver.find("NU ^@  10").unwrap_or_else(|| {
+            panic!(
+                "`:digraphs` must reach the ex parser and paint Neovim's \
+                 real digraph table on the command line, starting with the \
+                 `NU ^@  10 ...` row (#1302) — not a blank row; \
+                 screen:\n{screen}"
+            )
+        });
+        assert_eq!(
+            y as u16,
+            HEIGHT - 1,
+            "the digraph table's first content row must paint on the \
+             command line (last row), not in the document body — a hit \
+             anywhere else means the keystrokes were swallowed as \
+             normal/insert-mode edits instead of reaching the ex \
+             `:digraphs` branch; screen:\n{screen}"
+        );
+        let command_row = screen.lines().nth(y as usize).unwrap_or_default();
+        assert!(
+            !command_row.trim().is_empty(),
+            "the command line must not be blank after `:digraphs` \
+             (the #1302 regression — a leading `\\n` in `engine.message` \
+             made `build_command_line` paint an empty row); \
+             screen:\n{screen}"
+        );
+        assert!(
+            !screen.contains("Not an editor command"),
+            "`:digraphs` must not be rejected as an unknown command; \
+             screen:\n{screen}"
+        );
+    }
+
     /// A modal dialog must paint *and* cache its `DialogLayout` — the layout
     /// is what `handle_key_pressed`'s dialog tier and `handle_mouse_event`
     /// hit-test against, so a paint that doesn't publish it is only half
