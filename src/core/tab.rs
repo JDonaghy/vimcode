@@ -17,10 +17,12 @@ pub struct Tab {
     /// the *tab* (vim-split) level — distinct from `Engine::prev_active_group`,
     /// which tracks the VSCode-style editor-group toggle. Backs `CTRL-W p`
     /// (`:h CTRL-W_p`) within a single editor group (#1292). `None` until the
-    /// active window has changed at least once in this tab, or once the
-    /// recorded window has left the tab (closed, or moved elsewhere) —
-    /// `execute_wincmd`'s `'p'` arm treats either as "no previous window",
-    /// matching Neovim's no-op/fallback rather than reviving a stale id.
+    /// active window has changed at least once in this tab. The field itself
+    /// is never cleared when the recorded window later leaves the tab
+    /// (closed, or moved elsewhere) — instead `execute_wincmd`'s `'p'` arm
+    /// re-validates it against the tab's current window set at read time and
+    /// treats a stale id the same as `None`, matching Neovim's no-op/fallback
+    /// rather than reviving a stale id.
     pub prev_window: Option<WindowId>,
 }
 
