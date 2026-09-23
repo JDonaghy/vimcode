@@ -772,10 +772,8 @@ mod tests {
 
     #[cfg(unix)]
     fn spawn_fixture(extra_env: &[(&str, &str)]) -> AcpClient {
-        let argv = vec![
-            "sh".to_string(),
-            fixture_path().to_string_lossy().into_owned(),
-        ];
+        let (shell, _flag) = crate::core::terminal::shell_command();
+        let argv = vec![shell, fixture_path().to_string_lossy().into_owned()];
         let cwd = std::env::temp_dir();
         AcpClient::spawn_with_env(&argv, &cwd, extra_env).expect("fixture agent should spawn")
     }
