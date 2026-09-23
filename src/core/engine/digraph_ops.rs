@@ -8,21 +8,22 @@ impl Engine {
         digraphs::lookup(c1, c2, &self.custom_digraphs)
     }
 
-    /// `:digraphs` (`:h :digraphs`). No args: list every known digraph
-    /// (custom entries first, then the builtin table). With args of the
-    /// form `{char1}{char2} {number} [{char1}{char2} {number} ...]`: define
-    /// one or more custom digraphs (`:h digraph-usage`), each `{number}` a
-    /// decimal Unicode codepoint.
+    /// `:digraphs` (`:h :digraphs`). No args: list every known digraph as
+    /// Neovim's `:digraphs` (no bang) does — a column-wrapped grid, builtin
+    /// table first and any custom (`:digraph`-defined) entries after (never
+    /// the other way; `listdigraphs` in Neovim's `digraph.c` always lists
+    /// the builtin `digraphdefault` table before `user_digraphs` — #1302).
+    /// With args of the form `{char1}{char2} {number} [{char1}{char2}
+    /// {number} ...]`: define one or more custom digraphs (`:h
+    /// digraph-usage`), each `{number}` a decimal Unicode codepoint.
     pub(crate) fn ex_digraphs(&mut self, args: &str) -> EngineAction {
         if args.is_empty() {
-            let mut lines: Vec<String> = Vec::new();
-            for (&(c1, c2), &ch) in &self.custom_digraphs {
-                lines.push(format!("{c1}{c2} {ch}  {}", ch as u32));
-            }
-            for &(c1, c2, ch) in digraphs::BUILTIN_DIGRAPHS {
-                lines.push(format!("{c1}{c2} {ch}  {}", ch as u32));
-            }
-            self.message = lines.join("\n");
+            let builtin = digraphs::BUILTIN_DIGRAPHS.iter().copied();
+            let custom = self
+                .custom_digraphs
+                .iter()
+                .map(|(&(c1, c2), &ch)| (c1, c2, ch));
+            self.message = digraphs::format_digraph_table(builtin.chain(custom));
             return EngineAction::None;
         }
 
