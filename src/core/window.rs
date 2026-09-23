@@ -235,6 +235,40 @@ impl WindowLayout {
         Some(ids[prev_idx])
     }
 
+    /// Overwrite this layout's leaf `WindowId`s in place, in the same
+    /// tree-walk order [`window_ids`](Self::window_ids) visits them, with
+    /// the ids in `new_ids`. Used by `rotate_windows` (#1291) to reorder
+    /// window *identity* across the fixed tree shape — which `WindowId`
+    /// (and therefore which window's content and, if it was the active
+    /// one, focus) occupies each screen slot — instead of swapping each
+    /// slot's window's `buffer_id`/`view` while every `WindowId` stays
+    /// pinned to the position it started in. Panics if `new_ids.len()`
+    /// doesn't match the number of leaves: the only caller always builds
+    /// `new_ids` as a permutation of this same layout's own `window_ids()`,
+    /// so a mismatch means caller error, not user input.
+    pub fn set_window_ids_in_order(&mut self, new_ids: &[WindowId]) {
+        let mut it = new_ids.iter();
+        self.set_window_ids_in_order_inner(&mut it);
+        assert!(
+            it.next().is_none(),
+            "set_window_ids_in_order: new_ids longer than leaf count"
+        );
+    }
+
+    fn set_window_ids_in_order_inner(&mut self, it: &mut std::slice::Iter<'_, WindowId>) {
+        match self {
+            WindowLayout::Leaf(id) => {
+                *id = *it
+                    .next()
+                    .expect("set_window_ids_in_order: new_ids shorter than leaf count");
+            }
+            WindowLayout::Split { first, second, .. } => {
+                first.set_window_ids_in_order_inner(it);
+                second.set_window_ids_in_order_inner(it);
+            }
+        }
+    }
+
     /// Check if layout contains only one window.
     pub fn is_single_window(&self) -> bool {
         matches!(self, WindowLayout::Leaf(_))
@@ -1103,6 +1137,43 @@ mod tests {
         assert_eq!(layout.next_window(WindowId(2)), Some(WindowId(1)));
         assert_eq!(layout.prev_window(WindowId(1)), Some(WindowId(2)));
         assert_eq!(layout.prev_window(WindowId(2)), Some(WindowId(1)));
+    }
+
+    #[test]
+    fn test_set_window_ids_in_order_permutes_leaves_not_active() {
+        // Three windows nested as (1 (2 3)) — mirrors how a `<C-w>s<C-w>v`
+        // sequence nests a horizontal then a vertical split.
+        let mut layout = WindowLayout::leaf(WindowId(1));
+        layout.split_at(WindowId(1), SplitDirection::Horizontal, WindowId(2), false);
+        layout.split_at(WindowId(2), SplitDirection::Vertical, WindowId(3), false);
+        assert_eq!(
+            layout.window_ids(),
+            vec![WindowId(1), WindowId(2), WindowId(3)]
+        );
+
+        // #1291: CTRL-W r's "forward" rotation — the id that was in the last
+        // leaf slot moves to the first slot, and every other id shifts down
+        // one slot — applied to identity, not content.
+        let ids = layout.window_ids();
+        let mut rotated = ids.clone();
+        let last = rotated.pop().unwrap();
+        rotated.insert(0, last);
+        layout.set_window_ids_in_order(&rotated);
+
+        // The tree *shape* (which slots are leaves vs splits) is untouched;
+        // only which WindowId occupies each slot changed.
+        assert_eq!(
+            layout.window_ids(),
+            vec![WindowId(3), WindowId(1), WindowId(2)]
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "shorter than leaf count")]
+    fn test_set_window_ids_in_order_panics_on_too_few_ids() {
+        let mut layout = WindowLayout::leaf(WindowId(1));
+        layout.split_at(WindowId(1), SplitDirection::Vertical, WindowId(2), false);
+        layout.set_window_ids_in_order(&[WindowId(9)]);
     }
 
     #[test]

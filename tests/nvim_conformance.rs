@@ -2640,8 +2640,9 @@ fn run_jumps_case(case: &MultiJumpsCase) -> Outcome {
 // 80x24 screen), but the comparison only *looks* at them when
 // `check_size` is set — see the [`KNOWN_DEVIATIONS_WIN`] entries for the
 // real, distinct behavioural gaps this surfaced (a resize-unit mismatch, a
-// partial vs full maximize, a rect-rounding artifact, and a rotate that
-// doesn't move window identity). Two of the size-checked ids, `CTRL-W +`
+// partial vs full maximize, and a rect-rounding artifact — the rotate
+// identity gap this harness also found, #1291, is now fixed). Two of the
+// size-checked ids, `CTRL-W +`
 // and `_`, genuinely pass — not vacuously: both land on the *same* rows/cols
 // as Neovim on this harness's fixed 80x24 screen, which is worth noting
 // precisely because it means a couple of quick hand-tests of this family
@@ -9053,12 +9054,13 @@ const CASES_WIN: &[WinCase] = &[
         1,
         "<C-w>s<C-w>x",
     ),
-    // #1162 finding: `rotate_windows` rotates *content* across fixed
-    // `WindowId` tree slots rather than reordering window identity in the
-    // tree, so "current" stays pinned to the same screen position instead
-    // of following the window that was focused before the rotate (every
-    // leaf shows the same file/cursor here on purpose — `current` is the
-    // only signal that can distinguish the two models). See
+    // #1162 finding, FIXED by #1291: `rotate_windows` used to rotate
+    // *content* across fixed `WindowId` tree slots rather than reordering
+    // window identity in the tree, so "current" stayed pinned to the same
+    // screen position instead of following the window that was focused
+    // before the rotate (every leaf shows the same file/cursor here on
+    // purpose — `current` is the only signal that can distinguish the two
+    // models). Now a real, non-vacuous pass — removed from
     // KNOWN_DEVIATIONS_WIN.
     wc(
         "win:CTRL-W r rotates windows downward/rightward",
@@ -12909,11 +12911,15 @@ fn nvim_conformance_jumplist_multi_file() {
 //      is correct and shared with `GroupLayout` — the rounding-tie bug was
 //      strictly downstream of it).
 //   4. (#1291) "win:CTRL-W r/R rotate window identity, not just content"
-//      — rotate_windows swaps buffer_id/view across fixed WindowId tree
+//      — rotate_windows swapped buffer_id/view across fixed WindowId tree
 //      slots, leaving Tab::active_window pinned to the same screen
 //      position. Neovim rotates which window (identity + focus) occupies
-//      which position. Needs rotate_windows to reorder WindowIds in the
-//      WindowLayout tree instead of swapping fields across static slots.
+//      which position. FIXED: rotate_windows now permutes the `WindowId`s
+//      themselves through the tree's leaf slots (`WindowLayout::
+//      set_window_ids_in_order`) instead of copying `buffer_id`/`view`
+//      across static slots — `Tab::active_window` is left untouched, so a
+//      window that was focused before the rotate keeps its `WindowId` (and
+//      therefore focus) after landing in its new screen slot.
 //   5. (#1292) "win:CTRL-W p track Tab::prev_window for real previous-window recall"
 //      — execute_wincmd's 'p' arm only restores prev_active_group (the
 //      VSCode-style editor-group tree); there is no Tab-level "previously
@@ -12996,9 +13002,11 @@ const KNOWN_DEVIATIONS_WIN: &[&str] = &[
     // direction. "win:CTRL-W = re-equalizes windows after a resize" is now
     // a real, non-vacuous pass and was removed from this list.
     // Follow-up #4 above ("rotate window identity, not just content") —
-    // filed as #1291.
-    "win:CTRL-W r rotates windows downward/rightward",
-    "win:CTRL-W R rotates windows upward/leftward",
+    // filed and FIXED as #1291: `rotate_windows` now reorders `WindowId`s
+    // in the tree instead of swapping content across static slots, so
+    // focus follows the window. "win:CTRL-W r/R rotate windows
+    // downward/rightward"/"upward/leftward" are now real, non-vacuous
+    // passes and were removed from this list.
     // Follow-up #5 above ("track Tab::prev_window") — filed as #1292.
     "win:CTRL-W p returns to the previously active window",
 ];
@@ -22061,9 +22069,9 @@ fn visual_audit_gates_are_bidirectional() {
 //                                      ───
 //                                      376 index rows, tagged as 370 entries
 //
-//     ✅ Implemented       214
+//     ✅ Implemented       216
 //     🟡 Partial            17
-//     ❌ Not implemented   115
+//     ❌ Not implemented   113
 //     ⏭️  Skipped            24   (each carrying a reason from SKIP_REASONS)
 //                          ───
 //                          370
@@ -27168,7 +27176,7 @@ const NORMAL_AUDIT: &[NormAudit] = &[
     na(
         "CTRL-W R",
         "CTRL-W_R",
-        NotImplemented,
+        Implemented,
         Some(nlive(
             NA_TXT,
             (1, 1),
@@ -27181,12 +27189,14 @@ const NORMAL_AUDIT: &[NormAudit] = &[
             1,
             1,
             "",
-            "(h0.50 2* 1) tabs=1/1",
+            "(h0.50 1 2*) tabs=1/1",
         )),
         Some(Label("win:C-w R rotates upwards")),
         concat!(
-            "Vim rotates the windows upwards; vimcode's layout is ",
-            "byte-identical afterwards (window ids in the same slots).",
+            "Fixed by #1291: rotate_windows reorders WindowIds within the ",
+            "tree instead of swapping content across static slots, so ",
+            "matches Vim — with only 2 windows, R's one-step-upward ",
+            "rotation lands on the same swap as r's one-step-downward one.",
         ),
     ),
     na(
@@ -27789,7 +27799,7 @@ const NORMAL_AUDIT: &[NormAudit] = &[
     na(
         "CTRL-W r",
         "CTRL-W_r",
-        NotImplemented,
+        Implemented,
         Some(nlive(
             NA_TXT,
             (1, 1),
@@ -27802,12 +27812,13 @@ const NORMAL_AUDIT: &[NormAudit] = &[
             1,
             1,
             "",
-            "(h0.50 2* 1) tabs=1/1",
+            "(h0.50 1 2*) tabs=1/1",
         )),
         Some(Label("win:C-w r rotates downwards")),
         concat!(
-            "Vim rotates the windows downwards; vimcode's layout is unchanged ",
-            "afterwards.",
+            "Fixed by #1291: rotate_windows reorders WindowIds within the ",
+            "tree instead of swapping content across static slots, so ",
+            "matches Vim — the rotated-to window keeps focus.",
         ),
     ),
     na(
@@ -30794,7 +30805,7 @@ fn normal_audit_is_internally_consistent() {
             tally(|e| matches!(e.status, OptStatus::Skipped(_))),
             tally(|e| e.live.is_some()),
         ),
-        (214, 17, 115, 24, 323),
+        (216, 17, 113, 24, 323),
         "the audit tally moved: (implemented, partial, missing, skipped, \
          replayed). Update the section doc's table in the same commit."
     );
