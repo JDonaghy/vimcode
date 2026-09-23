@@ -12361,6 +12361,61 @@ mod tests {
         );
     }
 
+    /// #1301: `:jumps` must paint Neovim's real ` jump line  col file/text`
+    /// header — no vimcode-invented `tab` column — and must reach the ex
+    /// `"jumps"` branch at all.
+    ///
+    /// Per `build_command_line`'s "strip newlines so the command line never
+    /// exceeds one row" rule (see `marks_paints_nvim_header_via_shell_app`'s
+    /// doc comment above, which explains the same constraint), a one-row
+    /// command line can only show the message's *first* line, i.e. the
+    /// header. The full multi-row listing — the jump-number/line/col
+    /// columns, the `file/text` preview content for both same-buffer and
+    /// cross-buffer entries, and the trailing bare `>` line — is covered by
+    /// `test_ex_jumps_drops_tab_column_and_shows_file_text_preview` in
+    /// `src/core/engine/tests.rs`, this test's engine-tier twin.
+    ///
+    /// **Verified RED against unfixed `develop`:** with `execute.rs`
+    /// reverted to develop's `"jumps"` arm, the header paints
+    /// ` jump line  col  tab  file/text` (vimcode's invented `tab` column)
+    /// and the assertion below fails.
+    #[test]
+    fn jumps_paints_nvim_header_via_shell_app() {
+        const HEIGHT: u16 = 24;
+        let app = TuiShellApp::new_for_test();
+        let mut driver = driver_with_shell(app, config(), 100, HEIGHT);
+        run_ex_command(&mut driver, ":jumps");
+
+        let screen = driver.screen();
+        let (_, y) = driver.find(" jump line  col file/text").unwrap_or_else(|| {
+            panic!(
+                "`:jumps` must reach the ex parser and paint Neovim's \
+                     real ` jump line  col file/text` header on the command \
+                     line (#1301); screen:\n{screen}"
+            )
+        });
+        assert_eq!(
+            y as u16,
+            HEIGHT - 1,
+            "the jumps listing's header must paint on the command line \
+             (last row), not in the document body — a hit anywhere else \
+             means the keystrokes were swallowed as normal/insert-mode \
+             edits instead of reaching the ex `:jumps` branch; \
+             screen:\n{screen}"
+        );
+        assert!(
+            !screen.contains("Not an editor command"),
+            "`:jumps` must not be rejected as an unknown command; \
+             screen:\n{screen}"
+        );
+        let header_row = screen.lines().nth(y as usize).unwrap_or_default();
+        assert!(
+            !header_row.contains("tab"),
+            "the pre-#1301 invented `tab` column must be gone from the \
+             command-line header row; row:\n{header_row}"
+        );
+    }
+
     /// #1300: `:marks` must paint Neovim's real `mark line  col file/text`
     /// header (single space before `file/text` — the pre-fix arm had two)
     /// and must reach the ex `"marks"` branch at all.
