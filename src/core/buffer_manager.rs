@@ -328,12 +328,18 @@ impl UndoTree {
     /// cutoff` (`:earlier {N}[smhd]`). Falls back to the oldest live node if
     /// every one postdates `cutoff`.
     ///
-    /// #1280 follow-up, filed as #1294 (not yet fixed here): this reads
-    /// `cursor_after`, the same bug `older`/`newer` had before #1280 fixed
-    /// them to read `cursor_before`. No corpus case exercises the time-spec
-    /// form of `:earlier`/`:later` landing on a non-root node yet, so
-    /// nothing regresses today, but this is likely wrong for the same
-    /// reason.
+    /// #1294 (#1280 follow-up): returns the target node's `cursor_before`,
+    /// not `cursor_after` — same fix and same reasoning as `older`/`newer`,
+    /// just above. Verified by hand against a live `nvim --headless`
+    /// `--listen`/`--remote-send` session (not replayable through this
+    /// suite's key-replay oracle harness, since `:sleep` is unimplemented in
+    /// vimcode and the whole point here is a real wall-clock gap between two
+    /// commits): `ihello<Esc>`, a real ~2s pause, then `0ix<Esc>` from a
+    /// fresh cursor position, then `:earlier 1s` landed on the `"hello"`
+    /// node with the cursor at col 0 — where the `hello` edit *started*
+    /// (`cursor_before`), not col 4 where it *finished* (`cursor_after`).
+    /// The forward direction (`:later {N}[smhd]`) was checked the same way
+    /// and also lands on `cursor_before`.
     pub fn at_or_before(&mut self, cutoff: SystemTime) -> Option<(String, Cursor)> {
         let live = self.live_indices_sorted();
         let idx = live
@@ -344,11 +350,12 @@ impl UndoTree {
             .or_else(|| live.first().copied())?;
         self.current = idx;
         let n = &self.nodes[idx];
-        Some((n.text.clone(), n.cursor_after))
+        Some((n.text.clone(), n.cursor_before))
     }
 
     /// Move to the live node with the smallest `seq` whose `timestamp >=
-    /// cutoff` (`:later {N}[smhd]`).
+    /// cutoff` (`:later {N}[smhd]`). See `at_or_before`, just above, for why
+    /// this reads `cursor_before`.
     pub fn at_or_after(&mut self, cutoff: SystemTime) -> Option<(String, Cursor)> {
         let live = self.live_indices_sorted();
         let idx = live
@@ -358,7 +365,7 @@ impl UndoTree {
             .or_else(|| live.last().copied())?;
         self.current = idx;
         let n = &self.nodes[idx];
-        Some((n.text.clone(), n.cursor_after))
+        Some((n.text.clone(), n.cursor_before))
     }
 
     /// 1-based position of the current node within the live, `seq`-ordered

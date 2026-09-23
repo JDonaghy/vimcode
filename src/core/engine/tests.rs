@@ -2533,6 +2533,95 @@ fn test_ex_earlier_time_spec_falls_back_to_oldest_state() {
     assert_eq!(engine.buffer().to_string(), "abc");
 }
 
+/// #1294 (#1280 follow-up): `:earlier {N}[smhd]` must land on the target
+/// node's `cursor_before` (where *its own* edit started), not `cursor_after`
+/// (where it finished) — same fix, and same reasoning, as `g-`/`g+` got in
+/// #1280. `test_ex_earlier_time_spec_falls_back_to_oldest_state`, just above,
+/// can't catch this: it lands on the root, where `cursor_before ==
+/// cursor_after` by construction (exactly the pitfall #1280's own doc
+/// comment on `older`/`newer` describes for the count-based form's one
+/// pre-#1280 corpus case). This test instead lands on a *non-root* node with
+/// deliberately distinct `cursor_before`/`cursor_after`, so reading the wrong
+/// field produces a visibly wrong column. Verified by hand against a live
+/// `nvim --headless --listen`/`--remote-send` session (not automatable
+/// through this suite's key-replay oracle harness — `:sleep` is
+/// unimplemented in vimcode, and the real bug here needs a genuine wall-clock
+/// gap between two commits): `ihello<Esc>`, a ~2s real pause, then
+/// `0ix<Esc>`, then `:earlier 1s` landed on the `"hello"` node with the
+/// cursor at col 0 (where that edit started), not col 4 (where it finished).
+/// The node timestamps are backdated directly here (rather than a real
+/// `thread::sleep`) so the test is deterministic and fast; see the doc
+/// comment on `UndoTree::at_or_before` for the citation of that live-nvim
+/// session.
+#[test]
+fn test_ex_earlier_time_spec_lands_on_cursor_before_not_after() {
+    let mut engine = Engine::new();
+    // Node 1: cursor_before = col 0 (start of the empty buffer), cursor_after
+    // = col 4 (Esc lands on the trailing "o" of "hello").
+    send_keys(&mut engine, "ihello<Esc>");
+    assert_eq!(engine.view().cursor.col, 4);
+    // Node 2: `0` moves the cursor to col 0 *before* the insert group starts,
+    // so this node's own cursor_before/cursor_after are both col 0 — it's
+    // node 1 we're testing the landing on, not this one.
+    send_keys(&mut engine, "0ix<Esc>");
+    assert_eq!(engine.buffer().to_string(), "xhello");
+
+    // Backdate node 1 (the "hello" commit) far into the past, and leave the
+    // root and node 2 at their real (just-now) timestamps. A `1s` cutoff
+    // computed at the `execute_command` call below is only ever a fraction
+    // of a second after this test started, so it excludes the root and node
+    // 2 (both "younger" than the cutoff) and selects node 1 as the newest
+    // node at or before the cutoff — deterministically, with no real sleep.
+    {
+        let bs = engine.active_buffer_state_mut();
+        let far_past = std::time::SystemTime::now() - std::time::Duration::from_secs(10_000);
+        bs.undo_tree.nodes[1].timestamp = far_past;
+    }
+
+    engine.execute_command("earlier 1s");
+    assert_eq!(engine.buffer().to_string(), "hello");
+    assert_eq!(
+        engine.view().cursor.col,
+        0,
+        "`:earlier {{N}}s` must land on the target node's cursor_before (where its own edit started), not cursor_after"
+    );
+}
+
+/// #1294: the forward counterpart of the test just above — `:later
+/// {N}[smhd]` must also land on `cursor_before`, not `cursor_after`. Verified
+/// the same way against live `nvim --headless`: from the "hello" node,
+/// `u` back to the root, then `:later 1s` landed back on "hello" with the
+/// cursor at col 0, not col 4.
+#[test]
+fn test_ex_later_time_spec_lands_on_cursor_before_not_after() {
+    let mut engine = Engine::new();
+    // Node 1: cursor_before = col 0, cursor_after = col 4 — same distinct
+    // pair as the `:earlier` test above.
+    send_keys(&mut engine, "ihello<Esc>");
+    assert_eq!(engine.view().cursor.col, 4);
+
+    // Back to the root so `:later` has somewhere to jump forward *to*.
+    press_char(&mut engine, 'u');
+    assert_eq!(engine.buffer().to_string(), "");
+
+    // Backdate the root far into the past so a `1s`-ago cutoff excludes it,
+    // leaving node 1 (still at its real, just-now timestamp) as the only
+    // live node at or after the cutoff — deterministically, no real sleep.
+    {
+        let bs = engine.active_buffer_state_mut();
+        let far_past = std::time::SystemTime::now() - std::time::Duration::from_secs(10_000);
+        bs.undo_tree.nodes[0].timestamp = far_past;
+    }
+
+    engine.execute_command("later 1s");
+    assert_eq!(engine.buffer().to_string(), "hello");
+    assert_eq!(
+        engine.view().cursor.col,
+        0,
+        "`:later {{N}}s` must land on the target node's cursor_before (where its own edit started), not cursor_after"
+    );
+}
+
 #[test]
 fn test_undojoin_merges_next_change_into_previous_undo_step() {
     let mut engine = Engine::new();
