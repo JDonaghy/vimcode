@@ -2737,10 +2737,14 @@ impl Engine {
             self.message = "E471: Argument required".to_string();
             return EngineAction::None;
         }
+        // #1308: unlike `:cc`/`:cnext`/`:clist`/`:cfirst`/`:clast`, real
+        // Neovim's `:cdo`/`:cfdo`/`:ldo`/`:lfdo` are a silent no-op on an
+        // empty list — confirmed against a live `nvim --headless -u NONE`
+        // oracle. `pcall` succeeds and `v:errmsg` stays empty, so this must
+        // NOT set `Self::qf_empty_msg` like the other list-empty checks do.
         let items = match self.qf_get(win) {
             Some(list) if !list.items.is_empty() => list.items.clone(),
             _ => {
-                self.message = Self::qf_empty_msg(win);
                 return EngineAction::None;
             }
         };

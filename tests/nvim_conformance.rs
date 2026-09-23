@@ -9579,8 +9579,10 @@ const CASES_XFILE: &[WinCase] = &[
 // Follow-up #3 was filed as #1307 (filed 2026-09-22) and is now fixed —
 // its one case label is deleted below (the shrink-only gate: a
 // KNOWN_DEVIATIONS_XFILE entry that starts passing is removed, not kept for
-// history). Follow-up #4 was filed as #1308 and remains open/unfixed (it has
-// no case label to gate — see its own entry below for why).
+// history). Follow-up #4 was filed as #1308 (filed 2026-09-22) and is now
+// fixed — it never had a case label to gate (see its own entry below for
+// why), so there is nothing to delete from the array; only its writeup below
+// is updated.
 //
 //   1. (#1297, FIXED at the vimcode level — entries below stay red for a
 //      different reason, read on) "win:q: opens the command-line window" /
@@ -9645,22 +9647,27 @@ const CASES_XFILE: &[WinCase] = &[
 //      codebase's own rendering tests, and `qf_set_list`'s implicit `:grep`
 //      auto-open) is untouched — see `qf_has_real_window`'s doc comment.
 //
-//   4. (#1308, unfixed — no case label, since this scenario isn't reachable
-//      through the oracle `Case` harness at all, so it cannot be a
+//   4. (#1308, FIXED — no case label, since this scenario isn't reachable
+//      through the oracle `Case` harness at all, so it never was a
 //      `KNOWN_DEVIATIONS_XFILE` entry the way #3 was; it's tracked here
-//      purely as a follow-up.)
+//      purely as a follow-up, and stays tracked here now that it's fixed
+//      since there is no array entry to delete.)
 //      Title: "`:cdo`/`:cfdo`/`:ldo`/`:lfdo` should be silent no-ops on an
 //      empty quickfix/location list, not set a message". Confirmed against a
 //      live `nvim --headless -u NONE`: real Neovim's `:cdo {cmd}` (etc.) on
 //      an empty list is a silent no-op — `pcall` succeeds, `v:errmsg` stays
 //      empty — unlike `:cc`/`:cnext`/`:clist`/`:cfirst`/`:clast`, which all
-//      raise `E42: No Errors`. vimcode currently sets `engine.message` to
-//      the shared `E42: No Errors` wording for `:cdo`/`:cfdo`/`:ldo`/`:lfdo`
-//      too (see `execute.rs`'s handling of those four commands next to
-//      `qf_empty_msg`) — narrowing that one case to a true no-op (no message
-//      set) is a small, separable fix once filed. See
-//      `test_cdo_on_empty_list_errors_without_running_anything` in
-//      `src/core/engine/tests.rs` for the reproduction.
+//      raise `E42: No Errors`. vimcode used to set `engine.message` to the
+//      shared `E42: No Errors` wording for `:cdo`/`:cfdo`/`:ldo`/`:lfdo` too
+//      (see `execute.rs`'s handling of those four commands next to
+//      `qf_empty_msg`); `Engine::qf_do` (`src/core/engine/picker.rs`) now
+//      returns without touching `engine.message` at all on an empty list,
+//      matching the silent no-op. See
+//      `test_cdo_on_empty_list_is_silent_no_op` in `src/core/engine/tests.rs`
+//      (renamed from `test_cdo_on_empty_list_errors_without_running_anything`,
+//      which used to assert the old, wrong behaviour) for the regression
+//      guard — this is still the only one, since the scenario has no oracle
+//      `Case` to gate it.
 //
 // Follow-up #1 was not attempted in #1281 itself for the same reason #1162
 // gave for its own 5 (it since landed as #1297 — see that entry above for
@@ -9668,9 +9675,9 @@ const CASES_XFILE: &[WinCase] = &[
 // not attempted in #1283 for the same reason again (it has since landed as
 // #1307 — its case label is gone below, not kept, since `run_win_case`
 // *can* observe this one: no attached-UI transport gap like follow-up #1's,
-// just a genuine structural mismatch that #1307 closed); and #4 is
-// deliberately left as vimcode's existing (documented) behaviour rather than
-// narrowed inline, now filed as #1308 and still open.
+// just a genuine structural mismatch that #1307 closed); and #4 was left as
+// vimcode's existing (documented) behaviour rather than narrowed inline, now
+// filed as #1308 and fixed by that issue directly (see its writeup above).
 // ---------------------------------------------------------------------------
 
 const KNOWN_DEVIATIONS_XFILE: &[&str] = &[
