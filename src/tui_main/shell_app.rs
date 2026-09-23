@@ -18522,6 +18522,20 @@ mod tests {
     /// disappears from the screen the moment `q:` runs (the new tab
     /// replaces it entirely), so the first `screen_contains` assertion
     /// below fails. Restored, green again.
+    ///
+    /// Also covers the review follow-up: swapping `close_tab()` for
+    /// `close_window()` on the split-close path dropped `close_tab`'s
+    /// implicit eviction of buffers no longer referenced by any window, so
+    /// the cmdline window's `[Command History]`/`[Search History]` scratch
+    /// buffer leaked into `buffer_manager` on every `q:`/`q`. The `:bn`
+    /// block below proves it's gone via `close_window()`'s own orphan-scratch
+    /// sweep, black-box: with the leak, `:bn` has a second buffer to cycle
+    /// onto and its marker text reappears; fixed, `:bn` is a no-op.
+    /// **Verified RED against the pre-fix shape** for this part too
+    /// (confirmed by hand, reverting the `close_window()` orphan-scratch
+    /// sweep added for this review round): the `:bn` block's first
+    /// `screen_after_bn` assertion fails because `:bn` lands on the leaked
+    /// `[Command History]` buffer, blanking out the original file's line.
     #[test]
     fn q_colon_opens_a_split_not_a_new_tab_via_shell_app() {
         const WIDTH: u16 = 100;
@@ -18594,6 +18608,36 @@ mod tests {
             !screen_after_close.contains("set cmdwin1297marker"),
             "closing the cmdline window with `q` must remove its pane from \
              the screen;\nscreen:\n{screen_after_close}"
+        );
+
+        // #1297 review: closing the cmdline window via `close_window()`
+        // (instead of the old `close_tab()`) must still evict its ephemeral
+        // `[Command History]` scratch buffer from `buffer_manager` — not just
+        // unmap its window. Prove it black-box via `:bn`: if the scratch
+        // buffer had leaked, it would be the *only* other buffer left, so
+        // `:bn` would cycle the active window straight onto it and its
+        // history content (the marker line) would paint in the main window.
+        // With the leak fixed, there is nothing else to cycle to, so `:bn`
+        // is a no-op and the original file stays on screen.
+        for c in ":bn".chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
+        driver.render();
+
+        let screen_after_bn = driver.screen();
+        assert!(
+            screen_after_bn.contains("CMDWIN1297_000"),
+            "`:bn` after closing the cmdline window must stay on the \
+             original file — a second buffer to cycle onto means the \
+             `[Command History]` scratch buffer leaked instead of being \
+             evicted on window close;\nscreen:\n{screen_after_bn}"
+        );
+        assert!(
+            !screen_after_bn.contains("set cmdwin1297marker"),
+            "`:bn` must never land on a leaked `[Command History]` scratch \
+             buffer — its history content (the marker line) must not \
+             reappear on screen;\nscreen:\n{screen_after_bn}"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
