@@ -2459,8 +2459,6 @@ impl Engine {
                 let mut lines: Vec<String> = Vec::new();
                 lines.push("mark line  col file/text".to_string());
 
-                let line_text = |engine: &Self, line_idx: usize| engine.preview_line_text(line_idx);
-
                 // Neovim's `:marks` always lists the three automatic marks
                 // alongside any user-set ones (#1300): `'` (previous
                 // context — the pcmark set by the last jump), the user marks
@@ -2468,25 +2466,25 @@ impl Engine {
                 // buffer), and `.` (position of the last change).
                 let mut rows: Vec<(char, usize, usize, String)> = Vec::new();
                 if let Some((line, col)) = self.last_jump_pos {
-                    rows.push(('\'', line, col, line_text(self, line)));
+                    rows.push(('\'', line, col, self.preview_line_text(line)));
                 }
                 if let Some(marks_map) = self.marks.get(&buf_id) {
                     let mut sorted: Vec<(char, Cursor)> =
                         marks_map.iter().map(|(c, cur)| (*c, *cur)).collect();
                     sorted.sort_by_key(|(c, _)| *c);
                     for (c, cur) in sorted {
-                        rows.push((c, cur.line, cur.col, line_text(self, cur.line)));
+                        rows.push((c, cur.line, cur.col, self.preview_line_text(cur.line)));
                     }
                 }
                 // vimcode does not yet track buffer-enter/leave transitions,
                 // so `"` defaults to the buffer start — matching Neovim's own
                 // default for a buffer that has never actually been left.
-                rows.push(('"', 0, 0, line_text(self, 0)));
+                rows.push(('"', 0, 0, self.preview_line_text(0)));
                 // `.` likewise defaults to the buffer start before any real
                 // change has happened — confirmed against a live oracle,
                 // whose own fixture-loading step already counts as a change.
                 let (edit_line, edit_col) = self.last_edit_pos.unwrap_or((0, 0));
-                rows.push(('.', edit_line, edit_col, line_text(self, edit_line)));
+                rows.push(('.', edit_line, edit_col, self.preview_line_text(edit_line)));
                 for (c, line, col, text) in rows {
                     lines.push(format!(" {}{:>7}{:>5} {}", c, line + 1, col, text));
                 }
