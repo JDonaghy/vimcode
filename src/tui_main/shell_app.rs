@@ -3944,8 +3944,10 @@ fn handle_focus_owner_key(
     // #826: every `tui_key_to_engine_name(code)` call in this function's old
     // crossterm-`KeyCode` tables becomes this — the one shared decoder's
     // named-key table (`render::engine_key_from_ui`), which also backs GTK's
-    // `Key::Named` decode now. `Key::Char` stays inline per arm below (each
-    // panel's own char whitelist), unchanged from before.
+    // `Key::Named` decode now. `Key::Char` is handled inline per arm below —
+    // as of #1249 that's `c.to_string()` (or, for Source Control,
+    // `engine_key_from_ui`'s own shift resolution) rather than a fifth copy
+    // of a hand-written char->name table.
     let engine_name = || {
         render::engine_key_from_ui(key, modifiers, keyboard_enhanced)
             .map(|(name, _, _)| name)
@@ -3996,30 +3998,15 @@ fn handle_focus_owner_key(
 
     // ── Search panel ────────────────────────────────────────────────────
     if route == render::FocusKeyRoute::Search {
-        // Ctrl+V paste (backend-specific clipboard access).
-        //
-        // #946: quadraui#813 intercepts every Ctrl+V/Ctrl+Shift+V
-        // `KeyPressed` ahead of `AppLogic::handle` on every backend
-        // (`quadraui::runtime::preprocess_event`, step 6) and redelivers it
-        // as `UiEvent::ClipboardPaste(text)` instead — so in practice this
-        // arm's `ctrl && key_val == Key::Char('v')` guard never matches a
-        // real keypress; `Engine::route_paste`'s own `search_has_focus`
-        // branch (`keys.rs`) is the one live backends actually reach, via
-        // the `UiEvent::ClipboardPaste` arm in `handle()` above. Kept here
-        // (reading `engine.clipboard_read` rather than the deleted
-        // `Engine::clipboard_paste()` shell-out #946 removed) as the
-        // documented, still-correct fallback for any caller that reaches
-        // this function with an already-raw `KeyPressed` Ctrl+V — e.g. a
-        // synthetic/replayed event that bypasses quadraui's own runtime
-        // preprocessing.
-        if ctrl && key_val == Key::Char('v') {
-            let is_replace =
-                engine.search_panel_form_focus.borrow().as_deref() == Some("search:replace");
-            if let Some(text) = engine.clipboard_read.as_ref().and_then(|cb| cb().ok()) {
-                engine.search_input_paste(is_replace, &text);
-            }
-            return Reaction::Redraw;
-        }
+        // No Ctrl+V arm here (#1249): quadraui#813 intercepts every
+        // Ctrl+V/Ctrl+Shift+V `KeyPressed` ahead of `AppLogic::handle` on
+        // every backend (`quadraui::runtime::preprocess_event`, step 6) and
+        // redelivers it as `UiEvent::ClipboardPaste(text)` instead, so no
+        // real (or synthetic, replayed-through-the-runner) keypress can ever
+        // reach this function with `ctrl && key_val == Key::Char('v')`.
+        // `Engine::route_paste`'s `search_has_focus` branch (`keys.rs`) is
+        // the one every backend actually reaches, via the top-level
+        // `UiEvent::ClipboardPaste` arm in `handle()` above.
         let key_name = match key_val {
             // Single-char keys use the char as the key name (via `unicode`
             // below); Ctrl+b is the one that needs an explicit name.
@@ -4059,18 +4046,22 @@ fn handle_focus_owner_key(
             .handle(ui_event, backend, rect);
         if !engine.dispatch_dap_sidebar_event(sidebar_event) {
             // Ignored by the MSV — handle action keys via shared dispatch.
+            // Ctrl+b hides the sidebar (shared shape with the other panels'
+            // Ctrl+b arm below).
+            if ctrl && key_val == Key::Char('b') {
+                sidebar.has_focus = false;
+                engine.collapse_sidebar();
+                return Reaction::Redraw;
+            }
+            // #1249: `c.to_string()`, not a hand-written char->`String`
+            // identity table (`'q' => "q".to_string()`, …) — like GTK's own
+            // pass-through (`map_gtk_key_name`'s `other => other`),
+            // `dispatch_dap_sidebar_action_key` already ignores any letter
+            // it doesn't whitelist. Also fixes 'h' silently doing nothing on
+            // TUI: the old table never listed it, though the dispatch
+            // function (and GTK) both treat it the same as "Left".
             let key_name = match key_val {
-                Key::Char(c) => match c {
-                    'q' => "q".to_string(),
-                    'x' => "x".to_string(),
-                    'd' => "d".to_string(),
-                    'b' if ctrl => {
-                        sidebar.has_focus = false;
-                        engine.collapse_sidebar();
-                        String::new()
-                    }
-                    _ => String::new(),
-                },
+                Key::Char(c) => c.to_string(),
                 Key::Named(NamedKey::F(n)) if (5..=11).contains(&n) => match n {
                     5 | 9 | 10 | 11 => {
                         let name = format!("F{n}");
@@ -4137,36 +4128,31 @@ fn handle_focus_owner_key(
         // h/Left focus-to-activity-bar lives inside `handle_settings_key`:
         // when the selected row is not an enum, `h` sets
         // `activity_bar_focused`.
-        // Ctrl-V paste into the search input or an inline edit.
-        if ctrl && key_val == Key::Char('v') {
-            if engine.settings_input_active || engine.settings_editing.is_some() {
-                let text = match engine.clipboard_read {
-                    Some(ref cb) => cb().ok(),
-                    None => None,
-                };
-                if let Some(t) = text {
-                    engine.settings_paste(&t);
-                }
-            }
-            return Reaction::Redraw;
-        }
+        //
+        // No Ctrl+V arm here (#1249): `Engine::route_paste`'s
+        // `settings_input_active || settings_editing.is_some()` branch is
+        // what every backend's `UiEvent::ClipboardPaste` actually reaches —
+        // quadraui#813 intercepts the raw `KeyPressed` before it gets here.
+        //
+        // #1249: char/named key straight through, not a hand-written
+        // identity table (`Key::Char('j') => ("j".to_string(), None)`, …) —
+        // `handle_settings_key` already accepts both spellings for nav
+        // ("j"/"Down", "k"/"Up", "l"/"Right", "h"/"Left"), and always passing
+        // `unicode` (not just for the old catch-all's `"char"` sentinel) is
+        // what lets `j`/`k`/`h`/`l`/`/`/`q`/space be typed into the settings
+        // search filter, which the old table silently dropped. `' '` keeps
+        // its own arm: `handle_settings_key` matches literal `"Space"`, not
+        // `" "`.
         let (key_name, unicode): (String, Option<char>) = match key_val {
-            Key::Char('j') | Key::Named(NamedKey::Down) => ("j".to_string(), None),
-            Key::Char('k') | Key::Named(NamedKey::Up) => ("k".to_string(), None),
-            Key::Char('l') | Key::Named(NamedKey::Right) => ("l".to_string(), None),
-            Key::Char('h') | Key::Named(NamedKey::Left) => ("h".to_string(), None),
-            Key::Char(' ') => ("Space".to_string(), None),
-            Key::Char('/') => ("/".to_string(), None),
-            Key::Char('q') => ("Escape".to_string(), None),
-            Key::Char(ch) => ("char".to_string(), Some(ch)),
+            Key::Char(' ') => ("Space".to_string(), Some(' ')),
+            Key::Char(c) => (c.to_string(), Some(c)),
             Key::Named(_) => (engine_name(), None),
         };
         if !key_name.is_empty() {
-            let ch = if key_name == "char" { unicode } else { None };
-            let mapped: &str = if key_name == "char" { "" } else { &key_name };
-            let still_focused =
-                render::dispatch_sidebar_panel_key(engine, route, mapped, ch, None, ctrl, false)
-                    .unwrap_or(true);
+            let still_focused = render::dispatch_sidebar_panel_key(
+                engine, route, &key_name, unicode, None, ctrl, false,
+            )
+            .unwrap_or(true);
             if !still_focused {
                 sidebar.has_focus = false;
             }
@@ -4191,20 +4177,12 @@ fn handle_focus_owner_key(
     // text, not a hand-rolled key table like the retired
     // `handle_ai_panel_key` built from `KeyCode` spellings.
     if route == render::FocusKeyRoute::Ai {
-        // Literal Ctrl+V fallback for terminals that don't send bracketed
-        // paste as bytes — real terminal pastes already reach every panel
-        // uniformly via `UiEvent::ClipboardPaste` -> `Engine::route_paste`
-        // (see this file's top-level `handle` match).
-        if ctrl && key_val == Key::Char('v') {
-            let text = match engine.clipboard_read {
-                Some(ref cb) => cb().ok(),
-                None => None,
-            };
-            if let Some(t) = text {
-                engine.ai_chat.borrow_mut().input_insert_str(&t);
-            }
-            return Reaction::Redraw;
-        }
+        // No Ctrl+V arm here (#1249): every real (or synthetic,
+        // replayed-through-the-runner) terminal paste already reaches
+        // `Engine::route_paste`'s `ai_has_focus` branch uniformly via
+        // `UiEvent::ClipboardPaste` (see this file's top-level `handle`
+        // match) — quadraui#813 intercepts the raw Ctrl+V `KeyPressed`
+        // before it ever gets here, on every backend.
         let rect = engine.ai_chat_rect.get();
         let theme = render::Theme::from_name(&engine.settings.colorscheme);
         let still_focused = render::route_ai_chat_event(engine, ui_event, rect, &theme, backend);
@@ -4223,40 +4201,26 @@ fn handle_focus_owner_key(
             engine.collapse_sidebar();
             return Reaction::Redraw;
         }
-        // With keyboard enhancement (kitty protocol), Shift+s arrives as
-        // Char('s') + SHIFT, not Char('S'). Resolve the actual character
-        // before matching the whitelist.
-        let shift = modifiers.shift;
+        // #1249: reuse `render::engine_key_from_ui`'s keyboard-enhancement
+        // shift resolution (kitty: Shift+s arrives as Char('s') + SHIFT, not
+        // Char('S')) instead of a second, SC-local copy of it plus a
+        // 20-entry char->`&str` identity table gating which resolved letters
+        // pass through. `ctrl` is forced off: the one SC ctrl chord (Ctrl+b)
+        // is handled above, and `dispatch_sc_sidebar_key_unified` (like
+        // GTK's `map_gtk_key_with_unicode`) already ignores any letter it
+        // doesn't recognise.
         let (key_str, unicode): (String, Option<char>) = match key_val {
-            Key::Char(ch) => {
-                let resolved = if shift && ch.is_ascii_lowercase() {
-                    ch.to_ascii_uppercase()
-                } else {
-                    ch
+            Key::Char(_) => {
+                let plain_modifiers = quadraui::Modifiers {
+                    ctrl: false,
+                    ..modifiers
                 };
-                let name = match resolved {
-                    'j' => "j",
-                    'k' => "k",
-                    'h' => "h",
-                    'l' => "l",
-                    's' => "s",
-                    'S' => "S",
-                    'd' => "d",
-                    'D' => "D",
-                    'c' => "c",
-                    'C' => "C",
-                    'p' => "p",
-                    'P' => "P",
-                    'f' => "f",
-                    'r' => "r",
-                    'b' => "b",
-                    'B' => "B",
-                    'q' => "q",
-                    '?' => "?",
-                    '/' => "/",
-                    _ => "",
-                };
-                (name.to_string(), Some(resolved))
+                let resolved = render::engine_key_from_ui(key, plain_modifiers, keyboard_enhanced)
+                    .and_then(|(_, unicode, _)| unicode);
+                (
+                    resolved.map(|c| c.to_string()).unwrap_or_default(),
+                    resolved,
+                )
             }
             Key::Named(_) => (engine_name(), None),
         };
@@ -4289,13 +4253,17 @@ fn handle_focus_owner_key(
             // editing lost those two keys on TUI while GTK
             // (`map_gtk_key_name`) had them. `Page_Up`/`Page_Down` and
             // `PageUp`/`PageDown` are both accepted by the engine.
+            //
+            // #1249: `c.to_string()`, not a hand-written char->`String`
+            // identity table (`'j' => "j".to_string()`, …, `_ =>
+            // String::new()`) — `dispatch_explorer_key`'s own whitelist
+            // ignores any name it doesn't recognise and falls through to its
+            // `chr`-driven custom-keybinding lookup, which never read
+            // `key_name` anyway, so restricting which chars got a real name
+            // bought nothing (GTK's `map_gtk_key_with_unicode` is the same
+            // unrestricted pass-through).
             let key_name = match key_val {
-                Key::Char('j') => "j".to_string(),
-                Key::Char('k') => "k".to_string(),
-                Key::Char('h') => "h".to_string(),
-                Key::Char('l') => "l".to_string(),
-                Key::Char('q') => "q".to_string(),
-                Key::Char(_) => String::new(),
+                Key::Char(c) => c.to_string(),
                 Key::Named(_) => engine_name(),
             };
             let chr = if let Key::Char(c) = key_val {
@@ -13306,6 +13274,51 @@ mod tests {
             clicked_row.contains("[ ]"),
             "clicking the \"Cursor Line\" row should flip its own toggle off (was \"[x]\"); \
              row:\n{clicked_row}\nfull screen:\n{screen}"
+        );
+    }
+
+    /// #1249: before `handle_focus_owner_key`'s Settings-panel char table
+    /// was replaced with a straight `c.to_string()`/`Some(c)` pass-through,
+    /// `Key::Char('j'|'k'|'h'|'l'|' ')` were each remapped to their own
+    /// nav-key name with `unicode: None`, so typing any of them into the
+    /// settings search filter did nothing (the text-input branch only ever
+    /// reads `unicode`); and `Key::Char('q')` was renamed to `"Escape"`, so
+    /// typing `q` closed the search box outright instead of appending the
+    /// letter.
+    ///
+    /// RED-verified: reverting this commit's `shell_app.rs` change while
+    /// keeping this test fails the assertion below — the first keypress
+    /// ('q') closes the search box, so the query stays empty and never
+    /// reaches `"qj khl"`.
+    #[test]
+    fn settings_search_filter_accepts_letters_the_old_hand_written_table_dropped_via_shell_app() {
+        let mut app = TuiShellApp::new_for_test();
+        app.engine
+            .app_shell
+            .show_panel(&quadraui::WidgetId::new(PANEL_SETTINGS));
+        app.engine.settings_has_focus = true;
+        app.engine.settings_input_active = true;
+        app.sidebar.has_focus = true;
+
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        // Every one of these six characters used to be dropped (or, for
+        // 'q', used to close the search box) by the old hand-written table.
+        for c in ['q', 'j', ' ', 'k', 'h', 'l'] {
+            driver.dispatch(quadraui::UiEvent::KeyPressed {
+                key: quadraui::Key::Char(c),
+                modifiers: quadraui::Modifiers::default(),
+                repeat: false,
+            });
+        }
+        driver.render();
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("qj khl"),
+            "typing q/j/space/k/h/l into the settings search filter must \
+             append all six characters to the painted query, not silently \
+             drop most of them (or close the search box on 'q'); \
+             screen:\n{screen}"
         );
     }
 
