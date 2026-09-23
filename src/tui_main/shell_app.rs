@@ -561,6 +561,18 @@ pub struct TuiShellApp {
     ///   That's a genuine soundness bug, not just a slowdown, so this must
     ///   never run under test.
     live: bool,
+    /// Set by [`render::TickHost::quit_after_format_save`]'s TUI impl once
+    /// the deferred `:wq`/`:x` format-then-quit flow has saved session state
+    /// and shut everything down — `tick()` checks it right after calling
+    /// [`render::run_shared_tick_chores`] and turns it into
+    /// `Reaction::Exit` (#1248). Mirrors GTK's `App::exit_requested`
+    /// exactly: both backends now run every other chore in the same tick
+    /// before actually exiting (this used to `return Reaction::Exit`
+    /// mid-list on TUI, skipping the pending-terminal-command/ext-panel-
+    /// focus/platform-action drains below it — harmless either way since the
+    /// process is exiting regardless, but the two backends silently
+    /// disagreed on it, which is exactly what this issue converges).
+    exit_requested: Cell<bool>,
 }
 
 /// A ratatui cell rect as the quadraui `Rect` every shared painter takes.
@@ -1130,6 +1142,7 @@ impl TuiShellApp {
             suppress_shell_panel_echo: false,
             keyboard_enhanced: false,
             live: false,
+            exit_requested: Cell::new(false),
         }
     }
 
@@ -2068,38 +2081,6 @@ impl TuiShellApp {
     /// immediately after every hamburger reveal.
     fn disarm_hamburger_stale_click_guard(&mut self) {
         self.engine.hamburger_stale_click_guard = false;
-    }
-
-    /// Carry out a platform action queued by engine logic this frame — `gx`,
-    /// the "Reveal in File Manager" context-menu item, an extension-supplied
-    /// link, ... — using the runner-owned `backend`'s `PlatformServices`
-    /// (#1134). `core/engine/` has no `backend` handle of its own, hence the
-    /// queue-and-drain-in-`tick` shape (see `Engine::pending_platform_actions`'s
-    /// doc); mirrors `App::run_pending_platform_action` (`app.rs`), the GTK
-    /// twin of this method. On failure, reports it via `engine.message` (the
-    /// same status-line surface `gx`'s own "Opening:" message already uses)
-    /// rather than silently doing nothing. TUI's `PlatformServices::open_url_result`
-    /// (quadraui#969) falls back to an OSC 8 hyperlink when no platform
-    /// opener is reachable (a headless SSH session, say) before reporting
-    /// `Err`, so this only surfaces a message in the genuinely-unsupported
-    /// case.
-    fn run_pending_platform_action(
-        &mut self,
-        action: PendingPlatformAction,
-        backend: &mut dyn quadraui::Backend,
-    ) {
-        match action {
-            PendingPlatformAction::OpenUrl(url) => {
-                if let Err(e) = backend.services().open_url_result(&url) {
-                    self.engine.message = format!("Could not open URL: {e:?}");
-                }
-            }
-            PendingPlatformAction::Reveal(path) => {
-                if let Err(e) = backend.services().reveal_in_file_manager(&path) {
-                    self.engine.message = format!("Could not reveal in file manager: {e:?}");
-                }
-            }
-        }
     }
 }
 
@@ -3565,116 +3546,20 @@ impl ShellApp for TuiShellApp {
     }
 
     fn tick(&mut self, backend: &mut dyn quadraui::Backend) -> Reaction {
-        let mut needs_redraw = false;
-
-        // ── Per-frame viewport sync (mirrors `mod.rs:916`-`:967`) ───────────
-        // `event_loop` reads `terminal.size()`; the runner keeps
-        // `backend.viewport()` in sync every frame via `begin_frame`, so it
-        // is an exact substitute.
-        let viewport = backend.viewport();
-        let (vw, vh) = (viewport.width as u16, viewport.height as u16);
-        {
-            let engine = &mut self.engine;
-            // #1164: `content_rows` used to be a second, hand-summed model
-            // of the bottom chrome's height — `qf_rows`/`trm_rows`/
-            // `menu_row`/`dbg_row`/`wm_row` restated by hand, independently
-            // of `bottom_chrome_rects_for_shell_content`'s `v_chunks` (the
-            // model the paint path actually composes against). Routed
-            // through the same `bottom_band_row_heights` that function now
-            // calls instead — `tick` runs ahead of any paint, so there is
-            // no `ScreenLayout`/`area` to read a rect back from yet, only
-            // the raw `(vw, vh)` viewport; the menu-bar row is carved off
-            // by hand here for the same reason `build_screen_for_tui` does
-            // (see `bottom_band_row_heights`'s own doc comment), since
-            // `bottom_band_row_heights` itself never subtracts it.
-            let menu_row: u16 = if engine.menu_bar_visible { 1 } else { 0 };
-            let content_height = vh.saturating_sub(menu_row);
-            let bands = bottom_band_row_heights(engine, content_height);
-            let content_rows = content_height.saturating_sub(bands.total());
-            let gutter_approx = 4u16;
-            let sb_visible = engine.app_shell.sidebar_visible();
-            let sidebar_cols = if sb_visible {
-                self.sidebar_width + 1
-            } else {
-                0
-            };
-            let ab_w = if engine.settings.autohide_panels && !sb_visible {
-                0
-            } else {
-                ACTIVITY_BAR_WIDTH
-            };
-            let content_cols = vw.saturating_sub(ab_w + sidebar_cols + gutter_approx);
-            let show_breadcrumbs = engine.settings.breadcrumbs && !engine.terminal_maximized;
-            let tab_bar_rows: u16 = {
-                let has_single_tab = engine.active_group().tabs.len() <= 1;
-                if engine.settings.hide_single_tab && has_single_tab {
-                    u16::from(show_breadcrumbs)
-                } else if show_breadcrumbs {
-                    2
-                } else {
-                    1
-                }
-            };
-            // A per-window status line (`window_status_line`, on by
-            // default) reserves its own bottom row *inside* each window's
-            // rect, on top of everything `bottom_band_row_heights` already
-            // accounted for at the editor-band level — `render::
-            // window_status_row_reserved` is the single gate
-            // `build_rendered_window`'s real per-window `visible_lines`
-            // computation uses for the identical `-1` (see its own doc
-            // comment). This coarse, split-unaware estimate mirrors it for
-            // the common single-window case; `calculate_group_window_rects`
-            // handles the exact per-split accounting for the real paint,
-            // and the "Post-paint feedback" sync right below corrects this
-            // estimate against it one frame later regardless.
-            let mut viewport_lines = content_rows.saturating_sub(tab_bar_rows).max(1);
-            if render::window_status_row_reserved(engine) && viewport_lines > 1 {
-                viewport_lines -= 1;
-            }
-            engine.set_viewport_lines(viewport_lines as usize);
-            engine.set_viewport_cols(content_cols.max(1) as usize);
-        }
-
-        // ── Post-paint feedback from the last `render_content` (#634) ─────
-        // `event_loop` did both of these *inside* its draw block, between
-        // building the layout and the `terminal.draw` call (`mod.rs:1139`-
-        // `:1149`) and immediately after it (`:1216`-`:1266`). `render_content`
-        // is `&self` and can't touch `Engine`'s `&mut` API, so both read the
-        // caches it left behind and apply them here — the runner calls `tick`
-        // after every event batch, and returning `Reaction::Redraw` when
-        // anything moved reproduces the legacy two-pass repaint one frame
-        // later instead of within the same one.
-        {
-            let layout = self.last_layout.borrow();
-            if let Some(ref screen) = *layout {
-                // Exact per-window viewport dimensions from paint-time
-                // geometry, so `ensure_cursor_visible` uses real column
-                // counts rather than `tick`'s whole-screen approximation
-                // above (which can't see splits).
-                for rw in &screen.windows {
-                    self.engine.set_viewport_for_window(
-                        rw.window_id,
-                        rw.lines.len().max(1),
-                        rw.text_viewport_cols.max(1),
-                    );
-                }
-            }
-        }
-        {
-            // Apply the per-group tab-bar widths the paint measured and
-            // re-check that every group's active tab is on screen. Shared
-            // across backends — see `Engine::post_draw_apply_widths`.
-            let counts = self.tab_visible_counts.borrow().clone();
-            if !counts.is_empty() && self.engine.post_draw_apply_widths(&counts) {
-                needs_redraw = true;
-            }
-        }
+        // #1248: the whole-screen per-frame viewport *estimate* that used to
+        // live here (hand-summing `bottom_band_row_heights`/tab-bar/status-
+        // row reservations from the raw `backend.viewport()` size, ahead of
+        // any paint) is gone. It pre-resolved exactly what
+        // `build_screen_layout`'s real per-split accounting resolves anyway
+        // — `render::run_shared_tick_chores`'s `set_viewport_for_window` loop
+        // below applies that real geometry from the last paint every tick
+        // regardless, the same as GTK, which never had an estimate to begin
+        // with (GTK never calls `set_viewport_lines`/`set_viewport_cols` at
+        // all). Before the very first paint, `View::viewport_lines` sits at
+        // its documented sensible-default `40` (`core/view.rs`) — the same
+        // starting point GTK has always used.
 
         // ── Terminal chrome the runner doesn't own ───────────────────────
-        // Not a keyboard rung; #762 only drops the stale cross-file
-        // line-number citation it used to carry (the GTK loop it named is
-        // gone, and this has no GTK counterpart — GTK4 owns cursor shape
-        // and window title).
         // Cursor shape per mode used to be a hand-rolled crossterm
         // cursor-style write straight to the shared process stdout (an
         // `execute!` of crossterm's own cursor-style command) — a rule-6
@@ -3687,127 +3572,184 @@ impl ShellApp for TuiShellApp {
         // `std::io::stdout()` unconditionally (no test-mode guard of its
         // own — see its doc comment), so calling it outside `self.live`
         // would corrupt the harness' own output exactly as the old
-        // hand-rolled write would have.
-        //
-        // The emulator window title used to be hand-rolled the same way
-        // (crossterm's `SetTitle` directly), but #1124 routed it through
-        // `backend.window()?.set_title(..)` instead — the `WindowControl`
-        // surface (quadraui#950) `TuiBackend` backs with the exact same OSC
-        // 0/2 escape underneath, so this stays gated on `self.live` for the
-        // same reason as the cursor style, it just no longer names the
-        // escape sequence itself.
+        // hand-rolled write would have. No GTK counterpart — GTK4 owns
+        // cursor shape itself.
         if self.live {
             backend.set_caret_shape(self.caret_shape_for_mode());
-            let tui_title = self
-                .engine
-                .active_buffer_name()
-                .map(|n| format!("VimCode \u{2014} {}", n))
-                .unwrap_or_else(|| "VimCode".to_string());
-            if let Some(w) = backend.window() {
-                let _ = w.set_title(&tui_title);
-            }
         }
 
-        // ── Idle background work (mirrors `mod.rs:1157`-`:1247`) ───────────
-        if let Some(dl) = self.yank_hl_deadline.get() {
-            if Instant::now() >= dl {
-                self.engine.clear_yank_highlight();
-                self.yank_hl_deadline.set(None);
-                needs_redraw = true;
-            }
-        }
-
-        if self.engine.tab_switcher_open {
-            if let Some(last) = self.tab_switcher_last_cycle.get() {
-                if last.elapsed() >= Duration::from_millis(500) {
-                    self.engine.tab_switcher_confirm();
-                    self.tab_switcher_last_cycle.set(None);
-                    needs_redraw = true;
-                }
-            }
-            return if needs_redraw {
-                Reaction::Redraw
-            } else {
-                Reaction::Continue
+        // #1248: the rest of this function's chores — per-window viewport
+        // sync, tab-visibility re-check, window title, yank-highlight clear,
+        // the tab-switcher popup's own auto-confirm gate, idle/SC polling,
+        // deferred format-then-quit, terminal command, ext-panel focus, and
+        // the platform-action drain — are shared with GTK's
+        // `App::handle_poll_tick` via `render::run_shared_tick_chores`. See
+        // that function's rung header comment for the full list and why the
+        // pieces in `TuiTickHost` below differ.
+        let tab_switcher_was_open = self.engine.tab_switcher_open;
+        let mut needs_redraw = {
+            let mut host = TuiTickHost {
+                sidebar: &mut self.sidebar,
+                last_layout: &self.last_layout,
+                tab_visible_counts: &self.tab_visible_counts,
+                yank_hl_deadline: &self.yank_hl_deadline,
+                tab_switcher_last_cycle: &self.tab_switcher_last_cycle,
+                last_sidebar_refresh: &self.last_sidebar_refresh,
+                exit_requested: &self.exit_requested,
+                live: self.live,
+                backend,
             };
-        }
+            render::run_shared_tick_chores(&mut self.engine, &mut host)
+        };
 
-        needs_redraw |= self.engine.poll_idle();
-
-        // #1165: drain the background SC refresh the block below now
-        // triggers with `sc_refresh_async` — same `poll_sc_refresh`/
-        // `Engine::sc_refresh_async` pair `App::handle_poll_tick` (GTK) has
-        // always used. This used to call the *synchronous* `sc_refresh`
-        // directly on this thread every 2 seconds the SC/Explorer panel was
-        // visible — four `git` subprocess spawns per call — which stalls the
-        // single-threaded terminal event loop for however long that takes
-        // (worse than a barely-perceptible pause on a large repo/slow disk),
-        // something GTK's own poll tick was already careful to avoid.
-        if self.engine.poll_sc_refresh() {
-            needs_redraw = true;
-        }
-
-        if self.engine.format_save_quit_ready {
-            self.engine.format_save_quit_ready = false;
-            self.engine.cleanup_all_swaps();
-            self.engine.lsp_shutdown();
-            save_session(&mut self.engine);
+        if self.exit_requested.get() {
             return Reaction::Exit;
         }
 
-        if self.engine.app_shell.sidebar_visible()
-            && self.last_sidebar_refresh.get().elapsed() >= Duration::from_secs(2)
-        {
-            self.engine.explorer_rebuild_rows();
-            if self.engine.active_panel_is(PANEL_GIT) || self.engine.active_panel_is(PANEL_EXPLORER)
-            {
-                // #1165: async — see the `poll_sc_refresh` drain above.
-                self.engine.sc_refresh_async();
+        // Settings-file reload and the startup message aren't part of the
+        // shared chore list — GTK's own reload additionally reloads the
+        // colorscheme's CSS (TUI has no CSS), and the startup message is a
+        // TUI-only concept (`pending_startup_msg`). Both stay gated on the
+        // tab-switcher popup, same as the rest of the list they used to sit
+        // alongside before #1248 (`TickHost::tab_switcher_gate` short-
+        // circuits `run_shared_tick_chores` the same way this used to
+        // `return` early).
+        if !tab_switcher_was_open {
+            if self.engine.check_settings_reload() {
+                needs_redraw = true;
             }
-            self.last_sidebar_refresh.set(Instant::now());
-            needs_redraw = true;
-        }
-
-        if self.engine.check_settings_reload() {
-            needs_redraw = true;
-        }
-
-        if let Some(cmd) = self.engine.pending_terminal_command.take() {
-            self.engine
-                .terminal_run_command(&cmd, vw, self.engine.session.terminal_panel_rows);
-            needs_redraw = true;
-        }
-
-        if let Some(msg) = self.pending_startup_msg.take() {
-            self.engine.message = msg;
-            needs_redraw = true;
-        }
-
-        if let Some(panel_name) = self.engine.ext_panel_focus_pending.take() {
-            self.sidebar.ext_panel_name = Some(panel_name);
-            if !self.engine.app_shell.sidebar_visible() {
-                self.engine.toggle_sidebar();
+            if let Some(msg) = self.pending_startup_msg.take() {
+                self.engine.message = msg;
+                needs_redraw = true;
             }
-            self.sidebar.has_focus = true;
-            needs_redraw = true;
-        }
-
-        // Drain platform actions (open URL / reveal in file manager) queued
-        // by engine logic this frame — needs the runner-owned `backend` for
-        // `PlatformServices`, which `core/engine/` has no handle to (#1134).
-        // See `Engine::pending_platform_actions`'s doc.
-        if !self.engine.pending_platform_actions.is_empty() {
-            let actions = std::mem::take(&mut self.engine.pending_platform_actions);
-            for action in actions {
-                self.run_pending_platform_action(action, backend);
-            }
-            needs_redraw = true;
         }
 
         if needs_redraw {
             Reaction::Redraw
         } else {
             Reaction::Continue
+        }
+    }
+}
+
+/// [`render::TickHost`] impl for TUI — the tick-time background chores
+/// `TuiShellApp::tick` shares with GTK's `App::handle_poll_tick` (#1248).
+/// Holds direct field borrows (rather than `&mut TuiShellApp` — `tick`
+/// already holds `&mut self.engine` separately, and `Engine` is an owned
+/// field here, not the `Rc<RefCell<Engine>>` GTK's `App` uses, so a whole
+/// `&mut self` borrow would alias it) plus `backend`, following
+/// [`TuiEngineActionHost`]'s established shape.
+struct TuiTickHost<'a> {
+    sidebar: &'a mut TuiSidebar,
+    last_layout: &'a RefCell<Option<render::ScreenLayout>>,
+    tab_visible_counts: &'a RefCell<Vec<(GroupId, usize)>>,
+    yank_hl_deadline: &'a Cell<Option<Instant>>,
+    tab_switcher_last_cycle: &'a Cell<Option<Instant>>,
+    last_sidebar_refresh: &'a Cell<Instant>,
+    exit_requested: &'a Cell<bool>,
+    live: bool,
+    backend: &'a mut dyn quadraui::Backend,
+}
+
+impl render::TickHost for TuiTickHost<'_> {
+    fn with_last_layout(&self, f: &mut dyn FnMut(&render::ScreenLayout)) {
+        if let Some(layout) = self.last_layout.borrow().as_ref() {
+            f(layout);
+        }
+    }
+
+    fn tab_visible_counts(&self) -> Vec<(GroupId, usize)> {
+        self.tab_visible_counts.borrow().clone()
+    }
+
+    fn yank_highlight_deadline(&self) -> Option<Instant> {
+        self.yank_hl_deadline.get()
+    }
+
+    fn clear_yank_highlight_deadline(&mut self, engine: &mut Engine) {
+        engine.clear_yank_highlight();
+        self.yank_hl_deadline.set(None);
+    }
+
+    /// While the tab-switcher popup is mid-cycle, only its own 500ms
+    /// auto-confirm timer runs — everything else in the shared chore list
+    /// (idle polling, SC refresh, deferred quit, ...) waits until it closes,
+    /// exactly as it did before #1248 folded the rest of this list into
+    /// [`render::run_shared_tick_chores`]. GTK has no such popup, so the
+    /// trait's default (`None`, "no gate") applies there.
+    fn tab_switcher_gate(&mut self, engine: &mut Engine) -> Option<bool> {
+        if !engine.tab_switcher_open {
+            return None;
+        }
+        let mut redraw = false;
+        if let Some(last) = self.tab_switcher_last_cycle.get() {
+            if last.elapsed() >= Duration::from_millis(500) {
+                engine.tab_switcher_confirm();
+                self.tab_switcher_last_cycle.set(None);
+                redraw = true;
+            }
+        }
+        Some(redraw)
+    }
+
+    fn sidebar_refresh_due(&mut self) -> bool {
+        if self.last_sidebar_refresh.get().elapsed() >= Duration::from_secs(2) {
+            self.last_sidebar_refresh.set(Instant::now());
+            true
+        } else {
+            false
+        }
+    }
+
+    /// #1165: rebuild the explorer row cache on the same 2s tick, regardless
+    /// of which panel is active — mirrors the legacy `event_loop` behavior.
+    /// No GTK counterpart; see `TickHost::on_sidebar_refresh_tick`'s doc.
+    fn on_sidebar_refresh_tick(&mut self, engine: &mut Engine) {
+        engine.explorer_rebuild_rows();
+    }
+
+    fn run_terminal_command(&mut self, engine: &mut Engine, cmd: String) {
+        let vw = self.backend.viewport().width as u16;
+        engine.terminal_run_command(&cmd, vw, engine.session.terminal_panel_rows);
+    }
+
+    fn ext_panel_focus(&mut self, engine: &mut Engine, panel_name: String) {
+        self.sidebar.ext_panel_name = Some(panel_name);
+        if !engine.app_shell.sidebar_visible() {
+            engine.toggle_sidebar();
+        }
+        self.sidebar.has_focus = true;
+    }
+
+    fn quit_after_format_save(&mut self, engine: &mut Engine) {
+        engine.cleanup_all_swaps();
+        engine.lsp_shutdown();
+        save_session(engine);
+        self.exit_requested.set(true);
+    }
+
+    fn run_platform_action(
+        &mut self,
+        engine: &mut Engine,
+        action: crate::core::engine::PendingPlatformAction,
+    ) {
+        render::run_pending_platform_action(engine, action, self.backend);
+    }
+
+    /// The emulator window title used to be hand-rolled (crossterm's
+    /// `SetTitle` directly), but #1124 routed it through
+    /// `backend.window()?.set_title(..)` instead — the `WindowControl`
+    /// surface (quadraui#950) `TuiBackend` backs with the exact same OSC 0/2
+    /// escape underneath, so this stays gated on `self.live` for the same
+    /// reason as the cursor style in `tick()` — a real terminal, not
+    /// `driver_with_shell`'s harness.
+    fn sync_window_title(&mut self, engine: &Engine) {
+        if !self.live {
+            return;
+        }
+        let tui_title = render::window_title(engine);
+        if let Some(w) = self.backend.window() {
+            let _ = w.set_title(&tui_title);
         }
     }
 }
@@ -5148,168 +5090,70 @@ mod tests {
         assert!(app.engine.viewport_lines() > 0);
     }
 
-    /// #1164: `tick()`'s per-frame viewport-line estimate must agree with
-    /// the row count the real composer (`build_screen_for_shell_content`,
-    /// which now routes through the shared `bottom_band_row_heights` --
-    /// see that function's doc comment) actually reserves for the editor
-    /// column, given the *same* `Engine` state. Before #1164, `tick()`
-    /// hand-summed its own copy of the bottom-chrome row math
-    /// (`qf_rows`/`trm_rows`/`menu_row`/`dbg_row`/`wm_row`, plus a
-    /// hardcoded `2` standing in for "cmd + global status row") instead of
-    /// routing through the composer's own arithmetic -- a second geometry
-    /// model that *could* silently drift from the first the next time
-    /// either side is edited on its own.
+    /// #1248: `tick()`'s own per-frame viewport *estimate* — the subject of
+    /// the matrix-fixture drift check this test replaces — is deleted
+    /// outright, not folded into the shared chore list: it pre-resolved
+    /// exactly what `build_screen_for_shell_content`'s real per-split
+    /// accounting resolves anyway, and GTK never had an estimate of its own
+    /// to begin with. `Engine`'s per-window viewport now comes solely from
+    /// `render::run_shared_tick_chores`'s `set_viewport_for_window` loop,
+    /// applied from whatever `render_content` last left in `last_layout` —
+    /// this drives that loop directly (seeding `last_layout` with a real
+    /// `ScreenLayout` from the same composer the deleted test cross-checked
+    /// the old estimate against, `build_screen_for_shell_content`) and
+    /// checks `Engine::viewport_lines` ends up exactly matching the row
+    /// count that composer painted, with no second, independently-computed
+    /// estimate left to compare it against.
     ///
-    /// Runs the comparison over a small matrix of fixtures below --
-    /// quickfix open, `window_status_line` on (alone and combined with
-    /// quickfix), the debug-output bottom panel open with
-    /// `status_line_above_terminal` both on and off (the latter is the one
-    /// combination that reserves a *separated* status row --
-    /// `bands.separated_status`, the one band the pre-#1164 code never had
-    /// a term for at all), the debug toolbar, the wildmenu, and the menu
-    /// bar -- rather than a single scenario, so a *future* edit that
-    /// hand-rolls one band's arithmetic back into only one of `tick()` /
-    /// `bottom_band_row_heights`'s other three callers (`build_screen_for_tui`,
-    /// `build_screen_for_shell_content`, `bottom_chrome_rects_for_shell_content`)
-    /// has more than one chance to be caught.
-    ///
-    /// Correction -- an earlier version of this comment claimed a
-    /// RED-verification against the literal pre-#1164 formula that does not
-    /// hold: reverting `tick()`'s estimate block to the exact old
-    /// `vh.saturating_sub(2 + qf_rows + trm_rows + menu_row + dbg_row +
-    /// wm_row)` (no per-window-status-row term) does **not** turn this test
-    /// red for *any* fixture below, quickfix+`window_status_line` included
-    /// -- re-verified by hand (see #1164 fix-iteration-1 notes) by
-    /// literally reverting `tick()` and running this test unmodified. The
-    /// reason is an exact algebraic identity, not a coincidence of which
-    /// fixture got picked: the old formula's hardcoded `2` is always
-    /// `1 (cmd) + 1 (assumed global status)`, and the new code's
-    /// `global_status + separated_status + window_status_row_reserved as
-    /// u16` always sums to exactly `1` too, for *every* combination of
-    /// `window_status_line` / `status_line_above_terminal` /
-    /// `bottom_panel_open` -- the two "bugs" #1164's commit message
-    /// described (always reserving a global-status row regardless of the
-    /// setting; never clawing back the per-window-status row) cancelled
-    /// each other in the old code for every reachable `Engine` state, not
-    /// just the common single-window case. The one place the two formulas
-    /// *can* numerically differ -- `tick()` now measures the terminal
-    /// "maximize" target against the menu-row-adjusted height instead of
-    /// the raw viewport -- only matters while `terminal_maximized` is set,
-    /// and by the time that target actually dominates
-    /// `effective_terminal_panel_rows` the maximized panel already consumes
-    /// nearly the entire viewport, so the 1-2 row difference is absorbed by
-    /// this same function's `.max(1)` floor before it ever reaches
-    /// `viewport_lines()`. #1164 is therefore a pure deduplication -- one
-    /// arithmetic model instead of four hand-kept-in-sync copies -- with no
-    /// observable behavior change today, not a live off-by-one fix; its
-    /// value (and this test's) is guarding the *next* edit that touches
-    /// only one of the four call sites, which is what running the
-    /// comparison across a matrix of fixtures is for.
+    /// RED-verification: stubbing `TickHost::with_last_layout`'s TUI impl to
+    /// a no-op (so the sync loop never runs) leaves `viewport_lines()` at
+    /// `View`'s startup-default `40` (`core/view.rs`) instead of this
+    /// fixture's real, smaller composed row count — confirmed by hand
+    /// before committing (the `assert_ne!` below is what makes that
+    /// distinguishable at all: a fixture whose composed row count happened
+    /// to equal 40 would pass either way).
     #[test]
-    fn tick_viewport_estimate_matches_the_composed_editor_band_height() {
-        // (menu_bar_visible, window_status_line, quickfix_open,
-        //  bottom_panel_open, status_line_above_terminal,
-        //  debug_toolbar_visible, wildmenu_open)
-        let fixtures: &[(bool, bool, bool, bool, bool, bool, bool)] = &[
-            (false, false, false, false, true, false, false),
-            (false, true, true, false, true, false, false),
-            (false, true, false, true, true, false, false),
-            (false, true, false, true, false, false, false),
-            (true, true, true, false, true, false, false),
-            (false, false, false, false, true, true, false),
-            (false, false, false, false, true, false, true),
-        ];
+    fn tick_syncs_viewport_from_the_last_paint_now_the_estimate_is_gone() {
+        let mut app = TuiShellApp::new_for_test();
+        app.engine
+            .buffer_mut()
+            .insert(0, &(1..=300).map(|n| format!("L{n}\n")).collect::<String>());
 
-        for &(
-            menu_bar_visible,
-            window_status_line,
-            quickfix_open,
-            bottom_panel_open,
-            status_line_above_terminal,
-            debug_toolbar_visible,
-            wildmenu_open,
-        ) in fixtures
-        {
-            let mut app = TuiShellApp::new_for_test();
-            app.engine
-                .buffer_mut()
-                .insert(0, &(1..=300).map(|n| format!("L{n}\n")).collect::<String>());
-            app.engine.menu_bar_visible = menu_bar_visible;
-            app.engine.settings.window_status_line = window_status_line;
-            app.engine.settings.status_line_above_terminal = status_line_above_terminal;
-            app.engine.debug_toolbar_visible = debug_toolbar_visible;
-            if wildmenu_open {
-                app.engine.wildmenu_items = vec!["zqxw1164".to_string()];
-            }
-            if quickfix_open {
-                app.engine
-                    .quickfix
-                    .items
-                    .push(crate::core::project_search::ProjectMatch {
-                        file: PathBuf::from("zqxw1164.rs"),
-                        line: 0,
-                        col: 0,
-                        line_text: "ZQXW_1164_MARKER".to_string(),
-                    });
-                app.engine.quickfix.open = true;
-            }
-            // `bottom_panel_open`, not `terminal_open`: opening the real
-            // terminal without a backing PTY session gets auto-closed by
-            // `tick()`'s own `poll_idle -> poll_terminal` (no panes to
-            // poll -- see that function's `terminal_panes.is_empty()`
-            // branch), which would silently degrade this fixture back to
-            // "bottom panel closed" partway through the very `tick()` call
-            // under test. The debug-output bottom panel has no such
-            // self-closing behavior and exercises the identical
-            // `bottom_band_row_heights` "terminal" band (`bp_open =
-            // engine.terminal_open || engine.bottom_panel_open`).
-            app.engine.bottom_panel_open = bottom_panel_open;
+        let theme = app.theme();
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 20,
+        };
+        let tui_backend = super::super::backend::TuiBackend::new();
+        let screen = build_screen_for_shell_content(&app.engine, &theme, area, &tui_backend);
+        let painted_rows = screen
+            .windows
+            .iter()
+            .find(|w| w.window_id == screen.active_window_id)
+            .expect("build_screen_for_shell_content must paint the active window")
+            .lines
+            .len();
+        assert_ne!(
+            painted_rows, 40,
+            "fixture must differ from View's startup-default viewport_lines \
+             (40, core/view.rs), or this test can't tell 'synced from the \
+             last paint' apart from 'never synced at all'"
+        );
+        *app.last_layout.borrow_mut() = Some(screen);
 
-            let mut backend = backend_at(100.0, 40.0);
-            app.setup(&mut backend);
-            app.tick(&mut backend);
-            let estimated = app.engine.viewport_lines();
+        let mut backend = backend_at(100.0, 20.0);
+        app.tick(&mut backend);
 
-            // Independently derive the row count the real paint path would
-            // paint into the editor column, by calling the same composer
-            // `TuiShellApp::render_content` calls --
-            // `build_screen_for_shell_content` -- directly over a
-            // hand-built `area` mirroring `main_content_bounds` for this
-            // viewport. Unlike the single-fixture version of this test,
-            // the menu bar can be on here, so the menu-bar row is carved
-            // off `area.height` first -- matching what `AppShell` hands
-            // `render_content` in the live path (see
-            // `build_screen_for_shell_content`'s own doc comment on why it
-            // takes no menu-row term itself).
-            let theme = app.theme();
-            let menu_row: u16 = if menu_bar_visible { 1 } else { 0 };
-            let area = Rect {
-                x: 0,
-                y: 0,
-                width: 100,
-                height: 40 - menu_row,
-            };
-            let tui_backend = super::super::backend::TuiBackend::new();
-            let screen = build_screen_for_shell_content(&app.engine, &theme, area, &tui_backend);
-            let active_window = screen
-                .windows
-                .iter()
-                .find(|w| w.window_id == screen.active_window_id)
-                .expect("build_screen_for_shell_content must paint the active window");
-            let painted_rows = active_window.lines.len();
-
-            assert_eq!(
-                estimated, painted_rows,
-                "tick()'s viewport-line estimate ({estimated}) drifted from the \
-                 row count the real composer painted into the editor column \
-                 ({painted_rows}) for fixture menu_bar_visible={menu_bar_visible} \
-                 window_status_line={window_status_line} quickfix_open={quickfix_open} \
-                 bottom_panel_open={bottom_panel_open} \
-                 status_line_above_terminal={status_line_above_terminal} \
-                 debug_toolbar_visible={debug_toolbar_visible} \
-                 wildmenu_open={wildmenu_open} -- see bottom_band_row_heights (#1164)"
-            );
-        }
+        assert_eq!(
+            app.engine.viewport_lines(),
+            painted_rows,
+            "tick() did not sync Engine::viewport_lines from the last paint — \
+             with the per-frame estimate gone (#1248), \
+             `render::run_shared_tick_chores`'s `set_viewport_for_window` \
+             loop is the only mechanism left to do it"
+        );
     }
 
     /// #1165: `tick()`'s periodic SC/explorer auto-refresh used to call
@@ -25123,7 +24967,46 @@ mod tests {
         // before the editor ever sees it.
         app.engine.settings.panel_keys.toggle_sidebar = String::new();
 
-        let height = app.engine.viewport_lines();
+        // #1248: `Engine::viewport_lines()` is no longer trustworthy here on
+        // its own — `tick()`'s own per-frame estimate (which used to make it
+        // accurate immediately, with no paint required) is gone, and the
+        // sole sync mechanism left, `render::run_shared_tick_chores`'s
+        // `set_viewport_for_window` loop, only runs from a *previous* paint.
+        // Derive the real editor row count from the same composer
+        // `TuiShellApp::render_content` calls — `build_screen_for_shell_content`
+        // — then seed `last_layout` with it and `tick()` again so the sync
+        // loop primes `Engine::viewport_lines` for real before any of the
+        // driver interaction below, exactly as a live paint followed by a
+        // live tick would (mirrors
+        // `tick_syncs_viewport_from_the_last_paint_now_the_estimate_is_gone`,
+        // this file's dedicated coverage of that same mechanism).
+        let height = {
+            let theme = app.theme();
+            let area = Rect {
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 40,
+            };
+            let tui_backend = super::super::backend::TuiBackend::new();
+            let screen = build_screen_for_shell_content(&app.engine, &theme, area, &tui_backend);
+            let rows = screen
+                .windows
+                .iter()
+                .find(|w| w.window_id == screen.active_window_id)
+                .expect("build_screen_for_shell_content must paint the active window")
+                .lines
+                .len();
+            *app.last_layout.borrow_mut() = Some(screen);
+            app.tick(&mut backend);
+            rows
+        };
+        assert_eq!(
+            app.engine.viewport_lines(),
+            height,
+            "priming tick() did not sync Engine::viewport_lines from the \
+             seeded layout"
+        );
         assert!(
             height >= 7,
             "this fixture's arithmetic needs a real editor viewport of at \

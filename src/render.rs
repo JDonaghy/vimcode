@@ -5294,6 +5294,251 @@ pub fn sync_shell_event_shadow(
     }
 }
 
+// ─── Shared tick-chore rung (#1248) ──────────────────────────────────────────
+//
+// `App::handle_poll_tick`/`tick_dispatch` (GTK) and `TuiShellApp::tick` (TUI)
+// each ran the *same* dozen-item background chore list every frame, written
+// out twice: sync each window's viewport from the last paint, re-check
+// tab-bar scroll offsets against what that paint measured, clear an expired
+// yank highlight, poll LSP/DAP/search idle work, refresh source control on a
+// timer, finish a deferred format-then-quit, run a queued terminal command,
+// focus a just-revealed extension panel, drain queued platform actions, and
+// sync the OS window title — a byte-identical `format!("VimCode \u{2014}
+// {}", ...)` on both sides. [`run_shared_tick_chores`] is the one function
+// both `tick()`s now call for all of it.
+//
+// The handful of effects that genuinely differ per backend — how each stores
+// its "last paint" cache (`RefCell<Option<ScreenLayout>>` under two different
+// field names), how quitting actually ends the process (GTK sets a
+// `Cell<bool>` the runner polls next frame; TUI returns `Reaction::Exit`
+// directly), whether a terminal command needs a live `backend` handle for
+// sizing — live behind [`TickHost`], following [`PanelAcceleratorHost`] /
+// [`EngineActionHost`]'s established shape (a small per-backend host struct
+// holding `&mut App`/its own fields plus `backend`, constructed fresh at each
+// call site) rather than a new one. [`TickHost::tab_switcher_gate`] is the
+// one TUI-only hook with a default: TUI skips the rest of the chore list
+// entirely while the tab-switcher popup is mid-cycle (`event_loop`'s legacy
+// behavior, preserved as-is); GTK has no such popup, so the default no-op
+// (`None`) applies.
+
+/// Host hook for [`run_shared_tick_chores`] — see the rung's header comment
+/// above for why these, and only these, differ per backend.
+pub trait TickHost {
+    /// Run `f` against the `ScreenLayout` the last paint produced, if any.
+    fn with_last_layout(&self, f: &mut dyn FnMut(&ScreenLayout));
+
+    /// The per-group tab-bar widths this frame's `TabBars` rung painted
+    /// (#1165) — a clone, since both backends clear the real field at the
+    /// *start* of the next paint, not here.
+    fn tab_visible_counts(&self) -> Vec<(GroupId, usize)>;
+
+    /// The yank-highlight clear deadline armed by `run_post_key_epilogue`
+    /// (#813).
+    fn yank_highlight_deadline(&self) -> Option<std::time::Instant>;
+
+    /// Clear the armed yank highlight — both the engine-side highlight state
+    /// and this host's own deadline field.
+    fn clear_yank_highlight_deadline(&mut self, engine: &mut Engine);
+
+    /// TUI-only: while the tab-switcher popup is mid-cycle, run *only* its
+    /// own 500ms auto-confirm timer and skip every other chore below this
+    /// point in the list — `Some(needs_redraw)` short-circuits
+    /// [`run_shared_tick_chores`] with that verdict. `None` (GTK's default,
+    /// and TUI's own answer whenever the popup isn't open) means "no gate,
+    /// keep going."
+    fn tab_switcher_gate(&mut self, engine: &mut Engine) -> Option<bool> {
+        let _ = engine;
+        None
+    }
+
+    /// Extra work when `Engine::poll_idle` reports dirty state (LSP/DAP/
+    /// search finished something this tick) — GTK re-syncs sidebar widgets
+    /// from `engine.app_shell`; TUI needs nothing extra here (its sidebar
+    /// repaints from engine state every frame regardless).
+    fn on_idle_dirty(&mut self, engine: &mut Engine) {
+        let _ = engine;
+    }
+
+    /// True once >= 2s has elapsed since the last periodic sidebar/SC
+    /// refresh, resetting the timer as a side effect when it has. Each
+    /// backend owns its own `Instant`/`Cell<Instant>` field (different
+    /// storage shapes), so the elapsed check can't live in `Engine` itself.
+    fn sidebar_refresh_due(&mut self) -> bool;
+
+    /// TUI-only: rebuild the explorer row cache on the same 2s tick,
+    /// regardless of which panel is active (mirrors the legacy `event_loop`
+    /// behavior). No-op on GTK, which refreshes the file tree from
+    /// `Engine::explorer_needs_refresh` instead.
+    fn on_sidebar_refresh_tick(&mut self, engine: &mut Engine) {
+        let _ = engine;
+    }
+
+    /// Run a queued terminal command in a freshly-sized pane — needs a live
+    /// column/row count only available per-backend.
+    fn run_terminal_command(&mut self, engine: &mut Engine, cmd: String);
+
+    /// Give a just-revealed extension panel focus, in whatever backend-local
+    /// sidebar-focus state each backend tracks.
+    fn ext_panel_focus(&mut self, engine: &mut Engine, panel_name: String);
+
+    /// Finish the format-on-save-then-quit flow (`:wq`/`:x` deferred
+    /// quit) — each backend's own session-save + shutdown/exit sequence.
+    fn quit_after_format_save(&mut self, engine: &mut Engine);
+
+    /// Carry out one queued platform action (open URL / reveal in file
+    /// manager) via this host's own `backend` handle.
+    fn run_platform_action(
+        &mut self,
+        engine: &mut Engine,
+        action: crate::core::engine::PendingPlatformAction,
+    );
+
+    /// Sync the OS window title/chrome from `engine`'s state — [`window_title`]
+    /// supplies the shared string both backends format identically; each
+    /// decides when/whether to apply it (TUI gates on its own `live` field —
+    /// no real terminal under the test driver — and GTK additionally caches
+    /// the window bounds for session-restore).
+    fn sync_window_title(&mut self, engine: &Engine);
+}
+
+/// The OS/taskbar window title vimcode uses everywhere — `"VimCode —
+/// <buffer name>"`, or the bare app name with none open. Used to be
+/// formatted identically, and independently, in `App::handle_poll_tick` and
+/// `TuiShellApp::tick`; now the one string both [`TickHost::sync_window_title`]
+/// impls format (#1248).
+pub fn window_title(engine: &Engine) -> String {
+    engine
+        .active_buffer_name()
+        .map(|n| format!("VimCode \u{2014} {}", n))
+        .unwrap_or_else(|| "VimCode".to_string())
+}
+
+/// Carry out a queued [`crate::core::engine::PendingPlatformAction`] (open
+/// URL / reveal in file manager) via `backend`'s `PlatformServices`. Was
+/// `App::run_pending_platform_action` / `TuiShellApp::run_pending_platform_action`
+/// — two copies differing only in how each reaches its `Engine` (#1248).
+pub fn run_pending_platform_action(
+    engine: &mut Engine,
+    action: crate::core::engine::PendingPlatformAction,
+    backend: &mut dyn quadraui::Backend,
+) {
+    use crate::core::engine::PendingPlatformAction;
+    match action {
+        PendingPlatformAction::OpenUrl(url) => {
+            if let Err(e) = backend.services().open_url_result(&url) {
+                engine.message = format!("Could not open URL: {e:?}");
+            }
+        }
+        PendingPlatformAction::Reveal(path) => {
+            if let Err(e) = backend.services().reveal_in_file_manager(&path) {
+                engine.message = format!("Could not reveal in file manager: {e:?}");
+            }
+        }
+    }
+}
+
+/// Run the tick-time background chore list both backends share (#1248) —
+/// see the rung's header comment above for the full list and why the
+/// backend-specific bits live behind `host` instead of here. Returns `true`
+/// when anything changed this tick that warrants a redraw.
+pub fn run_shared_tick_chores(engine: &mut Engine, host: &mut impl TickHost) -> bool {
+    let mut needs_redraw = false;
+
+    // Exact per-window viewport dimensions from the last paint, so
+    // `ensure_cursor_visible` uses real geometry rather than a whole-screen
+    // approximation that can't see splits.
+    host.with_last_layout(&mut |layout| {
+        for rw in &layout.windows {
+            engine.set_viewport_for_window(
+                rw.window_id,
+                rw.lines.len().max(1),
+                rw.text_viewport_cols.max(1),
+            );
+        }
+    });
+
+    // Re-check every group's active tab is still on-screen against the
+    // widths this frame's `TabBars` rung actually painted (#1165).
+    let counts = host.tab_visible_counts();
+    if !counts.is_empty() && engine.post_draw_apply_widths(&counts) {
+        needs_redraw = true;
+    }
+
+    // Sync the OS window title before any chore below could plausibly change
+    // the active buffer name (mirrors the legacy TUI ordering).
+    host.sync_window_title(engine);
+
+    // Poll the yank-highlight deadline armed by `run_post_key_epilogue` (#813).
+    if let Some(deadline) = host.yank_highlight_deadline() {
+        if std::time::Instant::now() >= deadline {
+            host.clear_yank_highlight_deadline(engine);
+            needs_redraw = true;
+        }
+    }
+
+    // TUI-only early exit — see `TickHost::tab_switcher_gate`'s doc.
+    if let Some(redraw) = host.tab_switcher_gate(engine) {
+        return needs_redraw || redraw;
+    }
+
+    // Periodic background work: LSP, DAP, git, search, etc.
+    if engine.poll_idle() {
+        needs_redraw = true;
+        host.on_idle_dirty(engine);
+    }
+
+    // Auto-refresh source control periodically, gated on sidebar visibility
+    // and the active panel actually being one SC touches — resolved through
+    // `sidebar_owner` rather than a bare panel-id string compare so an
+    // extension panel shown over Git/Explorer doesn't spuriously re-trigger
+    // this (mirrors the legacy GTK gate exactly; TUI's own prior gate missed
+    // the ext-panel-priority case `sidebar_owner` already handles).
+    if engine.app_shell.sidebar_visible() && host.sidebar_refresh_due() {
+        host.on_sidebar_refresh_tick(engine);
+        if matches!(
+            sidebar_owner(engine),
+            SidebarOwner::Git | SidebarOwner::Explorer
+        ) {
+            engine.sc_refresh_async();
+        }
+        needs_redraw = true;
+    }
+    if engine.poll_sc_refresh() {
+        needs_redraw = true;
+    }
+
+    // Format-on-save + :wq/:x deferred quit.
+    if engine.format_save_quit_ready {
+        engine.format_save_quit_ready = false;
+        host.quit_after_format_save(engine);
+    }
+
+    // Run a pending terminal command (needs a live column/row count).
+    if let Some(cmd) = engine.pending_terminal_command.take() {
+        host.run_terminal_command(engine, cmd);
+        needs_redraw = true;
+    }
+
+    // Focus a panel revealed by plugin logic this frame.
+    if let Some(panel_name) = engine.ext_panel_focus_pending.take() {
+        host.ext_panel_focus(engine, panel_name);
+        needs_redraw = true;
+    }
+
+    // Drain platform actions (open URL / reveal in file manager) queued by
+    // engine logic this frame — needs `backend`'s `PlatformServices`, which
+    // `core/engine/` has no handle to (#1134).
+    let actions = std::mem::take(&mut engine.pending_platform_actions);
+    if !actions.is_empty() {
+        for action in actions {
+            host.run_platform_action(engine, action);
+        }
+        needs_redraw = true;
+    }
+
+    needs_redraw
+}
+
 // ─── Chrome mouse rung (#752 / #733 slice 2) ─────────────────────────────────
 //
 // The rung directly beneath [`route_modal_overlay_click`]: once no modal

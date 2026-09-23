@@ -106,7 +106,7 @@ use crate::core;
 use crate::icons;
 use crate::render;
 
-use core::engine::{EngineAction, PendingPlatformAction};
+use core::engine::EngineAction;
 use core::{Engine, WindowRect};
 use render::Theme;
 
@@ -311,6 +311,126 @@ impl render::EngineActionHost for GtkEngineActionHost<'_> {
         engine.cleanup_all_swaps();
         engine.lsp_shutdown();
         std::process::exit(1);
+    }
+}
+
+/// [`render::TickHost`] impl for GTK — the tick-time background chores
+/// `App::handle_poll_tick` shares with TUI's `TuiShellApp::tick` (#1248).
+/// Holds `app: &mut App` and `backend` as plain borrows, same shape as
+/// [`GtkEngineActionHost`]/[`GtkAccelHost`] above.
+///
+/// Every method that needs `Engine` mutation takes it via the `engine`
+/// parameter [`render::run_shared_tick_chores`] passes through — **never**
+/// via `self.app.engine.borrow_mut()`. The caller already holds that
+/// `RefCell` borrowed for the whole call (see `App::handle_poll_tick`), so a
+/// method reaching for `self.app`'s own `engine`-touching helpers (e.g.
+/// `App::quit_confirmed`, `App::run_command_in_terminal`) would panic with
+/// `BorrowMutError` — this struct inlines those helpers' bodies against the
+/// passed-in `engine` instead.
+struct GtkTickHost<'a> {
+    app: &'a mut App,
+    backend: &'a mut dyn quadraui::Backend,
+}
+
+impl render::TickHost for GtkTickHost<'_> {
+    fn with_last_layout(&self, f: &mut dyn FnMut(&render::ScreenLayout)) {
+        if let Some(layout) = self.app.cached_screen_layout.borrow().as_ref() {
+            f(layout);
+        }
+    }
+
+    fn tab_visible_counts(&self) -> Vec<(core::window::GroupId, usize)> {
+        self.app.tab_visible_counts.borrow().clone()
+    }
+
+    fn yank_highlight_deadline(&self) -> Option<std::time::Instant> {
+        self.app.yank_hl_deadline.get()
+    }
+
+    /// Inlines `App::clear_yank_highlight`'s body against `engine` directly
+    /// — see this struct's own doc for why it can't call that method.
+    fn clear_yank_highlight_deadline(&mut self, engine: &mut Engine) {
+        engine.clear_yank_highlight();
+        self.app.yank_hl_deadline.set(None);
+    }
+
+    /// Inlines `App::sync_sidebar_from_engine` — a redraw trigger only under
+    /// the `ShellApp` runner (see that method's own doc comment).
+    fn on_idle_dirty(&mut self, _engine: &mut Engine) {
+        self.app.draw_needed.set(true);
+    }
+
+    fn sidebar_refresh_due(&mut self) -> bool {
+        if self.app.last_sc_refresh.elapsed() >= std::time::Duration::from_secs(2) {
+            self.app.last_sc_refresh = std::time::Instant::now();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Inlines `App::run_command_in_terminal`'s body against `engine`
+    /// directly — see this struct's own doc for why it can't call that
+    /// method.
+    fn run_terminal_command(&mut self, engine: &mut Engine, cmd: String) {
+        let cols = self.app.terminal_cols();
+        let rows = engine.session.terminal_panel_rows;
+        engine.terminal_run_command(&cmd, cols, rows);
+    }
+
+    fn ext_panel_focus(&mut self, engine: &mut Engine, panel_name: String) {
+        if !engine.app_shell.sidebar_visible() {
+            engine.app_shell.toggle_sidebar();
+        }
+        engine.ext_panel_has_focus = true;
+        engine.ext_panel_active = Some(panel_name);
+        self.app.sync_sidebar_widgets();
+    }
+
+    /// Inlines `App::save_session_and_exit`'s body against `engine` directly
+    /// — see this struct's own doc for why it can't call that method.
+    fn quit_after_format_save(&mut self, engine: &mut Engine) {
+        engine.session.window.width = self.app.cached_window_width.get();
+        engine.session.window.height = self.app.cached_window_height.get();
+        engine.save_session_state();
+        engine.cleanup_all_swaps();
+        engine.lsp_shutdown();
+        self.app.exit_requested.set(true);
+    }
+
+    fn run_platform_action(
+        &mut self,
+        engine: &mut Engine,
+        action: crate::core::engine::PendingPlatformAction,
+    ) {
+        render::run_pending_platform_action(engine, action, self.backend);
+    }
+
+    /// Sync the OS window title with the active buffer name (taskbar/
+    /// pager). Routed through `Backend::window()` (quadraui#950, #1124)
+    /// rather than the old GTK-only `self.window`/`PlatformWindowHandle`
+    /// title setter (deleted #1234) — that seam was `None` on
+    /// macOS/Win-GUI, so this used to be a silent no-op there;
+    /// `WindowControl` is backed on every windowed backend.
+    fn sync_window_title(&mut self, engine: &Engine) {
+        let win_title = render::window_title(engine);
+        if let Some(w) = self.backend.window() {
+            let _ = w.set_title(&win_title);
+            // Refresh the session-restore size cache (#1234) — see
+            // `cached_window_width`'s doc for why this is cached here rather
+            // than read live from `save_session_and_exit`, and why it's
+            // gated on `!is_maximized()`.
+            if matches!(w.is_maximized(), Ok(false)) {
+                if let Ok(bounds) = w.bounds() {
+                    self.app
+                        .cached_window_width
+                        .set(bounds.width.round() as i32);
+                    self.app
+                        .cached_window_height
+                        .set(bounds.height.round() as i32);
+                }
+            }
+        }
     }
 }
 
@@ -1866,34 +1986,6 @@ impl App {
         self.draw_needed.set(true);
     }
 
-    /// Carry out a platform action queued by engine logic this frame — `gx`,
-    /// the "Reveal in File Manager" context-menu item, an extension-supplied
-    /// link, ... — using the runner-owned `backend`'s `PlatformServices`
-    /// (#1134). `core/engine/` has no `backend` handle of its own, hence the
-    /// queue-and-drain-in-`tick` shape; mirrors `run_pending_file_dialog` /
-    /// `run_pending_native_dialog` above. On failure, reports it via
-    /// `engine.message` (the same status-line surface `gx`'s own "Opening:"
-    /// message already uses) rather than silently doing nothing.
-    fn run_pending_platform_action(
-        &mut self,
-        action: PendingPlatformAction,
-        backend: &mut dyn quadraui::Backend,
-    ) {
-        match action {
-            PendingPlatformAction::OpenUrl(url) => {
-                if let Err(e) = backend.services().open_url_result(&url) {
-                    self.engine.borrow_mut().message = format!("Could not open URL: {e:?}");
-                }
-            }
-            PendingPlatformAction::Reveal(path) => {
-                if let Err(e) = backend.services().reveal_in_file_manager(&path) {
-                    self.engine.borrow_mut().message =
-                        format!("Could not reveal in file manager: {e:?}");
-                }
-            }
-        }
-    }
-
     /// Apply the `EngineAction` produced by dismissing a dialog — clears
     /// `explorer_needs_refresh` (some dialog outcomes, e.g. "Discard &
     /// Close", can trigger a sidebar refresh) and handles quit/save-quit.
@@ -2209,12 +2301,6 @@ impl App {
             engine.set_scroll_left_for_window(win_id, new_left);
         }
         drop(engine);
-        self.draw_needed.set(true);
-    }
-
-    /// Clear the yank highlight after the flash duration has elapsed.
-    fn clear_yank_highlight(&mut self) {
-        self.engine.borrow_mut().clear_yank_highlight();
         self.draw_needed.set(true);
     }
 
@@ -2827,120 +2913,28 @@ impl App {
         // origin the neighboring comment already flagged as the #582/#646
         // coordinate-frame bug, so it was not simply "wire the same code
         // back up"), which is follow-up work, not a dead-code deletion.
-        //
-        // Sync per-window viewport dimensions from the paint-time ScreenLayout
-        // so ensure_cursor_visible uses exact geometry.  This block is outside
-        // the `da_size` guard because `cached_screen_layout` is populated by
-        // render_content() regardless of whether `self.drawing_area` is set —
-        // which it is not under the quadraui ShellApp runner (the runner owns
-        // the single DrawingArea, not vimcode).
-        {
-            let layout_ref = self.cached_screen_layout.borrow();
-            if let Some(ref layout) = *layout_ref {
-                let mut engine = self.engine.borrow_mut();
-                for rw in &layout.windows {
-                    engine.set_viewport_for_window(
-                        rw.window_id,
-                        rw.lines.len().max(1),
-                        rw.text_viewport_cols.max(1),
-                    );
-                }
-            }
-        }
 
-        // Re-check every group's active tab is on-screen against the widths
-        // this frame's `TabBars` rung actually painted (#1165) — mirrors
-        // `TuiShellApp::tick`'s identical drain of `tab_visible_counts`
-        // right after its own per-frame viewport sync. See
-        // `Self::tab_visible_counts`'s doc for why this was never wired on
-        // GTK: a tab scrolled out of view by a resize, sidebar toggle, or a
-        // new tab opening past the bar's width could stay off-screen forever
-        // on this backend, with nothing to bring it back until some other
-        // change happened to touch `tab_scroll_offset`.
-        {
-            let counts = self.tab_visible_counts.borrow().clone();
-            if !counts.is_empty() && self.engine.borrow_mut().post_draw_apply_widths(&counts) {
-                self.draw_needed.set(true);
-            }
-        }
-
-        // Run all periodic background work (LSP, DAP, terminal, search, etc.)
-        // poll_idle() consumes dap_wants_sidebar internally.
-        let idle_dirty = self.engine.borrow_mut().poll_idle();
-        if idle_dirty {
-            self.sync_sidebar_from_engine();
-        }
-        // Format-on-save + :wq/:x deferred quit
-        if self.engine.borrow().format_save_quit_ready {
-            self.engine.borrow_mut().format_save_quit_ready = false;
-            self.quit_confirmed();
-        }
-        // Run pending terminal commands (needs backend-supplied terminal size).
-        if self.engine.borrow().pending_terminal_command.is_some() {
-            let cmd = self
-                .engine
-                .borrow_mut()
-                .pending_terminal_command
-                .take()
-                .unwrap();
-            self.run_command_in_terminal(cmd);
-        }
-        let active_panel = self.current_active_panel_id();
-        // Explorer refresh after confirmed file move.
+        // Explorer refresh after confirmed file move — GTK-only, no TUI
+        // counterpart (see `Self::explorer_needs_refresh`'s own doc).
         if self.engine.borrow().explorer_needs_refresh {
             self.engine.borrow_mut().explorer_needs_refresh = false;
             self.refresh_file_tree();
         }
-        // Auto-refresh SC panel periodically (gated on sidebar visibility).
-        if self.current_sidebar_visible()
-            && (active_panel == PANEL_GIT || active_panel == PANEL_EXPLORER)
-            && self.last_sc_refresh.elapsed() >= std::time::Duration::from_secs(2)
-        {
-            self.engine.borrow_mut().sc_refresh_async();
-            self.last_sc_refresh = std::time::Instant::now();
-        }
-        if self.engine.borrow_mut().poll_sc_refresh() {
+
+        // #1248: the rest of this function's chores — per-window viewport
+        // sync, tab-visibility re-check, window title, yank-highlight clear,
+        // idle/SC polling, deferred quit, terminal command, ext-panel focus,
+        // platform-action drain — are shared with `TuiShellApp::tick`. See
+        // `render::run_shared_tick_chores`'s header comment for the full
+        // list and why the pieces left in `GtkTickHost` below differ.
+        let engine_rc = self.engine.clone();
+        let needs_redraw = {
+            let mut engine = engine_rc.borrow_mut();
+            let mut host = GtkTickHost { app: self, backend };
+            render::run_shared_tick_chores(&mut engine, &mut host)
+        };
+        if needs_redraw {
             self.draw_needed.set(true);
-        }
-        // Check for panel reveal request from plugins.
-        // Extract into a separate binding so the RefMut drops before the
-        // re-borrows inside the body (Rust 2021 temporary lifetime rule).
-        let pending_panel = self.engine.borrow_mut().ext_panel_focus_pending.take();
-        if let Some(panel_name) = pending_panel {
-            {
-                let mut engine = self.engine.borrow_mut();
-                if !engine.app_shell.sidebar_visible() {
-                    engine.app_shell.toggle_sidebar();
-                }
-                engine.ext_panel_has_focus = true;
-                engine.ext_panel_active = Some(panel_name);
-            }
-            self.sync_sidebar_widgets();
-        }
-        // Sync the OS window title with the active buffer name (taskbar/
-        // pager). Routed through `Backend::window()` (quadraui#950, #1124)
-        // rather than the old GTK-only `self.window`/`PlatformWindowHandle`
-        // title setter (deleted #1234) — that seam was `None` on
-        // macOS/Win-GUI, so this used to be a silent no-op there;
-        // `WindowControl` is backed on every windowed backend.
-        let win_title = self
-            .engine
-            .borrow()
-            .active_buffer_name()
-            .map(|n| format!("VimCode \u{2014} {}", n))
-            .unwrap_or_else(|| "VimCode".to_string());
-        if let Some(w) = backend.window() {
-            let _ = w.set_title(&win_title);
-            // Refresh the session-restore size cache (#1234) — see
-            // `cached_window_width`'s doc for why this is cached here rather
-            // than read live from `save_session_and_exit`, and why it's
-            // gated on `!is_maximized()`.
-            if matches!(w.is_maximized(), Ok(false)) {
-                if let Ok(bounds) = w.bounds() {
-                    self.cached_window_width.set(bounds.width.round() as i32);
-                    self.cached_window_height.set(bounds.height.round() as i32);
-                }
-            }
         }
     }
 
@@ -5938,16 +5932,6 @@ impl App {
         self.draw_needed.set(true);
     }
 
-    /// Run `cmd` in a visible terminal pane (used for extension installs).
-    fn run_command_in_terminal(&mut self, cmd: String) {
-        let cols = self.terminal_cols();
-        let rows = self.engine.borrow().session.terminal_panel_rows;
-        self.engine
-            .borrow_mut()
-            .terminal_run_command(&cmd, cols, rows);
-        self.draw_needed.set(true);
-    }
-
     /// #731: was `if let Some(ref da) = *self.menu_dropdown_da.borrow()`
     /// — that field is permanently `None` under the ShellApp runner
     /// (nothing assigns it), so this has been a no-op since #540. The menu
@@ -6988,12 +6972,6 @@ impl App {
         self.draw_needed.set(true);
     }
 
-    /// User confirmed quit — save session state then exit the process.
-    fn quit_confirmed(&mut self) {
-        // Save session state then exit the process.
-        self.save_session_and_exit();
-    }
-
     /// User clicked ✕ on a tab with unsaved changes — ask what to do.
     ///
     /// #823 item 4: was a byte-identical restatement of
@@ -7843,16 +7821,6 @@ impl App {
             }
         }
 
-        // Poll the yank-highlight deadline armed by `run_post_key_epilogue`
-        // (#813 — see `yank_hl_deadline`'s doc comment).
-        if let Some(deadline) = self.yank_hl_deadline.get() {
-            if std::time::Instant::now() >= deadline {
-                self.clear_yank_highlight();
-                self.yank_hl_deadline.set(None);
-                self.draw_needed.set(true);
-            }
-        }
-
         // Run a file dialog requested this frame — needs the runner-owned
         // `backend` handle for `PlatformServices` (#572). See
         // `PendingFileDialog` for why this can't happen in the
@@ -7869,17 +7837,11 @@ impl App {
             self.run_pending_native_dialog(opts, backend);
         }
 
-        // Drain platform actions (open URL / reveal in file manager) queued
-        // by engine logic this frame — needs the runner-owned `backend` for
-        // `PlatformServices`, which `core/engine/` has no handle to (#1134).
-        // See `Engine::pending_platform_actions`'s doc; mirrors the file
-        // dialog and native dialog drains just above.
-        let actions = std::mem::take(&mut self.engine.borrow_mut().pending_platform_actions);
-        for action in actions {
-            self.run_pending_platform_action(action, backend);
-        }
-
-        // Periodic background work: LSP, DAP, git, search, etc.
+        // Periodic background work: LSP, DAP, git, search, etc. — also
+        // where the yank-highlight deadline armed by `run_post_key_epilogue`
+        // (#813) and the platform-action drain (open URL / reveal in file
+        // manager, #1134) are polled, since #1248 folded both into the
+        // chore list `render::run_shared_tick_chores` shares with TUI.
         self.handle_poll_tick(backend);
 
         if self.draw_needed.get() {
