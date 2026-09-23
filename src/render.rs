@@ -4449,12 +4449,39 @@ pub fn is_force_redraw_key(
 /// the popup itself painted last frame, in cells nothing repaints this
 /// frame — for that cache to wrongly believe are still correct and skip.
 /// Pulled out as its own pure function (mirroring [`is_force_redraw_key`]
-/// just above) because `quadraui::Backend` is a sealed trait and
-/// `quadraui::tui::testing::TuiDriver`'s internals are private to that
-/// crate, so a vimcode-side driver test cannot itself observe
-/// `request_full_repaint` being called or its effect on a real diff cache
-/// — the one thing outside this module that *is* directly testable from
-/// here is the edge-detection logic that decides to call it.
+/// just above) because it is the one piece of this wiring that *is*
+/// directly unit-testable from here.
+///
+/// **Why there is no driver-level (`tui_prod`) test proving the *repaint*
+/// itself, only this edge-detection predicate — verified directly against
+/// quadraui checkout rev `215e9e4`, not assumed:**
+/// `quadraui::tui::testing::TuiDriver` (`TestBackend`-backed) already
+/// consumes `request_full_repaint` in its own `render()` (it calls
+/// `Terminal::clear()` when the flag is set, exactly like the live
+/// runner) — that part isn't the blocker. The blocker is that
+/// `ratatui::Terminal::draw`'s own contract requires the render callback
+/// to fully repaint every frame, so `TestBackend`'s buffer self-heals any
+/// content that stops being painted through the normal
+/// `ShellApp::render_content` path with or without `request_full_repaint`
+/// — there is no stale cell for a `TestBackend`-based driver to observe in
+/// the first place. Only content written *outside* ratatui's `Buffer`/diff
+/// tracking (e.g. an embedded PTY writing raw bytes straight into the
+/// terminal) can produce the "diff believes this cell is unchanged"
+/// condition the hook exists to fix, and only `quadraui::tui::vt_testing::
+/// TuiVtDriver` (vt100-backed, real ANSI byte stream) can model that — see
+/// its own `render_actually_clears_stale_content_outside_the_diff_cache`
+/// test, which proves the *mechanism* works. Two things block using it
+/// from vimcode for a `ShellApp` impl: `TuiVtDriver::new` takes
+/// `AppLogic`, not `ShellApp` (no `driver_with_shell`-equivalent exists
+/// for it, and the only adapter between the two,
+/// `shell_adapter::build_shell_adapter`, is `pub(crate)`), and
+/// `TuiVtDriver`'s `parser: Rc<RefCell<vt100::Parser>>` field — the only
+/// way to inject the out-of-band bytes that test's own technique relies
+/// on — is private with no public equivalent. Filing a quadraui issue for
+/// this test-infrastructure gap (either a `vt_testing::driver_with_shell`,
+/// or a public `TuiVtDriver::inject_raw`) is deferred to the coordinator —
+/// this worker session has no `gh`/issue-filing access (see PR discussion
+/// for the drafted issue text).
 pub fn popup_overlay_closed_this_frame(was_open: bool, is_open_now: bool) -> bool {
     was_open && !is_open_now
 }
