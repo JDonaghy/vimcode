@@ -2,8 +2,18 @@ use super::*;
 
 impl Engine {
     pub fn execute_command(&mut self, cmd: &str) -> EngineAction {
-        // Save for @: repeat (before normalization, using trimmed original)
+        // Save for @: repeat (before normalization, using trimmed original).
+        // `prev_ex_command` is the value *before* this overwrite — the ":"
+        // register's true value while this command runs (`:h quote_:`):
+        // confirmed against a live oracle that `:registers`'s own listing
+        // shows the *previous* command in its ":" row, never itself, because
+        // the ":" register isn't updated until a command finishes.
+        // `self.last_ex_command` itself has to be set eagerly, right here,
+        // so `@:` and `":p`/`<C-r>:` see *this* command as soon as it
+        // completes — including for early-return paths below that never
+        // reach the bottom of this function.
         let trimmed_cmd = cmd.trim();
+        let prev_ex_command = self.last_ex_command.clone();
         if !trimmed_cmd.is_empty() {
             self.last_ex_command = Some(trimmed_cmd.to_string());
         }
@@ -2340,6 +2350,25 @@ impl Engine {
             return self.ex_digraphs(args);
         }
 
+        // Handle `:registers`/`:display` (`:h :registers`, #1299): with no
+        // arguments, lists every non-empty register in Neovim's canonical
+        // order; with a `{register-name}...` argument, restricts the listing
+        // to just those registers (`:reg a`, `:reg ab`, `:reg a b` all mean
+        // "show a and b" — each non-space character of the argument is its
+        // own register name, `:h :registers`). Both spellings normalize to
+        // "registers" via `EX_ABBREVS`.
+        if cmd == "registers"
+            || cmd.starts_with("registers ")
+            || cmd == "display"
+            || cmd.starts_with("display ")
+        {
+            let args = cmd
+                .split_once(' ')
+                .map(|(_, rest)| rest.trim())
+                .unwrap_or("");
+            return self.ex_registers(args, prev_ex_command.as_deref());
+        }
+
         match cmd {
             "write" => {
                 let _ = self.save_with_format(false);
@@ -2422,41 +2451,6 @@ impl Engine {
             "nohlsearch" => {
                 self.search_matches.clear();
                 self.search_index = None;
-                EngineAction::None
-            }
-            // Display registers
-            "registers" | "display" => {
-                let mut lines: Vec<String> = Vec::new();
-                lines.push("--- Registers ---".to_string());
-                let special_regs: Vec<char> = vec![
-                    '"', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', '-', '+', '*', '.', '%',
-                    '/',
-                ];
-                for &r in &special_regs {
-                    if let Some((content, ty)) = self.registers.get(&r).cloned() {
-                        let kind = reg_type_letter(ty);
-                        let preview: String = content.chars().take(40).collect();
-                        lines.push(format!(
-                            "\"{}  {}  {}",
-                            r,
-                            kind,
-                            preview.replace('\n', "\\n")
-                        ));
-                    }
-                }
-                for c in 'a'..='z' {
-                    if let Some((content, ty)) = self.registers.get(&c).cloned() {
-                        let kind = reg_type_letter(ty);
-                        let preview: String = content.chars().take(40).collect();
-                        lines.push(format!(
-                            "\"{}  {}  {}",
-                            c,
-                            kind,
-                            preview.replace('\n', "\\n")
-                        ));
-                    }
-                }
-                self.message = lines.join("\n");
                 EngineAction::None
             }
             // Display marks
@@ -5959,7 +5953,112 @@ impl Engine {
             listed.join("  |  ")
         }
     }
+
+    /// `:registers`/`:display` (`:h :registers`, #1299). With `args` empty,
+    /// lists every non-empty register; otherwise each non-space character of
+    /// `args` is one requested register name and only those are listed
+    /// (still in canonical order, not argument order — confirmed against a
+    /// live oracle: `:reg b a` lists `a` before `b`).
+    ///
+    /// `prev_ex_command` is `self.last_ex_command` from *before*
+    /// [`Engine::execute_command`] overwrote it for this very invocation —
+    /// needed because the `":"` register must show the previous command
+    /// while `:registers`/`:reg` itself is running, never itself (confirmed
+    /// against a live oracle: back-to-back `:registers` calls show the
+    /// *first* one's `":"` row empty, and the *second* one's `":"` row is
+    /// `registers`, the first call — not the second call self-referencing).
+    pub(crate) fn ex_registers(
+        &mut self,
+        args: &str,
+        prev_ex_command: Option<&str>,
+    ) -> EngineAction {
+        let requested: Option<Vec<char>> = if args.is_empty() {
+            None
+        } else {
+            Some(args.chars().filter(|c| !c.is_whitespace()).collect())
+        };
+        let mut lines: Vec<String> = vec!["Type Name Content".to_string()];
+        for r in REGISTERS_DISPLAY_ORDER.iter().copied() {
+            if let Some(requested) = &requested {
+                if !requested.contains(&r) {
+                    continue;
+                }
+            }
+            let Some((content, ty)) = self.register_display_value(r, prev_ex_command) else {
+                continue;
+            };
+            if content.is_empty() {
+                continue;
+            }
+            let kind = reg_type_letter(ty);
+            let preview: String = content.chars().take(40).collect();
+            lines.push(format!(
+                "  {}  \"{}   {}",
+                kind,
+                r,
+                preview.replace('\n', "^J")
+            ));
+        }
+        self.message = lines.join("\n");
+        EngineAction::None
+    }
+
+    /// Read-only lookup used by [`Engine::ex_registers`]: mirrors
+    /// [`Engine::get_register_content`] for the read-only pseudo-registers
+    /// (`%`, `#`, `.`, `:`, `/`) but never touches `self.message` or the
+    /// system clipboard — a listing command must not have those side
+    /// effects. `+`/`*` therefore read vimcode's own stored copy rather than
+    /// querying the clipboard provider live. `:` reads `prev_ex_command`
+    /// rather than `self.last_ex_command` — see [`Engine::ex_registers`]'s
+    /// doc comment for why.
+    fn register_display_value(
+        &self,
+        r: char,
+        prev_ex_command: Option<&str>,
+    ) -> Option<(String, RegType)> {
+        match r {
+            '%' => {
+                let name = self
+                    .active_buffer_state()
+                    .file_path
+                    .as_ref()
+                    .and_then(|p| p.file_name())
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                Some((name, RegType::Charwise))
+            }
+            '#' => {
+                let name = self
+                    .buffer_manager
+                    .alternate_buffer
+                    .and_then(|id| self.buffer_manager.get(id))
+                    .and_then(|state| state.file_path.as_ref())
+                    .and_then(|p| p.file_name())
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                Some((name, RegType::Charwise))
+            }
+            '.' => Some((self.last_inserted_text.clone(), RegType::Charwise)),
+            ':' => Some((
+                prev_ex_command.unwrap_or_default().to_string(),
+                RegType::Charwise,
+            )),
+            '/' => Some((self.search_query.clone(), RegType::Charwise)),
+            _ => self.registers.get(&r).cloned(),
+        }
+    }
 }
+
+/// Canonical `:registers` iteration order — unnamed, numbered, named, then
+/// the read-only/special registers in the order a live Neovim lists them
+/// (confirmed empirically: `:h registers`' prose order doesn't match the
+/// oracle's actual `:reg` output, so this is the order the oracle printed,
+/// not the doc's).
+const REGISTERS_DISPLAY_ORDER: &[char] = &[
+    '"', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h',
+    'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z', '-',
+    '*', '+', '.', ':', '%', '#', '/', '=',
+];
 
 /// One candidate match `:s///c` offers to confirm — everything about it is
 /// derived from the *original*, unmodified buffer text once, up front (see
