@@ -18006,6 +18006,163 @@ mod tests {
         );
     }
 
+    /// #1291 acceptance, painted-output tier: `CTRL-W r` must rotate window
+    /// *identity* — which window's content and focus land in which screen
+    /// slot — not just swap `buffer_id`/view content across fixed screen
+    /// positions while focus stays pinned to the same slot.
+    ///
+    /// Drives two real files into a horizontal split, the same fixture
+    /// shape `wheel_scrolls_the_hovered_pane_not_the_focused_one_via_shell_app`
+    /// (#1066) uses above: `Engine::split_window` always makes the new
+    /// window (file B) active and, since `splitbelow` defaults to `false`,
+    /// places it *first* (top) on screen — so before the rotate the top
+    /// pane shows file B's content and holds focus (the painted block
+    /// cursor), and the bottom pane shows file A's content and is
+    /// unfocused.
+    ///
+    /// With only two windows, a single `<C-w>r` is a straight swap of
+    /// which slot each window occupies (Neovim's own behaviour, confirmed
+    /// against the live oracle by `tests/nvim_conformance.rs`'s `win:
+    /// CTRL-W r rotates windows downward/rightward` case). Because
+    /// `rotate_windows` now permutes `WindowId`s through the
+    /// `WindowLayout` tree rather than copying content across fixed
+    /// slots, file A's content *and* the previously-unfocused window's
+    /// identity move to the top slot, while file B's content, its
+    /// still-active window, and the block cursor move to the bottom slot.
+    ///
+    /// RED against unfixed `rotate_windows` (pre-#1291): that version
+    /// swapped `buffer_id`/`view` across the two static `WindowLayout`
+    /// leaf slots while leaving `Tab::active_window` — and so the painted
+    /// block cursor — pinned to the top slot. The content assertion below
+    /// would still have passed (the two panes' text does swap either way),
+    /// but the cursor-follows-focus assertion would have failed: the
+    /// cursor cell would stay in the top slot (now painting file A) rather
+    /// than following file B's window down to the bottom slot. Confirmed
+    /// by hand: reverting `rotate_windows` to the pre-#1291 slot-swap
+    /// implementation flips the final assertion.
+    #[test]
+    fn ctrl_w_r_rotates_window_identity_and_focus_not_just_content_via_shell_app() {
+        const WIDTH: u16 = 120;
+        const HEIGHT: u16 = 40;
+
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_test_1291_rotate_identity_{:?}",
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_a = dir.join("a1291.txt"); // bottom pane, unfocused, before rotate
+        let file_b = dir.join("b1291.txt"); // top pane, focused, before rotate
+        let content_a: String = (0..40).map(|i| format!("AAA1291_{i:03}\n")).collect();
+        let content_b: String = (0..40).map(|i| format!("BBB1291_{i:03}\n")).collect();
+        std::fs::write(&file_a, &content_a).unwrap();
+        std::fs::write(&file_b, &content_b).unwrap();
+
+        let mut app = TuiShellApp::new(None);
+        app.engine.settings.autohide_panels = false;
+        app.engine.app_shell.hide_sidebar();
+        app.engine.session.explorer_visible = false;
+        app.engine
+            .open_file_with_mode(&file_a, crate::core::engine::OpenMode::Permanent)
+            .unwrap();
+        app.engine
+            .split_window(SplitDirection::Horizontal, Some(&file_b));
+
+        // Read the fixture's own resolved theme before `app` moves into
+        // the driver, the same way `focus_change_does_not_move_either_
+        // panes_text_via_shell_app` above does, so the cursor-cell scan
+        // matches whatever colour this fixture actually paints with.
+        let theme = Theme::from_name(&app.engine.settings.colorscheme);
+        let cursor_bg = quadraui::tui::ratatui_color(super::quadraui_tui::q_theme(&theme).cursor);
+
+        let mut driver = driver_with_shell(app, config(), WIDTH, HEIGHT);
+        // Warm-up dispatch: force one reconcile pass so the runner's
+        // painted `AppShell` sidebar/autohide state agrees with the
+        // engine's pinned state before anything is read off the screen
+        // (see #1066's fixture doc comment above for the full mechanism).
+        driver.mouse_move(0.0, 0.0);
+
+        fn cursor_cell(
+            driver: &quadraui::tui::testing::TuiDriver<impl quadraui::AppLogic>,
+            cursor_bg: quadraui::tui::testing::Color,
+        ) -> Option<(u16, u16)> {
+            for y in 0..HEIGHT {
+                for x in 0..WIDTH {
+                    if driver.style_at(x, y).map(|s| s.bg) == Some(cursor_bg) {
+                        return Some((x, y));
+                    }
+                }
+            }
+            None
+        }
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("AAA1291_000") && screen.contains("BBB1291_000"),
+            "both panes must paint their own first line before any \
+             rotate; screen:\n{screen}"
+        );
+        let (_, a_row_before) = driver
+            .find("AAA1291_000")
+            .expect("file A's first line must be painted somewhere");
+        let (_, b_row_before) = driver
+            .find("BBB1291_000")
+            .expect("file B's first line must be painted somewhere");
+        assert!(
+            b_row_before < a_row_before,
+            "test setup sanity: file B (the new, active window) must \
+             start in the top slot before the rotate; B row \
+             {b_row_before}, A row {a_row_before}"
+        );
+        let cell_before = cursor_cell(&driver, cursor_bg)
+            .expect("the active (top, file B) pane must paint a block cursor cell");
+        assert!(
+            (cell_before.1 as f32) < a_row_before,
+            "test setup sanity: the block cursor must start in the top \
+             (file B) pane, above file A's row {a_row_before}; cursor \
+             cell {cell_before:?}"
+        );
+
+        driver.ctrl_char('w');
+        driver.type_char('r');
+        driver.render();
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("AAA1291_000") && screen.contains("BBB1291_000"),
+            "both panes must still paint their own first line after \
+             `<C-w>r`; screen:\n{screen}"
+        );
+        let (_, a_row_after) = driver
+            .find("AAA1291_000")
+            .expect("file A's first line must still be painted somewhere");
+        let (_, b_row_after) = driver
+            .find("BBB1291_000")
+            .expect("file B's first line must still be painted somewhere");
+        assert!(
+            a_row_after < b_row_after,
+            "`<C-w>r` on two windows must swap which slot each window's \
+             content paints in — file A should now be in the top slot \
+             and file B in the bottom slot; A row {a_row_after}, B row \
+             {b_row_after}; screen:\n{screen}"
+        );
+
+        let cell_after = cursor_cell(&driver, cursor_bg).expect(
+            "the still-active (file B) pane must paint a block cursor \
+             cell after the rotate",
+        );
+        assert!(
+            (cell_after.1 as f32) > a_row_after,
+            "`<C-w>r` must move focus (and so the painted block-cursor \
+             cell) to follow the window that was active before the \
+             rotate (file B) down into its new, bottom slot — not leave \
+             it pinned to the top (now file A's) slot; file A row \
+             {a_row_after}, cursor cell {cell_after:?}; screen:\n{screen}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// #35: `render_content` must paint the minimap through the shell path,
     /// as braille — not just populate `ScreenLayout.minimap`.
     ///
