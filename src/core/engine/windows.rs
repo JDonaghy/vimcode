@@ -3948,37 +3948,33 @@ impl Engine {
 
     /// Ctrl-W r/R: rotate windows in the current tab.
     /// `forward=true` rotates downward/rightward, `forward=false` rotates upward/leftward.
+    ///
+    /// Rotates window *identity* through the fixed tree slots (#1291), not
+    /// each slot's content: Neovim's CTRL-W r/R moves which window (buffer +
+    /// view + `winid`) occupies each screen position, so a window that was
+    /// focused before the rotate stays focused after it, just in its new
+    /// position. `Tab::active_window` is a `WindowId`, and no `WindowId`
+    /// here ever changes which `Window` (`self.windows[id]`) it names — only
+    /// which tree leaf holds it — so leaving `active_window` untouched is
+    /// exactly "focus follows the window it was on".
     pub(crate) fn rotate_windows(&mut self, forward: bool) {
         let tab = self.active_tab();
-        let ids = tab.layout.window_ids();
+        let mut ids = tab.layout.window_ids();
         if ids.len() < 2 {
             return;
         }
-        // Collect (buffer_id, view) for each window in layout order
-        let mut data: Vec<_> = ids
-            .iter()
-            .map(|&id| {
-                let w = &self.windows[&id];
-                (w.buffer_id, w.view.clone())
-            })
-            .collect();
-        // Rotate the data
         if forward {
-            // Last element moves to front
-            let last = data.pop().unwrap();
-            data.insert(0, last);
+            // Last window moves to the first slot; every other window
+            // shifts down/right by one slot.
+            let last = ids.pop().unwrap();
+            ids.insert(0, last);
         } else {
-            // First element moves to back
-            let first = data.remove(0);
-            data.push(first);
+            // First window moves to the last slot; every other window
+            // shifts up/left by one slot.
+            let first = ids.remove(0);
+            ids.push(first);
         }
-        // Apply rotated data back
-        for (i, &id) in ids.iter().enumerate() {
-            if let Some(w) = self.windows.get_mut(&id) {
-                w.buffer_id = data[i].0;
-                w.view = data[i].1.clone();
-            }
-        }
+        self.active_tab_mut().layout.set_window_ids_in_order(&ids);
     }
 
     /// Jump to end of C-style comment block (]*  or  ]/).
