@@ -24077,6 +24077,127 @@ mod tests {
         );
     }
 
+    /// #1293: `ensure_cursor_visible_wrap` — the `'wrap'`-on vertical
+    /// scroll-to-cursor path — never read `self.settings.scrolloff`, unlike
+    /// the `'wrap'`-off path right next to it (`ensure_cursor_visible`).
+    /// `nvim_conformance`'s `"scroll:so=5 30G H"`/`"...L"` cases only
+    /// compare buffer+cursor *state*, never a rendered screen, so this
+    /// drives the same reproduction (`:set so=5<CR>`, jump past the bottom
+    /// of the first window, then `H`) through a real `TuiShellApp` +
+    /// `TuiDriver` and asserts on the painted status line — the
+    /// driver-tier black-box coverage CLAUDE.md's "Testing (CRITICAL)"
+    /// section requires for a user-visible scroll-to-cursor fix.
+    ///
+    /// Arithmetic (mirrors `test_ensure_cursor_visible_wrap_respects_
+    /// scrolloff_downward` in `core/engine/tests.rs`, driven through real
+    /// keys instead of calling `ensure_cursor_visible()` directly): jumping
+    /// to buffer line `height + 5` (1-indexed) with `scroll_top` starting
+    /// at 0 exercises the "scroll down to satisfy the *bottom* margin"
+    /// branch. Both the resulting topline and `H`'s landing line reduce to
+    /// values that are independent of `height` (the `+5`/`-5` cancel it
+    /// out), so the assertions below hold for any terminal size the
+    /// fixture's `height >= 7` guard allows:
+    ///
+    /// - 0-indexed cursor line = `height + 4`.
+    /// - Fixed: `scroll_top = cursor_line + scrolloff + 1 - height = 10`,
+    ///   i.e. topline (1-indexed) `11`.
+    /// - `H`'s target (`screen_top_target`, unaffected by this fix — it
+    ///   already read `scrolloff`) is `scroll_top + scrolloff = 15`
+    ///   (0-indexed), i.e. line `16` (1-indexed) — the status bar reads
+    ///   `"Ln 16, Col 1"`.
+    ///
+    /// **RED against unfixed `develop` (confirmed by hand-reverting
+    /// `ensure_cursor_visible_wrap` to the pre-#1293 formula and
+    /// re-running this exact test):** the unfixed path ignores
+    /// `scrolloff` entirely, landing `scroll_top` on `cursor_line - height
+    /// + 1 = 5` (topline `6`) instead of `11`, five lines short — matching
+    /// the `KNOWN_DEVIATIONS` entries' description of landing "one
+    /// scrolloff-margin short of Neovim". `H` then lands on line `11`
+    /// (`"Ln 11, Col 1"`) instead of `16`.
+    #[test]
+    fn h_after_jump_respects_scrolloff_under_wrap_via_shell_app() {
+        fn visible_l_markers(screen: &str) -> Vec<usize> {
+            screen
+                .lines()
+                .flat_map(|line| line.split_whitespace())
+                .filter_map(|tok| tok.strip_prefix('L').and_then(|n| n.parse::<usize>().ok()))
+                .collect()
+        }
+
+        let mut app = TuiShellApp::new_for_test();
+        app.engine
+            .buffer_mut()
+            .insert(0, &(1..=300).map(|n| format!("L{n}\n")).collect::<String>());
+
+        let mut backend = backend_at(100.0, 40.0);
+        app.setup(&mut backend);
+        // See the identical comment on `ctrl_b_clamped_scroll_lands_
+        // cursor_on_new_window_bottom_via_shell_app` above: `tick()`'s
+        // settings reload has to happen before any settings override below,
+        // or the real on-disk `~/.config/vimcode/settings.json` stomps it.
+        app.tick(&mut backend);
+        app.engine.settings.panel_keys.toggle_sidebar = String::new();
+
+        let height = app.engine.viewport_lines();
+        assert!(
+            height >= 7,
+            "this fixture's arithmetic needs a real editor viewport of at \
+             least 7 rows; got {height}"
+        );
+
+        let mut driver = driver_with_shell(app, config(), 100, 40);
+
+        // Click-to-focus guardrail, same rationale as the CTRL-B test above.
+        let (cx, cy) = driver
+            .find("L1")
+            .expect("the buffer's first line must paint before the click");
+        driver.click(cx, cy);
+
+        // `'wrap'` defaults to off in vimcode (`Settings::default().wrap`);
+        // Neovim's default (and the oracle's, per #1280) is on, which is
+        // what this bug needs to reproduce. `:set so=5` is the same
+        // abbreviation `nvim_conformance`'s cases use.
+        driver.press_named(quadraui::NamedKey::Escape);
+        for ch in ":set wrap so=5".chars() {
+            driver.type_char(ch);
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
+
+        // Jump 5 lines past the bottom of the first window (1-indexed
+        // target `height + 5`), the same shape of jump the CTRL-B test uses
+        // to force a downward scroll.
+        let target = height + 5;
+        driver.type_char(':');
+        for ch in target.to_string().chars() {
+            driver.type_char(ch);
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
+
+        let after_jump = visible_l_markers(&driver.screen());
+        assert_eq!(
+            after_jump.iter().min().copied(),
+            Some(11),
+            "with scrolloff=5, jumping to line {target} must leave a \
+             5-line margin below the cursor within the new window, landing \
+             the topline on 11 (unfixed `ensure_cursor_visible_wrap` \
+             ignores scrolloff entirely and would land on 6 instead); \
+             screen:\n{}",
+            driver.screen()
+        );
+
+        driver.type_char('H');
+
+        let expected_status = "Ln 16, Col 1";
+        assert!(
+            driver.screen_contains(expected_status),
+            "H must land 'scrolloff' (5) lines below the new topline (11), \
+             i.e. line 16 (\"{expected_status}\") — unfixed `ensure_cursor_\
+             visible_wrap`'s un-margined topline (6) would have put H on \
+             line 11 (\"Ln 11, Col 1\") instead; screen:\n{}",
+            driver.screen()
+        );
+    }
+
     // ── #1060: converge GTK's 4 kept-GTK-spelled keys onto the shared
     // `render::engine_key_from_ui` ─────────────────────────────────────
     //
