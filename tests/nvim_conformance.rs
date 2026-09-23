@@ -16829,11 +16829,14 @@ const REGMARK_AUDIT: &[RegMarkAudit] = &[
             "ma:marks<CR>",
             "a|b",
             (1, 1),
-            "mark line  col  file/text\n a      1    0",
+            "mark line  col file/text\n a      1    0 a\n \"      1    0 a\n \
+             .      1    0 a",
         )),
         Some(Keys(":marks")),
-        "lists only the letter marks; Vim also lists `' \" [ ] < > . ^` and a \
-        file/text column, and numbers the first column from zero",
+        "since #1300 lists the letter marks plus the three automatic marks \
+        (`'` when a jump has set the previous context, `\"`, `.`) and the \
+        `file/text` preview column, matching Neovim's header and column \
+        layout; still omits `` [ `` `` ] `` `<` `>` `^`",
     ),
     rm(
         Marks,
