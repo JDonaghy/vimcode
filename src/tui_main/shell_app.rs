@@ -10995,6 +10995,58 @@ mod tests {
         );
     }
 
+    /// #1308: real Neovim's `:cdo`/`:cfdo`/`:ldo`/`:lfdo` on an empty
+    /// quickfix/location list are a *silent* no-op (`pcall` succeeds,
+    /// `v:errmsg` stays empty) — confirmed against a live
+    /// `nvim --headless -u NONE` oracle. That's unlike `:cc`/`:cnext`/
+    /// `:clist`/`:cfirst`/`:clast` (see
+    /// `cnext_on_empty_quickfix_list_paints_e42_via_shell_app` above), which
+    /// all raise `E42: No Errors`.
+    ///
+    /// Before this fix `Engine::qf_do` (`picker.rs`) set the same shared
+    /// `E42: No Errors` message the other quickfix commands use, so `:cdo`
+    /// (and its three siblings) painted an error a live oracle never raises.
+    /// Driven through the real command line so the assertion is "the user
+    /// sees nothing", not "a field was left unset" — the state-only trap
+    /// this repo's testing guidance calls out (#587/#592).
+    ///
+    /// RED against unfixed `qf_do`: the command-line row paints
+    /// "E42: No Errors" for all four commands.
+    #[test]
+    fn cdo_family_on_empty_quickfix_list_paints_no_error_via_shell_app() {
+        for cmd in [
+            ":cdo normal! Ax",
+            ":cfdo normal! Ax",
+            ":ldo normal! Ax",
+            ":lfdo normal! Ax",
+        ] {
+            let app = TuiShellApp::new(None);
+            assert!(
+                app.engine.quickfix.items.is_empty(),
+                "precondition: a fresh engine has an empty quickfix list"
+            );
+            assert!(
+                app.engine.location_lists.is_empty(),
+                "precondition: a fresh engine has no location list at all"
+            );
+
+            let mut driver = driver_with_shell(app, config(), 80, 24);
+            driver.press_named(quadraui::NamedKey::Escape);
+            for c in cmd.chars() {
+                driver.type_char(c);
+            }
+            driver.press_named(quadraui::NamedKey::Enter);
+            driver.render();
+
+            let screen = driver.screen();
+            assert!(
+                !screen.contains("E42"),
+                "{cmd} on an empty list must never raise E42 in Neovim; \
+                 screen:\n{screen}"
+            );
+        }
+    }
+
     /// #608: `render_content` must also paint the *bottom panel* (terminal
     /// tab bar + Debug Output content) via
     /// `bottom_chrome_rects_for_shell_content` + `render_bottom_panel_tabs`
