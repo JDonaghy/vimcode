@@ -5621,6 +5621,95 @@ mod tests {
         );
     }
 
+    // ── #1243: the `Backend::request_full_repaint` call sites ──────────
+    //
+    // Black-box, through the real `driver_with_shell` shell wiring (the
+    // `tui_prod` lane's harness), asserting on the painted grid — the
+    // user-visible guarantee #1243's hook exists to make good on.
+    //
+    // **What this cannot prove, and why** (verified against pinned rev
+    // `215e9e4`, see `render::popup_overlay_closed_this_frame`'s doc for
+    // the full write-up): under a `ratatui` `TestBackend`,
+    // `Terminal::clear()` is *provably output-identical* to not clearing —
+    // it blanks the backend buffer and resets the back buffer, so the
+    // following `draw` writes every non-blank cell and lands on
+    // byte-for-byte the buffer the incremental path lands on. So no
+    // `screen()`/`style_at()`/`terminal_cursor_position()` assertion can
+    // distinguish "`request_full_repaint` fired" from "it didn't", and the
+    // test below does not go RED if the `backend.request_full_repaint()`
+    // calls are deleted. The stale-cell condition only arises for content
+    // written *outside* ratatui's `Buffer` (a PTY writing raw bytes),
+    // which needs quadraui's vt100-backed `TuiVtDriver` — unreachable from
+    // here behind two `pub(crate)` seams, drafted as a ready-to-file
+    // upstream issue in `docs/PENDING_QUADRAUI_ISSUES.md` ("TUI test
+    // drivers can't observe `Backend::request_full_repaint`'s effect…").
+    // This is therefore *paint-integrity* coverage of the popup-dismiss
+    // call site, not the repaint proof #1243's acceptance criteria ask
+    // for; that one is blocked on the filed gap. Do not read a green run
+    // here as proof the hook fires.
+    //
+    // **There is deliberately no companion Ctrl+L driver test**, and the
+    // reason is measured, not assumed: a Ctrl+L test was written, run, and
+    // then RED-verified by disabling the rung in `handle_key_pressed` —
+    // and it *stayed green*, because a fall-through Ctrl+L is inert in
+    // every reachable mode (Normal: unbound; Insert: `Engine::handle_key`
+    // drops `Ctrl`-modified printables; picker/folder-picker/dialog: those
+    // rungs intercept first). The chord's only effect is the repaint
+    // itself, which the paragraph above proves is unobservable here, so
+    // any Ctrl+L driver test is vacuous by construction — exactly the
+    // "test that cannot fail is not coverage" trap `CLAUDE.md` names, so
+    // it was deleted rather than shipped green. Ctrl+L's decision logic is
+    // covered by `render::is_force_redraw_key`'s own unit tests
+    // (`slice7_router_tests`); the wiring is a one-line delegation.
+
+    /// #1243, popup-dismiss call site: opening the unified picker must
+    /// paint its header, and dismissing it must leave **no** trace of it
+    /// on the grid — the exact stale-glyph symptom the
+    /// `had_popup_overlay` → `request_full_repaint` transition in
+    /// `render_content` exists to prevent on a real terminal.
+    ///
+    /// Drives the whole prod path: `driver_with_shell` →
+    /// `ShellAdapter::handle` → `TuiShellApp::handle` → `handle_key_pressed`
+    /// → `Engine`, then `ShellAdapter::render` → `render_content`, which is
+    /// where the new `popup_overlay_closed_this_frame` branch runs. Uses
+    /// `PickerSource::Keybindings` because `picker_populate_keybindings`
+    /// reads the in-memory keymap — no filesystem, no `cwd` dependence, so
+    /// the header and at least one row are deterministic on any machine.
+    ///
+    /// RED-verified for what it *does* cover: making the Escape rung in
+    /// `handle_key_pressed` leave `engine.picker_open` set makes the second
+    /// assertion fail ("Key Bindings" stays painted). It does **not** go
+    /// RED on removing `backend.request_full_repaint()` — see the module
+    /// comment above this test for the proof of why no `TestBackend`-based
+    /// assertion can.
+    #[test]
+    fn picker_dismiss_leaves_no_popup_glyphs_on_the_grid_via_shell_app() {
+        let mut app = TuiShellApp::new_for_test();
+        app.engine
+            .open_picker(crate::core::engine::PickerSource::Keybindings);
+        let mut driver = driver_with_shell(app, config(), 80, 24);
+
+        assert!(
+            driver.screen_contains("Key Bindings"),
+            "precondition: an open picker must paint its header through \
+             render_content — screen was:\n{}",
+            driver.screen()
+        );
+
+        let reaction = driver.press_named(quadraui::NamedKey::Escape);
+        assert_eq!(
+            reaction,
+            Reaction::Redraw,
+            "dismissing the picker must repaint"
+        );
+        assert!(
+            !driver.screen_contains("Key Bindings"),
+            "the dismissed picker must leave no glyphs behind — screen \
+             was:\n{}",
+            driver.screen()
+        );
+    }
+
     // ── #557: extension panels in the migrated activity bar ─────────────
     //
     // The Git Insights extension registers a display name *and* an icon

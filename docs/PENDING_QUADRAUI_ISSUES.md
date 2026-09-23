@@ -32,7 +32,107 @@ zero cost instead.
 
 ---
 
-## TUI runner has no host-facing "force full repaint" hook (blocks vimcode#58)
+## TUI test drivers can't observe `Backend::request_full_repaint`'s effect from a downstream `ShellApp` (blocks vimcode#1243's black-box test)
+
+**Title:** `tui::vt_testing::TuiVtDriver` has no `ShellApp` constructor and no
+public out-of-band write hook, so a downstream crate cannot black-box-test
+`Backend::request_full_repaint` (quadraui#1037) at all
+
+**Body:**
+
+quadraui#1037 shipped `Backend::request_full_repaint` and vimcode#1243 adopted
+it (Ctrl+L and the popup-dismiss transition in `TuiShellApp`). vimcode's
+`CLAUDE.md` requires every behaviour-changing PR to ship a black-box test that
+drives the running app and asserts on rendered output, and #1243's own
+acceptance criteria ask for "a `tui_prod` test proving Ctrl+L repaints cells an
+incremental diff would skip". **That test cannot currently be written by any
+consumer of this crate.** Verified against pinned rev `215e9e4`:
+
+1. `quadraui::tui::testing::TuiDriver::render` *does* consume
+   `take_full_repaint_requested` and call `Terminal::clear()` — so the driver
+   honours the hook. But under a `ratatui` `TestBackend` that clear is
+   **provably output-identical**: it blanks the backend buffer and resets the
+   back buffer, so the next `draw` diffs a fully-desired frame against a blank
+   previous frame and writes every non-blank cell — byte-for-byte the same
+   buffer the incremental path produces, because `Terminal::draw`'s contract
+   already requires the callback to repaint the whole frame. No `screen()` /
+   `style_at()` / `styled_row()` / `terminal_cursor_position()` assertion can
+   distinguish "hook fired" from "hook did not fire".
+2. The only harness in this crate that *can* reproduce the real condition is
+   `tui::vt_testing::TuiVtDriver`, whose own
+   `render_actually_clears_stale_content_outside_the_diff_cache` test injects
+   out-of-band ANSI bytes into its `vt100::Parser` to create a cell ratatui's
+   diff wrongly believes is current. A downstream crate cannot reuse that
+   technique: `TuiVtDriver::new` takes `A: AppLogic`, there is **no
+   `vt_testing::driver_with_shell`** equivalent, the only `ShellApp → AppLogic`
+   adapter (`shell_adapter::build_shell_adapter` / `ShellAdapter`) is
+   `pub(crate)` despite `pub mod shell_adapter`, and `TuiVtDriver`'s
+   `parser: Rc<RefCell<vt100::Parser>>` field is private with no public
+   injection method.
+3. `TuiBackend::take_full_repaint_requested` is `pub(crate)`,
+   `TuiDriver::backend()` returns `&TuiBackend` (immutable, and `TuiBackend`
+   has no `Debug`), and `Backend` is `sealed::Sealed` — so the fallbacks of
+   "read the flag back" or "write a spy `Backend` that counts the calls" are
+   both closed too.
+
+Net effect: `request_full_repaint` is a public API that **no downstream
+consumer can write a regression test for**, in a repo whose consumers are
+required to.
+
+**Ask** — any one of these unblocks it; (1) is the smallest and most
+conventional:
+
+1. Add `quadraui::tui::vt_testing::driver_with_shell<A: ShellApp>(app, config,
+   width, height) -> TuiVtDriver<impl AppLogic>`, mirroring
+   `quadraui::tui::testing::driver_with_shell` exactly, **and** a public
+   out-of-band write hook on `TuiVtDriver` (e.g.
+   `pub fn inject_raw(&self, bytes: &[u8])`) so a downstream test can
+   reproduce the stale-cell condition the same way
+   `render_actually_clears_stale_content_outside_the_diff_cache` does.
+2. Alternatively, make `shell_adapter::build_shell_adapter` (and
+   `ShellAdapter`) `pub` behind the existing feature gates, plus the
+   `inject_raw`-shaped hook — downstream can then compose the driver itself.
+3. Failing either, expose a read-only observation seam on the existing
+   `TestBackend` driver — e.g. `pub fn full_repaint_requested(&self) -> bool`
+   on `TuiDriver` (peek, not take), or a frame-level counter in
+   `FrameInventory`. This is weaker (it asserts on a flag rather than on
+   rendered output, which vimcode's own testing rules discourage) but it is
+   strictly better than the current "untestable by construction".
+
+**Blocks:** `JDonaghy/vimcode#1243` — leave that issue open behind this one,
+per `GOALS.md`'s milestone-discipline rule. The vimcode side of #1243 (both
+call sites plus the `popup_overlay_closed_this_frame` edge-detector and its
+unit test) is already written and merged-pending; only the driver-level proof
+is waiting on this.
+
+---
+
+## ~~TUI runner has no host-facing "force full repaint" hook (blocks vimcode#58)~~ — **SHIPPED, do not file (struck 2026-09-23, #1243)**
+
+> **This draft is retired. The API exists, is pinned, and is now adopted.**
+> quadraui#1037 shipped exactly the "Ask" shape 2 below —
+> `Backend::request_full_repaint()`, default no-op, implemented on
+> `TuiBackend` as a flag `tui::run::run_inner` consumes via
+> `take_full_repaint_requested` and answers with `Terminal::clear()` before
+> the next `render_frame`. Verified present at vimcode's pin `215e9e4` by
+> reading `quadraui/src/backend.rs:1368`, `quadraui/src/tui/backend.rs:1543`
+> and `quadraui/src/tui/run.rs:338`, not inferred from the issue being closed.
+>
+> vimcode#1243 consumed it: `render::is_force_redraw_key`'s Ctrl+L rung and
+> `TuiShellApp::render_content`'s `had_popup_overlay` transition — the two
+> "consumers waiting on this" named in the draft below — both call the hook
+> now, so `had_popup_overlay` has a reader again.
+>
+> **What is left is test infrastructure, not the hook**, and it is filed as its
+> own entry directly above ("TUI test drivers can't observe
+> `Backend::request_full_repaint`'s effect…"): the shipped hook has no
+> downstream-observable effect under any public driver, so vimcode#1243 cannot
+> yet ship the black-box test its own acceptance criteria require.
+>
+> The original draft is kept below, struck, so the history of the verdict is
+> readable — **do not file it.**
+
+### ~~Original draft (superseded by quadraui#1037)~~
 
 **Title:** `tui::run`/`run_with_shell` internalised the `Terminal`, silently
 dropping the only mitigation vimcode#58 (stale-character rendering artifacts)

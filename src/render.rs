@@ -4417,6 +4417,18 @@ pub fn dispatch_sidebar_panel_key(
 /// popup-disappearance clear this comment used to point at —
 /// `TuiShellApp::render_content`'s `had_popup_overlay` transition check.
 ///
+/// **No driver test covers the Ctrl+L call site, by measurement not by
+/// omission.** One was written and RED-verified by disabling this rung —
+/// and stayed green: a fall-through Ctrl+L is inert in every reachable
+/// mode (Normal, unbound; Insert, where `Engine::handle_key` drops
+/// `Ctrl`-modified printables; picker/dialog, whose rungs intercept
+/// first), so the chord's *only* effect is the repaint — which is
+/// unobservable under the only driver vimcode can reach. See
+/// [`popup_overlay_closed_this_frame`]'s doc for the proof and for the
+/// ready-to-file upstream gap in `docs/PENDING_QUADRAUI_ISSUES.md`. The
+/// decision logic here is unit-tested in `slice7_router_tests` below; the
+/// wiring at the call site is a one-line delegation.
+///
 /// `insert_ctrl_x_pending` is `engine.insert_ctrl_x_pending` (only ever true
 /// in the one-keystroke window right after `<C-x>` in Insert mode): right
 /// after `<C-x>`, `<C-x><C-l>` is the whole-line completion sub-mode
@@ -4452,36 +4464,52 @@ pub fn is_force_redraw_key(
 /// just above) because it is the one piece of this wiring that *is*
 /// directly unit-testable from here.
 ///
-/// **Why there is no driver-level (`tui_prod`) test proving the *repaint*
-/// itself, only this edge-detection predicate — verified directly against
-/// quadraui checkout rev `215e9e4`, not assumed:**
+/// **Why no driver test can assert on the *repaint* itself yet, only on
+/// this edge-detection predicate plus `tui_main::shell_app`'s
+/// paint-integrity black-box test
+/// (`picker_dismiss_leaves_no_popup_glyphs_on_the_grid_via_shell_app`) —
+/// verified directly against quadraui checkout rev `215e9e4`
+/// (`Cargo.toml`'s pin), not assumed:**
 /// `quadraui::tui::testing::TuiDriver` (`TestBackend`-backed) already
 /// consumes `request_full_repaint` in its own `render()` (it calls
 /// `Terminal::clear()` when the flag is set, exactly like the live
 /// runner) — that part isn't the blocker. The blocker is that
-/// `ratatui::Terminal::draw`'s own contract requires the render callback
-/// to fully repaint every frame, so `TestBackend`'s buffer self-heals any
-/// content that stops being painted through the normal
-/// `ShellApp::render_content` path with or without `request_full_repaint`
-/// — there is no stale cell for a `TestBackend`-based driver to observe in
-/// the first place. Only content written *outside* ratatui's `Buffer`/diff
-/// tracking (e.g. an embedded PTY writing raw bytes straight into the
-/// terminal) can produce the "diff believes this cell is unchanged"
-/// condition the hook exists to fix, and only `quadraui::tui::vt_testing::
-/// TuiVtDriver` (vt100-backed, real ANSI byte stream) can model that — see
-/// its own `render_actually_clears_stale_content_outside_the_diff_cache`
-/// test, which proves the *mechanism* works. Two things block using it
-/// from vimcode for a `ShellApp` impl: `TuiVtDriver::new` takes
-/// `AppLogic`, not `ShellApp` (no `driver_with_shell`-equivalent exists
-/// for it, and the only adapter between the two,
+/// `ratatui`'s `Terminal::clear()` is *provably output-identical* under a
+/// `TestBackend`: it blanks the backend buffer and resets the back
+/// buffer, so the following `draw` diffs a fully-desired frame against a
+/// blank previous frame and writes every non-blank cell — landing on
+/// byte-for-byte the same buffer the incremental path lands on, because
+/// `Terminal::draw`'s own contract already requires the render callback
+/// to repaint the whole frame. There is therefore no stale cell for a
+/// `TestBackend`-based driver to observe, and no `screen()` /
+/// `style_at()` / `terminal_cursor_position()` assertion that can
+/// distinguish the two paths. Only content written *outside* ratatui's
+/// `Buffer`/diff tracking (e.g. an embedded PTY writing raw bytes
+/// straight into the terminal) can produce the "diff believes this cell
+/// is unchanged" condition the hook exists to fix, and only
+/// [`TuiVtDriver`] (vt100-backed, real ANSI byte stream) can model that —
+/// see its own `render_actually_clears_stale_content_outside_the_diff_cache`
+/// test, which proves the *mechanism* works upstream. Two seams block
+/// reusing it from vimcode for a `ShellApp` impl: `TuiVtDriver::new`
+/// takes `AppLogic`, not `ShellApp` (no `driver_with_shell`-equivalent
+/// exists for it, and the only adapter between the two,
 /// `shell_adapter::build_shell_adapter`, is `pub(crate)`), and
 /// `TuiVtDriver`'s `parser: Rc<RefCell<vt100::Parser>>` field — the only
-/// way to inject the out-of-band bytes that test's own technique relies
-/// on — is private with no public equivalent. Filing a quadraui issue for
-/// this test-infrastructure gap (either a `vt_testing::driver_with_shell`,
-/// or a public `TuiVtDriver::inject_raw`) is deferred to the coordinator —
-/// this worker session has no `gh`/issue-filing access (see PR discussion
-/// for the drafted issue text).
+/// way to inject the out-of-band bytes that test's technique relies on —
+/// is private with no public equivalent. `quadraui::Backend` is also
+/// `sealed::Sealed`, so a vimcode-side spy `Backend` that merely counts
+/// `request_full_repaint` calls cannot be written either.
+///
+/// That upstream test-infrastructure gap is **drafted in full, ready to
+/// file, in `docs/PENDING_QUADRAUI_ISSUES.md`** ("TUI test drivers can't
+/// observe `Backend::request_full_repaint`…") — the repo's standing
+/// convention for exactly this, since worker sessions are `git`-only and
+/// cannot file GitHub issues themselves. Filing it is the coordinator
+/// action that unblocks the real black-box test; this doc comment is the
+/// grep-able pointer that keeps the finding from being lost in the
+/// meantime.
+///
+/// [`TuiVtDriver`]: https://github.com/JDonaghy/quadraui/blob/215e9e4/quadraui/src/tui/vt_testing.rs
 pub fn popup_overlay_closed_this_frame(was_open: bool, is_open_now: bool) -> bool {
     was_open && !is_open_now
 }
