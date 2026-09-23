@@ -3357,6 +3357,18 @@ impl App {
 
         match active_id.as_str() {
             PANEL_EXPLORER => {
+                // #1242: composed through `render::paint_sidebar_panel_chrome`
+                // (quadraui#1041's `SidebarPanelBody`) — `None`/`None` here
+                // reproduce this arm's pre-existing "no chrome" behaviour
+                // exactly (`layout.body_rect == q_sb`); TUI's
+                // `panels::render_explorer_sidebar_content` uses the same
+                // composer with `background: Some(tab_bar_bg)`.
+                let panel = render::SidebarPanelBody {
+                    background: None,
+                    chrome: render::SidebarPanelChrome::None,
+                    scrollbar_gutter: None,
+                };
+                let layout = render::paint_sidebar_panel_chrome(backend, &panel, q_sb);
                 render::populate_explorer_tree_controller(engine, theme);
                 // Capture the exact metrics the tree is drawn with so the
                 // click hit-test (which reads the backend's mutable
@@ -3364,9 +3376,14 @@ impl App {
                 // re-apply them and resolve the correct row. (#540)
                 self.cached_explorer_metrics
                     .set((backend.line_height() as f64, backend.char_width() as f64));
-                engine.explorer_tree_rect.set(q_sb);
-                engine.explorer_viewport_rows.set(q_sb.height as usize);
-                engine.explorer_tree.borrow().render(backend, q_sb);
+                engine.explorer_tree_rect.set(layout.body_rect);
+                engine
+                    .explorer_viewport_rows
+                    .set(layout.body_rect.height as usize);
+                engine
+                    .explorer_tree
+                    .borrow()
+                    .render(backend, layout.body_rect);
             }
             PANEL_SEARCH => {
                 // #1065: `search_sidebar_system` never had `set_backend_info`
@@ -3524,11 +3541,22 @@ impl App {
                 engine.ext_sidebar_system.borrow().render(backend, q_sb);
             }
             PANEL_SETTINGS => {
+                // #1242: `chrome: None` reproduces this arm's pre-existing
+                // "no header/search chrome" behaviour exactly — a
+                // pre-existing asymmetry with TUI's
+                // `panels::render_settings_panel`, tracked separately by
+                // `TUI_AUDIT_R2.md` §5 Wave 1 item 2, not resolved here.
+                let panel = render::SidebarPanelBody {
+                    background: None,
+                    chrome: render::SidebarPanelChrome::None,
+                    scrollbar_gutter: None,
+                };
+                let layout = render::paint_sidebar_panel_chrome(backend, &panel, q_sb);
                 render::populate_settings_form_controller(engine);
                 engine
                     .settings_form_controller
                     .borrow_mut()
-                    .render_and_cache(backend, q_sb);
+                    .render_and_cache(backend, layout.body_rect);
             }
             id if id.starts_with("ext:") => {
                 // #1089: a plugin-provided panel — paint its own sections +
@@ -3539,31 +3567,40 @@ impl App {
                 // *marketplace* — INSTALLED/AVAILABLE — which is what this
                 // arm painted before this fix, unconditionally, for every
                 // `ext:<name>` id).
+                //
+                // #1242: chrome + body now composed through quadraui#1041's
+                // `SidebarPanelBody::render` (`render::ExtPanelTreeBody`,
+                // same `&dyn BackendWidget` path `panels::render_ext_panel`
+                // uses). `scrollbar_gutter: None` — unlike TUI, this arm has
+                // never painted one.
                 if let Some(ref panel) = screen.ext_panel {
-                    let input_visible = panel.input_active || !panel.input_text.is_empty();
-                    let chrome_rows: f32 = if input_visible { 2.0 } else { 1.0 };
-                    let chrome_h = (chrome_rows * lh as f32).min(q_sb.height);
                     // Cache the whole content rect (chrome included),
                     // verbatim — mirrors `render_ext_panel`'s own
                     // `ext_panel_content_rect` write so a future hover/geometry
                     // consumer can't tell which backend painted this frame.
                     engine.ext_panel_content_rect.set(q_sb);
-                    let header_title = format!(" {}", panel.title);
-                    let chrome_area = quadraui::Rect::new(q_sb.x, q_sb.y, q_sb.width, chrome_h);
-                    backend.draw_settings_chrome(
-                        chrome_area,
-                        &header_title,
-                        &panel.input_text,
-                        "",
-                        panel.input_active,
-                    );
 
-                    let body_h = (q_sb.height - chrome_h).max(0.0);
-                    if body_h > 0.0 {
-                        let body_rect =
-                            quadraui::Rect::new(q_sb.x, q_sb.y + chrome_h, q_sb.width, body_h);
-                        let tree = render::ext_panel_to_tree_view(panel, theme);
-                        backend.draw_tree(body_rect, &tree);
+                    let input_visible = panel.input_active || !panel.input_text.is_empty();
+                    let header_title = format!(" {}", panel.title);
+                    let sidebar_panel = render::SidebarPanelBody {
+                        background: None,
+                        chrome: if input_visible {
+                            render::SidebarPanelChrome::HeaderAndSearch {
+                                header: header_title,
+                                query: panel.input_text.clone(),
+                                placeholder: String::new(),
+                                active: panel.input_active,
+                            }
+                        } else {
+                            render::SidebarPanelChrome::Header(header_title)
+                        },
+                        scrollbar_gutter: None,
+                    };
+                    let body =
+                        render::ExtPanelTreeBody(render::ext_panel_to_tree_view(panel, theme));
+                    let layout = sidebar_panel.render(backend, q_sb, &body);
+
+                    if layout.body_rect.height > 0.0 {
                         // #1089: cache the exact `Backend::tree_layout` this
                         // frame painted with — the click router
                         // (`render::route_ext_panel_click`, shared with TUI's
@@ -3572,10 +3609,10 @@ impl App {
                         // See `Engine::ext_panel_tree_layout`'s own doc for why
                         // that matters here: this backend pitches a tree's
                         // header rows shorter than its item rows.
-                        let tree_layout = backend.tree_layout(body_rect, &tree);
+                        let tree_layout = backend.tree_layout(layout.body_rect, &body.0);
                         engine
                             .ext_panel_tree_layout
-                            .replace(Some((body_rect, tree_layout)));
+                            .replace(Some((layout.body_rect, tree_layout)));
                     } else {
                         engine.ext_panel_tree_layout.replace(None);
                     }
