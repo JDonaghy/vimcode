@@ -18308,6 +18308,203 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// #1292 review round 2 (blocking finding), painted-output tier: a
+    /// *mouse* gutter click on a background split pane is a real
+    /// focus-changing call site, so a following `CTRL-W p` must recall the
+    /// pane the click came *from*.
+    ///
+    /// Drives the whole stack the user does: `TuiDriver::click` →
+    /// `tui_main::mouse`'s gutter branch → `render::apply_gutter_action`'s
+    /// `DiagnosticHover` arm → `Tab::focus_window`, then two real
+    /// keystrokes (`<C-w>`, `p`) → `execute_wincmd`'s `'p'` arm — and
+    /// reads the answer off the painted block-cursor cell, never off
+    /// `Tab::prev_window` directly (CLAUDE.md "Testing (CRITICAL)" rule 1:
+    /// assert on rendered output, never on state being populated).
+    ///
+    /// Fixture: file A (bottom pane) carries an LSP error diagnostic on
+    /// line 2, so that line's gutter resolves to
+    /// `GutterAction::DiagnosticHover`. After `split_window` the *new*
+    /// window (file B) is active and — `splitbelow` defaulting to `false`
+    /// — sits in the top slot, so file A's pane is the background one the
+    /// click must move focus into.
+    ///
+    /// **Verified RED against the pre-fix shape** (confirmed by hand):
+    /// reverting `apply_gutter_action`'s `DiagnosticHover` arm to the
+    /// original `engine.active_tab_mut().active_window = window_id;`
+    /// direct assignment leaves `prev_window` pointing at file A — the
+    /// window the click just made active — so `execute_wincmd`'s `'p'`
+    /// arm filters it out (`w != active_window`), falls through to the
+    /// single-group `prev_active_group` no-op, and the painted cursor
+    /// stays in file A's bottom pane. The final assertion flips.
+    #[test]
+    fn gutter_click_on_a_background_pane_then_ctrl_w_p_returns_focus_via_shell_app() {
+        const WIDTH: u16 = 120;
+        const HEIGHT: u16 = 40;
+
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_test_1292_gutter_prev_{:?}",
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_a = dir.join("ga1292.txt"); // bottom pane, background, carries the diagnostic
+        let file_b = dir.join("gb1292.txt"); // top pane, active right after the split
+        let content_a: String = (0..40).map(|i| format!("GAA1292_{i:03}\n")).collect();
+        let content_b: String = (0..40).map(|i| format!("GBB1292_{i:03}\n")).collect();
+        std::fs::write(&file_a, &content_a).unwrap();
+        std::fs::write(&file_b, &content_b).unwrap();
+
+        let mut app = TuiShellApp::new(None);
+        app.engine.settings.autohide_panels = false;
+        app.engine.app_shell.hide_sidebar();
+        app.engine.session.explorer_visible = false;
+        app.engine
+            .open_file_with_mode(&file_a, crate::core::engine::OpenMode::Permanent)
+            .unwrap();
+
+        // Diagnostics are keyed by the *canonical* path (that's the key
+        // `build_rendered_window` looks up when filling `diagnostic_gutter`).
+        const DIAG_LINE: u32 = 2;
+        app.engine.lsp_diagnostics.insert(
+            file_a.canonicalize().unwrap(),
+            vec![crate::core::lsp::Diagnostic {
+                range: crate::core::lsp::LspRange {
+                    start: crate::core::lsp::LspPosition {
+                        line: DIAG_LINE,
+                        character: 0,
+                    },
+                    end: crate::core::lsp::LspPosition {
+                        line: DIAG_LINE,
+                        character: 5,
+                    },
+                },
+                severity: crate::core::lsp::DiagnosticSeverity::Error,
+                message: "gutter click focus test".to_string(),
+                source: None,
+                code: None,
+            }],
+        );
+
+        app.engine
+            .split_window(SplitDirection::Horizontal, Some(&file_b));
+
+        let theme = Theme::from_name(&app.engine.settings.colorscheme);
+        let cursor_bg = quadraui::tui::ratatui_color(super::quadraui_tui::q_theme(&theme).cursor);
+
+        let mut driver = driver_with_shell(app, config(), WIDTH, HEIGHT);
+        driver.mouse_move(0.0, 0.0);
+        driver.render();
+
+        fn cursor_cell(
+            driver: &quadraui::tui::testing::TuiDriver<impl quadraui::AppLogic>,
+            cursor_bg: quadraui::tui::testing::Color,
+        ) -> Option<(u16, u16)> {
+            for y in 0..HEIGHT {
+                for x in 0..WIDTH {
+                    if driver.style_at(x, y).map(|s| s.bg) == Some(cursor_bg) {
+                        return Some((x, y));
+                    }
+                }
+            }
+            None
+        }
+
+        let screen_before = driver.screen();
+        let (diag_x, diag_y) = driver.find("GAA1292_002").unwrap_or_else(|| {
+            panic!("file A's diagnostic line must be painted;\nscreen:\n{screen_before}")
+        });
+        let (_, b_row) = driver.find("GBB1292_000").unwrap_or_else(|| {
+            panic!("file B's first line must be painted;\nscreen:\n{screen_before}")
+        });
+        assert!(
+            b_row < diag_y,
+            "test setup sanity: file B (the new, active window) must start \
+             in the top slot, above file A; B row {b_row}, A diag row \
+             {diag_y};\nscreen:\n{screen_before}"
+        );
+
+        let cell_after_split = cursor_cell(&driver, cursor_bg).unwrap_or_else(|| {
+            panic!("the active (top, file B) pane must paint a block cursor cell;\nscreen:\n{screen_before}")
+        });
+        assert!(
+            (cell_after_split.1 as f32) < diag_y,
+            "test setup sanity: the block cursor must start in the top \
+             (file B) pane, above file A's rows; cursor cell \
+             {cell_after_split:?}, file A diag row {diag_y};\nscreen:\n{screen_before}"
+        );
+
+        // Click the *gutter* cell immediately left of file A's diagnostic
+        // line — a background pane the user has not focused yet.
+        assert!(
+            diag_x >= 1.0,
+            "test setup sanity: file A's text must leave at least one \
+             gutter column to its left; text x {diag_x};\nscreen:\n{screen_before}"
+        );
+        driver.click(diag_x - 1.0, diag_y);
+        driver.render();
+
+        // Painted proof the gutter click really was routed to the
+        // `DiagnosticHover` arm (and not swallowed as a plain text click):
+        // that arm pops the diagnostic hover, which takes keyboard focus.
+        assert!(
+            driver.screen_contains("gutter click focus test"),
+            "the gutter click must open the diagnostic hover popup — \
+             otherwise this test is not exercising `apply_gutter_action`'s \
+             focus-changing arm at all;\nscreen:\n{}",
+            driver.screen()
+        );
+        // Dismiss it so the following `<C-w>p` reaches the editor rather
+        // than the focused popup's own key handler.
+        driver.press_named(quadraui::NamedKey::Escape);
+        driver.render();
+
+        let screen_after_click = driver.screen();
+        let cell_after_click = cursor_cell(&driver, cursor_bg).unwrap_or_else(|| {
+            panic!("the clicked (bottom, file A) pane must paint a block cursor cell;\nscreen:\n{screen_after_click}")
+        });
+        assert!(
+            (cell_after_click.1 as f32) > b_row,
+            "test setup sanity: clicking file A's gutter must move focus \
+             (and so the painted block cursor) into the bottom pane; file B \
+             row {b_row}, cursor cell {cell_after_click:?};\nscreen:\n{screen_after_click}"
+        );
+        assert_ne!(
+            cell_after_click.1, cell_after_split.1,
+            "test setup sanity: the gutter click must actually have moved \
+             the painted cursor off file B's row;\nscreen:\n{screen_after_click}"
+        );
+
+        // `<C-w>p` must now return focus to file B — the window that was
+        // active immediately before the gutter click stole focus.
+        driver.ctrl_char('w');
+        driver.type_char('p');
+        driver.render();
+
+        let screen = driver.screen();
+        let cell_after_prev = cursor_cell(&driver, cursor_bg).unwrap_or_else(|| {
+            panic!("the previously-active (top, file B) pane must paint a block cursor cell after `<C-w>p`;\nscreen:\n{screen}")
+        });
+        assert_eq!(
+            cell_after_prev.1,
+            cell_after_split.1,
+            "a gutter click on a background pane must record the window it \
+             stole focus from, so `<C-w>p` moves focus (and the painted \
+             block-cursor cell) back to file B's top-slot row \
+             {split_row} — not leave it on file A's row {click_row}; \
+             cursor cell {cell_after_prev:?};\nscreen:\n{screen}",
+            split_row = cell_after_split.1,
+            click_row = cell_after_click.1,
+        );
+        assert_ne!(
+            cell_after_prev.1, cell_after_click.1,
+            "`<C-w>p` must actually move focus away from the pane the \
+             gutter click focused, not stay put; cursor cell \
+             {cell_after_prev:?};\nscreen:\n{screen}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// #35: `render_content` must paint the minimap through the shell path,
     /// as braille — not just populate `ScreenLayout.minimap`.
     ///
