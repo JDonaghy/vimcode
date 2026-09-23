@@ -9897,12 +9897,24 @@ fn nvim_conformance_cross_file_ex() {
 //      within the current buffer, falling back to the file path otherwise —
 //      all confirmed against a live oracle. Its case label is deleted from
 //      `KNOWN_DEVIATIONS_MESSAGE` below.
-//   4. (#1302) "msg:ex::digraphs lists the digraph table" — title: "`:digraphs`:
-//      match Neovim's default digraph table and its column-wrapped grid
-//      layout". `src/core/digraphs.rs`'s table (#1160) was built against
-//      the *Vim* digraph list, and `ex_digraphs`'s no-argument listing
-//      formats it as one-per-line rather than Neovim's fixed-width grid —
-//      both dimensions differ from the live oracle's ~240KB dump.
+//   4. (#1302 — FIXED) "msg:ex::digraphs lists the digraph table" — title:
+//      "`:digraphs`: match Neovim's default digraph table and its
+//      column-wrapped grid layout". `src/core/digraphs.rs`'s table (#1160)
+//      was built against the *Vim* digraph list, not Neovim's, and
+//      `ex_digraphs`'s no-argument listing formatted it one-per-line
+//      instead of Neovim's fixed-width, column-wrapped grid — both
+//      dimensions differed from the live oracle. Fixed: `BUILTIN_DIGRAPHS`
+//      is now Neovim's default table (1366 entries, `vim.fn
+//      .digraph_getlist(1)`'s own order — extracted from a live
+//      `nvim --headless`, documented in the module doc so it can be
+//      re-derived byte-for-byte), and `format_digraph_table` reimplements
+//      `printdigraph`/`listdigraphs` (Neovim's `digraph.c`) — the
+//      13-cell-wide, 80-column grid, its control-char/composing-mark/
+//      wide-char cell-width rules, and (a separate bug found along the
+//      way) `ex_digraphs` listing custom (`:digraph`-defined) entries
+//      *before* the builtin table when Neovim always lists them *after*.
+//      Confirmed byte-for-byte against a live oracle; its case label is
+//      deleted from `KNOWN_DEVIATIONS_MESSAGE` below.
 //   5. (#1303) "msg:ex::changes lists a change" — title: "`:changes`: add the
 //      `text` column, fix `change_list`'s 0- vs 1-based numbering and the
 //      marker row". `"changes"`'s arm's header has no `text` column, and
@@ -9932,7 +9944,6 @@ fn nvim_conformance_cross_file_ex() {
 //      follow-up formatting-fix issue (same non-trivial-rewrite reasoning
 //      as the others).
 const KNOWN_DEVIATIONS_MESSAGE: &[&str] = &[
-    "msg:ex::digraphs lists the digraph table",
     "msg:ex::changes lists a change",
     "msg:ex::history lists prior ex commands",
 ];
