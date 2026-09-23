@@ -9838,31 +9838,40 @@ fn nvim_conformance_cross_file_ex() {
 // ## Follow-up issue status (read before editing any entry below)
 //
 // Same policy as KNOWN_DEVIATIONS_WIN/KNOWN_DEVIATIONS_XFILE: no `gh` access
-// from a worker session. Five of the six follow-ups below (items 1-5) are
-// filed, as #1299 through #1303 respectively (filed 2026-09-22). Item 6
-// (#1304) was itself a hermeticity bug rather than a formatting one; it is
-// now fixed (see item 6 below), and the formatting gap it had been masking
-// is not yet filed as its own issue. All seven entries below are
-// the same shape: vimcode's message-listing ex-commands were
-// implemented against a hand-remembered idea of the classic-Vim format
+// from a worker session. Item 1 below (#1299, "`:reg`/`:registers`: support a
+// register-name argument and match Neovim's `Type Name Content` table") is
+// FIXED — `ex_registers` (src/core/engine/execute.rs) now parses a trailing
+// register-name argument and prints the real `Type Name Content` table, so
+// its two case labels are deleted from `KNOWN_DEVIATIONS_MESSAGE` below; this
+// paragraph is left as the historical index so the remaining item numbers
+// need not be renumbered. Items 2-5 are filed, as #1300 through #1303
+// respectively (filed 2026-09-22). Item 6 (#1304) was itself a hermeticity
+// bug rather than a formatting one; it is now fixed (see item 6 below), and
+// the formatting gap it had been masking is not yet filed as its own issue.
+// All of these are the same shape: vimcode's message-listing ex-commands
+// were implemented against a hand-remembered idea of the classic-Vim format
 // rather than checked against a live Neovim, so every one of them differs —
 // sometimes by a column, sometimes by the whole table being a different
 // shape. None was attempted inline here because each is its own
 // non-trivial formatter rewrite (exact column widths, which rows Neovim
 // includes at all, in one case an entirely different feature — auto marks —
-// that does not exist in vimcode yet), not a one-line fix, and mixing seven
-// such rewrites into the slice that *adds the probe* would make this diff
+// that does not exist in vimcode yet), not a one-line fix, and mixing all of
+// them into the slice that *adds the probe* would make this diff
 // unreviewable. Every entry's live-oracle output is in this file's own git
 // history (the case, run once with `PROBE_VERBOSE=1`, printed it).
 //
-//   1. (#1299) "msg:ex::reg shows one named register's content" / "msg:ex::registers
-//      shows one named register's content" — title: "`:reg`/`:registers`:
-//      support a register-name argument and match Neovim's `Type Name
-//      Content` table". `execute_command`'s `"registers" | "display"` arm
-//      (src/core/engine/execute.rs) matches only the bare command — any
-//      trailing argument falls through to "not an editor command" — and
-//      even bare `:reg` prints a vimcode-invented `--- Registers ---`
-//      header/column layout instead of Neovim's real one.
+//   1. (#1299 — FIXED) "msg:ex::reg shows one named register's content" /
+//      "msg:ex::registers shows one named register's content". Was:
+//      `execute_command`'s `"registers" | "display"` arm matched only the
+//      bare command — any trailing argument fell through to "not an editor
+//      command" — and even bare `:reg` printed a vimcode-invented
+//      `--- Registers ---` header/column layout instead of Neovim's real
+//      one. Now: `ex_registers` parses an optional `{register-name}...`
+//      argument (each non-space character its own register name, `:h
+//      :registers`) and lists in Neovim's canonical order (unnamed,
+//      numbered, named, then `- * + . : % # / =`) using the real
+//      `Type Name Content` header and column layout, confirmed against a
+//      live oracle.
 //   2. (#1300) "msg:ex::marks lists a set mark" — title: "`:marks`: emit the three
 //      auto marks (`'`, `\"`, `.`) alongside user marks". `"marks"`'s arm
 //      only iterates `self.marks` (user-set marks); Neovim's `:marks`
@@ -9904,13 +9913,11 @@ fn nvim_conformance_cross_file_ex() {
 //      header and marks the current entry's row with a leading `>` (e.g.
 //      `>     3  history`); vimcode instead prints a vimcode-invented
 //      `--- Command History ---` header with no current-entry marker, the
-//      same shape as #1299/#1303's deviations. Left in
+//      same shape as #1303's deviation. Left in
 //      `KNOWN_DEVIATIONS_MESSAGE` below — the case still fails — pending a
 //      follow-up formatting-fix issue (same non-trivial-rewrite reasoning
-//      as the other six).
+//      as the others).
 const KNOWN_DEVIATIONS_MESSAGE: &[&str] = &[
-    "msg:ex::reg shows one named register's content",
-    "msg:ex::registers shows one named register's content",
     "msg:ex::marks lists a set mark",
     "msg:ex::jumps lists a jump",
     "msg:ex::digraphs lists the digraph table",
@@ -15767,19 +15774,24 @@ fn option_audit_gates_are_bidirectional() {
 //
 // The measurement, as of this slice:
 //
-//     ✅ Implemented       42
+//     ✅ Implemented       44
 //     🟡 Partial           12
-//     ❌ Not implemented   32
+//     ❌ Not implemented   30
 //     ⏭️  Intentionally skipped   3   (each with a reason from SKIP_REASONS)
 //                         ────
 //                          89   (34 registers, 55 marks)
+//
+// (#1299 moved `:reg[isters] {arg}` and `:di[splay] {arg}` from ❌ to ✅:
+// `execute_command`'s `"registers" | "display"` arm now parses a trailing
+// register-name argument and prints Neovim's real `Type Name Content` table
+// for both the bare and argument forms.)
 //
 // ## Why this slice is about *missing*, not *wrong*
 //
 // #1226 predicted it: the corpus already carries 44 `reg:` and 55
 // `mark:`/`jump:` cases and **none** of them is in [`KNOWN_DEVIATIONS`], so
 // the ground already entered is solid. What the walk finds is ground never
-// entered — 32 commands with no implementation at all, and 47 of the 86
+// entered — 30 commands with no implementation at all, and 47 of the 86
 // in-scope rows that no oracle case names. That is exactly the blind spot
 // #1007 exists to measure, and the reason the deliverable is a table rather
 // than a report.
@@ -15841,7 +15853,7 @@ enum RmArea {
 /// A recorded, re-measured column rather than a derived bool, because for a
 /// ❌ row "silent" is a strictly worse failure than "says so": a refusal
 /// sends the user to `:help`, a silent no-op looks like the command worked.
-/// Eight of this slice's 32 ❌ rows are silent — see
+/// Eight of this slice's 30 ❌ rows are silent — see
 /// [`regmark_audit_is_internally_consistent`], which pins that count.
 ///
 /// Note a few ✅ rows are `Refuses` too, because their recording ends with a
@@ -16279,29 +16291,30 @@ const REGMARK_AUDIT: &[RegMarkAudit] = &[
             "yy:registers<CR>",
             "a",
             (1, 1),
-            "--- Registers ---\n\"\"  l  a\\n\n\"0  l  a\\n",
+            "Type Name Content\n  l  \"\"   a^J\n  l  \"0   a^J",
         )),
         Some(Keys(":registers")),
-        "lists every non-empty register with Vim's c/l/b type column",
+        "lists every non-empty register, in Neovim's canonical order, using its \
+        real `Type Name Content` header/columns (#1299)",
     ),
     rm(
         Registers,
         ":reg[isters] {arg}",
         ":registers",
-        NotImplemented,
-        Refuses,
+        Implemented,
+        Silent,
         Some(live(
             &["a"],
             (1, 1),
             "\"ayy:reg a<CR>",
             "a",
             (1, 1),
-            "Not an editor command: registers a",
+            "Type Name Content\n  l  \"a   a^J",
         )),
         Some(Keys(":reg a")),
-        "Vim filters the listing to the named registers (`:reg 1a`); vimcode \
-        rejects any argument outright — worth implementing, it is a filter over \
-        a list execute.rs already builds",
+        "filters the listing to the requested register names, one per character \
+        of the argument (`:reg ab` == `:reg a b`); still shown in canonical, not \
+        argument, order — confirmed against a live oracle (#1299)",
     ),
     rm(
         Registers,
@@ -16315,27 +16328,27 @@ const REGMARK_AUDIT: &[RegMarkAudit] = &[
             "yy:display<CR>",
             "a",
             (1, 1),
-            "--- Registers ---\n\"\"  l  a\\n\n\"0  l  a\\n",
+            "Type Name Content\n  l  \"\"   a^J\n  l  \"0   a^J",
         )),
         Some(Keys(":display")),
-        "synonym for :registers, same listing",
+        "synonym for :registers, same listing (#1299)",
     ),
     rm(
         Registers,
         ":di[splay] {arg}",
         ":display",
-        NotImplemented,
-        Refuses,
+        Implemented,
+        Silent,
         Some(live(
             &["a"],
             (1, 1),
             "\"ayy:di a<CR>",
             "a",
             (1, 1),
-            "Not an editor command: display a",
+            "Type Name Content\n  l  \"a   a^J",
         )),
         Some(Keys(":di a")),
-        "same gap as `:reg {arg}` and the same one-line fix",
+        "same fix as `:reg {arg}` (#1299)",
     ),
     rm(
         Registers,
@@ -17697,7 +17710,7 @@ fn regmark_audit_is_internally_consistent() {
             tally(|e| matches!(e.area, RmArea::Marks)),
             tally(|e| matches!(e.status, OptStatus::NotImplemented) && e.report == Report::Silent),
         ),
-        (42, 12, 32, 3, 34, 55, 8),
+        (44, 12, 30, 3, 34, 55, 8),
         "the audit tally moved: (implemented, partial, missing, skipped, \
          registers, marks, missing-and-silent). Update the module doc's table \
          in the same commit."
