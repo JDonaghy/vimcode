@@ -26,7 +26,10 @@ fn normalizer_colo_to_colorscheme() {
 fn normalizer_di_to_display() {
     let mut e = engine_with("hello\n");
     exec(&mut e, "di");
-    assert_msg_contains(&e, "Registers");
+    // `:di` abbreviates to `:display`, which since #1299 prints Neovim's real
+    // `Type Name Content` table header rather than vimcode's old invented
+    // `--- Registers ---` banner.
+    assert_msg_contains(&e, "Type Name Content");
 }
 
 #[test]
@@ -195,8 +198,52 @@ fn normalizer_sp_to_split() {
 #[test]
 fn cmd_display_shows_registers() {
     let mut e = engine_with("hello\n");
+    exec(&mut e, "yank a");
     exec(&mut e, "display");
-    assert_msg_contains(&e, "Registers");
+    // #1299: Neovim's real header + `  {type}  "{name}   {content}` columns,
+    // with embedded newlines shown as `^J`, replacing vimcode's old invented
+    // `--- Registers ---` / `"a  l  hello\n` layout.
+    assert_msg_contains(&e, "Type Name Content");
+    assert_msg_contains(&e, "  l  \"a   hello^J");
+}
+
+#[test]
+fn cmd_registers_argument_filters_listing() {
+    let mut e = engine_with("alpha\nbravo\n");
+    exec(&mut e, "yank a");
+    press(&mut e, 'j');
+    exec(&mut e, "yank b");
+    exec(&mut e, "registers a");
+    assert_msg_contains(&e, "Type Name Content");
+    assert_msg_contains(&e, "  l  \"a   alpha^J");
+    assert!(
+        !e.message.contains("bravo"),
+        ":registers a must not list register b, got {:?}",
+        e.message
+    );
+    assert!(
+        !e.message.contains("\"\""),
+        ":registers a must not list the unnamed register, got {:?}",
+        e.message
+    );
+}
+
+#[test]
+fn cmd_reg_multi_char_argument_lists_each_register() {
+    let mut e = engine_with("alpha\nbravo\n");
+    exec(&mut e, "yank a");
+    press(&mut e, 'j');
+    exec(&mut e, "yank b");
+    // `:reg ba` — each non-space character is its own register name, and the
+    // listing stays in canonical order (a before b), not argument order.
+    exec(&mut e, "reg ba");
+    let a_at = e.message.find("\"a   alpha^J").expect("register a listed");
+    let b_at = e.message.find("\"b   bravo^J").expect("register b listed");
+    assert!(
+        a_at < b_at,
+        ":reg ba lists in canonical order, got {:?}",
+        e.message
+    );
 }
 
 #[test]
