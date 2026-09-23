@@ -417,6 +417,22 @@ pub struct TuiShellApp {
     hover_selecting: bool,
     fr_input_dragging: bool,
     last_layout: RefCell<Option<render::ScreenLayout>>,
+    /// Cached per-window status-bar hit zones, keyed by `WindowId::0` — the
+    /// TUI twin of `gtk::App::status_segment_map` (#1250). Populated by
+    /// `render_content`'s per-window (`paint_editor_band`) and separated
+    /// (`paint_bottom_band`) status-bar paint sites from the
+    /// `quadraui::StatusBarLayout` each `Backend::draw_status_bar` call
+    /// actually returned, consumed by `render::status_bands` so
+    /// `mouse::route_and_apply_chrome_click` hit-tests what was painted
+    /// instead of re-laying every bar's text out again on each click.
+    status_segment_map: RefCell<crate::app_support::StatusSegmentMap>,
+    /// Rect the last frame painted the separated status line into, or `None`
+    /// when that frame composed no `BottomOp::SeparatedStatus` — the GTK
+    /// twin of `App::separated_status_bar_rect` (#1250).
+    separated_status_bar_rect: Cell<Option<quadraui::Rect>>,
+    /// Hit zones for the global status bar's last painted layout — the GTK
+    /// twin of `App::global_status_zones` (#1250).
+    global_status_zones: RefCell<render::StatusZones>,
     /// Per-group tab-bar visible counts measured by the most recent
     /// `render_content`. `event_loop` collected these into a `draw_frame`
     /// out-param and fed them straight to `Engine::post_draw_apply_widths`
@@ -724,11 +740,17 @@ impl TuiShellApp {
                         continue;
                     };
                     backend.set_theme(super::quadraui_tui::q_theme(theme));
-                    let _ = render::paint_separated_status_rung(
-                        backend,
-                        status,
-                        to_q_rect(chrome.separated_status),
+                    let sb_rect = to_q_rect(chrome.separated_status);
+                    let sb_layout = render::paint_separated_status_rung(backend, status, sb_rect);
+                    // #1250: keyed by `active_window_id`, mirroring GTK's
+                    // `App::render_content` — the separated line shows the
+                    // active window's status, so that's the id
+                    // `render::status_bands` looks its zones up under.
+                    self.status_segment_map.borrow_mut().insert(
+                        screen.active_window_id.0,
+                        render::status_bar_zones_from_layout(&sb_layout),
                     );
+                    self.separated_status_bar_rect.set(Some(sb_rect));
                     composed_bottom.push(render::BottomOp::SeparatedStatus);
                 }
                 // Anchored just right of the sidebar's own right edge, which in
@@ -838,13 +860,27 @@ impl TuiShellApp {
                 // `Backend::draw_status_bar` — see its doc comment — so it no
                 // longer needs the raw `Frame` that `frame: None` used to
                 // skip it for).
-                render::EditorOp::Windows => render_all_windows(
-                    backend,
-                    None,
-                    &screen.windows,
-                    &screen.group_dividers,
-                    theme,
-                ),
+                render::EditorOp::Windows => {
+                    // #1250: cache the layout each window's status line
+                    // actually painted, keyed by its `WindowId` — the same
+                    // paint-time cache GTK's `render_content` fills at its
+                    // own per-window status-bar paint site, so
+                    // `render::status_bands` can read it back instead of
+                    // `mouse::route_and_apply_chrome_click` re-laying every
+                    // bar's text out again on each click.
+                    let status_layouts = render_all_windows(
+                        backend,
+                        None,
+                        &screen.windows,
+                        &screen.group_dividers,
+                        theme,
+                    );
+                    let mut segment_map = self.status_segment_map.borrow_mut();
+                    for (window_id, layout) in status_layouts {
+                        segment_map
+                            .insert(window_id.0, render::status_bar_zones_from_layout(&layout));
+                    }
+                }
                 // #35/#722: minimap strips on every window's right edge (one
                 // entry per `WindowId` in `screen.minimap`, not just the
                 // active window's) — one call, the braille rasteriser is
@@ -1114,6 +1150,9 @@ impl TuiShellApp {
             hover_selecting: false,
             fr_input_dragging: false,
             last_layout: RefCell::new(None),
+            status_segment_map: RefCell::new(std::collections::HashMap::new()),
+            separated_status_bar_rect: Cell::new(None),
+            global_status_zones: RefCell::new(Vec::new()),
             tab_visible_counts: RefCell::new(Vec::new()),
             debug_toolbar_rect: std::rc::Rc::new(Cell::new(quadraui::Rect::default())),
             explorer_sb_dragging: false,
@@ -1738,6 +1777,8 @@ impl TuiShellApp {
 
         let mut should_quit = false;
         let last_layout = self.last_layout.borrow();
+        let status_segment_map = self.status_segment_map.borrow();
+        let global_status_zones = self.global_status_zones.borrow();
         let hover_link_rects = self.hover_link_rects.borrow();
         let editor_hover_link_rects = self.editor_hover_link_rects.borrow();
         let completion_layout = self.completion_layout.borrow();
@@ -1766,6 +1807,9 @@ impl TuiShellApp {
             &mut drag_state,
             &mut modal_stack,
             last_layout.as_ref(),
+            &status_segment_map,
+            self.separated_status_bar_rect.get(),
+            &global_status_zones,
             is_double_click,
             &mut self.folder_picker,
             &mut should_quit,
@@ -1793,6 +1837,8 @@ impl TuiShellApp {
         drop(drag_state);
         drop(modal_stack);
         drop(last_layout);
+        drop(status_segment_map);
+        drop(global_status_zones);
         drop(hover_link_rects);
         drop(editor_hover_link_rects);
         drop(completion_layout);
@@ -2192,6 +2238,14 @@ impl ShellApp for TuiShellApp {
 
         backend.set_theme(super::quadraui_tui::q_theme(&theme));
 
+        // Per-window/separated status-bar hit zones (#1250), the TUI twin of
+        // GTK's identical top-of-frame `status_segment_map` clear: cleared
+        // here and re-populated per band below, so a window that closes (or
+        // a separated line that stops painting) doesn't leave a stale, now-
+        // wrong entry keyed by its id.
+        self.status_segment_map.borrow_mut().clear();
+        self.separated_status_bar_rect.set(None);
+
         let screen = build_screen_for_shell_content(&self.engine, &theme, area, backend);
 
         // ══ Editor band (#764, #735 slice 3) ═════════════════════════════
@@ -2415,12 +2469,17 @@ impl ShellApp for TuiShellApp {
                 // ── Global status bar ────────────────────────────────────
                 render::FrameOp::StatusBar => {
                     if let Some(ref bar) = screen.global_status_bar {
-                        let _ = render::paint_global_status_bar_rung(
+                        let sb_layout = render::paint_global_status_bar_rung(
                             backend,
                             &self.engine,
                             bar,
                             to_q_rect(chrome.status),
                         );
+                        // #1250: same zone recovery as the per-window and
+                        // separated bars above, mirroring GTK's
+                        // `App::global_status_zones`.
+                        *self.global_status_zones.borrow_mut() =
+                            render::status_bar_zones_from_layout(&sb_layout);
                         composed.push(render::FrameOp::StatusBar);
                     }
                 }
@@ -20987,8 +21046,8 @@ mod tests {
     /// Not RED on this backend — TUI's own arm worked. It is here because
     /// that arm is gone: three status arms (per-window, separated, global)
     /// collapsed into one shared band walk, and this is what catches it if
-    /// `window_status_line_zones` or the band's rect arithmetic drifts from
-    /// what `render_window_status_line` paints.
+    /// `status_segment_map`'s paint-time cache (#1250) or the band's rect
+    /// arithmetic drifts from what `render_window_status_line` paints.
     #[test]
     fn window_status_line_segment_click_still_fires_via_shell_app() {
         let mut app = TuiShellApp::new(None);
@@ -21016,6 +21075,69 @@ mod tests {
             screen.contains("Go to Line") || screen.contains("Command"),
             "clicking the cursor-position segment must open the go-to-line \
              palette (`StatusAction::GoToLine`); screen:\n{screen}"
+        );
+    }
+
+    /// #1250: the **separated** status line's segment click routing, with
+    /// the sidebar open so the painted row is *narrower* than the full
+    /// terminal width (`editor_left > 0`) — the case the pre-#1250 click
+    /// handler got wrong.
+    ///
+    /// **RED against unfixed `develop`**: the old handler re-laid the bar's
+    /// text out via `window_status_line_zones(status, bar_width)`, where
+    /// `bar_width` was the *full terminal width*, not the narrower width
+    /// `render_content` actually painted the row at
+    /// (`bar_width - editor_left`). The cursor-position segment is
+    /// right-aligned (pushed last, highest drop priority — see
+    /// `build_window_status_line`), so it is measured from the right edge of
+    /// that too-wide virtual bar: its zone lands at a local x at or beyond
+    /// the *real* rect's width, which `status_bar_zone_hit_test`'s
+    /// `local_x < rect.width` bound can never reach. Every click on the
+    /// segment as it is actually painted therefore missed, silently, with no
+    /// panic and no visible symptom other than "the palette never opens".
+    /// Reverting `render_window_status_line`'s per-window `WidgetId` back to
+    /// the shared `"status:window"` id does *not* reproduce this — the bug is
+    /// the click-time *width*, not the id. Reverting the paint-time cache
+    /// itself (making `TuiShellApp::paint_bottom_band`'s `SeparatedStatus`
+    /// arm lay the bar out at the full terminal width instead of the
+    /// `sb_rect` it actually painted at) does: observed RED — click landed
+    /// nowhere, palette never opened — before this fix, confirmed GREEN
+    /// after restoring it.
+    #[test]
+    fn separated_status_line_segment_click_fires_with_sidebar_open_via_shell_app() {
+        let mut app = TuiShellApp::new_for_test();
+        app.engine
+            .app_shell
+            .show_panel(&quadraui::WidgetId::new(PANEL_EXPLORER));
+        app.engine.session.explorer_visible = true;
+        // `separate_status` (`render.rs::build_screen_layout`) requires
+        // per-window status on, `status_line_above_terminal` off, and some
+        // bottom panel open — exactly the combination that extracts the
+        // active window's status into its own full-width row above the
+        // panel, which is the row this test targets.
+        app.engine.settings.window_status_line = true;
+        app.engine.settings.status_line_above_terminal = false;
+        app.engine.bottom_panel_open = true;
+        app.engine.bottom_panel_kind = render::BottomPanelKind::DebugOutput;
+        app.engine.buffer_mut().insert(0, "alpha\nbeta\ngamma\n");
+        // Same pre-existing, unrelated truncation drift `git_branch = None`
+        // sidesteps in the per-window test above.
+        app.engine.git_branch = None;
+
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        let (x, y) = driver
+            .find("Ln 1, Col 1")
+            .expect("the separated status line must paint its cursor segment");
+
+        driver.click(x, y);
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("Go to Line") || screen.contains("Command"),
+            "clicking the cursor-position segment on the separated status \
+             line (with the sidebar open, so the row is narrower than the \
+             full terminal width) must open the go-to-line palette \
+             (`StatusAction::GoToLine`); screen:\n{screen}"
         );
     }
 

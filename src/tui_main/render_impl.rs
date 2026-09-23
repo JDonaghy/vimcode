@@ -824,13 +824,21 @@ pub(super) fn compute_tui_tab_drop_zone(
 /// writes with no `Backend::draw_*` trait equivalent) — #609 ported it to
 /// `Backend::draw_status_bar` (see that function's doc comment), so it now
 /// runs unconditionally here regardless of `frame`.
+///
+/// Returns the [`quadraui::StatusBarLayout`] each window's own status line
+/// actually painted, keyed by [`crate::core::WindowId`] — #1250: the caller
+/// (`TuiShellApp::render_content`) caches these into its own paint-time
+/// segment map, mirroring GTK's `App::status_segment_map`, so
+/// `render::status_bands` reads what was painted rather than the click
+/// handler re-laying every bar's text out again on demand.
 pub(super) fn render_all_windows(
     backend: &mut dyn quadraui::Backend,
     mut frame: Option<&mut ratatui::Frame>,
     windows: &[RenderedWindow],
     group_dividers: &[GroupDivider],
     theme: &Theme,
-) {
+) -> Vec<(crate::core::WindowId, quadraui::StatusBarLayout)> {
+    let mut status_layouts = Vec::new();
     // #1245: plain layout-order iteration. #1039's paint-order workaround
     // (paint the active window last, so its `Some` cursor position wins
     // quadraui's `TuiBackend::last_cursor_position` cache) is gone — the
@@ -856,9 +864,13 @@ pub(super) fn render_all_windows(
             width: paint_rect.width as u16,
             height: paint_rect.height as u16,
         };
-        render_window(backend, frame.as_deref_mut(), win_rect, window, theme);
+        if let Some(layout) = render_window(backend, frame.as_deref_mut(), win_rect, window, theme)
+        {
+            status_layouts.push((window.window_id, layout));
+        }
     }
     render_separators(backend, windows, group_dividers, theme);
+    status_layouts
 }
 
 /// Render one editor window (pane) into `frame`.
@@ -886,7 +898,7 @@ pub(super) fn render_window(
     area: Rect,
     window: &RenderedWindow,
     theme: &Theme,
-) {
+) -> Option<quadraui::StatusBarLayout> {
     // Reserve the bottom row for the per-window status line when present.
     let status_bar_row = if window.status_line.is_some() && area.height > 1 {
         Some(area.y + area.height - 1)
@@ -923,7 +935,17 @@ pub(super) fn render_window(
     }
 
     if let (Some(status), Some(sy)) = (&window.status_line, status_bar_row) {
-        render_window_status_line(backend, editor_area.x, sy, editor_area.width, status, theme);
+        Some(render_window_status_line(
+            backend,
+            editor_area.x,
+            sy,
+            editor_area.width,
+            window.window_id,
+            status,
+            theme,
+        ))
+    } else {
+        None
     }
 }
 
@@ -933,12 +955,19 @@ pub(super) fn render_window(
 /// computes layout internally with `MIN_GAP_CELLS = 2.0` so right
 /// segments priority-drop on narrow bars (#159).
 ///
-/// `StatusBar` adapter encodes engine-side `StatusAction` values as
-/// opaque `WidgetId` strings; `status_segment_hit_test` (in mouse.rs)
-/// decodes them back to `StatusAction` via `status_action_from_id`
-/// after the layout's hit_test() resolves a click — TUI doesn't
-/// consume the hit regions returned by `draw_status_bar` because the
-/// click handler runs the layout on demand against current bar width.
+/// `StatusBar` adapter encodes engine-side `StatusAction` values as opaque
+/// `WidgetId` strings; `render::status_bar_zones_from_layout` decodes them
+/// back to `StatusAction` via `status_action_from_id` once
+/// [`crate::render::status_bands`] resolves a click against the returned
+/// layout — the *paint's* layout, cached by `TuiShellApp::render_content`
+/// (#1250), not a second on-demand `bar.layout()` re-measure at click time
+/// the way this used to work.
+///
+/// `id` is per-window (`status:{window_id}`, matching GTK's
+/// `status:{rw.window_id.0}`) rather than the single shared `"status:window"`
+/// every window used to paint under — #1250: with a multi-window split, a
+/// paint-time cache keyed only by that constant string would have every
+/// window's status line silently overwrite the previous one's cache entry.
 /// See `render_tab_bar`'s doc comment for why `backend` is the trait object
 /// rather than the concrete `TuiBackend` (#601).
 pub(super) fn render_window_status_line(
@@ -946,16 +975,17 @@ pub(super) fn render_window_status_line(
     x: u16,
     y: u16,
     width: u16,
+    window_id: crate::core::WindowId,
     status: &crate::render::WindowStatusLine,
     theme: &crate::render::Theme,
-) {
+) -> quadraui::StatusBarLayout {
     let bar = crate::render::window_status_line_to_status_bar(
         status,
-        quadraui::WidgetId::new("status:window"),
+        quadraui::WidgetId::new(format!("status:{}", window_id.0)),
     );
     let q_rect = quadraui::Rect::new(x as f32, y as f32, width as f32, 1.0);
     backend.set_theme(super::quadraui_tui::q_theme(theme));
-    let _ = backend.draw_status_bar(q_rect, &bar, None, None);
+    backend.draw_status_bar(q_rect, &bar, None, None)
 }
 
 /// True when `w`'s own `Backend::draw_editor` scrollbar occupies its last
@@ -1653,13 +1683,19 @@ mod tests {
                         engine.terminal_maximized,
                     ) {
                         match op {
-                            render::EditorOp::Windows => render_all_windows(
-                                backend,
-                                None,
-                                &screen.windows,
-                                &screen.group_dividers,
-                                &theme,
-                            ),
+                            render::EditorOp::Windows => {
+                                // Test-only buffer render (#1250): no click
+                                // routing happens against this path, so the
+                                // per-window status layouts `render_all_windows`
+                                // now returns have nothing to cache into.
+                                let _ = render_all_windows(
+                                    backend,
+                                    None,
+                                    &screen.windows,
+                                    &screen.group_dividers,
+                                    &theme,
+                                );
+                            }
                             render::EditorOp::Minimap => {
                                 render::draw_minimap_strip(backend, &screen);
                             }
@@ -2091,6 +2127,9 @@ mod tests {
             &mut drag_state,
             &mut modal_stack,
             Some(&screen),
+            &std::collections::HashMap::new(),
+            None,
+            &Vec::new(),
             false,
             &mut None,
             &mut should_quit,
