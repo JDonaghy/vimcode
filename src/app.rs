@@ -28,10 +28,14 @@
 //! listed as the remaining blockers to dropping the `gui` gate:
 //!
 //! 1. **The platform-typed fields** (`window`, `css_provider`) are now
-//!    type-erased behind the small local traits
-//!    [`PlatformWindowHandle`]/[`PlatformCssProvider`] (the same shape as
-//!    [`TextMetricsBackend`] and `Engine::clipboard_read`/`clipboard_write`,
-//!    #417). A third field used to live in this list, `settings_monitor`,
+//!    type-erased. `css_provider` goes behind the small local
+//!    [`PlatformCssProvider`] trait (the same shape as [`TextMetricsBackend`]
+//!    and `Engine::clipboard_read`/`clipboard_write`, #417); `window` had the
+//!    same treatment (`PlatformWindowHandle`) until #1234 deleted it outright
+//!    once `quadraui::Backend::window()` (`WindowControl`, quadraui#950)
+//!    became a full replacement — see that issue's note further down for why
+//!    the field itself, not just its type erasure, is gone. A third field
+//!    used to live in this list, `settings_monitor`,
 //!    holding a GTK-only `gio::FileMonitor` behind a `Box<dyn Any>`
 //!    drop-guard; #949 deleted it outright rather than type-erasing it —
 //!    `Engine::check_settings_reload`'s portable mtime poll (already the
@@ -40,13 +44,21 @@
 //!    closed the settings-hot-reload gap on macOS/Win-GUI that this file's
 //!    `new_portable` doc table used to list as deliberately skipped.
 //! 2. **The platform hook call sites** (colorscheme reload, OS window title /
-//!    default size / minimize / maximized-check, CSD capture) now go through
-//!    those same traits and compile for every feature set; only window
-//!    *discovery* (`find_visible_window` — quadraui has no portable "find the
-//!    runner's window" surface yet) and the `gdk::Display`/`gtk4::IconTheme`
-//!    icon-search-path setup inside `App::new` stay behind inline
-//!    `#[cfg(feature = "gui")]`. A `gtk4::Settings` dark/light-variant push
-//!    used to live here too (`App::new` and `handle_poll_tick` both);
+//!    size / maximized-check / decoration / minimize) now go through
+//!    `quadraui::Backend::window()` (`WindowControl`, quadraui#950) and
+//!    compile for every feature set. #1234 deleted the last of this file's
+//!    own window-handle plumbing — the local `PlatformWindowHandle` trait,
+//!    its `gtk4::Window` impl, and the `find_visible_window`
+//!    `gtk4::Window::list_toplevels()` discovery scan that fed it — once
+//!    `WindowControl::is_maximized`/`set_decorated` shipped upstream:
+//!    `GtkBackend` already tracks its own top-level window handle
+//!    internally, so `app.rs` never had a genuine discovery gap, only a
+//!    missing *portable accessor* to reach a window quadraui's own backend
+//!    already had a handle to. Only the `gdk::Display`/`gtk4::IconTheme`
+//!    icon-search-path setup inside `App::new` stays behind inline
+//!    `#[cfg(feature = "gui")]` — quadraui has no portable icon-theme
+//!    search-path surface. A `gtk4::Settings` dark/light-variant push used
+//!    to live here too (`App::new` and `handle_poll_tick` both);
 //!    quadraui#1016 moved it into `Backend::set_theme`, so both call sites
 //!    were deleted rather than kept behind the gate.
 //! 3. **`crate::gtk::{click, css, util}`.** The portable majority of these —
@@ -83,8 +95,6 @@
 
 #[cfg(feature = "gui")]
 use gtk4::gdk;
-#[cfg(feature = "gui")]
-use gtk4::prelude::*;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::collections::VecDeque;
@@ -191,16 +201,12 @@ impl GtkEngineActionHost<'_> {
     /// against the already-borrowed `engine` instead of calling it (see this
     /// struct's own doc for why).
     fn save_session_and_exit(app: &App, engine: &mut Engine) {
-        engine.session.window.width = app
-            .window
-            .as_ref()
-            .map(|w| w.win_default_width())
-            .unwrap_or(800);
-        engine.session.window.height = app
-            .window
-            .as_ref()
-            .map(|w| w.win_default_height())
-            .unwrap_or(600);
+        // #1234: reads `App::cached_window_width`/`cached_window_height`
+        // (refreshed every tick from `WindowControl::bounds()`) rather than
+        // querying a live `backend` handle — this call chain
+        // (`EngineActionHost`) carries none; see those fields' own doc.
+        engine.session.window.width = app.cached_window_width.get();
+        engine.session.window.height = app.cached_window_height.get();
         engine.save_session_state();
         engine.cleanup_all_swaps();
         engine.lsp_shutdown();
@@ -456,78 +462,23 @@ impl TextMetricsBackend for win_backend::WinBackend {
     }
 }
 
-/// Narrow seam over the OS top-level window handle (#862) for the window
-/// queries quadraui's `Backend::window()` (`WindowControl`, quadraui#950)
-/// used to have no portable answer for at all. `is_maximized()` and
-/// `set_decorated()` (#552 CSD — dropping the server-side titlebar in
-/// favour of the drawn one) both shipped upstream (`f352462`) and are
-/// present at this crate's pinned rev, so `win_is_maximized`/
-/// `win_set_decorated` below are today un-migrated GTK-only duplicates of
-/// that now-shared surface, not a workaround for a genuine gap. What
-/// quadraui's `WindowControl` still has no portable answer for is reading
-/// back the last-requested (non-maximized) size for session-restore —
-/// `win_default_width`/`win_default_height` below are that gap's actual,
-/// still-needed workaround. Method names are prefixed `win_*` to avoid
-/// colliding with the `gtk4::prelude` extension-trait methods of the same
-/// name on the one concrete impl below (both would otherwise be applicable
-/// to `&gtk4::Window` inside that impl, which is an ambiguous call, not a
-/// recursive one).
-///
-/// #1124 dropped this trait's title-set/minimize methods: both now
-/// route through `backend.window()?.set_title(..)`/`.minimize()` instead
-/// (the same `WindowControl` surface `TuiBackend` implements too — its one
-/// genuine capability there is `set_title`, emitting the OSC 0/2 escape;
-/// see `src/tui_main/shell_app.rs`). `self.window` below is only ever
-/// populated on GTK (`capture_window_and_apply_csd`'s discovery has no
-/// macOS/Win-GUI equivalent), which made title-sync and minimize silent
-/// no-ops on both of those backends; `backend.window()` is backed on every
-/// windowed backend, so this now works everywhere `App` runs.
-pub(crate) trait PlatformWindowHandle {
-    fn win_default_width(&self) -> i32;
-    fn win_default_height(&self) -> i32;
-    fn win_is_maximized(&self) -> bool;
-    // Only called from `capture_window_and_apply_csd`'s `gui`-gated inner
-    // block today — window *discovery* has no portable equivalent yet (see
-    // that method's doc comment), so nothing calls this outside `gui`.
-    #[cfg_attr(not(feature = "gui"), allow(dead_code))]
-    fn win_set_decorated(&self, decorated: bool);
-}
+// #1234: `PlatformWindowHandle`, the local seam that used to live here, is
+// gone. It existed because quadraui's `WindowControl` had no portable
+// `is_maximized()`/`set_decorated()` at the time; those shipped upstream
+// (`f352462`, #862) and are present at this crate's pinned rev, so every
+// caller now reaches `quadraui::Backend::window()` (`WindowControl`,
+// quadraui#950) directly instead — see `capture_window_and_apply_csd`
+// (CSD/decoration), `paint_title_bar_band`/`render_content`
+// (`is_maximized`), and `App::cached_window_width`/`cached_window_height`
+// (session-restore size, cached rather than read live — see that field's own
+// doc for why). `WindowControl` is backed on every windowed backend (GTK,
+// macOS, Win-GUI all `impl WindowControl` at the pinned rev) plus TUI
+// (title-only, via the OSC 0/2 escape — see `src/tui_main/shell_app.rs`), so
+// none of this needs a `#[cfg(feature = "gui")]` gate or a per-backend impl
+// the way the deleted trait's sole `gtk4::Window` impl did.
 
-#[cfg(feature = "gui")]
-impl PlatformWindowHandle for gtk4::Window {
-    fn win_default_width(&self) -> i32 {
-        gtk4::prelude::GtkWindowExt::default_width(self)
-    }
-    fn win_default_height(&self) -> i32 {
-        gtk4::prelude::GtkWindowExt::default_height(self)
-    }
-    fn win_is_maximized(&self) -> bool {
-        gtk4::prelude::GtkWindowExt::is_maximized(self)
-    }
-    fn win_set_decorated(&self, decorated: bool) {
-        gtk4::prelude::GtkWindowExt::set_decorated(self, decorated);
-    }
-}
-
-// #866: deliberately no `impl PlatformWindowHandle for` any Win-GUI type.
-// quadraui's `win` module (pinned rev `9eede7fd`) exposes no public
-// top-level-window handle at all — `WinBackend`'s `hwnd` field is private
-// and `#[cfg(target_os = "windows")]`-gated, and nothing in `win::run` or
-// `win::services` hands one back to a `ShellApp` caller. This is the same
-// gap `src/macos/mod.rs` documents for `MacBackend` (no `PlatformWindowHandle`
-// impl there either) — window *discovery* has no portable equivalent yet on
-// either backend, matching this trait's own doc comment above
-// (`win_set_decorated`'s `allow(dead_code)` already prices that in). `App`'s
-// `window` field simply stays `None` on the `new_portable` path both
-// backends use, exactly as it does for macOS today. Writing raw `windows`-
-// crate calls here to invent a handle would be new per-backend feature
-// logic — CLAUDE.md's Platform-Neutrality Rule says that gap belongs in a
-// quadraui issue (a public window-handle accessor next to `WinBackend`),
-// not in this file.
-
-/// Narrow seam over the platform stylesheet provider (#862) — same shape as
-/// [`PlatformWindowHandle`] above. `App::css_provider` stores one of these
-/// type-erased so the colorscheme-reload/`setup` methods can reload it
+/// Narrow seam over the platform stylesheet provider (#862). `App::css_provider`
+/// stores one of these type-erased so the colorscheme-reload/`setup` methods can reload it
 /// without naming `gtk4::CssProvider`.
 pub(crate) trait PlatformCssProvider {
     fn load_css_data(&self, css: &str);
@@ -775,11 +726,37 @@ pub(crate) struct App {
     /// `tab_drag_source`, `tab_drag_drop_zone`) with the shared
     /// [`render::TabDragState`], which TUI holds too.
     pub(crate) tab_drag: render::TabDragState,
-    /// OS top-level window handle, type-erased behind [`PlatformWindowHandle`]
-    /// (#862) so the shared paint/title-sync/minimize methods below can call
-    /// it without naming `gtk4::Window` — set in `ShellApp::setup` once the
-    /// runner creates the window.
-    pub(crate) window: Option<Box<dyn PlatformWindowHandle>>,
+    /// Whether `capture_window_and_apply_csd` has already dropped the
+    /// server-side WM titlebar via `WindowControl::set_decorated(false)`
+    /// (#552). `set_decorated` is idempotent, so this only exists to skip
+    /// the repeat `Backend::window()` call/dispatch on every subsequent
+    /// tick once it has taken effect once — not for correctness. Replaced
+    /// the `self.window.is_some()` check #1234 deleted along with the
+    /// `gtk4::Window`-typed `window` field it guarded.
+    pub(crate) csd_applied: Cell<bool>,
+    /// Cached window width/height (#1234), refreshed every tick
+    /// (`handle_poll_tick`) from `WindowControl::bounds()` rather than read
+    /// live at quit time: quit runs through `EngineActionHost`/
+    /// `handle_menu_action`/dialog-button call chains with no live
+    /// `backend: &mut dyn quadraui::Backend` in scope (only `tick`/`setup`/
+    /// paint entry points have one) — the same "no backend in scope"
+    /// problem `cached_line_height`/`cached_char_width` solve for text
+    /// metrics, solved the same way here.
+    ///
+    /// Only refreshed while the window is *not* maximized. `bounds()`
+    /// reports the window's live allocated size, which under GTK is the
+    /// full-screen extent while maximized; the deleted `PlatformWindowHandle`
+    /// seam avoided that by reading `gtk4::Window::default_width`/
+    /// `default_height` instead, GTK properties documented (and used by
+    /// GNOME's own save-window-state guidance) to freeze at the last
+    /// non-maximized size while maximized/fullscreen/tiled — no
+    /// `WindowControl` method reports that directly. Skipping the write
+    /// while maximized reproduces the same "last known non-maximized size"
+    /// behaviour without needing one: the fields simply keep whatever they
+    /// were last set to (or the `800`×`600` default below) until the window
+    /// un-maximizes again.
+    pub(crate) cached_window_width: Cell<i32>,
+    pub(crate) cached_window_height: Cell<i32>,
     /// Editor content bounds + tab-bar height as used by the LAST
     /// `render_content` pass, in the same **absolute** DA coordinate frame
     /// that mouse events arrive in (#550, #582).
@@ -1685,7 +1662,12 @@ impl App {
             terminal_split_dragging: false,
             divider_grab: None,
             tab_drag: render::TabDragState::default(),
-            window: None,
+            csd_applied: Cell::new(false),
+            // Matches `SessionState::default()`'s window geometry
+            // (`core/session.rs`) — the same fallback `save_session_and_exit`
+            // used before #1234 when `self.window` was `None`.
+            cached_window_width: Cell::new(800),
+            cached_window_height: Cell::new(600),
             cached_editor_bounds: Cell::new(None),
             menu_row_rect: Rc::new(Cell::new(quadraui::Rect::default())),
             menu_items_rect: Cell::new(quadraui::Rect::default()),
@@ -2272,19 +2254,15 @@ impl App {
     /// (`gtk/run.rs`), the same mechanism every other quadraui backend uses.
     fn save_session_and_exit(&self) {
         let mut engine = self.engine.borrow_mut();
-        // GTK-only: capture the live window geometry into session state
-        // *before* `save_session_state` persists it — `Engine` has no
-        // window handle of its own to read this from (#823 item 5).
-        engine.session.window.width = self
-            .window
-            .as_ref()
-            .map(|w| w.win_default_width())
-            .unwrap_or(800);
-        engine.session.window.height = self
-            .window
-            .as_ref()
-            .map(|w| w.win_default_height())
-            .unwrap_or(600);
+        // Capture the cached window geometry into session state *before*
+        // `save_session_state` persists it — `Engine` has no window handle
+        // of its own to read this from (#823 item 5). Reads
+        // `cached_window_width`/`cached_window_height` (refreshed every
+        // tick from `WindowControl::bounds()`) rather than a live `backend`
+        // handle, which this call chain carries none of — see those
+        // fields' own doc (#1234).
+        engine.session.window.width = self.cached_window_width.get();
+        engine.session.window.height = self.cached_window_height.get();
         engine.save_session_state();
         engine.cleanup_all_swaps();
         engine.lsp_shutdown();
@@ -2942,8 +2920,9 @@ impl App {
         // Sync the OS window title with the active buffer name (taskbar/
         // pager). Routed through `Backend::window()` (quadraui#950, #1124)
         // rather than the old GTK-only `self.window`/`PlatformWindowHandle`
-        // title setter — see that trait's doc comment for why this is what
-        // fixed title-sync being a silent no-op on macOS/Win-GUI.
+        // title setter (deleted #1234) — that seam was `None` on
+        // macOS/Win-GUI, so this used to be a silent no-op there;
+        // `WindowControl` is backed on every windowed backend.
         let win_title = self
             .engine
             .borrow()
@@ -2952,6 +2931,16 @@ impl App {
             .unwrap_or_else(|| "VimCode".to_string());
         if let Some(w) = backend.window() {
             let _ = w.set_title(&win_title);
+            // Refresh the session-restore size cache (#1234) — see
+            // `cached_window_width`'s doc for why this is cached here rather
+            // than read live from `save_session_and_exit`, and why it's
+            // gated on `!is_maximized()`.
+            if matches!(w.is_maximized(), Ok(false)) {
+                if let Ok(bounds) = w.bounds() {
+                    self.cached_window_width.set(bounds.width.round() as i32);
+                    self.cached_window_height.set(bounds.height.round() as i32);
+                }
+            }
         }
     }
 
@@ -6200,56 +6189,37 @@ impl App {
         self.draw_needed.set(true);
     }
 
-    /// Find the runner-created top-level window once it is mapped/visible.
-    /// Returns `None` until then — see `capture_window_and_apply_csd`. (#552)
+    /// Drop the server-side WM titlebar in favour of the drawn CSD row from
+    /// `render_content`, the first time each run `Backend::window()` returns
+    /// `Some` while this backend draws its own chrome. Called from both
+    /// `setup()` (fast path, usually too early — the runner hasn't called
+    /// `window.present()` yet, so `backend.window()` is still `None`) and
+    /// `tick()` (reliable path — retried every frame via `csd_applied` until
+    /// it succeeds). (#552)
     ///
-    /// Window discovery is inherently platform-specific (quadraui has no
-    /// portable "find the runner's window" surface yet — #862 module doc item
-    /// 2), so unlike `window`'s other call sites this one has no non-GTK
-    /// branch to fall back to; it stays behind the `gui` feature entirely.
+    /// Gated on `!backend.backend_caps().native_menu` rather than
+    /// `#[cfg(feature = "gui")]`: a backend with a real OS menu bar (macOS's
+    /// `MacBackend`, #901) keeps its native titlebar too — the drawn CSD row
+    /// only exists on backends that also draw their own menu bar (GTK,
+    /// Win-GUI) — so this is the same portable capability check `setup()`
+    /// already uses a few lines below to decide whether to install the
+    /// drawn menu bar at all, not a second per-backend fork of the same
+    /// decision.
     ///
-    /// #1124 narrowed what this feeds: title-sync and minimize moved off
-    /// `self.window` onto `backend.window()` (quadraui#950), so this
-    /// discovery hack now backs only `PlatformWindowHandle`'s two remaining
-    /// queries (`win_is_maximized`/`win_set_decorated` for CSD) plus the
-    /// session-restore size read (`win_default_width`/`win_default_height`)
-    /// — none of which have a `WindowControl` equivalent yet. Unlike the
-    /// title/minimize seam this trait used to also carry, this discovery
-    /// hack is *not* deleted, because there is no other way to reach the
-    /// raw `gtk4::Window` for those: dropping it would silently regress
-    /// GTK's CSD (both the server-side titlebar never getting suppressed,
-    /// and the maximize button's checked state) rather than fix a bug.
-    #[cfg(feature = "gui")]
-    fn find_visible_window() -> Option<Box<dyn PlatformWindowHandle>> {
-        // `list_toplevels` asserts GTK is initialized, which it never is under
-        // the headless test harness (#646). `run()` calls `gtk4::init()` before
-        // building the `App`, so this is unconditionally `true` in a live run
-        // and the guard costs production nothing.
-        if !gtk4::is_initialized() {
-            return None;
+    /// #1234 deleted this method's `gtk4::Window::list_toplevels()`
+    /// discovery scan (the former `find_visible_window`) along with the
+    /// `PlatformWindowHandle` seam it fed: `Backend::window()`
+    /// (quadraui#950) is now backed on every windowed backend, and
+    /// `GtkBackend` already tracks its own top-level window handle
+    /// internally the moment the runner constructs it, so `app.rs` never had
+    /// a genuine discovery gap here — only a missing portable accessor.
+    fn capture_window_and_apply_csd(&mut self, backend: &mut dyn quadraui::Backend) {
+        if self.csd_applied.get() || backend.backend_caps().native_menu {
+            return;
         }
-        gtk4::Window::list_toplevels()
-            .into_iter()
-            .filter_map(|obj| obj.downcast::<gtk4::Window>().ok())
-            .find(|w| w.is_visible())
-            .map(|w| Box::new(w) as Box<dyn PlatformWindowHandle>)
-    }
-
-    /// Capture the runner's GTK window (if not already captured) and drop
-    /// GTK's server-side WM titlebar in favour of the drawn CSD row from
-    /// `render_content`. Called from both `setup()` (fast path, usually too
-    /// early — the runner hasn't called `window.present()` yet) and `tick()`
-    /// (reliable path — retried every frame until the window is mapped).
-    /// (#552)
-    fn capture_window_and_apply_csd(&mut self) {
-        #[cfg(feature = "gui")]
-        {
-            if self.window.is_some() {
-                return;
-            }
-            if let Some(w) = Self::find_visible_window() {
-                w.win_set_decorated(false);
-                self.window = Some(w);
+        if let Some(w) = backend.window() {
+            if w.set_decorated(false).is_ok() {
+                self.csd_applied.set(true);
             }
         }
     }
@@ -6807,9 +6777,10 @@ impl App {
     /// Minimize the application window (inline window-control button).
     ///
     /// Routed through `Backend::window()` (quadraui#950, #1124) rather than
-    /// the old GTK-only `self.window`/`PlatformWindowHandle` seam — see
-    /// `PlatformWindowHandle`'s doc comment for why this is what fixed
-    /// minimize being a silent no-op on macOS/Win-GUI.
+    /// the old GTK-only `self.window`/`PlatformWindowHandle` seam (deleted
+    /// #1234) — that seam was `None` on macOS/Win-GUI, so this used to be a
+    /// silent no-op there; `WindowControl` is backed on every windowed
+    /// backend.
     fn window_minimize(&mut self, backend: &mut dyn quadraui::Backend) {
         if let Some(w) = backend.window() {
             let _ = w.minimize();
@@ -7160,7 +7131,15 @@ impl App {
         // "modal" means, and it is what TUI already did with everything it
         // painted into its own title-bar row.
         if let Some(controls_rect) = controls_rect {
-            let maximized = self.window.as_ref().is_some_and(|w| w.win_is_maximized());
+            // #1234: read live via `WindowControl::is_maximized()` rather
+            // than the deleted `self.window`/`PlatformWindowHandle` seam —
+            // `backend` is already in hand here, so there is no "no backend
+            // in scope" problem to cache around (contrast
+            // `App::cached_window_width`'s doc).
+            let maximized = backend
+                .window()
+                .and_then(|w| w.is_maximized().ok())
+                .unwrap_or(false);
             let controls_bar = render::window_controls_status_bar(theme, maximized);
             let interaction = self.title_bar_interaction.borrow();
             let hits = backend.draw_status_bar(
@@ -7846,10 +7825,10 @@ impl App {
         self.line_height_cell.set(self.cached_line_height);
         self.char_width_cell.set(self.cached_char_width);
 
-        // Retry the window capture until the runner has mapped it — see
-        // `capture_window_and_apply_csd` (#552). No-ops once `self.window`
-        // is `Some`.
-        self.capture_window_and_apply_csd();
+        // Retry dropping the server-side titlebar until the runner's window
+        // is mapped — see `capture_window_and_apply_csd` (#552). No-ops once
+        // `csd_applied` is set.
+        self.capture_window_and_apply_csd(backend);
 
         // Drain the actions async GTK callbacks queued for this frame.
         for action in self.deferred.drain() {
@@ -7933,13 +7912,12 @@ impl quadraui::ShellApp for App {
         // one-time `setup()` call, not part of the per-frame sync above.
         render::register_nerd_font_fallback(backend);
 
-        // Try to grab the runner-created GTK window now so minimize/maximize/
-        // close work and the server-side WM titlebar is dropped in favour of
-        // the drawn CSD row; `setup()` runs before `run_with_shell`'s runner
-        // calls `window.present()`, so it is very likely not yet mapped and
-        // this lookup finds nothing. `tick()` retries every frame until the
-        // window is mapped, which is the reliable path (#552).
-        self.capture_window_and_apply_csd();
+        // Try to drop the server-side WM titlebar now, in favour of the
+        // drawn CSD row; `setup()` runs before `run_with_shell`'s runner
+        // calls `window.present()`, so `backend.window()` is very likely
+        // still `None` here. `tick()` retries every frame until the window
+        // is mapped, which is the reliable path (#552).
+        self.capture_window_and_apply_csd(backend);
 
         // GTK draws its own VSCode-style menu bar (File/Edit/View/...) — it
         // acts as the client-side titlebar, always visible (unlike TUI, which
@@ -8355,7 +8333,13 @@ impl quadraui::ShellApp for App {
             // independent of any backend/driver (see that function's tests).
             let draw_controls =
                 render::should_draw_window_controls(presence.menu_row, control_inset);
-            let maximized = self.window.as_ref().is_some_and(|w| w.win_is_maximized());
+            // #1234: see `paint_title_bar_band`'s identical read for why
+            // this queries `WindowControl::is_maximized()` live instead of
+            // caching.
+            let maximized = backend
+                .window()
+                .and_then(|w| w.is_maximized().ok())
+                .unwrap_or(false);
             let controls_bar =
                 draw_controls.then(|| render::window_controls_status_bar(&theme, maximized));
             let bands = render::measure_title_bar_bands(
@@ -9286,6 +9270,15 @@ mod portable_entry_point_tests {
     /// way to attach a window (or a version bump otherwise changes this),
     /// which is exactly the signal that real black-box coverage of
     /// title-sync/minimize finally becomes possible.
+    ///
+    /// #1234 moved `capture_window_and_apply_csd` (CSD/`set_decorated`),
+    /// the two `paint_title_bar_band`/`render_content` `is_maximized` reads,
+    /// and `cached_window_width`/`cached_window_height`'s `bounds()` refresh
+    /// onto this exact same `Backend::window()` accessor, deleting the
+    /// `PlatformWindowHandle`/`gtk4::Window` seam that used to back them.
+    /// They inherit the identical structural gap this test documents — this
+    /// assertion covering all of them, not just title-sync/minimize, is why
+    /// it was not split into one copy per call site.
     #[cfg(feature = "gui")]
     #[test]
     fn gtk_backend_window_is_none_without_a_live_window_so_title_sync_and_minimize_stay_black_box_untestable(
