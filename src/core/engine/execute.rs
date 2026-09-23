@@ -6167,17 +6167,19 @@ impl Engine {
             std::slice::from_ref(&kind)
         };
 
-        // A single explicitly-named history with zero entries ever recorded
-        // errors instead of listing an empty table (confirmed against a
-        // live oracle: `:history search`/`:history expr` with nothing
-        // recorded print `'history' option is zero`) — `:history all` never
-        // errors this way, even when every section is empty.
-        if kinds.len() == 1 {
-            let entries = kinds[0].entries(self);
-            if entries.is_empty() {
-                self.message = "'history' option is zero".to_string();
-                return EngineAction::Error;
-            }
+        // Neovim's `'history' option is zero` error is a *session-wide* gate,
+        // not a per-requested-kind one (confirmed against a live oracle):
+        // it fires only when nothing has ever been recorded in *any* history
+        // kind, and applies identically whether the request is `all` or a
+        // single named kind. E.g. after one `:` command but zero searches,
+        // `:history search` still prints an empty `search history` table
+        // (no error) because *something* has been recorded overall; only a
+        // totally fresh session errors, for `all` and for every single name.
+        // vimcode only ever populates cmd/search history, so the gate is
+        // exactly "both of those are empty".
+        if self.history.command_history.is_empty() && self.history.search_history.is_empty() {
+            self.message = "'history' option is zero".to_string();
+            return EngineAction::Error;
         }
 
         let mut lines: Vec<String> = Vec::new();
@@ -6277,10 +6279,7 @@ impl HistoryKind {
 
     /// This kind's entries, oldest first. vimcode has no expression
     /// register, input-line or debug-command history at all, so those three
-    /// are always empty — which, via [`Engine::ex_history`]'s zero-entries
-    /// check, naturally reproduces the same `'history' option is zero` error
-    /// a live oracle gives for those (they're never populated there either
-    /// in a fresh session).
+    /// are always empty.
     fn entries(self, engine: &Engine) -> Vec<String> {
         match self {
             Self::Cmd => engine.history.command_history.clone(),
