@@ -9854,8 +9854,9 @@ fn nvim_conformance_cross_file_ex() {
 // paragraph is left as the historical index so the remaining item numbers
 // need not be renumbered. Items 2-5 are filed, as #1300 through #1303
 // respectively (filed 2026-09-22). Item 6 (#1304) was itself a hermeticity
-// bug rather than a formatting one; it is now fixed (see item 6 below), and
-// the formatting gap it had been masking is not yet filed as its own issue.
+// bug rather than a formatting one; it is now fixed, and the formatting gap
+// it had been masking was filed as #1327 and is now also fixed (see item 6
+// below).
 // All of these are the same shape: vimcode's message-listing ex-commands
 // were implemented against a hand-remembered idea of the classic-Vim format
 // rather than checked against a live Neovim, so every one of them differs —
@@ -9941,9 +9942,9 @@ fn nvim_conformance_cross_file_ex() {
 //      body mirrors `:jumps`' `i.abs_diff(idx)` numbering and marker logic.
 //      Confirmed against a live oracle; its case label is deleted from
 //      `KNOWN_DEVIATIONS_MESSAGE` below.
-//   6. (#1304, hermeticity — FIXED, formatting gap it was masking — not yet
-//      filed) "msg:ex::history lists prior ex commands". #1304 was a
-//      hermeticity bug, not a message-formatting one: `HistoryState::load()`
+//   6. (#1304, hermeticity — FIXED; #1327, formatting — FIXED)
+//      "msg:ex::history lists prior ex commands". #1304 was a hermeticity
+//      bug, not a message-formatting one: `HistoryState::load()`
 //      (src/core/session.rs) read `~/.config/vimcode/history.json`
 //      unconditionally, so every `Engine::new()` in this test binary
 //      started with whatever command history was sitting in the *developer
@@ -9952,18 +9953,24 @@ fn nvim_conformance_cross_file_ex() {
 //      flag (`src/core/session.rs`, checked by `HistoryState::load()`)
 //      alongside the existing `suppress_disk_saves()`, called from
 //      `tests/common::engine_with` before `Engine::new()`. With the
-//      developer's real history no longer leaking in, this case now runs
+//      developer's real history no longer leaking in, this case ran
 //      hermetically — three real entries in, three real entries out — and
-//      it *still* fails, on a genuine formatting gap the hermeticity bug
-//      was hiding: Neovim's `:history` prints a `      #  cmd history`
-//      header and marks the current entry's row with a leading `>` (e.g.
-//      `>     3  history`); vimcode instead prints a vimcode-invented
+//      it still failed, on the genuine formatting gap #1304 had been
+//      hiding: Neovim's `:history` prints a `      #  cmd history` header
+//      and marks the current entry's row with a leading `>` (e.g.
+//      `>     3  history`); vimcode printed a vimcode-invented
 //      `--- Command History ---` header with no current-entry marker, the
-//      same shape as #1303's deviation. Left in
-//      `KNOWN_DEVIATIONS_MESSAGE` below — the case still fails — pending a
-//      follow-up formatting-fix issue (same non-trivial-rewrite reasoning
-//      as the others).
-const KNOWN_DEVIATIONS_MESSAGE: &[&str] = &["msg:ex::history lists prior ex commands"];
+//      same shape as #1303's deviation. #1327 fixed the formatting: the
+//      `"history"` arm now builds the `      #  {kind} history` header and
+//      `{marker}{pos:>6}  {entry}` rows Neovim's own `:history` (`:h
+//      :history`) prints, plus `{name}` (`:`/`cmd`, `/`/`?`/`search`,
+//      `all`, and the always-empty `=`/`expr`, `@`/`input`, `>`/`debug`
+//      vimcode has no history for) and `{first}[,{last}]` index-range
+//      arguments — none of which need an expression evaluator, since both
+//      are plain keyword/integer tokens (`:h :history-indexing`). Confirmed
+//      against a live oracle; its case label is deleted from
+//      `KNOWN_DEVIATIONS_MESSAGE` below.
+const KNOWN_DEVIATIONS_MESSAGE: &[&str] = &[];
 
 #[test]
 fn nvim_conformance_messages() {
