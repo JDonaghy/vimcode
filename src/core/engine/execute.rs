@@ -2158,7 +2158,7 @@ impl Engine {
             let subcmd = subcmd.trim().to_string();
             let win_ids: Vec<WindowId> = self.active_tab().layout.window_ids();
             for wid in win_ids {
-                self.active_tab_mut().active_window = wid;
+                self.active_tab_mut().focus_window(wid);
                 self.execute_command(&subcmd);
             }
             return EngineAction::None;

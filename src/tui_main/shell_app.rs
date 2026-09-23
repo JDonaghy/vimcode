@@ -18163,6 +18163,151 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// #1292 acceptance, painted-output tier: `CTRL-W p` must return focus
+    /// (the painted block cursor) to the window that was active
+    /// immediately before the current one, at the *tab*/split level —
+    /// distinct from `prev_active_group`'s VSCode-editor-group toggle,
+    /// which is a no-op with a single group.
+    ///
+    /// Fixture shape matches the #1291 rotate test just above: split two
+    /// distinguishable files horizontally. `Engine::split_window` makes
+    /// the new window (file B) active and, since `splitbelow` defaults to
+    /// `false`, places it in the *top* slot — so after the split, file B
+    /// (top) holds focus and file A (bottom) doesn't. `<C-w>w` then cycles
+    /// focus to file A (bottom) — with exactly two windows this also
+    /// happens to be `<C-w>p`'s expected target on the very next press.
+    ///
+    /// RED against unfixed `execute_wincmd`'s `'p'` arm (pre-#1292): that
+    /// version only restored `prev_active_group` — the VSCode-style
+    /// editor-group tree, which has never changed here (there's only ever
+    /// one group in this fixture) — so `<C-w>p` was a no-op and the
+    /// cursor stayed in file A's (bottom) pane. Confirmed by hand:
+    /// reverting `execute_wincmd`'s `'p'` arm to the pre-#1292
+    /// group-only version flips the final assertion.
+    #[test]
+    fn ctrl_w_p_returns_focus_to_the_previously_active_window_via_shell_app() {
+        const WIDTH: u16 = 120;
+        const HEIGHT: u16 = 40;
+
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_test_1292_prev_window_{:?}",
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_a = dir.join("a1292.txt"); // bottom pane, before/after
+        let file_b = dir.join("b1292.txt"); // top pane, active right after split
+        let content_a: String = (0..40).map(|i| format!("AAA1292_{i:03}\n")).collect();
+        let content_b: String = (0..40).map(|i| format!("BBB1292_{i:03}\n")).collect();
+        std::fs::write(&file_a, &content_a).unwrap();
+        std::fs::write(&file_b, &content_b).unwrap();
+
+        let mut app = TuiShellApp::new(None);
+        app.engine.settings.autohide_panels = false;
+        app.engine.app_shell.hide_sidebar();
+        app.engine.session.explorer_visible = false;
+        app.engine
+            .open_file_with_mode(&file_a, crate::core::engine::OpenMode::Permanent)
+            .unwrap();
+        app.engine
+            .split_window(SplitDirection::Horizontal, Some(&file_b));
+
+        let theme = Theme::from_name(&app.engine.settings.colorscheme);
+        let cursor_bg = quadraui::tui::ratatui_color(super::quadraui_tui::q_theme(&theme).cursor);
+
+        let mut driver = driver_with_shell(app, config(), WIDTH, HEIGHT);
+        driver.mouse_move(0.0, 0.0);
+
+        fn cursor_cell(
+            driver: &quadraui::tui::testing::TuiDriver<impl quadraui::AppLogic>,
+            cursor_bg: quadraui::tui::testing::Color,
+        ) -> Option<(u16, u16)> {
+            for y in 0..HEIGHT {
+                for x in 0..WIDTH {
+                    if driver.style_at(x, y).map(|s| s.bg) == Some(cursor_bg) {
+                        return Some((x, y));
+                    }
+                }
+            }
+            None
+        }
+
+        let (_, a_row) = driver
+            .find("AAA1292_000")
+            .expect("file A's first line must be painted somewhere");
+        let (_, b_row) = driver
+            .find("BBB1292_000")
+            .expect("file B's first line must be painted somewhere");
+        assert!(
+            b_row < a_row,
+            "test setup sanity: file B (the new, active window) must \
+             start in the top slot; B row {b_row}, A row {a_row}"
+        );
+        let cell_after_split = cursor_cell(&driver, cursor_bg)
+            .expect("the active (top, file B) pane must paint a block cursor cell");
+        assert!(
+            (cell_after_split.1 as f32) < a_row,
+            "test setup sanity: the block cursor must start in the top \
+             (file B) pane, above file A's row {a_row}; cursor cell \
+             {cell_after_split:?}"
+        );
+
+        // Cycle focus to the other window (file A, bottom).
+        driver.ctrl_char('w');
+        driver.type_char('w');
+        driver.render();
+
+        let cell_after_cycle = cursor_cell(&driver, cursor_bg)
+            .expect("the newly-focused (bottom, file A) pane must paint a block cursor cell");
+        assert!(
+            (cell_after_cycle.1 as f32) > b_row,
+            "test setup sanity: `<C-w>w` must move focus to the bottom \
+             (file A) pane; file B row {b_row}, cursor cell \
+             {cell_after_cycle:?}"
+        );
+
+        // `<C-w>p` must return focus to the window active immediately
+        // before this one — file B, back in the top slot.
+        driver.ctrl_char('w');
+        driver.type_char('p');
+        driver.render();
+
+        let screen = driver.screen();
+        let cell_after_prev = cursor_cell(&driver, cursor_bg).expect(
+            "the previously-active (top, file B) pane must paint a \
+             block cursor cell after `<C-w>p`",
+        );
+        // Compare against the two already-observed cursor rows directly
+        // (rather than against `a_row`/`b_row`, the *text* rows, which sit
+        // close enough to the cursor row that a coarse `< a_row` threshold
+        // does not actually discriminate top-pane focus from bottom-pane
+        // focus — confirmed by hand: that weaker assertion stayed green
+        // even with `execute_wincmd`'s `'p'` arm reverted to its pre-#1292
+        // group-only version). `<C-w>p` must land the cursor back on
+        // exactly the row it painted right after the split (top, file B),
+        // not the row it moved to after `<C-w>w` (bottom, file A).
+        assert_eq!(
+            cell_after_prev.1,
+            cell_after_split.1,
+            "`<C-w>p` must move focus (and so the painted block-cursor \
+             cell) back to the window that was active immediately \
+             before the current one (file B, top slot, row \
+             {split_row}) — not leave it on file A (bottom slot, row \
+             {cycle_row}); cursor cell {cell_after_prev:?}; \
+             screen:\n{screen}",
+            split_row = cell_after_split.1,
+            cycle_row = cell_after_cycle.1,
+        );
+        assert_ne!(
+            cell_after_prev.1, cell_after_cycle.1,
+            "`<C-w>p` must actually move focus away from file A's \
+             (bottom) pane, not stay put; cursor cell {cell_after_prev:?}; \
+             screen:\n{screen}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// #35: `render_content` must paint the minimap through the shell path,
     /// as braille — not just populate `ScreenLayout.minimap`.
     ///

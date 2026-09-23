@@ -222,7 +222,7 @@ impl Engine {
         let tab = self.active_tab_mut();
         tab.layout
             .split_at(current_window_id, direction, new_window_id, new_first);
-        tab.active_window = new_window_id;
+        tab.focus_window(new_window_id);
 
         // #1288: `WindowLayout::split_at` always starts a fresh split at an
         // exact 0.5 ratio; give both new sibling windows an immediately
@@ -285,7 +285,7 @@ impl Engine {
             tab.layout = new_layout;
             // Set new active window
             if let Some(new_active) = tab.layout.window_ids().first().copied() {
-                tab.active_window = new_active;
+                tab.focus_window(new_active);
             }
         }
 
@@ -313,7 +313,7 @@ impl Engine {
                     if let Some(new_layout) = tab.layout.remove(partner) {
                         tab.layout = new_layout;
                         if let Some(first) = tab.layout.window_ids().first().copied() {
-                            tab.active_window = first;
+                            tab.focus_window(first);
                         }
                     }
                     self.windows.remove(&partner);
@@ -481,7 +481,7 @@ impl Engine {
     pub(crate) fn activate_window(&mut self, window_id: WindowId) {
         self.focus_group_for_window(window_id);
         if self.windows.contains_key(&window_id) {
-            self.active_tab_mut().active_window = window_id;
+            self.active_tab_mut().focus_window(window_id);
         }
     }
 
@@ -520,7 +520,7 @@ impl Engine {
     pub fn set_cursor_for_window(&mut self, window_id: WindowId, line: usize, col: usize) {
         // Make the window active
         if self.windows.contains_key(&window_id) {
-            self.active_tab_mut().active_window = window_id;
+            self.active_tab_mut().focus_window(window_id);
 
             // Get buffer and clamp line
             let buffer = self.buffer();
@@ -1963,7 +1963,7 @@ impl Engine {
     ) {
         self.active_group = group_id;
         self.active_group_mut().active_tab = tab_idx;
-        self.active_tab_mut().active_window = window_id;
+        self.active_tab_mut().focus_window(window_id);
         self.line_annotations.clear();
         self.blame_annotations_active = false;
         self.tab_mru_touch();
@@ -3727,8 +3727,25 @@ impl Engine {
             // the oracle-backed `win:CTRL-W W` case.
             'w' => self.focus_next_window(),
             'W' => self.focus_prev_window(),
+            // #1292: real Vim's "previously active window" is tab/split
+            // scoped — `Tab::prev_window`, updated at every focus-changing
+            // call site (see `Tab::focus_window`). Prefer that; a window
+            // that's since been closed or moved out of this tab reads back
+            // as `None`/stale, so re-validate against the *current* tab
+            // layout rather than reviving a dead id. Only when there's no
+            // usable window-level target (single-window tab) does `p` fall
+            // back to the pre-existing VSCode-style editor-group toggle —
+            // this repo's own layer beneath real Vim, which has no such
+            // concept and so cannot arbitrate it.
             'p' => {
-                if let Some(prev) = self.prev_active_group {
+                let win_target = self.active_tab().prev_window.filter(|&w| {
+                    w != self.active_tab().active_window
+                        && self.windows.contains_key(&w)
+                        && self.active_tab().layout.window_ids().contains(&w)
+                });
+                if let Some(prev) = win_target {
+                    self.activate_window(prev);
+                } else if let Some(prev) = self.prev_active_group {
                     if self.editor_groups.contains_key(&prev) {
                         let cur = self.active_group;
                         self.active_group = prev;
