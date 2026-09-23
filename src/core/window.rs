@@ -34,35 +34,27 @@ pub(crate) fn from_quadraui_direction(d: quadraui::SplitDirection) -> SplitDirec
     }
 }
 
-/// Encode a [`WindowId`] as a `quadraui::WidgetId` for round-tripping
+/// Encode a [`GroupId`] as a `quadraui::WidgetId` for round-tripping
 /// through `quadraui::SplitTree` — the id only ever needs to survive one
 /// `to_split_tree` → `layout` round trip within a single call, never
 /// painted or persisted, so the encoding is an implementation detail.
-fn window_widget_id(id: WindowId) -> quadraui::WidgetId {
-    quadraui::WidgetId::new(format!("w{}", id.0))
-}
-
-/// Panics if `id` isn't a well-formed `"w{usize}"` — the only strings
-/// [`window_widget_id`] ever produces, and the only producer `SplitTree`
-/// ever hands back to this function within a single `to_split_tree` →
-/// `layout` round trip. A parse failure here means `quadraui::SplitTree`
-/// mutated or fabricated a `WidgetId` this code never gave it, which would
-/// otherwise silently resolve to window `0` — a wrong-window bug far harder
-/// to spot than a panic naming the offending id.
-fn window_id_from_widget(id: &quadraui::WidgetId) -> WindowId {
-    WindowId(
-        id.as_str()[1..]
-            .parse()
-            .unwrap_or_else(|e| panic!("malformed window WidgetId {id:?} from SplitTree: {e}")),
-    )
-}
-
-/// See [`window_widget_id`].
+///
+/// (`WindowLayout` had an analogous `window_widget_id`/`window_id_from_widget`
+/// pair until #1290 moved its `calculate_rects`/`dividers` off
+/// `quadraui::SplitTree::layout` entirely — see that method's doc.
+/// `GroupLayout` still routes through the shared primitive, so it still
+/// needs this round trip.)
 fn group_widget_id(id: GroupId) -> quadraui::WidgetId {
     quadraui::WidgetId::new(format!("g{}", id.0))
 }
 
-/// See [`window_id_from_widget`] — same contract, for `GroupId`.
+/// Panics if `id` isn't a well-formed `"g{usize}"` — the only strings
+/// [`group_widget_id`] ever produces, and the only producer `SplitTree`
+/// ever hands back to this function within a single `to_split_tree` →
+/// `layout` round trip. A parse failure here means `quadraui::SplitTree`
+/// mutated or fabricated a `WidgetId` this code never gave it, which would
+/// otherwise silently resolve to group `0` — a wrong-group bug far harder
+/// to spot than a panic naming the offending id.
 fn group_id_from_widget(id: &quadraui::WidgetId) -> GroupId {
     GroupId(
         id.as_str()[1..]
@@ -292,37 +284,32 @@ impl From<quadraui::Rect> for WindowRect {
 }
 
 impl WindowLayout {
-    /// Convert to a `quadraui::SplitTree` so `calculate_rects`/`dividers`
-    /// can compute leaf rects and divider geometry in `SplitTree::layout`'s
-    /// single recursive pass, rather than two hand-rolled passes over this
-    /// tree that could (and per #582/#452, once did) diverge (#818).
-    fn to_split_tree(&self) -> quadraui::SplitTree {
-        match self {
-            WindowLayout::Leaf(id) => quadraui::SplitTree::leaf(window_widget_id(*id)),
-            WindowLayout::Split {
-                direction,
-                ratio,
-                first,
-                second,
-            } => quadraui::SplitTree::split(
-                to_quadraui_direction(*direction),
-                *ratio as f32,
-                first.to_split_tree(),
-                second.to_split_tree(),
-            ),
-        }
-    }
-
     /// Calculate the pixel rectangles for each window in the layout.
+    ///
+    /// Unlike `GroupLayout::calculate_group_rects` (still routed through
+    /// `quadraui::SplitTree::layout`, which divides raw float axis space
+    /// with no rounding of its own — by design, so continuous-pixel GTK/
+    /// macOS hosts get the exact share), this recurses on vimcode's own
+    /// side: `layout_snapped` rounds each split's *boundary* exactly once
+    /// and derives both children's extents from that single rounded value,
+    /// instead of rounding each child's own float share independently.
+    ///
+    /// That distinction matters on a tie: `equalize_splits` (and a fresh
+    /// `:split`) sets `ratio = 0.5` exactly, so an odd axis (e.g. 23 rows)
+    /// gives both children the *same* exact `available / 2.0` share
+    /// (`11.5`/`11.5`). Rounding each side independently sends both
+    /// through the same half-up tie-break and lands them on the *same*
+    /// integer (11/11 or 12/12) — never on Neovim's real 12/11 (confirmed
+    /// against a live `nvim --headless`: a fresh `<C-w>s` on a 23-row
+    /// content area gives the new, first, window 12 rows and the original,
+    /// second, window 11). Rounding the boundary once and taking the
+    /// second child's extent as the exact remainder reproduces that: ties
+    /// always resolve in the first child's favour, matching Neovim (#1290).
     pub fn calculate_rects(&self, bounds: WindowRect) -> Vec<(WindowId, WindowRect)> {
-        let layout = self
-            .to_split_tree()
-            .layout(bounds.into(), quadraui::SplitTreeMeasure::new(0.0));
-        layout
-            .leaves
-            .into_iter()
-            .map(|(id, rect)| (window_id_from_widget(&id), rect.into()))
-            .collect()
+        let mut leaves = Vec::new();
+        let mut dividers = Vec::new();
+        self.layout_snapped(bounds, &mut 0, &mut leaves, &mut dividers);
+        leaves
     }
 
     /// Collect all split dividers with pre-order `split_index`.
@@ -338,16 +325,92 @@ impl WindowLayout {
     /// numbered tree) — it is advanced here purely to preserve the pre-#818
     /// signature for any future caller that does thread a running counter
     /// through.
+    ///
+    /// Shares [`Self::layout_snapped`] with [`Self::calculate_rects`] (one
+    /// recursive pass computing both leaf rects and divider geometry, as
+    /// #818 established) so the two can never read a different rounding of
+    /// the same split — the exact class of paint/click drift #582 was.
     pub fn dividers(&self, bounds: WindowRect, counter: &mut usize) -> Vec<GroupDivider> {
-        let layout = self
-            .to_split_tree()
-            .layout(bounds.into(), quadraui::SplitTreeMeasure::new(0.0));
-        *counter += layout.dividers.len();
-        layout
-            .dividers
-            .iter()
-            .map(group_divider_from_split_tree)
-            .collect()
+        let mut leaves = Vec::new();
+        let mut dividers = Vec::new();
+        self.layout_snapped(bounds, &mut 0, &mut leaves, &mut dividers);
+        *counter += dividers.len();
+        dividers
+    }
+
+    /// Single recursive pass behind [`Self::calculate_rects`] and
+    /// [`Self::dividers`] — see [`Self::calculate_rects`]'s doc for why
+    /// this rounds the split boundary itself rather than delegating to
+    /// `quadraui::SplitTree::layout` the way `GroupLayout` still does.
+    /// `WindowLayout` splits always reserve zero divider thickness (each
+    /// window's own status line already supplies the visual separation for
+    /// `Horizontal` splits; `Vertical` splits' real one-column Neovim gap
+    /// is a separate, not-yet-fixed issue — see `KNOWN_DEVIATIONS_WIN`'s
+    /// `<`/`>`/`\|` entries), so it's hardcoded rather than threaded
+    /// through as a parameter no call site would ever set non-zero.
+    fn layout_snapped(
+        &self,
+        bounds: WindowRect,
+        counter: &mut usize,
+        leaves: &mut Vec<(WindowId, WindowRect)>,
+        dividers: &mut Vec<GroupDivider>,
+    ) {
+        match self {
+            WindowLayout::Leaf(id) => leaves.push((*id, bounds)),
+            WindowLayout::Split {
+                direction,
+                ratio,
+                first,
+                second,
+            } => {
+                let idx = *counter;
+                *counter += 1;
+                let clamped = ratio.clamp(0.0, 1.0);
+                let (first_bounds, second_bounds, divider) = match direction {
+                    // left/right: split bounds.width, boundary rounds `x`.
+                    SplitDirection::Vertical => {
+                        let far = bounds.x + bounds.width;
+                        let boundary = (bounds.x + bounds.width * clamped).round();
+                        let first_b =
+                            WindowRect::new(bounds.x, bounds.y, boundary - bounds.x, bounds.height);
+                        let second_b =
+                            WindowRect::new(boundary, bounds.y, far - boundary, bounds.height);
+                        let div = GroupDivider {
+                            split_index: idx,
+                            direction: *direction,
+                            position: boundary,
+                            axis_start: bounds.x,
+                            axis_size: bounds.width,
+                            cross_start: bounds.y,
+                            cross_size: bounds.height,
+                        };
+                        (first_b, second_b, div)
+                    }
+                    // top/bottom: split bounds.height, boundary rounds `y`.
+                    SplitDirection::Horizontal => {
+                        let far = bounds.y + bounds.height;
+                        let boundary = (bounds.y + bounds.height * clamped).round();
+                        let first_b =
+                            WindowRect::new(bounds.x, bounds.y, bounds.width, boundary - bounds.y);
+                        let second_b =
+                            WindowRect::new(bounds.x, boundary, bounds.width, far - boundary);
+                        let div = GroupDivider {
+                            split_index: idx,
+                            direction: *direction,
+                            position: boundary,
+                            axis_start: bounds.y,
+                            axis_size: bounds.height,
+                            cross_start: bounds.x,
+                            cross_size: bounds.width,
+                        };
+                        (first_b, second_b, div)
+                    }
+                };
+                dividers.push(divider);
+                first.layout_snapped(first_bounds, counter, leaves, dividers);
+                second.layout_snapped(second_bounds, counter, leaves, dividers);
+            }
+        }
     }
 
     /// Find the Nth split node in pre-order and set its ratio (clamped to 0.1..0.9,

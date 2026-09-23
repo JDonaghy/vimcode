@@ -9084,12 +9084,12 @@ const CASES_WIN: &[WinCase] = &[
         "<C-w>f",
     ),
     // --- Resize / maximize / equalize ---
-    // #1162 finding: `equalize_splits` does set every ratio to exactly 0.5
-    // (Neovim's own default too, so this still converges to the same
-    // layout as `CASES_WIN`'s plain `s`/`v` cases regardless of the
-    // percentage-vs-line-resize that ran first) — but `WindowLayout::
-    // calculate_rects`'s rect-rounding is off by one row on this odd-sized
-    // split (11/11 vs Neovim's 11/10). See KNOWN_DEVIATIONS_WIN.
+    // #1162 finding, FIXED by #1290: `equalize_splits` does set every ratio
+    // to exactly 0.5 (Neovim's own default too, so this still converges to
+    // the same layout as `CASES_WIN`'s plain `s`/`v` cases regardless of
+    // the percentage-vs-line-resize that ran first), and `WindowLayout::
+    // calculate_rects`'s rect-rounding now gives the exact 12/11 split
+    // Neovim does on this odd-sized axis (was 11/11 pre-#1290).
     wc_sized(
         "win:CTRL-W = re-equalizes windows after a resize",
         WIN_TWO_LINES,
@@ -12899,11 +12899,15 @@ fn nvim_conformance_jumplist_multi_file() {
 //      supplies the visual separation), so it was already a real,
 //      non-coincidental pass before and after this change.
 //   3. (#1290) "win:CTRL-W = fix off-by-one rect rounding on odd-sized splits"
-//      — WindowLayout::calculate_rects (SplitTreeMeasure::new(0.0)) rounds
+//      — WindowLayout::calculate_rects (SplitTreeMeasure::new(0.0)) rounded
 //      each child's share of a split independently instead of giving one
-//      side the exact remainder, so an odd-sized 50/50 split lands 11/11
-//      instead of Neovim's 11/10. calculate_rects is shared by every other
-//      split-rect consumer in render.rs, so this needs care.
+//      side the exact remainder, so an odd-sized 50/50 split landed 11/11
+//      instead of Neovim's 11/10. FIXED: `calculate_rects`/`dividers` now
+//      round the split *boundary* once and derive both children's extents
+//      from that single value (moved off `quadraui::SplitTree::layout`
+//      entirely for `WindowLayout`, since that primitive's float division
+//      is correct and shared with `GroupLayout` — the rounding-tie bug was
+//      strictly downstream of it).
 //   4. (#1291) "win:CTRL-W r/R rotate window identity, not just content"
 //      — rotate_windows swaps buffer_id/view across fixed WindowId tree
 //      slots, leaving Tab::active_window pinned to the same screen
@@ -12982,11 +12986,15 @@ const KNOWN_DEVIATIONS_WIN: &[&str] = &[
     // supplies the visual separation).
     "win:CTRL-W | maximizes the active window's width",
     // Follow-up #3 above ("off-by-one rect rounding on odd-sized splits")
-    // — filed as #1290. Distinct from follow-up #1/#2: `equalize_splits`
-    // sets every ratio to exactly 0.5, matching Neovim's own default, so
-    // the *ratio* math is right — only the rect-rounding on top of it is
-    // off by one row on an odd-sized split.
-    "win:CTRL-W = re-equalizes windows after a resize",
+    // — filed as #1290, FIXED: `WindowLayout::calculate_rects`/`dividers`
+    // now round each split's boundary exactly once (giving the exact
+    // integer remainder to the second child) instead of rounding each
+    // child's own float share independently, so a `.5`/`.5` tie (e.g.
+    // `equalize_splits`'s exact `ratio = 0.5` on an odd axis) no longer
+    // sends both children through the same half-up tie-break — see that
+    // method's doc for the fix and the live-`nvim`-verified 12/11 tie-break
+    // direction. "win:CTRL-W = re-equalizes windows after a resize" is now
+    // a real, non-vacuous pass and was removed from this list.
     // Follow-up #4 above ("rotate window identity, not just content") —
     // filed as #1291.
     "win:CTRL-W r rotates windows downward/rightward",
