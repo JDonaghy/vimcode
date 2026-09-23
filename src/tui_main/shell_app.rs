@@ -457,6 +457,15 @@ pub struct TuiShellApp {
     tab_drag: render::TabDragState,
     last_clipboard_content: Option<String>,
     pending_startup_msg: Option<String>,
+    /// Was an editor-anchored popup (the completions/hover-doc picker or the
+    /// modal folder picker) open on the *previous* frame `render_content`
+    /// painted? #1243 gives this its reader back: the field went dead when
+    /// #634 moved TUI onto quadraui's shell runner (no more `Terminal::
+    /// clear()` call for it to drive), and `render_content` now compares
+    /// this against the current frame's popup state through
+    /// [`render::popup_overlay_closed_this_frame`] to call
+    /// `quadraui::Backend::request_full_repaint` (quadraui#1037) exactly on
+    /// the closing transition — see that function's own doc.
     had_popup_overlay: Cell<bool>,
     hover_link_rects: RefCell<PanelHoverLinkRects>,
     hover_popup_rect: Cell<Option<quadraui::Rect>>,
@@ -2686,13 +2695,21 @@ impl ShellApp for TuiShellApp {
         // moved in rather than cloned.
         //
         // Also mirrors `mod.rs:1164`-`:1169`'s popup-disappearance tracking.
-        // The legacy loop followed it with `terminal.clear()`; the shell
-        // runner owns the `Terminal` and exposes no repaint hook, so the flag
-        // is kept (cheap, and the state it records is real) while the clear
-        // itself is an upstream gap — see the Ctrl+L note in
-        // `handle_key_pressed`.
-        self.had_popup_overlay
-            .set(screen.picker.is_some() || self.folder_picker.is_some());
+        // The legacy loop followed it with `terminal.clear()`. #1243 gives
+        // this its reader back: `Backend::request_full_repaint`
+        // (quadraui#1037) is the hook that was missing when this field was
+        // first added — a popup (the picker or the folder-picker modal)
+        // that was up last frame and is gone this frame can leave stale
+        // glyphs in cells the popup itself painted over and the app's own
+        // content never touches, which an ordinary incremental diff skips
+        // because it still believes those cells match. Only the *closing*
+        // transition needs the hook — a popup staying open or newly opening
+        // paints its own content this frame regardless.
+        let popup_open_now = screen.picker.is_some() || self.folder_picker.is_some();
+        if render::popup_overlay_closed_this_frame(self.had_popup_overlay.get(), popup_open_now) {
+            backend.request_full_repaint();
+        }
+        self.had_popup_overlay.set(popup_open_now);
         *self.last_layout.borrow_mut() = Some(screen);
     }
 
@@ -4474,12 +4491,20 @@ fn handle_key_pressed(
     };
 
     // ── Shared Ctrl+L force-redraw rung (#762 / #734 slice 7) ───────────
+    // #1243: `request_full_repaint` (quadraui#1037) is the hook `render.rs`'s
+    // own doc on `is_force_redraw_key` named as missing — the actual
+    // `ratatui::Terminal::clear()`-equivalent now lives one layer down, in
+    // `tui::run::run_inner`'s frame loop, and is armed by this flag rather
+    // than called directly here. An ordinary `Reaction::Redraw` alone would
+    // still just re-run the incremental diff against the same stale buffer
+    // Ctrl+L exists to escape.
     if render::is_force_redraw_key(
         &key_name,
         unicode,
         ctrl,
         engine.mode == crate::core::Mode::Insert && engine.insert_ctrl_x_pending,
     ) {
+        backend.request_full_repaint();
         return Reaction::Redraw;
     }
 
