@@ -5698,11 +5698,12 @@ impl App {
             }
             render::MouseDragRoute::TerminalPanelResize => {
                 if self.cached_line_height > 0.0 {
-                    let global_status_rows = if self.engine.borrow().settings.window_status_line {
-                        0.0
-                    } else {
-                        1.0
-                    };
+                    let global_status_rows =
+                        if render::global_status_bar_visible(&self.engine.borrow()) {
+                            1.0
+                        } else {
+                            0.0
+                        };
                     let status_h = (1.0 + global_status_rows) * self.cached_line_height;
                     let available = (height - y - status_h).max(0.0);
                     // Leave at least 4 editor lines visible (+ tab bar chrome)
@@ -8030,7 +8031,13 @@ impl quadraui::ShellApp for App {
         // ── Layout ────────────────────────────────────────────────────────────
         let tab_row_h = render::tab_row_height_px(lh);
         let tab_bar_h = render::tab_bar_height_px(lh, engine.settings.breadcrumbs);
-        let per_window_status = engine.settings.window_status_line;
+        // Whether the *global* (non-per-window) status bar occupies its own
+        // row — `global_status_bar_visible`, not `effective_window_status_line`
+        // directly, since `'laststatus'` can hide the status line entirely
+        // (0, or 1 with a single window) even while per-window status is off,
+        // in which case there is still no separate global row to offset the
+        // wildmenu past (#1235 follow-up).
+        let global_status_visible = render::global_status_bar_visible(&engine);
         let el = render::compute_editor_layout(&engine, h, lh, false);
         // `el.status_bar_h` is `compute_editor_layout`'s single source of
         // truth for this (identical formula to the `wildmenu_px`/
@@ -8409,12 +8416,14 @@ impl quadraui::ShellApp for App {
                 // ── Wildmenu bar (command Tab completion) ────────────────────
                 render::FrameOp::Wildmenu => {
                     if let Some(ref wm) = screen.wildmenu {
-                        // Shares the global bar's row when per-window status
-                        // lines are on (there is no global bar to sit under).
-                        let wm_y = if per_window_status {
-                            status_y
-                        } else {
+                        // Shares the command-line row whenever there is no
+                        // separate global bar row to sit under — per-window
+                        // status lines are on, or `'laststatus'` hides the
+                        // status line entirely (#1235 follow-up).
+                        let wm_y = if global_status_visible {
                             status_y + lh
+                        } else {
+                            status_y
                         };
                         let wm_rect =
                             quadraui::Rect::new(x as f32, wm_y as f32, w as f32, lh as f32);

@@ -14217,3 +14217,115 @@ mod issue_1063_menu_action_engine_action_applier_gtk {
         );
     }
 }
+
+#[cfg(test)]
+mod issue_1235_laststatus_frame_sizing {
+    //! #1235: `app.rs`'s `TerminalPanelResize` drag row math and the
+    //! wildmenu-`y` positioning both read `engine.settings.window_status_line`
+    //! directly instead of `render::effective_window_status_line` (#1206's
+    //! narrowing by `'laststatus'`), so they disagreed with
+    //! `render::build_screen_layout`/`compute_editor_layout` — which already
+    //! used the effective value — by one row whenever `'laststatus'` narrowed
+    //! `window_status_line` to `false`. This is the GTK twin of
+    //! `tui_main::shell_app::tests::
+    //! laststatus_frame_sizing_matches_shared_layout_across_window_count_via_shell_app`.
+    use super::*;
+    use crate::core::window::SplitDirection;
+
+    fn run_ex_command<A: quadraui::AppLogic>(h: &mut Harness<A>, text: &str) {
+        for ch in text.chars() {
+            h.driver.type_char(ch);
+        }
+        h.driver.press_named(quadraui::NamedKey::Enter);
+        h.driver.render();
+    }
+
+    /// Row-reservation evidence, read from **painted output**, not a
+    /// decision-only flag: `Engine::global_status_rect` is cleared to
+    /// `Rect::default()` at the top of every `render_content` pass and only
+    /// set back to a non-empty rect from inside the `FrameOp::GlobalStatusBar`
+    /// paint arm itself (`app.rs`, just above `FrameOp::Wildmenu`) — the same
+    /// #555 "what was actually painted" cache `route_chrome_click` hit-tests
+    /// clicks against, mirroring TUI's `chrome.status`/`command_line_rect`.
+    ///
+    /// **RED-verified against unfixed `develop`**: with a single window and
+    /// `laststatus=1`, `render::build_screen_layout`'s paint decision already
+    /// hid the global bar correctly (effective-value-based since #1206), but
+    /// `app.rs`'s raw-field row math still assumed it occupied its own row —
+    /// the bar's text stayed on screen with a non-empty `global_status_rect`
+    /// instead of clearing. Observed failing before the four-site fix,
+    /// passing after.
+    #[test]
+    fn laststatus_hides_the_global_status_bar_and_frees_its_row_via_gtk_driver() {
+        let mut engine = Engine::new_for_test();
+        engine.settings.use_nerd_fonts = Some(false);
+        engine.settings.window_status_line = false; // global-bar mode
+        engine.git_branch = None;
+        engine.buffer_mut().insert(0, "alpha\nbeta\ngamma\n");
+
+        let mut h = harness(engine, 800, 600);
+        h.driver.render();
+        assert!(
+            h.driver.screen_contains("Ln 1, Col 1"),
+            "sanity: single window, default laststatus=2, global-bar mode \
+             -- the global status bar must paint; painted: {:?}",
+            h.driver.painted_texts()
+        );
+        assert!(
+            h.engine.borrow().global_status_rect.get().height > 0.0,
+            "sanity: the global status bar rung must have reserved and \
+             painted a non-empty rect"
+        );
+
+        // laststatus=1 + one window: real Vim hides the status line
+        // entirely, and the paint layer must clear the row it reserved.
+        run_ex_command(&mut h, ":set laststatus=1");
+        assert!(
+            !h.driver.screen_contains("Ln 1, Col 1"),
+            "'laststatus=1' with one window must hide the global status \
+             bar; painted: {:?}",
+            h.driver.painted_texts()
+        );
+        assert_eq!(
+            h.engine.borrow().global_status_rect.get(),
+            quadraui::Rect::default(),
+            "hiding the global bar must clear its painted rect -- the row \
+             `app.rs`'s row math mis-reserved when reading the raw \
+             `window_status_line` field instead of \
+             `render::effective_window_status_line`"
+        );
+
+        // Splitting to 2+ windows (still global-bar mode -- window_status_
+        // line stayed false) must show the bar again, matching
+        // `effective_window_status_line`'s own `windows.len() > 1` gate.
+        h.engine
+            .borrow_mut()
+            .split_window(SplitDirection::Horizontal, None);
+        h.driver.render();
+        assert!(
+            h.driver.screen_contains("Ln 1, Col 1"),
+            "'laststatus=1' with 2+ windows must show the global status \
+             bar again; painted: {:?}",
+            h.driver.painted_texts()
+        );
+        assert!(
+            h.engine.borrow().global_status_rect.get().height > 0.0,
+            "the global bar's row must be reserved again with 2+ windows"
+        );
+
+        // laststatus=0 hides the status line unconditionally, even with 2+
+        // windows still open.
+        run_ex_command(&mut h, ":set laststatus=0");
+        assert!(
+            !h.driver.screen_contains("Ln 1, Col 1"),
+            "'laststatus=0' must hide the global status bar even with 2+ \
+             windows open; painted: {:?}",
+            h.driver.painted_texts()
+        );
+        assert_eq!(
+            h.engine.borrow().global_status_rect.get(),
+            quadraui::Rect::default(),
+            "laststatus=0 must clear the painted global-bar rect too"
+        );
+    }
+}

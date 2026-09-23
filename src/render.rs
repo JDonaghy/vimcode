@@ -14715,6 +14715,43 @@ pub fn effective_window_status_line(engine: &Engine) -> bool {
     }
 }
 
+/// Whether `'laststatus'` allows *any* status line — per-window or global —
+/// to be visible at all, independent of `Settings::window_status_line`
+/// (`:h 'laststatus'`).
+///
+/// This is the other half of `'laststatus'`'s policy that
+/// `effective_window_status_line` alone cannot express: that function
+/// answers "should each window paint its own row", so it also returns
+/// `false` for `laststatus=0` and `laststatus=1` with one window — the two
+/// cases where no status line of *any* kind should show. A naive
+/// `!effective_window_status_line(engine)` read of that `false` as "show
+/// the single global bar instead" (the correct reading for
+/// `window_status_line=false` at `laststatus=2`) reintroduces exactly the
+/// row it was supposed to hide (#1235 follow-up: `laststatus=0` painted a
+/// full-width global status bar with the per-window-row-count row freed by
+/// this same fix, because `global_status_bar`'s `if per_window_status {
+/// None } else { Some(..) }` conflated "not per-window" with "show the
+/// global fallback").
+pub fn any_status_line_visible(engine: &Engine) -> bool {
+    match engine.settings.laststatus {
+        0 => false,
+        1 => engine.windows.len() > 1,
+        _ => true,
+    }
+}
+
+/// Whether the bottom band needs a dedicated row for the **global**
+/// (non-per-window) status bar — i.e. no window paints its own status row
+/// (`!effective_window_status_line`) but `'laststatus'` still allows some
+/// status line to show (`any_status_line_visible`). When this is `false`,
+/// the bottom band's status-line footprint is a single row: either each
+/// window carries its own (`effective_window_status_line` true), or
+/// `'laststatus'` hides the status line entirely and only the always-present
+/// command line remains.
+pub fn global_status_bar_visible(engine: &Engine) -> bool {
+    !effective_window_status_line(engine) && any_status_line_visible(engine)
+}
+
 // ─── build_screen_layout ──────────────────────────────────────────────────────
 
 /// Build a complete `ScreenLayout` from current engine state.
@@ -14978,10 +15015,10 @@ pub fn build_screen_layout_with_breadcrumb_row(
         None
     };
 
-    let global_status_bar = if per_window_status {
-        None
-    } else {
+    let global_status_bar = if global_status_bar_visible(engine) {
         Some(build_global_status_bar(engine, theme))
+    } else {
+        None
     };
     let command = build_command_line(engine);
 
@@ -23068,7 +23105,11 @@ pub fn compute_editor_layout(
     } else {
         lh
     };
-    let status_bar_h = status_bar_height_px(lh, per_window, !engine.wildmenu_items.is_empty());
+    let status_bar_h = status_bar_height_px(
+        lh,
+        global_status_bar_visible(engine),
+        !engine.wildmenu_items.is_empty(),
+    );
     let command_line_h = lh;
 
     let (terminal_h, terminal_content_rows, terminal_max_target_rows) = if bp_open {
@@ -23169,13 +23210,15 @@ pub fn tab_bar_height_px(_line_height: f64, breadcrumbs: bool) -> f64 {
 }
 
 /// Compute the height of the bottom chrome (status bar + wildmenu) in pixels.
-pub fn status_bar_height_px(
-    line_height: f64,
-    per_window_status_line: bool,
-    has_wildmenu: bool,
-) -> f64 {
+///
+/// `show_global_status` is [`global_status_bar_visible`]'s value, **not**
+/// `effective_window_status_line`'s — the always-present command line needs
+/// only one row when no *global* bar occupies its own (either because each
+/// window paints its own status, or `'laststatus'` hides the status line
+/// entirely), and two when the global bar has its own row to sit in.
+pub fn status_bar_height_px(line_height: f64, show_global_status: bool, has_wildmenu: bool) -> f64 {
     let wildmenu_px = if has_wildmenu { line_height } else { 0.0 };
-    let global_rows = if per_window_status_line { 1.0 } else { 2.0 };
+    let global_rows = if show_global_status { 2.0 } else { 1.0 };
     line_height * global_rows + wildmenu_px
 }
 
@@ -25562,12 +25605,12 @@ mod tests {
     #[test]
     fn test_status_bar_height_px() {
         let lh = 16.0;
-        // per-window status → 1 global row
-        assert_eq!(status_bar_height_px(lh, true, false), lh);
-        // no per-window → 2 global rows
-        assert_eq!(status_bar_height_px(lh, false, false), 2.0 * lh);
+        // global bar not shown (per-window, or no status at all) → 1 row
+        assert_eq!(status_bar_height_px(lh, false, false), lh);
+        // global bar shown → 2 rows (bar + command line)
+        assert_eq!(status_bar_height_px(lh, true, false), 2.0 * lh);
         // with wildmenu adds one line_height
-        assert_eq!(status_bar_height_px(lh, true, true), 2.0 * lh);
+        assert_eq!(status_bar_height_px(lh, false, true), 2.0 * lh);
     }
 
     #[test]

@@ -77,8 +77,12 @@ pub(super) fn bottom_band_row_heights(
     } else {
         0
     };
-    let per_window_status = engine.settings.window_status_line;
-    let global_status = if per_window_status { 0 } else { 1 };
+    let per_window_status = render::effective_window_status_line(engine);
+    let global_status = if render::global_status_bar_visible(engine) {
+        1
+    } else {
+        0
+    };
     let separate_status =
         per_window_status && !engine.settings.status_line_above_terminal && bottom_panel_open;
     let separated_status = if separate_status { 1 } else { 0 };
