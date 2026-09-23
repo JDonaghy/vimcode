@@ -21760,6 +21760,182 @@ mod tests {
         );
     }
 
+    /// #1294 (#1280 follow-up): `:earlier {N}[smhd]` — the time-cutoff spec
+    /// form, as opposed to the count-stepped form the test above already
+    /// covers — must land the cursor on the target undo-tree node's
+    /// `cursor_before` (where its own edit started), not `cursor_after`
+    /// (where it finished), exactly like `g-`/`g+` and the count form were
+    /// fixed to do in #1280 (see the doc comment on `UndoTree::at_or_before`
+    /// in `buffer_manager.rs`). Landing on the tree root (as
+    /// `test_ex_earlier_time_spec_falls_back_to_oldest_state` in
+    /// `core/engine/tests.rs` does) can't catch this — `cursor_before ==
+    /// cursor_after` there by construction — so this drives a *non-root*
+    /// landing through the real command line, end to end through
+    /// `driver_with_shell` (guarding against the same class of bug #1160
+    /// found: a keystroke path silently swallowed above the engine layer,
+    /// invisible to an engine-only test), and asserts on the *painted*
+    /// block-cursor cell rather than internal model state.
+    ///
+    /// The undo-tree node timestamp is backdated directly
+    /// (`app.engine.active_buffer_state_mut().undo_tree.nodes[1].timestamp`)
+    /// rather than through a real `std::thread::sleep`, so the test is
+    /// deterministic and fast — and it has to happen *before* the app is
+    /// handed to `driver_with_shell`, since `ShellAdapter` hides the
+    /// wrapped app afterward (see `tui_ext_panel_reveal_by_short_hash_...`,
+    /// above, for the same constraint). See the doc comment on
+    /// `UndoTree::at_or_before` for the citation of the live-`nvim
+    /// --headless` session this mirrors.
+    ///
+    /// **Verified RED against unfixed `develop`:** reverting `at_or_before`
+    /// to read `cursor_after` instead of `cursor_before` lands the block
+    /// cursor on "hello"'s trailing "o" (display column 4) instead of its
+    /// leading "h" (display column 0).
+    #[test]
+    fn ex_earlier_time_spec_lands_on_cursor_before_not_after_via_shell_app() {
+        let mut app = TuiShellApp::new_for_test();
+
+        // Node 1 ("hello"): cursor_before = col 0 (start of the empty
+        // buffer), cursor_after = col 4 (Esc lands on the trailing "o").
+        for c in "ihello".chars() {
+            app.engine.handle_key(&c.to_string(), Some(c), false);
+        }
+        app.engine.handle_key("Escape", None, false);
+        assert_eq!(app.engine.view().cursor.col, 4);
+
+        // Node 2: `0ix<Esc>` moves to col 0 *before* starting its own
+        // insert group, so this node's own cursor_before/cursor_after are
+        // both col 0 — it's node 1 ("hello") we're testing the landing on.
+        app.engine.handle_key("0", Some('0'), false);
+        app.engine.handle_key("i", Some('i'), false);
+        app.engine.handle_key("x", Some('x'), false);
+        app.engine.handle_key("Escape", None, false);
+        assert_eq!(app.engine.buffer().to_string(), "xhello");
+
+        // Backdate node 1 (the "hello" commit) far into the past, leaving
+        // the root and node 2 at their real (just-now) timestamps, so a
+        // `1s`-ago cutoff computed once `:earlier 1s` actually runs below
+        // excludes both of those and selects node 1 as the newest node at
+        // or before the cutoff — deterministically, no real sleep needed.
+        {
+            let bs = app.engine.active_buffer_state_mut();
+            let far_past = std::time::SystemTime::now() - std::time::Duration::from_secs(10_000);
+            bs.undo_tree.nodes[1].timestamp = far_past;
+        }
+
+        let theme = Theme::from_name(&app.engine.settings.colorscheme);
+        let cursor_bg = quadraui::tui::ratatui_color(super::quadraui_tui::q_theme(&theme).cursor);
+
+        let mut driver = driver_with_shell(app, config(), 80, 24);
+        driver.render();
+
+        for c in ":earlier 1s".chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
+        driver.render();
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("hello") && !screen.contains("xhello"),
+            ":earlier 1s must land on the \"hello\" node, undoing the \"x\" \
+             insert; screen:\n{screen}"
+        );
+
+        let hello_bounds = driver
+            .find_bounds("hello")
+            .expect("\"hello\" must be painted on screen");
+        let row = hello_bounds.y as u16;
+        let start_col = hello_bounds.x as u16;
+        assert_eq!(
+            driver.style_at(start_col, row).map(|s| s.bg),
+            Some(cursor_bg),
+            ":earlier 1s must land the cursor on cursor_before (col 0, \
+             \"hello\"'s leading \"h\"), not cursor_after (col 4, its \
+             trailing \"o\"); screen:\n{screen}"
+        );
+        assert_ne!(
+            driver.style_at(start_col + 4, row).map(|s| s.bg),
+            Some(cursor_bg),
+            "the cursor must not be sitting on \"hello\"'s trailing \"o\" \
+             (cursor_after); screen:\n{screen}"
+        );
+    }
+
+    /// #1294: the forward counterpart of the test just above — `:later
+    /// {N}[smhd]` must also land on `cursor_before`, not `cursor_after`.
+    /// Same driver-tier rationale; see that test's doc comment. The
+    /// backdating here targets the *root* node (index 0) instead, since
+    /// `:later` needs to jump forward from the root onto "hello".
+    ///
+    /// **Verified RED against unfixed `develop`:** reverting `at_or_after`
+    /// to read `cursor_after` instead of `cursor_before` lands the block
+    /// cursor on "hello"'s trailing "o" (display column 4) instead of its
+    /// leading "h" (display column 0).
+    #[test]
+    fn ex_later_time_spec_lands_on_cursor_before_not_after_via_shell_app() {
+        let mut app = TuiShellApp::new_for_test();
+
+        // Node 1 ("hello"): cursor_before = col 0, cursor_after = col 4 —
+        // same distinct pair as the `:earlier` test above.
+        for c in "ihello".chars() {
+            app.engine.handle_key(&c.to_string(), Some(c), false);
+        }
+        app.engine.handle_key("Escape", None, false);
+        assert_eq!(app.engine.view().cursor.col, 4);
+
+        // Back to the root so `:later` has somewhere to jump forward *to*.
+        app.engine.handle_key("u", Some('u'), false);
+        assert_eq!(app.engine.buffer().to_string(), "");
+
+        // Backdate the root far into the past so a `1s`-ago cutoff
+        // excludes it, leaving node 1 (still at its real, just-now
+        // timestamp) as the only live node at or after the cutoff —
+        // deterministically, no real sleep needed.
+        {
+            let bs = app.engine.active_buffer_state_mut();
+            let far_past = std::time::SystemTime::now() - std::time::Duration::from_secs(10_000);
+            bs.undo_tree.nodes[0].timestamp = far_past;
+        }
+
+        let theme = Theme::from_name(&app.engine.settings.colorscheme);
+        let cursor_bg = quadraui::tui::ratatui_color(super::quadraui_tui::q_theme(&theme).cursor);
+
+        let mut driver = driver_with_shell(app, config(), 80, 24);
+        driver.render();
+
+        for c in ":later 1s".chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
+        driver.render();
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("hello"),
+            ":later 1s must redo forward onto the \"hello\" node; \
+             screen:\n{screen}"
+        );
+
+        let hello_bounds = driver
+            .find_bounds("hello")
+            .expect("\"hello\" must be painted on screen");
+        let row = hello_bounds.y as u16;
+        let start_col = hello_bounds.x as u16;
+        assert_eq!(
+            driver.style_at(start_col, row).map(|s| s.bg),
+            Some(cursor_bg),
+            ":later 1s must land the cursor on cursor_before (col 0, \
+             \"hello\"'s leading \"h\"), not cursor_after (col 4, its \
+             trailing \"o\"); screen:\n{screen}"
+        );
+        assert_ne!(
+            driver.style_at(start_col + 4, row).map(|s| s.bg),
+            Some(cursor_bg),
+            "the cursor must not be sitting on \"hello\"'s trailing \"o\" \
+             (cursor_after); screen:\n{screen}"
+        );
+    }
+
     /// #887: `ap`'s trailing-blank-block preference must fall back to the
     /// *leading* blank block when the cursor's paragraph is the last one in
     /// the buffer (no trailing blank exists to select instead). Verified
