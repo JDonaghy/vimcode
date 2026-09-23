@@ -269,10 +269,10 @@ pub(super) fn handle_mouse(
     let has_separated = last_layout
         .as_ref()
         .is_some_and(|l| l.separated_status_line.is_some());
-    let bottom_chrome: u16 = if engine.settings.window_status_line {
-        1 // cmd only
-    } else {
+    let bottom_chrome: u16 = if render::global_status_bar_visible(engine) {
         2 // status + cmd
+    } else {
+        1 // cmd only
     };
     // Separated status row between terminal and cmd (when noslat + terminal open).
     let sep_status_rows: u16 = if has_separated { 1 } else { 0 };

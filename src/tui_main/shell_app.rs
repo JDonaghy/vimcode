@@ -21119,6 +21119,111 @@ mod tests {
         );
     }
 
+    /// #1235: `bottom_band_row_heights` (TUI frame sizing) and `mouse.rs`'s
+    /// `bottom_chrome` (click-row mapping) read the raw
+    /// `engine.settings.window_status_line` field directly instead of
+    /// `render::effective_window_status_line`, so they disagreed with
+    /// `render::build_screen_layout`/`compute_editor_layout` — which already
+    /// used the effective, `'laststatus'`-narrowed value via #1206 — by one
+    /// row whenever `'laststatus'` narrowed `window_status_line` to `false`:
+    /// `laststatus=0`, or `laststatus=1` with one window. Neither of the two
+    /// broken sites ever looked at window count, so a `laststatus=1` global
+    /// status bar's row stayed reserved after closing back down to a single
+    /// window, and never grew back after a split undid the narrowing.
+    ///
+    /// Global (non-per-window) status mode (`window_status_line = false`) is
+    /// what isolates this from `window_status_row_reserved`, which was
+    /// already correct pre-#1235: with per-window status on, the freed row
+    /// lives *inside* the window's own rect, not in the bottom band these
+    /// two sites size, so the divergence never surfaces there. `'laststatus'`
+    /// narrowing only matters for the shared *global* bar's own row.
+    ///
+    /// Row count is read from **painted content**, never the layout formula:
+    /// a numbered filler buffer long enough to overflow the viewport, so a
+    /// reclaimed row shows up as one more marker line becoming visible
+    /// (`screen_contains` reads the painted cell grid).
+    ///
+    /// **RED-verified against unfixed `develop`**: with a single window and
+    /// `laststatus=1`, `render::build_screen_layout`'s paint decision
+    /// already hid the global bar correctly (effective-value-based since
+    /// #1206), but `bottom_band_row_heights` still reserved its row because
+    /// it read the raw field — so the frame stayed one row short, the global
+    /// bar's text painted into the squeezed sliver instead of vanishing, and
+    /// the filler line that should have reclaimed the row never became
+    /// visible. Observed failing (stale "Ln 1, Col 1" still on screen, row
+    /// count unchanged) before the four-site fix, passing after.
+    #[test]
+    fn laststatus_frame_sizing_matches_shared_layout_across_window_count_via_shell_app() {
+        let mut app = TuiShellApp::new_for_test();
+        app.engine.settings.autohide_panels = false;
+        app.engine.app_shell.hide_sidebar();
+        app.engine.session.explorer_visible = false;
+        app.engine.settings.window_status_line = false; // global-bar mode
+        app.engine.git_branch = None;
+        for i in 0..40 {
+            let pos = app.engine.buffer().len_chars();
+            app.engine
+                .buffer_mut()
+                .insert(pos, &format!("ZQ1235R{i:02}\n"));
+        }
+
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        let visible_marker_rows = |d: &quadraui::tui::testing::TuiDriver<_>| -> usize {
+            (0..40)
+                .filter(|i| d.screen_contains(&format!("ZQ1235R{i:02}")))
+                .count()
+        };
+
+        assert!(
+            driver.screen_contains("Ln 1, Col 1"),
+            "sanity: single window, default laststatus=2, global-bar mode \
+             -- the global status bar must paint; screen:\n{}",
+            driver.screen()
+        );
+        let rows_with_status = visible_marker_rows(&driver);
+
+        // laststatus=1 + one window: real Vim hides the status line
+        // entirely, and the frame must reclaim exactly the one row it freed.
+        run_ex_command(&mut driver, ":set laststatus=1");
+        assert!(
+            !driver.screen_contains("Ln 1, Col 1"),
+            "'laststatus=1' with one window must hide the global status \
+             bar; screen:\n{}",
+            driver.screen()
+        );
+        assert_eq!(
+            visible_marker_rows(&driver),
+            rows_with_status + 1,
+            "hiding the global bar must reclaim exactly the one row it \
+             occupied -- the row `bottom_band_row_heights` mis-reserved \
+             when reading the raw field instead of \
+             `render::effective_window_status_line`; screen:\n{}",
+            driver.screen()
+        );
+
+        // Splitting back to 2+ windows (still global-bar mode -- window_
+        // status_line stayed false) must show the bar again, matching
+        // `effective_window_status_line`'s own `windows.len() > 1` gate,
+        // and cost back exactly the row single-window laststatus=1 freed.
+        run_ex_command(&mut driver, ":split");
+        assert!(
+            driver.screen_contains("Ln 1, Col 1"),
+            "'laststatus=1' with 2+ windows must show the global status \
+             bar again; screen:\n{}",
+            driver.screen()
+        );
+
+        // laststatus=0 hides the status line unconditionally, even with
+        // 2+ windows still open.
+        run_ex_command(&mut driver, ":set laststatus=0");
+        assert!(
+            !driver.screen_contains("Ln 1, Col 1"),
+            "'laststatus=0' must hide the global status bar even with 2+ \
+             windows open; screen:\n{}",
+            driver.screen()
+        );
+    }
+
     /// #752: clicking a tab in an *unsplit* window must switch the painted
     /// editor pane to that tab's own buffer — regression coverage for the
     /// single-group arm of `handle_mouse` now delegating to
