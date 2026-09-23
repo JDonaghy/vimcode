@@ -754,15 +754,55 @@ fn test_history_range_filters_rows() {
     assert_eq!(e.message, "      #  cmd history\n>     2  echo two");
 }
 
-/// #1327: requesting a single named history that has never had anything
-/// recorded errors with Neovim's own `'history' option is zero` message
-/// (`:h :history`) rather than printing an empty table — confirmed against
-/// a live oracle. `:history all` (covered above) never hits this, even
-/// though vimcode's `expr`/`input`/`debug` sections are always empty too.
+/// #1327: on a totally fresh session — nothing ever recorded in *any*
+/// history kind — every one of `:history`, `:history {name}` and
+/// `:history all` errors with Neovim's own `'history' option is zero`
+/// message (`:h :history`) rather than printing an empty table. Confirmed
+/// against a live oracle.
 #[test]
 fn test_history_named_empty_kind_errors() {
     let mut e = engine_with("hello\n");
     let action = exec(&mut e, "history search");
+    assert_eq!(e.message, "'history' option is zero");
+    assert!(matches!(action, EngineAction::Error));
+}
+
+/// #1327 review: the `'history' option is zero` gate is session-wide, not
+/// per-requested-kind — confirmed against a live oracle. Once *any* kind has
+/// recorded something (here, only `cmd` via `run_cmd`), requesting a
+/// *different*, still-empty kind (`search`) must print that kind's empty
+/// table, not error. Before this fix, `ex_history` checked only the
+/// requested kind's own entries, so this exact case incorrectly errored.
+#[test]
+fn test_history_other_kind_empty_prints_empty_table_when_something_recorded() {
+    let mut e = engine_with("hello\n");
+    run_cmd(&mut e, "echo one");
+    let action = exec(&mut e, "history search");
+    assert_eq!(e.message, "      #  search history");
+    assert!(!matches!(action, EngineAction::Error));
+}
+
+/// #1327 review: the symmetric case of the test above — only `search`
+/// history has ever been recorded, `cmd` history (the bare `:history`
+/// default, `:h :history`) is empty. Must print an empty table, not error.
+/// Confirmed against a live oracle.
+#[test]
+fn test_history_bare_default_prints_empty_table_when_only_search_recorded() {
+    let mut e = engine_with("hello\nworld\n");
+    search_fwd(&mut e, "hello");
+    let action = exec(&mut e, "history");
+    assert_eq!(e.message, "      #  cmd history");
+    assert!(!matches!(action, EngineAction::Error));
+}
+
+/// #1327 review: `:history all` on a totally fresh session — nothing ever
+/// recorded in any kind — errors exactly like a single named kind does,
+/// rather than printing five empty headers. Confirmed against a live
+/// oracle.
+#[test]
+fn test_history_all_errors_on_totally_fresh_session() {
+    let mut e = engine_with("hello\n");
+    let action = exec(&mut e, "history all");
     assert_eq!(e.message, "'history' option is zero");
     assert!(matches!(action, EngineAction::Error));
 }

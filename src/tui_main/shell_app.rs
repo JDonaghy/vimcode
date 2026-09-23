@@ -12572,6 +12572,62 @@ mod tests {
         );
     }
 
+    /// #1327: `:history` must paint Neovim's real `      #  cmd history`
+    /// header on the command line — not the vimcode-invented
+    /// `--- Command History ---` banner — and must reach the ex `"history"`
+    /// branch at all.
+    ///
+    /// Per `build_command_line`'s "strip newlines so the command line never
+    /// exceeds one row" rule (see `marks_paints_nvim_header_via_shell_app`'s
+    /// doc comment above), a one-row command line can only show the
+    /// message's *first* line, i.e. the header. The full multi-row listing —
+    /// the numbered rows and the `>` current-entry marker — is covered by
+    /// `test_history_is_hermetic_and_shows_only_this_tests_commands` and its
+    /// siblings in `tests/new_vim_features.rs`, this test's engine-tier
+    /// twins.
+    ///
+    /// **Verified RED against unfixed `develop`:** with `execute.rs`
+    /// reverted to develop's `"history"` arm, the row paints
+    /// `--- Command History ---` and the assertion below fails.
+    #[test]
+    fn history_paints_nvim_header_via_shell_app() {
+        const HEIGHT: u16 = 24;
+        let app = TuiShellApp::new_for_test();
+        let mut driver = driver_with_shell(app, config(), 100, HEIGHT);
+        // Populate command history (bare `:history` on a session with
+        // nothing recorded errors instead — see the engine-tier
+        // `test_history_named_empty_kind_errors`).
+        run_ex_command(&mut driver, ":echo hi");
+        run_ex_command(&mut driver, ":history");
+
+        let screen = driver.screen();
+        let (_, y) = driver.find("      #  cmd history").unwrap_or_else(|| {
+            panic!(
+                "`:history` must reach the ex parser and paint Neovim's \
+                 real `      #  cmd history` header on the command line \
+                 (#1327); screen:\n{screen}"
+            )
+        });
+        assert_eq!(
+            y as u16,
+            HEIGHT - 1,
+            "the history listing's header must paint on the command line \
+             (last row), not in the document body — a hit anywhere else \
+             means the keystrokes were swallowed as normal/insert-mode \
+             edits instead of reaching the ex `:history` branch; \
+             screen:\n{screen}"
+        );
+        assert!(
+            !screen.contains("Not an editor command"),
+            "`:history` must not be rejected as an unknown command; \
+             screen:\n{screen}"
+        );
+        assert!(
+            !screen.contains("--- Command History ---"),
+            "the pre-#1327 invented header must be gone; screen:\n{screen}"
+        );
+    }
+
     /// A modal dialog must paint *and* cache its `DialogLayout` — the layout
     /// is what `handle_key_pressed`'s dialog tier and `handle_mouse_event`
     /// hit-test against, so a paint that doesn't publish it is only half
