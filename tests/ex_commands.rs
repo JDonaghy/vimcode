@@ -246,6 +246,38 @@ fn cmd_reg_multi_char_argument_lists_each_register() {
     );
 }
 
+// #1300: Neovim's `:marks` always lists the three automatic marks (`'`
+// previous-context, `"` last-position-before-leaving-buffer, `.`
+// last-change) alongside any user-set ones — vimcode's `"marks"` arm used to
+// iterate only `self.marks` (user marks), silently dropping all three.
+// `maG:marks` is the exact key sequence the oracle-backed
+// `msg:ex::marks lists a set mark` case in `tests/nvim_conformance.rs` drives
+// against a live `nvim --headless`; this is its engine-tier twin so the
+// listing stays covered even where the oracle isn't installed.
+//
+// Verified RED against unfixed `develop`: the pre-#1300 arm only emitted
+// `" a      2    0"` (the user mark, no `file/text` column and none of the
+// three auto marks), so every assertion below failed.
+#[test]
+fn cmd_marks_lists_auto_marks_alongside_user_marks() {
+    let mut e = engine_with("one\ntwo\nthree\n");
+    press(&mut e, 'j'); // cursor -> ("two", col 0)
+    press(&mut e, 'm');
+    press(&mut e, 'a'); // mark a := ("two", col 0)
+    press(&mut e, 'G'); // jump to "three"; sets the '' pcmark to the pre-jump position
+    exec(&mut e, "marks");
+    assert_msg_contains(&e, "mark line  col file/text");
+    // `'` — previous context (pcmark), set by the `G` jump above.
+    assert_msg_contains(&e, "'      2    0 two");
+    // The user mark itself.
+    assert_msg_contains(&e, "a      2    0 two");
+    // `"` and `.` — vimcode does not track buffer-enter/leave transitions or
+    // a change list yet, so both default to the buffer start, matching
+    // Neovim's own default when neither has happened.
+    assert_msg_contains(&e, "\"      1    0 one");
+    assert_msg_contains(&e, ".      1    0 one");
+}
+
 #[test]
 fn cmd_join_lines() {
     let mut e = engine_with("hello\nworld\n");

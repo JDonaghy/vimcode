@@ -9872,11 +9872,17 @@ fn nvim_conformance_cross_file_ex() {
 //      numbered, named, then `- * + . : % # / =`) using the real
 //      `Type Name Content` header and column layout, confirmed against a
 //      live oracle.
-//   2. (#1300) "msg:ex::marks lists a set mark" — title: "`:marks`: emit the three
-//      auto marks (`'`, `\"`, `.`) alongside user marks". `"marks"`'s arm
-//      only iterates `self.marks` (user-set marks); Neovim's `:marks`
-//      output always also lists the previous-context, last-cursor-before-
-//      leaving-buffer and last-change positions.
+//   2. (#1300 — FIXED) "msg:ex::marks lists a set mark" — title: "`:marks`:
+//      emit the three auto marks (`'`, `\"`, `.`) alongside user marks".
+//      `"marks"`'s arm only iterated `self.marks` (user-set marks); Neovim's
+//      `:marks` output always also lists the previous-context (`'`,
+//      `last_jump_pos`), last-cursor-before-leaving-buffer (`"`, defaulted
+//      to the buffer start — vimcode does not track buffer-enter/leave
+//      transitions) and last-change (`.`, `last_edit_pos`) positions, each
+//      with a `file/text` column previewing the target line (leading
+//      whitespace trimmed). The header's `col`/`file/text` gap was also off
+//      by one space. Confirmed against a live oracle; its case label is
+//      deleted from `KNOWN_DEVIATIONS_MESSAGE` below.
 //   3. (#1301) "msg:ex::jumps lists a jump" — title: "`:jumps`: drop the
 //      vimcode-only `tab` column, add the `file/text` preview column
 //      Neovim has instead". `"jumps"`'s arm prints a header/column vimcode
@@ -9918,7 +9924,6 @@ fn nvim_conformance_cross_file_ex() {
 //      follow-up formatting-fix issue (same non-trivial-rewrite reasoning
 //      as the others).
 const KNOWN_DEVIATIONS_MESSAGE: &[&str] = &[
-    "msg:ex::marks lists a set mark",
     "msg:ex::jumps lists a jump",
     "msg:ex::digraphs lists the digraph table",
     "msg:ex::changes lists a change",

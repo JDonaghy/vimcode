@@ -12361,6 +12361,54 @@ mod tests {
         );
     }
 
+    /// #1300: `:marks` must paint Neovim's real `mark line  col file/text`
+    /// header (single space before `file/text` — the pre-fix arm had two)
+    /// and must reach the ex `"marks"` branch at all.
+    ///
+    /// The command line renders `engine.message` verbatim but strips
+    /// newlines (`render_content_paints_command_line_via_shell_app`
+    /// establishes this, and `reg_with_register_argument_paints_nvim_header_
+    /// via_shell_app`'s doc comment above explains why), so the header —
+    /// the message's first line — is what a one-row command line can show;
+    /// the full multi-row listing (the `'`/user-mark/`"`/`.` rows) is
+    /// covered by `cmd_marks_lists_auto_marks_alongside_user_marks` in
+    /// `tests/ex_commands.rs`, this test's engine-tier twin.
+    ///
+    /// **Verified RED against unfixed `develop`:** with `execute.rs`
+    /// reverted to develop's `"marks"` arm, the row paints
+    /// `mark line  col  file/text` (double space) and the assertion below
+    /// fails.
+    #[test]
+    fn marks_paints_nvim_header_via_shell_app() {
+        const HEIGHT: u16 = 24;
+        let app = TuiShellApp::new_for_test();
+        let mut driver = driver_with_shell(app, config(), 100, HEIGHT);
+        run_ex_command(&mut driver, ":marks");
+
+        let screen = driver.screen();
+        let (_, y) = driver.find("mark line  col file/text").unwrap_or_else(|| {
+            panic!(
+                "`:marks` must reach the ex parser and paint Neovim's real \
+                 `mark line  col file/text` header on the command line \
+                 (#1300); screen:\n{screen}"
+            )
+        });
+        assert_eq!(
+            y as u16,
+            HEIGHT - 1,
+            "the marks listing's header must paint on the command line \
+             (last row), not in the document body — a hit anywhere else \
+             means the keystrokes were swallowed as normal/insert-mode \
+             edits instead of reaching the ex `:marks` branch; \
+             screen:\n{screen}"
+        );
+        assert!(
+            !screen.contains("Not an editor command"),
+            "`:marks` must not be rejected as an unknown command; \
+             screen:\n{screen}"
+        );
+    }
+
     /// A modal dialog must paint *and* cache its `DialogLayout` — the layout
     /// is what `handle_key_pressed`'s dialog tier and `handle_mouse_event`
     /// hit-test against, so a paint that doesn't publish it is only half

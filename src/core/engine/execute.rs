@@ -2457,20 +2457,61 @@ impl Engine {
             "marks" => {
                 let buf_id = self.active_buffer_id();
                 let mut lines: Vec<String> = Vec::new();
-                lines.push("mark line  col  file/text".to_string());
-                if let Some(marks_map) = self.marks.get(&buf_id).cloned() {
-                    let mut sorted: Vec<(char, Cursor)> = marks_map.into_iter().collect();
+                lines.push("mark line  col file/text".to_string());
+
+                // Preview text for a mark's target line: leading whitespace
+                // trimmed, no trailing newline — matches Neovim's `:marks`
+                // `file/text` column (confirmed against a live oracle, #1300).
+                let line_text = |engine: &Self, line_idx: usize| -> String {
+                    let clamped =
+                        line_idx.min(engine.buffer().content.len_lines().saturating_sub(1));
+                    engine
+                        .buffer()
+                        .content
+                        .line(clamped)
+                        .chars()
+                        .collect::<String>()
+                        .trim_end_matches(['\n', '\r'])
+                        .trim_start()
+                        .to_string()
+                };
+
+                // Neovim's `:marks` always lists the three automatic marks
+                // alongside any user-set ones (#1300): `'` (previous
+                // context — the pcmark set by the last jump), the user marks
+                // themselves, `"` (cursor position before last leaving this
+                // buffer), and `.` (position of the last change).
+                let mut rows: Vec<(char, usize, usize, String)> = Vec::new();
+                if let Some((line, col)) = self.last_jump_pos {
+                    rows.push(('\'', line, col, line_text(self, line)));
+                }
+                if let Some(marks_map) = self.marks.get(&buf_id) {
+                    let mut sorted: Vec<(char, Cursor)> =
+                        marks_map.iter().map(|(c, cur)| (*c, *cur)).collect();
                     sorted.sort_by_key(|(c, _)| *c);
                     for (c, cur) in sorted {
-                        lines.push(format!(" {}   {:4}  {:3}", c, cur.line + 1, cur.col));
+                        rows.push((c, cur.line, cur.col, line_text(self, cur.line)));
                     }
                 }
+                // vimcode does not yet track buffer-enter/leave transitions,
+                // so `"` defaults to the buffer start — matching Neovim's own
+                // default for a buffer that has never actually been left.
+                rows.push(('"', 0, 0, line_text(self, 0)));
+                // `.` likewise defaults to the buffer start before any real
+                // change has happened — confirmed against a live oracle,
+                // whose own fixture-loading step already counts as a change.
+                let (edit_line, edit_col) = self.last_edit_pos.unwrap_or((0, 0));
+                rows.push(('.', edit_line, edit_col, line_text(self, edit_line)));
+                for (c, line, col, text) in rows {
+                    lines.push(format!(" {}{:>7}{:>5} {}", c, line + 1, col, text));
+                }
+
                 for (c, (path, line, col)) in &self.global_marks {
                     let path_str = path
                         .as_ref()
                         .map(|p| p.to_string_lossy().into_owned())
                         .unwrap_or_default();
-                    lines.push(format!(" {}   {:4}  {:3}  {}", c, line + 1, col, path_str));
+                    lines.push(format!(" {}{:>7}{:>5} {}", c, line + 1, col, path_str));
                 }
                 self.message = lines.join("\n");
                 EngineAction::None
