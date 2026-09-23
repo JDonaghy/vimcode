@@ -1144,6 +1144,27 @@ mod tests {
         assert!((rects[1].1.x - 400.0).abs() < 0.001);
     }
 
+    /// #1290: on an odd axis, a `.5`/`.5` tie must round the split
+    /// *boundary* once, not each child's own share independently — the
+    /// first child gets the extra unit, matching a live `nvim --headless`
+    /// (see `calculate_rects`'s doc comment). Height 23 with ratio 0.5
+    /// gives boundary = round(23 * 0.5) = round(11.5) = 12, so first =
+    /// 12, second = 23 - 12 = 11, exercising both the tie-break direction
+    /// and the width-preservation property this rewrite relies on
+    /// (12 + 11 == 23, never 11 + 11 or 12 + 12).
+    #[test]
+    fn test_calculate_rects_odd_axis_tie_breaks_to_first_child() {
+        let mut layout = WindowLayout::leaf(WindowId(1));
+        layout.split_at(WindowId(1), SplitDirection::Horizontal, WindowId(2), false);
+        assert!(layout.set_ratio_at_index(0, 0.5));
+
+        let bounds = WindowRect::new(0.0, 0.0, 100.0, 23.0);
+        let rects = layout.calculate_rects(bounds);
+
+        assert!((rects[0].1.height - 12.0).abs() < 0.001);
+        assert!((rects[1].1.height - 11.0).abs() < 0.001);
+    }
+
     // ── WindowLayout divider tests (#582) ────────────────────────────────
 
     #[test]

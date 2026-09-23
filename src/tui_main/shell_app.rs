@@ -17551,6 +17551,98 @@ mod tests {
         );
     }
 
+    /// Row of the **upper** pane's first painted buffer line in a
+    /// horizontal split — [`lower_pane_first_row`]'s sibling, giving the
+    /// *first* (rather than second) occurrence of `"line 0"`. Both are
+    /// located from painted content, never from `WindowLayout`'s ratio.
+    fn upper_pane_first_row(screen: &str) -> Option<usize> {
+        screen.lines().position(|line| line.contains("line 0"))
+    }
+
+    /// Count of screen rows starting at `start_row` that still paint
+    /// buffer content (`"line "` followed by a number, per
+    /// `app_with_shaped_buffer`'s fixture text) — i.e. a pane's *content*
+    /// height read back from the painted frame, stopping at the first row
+    /// that isn't buffer text (that pane's own per-window status line, or
+    /// the frame's bottom chrome). Located from painted output, never from
+    /// `WindowRect`.
+    fn contiguous_content_rows(screen: &str, start_row: usize) -> usize {
+        screen
+            .lines()
+            .skip(start_row)
+            .take_while(|line| line.contains("line "))
+            .count()
+    }
+
+    /// #1290 acceptance, painted-output tier: after a resize *and* a
+    /// re-equalize (`CTRL-W =`), an odd-height horizontal split must land
+    /// on Neovim's real 12/11 (first/top pane one row taller than the
+    /// second/bottom), never `WindowLayout::calculate_rects`'s old
+    /// independently-rounded 11/11 tie.
+    ///
+    /// Height 26 was picked empirically (not guessed): probing this
+    /// fixture's content-row counts across a range of frame heights shows
+    /// height 26 is the first that lands the fresh 50/50 split's raw
+    /// content-row axis on an *odd* total, which is the only axis parity
+    /// where the old and new rounding strategies disagree at all — on an
+    /// even axis both strategies agree (each side gets exactly half), so a
+    /// height that happened to be even would pass before and after the fix
+    /// and prove nothing.
+    ///
+    /// RED-verified against unfixed `develop`: temporarily restoring
+    /// `develop`'s `src/core/window.rs` (`SplitTreeMeasure`-based
+    /// `calculate_rects`, rounding each child's share independently) over
+    /// the fix and re-running this exact scenario gives the upper pane 10
+    /// content rows and the lower pane 10 — an equal (11/11-shaped) split,
+    /// not Neovim's asymmetric 12/11. The fix instead gives the upper pane
+    /// 11 content rows and the lower pane 10, a one-row difference in the
+    /// upper pane's favour (matching a live `nvim --headless`'s tie-break,
+    /// per `WindowLayout::calculate_rects`'s doc comment).
+    #[test]
+    fn ctrl_w_equals_reequalizes_an_odd_split_to_the_real_nvim_tie_break_via_shell_app() {
+        let mut driver = driver_with_shell(app_with_hsplit_shaped_buffer(), config(), 120, 26);
+        driver.tick();
+        driver.tick();
+
+        // Knock the fresh 50/50 split off-centre first, so re-equalizing
+        // is actually exercising `CTRL-W =`'s own math rather than just
+        // reading back the split's untouched initial ratio.
+        driver.type_char('5');
+        driver.ctrl_char('w');
+        driver.type_char('-');
+        driver.tick();
+
+        driver.ctrl_char('w');
+        driver.type_char('=');
+        driver.tick();
+
+        let screen = driver.screen();
+        let top0 = upper_pane_first_row(&screen).unwrap_or_else(|| {
+            panic!(
+                "fixture must paint the upper pane's first buffer line; screen:\n{}",
+                screen
+            )
+        });
+        let boundary = lower_pane_first_row(&screen).unwrap_or_else(|| {
+            panic!(
+                "fixture must paint the lower pane's first buffer line; screen:\n{}",
+                screen
+            )
+        });
+        let top_h = contiguous_content_rows(&screen, top0);
+        let bot_h = contiguous_content_rows(&screen, boundary);
+
+        assert_eq!(
+            top_h as i64 - bot_h as i64,
+            1,
+            "`CTRL-W =` on an odd-height split must give the upper (first) \
+             pane exactly one more content row than the lower (second) \
+             pane (Neovim's real 12/11 tie-break), not an equal split; got \
+             upper={top_h} rows, lower={bot_h} rows; screen:\n{}",
+            screen
+        );
+    }
+
     /// Column of the left pane's own per-window scrollbar-strip glyph
     /// (`'⢸'`, painted at the right edge of *each* window's content area) on
     /// the first content row that carries one — a stand-in for "where does
