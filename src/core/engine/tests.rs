@@ -15320,34 +15320,46 @@ fn test_cdo_runs_command_once_per_entry_cfdo_once_per_file() {
 }
 
 #[test]
-fn test_cdo_on_empty_list_errors_without_running_anything() {
-    let mut engine = Engine::new();
-    engine.execute_command("cdo normal! Ax");
-    // #1283: was `.contains("empty")` against vimcode's invented "Quickfix
-    // list is empty"; now the shared `Engine::qf_empty_msg` spelling, which a
-    // live oracle pins as `E42: No Errors`.
+fn test_cdo_on_empty_list_is_silent_no_op() {
+    // #1308: real Neovim's `:cdo`/`:cfdo`/`:ldo`/`:lfdo` on an empty
+    // quickfix/location list are a *silent* no-op (`pcall` succeeds,
+    // `v:errmsg` stays empty) — confirmed against a live
+    // `nvim --headless -u NONE` oracle. This is unlike `:cc`/`:cnext`/
+    // `:clist`/`:cfirst`/`:clast`, which all do raise `E42: No Errors`.
     //
-    // Known, deliberate divergence re-confirmed here against `nvim --headless
-    // -u NONE`: real Neovim's `:cdo`/`:cfdo`/`:ldo` on an empty list are
-    // *silent* no-ops (`pcall` succeeds, `v:errmsg` stays empty) rather than
-    // erroring — only the `:cc`/`:cnext`/`:clist`/`:cfirst`/`:clast` family
-    // raises `E42`. vimcode keeps a message because "nothing happened" with
-    // no feedback reads as a broken command, and the invariant the test name
-    // claims — *nothing ran* — matches Neovim either way. The message text is
-    // not part of the conformance corpus: the oracle `Case` harness compares
-    // buffer and cursor only, so no `tests/nvim_conformance.rs` row asserts
-    // it. Narrowing this to a silent no-op is a separate behaviour decision,
-    // not a casing fix, so it is deliberately out of #1283's scope — tracked
-    // as follow-up #4 in `tests/nvim_conformance.rs`'s "Follow-up issue
-    // status" comment above `KNOWN_DEVIATIONS_XFILE`, for the coordinator to
-    // file with a real issue number per this repo's discovered-deviation
-    // policy.
-    assert!(
-        engine.message.contains("E42: No Errors"),
-        "cdo on an empty quickfix list should use the shared E42 wording, got {:?}",
+    // This scenario has no oracle `Case` (the harness can't reach it), so it
+    // can't be a `KNOWN_DEVIATIONS_XFILE` entry — this engine-level test is
+    // the only regression guard. It used to assert the opposite (that vimcode
+    // set the shared `E42: No Errors` message); narrowing to a true no-op
+    // means no message is set at all, and nothing runs.
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "hello\n");
+    engine.update_syntax();
+    engine.execute_command("cdo normal! Ax");
+    assert_eq!(
+        engine.message, "",
+        "cdo on an empty quickfix list must be a silent no-op, got message {:?}",
         engine.message
     );
+    let line = engine.buffer().content.line(0).to_string();
+    assert_eq!(
+        line.trim_end_matches('\n'),
+        "hello",
+        "cdo on an empty quickfix list must not run the command against anything"
+    );
 
+    // :cfdo / :ldo / :lfdo on their respective empty lists are the same.
+    engine.execute_command("cfdo normal! Ax");
+    assert_eq!(engine.message, "");
+    engine.execute_command("ldo normal! Ax");
+    assert_eq!(engine.message, "");
+    engine.execute_command("lfdo normal! Ax");
+    assert_eq!(engine.message, "");
+    let line = engine.buffer().content.line(0).to_string();
+    assert_eq!(line.trim_end_matches('\n'), "hello");
+
+    // Bare `:cdo` (no argument) still raises E471 — that's an argument-count
+    // error, not the "list is empty" case this test covers.
     engine.execute_command("cdo");
     assert!(engine.message.contains("E471"));
 }
