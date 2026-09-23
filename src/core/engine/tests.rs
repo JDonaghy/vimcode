@@ -34692,6 +34692,56 @@ fn test_1160_digraphs_ex_command_via_min_abbreviation() {
     assert!(engine.message.contains("a: ä"), "{}", engine.message);
 }
 
+/// #1302: `Engine::ex_digraphs`'s no-argument listing must match Neovim's
+/// real `listdigraphs` output — `engine.message` should be the same string
+/// `digraphs::format_digraph_table` produces for the builtin table (a
+/// leading blank line, then the `NU ^@  10 ...` grid), reached through the
+/// real ex-command path rather than calling `format_digraph_table`
+/// directly (the in-module `digraphs.rs` unit tests already pin that
+/// formatter's byte-for-byte output; this is the engine-tier twin that
+/// proves `ex_digraphs` actually wires it up).
+///
+/// **Verified RED against unfixed `develop`:** before #1302, `ex_digraphs`
+/// built its own Vim-shaped, one-entry-per-line message via a hand-rolled
+/// loop instead of calling `format_digraph_table`, so `engine.message`
+/// didn't start with `"\nNU ^@  10"` and the assertion below failed.
+#[test]
+fn test_1302_ex_digraphs_lists_builtin_table_matching_format_digraph_table() {
+    let mut engine = engine_with_text("");
+    engine.execute_command("digraphs");
+    assert!(
+        engine.message.starts_with("\nNU ^@  10"),
+        "`:digraphs` message should start with Neovim's leading blank line \
+         then the `NU ^@  10 ...` row; got: {:?}",
+        &engine.message[..engine.message.len().min(80)]
+    );
+}
+
+/// #1302: `ex_digraphs`'s no-argument listing must list the builtin table
+/// before any `:digraph`-defined custom entries, reached through the real
+/// `self.custom_digraphs` map (not a hand-built iterator, unlike
+/// `digraphs.rs`'s `ex_digraphs_lists_builtin_before_custom` unit test).
+#[test]
+fn test_1302_ex_digraphs_lists_builtin_before_custom_via_real_map() {
+    let mut engine = engine_with_text("");
+    engine.execute_command("digraph zz 9733"); // ★, defines a custom digraph
+    engine.execute_command("digraphs");
+    let nu_pos = engine
+        .message
+        .find("NU ^@")
+        .expect("builtin entry present in the listing");
+    let zz_pos = engine
+        .message
+        .find("zz ★")
+        .expect("custom entry present in the listing");
+    assert!(
+        nu_pos < zz_pos,
+        "the builtin table must precede the custom `:digraph zz` entry; \
+         message: {:?}",
+        engine.message
+    );
+}
+
 #[test]
 fn test_1160_ctrl_x_ctrl_l_completes_whole_line() {
     let mut engine = Engine::new();
