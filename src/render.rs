@@ -12194,42 +12194,47 @@ pub fn build_minimap_data(
     let k = desired_window_lines
         .div_ceil(target_lines.max(1))
         .clamp(1, MINIMAP_MAX_COMPRESSION);
-    // quadraui's own `MinimapSizing::FixedPitch` already implements this
-    // slide (`slide_window_start_row`) — but only engages once it's handed
-    // more `lines` than the strip can hold. Handing it the *whole* buffer
-    // to get that engagement would cost O(file) per frame (the
-    // #728/#1085 regression this function exists to avoid), so the window
-    // is computed here, host-side, over a `lines` vector that never
-    // exceeds `target_lines` — `slide_window_start_row` then always takes
-    // its "already fits" branch and returns `0`, by construction.
+    // #1247 (quadraui#1044): the window's *sizing* (`window_len`, via `k`
+    // above) stays host-side — it depends on this strip's own geometry
+    // (`target_lines`/`editor_visible_rows`), which quadraui has no way to
+    // know — but where the window *starts* is now quadraui's own decision,
+    // via `window_start_line`. Before #1044 that primitive didn't exist, so
+    // this function pre-sliced the buffer down to a `window_len`-sized
+    // range by hand and handed quadraui only the already-sliced result;
+    // quadraui's own post-sample slide (`Minimap::layout_with_sizing`'s
+    // `FixedPitch` arm, `slide_window_start_row`) never saw more `lines`
+    // than the strip could already hold, so it always took its "already
+    // fits" branch and returned `0` — permanently defeated, as that
+    // function's own doc comment used to note. `window_start_line` is the
+    // pre-sample counterpart #1044 added specifically to close that gap:
+    // calling it here, instead of re-deriving the same fraction-of-buffer
+    // arithmetic host-side, makes the slide live rather than defeated,
+    // while still costing O(window_len) per frame, not O(file) (the
+    // #728/#1085 regression this function exists to avoid — `window_len`
+    // is still capped below `total_buffer_lines` before this call runs).
     let window_len = target_lines.saturating_mul(k).min(total_buffer_lines);
-    let max_start = total_buffer_lines - window_len;
-    let window_start_line = if max_start == 0 {
-        // The whole file already fits in one window — top-aligned, no
-        // slide, byte-for-byte the pre-#1093 behaviour.
-        0
-    } else {
-        // Slide in lockstep with the editor's own scroll position: `0` at
-        // the top of the file, `max_start` (the window's own last
-        // reachable position) once the editor can't scroll down any
-        // further. Anchored to the editor's own scroll *ceiling*
-        // (`total_buffer_lines - editor_visible_rows`, the same arithmetic
-        // `View::ensure_cursor_visible` clamps `scroll_top` against)
-        // rather than `total_buffer_lines` itself, so the window reaches
-        // its own bottom exactly when the editor viewport reaches the real
-        // bottom of the file — not some fraction short of it (which a
-        // `scroll_top / total_buffer_lines` fraction would leave: the
-        // editor's own `scroll_top` never reaches `total_buffer_lines - 1`
-        // except in a one-row viewport).
-        let max_scroll_top = total_buffer_lines.saturating_sub(editor_visible_rows.max(1));
-        if max_scroll_top == 0 {
-            0
-        } else {
-            let scroll_top = window.view.scroll_top.min(max_scroll_top);
-            let fraction = scroll_top as f64 / max_scroll_top as f64;
-            ((fraction * max_start as f64).round() as usize).min(max_start)
-        }
-    };
+    // `total_at_position` is `max_scroll_top + 1`, the number of distinct
+    // scroll positions the editor itself can reach — not `total_buffer_lines`
+    // — so the slide is anchored to the editor's own scroll *ceiling*
+    // (`total_buffer_lines - editor_visible_rows`, the same arithmetic
+    // `View::ensure_cursor_visible` clamps `scroll_top` against) exactly the
+    // way #1093/#1211 always have: the window reaches its own bottom exactly
+    // when the editor viewport reaches the real bottom of the file, not some
+    // fraction short of it (which a `scroll_top / total_buffer_lines`
+    // fraction would leave — the editor's own `scroll_top` never reaches
+    // `total_buffer_lines - 1` except in a one-row viewport).
+    // `window_start_line`'s own `total_at_position <= 1` branch returns `0`
+    // here exactly when `max_scroll_top == 0`, so a one-screen file still
+    // stays top-aligned with no slide, byte-for-byte the pre-#1093
+    // behaviour.
+    let max_scroll_top = total_buffer_lines.saturating_sub(editor_visible_rows.max(1));
+    let scroll_top_for_window = window.view.scroll_top.min(max_scroll_top);
+    let window_start_line = quadraui::window_start_line(
+        total_buffer_lines,
+        window_len,
+        scroll_top_for_window,
+        max_scroll_top + 1,
+    );
     // Downstream code (the viewport-highlight band `build_minimap_data`
     // paints further below, and every consumer of `Minimap::visible_row_start`)
     // relies on `scroll_top` always landing inside
