@@ -299,7 +299,10 @@ pub fn session_update_chunk(update: &serde_json::Value) -> Option<(AcpChunkKind,
 /// [`AcpToolCallInfo::kind`] (the tool-call's category, e.g. `"edit"`).
 /// Kept as a raw `String` rather than an enum: an agent sending a kind this
 /// client doesn't recognize should still render as a selectable button
-/// (whatever `name` says) rather than silently vanishing.
+/// (whatever `name` says) rather than silently vanishing. A missing `kind`
+/// on the wire parses to `""` (see `parse_request_permission`), not
+/// `"allow_once"` — never default toward the most permissive category on
+/// missing data in a permission-approval path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AcpPermissionOption {
     pub option_id: String,
@@ -380,10 +383,20 @@ pub fn parse_request_permission(params: &serde_json::Value) -> Option<AcpPermiss
             .and_then(|v| v.as_str())
             .unwrap_or("Option")
             .to_string();
+        // A spec-conformant agent always sends `kind`; a missing one is
+        // malformed input, not a signal to default toward the *most*
+        // permissive category. Default to `""` (matches neither the
+        // `allow_`/`reject_` prefix `Engine::acp_handle_permission_request`
+        // checks for a remembered `allow_always`/`reject_always` decision,
+        // nor anything a real agent would send) so the option still renders
+        // as a selectable button — never silently vanishes — but can never
+        // be auto-answered from memory and can never masquerade as
+        // `allow_once` (#953 review: "defaulting toward allow on missing
+        // data in a permission-approval path is the wrong direction").
         let opt_kind = opt
             .get("kind")
             .and_then(|v| v.as_str())
-            .unwrap_or("allow_once")
+            .unwrap_or("")
             .to_string();
         options.push(AcpPermissionOption {
             option_id,
@@ -1085,6 +1098,34 @@ mod tests {
         assert_eq!(req.tool_call.title, "Tool call");
         assert_eq!(req.tool_call.kind, "other");
         assert!(req.tool_call.locations.is_empty());
+    }
+
+    /// #953 review (non-blocking concern): a missing per-option `kind` must
+    /// default to something neutral, never to `"allow_once"` — the most
+    /// permissive category — since that would let a request with a missing
+    /// `kind` silently match `Engine::acp_remembered_decisions`'s
+    /// `allow_`-prefix lookup as if a human had already approved it.
+    #[test]
+    fn parse_request_permission_defaults_missing_option_kind_to_neutral_not_allow_once() {
+        let params = serde_json::json!({
+            "sessionId": "sess-1",
+            "toolCall": {"title": "t", "kind": "edit"},
+            "options": [{"optionId": "x", "name": "Go"}],
+        });
+        let req = parse_request_permission(&params).expect("should parse");
+        assert_eq!(req.options.len(), 1);
+        assert_ne!(
+            req.options[0].kind, "allow_once",
+            "a missing option kind must not default to the most permissive \
+             category"
+        );
+        assert!(
+            !req.options[0].kind.starts_with("allow_")
+                && !req.options[0].kind.starts_with("reject_"),
+            "a missing option kind must not match either remembered-decision \
+             prefix: {:?}",
+            req.options[0].kind
+        );
     }
 
     #[test]

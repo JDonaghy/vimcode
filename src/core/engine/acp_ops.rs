@@ -230,6 +230,15 @@ impl Engine {
     /// A malformed request (missing `sessionId`/`toolCall`, no options)
     /// still gets exactly one reply — a JSON-RPC error, since there is
     /// nothing a human could meaningfully select — never silence.
+    ///
+    /// Unlike the `SessionUpdate` handler a few lines above this in
+    /// `poll_acp` (which filters on `self.acp_session_id`), this does not
+    /// check `req.session_id` before opening the dialog. That's harmless
+    /// today — only one `AcpClient`/session is ever live at a time, so
+    /// there is no *other* session's request this could ever be — but if a
+    /// future slice ever hosts more than one concurrent session, add the
+    /// same filter here for symmetry (a permission prompt is far more
+    /// consequential to mis-route than a transcript chunk).
     fn acp_handle_permission_request(&mut self, request_id: i64, params: serde_json::Value) {
         let Some(req) = crate::core::acp::parse_request_permission(&params) else {
             if let Some(client) = self.acp_client.as_ref() {
@@ -287,19 +296,36 @@ impl Engine {
                 });
             }
         }
+        // Hotkeys must be unique across this dialog's own buttons — a naive
+        // "first letter of the name" pick collides for common ACP option
+        // pairs like "Allow Once" / "Always Allow" (both 'a'), and
+        // `handle_dialog_key`'s hotkey scan matches the *first* button with
+        // a given letter, so a collision silently makes every button after
+        // the first one keyboard-unreachable by hotkey (#953 review). Scan
+        // each option's own name left-to-right for the first alphabetic
+        // character not already claimed by an earlier button in this same
+        // dialog; fall back to no hotkey (`'\0'`, still selectable by mouse
+        // or arrow-key navigation + Enter) if the name has none left to
+        // offer.
+        let mut used_hotkeys: std::collections::HashSet<char> = std::collections::HashSet::new();
         let buttons: Vec<DialogButton> = req
             .options
             .iter()
-            .map(|opt| DialogButton {
-                label: opt.name.clone(),
-                hotkey: opt
+            .map(|opt| {
+                let hotkey = opt
                     .name
                     .chars()
-                    .next()
                     .map(|c| c.to_ascii_lowercase())
-                    .filter(|c| c.is_ascii_alphabetic())
-                    .unwrap_or('\0'),
-                action: opt.option_id.clone(),
+                    .find(|c| c.is_ascii_alphabetic() && !used_hotkeys.contains(c))
+                    .unwrap_or('\0');
+                if hotkey != '\0' {
+                    used_hotkeys.insert(hotkey);
+                }
+                DialogButton {
+                    label: opt.name.clone(),
+                    hotkey,
+                    action: opt.option_id.clone(),
+                }
             })
             .collect();
 
@@ -866,6 +892,164 @@ mod tests {
         assert!(
             engine.acp_pending_permission.is_none(),
             "the parked request must be dropped, not left to answer later"
+        );
+    }
+
+    /// #953 review: "the user must be able to abort a running turn from the
+    /// panel" — `dispatch_ai_chat_event`'s Ctrl+C wiring
+    /// (`src/core/engine/ext_panel.rs`) must actually route through
+    /// `acp_cancel_turn` while a live ACP turn is streaming, not just exist
+    /// as an unreferenced method. Exercises it exactly the way the AI panel
+    /// does: a `ChatControllerEvent::KeyPressed` for Ctrl+C dispatched while
+    /// `acp_client.is_some() && ai_streaming` — with a permission dialog
+    /// parked mid-turn, so this also covers "session cancelled while a
+    /// prompt is open -> close the dialog, reply cancelled" (#953's
+    /// acceptance bar).
+    ///
+    /// RED verified: with `acp_cancel_turn`'s body emptied to a no-op, this
+    /// test fails outright (`ai_streaming` stays `true` and the dialog stays
+    /// open immediately after dispatch, instead of clearing synchronously).
+    #[cfg(unix)]
+    #[test]
+    fn ctrl_c_during_a_streaming_turn_cancels_via_acp_cancel_turn_not_ai_clear() {
+        let mut engine = engine_with_fixture_agent(&[("ACP_FAKE_REQUEST_PERMISSION", "1")]);
+        engine.settings.acp_agent_command = "already-spawned-above".to_string();
+
+        engine.ai_send_message("please edit".to_string());
+        poll_until_permission_dialog(&mut engine);
+        assert!(
+            engine.ai_streaming,
+            "sanity: the turn must still be streaming/parked before Ctrl+C"
+        );
+
+        engine.dispatch_ai_chat_event(quadraui::ChatControllerEvent::KeyPressed {
+            key: "Char('c')".to_string(),
+            modifiers: quadraui::Modifiers {
+                ctrl: true,
+                ..Default::default()
+            },
+        });
+
+        // `acp_cancel_turn` clears busy state synchronously — it must not
+        // wait for a `PromptStopped` a hung/misbehaving agent might never
+        // send.
+        assert!(
+            !engine.ai_streaming,
+            "Ctrl+C must clear the busy state immediately, not wait for the \
+             agent to acknowledge"
+        );
+        assert!(
+            engine.dialog.is_none(),
+            "the parked permission dialog must close the moment the turn is \
+             cancelled"
+        );
+        assert!(
+            engine.acp_pending_permission.is_none(),
+            "the parked permission request must be answered (not left to \
+             hang) as part of cancelling the turn"
+        );
+        assert!(
+            engine
+                .ai_messages
+                .last()
+                .is_some_and(|m| m.content.contains("cancelled by user")),
+            "a cancellation notice should land in the transcript: {:?}",
+            engine.ai_messages
+        );
+        // Ctrl+C's ACP-2 behaviour is scoped abort of the turn, NOT
+        // `ai_clear`'s full teardown — the session/process must stay alive
+        // so the user can send another message without re-spawning the
+        // agent.
+        assert!(
+            engine.acp_client.is_some(),
+            "cancelling a turn must not tear down the agent session — that \
+             is ai_clear's job, not Ctrl+C's, while a turn is in flight"
+        );
+        assert!(
+            !engine.ai_messages.is_empty(),
+            "unlike ai_clear, cancelling an in-flight turn must not wipe \
+             the transcript"
+        );
+    }
+
+    /// #953 review: the *other* named reply path for a parked permission
+    /// dialog — "dialog dismissed ... or by any unrelated action that
+    /// closes it" — must also produce exactly one `cancelled` reply, not
+    /// just the Esc/`dialog_cancel()` half already covered above.
+    /// `show_dialog`'s own `acp_cancel_pending_permission()` guard
+    /// (`src/core/engine/panels.rs`) is what makes this safe: opening any
+    /// other dialog (here, the quit-confirmation prompt) while an
+    /// `"acp_permission"` dialog is parked must answer it first.
+    ///
+    /// RED verified: deleting the `self.acp_cancel_pending_permission();`
+    /// call at the top of `show_dialog` makes this test hang — the fixture
+    /// stays blocked on its `read -r _reply` forever because nothing ever
+    /// answers request 9002, even though a different dialog is now on
+    /// screen.
+    #[cfg(unix)]
+    #[test]
+    fn an_unrelated_dialog_replacing_the_permission_prompt_still_replies_cancelled() {
+        let mut engine = engine_with_fixture_agent(&[("ACP_FAKE_REQUEST_PERMISSION", "1")]);
+        engine.settings.acp_agent_command = "already-spawned-above".to_string();
+
+        engine.ai_send_message("please edit".to_string());
+        poll_until_permission_dialog(&mut engine);
+        assert!(engine.acp_pending_permission.is_some());
+
+        // An unrelated event opens a completely different dialog over the
+        // still-parked permission prompt — e.g. the app deciding to confirm
+        // quitting with unsaved changes.
+        engine.show_quit_confirm();
+
+        assert_eq!(
+            engine.dialog.as_ref().map(|d| d.tag.as_str()),
+            Some("quit_unsaved"),
+            "the unrelated dialog must actually take over the screen"
+        );
+        assert!(
+            engine.acp_pending_permission.is_none(),
+            "the replaced permission request must be answered (cancelled), \
+             not silently dropped or left parked behind the new dialog"
+        );
+
+        poll_acp_until(&mut engine, |e| !e.ai_streaming);
+        assert!(
+            !engine.ai_streaming,
+            "the cancelled reply must actually reach the (fake) agent and \
+             let the turn end cleanly within {TEST_DEADLINE:?}, not hang \
+             forever behind the unrelated dialog"
+        );
+    }
+
+    /// #953 review (non-blocking concern): the malformed-request error path
+    /// — "a JSON-RPC error, since there is nothing a human could
+    /// meaningfully select" — must actually reach the (fake) agent exactly
+    /// like every other reply path in this file, and must never open a
+    /// dialog for a request with no selectable options.
+    #[cfg(unix)]
+    #[test]
+    fn malformed_request_permission_replies_with_an_error_not_a_dialog() {
+        let mut engine =
+            engine_with_fixture_agent(&[("ACP_FAKE_MALFORMED_REQUEST_PERMISSION", "1")]);
+        engine.settings.acp_agent_command = "already-spawned-above".to_string();
+
+        engine.ai_send_message("please edit".to_string());
+
+        poll_acp_until(&mut engine, |e| !e.ai_streaming);
+        assert!(
+            !engine.ai_streaming,
+            "the error reply must actually reach the (fake) agent and let \
+             the turn end cleanly within {TEST_DEADLINE:?}, not hang \
+             forever waiting for a dialog that never opens"
+        );
+        assert!(
+            engine.dialog.is_none(),
+            "a request with no options array has nothing a human could \
+             select — it must never open a dialog"
+        );
+        assert!(
+            engine.acp_pending_permission.is_none(),
+            "a malformed request must never be tracked as parked"
         );
     }
 }

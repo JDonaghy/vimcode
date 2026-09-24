@@ -61,7 +61,17 @@
 #                           and exits immediately without reading a reply —
 #                           for the "agent dies with a permission dialog
 #                           open" acceptance criterion (must not hang, must
-#                           not write to the now-dead stdin).
+#                           not write to the now-dead stdin). With
+#                           $ACP_FAKE_MALFORMED_REQUEST_PERMISSION set:
+#                           emits a session/request_permission request
+#                           (fixed id 9003) with no "options" array —
+#                           malformed per the ACP v1 schema (there is
+#                           nothing a human could select) — then BLOCKS
+#                           reading one line before replying end_turn, same
+#                           shape as the well-formed variant, so a test can
+#                           confirm the client answers with a JSON-RPC error
+#                           immediately (never opens a dialog) and that
+#                           reply still reaches this process.
 #   - session/cancel     -> notification, silently acknowledged (no reply).
 #   - anything else      -> logged to stderr, ignored.
 #
@@ -109,6 +119,14 @@ while IFS= read -r line; do
       elif [ -n "$ACP_FAKE_DIE_DURING_PERMISSION" ]; then
         printf '{"jsonrpc":"2.0","id":9002,"method":"session/request_permission","params":{"sessionId":"sess-1","toolCall":{"title":"Edit src/main.rs","kind":"edit","locations":[{"path":"src/main.rs","line":42}]},"options":[{"optionId":"allow-once","name":"Allow Once","kind":"allow_once"},{"optionId":"allow-always","name":"Always Allow","kind":"allow_always"},{"optionId":"reject-once","name":"Reject","kind":"reject_once"}]}}\n'
         exit 9
+      elif [ -n "$ACP_FAKE_MALFORMED_REQUEST_PERMISSION" ]; then
+        printf '{"jsonrpc":"2.0","id":9003,"method":"session/request_permission","params":{"sessionId":"sess-1","toolCall":{"title":"Edit src/main.rs","kind":"edit"}}}\n'
+        # Park: block until the client answers request 9003 out of band —
+        # the client should answer immediately with a JSON-RPC error since
+        # there is no "options" array to select from, never opening a
+        # dialog first.
+        read -r _reply
+        printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id"
       else
         printf '{"jsonrpc":"2.0","id":9001,"method":"fs/read_text_file","params":{"sessionId":"sess-1","path":"/tmp/fake.txt"}}\n'
         # Park: block until the client answers request 9001 out of band.

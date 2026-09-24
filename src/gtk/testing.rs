@@ -4940,13 +4940,19 @@ second line here
         );
         // Labels carry a bracketed hotkey letter (`[A]llow Once`) —
         // `dialog_panel_to_quadraui_dialog`'s formatting, same as the
-        // in-canvas TUI dialog's twin test.
+        // in-canvas TUI dialog's twin test. "Allow Once" and "Always
+        // Allow" both start with 'a'; `acp_handle_permission_request`
+        // de-duplicates hotkeys across a dialog's own buttons (#953
+        // review), so "Always Allow" gets its *next* unclaimed letter
+        // ('l', the first letter after the leading 'a') rather than being
+        // silently unreachable by keyboard.
         let labels: Vec<&str> = opts.buttons.iter().map(|b| b.label.as_str()).collect();
         assert_eq!(
             labels,
-            vec!["[A]llow Once", "[A]lways Allow", "[R]eject"],
+            vec!["[A]llow Once", "A[L]ways Allow", "[R]eject"],
             "the agent's own options must be presented verbatim, not a \
-             hardcoded yes/no"
+             hardcoded yes/no, and each hotkey must be unique within the \
+             dialog"
         );
 
         assert!(
