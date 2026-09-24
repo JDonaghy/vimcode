@@ -25853,6 +25853,304 @@ mod tests {
         );
     }
 
+    // ── #1345: native tool acquisition — driver-tier black-box coverage ──
+    //
+    // Review finding: the only prior coverage for #1345's user-visible
+    // behaviour (a new "Acquiring X…" notification, a new no-terminal
+    // install path, a new post-install status message) drove `Engine`
+    // directly and asserted on internal state
+    // (`tests/extensions.rs::ext_install_with_acquire_runs_no_terminal_
+    // command_and_registers_lsp`), never on painted output. These two
+    // tests close that gap the same way the #1344 tests above do for the
+    // terminal-install path: real `TuiShellApp` + `driver_with_shell`,
+    // assertions on `driver.screen()`.
+    //
+    // `VIMCODE_TEST_DATA_HOME` is also mutated by `core::paths`' and
+    // `core::tool_acquire`'s own tests in this same shared `--lib` binary,
+    // so this uses `paths::VIMCODE_TEST_DATA_HOME_LOCK` rather than a
+    // module-local mutex — see that lock's doc comment for the race a
+    // module-local one produced in practice (a `tool_acquire::tests` test
+    // observed a real, non-test data dir while a `shell_app::tests` test
+    // using its own separate lock was concurrently restoring the var).
+    use crate::core::paths::VIMCODE_TEST_DATA_HOME_LOCK as TOOL_ACQUIRE_ENV_LOCK;
+
+    /// RAII guard: snapshot + restore an environment variable across a test.
+    struct AcquireEnvVarGuard {
+        key: &'static str,
+        old: Option<std::ffi::OsString>,
+    }
+
+    impl AcquireEnvVarGuard {
+        fn set(key: &'static str, value: &std::ffi::OsStr) -> Self {
+            let old = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, old }
+        }
+    }
+
+    impl Drop for AcquireEnvVarGuard {
+        fn drop(&mut self) {
+            match self.old.take() {
+                Some(v) => std::env::set_var(self.key, v),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
+    /// Build a throwaway zip fixture containing a single entry — mirrors
+    /// `tests/extensions.rs`'s `make_fixture_zip`, duplicated here rather
+    /// than shared because integration tests and this crate's own `--lib`
+    /// unit tests are separate compilation units.
+    fn make_acquire_fixture_zip(
+        dir: &std::path::Path,
+        entry_name: &str,
+        contents: &[u8],
+    ) -> std::path::PathBuf {
+        let path = dir.join("archive.zip");
+        let file = std::fs::File::create(&path).unwrap();
+        let mut writer = zip::ZipWriter::new(file);
+        let options: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default();
+        writer.start_file(entry_name, options).unwrap();
+        std::io::Write::write_all(&mut writer, contents).unwrap();
+        writer.finish().unwrap();
+        path
+    }
+
+    /// #1345 core acceptance, painted: a manifest declaring `[lsp.acquire]`
+    /// and no `install_*` must (1) paint "Acquiring …" immediately — no
+    /// terminal pane opens, confirmed via `pending_terminal_command` before
+    /// the driver is even built — and (2) once the background download/
+    /// verify/unpack completes (driven by `driver.tick()` →
+    /// `Engine::poll_idle` → `poll_tool_acquire`, exactly like a live event
+    /// loop), paint the "installed and started" status line.
+    ///
+    /// Verified RED against unfixed `develop`: reverting #1345's engine
+    /// wiring (no `acquire` branch in `ext_install_from_registry`) leaves
+    /// `status_parts` empty and nothing native ever runs, so neither string
+    /// below is ever painted and `poll_until_screen` times out.
+    #[test]
+    fn extension_install_with_acquire_paints_acquiring_then_installed_via_shell_app() {
+        use crate::core::extensions::{ExtensionManifest, LspConfig};
+        use crate::core::settings::TestSettingsPathGuard;
+        use crate::core::tool_acquire::{AcquireConfig, AcquireKind};
+
+        let _lock = TOOL_ACQUIRE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        // Points `Engine::check_settings_reload` (polled every `tick()`,
+        // see `TuiShellApp::tick`) at a private, nonexistent path instead of
+        // the real `~/.config/vimcode/settings.json` — otherwise a
+        // concurrently-running test elsewhere in this shared `--lib` binary
+        // that legitimately writes the real settings file mid-`poll_until_
+        // screen` can fire a real "Settings reloaded" reload, overwriting
+        // `self.message` out from under this test's own assertions
+        // (observed directly: flaked with the real "installed and started"
+        // message replaced by "Settings reloaded" when run alongside
+        // `terminal_ops`/`lsp_ops` tests). Mirrors `app.rs`'s
+        // `handle_poll_tick_reloads_settings_changed_on_disk` — see
+        // `TestSettingsPathGuard`'s doc for why a thread-local override
+        // rather than a `$HOME` mutation.
+        let _settings_guard = TestSettingsPathGuard::install(std::env::temp_dir().join(format!(
+            "vimcode_test_shell_app_acquire_settings_{}_{:?}.json",
+            std::process::id(),
+            std::thread::current().id()
+        )));
+
+        let data_home = std::env::temp_dir().join(format!(
+            "vimcode_test_shell_app_acquire_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&data_home);
+        std::fs::create_dir_all(&data_home).unwrap();
+        let _data_home_guard =
+            AcquireEnvVarGuard::set("VIMCODE_TEST_DATA_HOME", data_home.as_os_str());
+
+        let fixture_dir = std::env::temp_dir().join(format!(
+            "vimcode_test_shell_app_acquire_fixture_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&fixture_dir);
+        std::fs::create_dir_all(&fixture_dir).unwrap();
+        let binary_name = "vimcode-test-shell-acquire-lsp-1345";
+        let archive = make_acquire_fixture_zip(&fixture_dir, binary_name, b"#!fake-lsp-server");
+
+        let mut app = TuiShellApp::new_for_test();
+        let ext_name = "vimcode-test-shell-acquire-ext-1345".to_string();
+        app.engine.ext_registry = Some(vec![ExtensionManifest {
+            name: ext_name.clone(),
+            display_name: "Acquire Test Extension (shell_app)".to_string(),
+            language_ids: vec!["vimcode-test-shell-acquire-lang-1345".to_string()],
+            lsp: LspConfig {
+                binary: binary_name.to_string(),
+                acquire: Some(AcquireConfig {
+                    kind: AcquireKind::UrlTemplate,
+                    url: format!("file://{}", archive.display()),
+                    version: "1.0.0".to_string(),
+                    binary_path: binary_name.to_string(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            ..Default::default()
+        }]);
+
+        app.engine.ext_install_from_registry(&ext_name);
+        assert!(
+            app.engine.pending_terminal_command.is_none(),
+            "native acquisition must queue no shell command"
+        );
+
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        driver.render();
+        assert!(
+            driver.screen().to_lowercase().contains("acquiring"),
+            "status line never painted the 'Acquiring …' message; screen:\n{}",
+            driver.screen()
+        );
+
+        assert!(
+            poll_until_screen(&mut driver, Duration::from_secs(20), |screen| {
+                screen.contains("installed and started")
+            }),
+            "command line never painted the finalize message; screen:\n{}",
+            driver.screen()
+        );
+
+        let _ = std::fs::remove_dir_all(&data_home);
+        let _ = std::fs::remove_dir_all(&fixture_dir);
+    }
+
+    /// #1345 review finding: a manifest with both `[lsp.acquire]` and
+    /// `[dap.acquire]` spawns two concurrent background acquisitions; when
+    /// both land in the same `poll_tool_acquire` tick (the common case for
+    /// two near-instant `file://` fixtures spawned back to back), the
+    /// second leg's outcome must not silently erase the first's status
+    /// text — the same "DAP outcome clobbering LSP success" class already
+    /// fixed for the terminal-install path (#1344,
+    /// `extension_install_lsp_success_survives_dap_not_found_via_shell_app`
+    /// above), reproduced here for the native-acquisition path this PR
+    /// adds.
+    ///
+    /// The DAP leg's archive deliberately doesn't contain `binary_path`,
+    /// so its acquisition fails with an `Archive` error while the LSP leg
+    /// succeeds — reproducing the realistic "one leg succeeds, one leg
+    /// fails" combination.
+    ///
+    /// Verified RED against `finalize_tool_acquire_group` reverted to
+    /// per-outcome `self.message = format!(...)` assignments (this PR's
+    /// pre-fix shape): whichever leg's background thread happens to send
+    /// its outcome second overwrites `self.message` outright, so one of
+    /// the two assertions below fails depending on completion order —
+    /// exactly the flake-shaped symptom the review flagged.
+    #[test]
+    fn extension_install_lsp_acquire_success_survives_dap_acquire_failure_via_shell_app() {
+        use crate::core::extensions::{DapConfig, ExtensionManifest, LspConfig};
+        use crate::core::settings::TestSettingsPathGuard;
+        use crate::core::tool_acquire::{AcquireConfig, AcquireKind};
+
+        let _lock = TOOL_ACQUIRE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        // See the sibling test above for why this points `check_settings_
+        // reload` away from the real settings file.
+        let _settings_guard = TestSettingsPathGuard::install(std::env::temp_dir().join(format!(
+            "vc_test_acq_combined_settings_{}_{:?}.json",
+            std::process::id(),
+            std::thread::current().id()
+        )));
+
+        let data_home =
+            std::env::temp_dir().join(format!("vc_test_acq_combined_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&data_home);
+        std::fs::create_dir_all(&data_home).unwrap();
+        let _data_home_guard =
+            AcquireEnvVarGuard::set("VIMCODE_TEST_DATA_HOME", data_home.as_os_str());
+
+        let fixture_dir = std::env::temp_dir().join(format!(
+            "vc_test_acq_combined_fixture_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&fixture_dir);
+        std::fs::create_dir_all(&fixture_dir).unwrap();
+
+        let lsp_binary_name = "vc-acq-lsp-1345";
+        let lsp_archive =
+            make_acquire_fixture_zip(&fixture_dir, lsp_binary_name, b"#!fake-lsp-server");
+
+        // A second, distinct archive whose one entry deliberately does NOT
+        // match the DAP leg's `binary_path` below, so extraction fails with
+        // `AcquireError::Archive("... not found in archive")`.
+        let dap_fixture_dir = fixture_dir.join("dap");
+        std::fs::create_dir_all(&dap_fixture_dir).unwrap();
+        let dap_archive =
+            make_acquire_fixture_zip(&dap_fixture_dir, "unrelated-entry", b"#!fake-dap-adapter");
+        let dap_binary_name = "vc-acq-dap-1345";
+
+        let mut app = TuiShellApp::new_for_test();
+        let ext_name = "vc-acq-ext-1345".to_string();
+        app.engine.ext_registry = Some(vec![ExtensionManifest {
+            name: ext_name.clone(),
+            display_name: "Acquire Combined Test Extension (shell_app)".to_string(),
+            language_ids: vec!["vc-acq-lang-1345".to_string()],
+            lsp: LspConfig {
+                binary: lsp_binary_name.to_string(),
+                acquire: Some(AcquireConfig {
+                    kind: AcquireKind::UrlTemplate,
+                    url: format!("file://{}", lsp_archive.display()),
+                    version: "1.0.0".to_string(),
+                    binary_path: lsp_binary_name.to_string(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            dap: DapConfig {
+                adapter: "vc-acq-adapter-1345".to_string(),
+                binary: dap_binary_name.to_string(),
+                acquire: Some(AcquireConfig {
+                    kind: AcquireKind::UrlTemplate,
+                    url: format!("file://{}", dap_archive.display()),
+                    version: "1.0.0".to_string(),
+                    binary_path: dap_binary_name.to_string(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            ..Default::default()
+        }]);
+
+        app.engine.ext_install_from_registry(&ext_name);
+        assert!(
+            app.engine.pending_terminal_command.is_none(),
+            "native acquisition must queue no shell command"
+        );
+
+        // Wide row (mirrors `extension_install_lsp_success_survives_dap_
+        // not_found_via_shell_app` above): the joined LSP+DAP message is
+        // long, and a narrower row would truncate it before the "failed to
+        // acquire" text this test checks for.
+        let mut driver = driver_with_shell(app, config(), 300, 24);
+
+        assert!(
+            poll_until_screen(&mut driver, Duration::from_secs(20), |screen| {
+                screen.contains("failed to acquire")
+            }),
+            "command line never painted the DAP acquisition failure; screen:\n{}",
+            driver.screen()
+        );
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("installed and started"),
+            "the LSP acquisition success message must survive alongside the \
+             DAP acquisition failure, not be overwritten by it; screen:\n{screen}"
+        );
+
+        let _ = std::fs::remove_dir_all(&data_home);
+        let _ = std::fs::remove_dir_all(&fixture_dir);
+    }
+
     // ── #990: v0.11.0 TUI minimap rendering bug suite ───────────────────
     //
     // Three separately-gated painted-output scenarios, one per reported

@@ -259,6 +259,23 @@ pub fn strip_unc_prefix(path: &Path) -> std::borrow::Cow<'_, Path> {
     std::borrow::Cow::Borrowed(path)
 }
 
+/// Serializes every test *anywhere in this crate* that mutates the
+/// process-global `VIMCODE_TEST_DATA_HOME` env var (read by
+/// [`vimcode_data_dir`]) against every other one. Shared rather than a
+/// per-module lock (this module's own tests, `tool_acquire.rs`'s tests, and
+/// `tui_main/shell_app.rs`'s driver-tier tests all set this var) because
+/// `cargo test` runs `#[test]`s in parallel threads within one process by
+/// default — three independent, non-cooperating locks each guarding the
+/// same global var is exactly the shape that raced in practice: a
+/// `tool_acquire::tests` test observed a real `$HOME/.local/share/vimcode`
+/// path instead of its own throwaway dir because a concurrently-running
+/// `shell_app::tests` test (using its own, different lock) had already
+/// restored the *previous* value by the time the first test's guard read
+/// it back. See `crate::core::engine::terminal_ops::tests::HOME_ENV_LOCK`'s
+/// doc comment for the same tradeoff applied to `HOME`/`PATH` instead.
+#[cfg(test)]
+pub(crate) static VIMCODE_TEST_DATA_HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -287,10 +304,10 @@ mod tests {
 
     // ── #1345: managed tools dir ────────────────────────────────────────────
     //
-    // `VIMCODE_TEST_DATA_HOME` is process-global env state; a `Mutex` (mirroring
-    // `lsp_manager`'s `HOMEBREW_ENV_LOCK` / `VIMCODE_TEST_HOMEBREW_PREFIXES`
-    // pattern for #917) serializes the tests below so they can't interleave.
-    static DATA_HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // `VIMCODE_TEST_DATA_HOME` is process-global env state, mutated by tests
+    // in this module, `tool_acquire.rs`, and `tui_main/shell_app.rs` alike —
+    // see `super::VIMCODE_TEST_DATA_HOME_LOCK`'s doc comment for why they
+    // all share one lock rather than each guarding their own.
 
     struct DataHomeGuard {
         old: Option<std::ffi::OsString>,
@@ -323,7 +340,9 @@ mod tests {
 
     #[test]
     fn managed_tools_dir_is_under_data_dir() {
-        let _lock = DATA_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = super::VIMCODE_TEST_DATA_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let guard = DataHomeGuard::new("layout");
         assert_eq!(managed_tools_dir(), guard.dir.join("tools"));
         assert_eq!(
@@ -334,7 +353,9 @@ mod tests {
 
     #[test]
     fn managed_tool_current_version_absent_by_default() {
-        let _lock = DATA_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = super::VIMCODE_TEST_DATA_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let _guard = DataHomeGuard::new("absent");
         assert_eq!(managed_tool_current_version("terraform-ls"), None);
         assert_eq!(managed_tool_binary_path("terraform-ls"), None);
@@ -342,7 +363,9 @@ mod tests {
 
     #[test]
     fn set_managed_tool_current_then_binary_path_resolves() {
-        let _lock = DATA_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = super::VIMCODE_TEST_DATA_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let _guard = DataHomeGuard::new("resolve");
 
         let version_dir = managed_tool_version_dir("terraform-ls", "0.32.0");
@@ -365,7 +388,9 @@ mod tests {
         // The extracted filename can differ from the resolver's lookup key
         // (see the doc comment on `managed_tool_binary_path`) — cover that
         // fallback explicitly rather than only the exact-name-match path.
-        let _lock = DATA_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = super::VIMCODE_TEST_DATA_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let _guard = DataHomeGuard::new("fallback");
 
         let version_dir = managed_tool_version_dir("some-lsp", "1.0.0");

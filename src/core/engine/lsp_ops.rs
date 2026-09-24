@@ -19,6 +19,14 @@ pub(crate) struct ToolAcquireOutcome {
     pub leg: ToolAcquireLeg,
     pub tool_name: String,
     pub result: Result<std::path::PathBuf, String>,
+    /// The specific notification this outcome must resolve — never marked
+    /// done "by kind" (review finding on #1345): a manifest with both
+    /// `[lsp.acquire]` and `[dap.acquire]` spawns two concurrent native
+    /// acquisitions, both using `NotificationKind::LspInstall`, so
+    /// `notify_done_by_kind` would mark *both* notifications done the moment
+    /// either leg finishes — a still-downloading DAP adapter would flip to
+    /// "done" in the UI the instant the LSP leg completes (or vice versa).
+    pub notification_id: u64,
 }
 
 impl Engine {
@@ -318,7 +326,7 @@ impl Engine {
             } else if let Some(acquire) = manifest.lsp.acquire.clone() {
                 let lsp_key = format!("ext:{ext_name}:lsp");
                 self.lsp_installing.insert(lsp_key.clone());
-                self.notify(
+                let notification_id = self.notify(
                     NotificationKind::LspInstall,
                     &format!("Acquiring {}…", manifest.lsp.binary),
                 );
@@ -331,6 +339,7 @@ impl Engine {
                     },
                     manifest.lsp.binary.clone(),
                     acquire,
+                    notification_id,
                 );
                 has_native_acquire = true;
                 status_parts.push(format!("LSP: acquiring {}…", manifest.lsp.binary));
@@ -371,7 +380,7 @@ impl Engine {
             } else if let Some(acquire) = manifest.dap.acquire.clone() {
                 let dap_key = format!("dap:{}", manifest.dap.adapter);
                 self.lsp_installing.insert(dap_key.clone());
-                self.notify(
+                let notification_id = self.notify(
                     NotificationKind::LspInstall,
                     &format!("Acquiring {}…", manifest.dap.adapter),
                 );
@@ -381,6 +390,7 @@ impl Engine {
                     ToolAcquireLeg::Dap,
                     manifest.dap.binary.clone(),
                     acquire,
+                    notification_id,
                 );
                 has_native_acquire = true;
                 status_parts.push(format!("DAP: acquiring {}…", manifest.dap.adapter));
@@ -476,6 +486,7 @@ impl Engine {
         leg: ToolAcquireLeg,
         tool_name: String,
         acquire: crate::core::tool_acquire::AcquireConfig,
+        notification_id: u64,
     ) {
         let (tx, rx) = std::sync::mpsc::channel();
         let bg_tool_name = tool_name.clone();
@@ -489,6 +500,7 @@ impl Engine {
                 leg,
                 tool_name: bg_tool_name,
                 result,
+                notification_id,
             });
         });
         self.tool_acquire_tasks.insert(install_key, rx);
@@ -509,68 +521,107 @@ impl Engine {
         for (key, _) in &completed {
             self.tool_acquire_tasks.remove(key);
         }
+
+        // Group by extension (review finding on #1345): a manifest with
+        // both `[lsp.acquire]` and `[dap.acquire]` spawns two concurrent
+        // background acquisitions, and if both land in the same poll tick,
+        // finalizing them one at a time straight into `self.message` would
+        // let the second overwrite the first's success/failure text —
+        // exactly the "DAP outcome clobbering LSP success" class fixed for
+        // the terminal-install path in `finalize_install_from_terminal`
+        // (#1344). Outcomes for the same extension are collected and joined
+        // into one status line instead; outcomes for different extensions
+        // still each get their own call (and so the last one to finalize
+        // wins `self.message` — a pre-existing, unrelated property of a
+        // single-line status bar shared across all engine operations).
+        let mut order: Vec<String> = Vec::new();
+        let mut by_ext: std::collections::HashMap<String, Vec<ToolAcquireOutcome>> =
+            std::collections::HashMap::new();
         for (_, outcome) in completed {
-            self.finalize_tool_acquire(outcome);
+            if !by_ext.contains_key(&outcome.ext_name) {
+                order.push(outcome.ext_name.clone());
+            }
+            by_ext
+                .entry(outcome.ext_name.clone())
+                .or_default()
+                .push(outcome);
+        }
+        for ext_name in order {
+            if let Some(outcomes) = by_ext.remove(&ext_name) {
+                self.finalize_tool_acquire_group(outcomes);
+            }
         }
         true
     }
 
-    /// Apply the result of a completed background acquisition: on success,
-    /// register + start the LSP server (mirrors
-    /// `terminal_ops::finalize_install_from_terminal`'s LSP branch) or, for
-    /// a DAP leg, just report success — `dap_manager` re-resolves the
-    /// binary lazily at debug-start time. On failure, delete nothing further
-    /// (`tool_acquire::acquire_and_install` already cleaned up its own
-    /// partial state) and surface the error.
-    fn finalize_tool_acquire(&mut self, outcome: ToolAcquireOutcome) {
-        self.lsp_installing.remove(&outcome.install_key);
-        self.notify_done_by_kind(&NotificationKind::LspInstall, None);
+    /// Apply the results of one or more completed background acquisitions
+    /// belonging to the same extension: on success, register + start the
+    /// LSP server (mirrors `terminal_ops::finalize_install_from_terminal`'s
+    /// LSP branch) or, for a DAP leg, just report success — `dap_manager`
+    /// re-resolves the binary lazily at debug-start time. On failure,
+    /// delete nothing further (`tool_acquire::acquire_and_install` already
+    /// cleaned up its own partial state) and surface the error. Each
+    /// outcome resolves its own notification by ID (never "by kind" — see
+    /// `ToolAcquireOutcome::notification_id`'s doc comment), and the
+    /// per-leg messages are joined into one status line, mirroring
+    /// `finalize_install_from_terminal`'s collect-then-join pattern so a
+    /// second leg's outcome can never silently erase the first's.
+    fn finalize_tool_acquire_group(&mut self, outcomes: Vec<ToolAcquireOutcome>) {
+        let mut messages: Vec<String> = Vec::new();
+        for outcome in outcomes {
+            self.lsp_installing.remove(&outcome.install_key);
+            self.notify_done(outcome.notification_id, None);
 
-        let ext_name = &outcome.ext_name;
-        match outcome.result {
-            Ok(bin_path) => {
-                crate::core::lsp_manager::install_log(&format!(
-                    "[ext-install] '{ext_name}' acquired {} -> {}",
-                    outcome.tool_name,
-                    bin_path.display()
-                ));
-                match outcome.leg {
-                    ToolAcquireLeg::Lsp { lang_ids, args } => {
-                        self.ensure_lsp_manager();
-                        for lsp_lang in &lang_ids {
-                            let config = lsp::LspServerConfig {
-                                command: outcome.tool_name.clone(),
-                                args: args.clone(),
-                                languages: vec![lsp_lang.clone()],
-                                ..Default::default()
-                            };
-                            if let Some(mgr) = &mut self.lsp_manager {
-                                mgr.add_registry_entry(config);
-                                mgr.ensure_server_for_language(lsp_lang);
+            let ext_name = outcome.ext_name.clone();
+            match outcome.result {
+                Ok(bin_path) => {
+                    crate::core::lsp_manager::install_log(&format!(
+                        "[ext-install] '{ext_name}' acquired {} -> {}",
+                        outcome.tool_name,
+                        bin_path.display()
+                    ));
+                    match outcome.leg {
+                        ToolAcquireLeg::Lsp { lang_ids, args } => {
+                            self.ensure_lsp_manager();
+                            for lsp_lang in &lang_ids {
+                                let config = lsp::LspServerConfig {
+                                    command: outcome.tool_name.clone(),
+                                    args: args.clone(),
+                                    languages: vec![lsp_lang.clone()],
+                                    ..Default::default()
+                                };
+                                if let Some(mgr) = &mut self.lsp_manager {
+                                    mgr.add_registry_entry(config);
+                                    mgr.ensure_server_for_language(lsp_lang);
+                                }
+                                self.lsp_reopen_buffers_for_language(lsp_lang);
                             }
-                            self.lsp_reopen_buffers_for_language(lsp_lang);
+                            messages.push(format!(
+                                "LSP server for '{ext_name}' installed and started ({})",
+                                outcome.tool_name
+                            ));
                         }
-                        self.message = format!(
-                            "LSP server for '{ext_name}' installed and started ({})",
-                            outcome.tool_name
-                        );
-                    }
-                    ToolAcquireLeg::Dap => {
-                        self.message =
-                            format!("DAP adapter for '{ext_name}' installed — press F5 to debug");
+                        ToolAcquireLeg::Dap => {
+                            messages.push(format!(
+                                "DAP adapter for '{ext_name}' installed — press F5 to debug"
+                            ));
+                        }
                     }
                 }
+                Err(e) => {
+                    crate::core::lsp_manager::install_log(&format!(
+                        "[ext-install] '{ext_name}' acquisition of {} failed: {e}",
+                        outcome.tool_name
+                    ));
+                    messages.push(format!(
+                        "Install for '{ext_name}' failed to acquire {}: {e}",
+                        outcome.tool_name
+                    ));
+                }
             }
-            Err(e) => {
-                crate::core::lsp_manager::install_log(&format!(
-                    "[ext-install] '{ext_name}' acquisition of {} failed: {e}",
-                    outcome.tool_name
-                ));
-                self.message = format!(
-                    "Install for '{ext_name}' failed to acquire {}: {e}",
-                    outcome.tool_name
-                );
-            }
+        }
+        if !messages.is_empty() {
+            self.message = messages.join(" | ");
         }
     }
 
