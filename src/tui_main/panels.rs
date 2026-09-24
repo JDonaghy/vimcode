@@ -220,13 +220,17 @@ fn fill_rect(backend: &mut dyn quadraui::Backend, area: Rect, fg: Color, bg: Col
 /// #635 (Stage 6b) retires that stand-in now that #531 has landed: the
 /// chrome paints through the real trait call below.
 ///
-/// #1242: background + header/search chrome now go through
-/// `render::paint_sidebar_panel_chrome` (quadraui#1041's `SidebarPanelBody`)
-/// — same two backend calls, now composed through the shared primitive
-/// instead of hand-derived row-slicing. GTK's `PANEL_SETTINGS` arm paints
-/// no chrome (`chrome: SidebarPanelChrome::None`) — a pre-existing
-/// asymmetry `TUI_AUDIT_R2.md` §5 Wave 1 item 2 tracks separately, not
-/// resolved here.
+/// #1343: the shell's own `AppShell` sidebar header now paints " SETTINGS"
+/// above `area` (quadraui#1055, landed via #1356's pin bump — Settings is a
+/// bottom item, so it wasn't reliable until then). This panel used to paint
+/// its own " SETTINGS" header row on top of that via
+/// `render::paint_sidebar_panel_chrome`'s `SidebarPanelChrome::
+/// HeaderAndSearch` — a duplicate header #1256 found (`extensions_header_
+/// is_painted` had a GTK-side twin: GTK painted *no* chrome for either
+/// panel, so the two backends drifted in opposite directions). Now paints
+/// only the filter row, through the shared `render::
+/// paint_sidebar_search_row` GTK's `App::paint_sidebar_panel_rung`
+/// `PANEL_SETTINGS` arm uses — one implementation instead of two.
 pub(super) fn render_settings_panel(
     backend: &mut dyn quadraui::Backend,
     area: Rect,
@@ -244,24 +248,22 @@ pub(super) fn render_settings_panel(
         area.width as f32,
         area.height as f32,
     );
-    let panel = render::SidebarPanelBody {
-        background: Some(theme.tab_bar_bg),
-        chrome: render::SidebarPanelChrome::HeaderAndSearch {
-            header: " SETTINGS".to_string(),
-            query: engine.settings_query.clone(),
-            placeholder: String::new(),
-            active: engine.settings_input_active,
-        },
-        scrollbar_gutter: None,
-    };
-    let layout = render::paint_sidebar_panel_chrome(backend, &panel, q_rect);
+    backend.draw_solid_fill(q_rect, theme.tab_bar_bg);
+    let body_rect = render::paint_sidebar_search_row(
+        backend,
+        q_rect,
+        &engine.settings_query,
+        "",
+        engine.settings_input_active,
+        theme,
+    );
 
     // Scrollable form content, via the shared `quadraui::Form` +
     // `FormController` primitive (#479). Inline-edit rows are driven
     // through `FieldKind::TextInput` with a cursor (see
     // `render::settings_to_form`) so there is no separate manual
     // renderer for the edit-in-progress state.
-    if layout.body_rect.height <= 0.0 {
+    if body_rect.height <= 0.0 {
         return;
     }
 
@@ -271,12 +273,12 @@ pub(super) fn render_settings_panel(
     // read this back instead of re-deriving `y = area.y + 2` by hand, which
     // drifted the moment the sidebar's own origin was not `y == 0` (e.g. the
     // menu bar visible).
-    engine.settings_form_rect.set(layout.body_rect);
+    engine.settings_form_rect.set(body_rect);
     backend.set_theme(super::quadraui_tui::q_theme(theme));
     engine
         .settings_form_controller
         .borrow_mut()
-        .render_and_cache(backend, layout.body_rect);
+        .render_and_cache(backend, body_rect);
 }
 
 /// Render the project search panel via SidebarSystem (Form + TreeView).
@@ -882,20 +884,22 @@ pub(super) fn render_panel_hover_popup(
 
 /// Render the Extensions sidebar panel.
 ///
-/// Migrated to `quadraui::MultiSectionView` (#293). The panel header
-/// row + search-input row stay panel-specific chrome; the two
-/// "INSTALLED" / "AVAILABLE" sections (each with its own `TreeView`
-/// body) are now a `MultiSectionView` built by
-/// `render::ext_sidebar_to_multi_section_view` and rasterised via
-/// `quadraui::tui::draw_multi_section_view`. Both the section-header
-/// chevrons / titles and per-section scrollbars come from the
-/// primitive — there is no per-backend section-walk code that paint
+/// Migrated to `quadraui::MultiSectionView` (#293). The two "INSTALLED" /
+/// "AVAILABLE" sections (each with its own `TreeView` body) are a
+/// `MultiSectionView` built by `render::ext_sidebar_to_multi_section_view`
+/// and rasterised via `quadraui::tui::draw_multi_section_view`. Both the
+/// section-header chevrons / titles and per-section scrollbars come from
+/// the primitive — there is no per-backend section-walk code that paint
 /// and click could disagree on (the structural fix for the #281 bug
 /// classes).
-/// #605: widened from `&mut TuiBackend` + `&mut Frame` to `&mut dyn Backend`.
-/// The two chrome rows were the only raw-`Buffer` writes left; the local
-/// `write_row` closure they used is exactly what [`fill_row`] does, so it
-/// collapsed into that.
+///
+/// #1343: this panel used to also hand-paint its own " EXTENSIONS" header
+/// row (via [`fill_row`]) on top of the shell's own `AppShell` sidebar
+/// header — a real double-header #1256 found by driving the shipped TUI.
+/// The shell already paints " EXTENSIONS " above `area`, so only the
+/// search row is painted here now, through the shared `render::
+/// paint_sidebar_search_row` GTK's `App::paint_sidebar_panel_rung`
+/// `PANEL_EXTENSIONS` arm uses.
 pub(super) fn render_ext_sidebar(
     backend: &mut dyn quadraui::Backend,
     screen: &render::ScreenLayout,
@@ -909,69 +913,39 @@ pub(super) fn render_ext_sidebar(
 
     // #1252: reads the frame's own `screen` — see `render_sidebar_content`'s
     // doc comment.
-    let Some(ref ext) = screen.ext_sidebar else {
+    if screen.ext_sidebar.is_none() {
         return;
-    };
-
-    let header_fg = theme.status_fg;
-    let header_bg = theme.status_bg;
-    let default_fg = theme.foreground;
-    let dim_fg = theme.line_number_fg;
-    let sel_bg = theme.fuzzy_selected_bg;
-    let panel_bg = theme.completion_bg;
-
-    // ── Chrome rows: panel header (row 0) + search box (row 1) ───────────────
-    if area.height >= 1 {
-        let hdr = if ext.fetching {
-            " \u{eb85} EXTENSIONS  (fetching…)".to_string()
-        } else {
-            " \u{eb85} EXTENSIONS".to_string()
-        };
-        fill_row(
-            backend, area.x, area.y, area.width, &hdr, header_fg, header_bg,
-        );
     }
 
-    if area.height >= 2 {
-        let search_bg = if ext.input_active { sel_bg } else { panel_bg };
-        let search_fg = if ext.input_active || !ext.query.is_empty() {
-            default_fg
-        } else {
-            dim_fg
-        };
-        let search_text = if ext.input_active {
-            format!(" \u{f002} {}|", ext.query)
-        } else if ext.query.is_empty() {
-            " \u{f002} Search extensions (press /)".to_string()
-        } else {
-            format!(" \u{f002} {}", ext.query)
-        };
-        fill_row(
-            backend,
-            area.x,
-            area.y + 1,
-            area.width,
-            &search_text,
-            search_fg,
-            search_bg,
-        );
-    }
+    let q_rect = quadraui::Rect::new(
+        area.x as f32,
+        area.y as f32,
+        area.width as f32,
+        area.height as f32,
+    );
+    backend.set_theme(super::quadraui_tui::q_theme(theme));
+    let body_rect = render::paint_sidebar_search_row(
+        backend,
+        q_rect,
+        &engine.ext_sidebar_query,
+        "Search extensions (press /)",
+        engine.ext_sidebar_input_active,
+        theme,
+    );
 
     // ── SidebarSystem body: rest of the panel ──────────────────────────────
-    if area.height <= 2 {
+    if body_rect.height <= 0.0 {
+        engine.ext_sidebar_body_rect.set(body_rect);
         return;
     }
-    let msv_rect = quadraui::Rect::new(
-        area.x as f32,
-        (area.y + 2) as f32,
-        area.width as f32,
-        (area.height - 2) as f32,
-    );
-    engine.ext_sidebar_body_rect.set(msv_rect);
+    engine.ext_sidebar_body_rect.set(body_rect);
     render::populate_ext_sidebar_system(engine);
     let q_theme = super::quadraui_tui::q_theme(theme);
     backend.set_theme(q_theme);
-    engine.ext_sidebar_system.borrow().render(backend, msv_rect);
+    engine
+        .ext_sidebar_system
+        .borrow()
+        .render(backend, body_rect);
 }
 
 // ─── AI assistant sidebar panel ───────────────────────────────────────────────

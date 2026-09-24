@@ -1329,36 +1329,25 @@ pub(crate) fn assert_text_metrics_backend_applies_metrics<B: TextMetricsBackend>
 // instead of ever reaching the picker's own dismiss routing. Folded into
 // the same `intercepts_blocked` gate every panel intercept already shares.
 ///
-/// Empty as of #1276: #1089 fixed the shared `crate::app::App` paint/click
+/// Empty as of #1343: #1089 fixed the shared `crate::app::App` paint/click
 /// path (`src/app.rs`'s `ext:` arm + `try_route_sidebar_mouse_event`'s
 /// `ExtPanel` arm) for all four backends, but its three `::macos`-suffixed
 /// plugin-panel scenarios were left gated here because there was no macOS
 /// runner available to confirm them at the time. The macOS native/AppKit CI
 /// lane has since confirmed all three pass, so `known_bug_gate` fired
 /// exactly as designed (see its doc comment) and those entries were
-/// deleted. Every scenario in this suite now takes the plain `Pass` /
-/// `Regression` arms of [`GateOutcome`] — there is currently no bug this
-/// table needs to track.
-pub(crate) const KNOWN_BUGS: &[&str] = &[
-    // #1256: the shared `App` (GTK, and the `::tui` control arm that wraps
-    // the same `App`) paints no search/filter row for the Settings and
-    // Extensions sidebars. The shipped TUI (`::tui_prod`) paints both. Whether
-    // to converge (and in which direction) is ruled on by #1258 — delete
-    // these entries in whichever PR lands that ruling's fix. See
-    // `issue_1256_sidebar_chrome` below.
-    //
-    // The Settings-header-naming pair that used to live here
-    // (`settings_header_names_settings::{gtk,tui}`) was fixed by #1356's
-    // quadraui bump (quadraui#1055: `AppShell::show_panel` now accepts a
-    // bottom item's id, so `App`/`TuiShellApp`'s `on_shell_event_ctx` can
-    // opt Settings into owning the sidebar header) and deleted here —
-    // `known_bug_gate` reported `FixLanded` once the bump landed, exactly
-    // as designed.
-    "issue_1256_sidebar_chrome::settings_filter_row_is_painted::gtk",
-    "issue_1256_sidebar_chrome::settings_filter_row_is_painted::tui",
-    "issue_1256_sidebar_chrome::extensions_search_row_is_painted::gtk",
-    "issue_1256_sidebar_chrome::extensions_search_row_is_painted::tui",
-];
+/// deleted.
+///
+/// The `issue_1256_sidebar_chrome::{settings_filter_row_is_painted,
+/// extensions_search_row_is_painted}::{gtk,tui}` quartet that used to live
+/// here (#1258's ruling: one shared `render::paint_sidebar_search_row`,
+/// called by both GTK's `App::paint_sidebar_panel_rung` and the shipped
+/// TUI's `tui_main::panels::render_settings_panel`/`render_ext_sidebar`)
+/// was fixed by #1343 and deleted here — `known_bug_gate` reported
+/// `FixLanded` once the fix landed, exactly as designed. Every scenario in
+/// this suite now takes the plain `Pass`/`Regression` arms of
+/// [`GateOutcome`] — there is currently no bug this table needs to track.
+pub(crate) const KNOWN_BUGS: &[&str] = &[];
 
 /// A saved `std::panic::set_hook`/`take_hook` closure — named so
 /// `known_bug_gate_outcome`'s suppress/restore `RestoreHook` doesn't need
@@ -3980,11 +3969,12 @@ mod issue_1064_take_requested_panel {
     }
 }
 
-/// #1256: does GTK compose the Settings/Extensions sidebar header and
+/// #1256/#1343: does GTK compose the Settings/Extensions sidebar header and
 /// search chrome somewhere other than `App::paint_sidebar_panel_rung`
-/// (whose `PANEL_SETTINGS`/`PANEL_EXTENSIONS` arms paint only the body
-/// widget), or is it missing? Answered here by driving all three shells,
-/// each panel opened by a real click on its activity-bar icon:
+/// (whose `PANEL_SETTINGS`/`PANEL_EXTENSIONS` arms used to paint only the
+/// body widget), or is it missing? Originally answered by driving all
+/// three shells, each panel opened by a real click on its activity-bar
+/// icon, which found:
 ///
 /// | | `gtk` / `tui` (shared `App`) | `tui_prod` (`TuiShellApp`) |
 /// |---|---|---|
@@ -3993,13 +3983,17 @@ mod issue_1064_take_requested_panel {
 /// | Settings header | " SETTINGS " — fixed by #1356's quadraui bump (quadraui#1055/#1056): `AppShell::show_panel` now accepts the Settings bottom item's id, and `App::on_shell_event_ctx`'s `BottomItemClicked` arm opts into it by calling `ctx.shell_mut().show_panel(id)`, same as quadraui's own `AppShellDemo` | runner header "Menu", masked by `render_settings_panel`'s own " SETTINGS" row |
 /// | Settings filter row | **none** — `settings_query` still filters the form, invisibly | "/ <query>" via `draw_settings_chrome` |
 ///
-/// So the Extensions *header* is composed elsewhere on GTK (ungated test
-/// below); the Settings header was fixed in #1356 (its `settings_header_
-/// names_settings::{gtk,tui}` scenarios are ungated now, below); the two
-/// remaining rows are missing on the shared `App` and stay recorded as a
-/// `KNOWN_BUGS`-gated divergence whose fix #1258 rules on. The gated
-/// bodies encode the shipped TUI's behaviour, so they turn `FixLanded`
-/// (red) the moment the shared `App` gains the row.
+/// #1343 (#1258's ruling) converged both gaps: the shell's own `AppShell`
+/// header is the *only* header on both backends now (title-case
+/// "Extensions"/"Settings" on `tui_prod`'s own `shell_config`, all-caps
+/// "EXTENSIONS"/"SETTINGS" from the shared `App`'s `PanelDefinition`s —
+/// that casing split is real and stays, see the scenarios' own doc
+/// comments below), and both panels paint a search/filter row through the
+/// one shared `render::paint_sidebar_search_row`, called by GTK's
+/// `App::paint_sidebar_panel_rung` and by the shipped TUI's
+/// `tui_main::panels::render_settings_panel`/`render_ext_sidebar` (whose
+/// own hand-painted duplicate header rows are deleted). Every scenario
+/// below is ungated (`KNOWN_BUGS` is empty) as of #1343.
 #[cfg(test)]
 mod issue_1256_sidebar_chrome {
     use super::*;
@@ -4035,9 +4029,17 @@ mod issue_1256_sidebar_chrome {
 
     fn extensions_header_is_painted<D: ConformanceDriver>(driver: &mut D) {
         open_extensions(driver);
+        // Case differs by arm, same as `settings_then_explorer_reclaims_
+        // header` below: the shared `App`'s `PanelDefinition` titles are
+        // all-caps ("EXTENSIONS"), `TuiShellApp::shell_config`'s own are
+        // title-case ("Extensions") — both are the shell's *one* header,
+        // not a second hand-painted row (#1343 deleted the shipped TUI's
+        // duplicate " EXTENSIONS" row that used to paper over this exact
+        // casing gap by accident).
         assert!(
-            driver.screen_has("EXTENSIONS"),
-            "#1256: the Extensions sidebar must paint a header naming it"
+            driver.screen_has("EXTENSIONS") || driver.screen_has("Extensions"),
+            "#1256: the Extensions sidebar must paint a header naming it: {:?}",
+            driver.inventory()
         );
     }
 
@@ -4056,10 +4058,18 @@ mod issue_1256_sidebar_chrome {
             "precondition: clicking the Settings icon must paint the \
              settings form body"
         );
+        // Case differs by arm, same as `settings_then_explorer_reclaims_
+        // header` below and `extensions_header_is_painted` above: the
+        // shared `App`'s `PanelDefinition` titles are all-caps
+        // ("SETTINGS"), `TuiShellApp::shell_config`'s own bottom-item
+        // title is title-case ("Settings").
         assert!(
-            driver.screen_has("SETTINGS") && !driver.screen_has("EXPLORER"),
+            (driver.screen_has("SETTINGS") || driver.screen_has("Settings"))
+                && !driver.screen_has("EXPLORER")
+                && !driver.screen_has("Explorer"),
             "#1256: the Settings sidebar must be headed SETTINGS, not the \
-             previous panel's title"
+             previous panel's title: {:?}",
+            driver.inventory()
         );
     }
 
@@ -4111,6 +4121,52 @@ mod issue_1256_sidebar_chrome {
             !driver.screen_has("Appearance"),
             "#1356: the sidebar body must switch away from the Settings \
              form once Explorer reclaims the sidebar"
+        );
+    }
+
+    /// #1343 new assertion: the shipped TUI must paint exactly *one*
+    /// header naming the Extensions panel — not the shell's own header
+    /// row plus a second, hand-painted duplicate. Before this fix,
+    /// `render_ext_sidebar` painted its own " EXTENSIONS" row on top of
+    /// the shell's — this counts painted text runs instead of just
+    /// checking presence (`extensions_header_is_painted` above), since
+    /// presence alone can't distinguish "painted once" from "painted
+    /// twice" and passed throughout the #1256 double-header bug. Scoped
+    /// to `tui_prod` only: GTK and the `tui` control arm never had a
+    /// hand-painted second header (see this module's doc table above).
+    #[test]
+    fn tui_prod_paints_exactly_one_extensions_header() {
+        let mut h = crate::tui_main::testing::conformance_harness_prod(engine_fixture(), 100, 30);
+        open_extensions(&mut h.driver);
+        let inv = h.driver.inventory();
+        // Case differs by arm (see `extensions_header_is_painted`'s doc) —
+        // `TuiShellApp::shell_config`'s title is "Extensions", not
+        // "EXTENSIONS"; sum both so a regression that reintroduces the
+        // all-caps duplicate still trips this either way.
+        let count = inv.count("EXTENSIONS") + inv.count("Extensions");
+        assert_eq!(
+            count, 1,
+            "#1343: the shipped TUI must paint exactly one Extensions \
+             header, not the shell's plus a second hand-painted \
+             duplicate: {inv:?}"
+        );
+    }
+
+    /// Settings twin of
+    /// [`tui_prod_paints_exactly_one_extensions_header`] — before this
+    /// fix, `render_settings_panel` painted its own " SETTINGS" row on
+    /// top of the shell's (stale, pre-#1356) header.
+    #[test]
+    fn tui_prod_paints_exactly_one_settings_header() {
+        let mut h = crate::tui_main::testing::conformance_harness_prod(engine_fixture(), 100, 30);
+        open_settings(&mut h.driver);
+        let inv = h.driver.inventory();
+        let count = inv.count("SETTINGS") + inv.count("Settings");
+        assert_eq!(
+            count, 1,
+            "#1343: the shipped TUI must paint exactly one Settings \
+             header, not the shell's plus a second hand-painted \
+             duplicate: {inv:?}"
         );
     }
 
