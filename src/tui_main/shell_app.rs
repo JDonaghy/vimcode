@@ -18941,7 +18941,15 @@ mod tests {
         const WIDTH: u16 = 120;
         const HEIGHT: u16 = 40;
 
-        let dir = std::env::temp_dir().join(format!(
+        // Canonicalize the temp root before joining: on macOS
+        // `std::env::temp_dir()` returns a path under `/var/folders/...`,
+        // and `/var` is a symlink to `/private/var`. `file_a` is opened
+        // below by this un-canonicalized path, but the diagnostic is keyed
+        // by `file_a.canonicalize()` — without canonicalizing here first,
+        // those two paths differ (`/var/...` vs `/private/var/...`), the
+        // lookup misses, no diagnostic renders, and the gutter click this
+        // test exercises never opens the popup it's asserting on (#1350).
+        let dir = std::env::temp_dir().canonicalize().unwrap().join(format!(
             "vimcode_test_1292_gutter_prev_{:?}",
             std::thread::current().id()
         ));
