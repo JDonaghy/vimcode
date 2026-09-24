@@ -168,15 +168,20 @@ pub(crate) fn abs_close_record(
     (y_top, y_bot, xs)
 }
 
-/// Collect the visible tab slots (absolute x-ranges) from a `TabBarHits`,
-/// dropping the `(0.0, 0.0)` sentinels for scrolled-off / non-fitting tabs.
-/// The result is a contiguous run starting at the tab bar's `scroll_offset`,
-/// which the drop-zone reorder logic offsets back to absolute tab indices.
-/// (#515)
-pub(crate) fn abs_visible_slots(hits: &quadraui::TabBarHits) -> Vec<(f32, f32)> {
+/// Absolute x-ranges for every tab slot in a `TabBarHits`, index-aligned to
+/// the group's own tab list, with a `(0.0, 0.0)` sentinel left in place for
+/// any tab scrolled off the strip.
+///
+/// #1370: used to filter the sentinels out and return a contiguous
+/// visible-only run (dropped tabs re-added later by offsetting indices by
+/// the tab bar's `scroll_offset`, in `render::build_tab_drop_groups`). That
+/// offsetting is exactly the convention `quadraui::DropGroupRect::tab_slots`
+/// and `PaneDragRect::tab_slots` document natively — index-aligned with
+/// sentinels — so `render::build_tab_drop_ctx` now wants this unfiltered
+/// (#515's original filtering is gone, not just moved).
+pub(crate) fn abs_slot_positions(hits: &quadraui::TabBarHits) -> Vec<(f32, f32)> {
     hits.slot_positions
         .iter()
-        .filter(|&&(a, b)| (a, b) != (0.0, 0.0))
         .map(|&(a, b)| (a as f32, b as f32))
         .collect()
 }
@@ -702,9 +707,12 @@ pub(crate) fn handle_mouse_click(
 
 // Tab-drag drop-zone geometry is now computed in `App::render_content` from the
 // shared `render::screen_to_drop_group_bounds` pipeline and cached on the App for
-// the drag hit-test to reuse — see `cached_drop_groups`. The former GTK-specific
+// the drag hit-test to reuse — see `cached_drop_ctx`. The former GTK-specific
 // `build_gtk_tab_slots` / `compute_tab_drop_zone` helpers (which depended on the
-// legacy per-backend pixel maps) were removed in #515.
+// legacy per-backend pixel maps) were removed in #515; `compute_tab_drop_zone`
+// itself (vimcode's own geometry adapter over quadraui's `compute_drop_zone`)
+// was later replaced by `render::resolve_tab_drop_zone`, which resolves through
+// quadraui's host-owned-model `resolve_tab_drop` instead (#1370).
 
 /// Handle mouse double-click — select word at position.
 #[allow(clippy::too_many_arguments)]

@@ -6583,16 +6583,20 @@ pub enum TabDragMove {
 /// invariants checkable: a `source` can only exist while `dragging`, and
 /// `press` and `dragging` are never both set.
 ///
-/// **#822 asks this to be replaced by `quadraui::compose::TabGroupController`.**
-/// That adoption was investigated and correctly declined for now:
+/// **#822 asked this to be replaced by `quadraui::compose::TabGroupController`
+/// wholesale.** That adoption was investigated and correctly declined:
 /// `TabGroupController` owns its own `Vec<Pane>`/`GroupLayout` model, and
 /// vimcode already owns the authoritative model in `Engine` — adopting it
 /// as-is would mean mirroring `Engine`'s editor-group state into a second
-/// source of truth. The upstream gap this implies (an external-model
-/// adoption path for `TabGroupController`) is drafted, not yet filed, in
-/// `docs/PENDING_QUADRAUI_ISSUES.md`. Per `CLAUDE.md`'s Platform-Neutrality
-/// Rule, that filing — not new code here — is the correct next step, and
-/// #822 must stay open behind it, not close on this investigation alone.
+/// source of truth, which this state machine still deliberately does not do.
+/// #1370 landed the upstream gap that made a *partial* adoption possible
+/// instead: `quadraui::compose::resolve_tab_drop` (quadraui#998) takes the
+/// host's own drag-source indices and geometry and returns a position-based
+/// `TabDropInstruction`, with no owned `Vec<Pane>` on either side. This
+/// struct still owns the arm → threshold → track → commit sequencing (that
+/// part has no quadraui equivalent to adopt), but the *geometry resolution*
+/// step in the middle now goes through `resolve_tab_drop_zone`, which calls
+/// straight into `resolve_tab_drop` — see that function's doc comment.
 #[derive(Debug, Clone)]
 pub struct TabDragState {
     /// Where the left button went down inside a tab bar, until either the
@@ -6602,7 +6606,11 @@ pub struct TabDragState {
     source: Option<(GroupId, usize)>,
     /// Latest pointer position, for the drag ghost.
     cursor: Option<(f64, f64)>,
-    /// Latest computed drop zone, for the drop overlay and for the commit.
+    /// Latest computed drop zone, for the commit. #1370: no longer read by
+    /// the drop *overlay* — that's now a pure query recomputed fresh from
+    /// painted geometry each frame ([`tab_drop_overlay`]), independent of
+    /// this cached, mutation-only value (see that function's doc comment
+    /// for why the two must not share one cache).
     zone: crate::core::window::DropZone,
     dragging: bool,
 }
@@ -6655,11 +6663,6 @@ impl TabDragState {
     /// `(group, tab index)` being dragged, for the ghost label's text.
     pub fn source(&self) -> Option<(GroupId, usize)> {
         self.source
-    }
-
-    /// Latest computed drop zone, for the drop overlay.
-    pub fn zone(&self) -> &crate::core::window::DropZone {
-        &self.zone
     }
 
     /// Advance the machine for a left-button move at `(x, y)`.
@@ -9162,26 +9165,13 @@ pub fn draw_dividers_as_splits<D: DividerGeometry>(
 /// height; TUI: `1.0` and `2.0` cells).
 pub fn paint_tab_drop_overlay(
     backend: &mut dyn quadraui::Backend,
-    drop_zone: &crate::core::window::DropZone,
-    groups: &[TabDropGroup],
+    ctx: &TabDropCtx,
     cursor: (f32, f32),
-    tab_bar_height: f32,
     bar_thickness: f32,
     ghost_offset: f32,
-) -> Option<TabDropOverlay> {
-    let overlay = compute_tab_drop_overlay(
-        drop_zone,
-        groups,
-        cursor,
-        tab_bar_height,
-        bar_thickness,
-        ghost_offset,
-    )?;
-    backend.draw_drop_overlay(&quadraui::DropOverlay {
-        highlight: overlay.highlight,
-        insertion_bar: overlay.insertion_bar,
-        ghost_position: Some(overlay.ghost_position),
-    });
+) -> Option<quadraui::DropOverlay> {
+    let overlay = tab_drop_overlay(ctx, cursor.0, cursor.1, bar_thickness, ghost_offset)?;
+    backend.draw_drop_overlay(&overlay);
     Some(overlay)
 }
 
@@ -24477,20 +24467,33 @@ pub fn app_icon_image() -> quadraui::Image {
 }
 
 // ─── Tab drop-zone (shared) ─────────────────────────────────────────────────
+//
+// #1370: this used to be vimcode's own hand-rolled geometry (`TabDropGroup`,
+// `build_tab_drop_groups`, `compute_tab_drop_zone`, `compute_tab_drop_overlay`)
+// layered on top of quadraui's geometry-only `compute_drop_zone` primitive.
+// quadraui#998 landed the missing piece — `resolve_tab_drop`, a
+// host-owned-model adoption path that takes the drag *source* (which pane/tab,
+// per vimcode's own `Engine::editor_groups`) and returns a position-based
+// `TabDropInstruction` instead of mutating a `TabGroupController`-owned
+// `Vec<Pane>` vimcode doesn't have. [`TabDropCtx`]/[`build_tab_drop_ctx`] is
+// now the only local adapter: it flattens a frame's group geometry into the
+// parallel index-aligned slices `resolve_tab_drop` (mutation) and
+// `drop_zone_hit_test`/`drop_zone_overlay` (overlay) both key off of the same
+// `group_idx`/`pane_idx`.
 
-pub struct TabDropGroup {
-    pub group_id: GroupId,
-    pub rect: quadraui::DropGroupRect,
-    pub tab_scroll_offset: usize,
+/// Per-frame tab-drop geometry, index-aligned so `group_ids[i]` /
+/// `rects[i]` / `tab_counts[i]` all describe the same pane — the same index
+/// quadraui's `resolve_tab_drop` calls `pane_idx` and `drop_zone_hit_test`
+/// calls `group_idx`.
+#[derive(Default, Debug)]
+pub struct TabDropCtx {
+    pub group_ids: Vec<GroupId>,
+    pub rects: Vec<quadraui::DropGroupRect>,
+    pub tab_counts: Vec<usize>,
+    pub tab_bar_height: f32,
 }
 
-pub struct TabDropOverlay {
-    pub highlight: Option<quadraui::Rect>,
-    pub insertion_bar: Option<quadraui::Rect>,
-    pub ghost_position: (f32, f32),
-}
-
-/// Lightweight group-bounds descriptor for [`build_tab_drop_groups`].
+/// Lightweight group-bounds descriptor for [`build_tab_drop_ctx`].
 pub struct DropGroupBounds {
     pub group_id: GroupId,
     pub x: f32,
@@ -24500,21 +24503,26 @@ pub struct DropGroupBounds {
     pub tab_scroll_offset: usize,
 }
 
-/// Build `TabDropGroup`s from a set of group bounds.
+/// Build a [`TabDropCtx`] from a set of group bounds.
 ///
 /// `tab_bar_height` is in the same units as the bounds (cells for TUI,
 /// pixels for GTK/Win-GUI). Each group's bounds describe the
 /// **content area** — the function prepends `tab_bar_height` above.
 ///
-/// `tab_slots_map` maps `GroupId.0` → visible tab slot positions in
-/// the same coordinate system as the bounds.
-pub fn build_tab_drop_groups(
+/// `tab_slots_map` maps `GroupId.0` → per-tab slot positions, index-aligned
+/// to the group's own `Vec<Tab>` with a `(0.0, 0.0)` sentinel for any tab
+/// scrolled off the strip — the convention `quadraui::DropGroupRect::tab_slots`
+/// and `PaneDragRect::tab_slots` both document, and the one `build_tui_tab_slots`
+/// / `TabBarHits::slot_positions` already produce.
+pub fn build_tab_drop_ctx(
     group_bounds: &[DropGroupBounds],
     engine: &crate::core::engine::Engine,
     tab_bar_height: f32,
     tab_slots_map: &std::collections::HashMap<usize, Vec<(f32, f32)>>,
-) -> (Vec<TabDropGroup>, f32) {
-    let mut groups = Vec::new();
+) -> TabDropCtx {
+    let mut group_ids = Vec::with_capacity(group_bounds.len());
+    let mut rects = Vec::with_capacity(group_bounds.len());
+    let mut tab_counts = Vec::with_capacity(group_bounds.len());
     let breadcrumbs = engine.settings.breadcrumbs;
 
     for gb in group_bounds {
@@ -24536,34 +24544,46 @@ pub fn build_tab_drop_groups(
                 .cloned()
                 .unwrap_or_default()
         };
-        groups.push(TabDropGroup {
-            group_id: gb.group_id,
-            rect: quadraui::DropGroupRect {
-                bounds: quadraui::Rect::new(
-                    gb.x,
-                    gb.y - eff_tbh,
-                    gb.width,
-                    eff_tbh + gb.content_height,
-                ),
-                tab_slots,
-            },
-            tab_scroll_offset: gb.tab_scroll_offset,
+        group_ids.push(gb.group_id);
+        rects.push(quadraui::DropGroupRect {
+            bounds: quadraui::Rect::new(
+                gb.x,
+                gb.y - eff_tbh,
+                gb.width,
+                eff_tbh + gb.content_height,
+            ),
+            tab_slots,
         });
+        tab_counts.push(
+            engine
+                .editor_groups
+                .get(&gb.group_id)
+                .map(|g| g.tabs.len())
+                .unwrap_or(0),
+        );
     }
 
-    let effective_tbh = if groups.iter().any(|g| engine.is_tab_bar_hidden(g.group_id)) {
+    let effective_tbh = if group_bounds
+        .iter()
+        .any(|gb| engine.is_tab_bar_hidden(gb.group_id))
+    {
         0.0
     } else {
         tab_bar_height
     };
-    (groups, effective_tbh)
+    TabDropCtx {
+        group_ids,
+        rects,
+        tab_counts,
+        tab_bar_height: effective_tbh,
+    }
 }
 
 /// Build [`DropGroupBounds`] from a `ScreenLayout`. Both TUI and GTK call
 /// this when the `ScreenLayout` is available (draw path, or TUI's cached
 /// layout).
 ///
-/// [`DropGroupBounds`] (and `build_tab_drop_groups`, which reconstructs the
+/// [`DropGroupBounds`] (and [`build_tab_drop_ctx`], which reconstructs the
 /// tab-bar band by subtracting `tab_bar_height` back out) expects
 /// **content-area** bounds — i.e. already past the tab bar — which is exactly
 /// what every `GroupTabBar::bounds` is ("content area of this group; tab bar
@@ -24595,114 +24615,127 @@ pub fn screen_to_drop_group_bounds(screen: &ScreenLayout) -> Vec<DropGroupBounds
         .collect()
 }
 
-/// #822 asks this adapter (and [`build_tab_drop_groups`]) to be replaced by
-/// `quadraui::compose::TabGroupController`. See the doc comment on
-/// [`TabDragState`] and `docs/PENDING_QUADRAUI_ISSUES.md` for why that isn't
-/// a like-for-like swap yet, and #822 must stay open behind the drafted
-/// quadraui gap rather than close on this investigation alone. The geometry
-/// math this function does is already shared (it calls straight through to
-/// `quadraui::compute_drop_zone`); what's local is the `Engine` ↔
-/// `TabDropGroup` adapter.
-pub fn compute_tab_drop_zone(
-    cursor_x: f32,
-    cursor_y: f32,
-    groups: &[TabDropGroup],
-    tab_bar_height: f32,
-) -> crate::core::window::DropZone {
-    use crate::core::window::DropZone;
-
-    let rects: Vec<quadraui::DropGroupRect> = groups.iter().map(|g| g.rect.clone()).collect();
-    match quadraui::compute_drop_zone(cursor_x, cursor_y, &rects, tab_bar_height) {
-        Some(qz) => {
-            let g = &groups[qz.group_idx];
-            match qz.kind {
-                quadraui::DropZoneKind::Center => DropZone::Center(g.group_id),
-                quadraui::DropZoneKind::Split(edge) => {
-                    let (dir, new_first) = match edge {
-                        quadraui::DropEdge::Left => (SplitDirection::Vertical, true),
-                        quadraui::DropEdge::Right => (SplitDirection::Vertical, false),
-                        quadraui::DropEdge::Top => (SplitDirection::Horizontal, true),
-                        quadraui::DropEdge::Bottom => (SplitDirection::Horizontal, false),
-                    };
-                    DropZone::Split(g.group_id, dir, new_first)
-                }
-                quadraui::DropZoneKind::TabReorder(idx) => {
-                    DropZone::TabReorder(g.group_id, g.tab_scroll_offset + idx)
-                }
-            }
-        }
-        None => DropZone::None,
+/// Map a [`quadraui::DropEdge`] to vimcode's own [`SplitDirection`] plus
+/// which side the new pane lands on. Mirrors [`TabDropInstruction`]'s own
+/// `edge` → `split_direction` mapping, but in vimcode's `SplitDirection`
+/// naming rather than quadraui's (the two crates name the same physical
+/// split oppositely: quadraui's `SplitDirection::Horizontal` is vimcode's
+/// `SplitDirection::Vertical` — a side-by-side pair divided by a vertical
+/// line).
+fn split_edge_to_vimcode(edge: quadraui::DropEdge) -> (SplitDirection, bool) {
+    match edge {
+        quadraui::DropEdge::Left => (SplitDirection::Vertical, true),
+        quadraui::DropEdge::Right => (SplitDirection::Vertical, false),
+        quadraui::DropEdge::Top => (SplitDirection::Horizontal, true),
+        quadraui::DropEdge::Bottom => (SplitDirection::Horizontal, false),
     }
 }
 
-pub fn compute_tab_drop_overlay(
-    drop_zone: &crate::core::window::DropZone,
-    groups: &[TabDropGroup],
-    cursor: (f32, f32),
-    tab_bar_height: f32,
+/// Resolve a live tab drag against `ctx` into vimcode's own
+/// [`crate::core::window::DropZone`] — the shape `Engine::apply_tab_drop_zone`
+/// already mutates from — via quadraui's host-owned-model adoption path
+/// (`quadraui::compose::resolve_tab_drop`, #998) instead of a hand-rolled
+/// geometry walk (#1370, replaces the old `compute_tab_drop_zone`).
+///
+/// `source` is `(group, tab index)` of the tab being dragged, captured when
+/// the drag began — [`resolve_tab_drop`][quadraui::compose::resolve_tab_drop]
+/// needs it up front to decide same-pane reorder vs. cross-pane merge, unlike
+/// the old geometry-only `compute_tab_drop_zone`, which deferred that
+/// decision to `apply_tab_drop_zone` at commit time.
+///
+/// `MoveToPane` collapses what used to be two distinct `DropZone` variants
+/// (`Center` for a content-area drop, `TabReorder` for a tab-bar drop into
+/// another group) into one instruction — its `insert_idx` already defaults to
+/// "append at the end" for the former, so mapping both to `DropZone::TabReorder`
+/// here reproduces the old mutation exactly. The lost visual distinction
+/// (highlight-the-whole-group vs. an insertion bar) is not lost overall: the
+/// overlay is resolved independently, from the same `ctx`, by
+/// [`tab_drop_overlay`] against quadraui's geometry-only `DropZoneKind`.
+pub fn resolve_tab_drop_zone(
+    ctx: &TabDropCtx,
+    source: (GroupId, usize),
+    cursor_x: f32,
+    cursor_y: f32,
+) -> crate::core::window::DropZone {
+    use crate::core::window::DropZone;
+    use quadraui::compose::{TabDragSource, TabDropInstruction};
+
+    let Some(pane_idx) = ctx.group_ids.iter().position(|&g| g == source.0) else {
+        return DropZone::None;
+    };
+    let instr = quadraui::compose::resolve_tab_drop(
+        TabDragSource {
+            pane_idx,
+            tab_idx: source.1,
+        },
+        &ctx.tab_counts,
+        cursor_x,
+        cursor_y,
+        &ctx.rects,
+        ctx.tab_bar_height,
+    );
+    match instr {
+        TabDropInstruction::NoOp => DropZone::None,
+        TabDropInstruction::Reorder {
+            pane_idx, to_idx, ..
+        } => ctx
+            .group_ids
+            .get(pane_idx)
+            .map(|&gid| DropZone::TabReorder(gid, to_idx))
+            .unwrap_or(DropZone::None),
+        TabDropInstruction::MoveToPane {
+            to_pane_idx,
+            insert_idx,
+            ..
+        } => ctx
+            .group_ids
+            .get(to_pane_idx)
+            .map(|&gid| DropZone::TabReorder(gid, insert_idx))
+            .unwrap_or(DropZone::None),
+        TabDropInstruction::SplitToNewPane {
+            target_pane_idx,
+            edge,
+            ..
+        } => {
+            let (direction, new_first) = split_edge_to_vimcode(edge);
+            ctx.group_ids
+                .get(target_pane_idx)
+                .map(|&gid| DropZone::Split(gid, direction, new_first))
+                .unwrap_or(DropZone::None)
+        }
+    }
+}
+
+/// Resolve the drop-zone overlay geometry for `ctx` at `(cursor_x, cursor_y)`
+/// — straight from quadraui's own [`quadraui::drop_zone_hit_test`] /
+/// [`quadraui::drop_zone_overlay`], no vimcode-local adapter (#1370, replaces
+/// the old `compute_tab_drop_overlay`/`TabDropOverlay`).
+///
+/// Deliberately independent of [`resolve_tab_drop_zone`]: that function
+/// answers "what mutation should this drop commit", collapsing `Center` and
+/// cross-pane `TabReorder` into one `MoveToPane`; this function answers "what
+/// should the overlay look like *right now*", which still needs that
+/// distinction (a highlight over the whole pane vs. an insertion bar) to
+/// paint correctly. Both are pure queries over the same `ctx`, so computing
+/// the hit test twice (once per question) costs nothing correctness-relevant.
+pub fn tab_drop_overlay(
+    ctx: &TabDropCtx,
+    cursor_x: f32,
+    cursor_y: f32,
     bar_thickness: f32,
     ghost_offset: f32,
-) -> Option<TabDropOverlay> {
-    use crate::core::window::DropZone;
-
-    let ghost_position = (cursor.0 + ghost_offset, cursor.1);
-
-    match drop_zone {
-        DropZone::None => None,
-        DropZone::Center(gid) => {
-            let g = groups.iter().find(|g| g.group_id == *gid)?;
-            let b = &g.rect.bounds;
-            Some(TabDropOverlay {
-                highlight: Some(quadraui::Rect::new(b.x, b.y, b.width, b.height)),
-                insertion_bar: None,
-                ghost_position,
-            })
-        }
-        DropZone::Split(gid, dir, new_first) => {
-            let g = groups.iter().find(|g| g.group_id == *gid)?;
-            let b = &g.rect.bounds;
-            let h = match (dir, new_first) {
-                (SplitDirection::Vertical, true) => {
-                    quadraui::Rect::new(b.x, b.y, b.width / 2.0, b.height)
-                }
-                (SplitDirection::Vertical, false) => {
-                    quadraui::Rect::new(b.x + b.width / 2.0, b.y, b.width / 2.0, b.height)
-                }
-                (SplitDirection::Horizontal, true) => {
-                    quadraui::Rect::new(b.x, b.y, b.width, b.height / 2.0)
-                }
-                (SplitDirection::Horizontal, false) => {
-                    quadraui::Rect::new(b.x, b.y + b.height / 2.0, b.width, b.height / 2.0)
-                }
-            };
-            Some(TabDropOverlay {
-                highlight: Some(h),
-                insertion_bar: None,
-                ghost_position,
-            })
-        }
-        DropZone::TabReorder(gid, abs_idx) => {
-            let g = groups.iter().find(|g| g.group_id == *gid)?;
-            let b = &g.rect.bounds;
-            let vis_idx = abs_idx.saturating_sub(g.tab_scroll_offset);
-            let bar_x = if vis_idx < g.rect.tab_slots.len() {
-                g.rect.tab_slots[vis_idx].0
-            } else if let Some(last) = g.rect.tab_slots.last() {
-                last.1
-            } else {
-                b.x
-            };
-            Some(TabDropOverlay {
-                highlight: Some(quadraui::Rect::new(b.x, b.y, b.width, tab_bar_height)),
-                insertion_bar: Some(quadraui::Rect::new(
-                    bar_x - bar_thickness / 2.0,
-                    b.y,
-                    bar_thickness,
-                    tab_bar_height,
-                )),
-                ghost_position,
-            })
-        }
+) -> Option<quadraui::DropOverlay> {
+    match quadraui::drop_zone_hit_test(cursor_x, cursor_y, &ctx.rects, ctx.tab_bar_height) {
+        quadraui::DropZoneHit::Zone(zone) => Some(quadraui::drop_zone_overlay(
+            &zone,
+            &ctx.rects,
+            cursor_x,
+            cursor_y,
+            ctx.tab_bar_height,
+            bar_thickness,
+            ghost_offset,
+        )),
+        quadraui::DropZoneHit::Empty => None,
     }
 }
 
