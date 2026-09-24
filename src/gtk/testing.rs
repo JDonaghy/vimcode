@@ -5147,6 +5147,104 @@ second line here
         );
     }
 
+    /// #958 (ACP-7) acceptance, GTK's twin of `tui_main::shell_app::tests::
+    /// ai_panel_switches_between_registered_agents_via_ai_agent_command_
+    /// via_shell_app`: a second, differently-configured
+    /// `settings.acp_agents` entry completes its own independent session,
+    /// and `:AiAgent <name>` (the real ex-command path, via
+    /// `execute_command` — same convention as
+    /// `ai_panel_mode_switch_round_trips_via_session_set_mode` above)
+    /// hands the *next* message to the newly-active profile without
+    /// restarting vimcode. Both registry entries spawn the exact same
+    /// `fake_acp_agent.sh` binary — only their `env` entry
+    /// (`ACP_FAKE_AGENT_LABEL`) differs — proving "a second agent" is a
+    /// config fact flowing through one generic spawn path, not a Rust
+    /// branch on agent identity.
+    ///
+    /// RED verified: pinning `Engine::acp_resolve_agent_launch` to always
+    /// return `settings.acp_agents[0]` (ignoring `acp_active_agent`
+    /// entirely) makes this fail — the second message still greets as
+    /// `Hello_AlphaTag958` after `:AiAgent beta`.
+    #[cfg(unix)]
+    #[test]
+    fn ai_panel_switches_between_registered_agents_via_ai_agent_command_via_gtk_driver() {
+        let mut h = panel_harness(PANEL_AI);
+
+        let fixture = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/fake_acp_agent.sh"
+        );
+        {
+            let mut engine = h.engine.borrow_mut();
+            engine.settings.acp_agents = vec![
+                crate::core::acp::AcpAgentProfile {
+                    name: "alpha".to_string(),
+                    command: format!("sh \"{fixture}\""),
+                    cwd: String::new(),
+                    env: vec![
+                        "ACP_FAKE_NO_TOOL_REQUEST=1".to_string(),
+                        "ACP_FAKE_AGENT_LABEL=AlphaTag958".to_string(),
+                    ],
+                },
+                crate::core::acp::AcpAgentProfile {
+                    name: "beta".to_string(),
+                    command: format!("sh \"{fixture}\""),
+                    cwd: String::new(),
+                    env: vec![
+                        "ACP_FAKE_NO_TOOL_REQUEST=1".to_string(),
+                        "ACP_FAKE_AGENT_LABEL=BetaTag958".to_string(),
+                    ],
+                },
+            ];
+            engine.settings.acp_active_agent = "alpha".to_string();
+        }
+
+        let sb = h.painted_sidebar_bounds.get().unwrap();
+        h.driver.click(sb.x + 20.0, sb.y + 20.0);
+        for c in "hi".chars() {
+            h.driver.type_char(c);
+        }
+        h.driver.ctrl_char('s');
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !h.driver.screen_contains("Hello_AlphaTag958") && std::time::Instant::now() < deadline
+        {
+            h.engine.borrow_mut().poll_acp();
+            h.driver.render();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            h.driver.screen_contains("Hello_AlphaTag958"),
+            "the initially-active agent (alpha) must reply within 5s"
+        );
+
+        h.engine.borrow_mut().execute_command("AiAgent beta");
+
+        h.driver.click(sb.x + 20.0, sb.y + 20.0);
+        for c in "hi again".chars() {
+            h.driver.type_char(c);
+        }
+        h.driver.ctrl_char('s');
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !h.driver.screen_contains("Hello_BetaTag958") && std::time::Instant::now() < deadline
+        {
+            h.engine.borrow_mut().poll_acp();
+            h.driver.render();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            h.driver.screen_contains("Hello_BetaTag958"),
+            "after `:AiAgent beta`, the next message must be answered by \
+             the beta profile within 5s"
+        );
+        assert!(
+            !h.driver.screen_contains("AlphaTag958"),
+            "switching agents ends the old session -- the new agent's \
+             transcript must not still show the previous agent's reply"
+        );
+    }
+
     /// #955 (ACP-4) acceptance, GTK's twin of `tui_main::shell_app::tests::
     /// ai_panel_tool_call_status_transitions_via_shell_app`: a tool call's
     /// transcript summary shows `title` + `kind`, and its status glyph

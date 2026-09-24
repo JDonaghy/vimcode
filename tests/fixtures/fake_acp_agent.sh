@@ -40,6 +40,15 @@
 #                           wire shape (`sessionUpdate` tag + `content.text`,
 #                           not the placeholder `kind`/`text` shape ACP-0
 #                           used before any slice read the field values).
+#                           The first message chunk reads "Hello", or
+#                           "Hello_$ACP_FAKE_AGENT_LABEL" (one unbroken
+#                           token, so it survives panel word-wrap intact) if
+#                           that env var is set (#958, ACP-7) — lets a test
+#                           run this exact same binary as two *different*
+#                           registry entries (only `env` differs) and tell
+#                           their replies apart, proving the multi-agent
+#                           registry is a config fact, not a Rust
+#                           special-case.
 #                           Then, unless $ACP_FAKE_NO_TOOL_REQUEST is set, a
 #                           scripted agent->client request (fixed id 9001,
 #                           method fs/read_text_file) that BLOCKS reading one
@@ -249,8 +258,22 @@ while IFS= read -r line; do
       ;;
     *'"method":"session/prompt"'*)
       id=$(extract_id "$line")
+      # #958 (ACP-7): $ACP_FAKE_AGENT_LABEL, if set, is folded into the
+      # first message chunk so a test can run this exact same script as two
+      # differently-configured `settings.acp_agents` registry entries and
+      # tell their replies apart on screen — see this file's top-of-file
+      # doc.
+      # Deliberately one unbroken token when the label is set (no spaces) —
+      # a multi-word greeting can word-wrap across two rendered rows in a
+      # narrow panel, which would break a caller's `screen_contains` check
+      # on the whole string (see `ai_panel_shows_actionable_message_when_
+      # agent_binary_is_missing_via_shell_app`'s doc for the same reasoning).
+      hello_text="Hello"
+      if [ -n "$ACP_FAKE_AGENT_LABEL" ]; then
+        hello_text="Hello_${ACP_FAKE_AGENT_LABEL}"
+      fi
       printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"agent_thought_chunk","content":{"type":"text","text":"pondering the question"}}}}\n'
-      printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Hello"}}}}\n'
+      printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"%s"}}}}\n' "$hello_text"
       printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":" world"}}}}\n'
       if [ -n "$ACP_FAKE_NO_TOOL_REQUEST" ]; then
         printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id"

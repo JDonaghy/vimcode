@@ -14779,6 +14779,115 @@ mod tests {
         );
     }
 
+    /// #958 (ACP-7) acceptance: a second, differently-configured
+    /// `settings.acp_agents` entry completes its own independent session,
+    /// and `:AiAgent <name>` (the real ex-command path, typed through the
+    /// command line — not a direct `Engine::acp_switch_agent` call) hands
+    /// the *next* message to the newly-active profile without restarting
+    /// vimcode. Both registry entries spawn the exact same
+    /// `fake_acp_agent.sh` binary — only their `env` entry
+    /// (`ACP_FAKE_AGENT_LABEL`) differs — proving "a second agent" is a
+    /// config fact flowing through one generic spawn path, not a Rust
+    /// branch on agent identity.
+    ///
+    /// RED verified: pinning `Engine::acp_resolve_agent_launch` to always
+    /// return `settings.acp_agents[0]` (ignoring `acp_active_agent`
+    /// entirely, as an earlier draft of this slice did) makes this fail —
+    /// the second `:AI` send still greets as `Hello_AlphaTag958` after
+    /// `:AiAgent beta`, because the switch never reaches the spawn call.
+    #[cfg(unix)]
+    #[test]
+    fn ai_panel_switches_between_registered_agents_via_ai_agent_command_via_shell_app() {
+        let mut app = TuiShellApp::new(None);
+        app.engine
+            .app_shell
+            .show_panel(&quadraui::WidgetId::new(PANEL_AI));
+
+        let fixture = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/fake_acp_agent.sh"
+        );
+        app.engine.settings.acp_agents = vec![
+            crate::core::acp::AcpAgentProfile {
+                name: "alpha".to_string(),
+                command: format!("sh \"{fixture}\""),
+                cwd: String::new(),
+                env: vec![
+                    "ACP_FAKE_NO_TOOL_REQUEST=1".to_string(),
+                    "ACP_FAKE_AGENT_LABEL=AlphaTag958".to_string(),
+                ],
+            },
+            crate::core::acp::AcpAgentProfile {
+                name: "beta".to_string(),
+                command: format!("sh \"{fixture}\""),
+                cwd: String::new(),
+                env: vec![
+                    "ACP_FAKE_NO_TOOL_REQUEST=1".to_string(),
+                    "ACP_FAKE_AGENT_LABEL=BetaTag958".to_string(),
+                ],
+            },
+        ];
+        app.engine.settings.acp_active_agent = "alpha".to_string();
+
+        // Never sets `ai_has_focus`/sidebar focus, so `:` reaches the
+        // normal-mode command line (`route_focus_key` falls through to
+        // `FocusKeyRoute::None`) rather than being typed as literal chat
+        // input — the same reasoning `count_before_colon_prefills_range_
+        // via_shell_app` above relies on.
+        let mut driver = driver_with_shell(app, config(), 80, 24);
+        driver.press_named(quadraui::NamedKey::Escape);
+
+        driver.type_char(':');
+        for c in "AI hi".chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut screen = driver.screen();
+        while !screen.contains("Hello_AlphaTag958") && Instant::now() < deadline {
+            driver.tick();
+            std::thread::sleep(Duration::from_millis(10));
+            screen = driver.screen();
+        }
+        assert!(
+            screen.contains("Hello_AlphaTag958"),
+            "the initially-active agent (alpha) must reply within 5s; \
+             screen:\n{screen}"
+        );
+
+        driver.type_char(':');
+        for c in "AiAgent beta".chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
+
+        driver.type_char(':');
+        for c in "AI hi again".chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut screen = driver.screen();
+        while !screen.contains("Hello_BetaTag958") && Instant::now() < deadline {
+            driver.tick();
+            std::thread::sleep(Duration::from_millis(10));
+            screen = driver.screen();
+        }
+        assert!(
+            screen.contains("Hello_BetaTag958"),
+            "after `:AiAgent beta`, the next message must be answered by \
+             the beta profile within 5s; screen:\n{screen}"
+        );
+        assert!(
+            !screen.contains("AlphaTag958"),
+            "switching agents ends the old session -- the new agent's \
+             transcript must not still show the previous agent's reply; \
+             screen:\n{screen}"
+        );
+    }
+
     /// #954 (ACP-3) acceptance: `fs/read_text_file` must serve an open,
     /// **dirty** buffer's unsaved in-memory content, not stale on-disk
     /// text — the single most important correctness property in the

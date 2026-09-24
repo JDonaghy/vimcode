@@ -286,6 +286,47 @@ pub fn parse_agent_command(cmd: &str) -> Vec<String> {
     out
 }
 
+/// One entry in the user-configured multi-agent registry
+/// (`settings.acp_agents`, #958 ACP-7). Bringing up a *second* ACP agent is
+/// meant to be a pure config fact — a second `AcpAgentProfile` spawned
+/// through the exact same [`AcpClient::spawn_with_env`] call the single-agent
+/// `acp_agent_command` path already used — never a new branch on which
+/// agent is active anywhere in this file or `Engine`. See
+/// `Engine::acp_resolve_agent_launch` (`src/core/engine/acp_ops.rs`), the
+/// one place that reads this struct.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AcpAgentProfile {
+    /// Display/lookup name, matched case-insensitively by `:AiAgent
+    /// <name>`. Must be unique within `settings.acp_agents`; the first
+    /// match wins if it isn't.
+    pub name: String,
+    /// Command line, parsed the same way as `acp_agent_command`
+    /// ([`parse_agent_command`]) — plain whitespace tokens plus
+    /// double-quoted segments.
+    pub command: String,
+    /// Working directory for `session/new`'s `cwd`. Empty (the default)
+    /// falls back to the workspace root / process cwd, same as the
+    /// single-agent path (`Engine::acp_workspace_cwd`).
+    #[serde(default)]
+    pub cwd: String,
+    /// Extra environment variables for the spawned subprocess, each
+    /// `"KEY=VALUE"` ([`parse_agent_env`]). Entries with no `=` are
+    /// skipped rather than erroring.
+    #[serde(default)]
+    pub env: Vec<String>,
+}
+
+/// Parse an [`AcpAgentProfile::env`] list into `(key, value)` pairs for
+/// [`AcpClient::spawn_with_env`]. Entries with no `=` are silently skipped
+/// — a config typo degrades quietly, same posture as
+/// [`parse_agent_command`]'s empty-token handling.
+pub fn parse_agent_env(env: &[String]) -> Vec<(String, String)> {
+    env.iter()
+        .filter_map(|entry| entry.split_once('='))
+        .map(|(k, v)| (k.trim().to_string(), v.to_string()))
+        .collect()
+}
+
 /// Which kind of `session/update` chunk a notification carries, as mapped
 /// onto the AI panel's own transcript roles by
 /// `Engine::acp_append_chunk` (`src/core/engine/acp_ops.rs`, ACP-1,
@@ -1768,6 +1809,32 @@ mod tests {
     fn parse_agent_command_empty_and_whitespace_only_is_empty_argv() {
         assert!(parse_agent_command("").is_empty());
         assert!(parse_agent_command("   \t  ").is_empty());
+    }
+
+    // ---- parse_agent_env (#958, ACP-7 agent registry): pure, no subprocess ----
+
+    #[test]
+    fn parse_agent_env_splits_key_value_pairs() {
+        assert_eq!(
+            parse_agent_env(&["FOO=bar".to_string(), "BAZ=qux=extra".to_string()]),
+            vec![
+                ("FOO".to_string(), "bar".to_string()),
+                ("BAZ".to_string(), "qux=extra".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_agent_env_skips_entries_with_no_equals() {
+        assert_eq!(
+            parse_agent_env(&["MALFORMED".to_string(), "OK=1".to_string()]),
+            vec![("OK".to_string(), "1".to_string())]
+        );
+    }
+
+    #[test]
+    fn parse_agent_env_empty_is_empty() {
+        assert!(parse_agent_env(&[]).is_empty());
     }
 
     #[test]
