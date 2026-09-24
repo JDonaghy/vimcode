@@ -16904,6 +16904,31 @@ pub fn sc_header_status_bar(sc: &SourceControlData, theme: &Theme) -> quadraui::
     }
 }
 
+/// The SC panel's focused-hint text, shared so it can't drift between the
+/// row-reservation math in [`sc_sidebar_bands`] and the text actually
+/// painted (#1361).
+pub const SC_HINT_TEXT: &str = " Press '?' for help";
+
+/// Build the SC panel's focused-hint row as a single-segment
+/// `quadraui::StatusBar` (#1361), mirroring [`sc_header_status_bar`]. Both
+/// backends paint this through `draw_status_bar` into the row
+/// [`sc_sidebar_bands`] reserves via `ScSidebarBands::hint`, so the hint
+/// can't appear on one backend and not the other, or land on a different
+/// row than what was hit-tested.
+pub fn sc_hint_status_bar(theme: &Theme) -> quadraui::StatusBar {
+    quadraui::StatusBar {
+        id: quadraui::WidgetId::new("sc:hint"),
+        left_segments: vec![quadraui::StatusBarSegment {
+            text: SC_HINT_TEXT.to_string(),
+            fg: theme.line_number_fg,
+            bg: theme.status_bg,
+            bold: false,
+            action_id: None,
+        }],
+        right_segments: Vec::new(),
+    }
+}
+
 /// Number of text rows in the SC commit message (at least 1, even when
 /// empty). Shared raw line count — both backends derive their own
 /// border/line-height-aware box height from this (#480).
@@ -16939,8 +16964,14 @@ pub struct ScSidebarBands {
     pub header: quadraui::Rect,
     /// Commit-message input box, including its border.
     pub commit_input: quadraui::Rect,
-    /// Everything below: the toolbar slab and the change sections.
+    /// The toolbar slab and the change sections — everything between the
+    /// commit box and the focused-hint row (or the panel bottom, when
+    /// unfocused).
     pub slab: quadraui::Rect,
+    /// The "Press '?' for help" row (#1361), reserved at the panel's
+    /// bottom only while the panel has keyboard focus — `None` means no
+    /// row was reserved, so `slab` already extends to the panel bottom.
+    pub hint: Option<quadraui::Rect>,
 }
 
 /// Split a git-sidebar content rect into its [`ScSidebarBands`].
@@ -16949,25 +16980,157 @@ pub struct ScSidebarBands {
 /// cells on TUI). `commit_border` is what the `TextInput` primitive's 1-unit
 /// border on top *and* bottom costs in that same unit — 2.0 px on GTK, 2.0
 /// rows on TUI (see [`sc_commit_input_box_height`], which is the row-unit
-/// spelling of the same constant).
+/// spelling of the same constant). `has_focus` reserves one `row_height`
+/// row at the bottom for the focused-hint (#1361) — both the painter and
+/// the click router pass the same `SourceControlData::has_focus` /
+/// `engine.sc_has_focus` value so the reservation can't drift between the
+/// two.
 pub fn sc_sidebar_bands(
     commit_message: &str,
     rect: quadraui::Rect,
     row_height: f32,
     commit_border: f32,
+    has_focus: bool,
 ) -> ScSidebarBands {
     let header_h = row_height;
     let commit_h = sc_commit_input_row_count(commit_message) as f32 * row_height + commit_border;
     let slab_y = rect.y + header_h + commit_h;
+    let hint_h = if has_focus { row_height } else { 0.0 };
+    let slab_h = (rect.y + rect.height - slab_y - hint_h).max(0.0);
+    let hint = if has_focus {
+        Some(quadraui::Rect::new(
+            rect.x,
+            slab_y + slab_h,
+            rect.width,
+            hint_h,
+        ))
+    } else {
+        None
+    };
     ScSidebarBands {
         header: quadraui::Rect::new(rect.x, rect.y, rect.width, header_h),
         commit_input: quadraui::Rect::new(rect.x, rect.y + header_h, rect.width, commit_h),
-        slab: quadraui::Rect::new(
-            rect.x,
-            slab_y,
-            rect.width,
-            (rect.y + rect.height - slab_y).max(0.0),
-        ),
+        slab: quadraui::Rect::new(rect.x, slab_y, rect.width, slab_h),
+        hint,
+    }
+}
+
+/// #1361: `sc_sidebar_bands` is the *only* place the focused-hint row's
+/// reservation is computed — both `App::paint_sidebar_panel_rung`'s
+/// `PANEL_GIT` arm (paint) and `App::route_sc_sidebar_event`/
+/// `tui_main::mouse`'s `SidebarOwner::Git` arm (click routing) call this
+/// exact function with the exact same `has_focus` value the frame was
+/// painted with (`cached_sc_bands`/the per-click `engine.sc_has_focus`
+/// read), so proving this function's own geometry is internally
+/// consistent is what rules out the row-reservation half of "click
+/// hit-testing for the rows below must account for the reserved row" —
+/// the shared derivation can't drift between painter and router when
+/// there is only one derivation for both to call.
+///
+/// A full click-driven sweep across a *painted row* (the more traditional
+/// black-box proof, `crate::harness::sweep_hit_band_integrity`) was tried
+/// here first and dropped: it lands on a pre-existing, focus-independent
+/// GTK hit-band inaccuracy in `quadraui::SidebarSystem`'s own section
+/// header (reproduced identically with `has_focus: false`, i.e. with no
+/// hint row reserved at all, so it predates and is unrelated to this
+/// fix) — a separate, out-of-scope defect for whoever picks it up next,
+/// not a regression this issue introduces.
+#[cfg(test)]
+mod sc_sidebar_bands_tests {
+    use super::*;
+
+    fn rect() -> quadraui::Rect {
+        quadraui::Rect::new(0.0, 0.0, 40.0, 20.0)
+    }
+
+    #[test]
+    fn hint_is_none_when_unfocused_and_slab_fills_the_rest() {
+        let unfocused = sc_sidebar_bands("", rect(), 1.0, 2.0, false);
+        assert_eq!(unfocused.hint, None, "no row should be reserved unfocused");
+        assert_eq!(
+            unfocused.slab.y + unfocused.slab.height,
+            rect().y + rect().height,
+            "with nothing reserved, the slab must reach the panel's bottom edge"
+        );
+    }
+
+    #[test]
+    fn hint_reserves_exactly_one_row_height_at_the_bottom_when_focused() {
+        let row_height = 1.0;
+        let focused = sc_sidebar_bands("", rect(), row_height, 2.0, true);
+        let hint = focused
+            .hint
+            .expect("a focused panel must reserve the hint row");
+        assert_eq!(
+            hint.height, row_height,
+            "the hint row must be exactly one text row tall"
+        );
+        assert_eq!(
+            hint.y + hint.height,
+            rect().y + rect().height,
+            "the hint row must sit flush against the panel's bottom edge"
+        );
+        assert_eq!(
+            hint.x,
+            rect().x,
+            "the hint row must span the panel's full width, starting at its left edge"
+        );
+        assert_eq!(
+            hint.width,
+            rect().width,
+            "the hint row must span the panel's full width"
+        );
+    }
+
+    #[test]
+    fn focused_slab_is_exactly_one_row_shorter_than_unfocused_and_never_overlaps_the_hint() {
+        let row_height = 1.0;
+        let unfocused = sc_sidebar_bands("", rect(), row_height, 2.0, false);
+        let focused = sc_sidebar_bands("", rect(), row_height, 2.0, true);
+
+        // Same header/commit-input geometry regardless of focus — only the
+        // slab shrinks to make room for the hint (#1361's own "only the
+        // paint mechanism differs" scoping, applied to geometry: nothing
+        // above the slab should ever move because of focus).
+        assert_eq!(unfocused.header, focused.header);
+        assert_eq!(unfocused.commit_input, focused.commit_input);
+
+        assert_eq!(
+            unfocused.slab.height - focused.slab.height,
+            row_height,
+            "the slab must shrink by exactly one row when the hint is reserved"
+        );
+        let hint = focused.hint.unwrap();
+        assert_eq!(
+            focused.slab.y + focused.slab.height,
+            hint.y,
+            "the slab must end exactly where the hint row begins — no gap, no overlap"
+        );
+    }
+
+    #[test]
+    fn a_multiline_commit_message_shifts_the_hint_reservation_but_not_its_height() {
+        // #1361 acceptance: hit-testing for rows *below* the commit box
+        // must account for the reserved row regardless of how tall the
+        // commit box itself is — the hint row's height must always stay
+        // one row, only its `y` (and the slab's) should move.
+        let row_height = 1.0;
+        let one_line = sc_sidebar_bands("single line", rect(), row_height, 2.0, true);
+        let three_lines = sc_sidebar_bands("a\nb\nc", rect(), row_height, 2.0, true);
+        let hint1 = one_line.hint.unwrap();
+        let hint3 = three_lines.hint.unwrap();
+        assert_eq!(hint1.height, hint3.height, "hint height is always one row");
+        assert_eq!(
+            hint1.y, hint3.y,
+            "both variants share the same overall rect, so the hint — \
+             anchored to the panel's bottom edge, not the commit box — \
+             must land at the same y regardless of commit message length"
+        );
+        assert!(
+            three_lines.commit_input.height > one_line.commit_input.height,
+            "sanity: the 3-line commit message must actually claim more \
+             rows than the 1-line one, or this test proves nothing"
+        );
     }
 }
 

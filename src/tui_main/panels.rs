@@ -378,7 +378,6 @@ pub(super) fn render_source_control(
     let hdr_bg = theme.status_bg;
     // Clear the entire area first to prevent stale content from previous renders.
     fill_rect(backend, area, theme.foreground, theme.tab_bar_bg);
-    let dim_fg = theme.line_number_fg;
 
     // #1252: SC data comes from the frame's own `screen` (built once by
     // `build_screen_for_shell_content`) instead of a second, independently
@@ -387,18 +386,26 @@ pub(super) fn render_source_control(
         return;
     };
 
-    // Reserve bottom row for hint bar when focused.
-    let area = if sc.has_focus && area.height > 2 {
-        let hint_y = area.y + area.height - 1;
-        fill_row(
-            backend,
-            area.x,
-            hint_y,
-            area.width,
-            " Press '?' for help",
-            dim_fg,
-            hdr_bg,
-        );
+    // #1361: whether the bottom row is reserved for the focused-hint comes
+    // from `render::sc_sidebar_bands` — the exact same derivation
+    // `mouse.rs`'s click router uses (row_height 1.0, commit_border 2.0,
+    // `sc.has_focus`) — so the reservation this paints can never disagree
+    // with what a click is hit-tested against. Painted as a shared
+    // `StatusBar` (`render::sc_hint_status_bar`), same mechanism as GTK's
+    // `PANEL_GIT` arm, not a raw `fill_row`.
+    let bands = render::sc_sidebar_bands(
+        &sc.commit_message,
+        super::shell_app::to_q_rect(area),
+        1.0,
+        2.0,
+        sc.has_focus,
+    );
+    if let Some(hint_rect) = bands.hint {
+        backend.set_theme(super::quadraui_tui::q_theme(theme));
+        let hint_bar = render::sc_hint_status_bar(theme);
+        let _ = backend.draw_status_bar(hint_rect, &hint_bar, None, None);
+    }
+    let area = if bands.hint.is_some() {
         Rect {
             x: area.x,
             y: area.y,
