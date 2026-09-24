@@ -7419,15 +7419,42 @@ mod minimap {
 
     /// A buffer with a distinctive indentation shape and enough lines that
     /// the minimap has something to down-sample.
+    ///
+    /// #1350: opens a real, on-disk `.rs` file through `open_file_with_mode`
+    /// (rather than inserting text straight into an unnamed
+    /// `Engine::new()` buffer) so the buffer has a language and gets real
+    /// tree-sitter syntax highlighting — `minimap_click_at_the_middle_
+    /// scrolls_to_half_the_file`'s "syntax-colored ink" sanity check found
+    /// zero colour on macOS because an unnamed buffer never had any syntax
+    /// colour to find in the first place, unrelated to the anti-aliasing
+    /// mode it was first blamed on. Also switches to `Engine::new_for_test()`
+    /// so this fixture no longer reads the developer's own
+    /// `~/.config/vimcode/settings.json`. `syntax_max_lines` is pinned
+    /// because it's a process-global atomic another test in this binary can
+    /// have moved (mirrors `minimap_gtk_distinct_colors_for_indent` above).
     fn engine_with_shaped_buffer() -> Engine {
-        let mut engine = Engine::new();
+        crate::core::buffer_manager::set_syntax_max_lines(20_000);
+
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_test_1350_minimap_shaped_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("shaped1350.rs");
         let text: String = (0..400)
             .map(|i| {
                 let depth = if (100..300).contains(&i) { 3 } else { 0 };
                 format!("{}fn item_{i}() {{ let x = {i}; }}\n", "    ".repeat(depth))
             })
             .collect();
-        engine.buffer_mut().insert(0, &text);
+        std::fs::write(&file, &text).unwrap();
+
+        let mut engine = Engine::new_for_test();
+        engine
+            .open_file_with_mode(&file, crate::core::engine::OpenMode::Permanent)
+            .unwrap();
         engine
     }
 
@@ -7746,6 +7773,25 @@ mod minimap {
     /// out to be theme-dependent noise (see the color-vs-brightness note
     /// above) and had to be replaced with this colorfulness count — before
     /// restoring the fix.
+    ///
+    /// #1350: on macOS this test's own setup sanity check (`before > 0`)
+    /// failed outright — every pixel in the probed band was grayscale, none
+    /// colorful. Root cause: `engine_with_shaped_buffer` built its buffer
+    /// from an unnamed `Engine::new()` buffer (`buffer_mut().insert`
+    /// straight into the default buffer, no file path), so it had no
+    /// language and therefore no tree-sitter highlights — there was no
+    /// syntax colour to find on *any* platform, not just macOS; Linux
+    /// apparently stayed green only because Cairo/FreeType's colourful
+    /// subpixel AA fringing around the plain grayscale glyph ink happened to
+    /// clear `is_colorful`'s tolerance by coincidence, which macOS/Quartz's
+    /// grayscale-only AA does not reproduce. Fixed at the source in
+    /// `engine_with_shaped_buffer` (opens a real on-disk `.rs` file so the
+    /// buffer gets a language and real syntax colour) rather than by
+    /// loosening this predicate: a "differs from background" rewrite would
+    /// also count the (grayscale, always-present) indent guide as ink and
+    /// break the "after" band's must-be-zero assertion on every indented
+    /// row, so chroma — not "differs from background" — has to stay the
+    /// discriminator here.
     #[test]
     fn minimap_click_at_the_middle_scrolls_to_half_the_file() {
         let mut h = harness(engine_with_shaped_buffer(), 1400, 900);
@@ -7792,7 +7838,13 @@ mod minimap {
         // immune to the indent guide: a light theme makes background the
         // *brightest* color in the band rather than the ink, and indent
         // guides paint real (if faint) grayscale pixels in the same band
-        // even on a correctly-repainted frame.
+        // even on a correctly-repainted frame — chroma, not "differs from
+        // background", is load-bearing here, which is why #1350's fix is in
+        // `engine_with_shaped_buffer` (give the buffer a real language so
+        // there's syntax colour to find) rather than in this predicate: a
+        // "differs from background" rewrite would count the always-present
+        // grayscale indent guide as ink and break the "after" band's
+        // must-be-zero assertion on every indented row.
         //
         // #934: 3 rows, not 1. A Darwin/Quartz run reported the single-row
         // version's "before" sanity check failing outright (0 colorful
