@@ -3,12 +3,13 @@
 //! lifecycle drive and the `session/update` -> AI-panel chunk mapping this
 //! module implements; #953 ACP-2 adds `session/request_permission` — the
 //! human-in-the-loop tool-call approval chokepoint — routed onto the
-//! existing dialog system, plus `session/cancel` wiring). `tool_call`/
-//! `tool_call_update`/`plan` updates and the `fs/*` agent -> client requests
-//! are still intentionally left unhandled here — parked/ignored without
-//! breaking the stream — per ACP-1's scope; later ACP slices (ACP-3 fs
-//! bridge, ACP-4/5 tool-call + plan rendering) add real handling on top of
-//! the same `AcpEvent` stream, not a transport change.
+//! existing dialog system, plus `session/cancel` wiring; #954 ACP-3 adds
+//! `fs/read_text_file`/`fs/write_text_file`, served through vimcode's own
+//! buffers rather than the raw filesystem — see [`Engine::acp_read_text_file`]
+//! / [`Engine::acp_write_text_file`]). `tool_call`/`tool_call_update`/`plan`
+//! updates are still intentionally left unhandled here — ignored without
+//! breaking the stream — per ACP-1's scope; ACP-4/5 add real handling for
+//! those on top of the same `AcpEvent` stream, not a transport change.
 
 use super::*;
 use crate::core::acp::{AcpChunkKind, AcpEvent};
@@ -154,15 +155,23 @@ impl Engine {
                     method,
                     params,
                 } => {
-                    if method == "session/request_permission" {
-                        self.acp_handle_permission_request(request_id, params);
+                    match method.as_str() {
+                        "session/request_permission" => {
+                            self.acp_handle_permission_request(request_id, params);
+                        }
+                        "fs/read_text_file" => {
+                            self.acp_handle_read_text_file(request_id, params);
+                        }
+                        "fs/write_text_file" => {
+                            self.acp_handle_write_text_file(request_id, params);
+                        }
+                        // Everything else is still left parked, not
+                        // answered — not answering doesn't break the
+                        // transport (`AcpClient::poll` keeps draining), it
+                        // just means a turn that needs one will not reach
+                        // `PromptStopped` yet.
+                        _ => {}
                     }
-                    // Everything else (`fs/read_text_file`, ...) is still
-                    // left parked, not answered — the fs/* bridge is a
-                    // later ACP slice. Not answering doesn't break the
-                    // transport (`AcpClient::poll` keeps draining), it just
-                    // means a turn that needs one will not reach
-                    // `PromptStopped` yet.
                     redraw = true;
                 }
             }
@@ -183,6 +192,161 @@ impl Engine {
         self.workspace_root
             .clone()
             .unwrap_or_else(|| self.cwd.clone())
+    }
+
+    // ── fs/read_text_file, fs/write_text_file (#954, ACP-3) ─────────────────
+
+    /// Directories an ACP agent's `fs/write_text_file` may write inside.
+    /// Today that's just the session `cwd` — ACP's `session/new` has an
+    /// `additionalDirectories` field in later protocol drafts, but this
+    /// client's `session/new` (`AcpClient::new_session`) doesn't negotiate
+    /// it yet, so there is nothing else to add here. Kept as its own
+    /// `Vec`-returning method (rather than inlining `vec![self.
+    /// acp_workspace_cwd()]` at each call site) so wiring up
+    /// `additionalDirectories` later is a one-line change in one place.
+    fn acp_workspace_roots(&self) -> Vec<std::path::PathBuf> {
+        vec![self.acp_workspace_cwd()]
+    }
+
+    /// Answer a parked `fs/read_text_file` request. A malformed request
+    /// (missing `sessionId`/`path`) gets a JSON-RPC error, never silence —
+    /// same policy as the malformed `session/request_permission` path
+    /// above.
+    fn acp_handle_read_text_file(&mut self, request_id: i64, params: serde_json::Value) {
+        let Some(req) = crate::core::acp::parse_read_text_file_params(&params) else {
+            self.acp_respond_error(request_id, "invalid fs/read_text_file params");
+            return;
+        };
+        match self.acp_read_text_file(std::path::Path::new(&req.path), req.line, req.limit) {
+            Ok(content) => {
+                if let Some(client) = self.acp_client.as_ref() {
+                    client.respond_to_client_request(
+                        request_id,
+                        Ok(crate::core::acp::read_text_file_result(&content)),
+                    );
+                }
+            }
+            Err(msg) => self.acp_respond_error(request_id, &msg),
+        }
+    }
+
+    /// Read `path`'s text content for `fs/read_text_file`. **Buffer-first**:
+    /// an already-open buffer's in-memory content — including unsaved edits
+    /// — wins over whatever is on disk. This is the single most important
+    /// correctness property in #954's slice: an agent that reads a dirty
+    /// buffer from disk reasons about stale text and proposes edits against
+    /// lines the user already changed. Falls back to the filesystem only
+    /// when no buffer has this path open. `line`/`limit` are applied via
+    /// [`crate::core::acp::select_text_lines`] regardless of which source
+    /// served the content.
+    pub(crate) fn acp_read_text_file(
+        &self,
+        path: &Path,
+        line: Option<u32>,
+        limit: Option<u32>,
+    ) -> Result<String, String> {
+        let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        let buffer_text = self.buffer_manager.iter().find_map(|(_, state)| {
+            let existing = state.file_path.as_ref()?;
+            let existing_canonical = existing.canonicalize().unwrap_or_else(|_| existing.clone());
+            (existing_canonical == canonical).then(|| state.buffer.content.to_string())
+        });
+        let text = match buffer_text {
+            Some(t) => t,
+            None => std::fs::read_to_string(path)
+                .map_err(|e| format!("failed to read {}: {e}", path.display()))?,
+        };
+        Ok(crate::core::acp::select_text_lines(&text, line, limit))
+    }
+
+    /// Answer a parked `fs/write_text_file` request. A malformed request
+    /// gets a JSON-RPC error; a well-formed one that fails for another
+    /// reason (path outside the workspace, disk write error, ...) gets its
+    /// message surfaced as a JSON-RPC error too — never a swallowed
+    /// failure the way the pre-#954 closed-file `apply_workspace_edit`
+    /// branch was.
+    fn acp_handle_write_text_file(&mut self, request_id: i64, params: serde_json::Value) {
+        let Some(req) = crate::core::acp::parse_write_text_file_params(&params) else {
+            self.acp_respond_error(request_id, "invalid fs/write_text_file params");
+            return;
+        };
+        match self.acp_write_text_file(std::path::Path::new(&req.path), &req.content) {
+            Ok(()) => {
+                if let Some(client) = self.acp_client.as_ref() {
+                    client.respond_to_client_request(request_id, Ok(serde_json::Value::Null));
+                }
+            }
+            Err(msg) => self.acp_respond_error(request_id, &msg),
+        }
+    }
+
+    /// Serve `fs/write_text_file`: open (or reuse) a buffer for `path`,
+    /// replace its whole content through the undo-grouped path (a single
+    /// `u` reverts the whole write, like any other edit), then persist to
+    /// disk — creating the file if it didn't already exist, per the ACP v1
+    /// spec's requirement for this method. Refuses to write outside
+    /// [`Self::acp_workspace_roots`].
+    ///
+    /// This exists specifically so ACP's write path never falls into the
+    /// bug `apply_workspace_edit`'s old closed-file branch had (no undo, no
+    /// canonicalisation, swallowed errors) — see that method's doc comment
+    /// in `panels.rs` for the fuller history. Unlike `apply_workspace_edit`
+    /// (which leaves a closed-file edit dirty for the user to review/save,
+    /// matching how an edit to an already-open buffer behaves),
+    /// `fs/write_text_file` is inherently a disk write — the whole point of
+    /// the RPC — so this persists immediately rather than leaving the write
+    /// invisible to anything reading the file outside the editor (a shell
+    /// command the same agent runs next, say).
+    pub(crate) fn acp_write_text_file(&mut self, path: &Path, content: &str) -> Result<(), String> {
+        let roots = self.acp_workspace_roots();
+        let resolved = crate::core::acp::resolve_path_within_roots(path, &roots)?;
+        let buffer_id = self
+            .buffer_manager
+            .open_file(&resolved)
+            .map_err(|e| format!("failed to open {}: {e}", resolved.display()))?;
+        self.acp_replace_buffer_content(buffer_id, content);
+        self.save_buffer_by_id(buffer_id)
+    }
+
+    /// Replace the entirety of `buffer_id`'s content with `new_content` as
+    /// one undo-grouped edit — the same start/finish-undo-group shape
+    /// `apply_lsp_edits` uses, just for a whole-buffer swap instead of a
+    /// list of ranged edits (there is no LSP-style range list to apply for
+    /// `fs/write_text_file`; the agent hands over the whole new file body).
+    fn acp_replace_buffer_content(&mut self, buffer_id: BufferId, new_content: &str) {
+        let cursor = self
+            .windows
+            .values()
+            .find(|w| w.buffer_id == buffer_id)
+            .map(|w| w.view.cursor)
+            .unwrap_or_default();
+        let Some(state) = self.buffer_manager.get_mut(buffer_id) else {
+            return;
+        };
+        state.start_undo_group(cursor);
+        let old_len = state.buffer.content.len_chars();
+        if old_len > 0 {
+            let deleted: String = state.buffer.content.slice(0..old_len).chars().collect();
+            state.buffer.content.remove(0..old_len);
+            state.record_delete(0, &deleted);
+        }
+        if !new_content.is_empty() {
+            state.buffer.content.insert(0, new_content);
+            state.record_insert(0, new_content);
+        }
+        state.dirty = true;
+        state.finish_undo_group(cursor);
+        state.semantic_tokens.clear();
+        self.lsp_dirty_buffers.insert(buffer_id, true);
+    }
+
+    /// Reply to a parked agent -> client request with a JSON-RPC error —
+    /// the shared "surface it, never swallow it" tail every `fs/*` handler
+    /// above funnels through.
+    fn acp_respond_error(&self, request_id: i64, message: &str) {
+        if let Some(client) = self.acp_client.as_ref() {
+            client.respond_to_client_request(request_id, Err((-32000, message.to_string())));
+        }
     }
 
     /// Append one `session/update` chunk to the AI panel transcript
@@ -398,6 +562,7 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use crate::core::engine::Engine;
+    use crate::core::lsp::{self, FormattingEdit, WorkspaceEdit};
 
     #[test]
     fn poll_acp_is_a_no_op_when_no_client_is_running() {
@@ -1051,5 +1216,477 @@ mod tests {
             engine.acp_pending_permission.is_none(),
             "a malformed request must never be tracked as parked"
         );
+    }
+
+    // ── fs/read_text_file, fs/write_text_file (#954, ACP-3) ────────────────
+
+    fn unique_temp_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "acp3-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// #954's core correctness property: a dirty (unsaved) open buffer's
+    /// in-memory content must win over disk when the agent calls
+    /// `fs/read_text_file` — reading from disk instead makes the agent
+    /// reason about stale text and propose edits against lines the user
+    /// already changed. Drives the real dispatch path (`poll_acp` ->
+    /// `Engine::acp_handle_read_text_file` -> `Engine::acp_read_text_file`)
+    /// against the fixture's `ACP_FAKE_FS_READ_PATH` branch, which echoes
+    /// whatever content it got back into the transcript — so this reads the
+    /// answer off `ai_messages`, not off internal engine state.
+    ///
+    /// RED verified: reverting `acp_read_text_file` to always
+    /// `std::fs::read_to_string` (skip the buffer-first lookup) makes this
+    /// fail — the transcript shows `"read:on disk"` instead of
+    /// `"read:dirty in memory"`.
+    #[cfg(unix)]
+    #[test]
+    fn fs_read_text_file_serves_dirty_buffer_content_not_disk() {
+        let dir = unique_temp_dir("read");
+        let file_path = dir.join("dirty.txt");
+        std::fs::write(&file_path, "on disk").unwrap();
+        let path_str = file_path.to_string_lossy().into_owned();
+
+        let mut engine = engine_with_fixture_agent(&[("ACP_FAKE_FS_READ_PATH", &path_str)]);
+        engine.settings.acp_agent_command = "already-spawned-above".to_string();
+        engine.workspace_root = Some(dir.clone());
+
+        let buffer_id = engine
+            .buffer_manager
+            .open_file(&file_path)
+            .expect("should open");
+        {
+            let state = engine.buffer_manager.get_mut(buffer_id).unwrap();
+            let len = state.buffer.content.len_chars();
+            state.buffer.content.remove(0..len);
+            state.buffer.content.insert(0, "dirty in memory");
+            state.dirty = true;
+        }
+
+        engine.ai_send_message("please read".to_string());
+        poll_acp_until(&mut engine, |e| !e.ai_streaming);
+        assert!(
+            !engine.ai_streaming,
+            "turn should complete within {TEST_DEADLINE:?}"
+        );
+
+        let transcript: Vec<&str> = engine
+            .ai_messages
+            .iter()
+            .map(|m| m.content.as_str())
+            .collect();
+        assert!(
+            transcript
+                .iter()
+                .any(|c| c.contains("read:dirty in memory")),
+            "expected the dirty buffer's in-memory content in the \
+             transcript: {transcript:?}"
+        );
+        assert!(
+            !transcript.iter().any(|c| c.contains("read:on disk")),
+            "must never serve stale on-disk content for an open, dirty \
+             buffer: {transcript:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `fs/read_text_file`'s `line`/`limit` must actually reach
+    /// `select_text_lines` through the real dispatch method (not just be
+    /// unit-tested in isolation on `core::acp`) — a closed file, so this
+    /// also exercises the plain-disk-read fallback half of buffer-first
+    /// resolution.
+    #[test]
+    fn acp_read_text_file_honours_line_and_limit_against_a_closed_file() {
+        let dir = unique_temp_dir("read-line-limit");
+        let file_path = dir.join("lines.txt");
+        std::fs::write(&file_path, "one\ntwo\nthree\nfour").unwrap();
+
+        let engine = Engine::new_for_test();
+        let result = engine
+            .acp_read_text_file(&file_path, Some(2), Some(2))
+            .expect("closed file should be readable from disk");
+        assert_eq!(result, "two\nthree");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #954: "`fs/write_text_file` on a closed file -> file opens, edit
+    /// applies, a single undo reverts it." Drives the real dispatch path
+    /// (`poll_acp` -> `Engine::acp_handle_write_text_file` ->
+    /// `Engine::acp_write_text_file`) against the fixture's
+    /// `ACP_FAKE_FS_WRITE_PATH` branch, which reports back `"write:ok"` or
+    /// `"write:error:..."` depending on whether the reply was a JSON-RPC
+    /// error, so the reply itself is observed through the transcript, not
+    /// just trusted.
+    ///
+    /// RED verified: reverting `apply_workspace_edit`'s pre-#954
+    /// closed-file shape onto this call path (raw `fs::write`, no buffer,
+    /// no undo group) makes the final `state.undo()` assertion fail outright
+    /// (no buffer ever exists to undo) instead of reverting the content.
+    #[cfg(unix)]
+    #[test]
+    fn fs_write_text_file_on_closed_file_opens_buffer_applies_and_a_single_undo_reverts_it() {
+        let dir = unique_temp_dir("write-closed");
+        let file_path = dir.join("closed.txt");
+        std::fs::write(&file_path, "original content").unwrap();
+        let path_str = file_path.to_string_lossy().into_owned();
+
+        let mut engine = engine_with_fixture_agent(&[
+            ("ACP_FAKE_FS_WRITE_PATH", &path_str),
+            ("ACP_FAKE_FS_WRITE_CONTENT", "new content from agent"),
+        ]);
+        engine.settings.acp_agent_command = "already-spawned-above".to_string();
+        engine.workspace_root = Some(dir.clone());
+        assert!(
+            !engine.buffer_manager.is_path_open(&file_path),
+            "sanity: the file must start closed"
+        );
+
+        engine.ai_send_message("please write".to_string());
+        poll_acp_until(&mut engine, |e| !e.ai_streaming);
+        assert!(
+            !engine.ai_streaming,
+            "turn should complete within {TEST_DEADLINE:?}"
+        );
+
+        let transcript: Vec<&str> = engine
+            .ai_messages
+            .iter()
+            .map(|m| m.content.as_str())
+            .collect();
+        assert!(
+            transcript.iter().any(|c| c.contains("write:ok")),
+            "the write must succeed and be reported ok: {transcript:?}"
+        );
+
+        assert!(
+            engine.buffer_manager.is_path_open(&file_path),
+            "fs/write_text_file on a closed file must open it into a buffer"
+        );
+        let buffer_id = engine
+            .buffer_manager
+            .list()
+            .into_iter()
+            .find(|&id| {
+                engine
+                    .buffer_manager
+                    .get(id)
+                    .and_then(|s| s.file_path.as_deref())
+                    == Some(file_path.as_path())
+            })
+            .expect("buffer for the written path should exist");
+
+        assert_eq!(
+            std::fs::read_to_string(&file_path).unwrap(),
+            "new content from agent",
+            "fs/write_text_file must persist to disk"
+        );
+        assert_eq!(
+            engine
+                .buffer_manager
+                .get(buffer_id)
+                .unwrap()
+                .buffer
+                .content
+                .to_string(),
+            "new content from agent"
+        );
+
+        let state = engine.buffer_manager.get_mut(buffer_id).unwrap();
+        assert!(
+            state.undo().is_some(),
+            "a single undo must be available to revert the agent's write"
+        );
+        assert_eq!(
+            state.buffer.content.to_string(),
+            "original content",
+            "one undo must revert the whole write, like any other edit"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #954: "Write to a new path inside cwd creates the file" + "a single
+    /// undo reverts it" for the brand-new-file case too (no prior on-disk
+    /// content to fall back to).
+    #[test]
+    fn acp_write_text_file_creates_a_new_file_and_a_single_undo_reverts_it() {
+        let dir = unique_temp_dir("write-new");
+        let file_path = dir.join("brand-new.txt");
+        assert!(!file_path.exists(), "sanity: must not exist yet");
+
+        let mut engine = Engine::new_for_test();
+        engine.workspace_root = Some(dir.clone());
+
+        engine
+            .acp_write_text_file(&file_path, "hello from the agent")
+            .expect("writing a new file inside the workspace root should succeed");
+
+        assert!(
+            file_path.exists(),
+            "fs/write_text_file must create the file"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&file_path).unwrap(),
+            "hello from the agent"
+        );
+
+        let buffer_id = engine
+            .buffer_manager
+            .list()
+            .into_iter()
+            .find(|&id| {
+                engine
+                    .buffer_manager
+                    .get(id)
+                    .and_then(|s| s.file_path.as_deref())
+                    == Some(file_path.as_path())
+            })
+            .expect("the new file must be open in a buffer");
+        let state = engine.buffer_manager.get_mut(buffer_id).unwrap();
+        assert!(state.undo().is_some());
+        assert_eq!(
+            state.buffer.content.to_string(),
+            "",
+            "undoing a brand-new file's only edit must revert to empty content"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #954: "write outside cwd is refused." No JSON-RPC round trip needed
+    /// here — this is `Engine::acp_write_text_file`'s own contract, and the
+    /// fixture round trip above already proves the reply mechanism works.
+    #[test]
+    fn acp_write_text_file_rejects_a_path_outside_the_workspace_root() {
+        let dir = unique_temp_dir("write-root");
+        let outside = unique_temp_dir("write-outside");
+        let target = outside.join("should-not-be-written.txt");
+
+        let mut engine = Engine::new_for_test();
+        engine.workspace_root = Some(dir.clone());
+
+        let result = engine.acp_write_text_file(&target, "malicious content");
+        assert!(
+            result.is_err(),
+            "a write outside the workspace root must be refused"
+        );
+        assert!(
+            !target.exists(),
+            "a refused write must never touch the filesystem"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    /// #954: "Write error (read-only path) surfaces to the user and returns
+    /// a JSON-RPC error, not a swallowed failure." Skips itself when running
+    /// as root (common in some CI containers) — root bypasses Unix
+    /// permission bits entirely, so the write would simply succeed and the
+    /// scenario this test exists to cover (a *legitimate* disk failure
+    /// reaching the caller instead of being swallowed) can't be produced
+    /// this way in that environment.
+    #[cfg(unix)]
+    #[test]
+    fn acp_write_text_file_surfaces_a_disk_write_error_not_swallowed() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!(
+                "skipping acp_write_text_file_surfaces_a_disk_write_error_not_swallowed: \
+                 running as root, permission bits don't block writes"
+            );
+            return;
+        }
+
+        let dir = unique_temp_dir("write-readonly");
+        let file_path = dir.join("readonly.txt");
+        std::fs::write(&file_path, "orig").unwrap();
+        let mut perms = std::fs::metadata(&file_path).unwrap().permissions();
+        perms.set_mode(0o444);
+        std::fs::set_permissions(&file_path, perms).unwrap();
+
+        let mut engine = Engine::new_for_test();
+        engine.workspace_root = Some(dir.clone());
+
+        let result = engine.acp_write_text_file(&file_path, "new content");
+        assert!(
+            result.is_err(),
+            "a disk write failure must surface as an Err, not be swallowed"
+        );
+        assert!(
+            !result.unwrap_err().is_empty(),
+            "the error must actually name something, not just be a bare failure marker"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&file_path).unwrap(),
+            "orig",
+            "a failed write must not have partially clobbered the file"
+        );
+
+        // Restore write permission so the temp dir can be cleaned up.
+        let mut perms = std::fs::metadata(&file_path).unwrap().permissions();
+        perms.set_mode(0o644);
+        let _ = std::fs::set_permissions(&file_path, perms);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── apply_workspace_edit closed-file regression (#954) ──────────────────
+
+    /// The fix itself: a closed file targeted by a workspace edit (LSP
+    /// rename-across-files, or a code action touching an unopened file)
+    /// must be opened into a buffer and edited through the same
+    /// undo-grouped path an already-open file gets — not written straight
+    /// to disk with `fs::write` (no undo, errors swallowed — the pre-#954
+    /// bug). This also proves the fix does *not* silently persist to disk
+    /// on its own: the edit is left dirty for the user to review/save, the
+    /// same as an edit to an already-open buffer would be.
+    ///
+    /// RED verified: this exact assertion sequence (buffer opens with the
+    /// edit applied, disk untouched, one undo reverts it) cannot pass
+    /// against the pre-fix code, which never created a buffer at all for a
+    /// closed-file edit — there'd be nothing in `buffer_manager` to find.
+    #[test]
+    fn apply_workspace_edit_opens_closed_file_into_a_buffer_undo_grouped_no_auto_save() {
+        let dir = unique_temp_dir("workspace-edit-closed");
+        let file_path = dir.join("renamed.rs");
+        std::fs::write(&file_path, "let old_name = 1;").unwrap();
+
+        let mut engine = Engine::new_for_test();
+        assert!(!engine.buffer_manager.is_path_open(&file_path));
+
+        let edit = WorkspaceEdit {
+            changes: vec![lsp::FileEdit {
+                path: file_path.clone(),
+                edits: vec![FormattingEdit {
+                    range: lsp::LspRange {
+                        start: lsp::LspPosition {
+                            line: 0,
+                            character: 4,
+                        },
+                        end: lsp::LspPosition {
+                            line: 0,
+                            character: 12,
+                        },
+                    },
+                    new_text: "new_name".to_string(),
+                }],
+            }],
+        };
+        let errors = engine.apply_workspace_edit(edit);
+        assert!(errors.is_empty(), "expected no errors: {errors:?}");
+
+        assert!(
+            engine.buffer_manager.is_path_open(&file_path),
+            "the closed file must be opened into a buffer"
+        );
+        let buffer_id = engine
+            .buffer_manager
+            .list()
+            .into_iter()
+            .find(|&id| {
+                engine
+                    .buffer_manager
+                    .get(id)
+                    .and_then(|s| s.file_path.as_deref())
+                    == Some(file_path.as_path())
+            })
+            .unwrap();
+        let state = engine.buffer_manager.get(buffer_id).unwrap();
+        assert_eq!(state.buffer.content.to_string(), "let new_name = 1;");
+        assert!(
+            state.dirty,
+            "the edit must be left dirty, like any other edit"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&file_path).unwrap(),
+            "let old_name = 1;",
+            "must NOT silently write to disk — that's the exact behaviour \
+             being replaced, just via a safer (buffer-backed) mechanism \
+             instead of a raw fs::write"
+        );
+
+        let state = engine.buffer_manager.get_mut(buffer_id).unwrap();
+        assert!(state.undo().is_some());
+        assert_eq!(state.buffer.content.to_string(), "let old_name = 1;");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The other half of the regression: the pre-#954 closed-file branch
+    /// used `if let Ok(text) = fs::read_to_string(...)`, so a failure (a
+    /// path that can't be read as text — here, a directory) was silently
+    /// dropped with no error and no buffer. `apply_workspace_edit` must
+    /// surface it instead.
+    #[test]
+    fn apply_workspace_edit_surfaces_the_previously_swallowed_open_error() {
+        let dir = unique_temp_dir("workspace-edit-error");
+        // A directory can't be opened as a text buffer — `Buffer::from_file`
+        // fails on it deterministically, independent of Unix permission
+        // bits or the test's effective uid.
+        let bad_path = dir.join("not_a_file");
+        std::fs::create_dir_all(&bad_path).unwrap();
+
+        let mut engine = Engine::new_for_test();
+        let edit = WorkspaceEdit {
+            changes: vec![lsp::FileEdit {
+                path: bad_path.clone(),
+                edits: vec![FormattingEdit {
+                    range: lsp::LspRange::default(),
+                    new_text: "x".to_string(),
+                }],
+            }],
+        };
+        let errors = engine.apply_workspace_edit(edit);
+        assert_eq!(
+            errors.len(),
+            1,
+            "the open failure must be surfaced, not swallowed: {errors:?}"
+        );
+        assert!(
+            errors[0].contains(&bad_path.display().to_string()),
+            "the error should name the offending path: {:?}",
+            errors[0]
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #954: path safety must reject writes escaping the workspace root even
+    /// via `..` traversal, not just a plain "different directory" check —
+    /// see `core::acp::resolve_path_within_roots`'s own dedicated tests for
+    /// the pure-function coverage; this confirms `Engine::
+    /// acp_write_text_file` actually calls it rather than some looser
+    /// ad hoc check.
+    #[test]
+    fn acp_write_text_file_rejects_dot_dot_traversal_out_of_the_workspace_root() {
+        let dir = unique_temp_dir("write-traversal-root");
+        let sibling = unique_temp_dir("write-traversal-sibling");
+        let escaping = dir.join("..").join(
+            sibling
+                .file_name()
+                .expect("temp dir should have a file name")
+                .to_owned(),
+        );
+        let target = escaping.join("escaped.txt");
+
+        let mut engine = Engine::new_for_test();
+        engine.workspace_root = Some(dir.clone());
+
+        let result = engine.acp_write_text_file(&target, "should never land");
+        assert!(result.is_err(), "`..` must not escape the workspace root");
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&sibling);
     }
 }

@@ -14747,6 +14747,99 @@ mod tests {
         );
     }
 
+    /// #954 (ACP-3) acceptance: `fs/read_text_file` must serve an open,
+    /// **dirty** buffer's unsaved in-memory content, not stale on-disk
+    /// text — the single most important correctness property in the
+    /// slice, per the issue's own framing (an agent reasoning over stale
+    /// text proposes edits against lines the user already changed). Uses
+    /// the fixture's `ACP_FAKE_FS_READ_PATH` branch (see its own doc
+    /// comment), which echoes back whatever `fs/read_text_file` returned
+    /// as a transcript chunk — so this reads the answer off the rendered
+    /// screen through the real `TuiShellApp`/`TuiDriver` stack, exactly
+    /// like `ai_panel_streams_acp_thought_and_message_chunks_via_shell_app`
+    /// above does for `session/update` chunks.
+    ///
+    /// RED verified: reverting `Engine::acp_read_text_file` to always
+    /// `std::fs::read_to_string` (skipping the buffer-first lookup) makes
+    /// this fail — the screen shows `"read:on disk"` instead of
+    /// `"read:DIRTYMARKER123"`.
+    #[cfg(unix)]
+    #[test]
+    fn fs_read_text_file_serves_dirty_buffer_content_via_shell_app() {
+        let dir = std::env::temp_dir().join(format!("acp3-tui-read-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_path = dir.join("dirty.txt");
+        std::fs::write(&file_path, "on disk").unwrap();
+
+        let mut app = TuiShellApp::new(None);
+        app.engine
+            .app_shell
+            .show_panel(&quadraui::WidgetId::new(PANEL_AI));
+        app.engine.ai_has_focus = true;
+        app.sidebar.has_focus = true;
+        app.engine.workspace_root = Some(dir.clone());
+
+        let buffer_id = app
+            .engine
+            .buffer_manager
+            .open_file(&file_path)
+            .expect("should open");
+        {
+            let state = app.engine.buffer_manager.get_mut(buffer_id).unwrap();
+            let len = state.buffer.content.len_chars();
+            state.buffer.content.remove(0..len);
+            state.buffer.content.insert(0, "DIRTYMARKER123");
+            state.dirty = true;
+        }
+
+        let path_str = file_path.to_string_lossy().into_owned();
+        let argv = vec![
+            "sh".to_string(),
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/fake_acp_agent.sh"
+            )
+            .to_string(),
+        ];
+        let cwd = std::env::temp_dir();
+        let mut client = crate::core::acp::AcpClient::spawn_with_env(
+            &argv,
+            &cwd,
+            &[("ACP_FAKE_FS_READ_PATH", path_str.as_str())],
+        )
+        .expect("fixture agent should spawn");
+        client.initialize();
+        app.engine.acp_client = Some(client);
+        app.engine.settings.acp_agent_command = "already-spawned-above".to_string();
+
+        let mut driver = driver_with_shell(app, config(), 80, 24);
+        for c in "please read".chars() {
+            driver.type_char(c);
+        }
+        driver.ctrl_char('s');
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut screen = driver.screen();
+        while !screen.contains("read:DIRTYMARKER123") && Instant::now() < deadline {
+            driver.tick();
+            std::thread::sleep(Duration::from_millis(10));
+            screen = driver.screen();
+        }
+
+        assert!(
+            screen.contains("read:DIRTYMARKER123"),
+            "the agent's fs/read_text_file reply must carry the dirty \
+             buffer's unsaved content within 5s; screen:\n{screen}"
+        );
+        assert!(
+            !screen.contains("read:on disk"),
+            "must never serve stale on-disk content for an open, dirty \
+             buffer; screen:\n{screen}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Toasts are the last thing painted, on top of every other surface.
     #[test]
     fn render_content_paints_toast_via_shell_app() {

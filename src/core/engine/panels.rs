@@ -531,8 +531,12 @@ impl Engine {
                         if let Some(ca) = self.pending_code_action_choices.get(idx).cloned() {
                             self.pending_code_action_choices.clear();
                             if let Some(edit) = ca.edit {
-                                self.apply_workspace_edit(edit);
-                                self.message = format!("Applied: {}", ca.title);
+                                let errors = self.apply_workspace_edit(edit);
+                                self.message = if errors.is_empty() {
+                                    format!("Applied: {}", ca.title)
+                                } else {
+                                    format!("Applied: {} (errors: {})", ca.title, errors.join("; "))
+                                };
                             } else {
                                 self.message = format!("No edit available for '{}'", ca.title);
                             }
@@ -1496,8 +1500,12 @@ impl Engine {
                         self.lsp_pending_rename = None;
                         let n = workspace_edit.changes.len();
                         if n > 0 {
-                            self.apply_workspace_edit(workspace_edit);
-                            self.message = format!("Renamed in {n} file(s)");
+                            let errors = self.apply_workspace_edit(workspace_edit);
+                            self.message = if errors.is_empty() {
+                                format!("Renamed in {n} file(s)")
+                            } else {
+                                format!("Renamed in {n} file(s) with errors: {}", errors.join("; "))
+                            };
                         } else if let Some(err) = error_message {
                             self.message = format!("Rename failed: {err}");
                         } else {
@@ -2116,10 +2124,32 @@ impl Engine {
         self.lsp_dirty_buffers.insert(buffer_id, true);
     }
 
-    /// Apply a workspace-wide rename edit.
-    pub(crate) fn apply_workspace_edit(&mut self, we: WorkspaceEdit) {
+    /// Apply a workspace-wide rename edit. Returns one error message per
+    /// file this couldn't be applied to (empty on full success) — never
+    /// swallows a failure the way the old closed-file branch did (#954
+    /// review of #1897-1964/#1967-2016).
+    ///
+    /// For a file that's already open, this delegates straight to
+    /// [`Self::apply_lsp_edits`] (undo-grouped, UTF-16-aware). For a
+    /// **closed** file, this used to fall through to a raw `fs::write` with
+    /// no undo group, no path canonicalisation (so an already-open buffer
+    /// under a differently-spelled-but-equal path could silently diverge
+    /// from what just got written to disk), and a swallowed `Result` (a
+    /// failed write — read-only file, missing parent directory, whatever —
+    /// looked identical to a no-op success). That made LSP rename-across-
+    /// files unsafe, and would have made ACP's `fs/write_text_file`
+    /// (#954) unsafe by construction had it reused this path unfixed. The
+    /// fix: open the closed file into a buffer first (`BufferManager::
+    /// open_file`, which already canonicalizes for its own dedup), then
+    /// apply through the exact same undo-grouped path an already-open file
+    /// gets — deliberately **not** an immediate disk write. This matches
+    /// how an already-open buffer behaves (dirty, undoable, saved
+    /// whenever the user next saves) instead of re-introducing a silent
+    /// background write behind the user's back.
+    pub(crate) fn apply_workspace_edit(&mut self, we: WorkspaceEdit) -> Vec<String> {
+        let mut errors = Vec::new();
         for file_edit in we.changes {
-            // Try to find an already-open buffer for this path
+            // Try to find an already-open buffer for this path.
             let buffer_id = self.buffer_manager.list().into_iter().find(|&bid| {
                 self.buffer_manager
                     .get(bid)
@@ -2128,44 +2158,19 @@ impl Engine {
                     .unwrap_or(false)
             });
 
-            if let Some(bid) = buffer_id {
-                self.apply_lsp_edits(bid, file_edit.edits);
-            } else {
-                // File not open — read, edit, and write back to disk
-                if let Ok(text) = std::fs::read_to_string(&file_edit.path) {
-                    let mut edits = file_edit.edits;
-                    // Sort in reverse order
-                    edits.sort_by(|a, b| {
-                        b.range
-                            .start
-                            .line
-                            .cmp(&a.range.start.line)
-                            .then(b.range.start.character.cmp(&a.range.start.character))
-                    });
-                    let mut rope = ropey::Rope::from_str(&text);
-                    for edit in &edits {
-                        let total_lines = rope.len_lines();
-                        let start_line =
-                            (edit.range.start.line as usize).min(total_lines.saturating_sub(1));
-                        let end_line =
-                            (edit.range.end.line as usize).min(total_lines.saturating_sub(1));
-                        let start_line_text: String = rope.line(start_line).chars().collect();
-                        let end_line_text: String = rope.line(end_line).chars().collect();
-                        let start_char =
-                            lsp::utf16_offset_to_char(&start_line_text, edit.range.start.character);
-                        let end_char =
-                            lsp::utf16_offset_to_char(&end_line_text, edit.range.end.character);
-                        let start_offset = rope.line_to_char(start_line) + start_char;
-                        let end_offset = rope.line_to_char(end_line) + end_char;
-                        if end_offset > start_offset {
-                            rope.remove(start_offset..end_offset);
-                        }
-                        rope.insert(start_offset, &edit.new_text);
+            let buffer_id = match buffer_id {
+                Some(bid) => bid,
+                None => match self.buffer_manager.open_file(&file_edit.path) {
+                    Ok(bid) => bid,
+                    Err(e) => {
+                        errors.push(format!("{}: {e}", file_edit.path.display()));
+                        continue;
                     }
-                    let _ = std::fs::write(&file_edit.path, rope.to_string());
-                }
-            }
+                },
+            };
+            self.apply_lsp_edits(buffer_id, file_edit.edits);
         }
+        errors
     }
 
     /// Get the cursor's file path, line, and UTF-16 column for LSP requests.
