@@ -21,24 +21,13 @@ pub(super) fn render_activity_bar(
 /// Render the explorer tree panel's body: background fill + the
 /// `TreeController` itself + its scroll-surface registration.
 ///
-/// #766: used to be reached two ways — the (now-deleted) `draw_frame`'s test
-/// harness via a `render_sidebar` dispatcher that lived here, and
-/// `TuiShellApp::render_content` (`shell_app.rs`, which never has a raw
-/// `Frame`/`Buffer` — see that module's doc comment) via `render_sidebar_content`
-/// (below). `draw_frame`'s test suite never asserted on sidebar content, so
-/// `render_sidebar` and its panel-dispatch `match` were dead weight once it
-/// was gone; `render_sidebar_content` still falls through to this function
-/// for the explorer panel. The background
-/// fill that used to be a raw `set_cell` loop over `frame.buffer_mut()` is
-/// now painted via `Backend::draw_status_bar` with a single blank segment
-/// per row — `draw_status_bar`'s TUI rasteriser always fills the *entire*
-/// row with the first segment's `bg` before painting segment text
-/// (`quadraui/src/tui/status_bar.rs`'s `fill_bg` loop), so an empty-text
-/// segment is enough to reproduce the old solid-fill behavior exactly. This
-/// is the same "solid `StatusBar` as background fill" trick quadraui's own
-/// `AppShell::render` uses for its resize divider (`compose/app_shell.rs`'s
-/// `divider_bounds` block) — the issue's suggested stand-in for raw
-/// background fills that have no direct `Backend::draw_*` equivalent.
+/// #766/#607: reached only via `render_sidebar_content` below.
+///
+/// #1242: background fill + no-chrome carve go through
+/// `render::paint_sidebar_panel_chrome` (quadraui#1041's `SidebarPanelBody`).
+/// GTK's `PANEL_EXPLORER` arm uses the same call with `background: None`
+/// (unchanged behaviour there); see `paint_sidebar_panel_chrome`'s doc for
+/// why the `TreeController` body itself stays a direct call.
 pub(super) fn render_explorer_sidebar_content(
     backend: &mut dyn quadraui::Backend,
     area: Rect,
@@ -51,33 +40,29 @@ pub(super) fn render_explorer_sidebar_content(
 
     backend.set_theme(super::quadraui_tui::q_theme(theme));
 
-    let bg_bar = quadraui::StatusBar {
-        id: quadraui::WidgetId::new("explorer:bg"),
-        left_segments: vec![quadraui::StatusBarSegment {
-            text: String::new(),
-            fg: theme.explorer_file_fg,
-            bg: theme.tab_bar_bg,
-            bold: false,
-            action_id: None,
-        }],
-        right_segments: vec![],
-    };
-    for y in area.y..area.y + area.height {
-        let row_rect = quadraui::Rect::new(area.x as f32, y as f32, area.width as f32, 1.0);
-        let _ = backend.draw_status_bar(row_rect, &bg_bar, None, None);
-    }
-
     let q_rect = quadraui::Rect::new(
         area.x as f32,
         area.y as f32,
         area.width as f32,
         area.height as f32,
     );
-    engine.explorer_tree_rect.set(q_rect);
-    engine.explorer_viewport_rows.set(area.height as usize);
+    let panel = render::SidebarPanelBody {
+        background: Some(theme.tab_bar_bg),
+        chrome: render::SidebarPanelChrome::None,
+        scrollbar_gutter: None,
+    };
+    let layout = render::paint_sidebar_panel_chrome(backend, &panel, q_rect);
+
+    engine.explorer_tree_rect.set(layout.body_rect);
+    engine
+        .explorer_viewport_rows
+        .set(layout.body_rect.height as usize);
     render::populate_explorer_tree_controller(engine, theme);
     backend.set_theme(super::quadraui_tui::q_theme(theme));
-    engine.explorer_tree.borrow().render(backend, q_rect);
+    engine
+        .explorer_tree
+        .borrow()
+        .render(backend, layout.body_rect);
 
     // TreeController.render() draws the scrollbar internally.
     // Register a ScrollSurface for scroll-wheel dispatch only.
@@ -86,7 +71,7 @@ pub(super) fn render_explorer_sidebar_content(
         .borrow_mut()
         .push(quadraui::ScrollSurface {
             id: quadraui::WidgetId::new("explorer:sb"),
-            bounds: q_rect,
+            bounds: layout.body_rect,
             scrollbar: None,
         });
 }
@@ -122,8 +107,16 @@ pub(super) fn render_explorer_sidebar_content(
 /// the chat history and [`fill_row`] for its plain chrome rows). See each
 /// function's own doc comment for the specific tradeoffs.
 ///
+/// #1252: takes the frame's own `screen: &render::ScreenLayout` — built once
+/// per frame by `build_screen_for_shell_content` — instead of each panel
+/// rebuilding its own via `render::build_screen_layout(engine, theme, &[],
+/// ...)`. GTK's `paint_sidebar_panel_rung` (`src/app.rs`) already threads the
+/// frame's `screen` this way; a second, independently-built `ScreenLayout`
+/// mid-frame could disagree with the one the rest of the frame was composed
+/// from, on top of the redundant per-frame rebuild cost.
 pub(super) fn render_sidebar_content(
     backend: &mut dyn quadraui::Backend,
+    screen: &render::ScreenLayout,
     area: Rect,
     sidebar: &TuiSidebar,
     engine: &Engine,
@@ -134,19 +127,19 @@ pub(super) fn render_sidebar_content(
         // dropped its `&mut Frame` parameter (help popup + scrollbar now
         // paint through `Backend::draw_tooltip`/`fill_row`; see that
         // function's doc comment).
-        render_ext_panel(backend, area, engine, theme);
+        render_ext_panel(backend, screen, area, engine, theme);
         return;
     }
 
     match engine.app_shell.active_panel_id().map(|w| w.as_str()) {
         Some(PANEL_SEARCH) => render_search_panel(backend, area, engine, theme),
-        Some(PANEL_DEBUG) => render_debug_sidebar(backend, area, engine, theme),
+        Some(PANEL_DEBUG) => render_debug_sidebar(backend, screen, area, engine, theme),
         // #605: settings, source control and extensions are no longer
         // deferred — each had its raw `set_cell` chrome converted to the
         // rule-row trick.
         Some(PANEL_SETTINGS) => render_settings_panel(backend, area, theme, engine),
-        Some(PANEL_GIT) => render_source_control(backend, area, engine, theme),
-        Some(PANEL_EXTENSIONS) => render_ext_sidebar(backend, area, engine, theme),
+        Some(PANEL_GIT) => render_source_control(backend, screen, area, engine, theme),
+        Some(PANEL_EXTENSIONS) => render_ext_sidebar(backend, screen, area, engine, theme),
         // #635 (Stage 6b item C): AI is no longer deferred — `render_ai_sidebar`
         // dropped its `buf: &mut Buffer` parameter for `&mut dyn Backend`.
         Some(PANEL_AI) => render_ai_sidebar(backend, area, engine, theme),
@@ -226,6 +219,14 @@ fn fill_rect(backend: &mut dyn quadraui::Backend, area: Rect, fg: Color, bg: Col
 /// ([JDonaghy/quadraui#531](https://github.com/JDonaghy/quadraui/issues/531)).
 /// #635 (Stage 6b) retires that stand-in now that #531 has landed: the
 /// chrome paints through the real trait call below.
+///
+/// #1242: background + header/search chrome now go through
+/// `render::paint_sidebar_panel_chrome` (quadraui#1041's `SidebarPanelBody`)
+/// — same two backend calls, now composed through the shared primitive
+/// instead of hand-derived row-slicing. GTK's `PANEL_SETTINGS` arm paints
+/// no chrome (`chrome: SidebarPanelChrome::None`) — a pre-existing
+/// asymmetry `TUI_AUDIT_R2.md` §5 Wave 1 item 2 tracks separately, not
+/// resolved here.
 pub(super) fn render_settings_panel(
     backend: &mut dyn quadraui::Backend,
     area: Rect,
@@ -236,55 +237,46 @@ pub(super) fn render_settings_panel(
         return;
     }
 
-    // Fill background
-    fill_rect(backend, area, theme.foreground, theme.tab_bar_bg);
-
-    // Rows 0–1: header + search input chrome.
-    let chrome_h = area.height.min(2);
-    let chrome_area = quadraui::Rect::new(
+    backend.set_theme(super::quadraui_tui::q_theme(theme));
+    let q_rect = quadraui::Rect::new(
         area.x as f32,
         area.y as f32,
         area.width as f32,
-        chrome_h as f32,
+        area.height as f32,
     );
-    backend.set_theme(super::quadraui_tui::q_theme(theme));
-    backend.draw_settings_chrome(
-        chrome_area,
-        " SETTINGS",
-        &engine.settings_query,
-        "",
-        engine.settings_input_active,
-    );
+    let panel = render::SidebarPanelBody {
+        background: Some(theme.tab_bar_bg),
+        chrome: render::SidebarPanelChrome::HeaderAndSearch {
+            header: " SETTINGS".to_string(),
+            query: engine.settings_query.clone(),
+            placeholder: String::new(),
+            active: engine.settings_input_active,
+        },
+        scrollbar_gutter: None,
+    };
+    let layout = render::paint_sidebar_panel_chrome(backend, &panel, q_rect);
 
-    // Rows 2+: scrollable form content, via the shared `quadraui::Form` +
+    // Scrollable form content, via the shared `quadraui::Form` +
     // `FormController` primitive (#479). Inline-edit rows are driven
     // through `FieldKind::TextInput` with a cursor (see
     // `render::settings_to_form`) so there is no separate manual
     // renderer for the edit-in-progress state.
-    let content_start = area.y + 2;
-    let content_height = area.height.saturating_sub(2) as usize;
-    if content_height == 0 {
+    if layout.body_rect.height <= 0.0 {
         return;
     }
 
     render::populate_settings_form_controller(engine);
-    let q_rect = quadraui::Rect::new(
-        area.x as f32,
-        content_start as f32,
-        area.width as f32,
-        content_height as f32,
-    );
     // Cache the exact rect this frame painted into (#1238) — mirrors
     // `explorer_tree_rect` / `ext_panel_content_rect`. `mouse.rs`'s hit-tests
     // read this back instead of re-deriving `y = area.y + 2` by hand, which
     // drifted the moment the sidebar's own origin was not `y == 0` (e.g. the
     // menu bar visible).
-    engine.settings_form_rect.set(q_rect);
+    engine.settings_form_rect.set(layout.body_rect);
     backend.set_theme(super::quadraui_tui::q_theme(theme));
     engine
         .settings_form_controller
         .borrow_mut()
-        .render_and_cache(backend, q_rect);
+        .render_and_cache(backend, layout.body_rect);
 }
 
 /// Render the project search panel via SidebarSystem (Form + TreeView).
@@ -372,6 +364,7 @@ pub(super) fn render_command_line(
 /// trait call.
 pub(super) fn render_source_control(
     backend: &mut dyn quadraui::Backend,
+    screen: &render::ScreenLayout,
     area: Rect,
     engine: &Engine,
     theme: &Theme,
@@ -385,17 +378,9 @@ pub(super) fn render_source_control(
     fill_rect(backend, area, theme.foreground, theme.tab_bar_bg);
     let dim_fg = theme.line_number_fg;
 
-    // Build SC data from engine state via the render abstraction.
-    let screen = render::build_screen_layout(
-        engine,
-        theme,
-        &[],
-        1.0,
-        1.0,
-        true,
-        0.0,
-        render::TUI_MINIMAP_SIZING,
-    );
+    // #1252: SC data comes from the frame's own `screen` (built once by
+    // `build_screen_for_shell_content`) instead of a second, independently
+    // built `ScreenLayout` — see `render_sidebar_content`'s doc comment.
     let Some(ref sc) = screen.source_control else {
         return;
     };
@@ -556,18 +541,18 @@ pub(super) fn render_source_control(
 
 /// Render an extension-provided sidebar panel.
 ///
-/// Migrated to `quadraui::TreeView` (#476). Header + search-input chrome
-/// route through `Backend::draw_settings_chrome`; the body rows (sections +
-/// expandable tree items + badges + action labels) flow through
-/// `render::ext_panel_to_tree_view()` + `Backend::draw_tree`. The
-/// help-popup overlay and the scrollbar are panel-specific chrome that
-/// don't fit `TreeView` and stay inline — as of #635 (Stage 6b item C)
-/// through `Backend::draw_tooltip`/[`fill_row`] rather than raw `set_cell`,
-/// so `backend` widens to `&mut dyn Backend` and `frame` drops out of the
-/// signature entirely (this was the panel's own doc-flagged "no primitive
-/// stand-in checked yet" gap — see `shell_app.rs`'s module doc).
+/// #1242: background(none), header/search chrome, tree body and scrollbar
+/// gutter compose through quadraui#1041's `SidebarPanelBody::render` — the
+/// only sidebar rung whose body is an *owned* per-frame value
+/// (`render::ext_panel_to_tree_view`'s fresh `TreeView`, not a persistent
+/// controller), so it's the one that can use the real `&dyn BackendWidget`
+/// path (`render::ExtPanelTreeBody`) rather than
+/// `paint_sidebar_panel_chrome` plus a manual body call. The help-popup
+/// overlay and the scrollbar's own thumb/track paint stay inline — neither
+/// has a `TreeView`/`SidebarPanelBody` equivalent.
 pub(super) fn render_ext_panel(
     backend: &mut dyn quadraui::Backend,
+    screen: &render::ScreenLayout,
     area: Rect,
     engine: &Engine,
     theme: &Theme,
@@ -575,16 +560,8 @@ pub(super) fn render_ext_panel(
     if area.height == 0 {
         return;
     }
-    let screen = render::build_screen_layout(
-        engine,
-        theme,
-        &[],
-        1.0,
-        1.0,
-        true,
-        0.0,
-        render::TUI_MINIMAP_SIZING,
-    );
+    // #1252: reads the frame's own `screen` — see `render_sidebar_content`'s
+    // doc comment.
     let Some(ref panel) = screen.ext_panel else {
         engine.ext_panel_tree_layout.replace(None);
         return;
@@ -597,55 +574,53 @@ pub(super) fn render_ext_panel(
     // actually painted instead of re-deriving the sidebar content's top row
     // from the menu-bar row count by hand. Mirrors `explorer_tree_rect` /
     // `dap_sidebar_body_rect`.
-    engine.ext_panel_content_rect.set(quadraui::Rect::new(
+    let q_rect = quadraui::Rect::new(
         area.x as f32,
         area.y as f32,
         area.width as f32,
         area.height as f32,
-    ));
+    );
+    engine.ext_panel_content_rect.set(q_rect);
 
-    // ── Chrome: header (always) + search input (only when active or text). ─
+    // Header (always) + search input (only when active or text) — see this
+    // function's own doc for why `SidebarPanelBody::render`'s real
+    // `&dyn BackendWidget` path applies here.
     let input_visible = panel.input_active || !panel.input_text.is_empty();
-    let chrome_h: u16 = (if input_visible { 2 } else { 1 }).min(area.height);
     let header_title = format!(" {}", panel.title);
-    let chrome_area = quadraui::Rect::new(
-        area.x as f32,
-        area.y as f32,
-        area.width as f32,
-        chrome_h as f32,
-    );
+    let sidebar_panel = render::SidebarPanelBody {
+        background: None,
+        chrome: if input_visible {
+            render::SidebarPanelChrome::HeaderAndSearch {
+                header: header_title,
+                query: panel.input_text.clone(),
+                placeholder: String::new(),
+                active: panel.input_active,
+            }
+        } else {
+            render::SidebarPanelChrome::Header(header_title)
+        },
+        // 1 col reserved for the scrollbar, unconditionally — `draw_tree`
+        // "doesn't render scrollbars yet" (see below), so this file paints
+        // its own into the gutter `layout.scrollbar_rect` reserves.
+        scrollbar_gutter: Some(1.0),
+    };
     backend.set_theme(super::quadraui_tui::q_theme(theme));
-    backend.draw_settings_chrome(
-        chrome_area,
-        &header_title,
-        &panel.input_text,
-        "",
-        panel.input_active,
-    );
+    let body = render::ExtPanelTreeBody(render::ext_panel_to_tree_view(panel, theme));
+    let layout = sidebar_panel.render(backend, q_rect, &body);
 
-    // ── Body: TreeView rasterised via the shared primitive. ────────────────
-    let body_h = area.height.saturating_sub(chrome_h);
-    if body_h > 0 {
-        let body_w = area.width.saturating_sub(1); // 1 col reserved for scrollbar
-        let tree = render::ext_panel_to_tree_view(panel, theme);
-        let body_q_rect = quadraui::Rect::new(
-            area.x as f32,
-            (area.y + chrome_h) as f32,
-            body_w as f32,
-            body_h as f32,
-        );
-        backend.set_theme(super::quadraui_tui::q_theme(theme));
-        backend.draw_tree(body_q_rect, &tree);
+    // ── Scrollbar + click-routing cache: only when the body actually got
+    // rows to show (chrome could have consumed the whole area). ───────────
+    if layout.body_rect.height > 0.0 {
         // #1089: cache the exact `Backend::tree_layout` this frame painted
         // with — the click router (`render::route_ext_panel_click`, shared
         // with the GTK/macOS/Win `App`) reads this instead of re-deriving
         // row geometry from a uniform row height. See
         // `Engine::ext_panel_tree_layout`'s own doc for why that matters on
         // the pixel backends even though TUI's own rows are uniform.
-        let tree_layout = backend.tree_layout(body_q_rect, &tree);
+        let tree_layout = backend.tree_layout(layout.body_rect, &body.0);
         engine
             .ext_panel_tree_layout
-            .replace(Some((body_q_rect, tree_layout)));
+            .replace(Some((layout.body_rect, tree_layout)));
 
         // Scrollbar: `draw_tree` doesn't render scrollbars yet. Total
         // visible rows = tree.rows.len() (sections + their expanded items,
@@ -654,37 +629,41 @@ pub(super) fn render_ext_panel(
         // one [`fill_row`] call per row (the rule-row trick #605 used for
         // the settings/source-control/extensions sidebar chrome) instead
         // of a raw `Buffer` write.
-        let total = tree.rows.len();
-        let track_h = body_h as usize;
-        let ext_panel_scrollbar = if total > track_h && track_h > 0 {
-            let scroll = panel.scroll_top;
-            let sb_x = area.x + area.width - 1;
-            let thumb_h = (track_h * track_h / total).max(1);
-            let thumb_top = scroll * track_h / total;
-            for i in 0..track_h {
-                let y = area.y + chrome_h + i as u16;
-                let (ch, fg) = if i >= thumb_top && i < thumb_top + thumb_h {
-                    ('\u{2588}', theme.scrollbar_thumb)
-                } else {
-                    ('\u{2591}', theme.scrollbar_track)
-                };
-                fill_row(backend, sb_x, y, 1, &ch.to_string(), fg, theme.background);
+        let total = body.0.rows.len();
+        let ext_panel_scrollbar = if let Some(sb_rect) = layout.scrollbar_rect {
+            let track_h = sb_rect.height as usize;
+            if total > track_h && track_h > 0 {
+                let scroll = panel.scroll_top;
+                let sb_x = sb_rect.x as u16;
+                let sb_y = sb_rect.y as u16;
+                let thumb_h = (track_h * track_h / total).max(1);
+                let thumb_top = scroll * track_h / total;
+                for i in 0..track_h {
+                    let y = sb_y + i as u16;
+                    let (ch, fg) = if i >= thumb_top && i < thumb_top + thumb_h {
+                        ('\u{2588}', theme.scrollbar_thumb)
+                    } else {
+                        ('\u{2591}', theme.scrollbar_track)
+                    };
+                    fill_row(backend, sb_x, y, 1, &ch.to_string(), fg, theme.background);
+                }
+                Some(quadraui::SurfaceScrollbar {
+                    axis: quadraui::ScrollAxis::Vertical,
+                    track_bounds: sb_rect,
+                    thumb_bounds: quadraui::Rect::new(
+                        sb_rect.x,
+                        sb_rect.y + thumb_top as f32,
+                        1.0,
+                        thumb_h as f32,
+                    ),
+                    total_items: total,
+                    visible_items: track_h,
+                    scroll_offset: scroll,
+                    inverted: false,
+                })
+            } else {
+                None
             }
-            let track_start_y = (area.y + chrome_h) as f32;
-            Some(quadraui::SurfaceScrollbar {
-                axis: quadraui::ScrollAxis::Vertical,
-                track_bounds: quadraui::Rect::new(sb_x as f32, track_start_y, 1.0, track_h as f32),
-                thumb_bounds: quadraui::Rect::new(
-                    sb_x as f32,
-                    track_start_y + thumb_top as f32,
-                    1.0,
-                    thumb_h as f32,
-                ),
-                total_items: total,
-                visible_items: track_h,
-                scroll_offset: scroll,
-                inverted: false,
-            })
         } else {
             None
         };
@@ -693,12 +672,7 @@ pub(super) fn render_ext_panel(
             .borrow_mut()
             .push(quadraui::ScrollSurface {
                 id: quadraui::WidgetId::new("ext_panel:sb"),
-                bounds: quadraui::Rect::new(
-                    area.x as f32,
-                    area.y as f32,
-                    area.width as f32,
-                    area.height as f32,
-                ),
+                bounds: q_rect,
                 scrollbar: ext_panel_scrollbar,
             });
     } else {
@@ -924,6 +898,7 @@ pub(super) fn render_panel_hover_popup(
 /// collapsed into that.
 pub(super) fn render_ext_sidebar(
     backend: &mut dyn quadraui::Backend,
+    screen: &render::ScreenLayout,
     area: Rect,
     engine: &Engine,
     theme: &Theme,
@@ -932,16 +907,8 @@ pub(super) fn render_ext_sidebar(
         return;
     }
 
-    let screen = render::build_screen_layout(
-        engine,
-        theme,
-        &[],
-        1.0,
-        1.0,
-        true,
-        0.0,
-        render::TUI_MINIMAP_SIZING,
-    );
+    // #1252: reads the frame's own `screen` — see `render_sidebar_content`'s
+    // doc comment.
     let Some(ref ext) = screen.ext_sidebar else {
         return;
     };
@@ -1038,6 +1005,9 @@ pub(super) fn render_ai_sidebar(
     engine.ai_chat_rect.set(q_area);
     backend.set_theme(super::quadraui_tui::q_theme(theme));
     engine.ai_chat.borrow().render(backend, q_area);
+    // #956 (ACP-5): slash-command completions, painted on top — no-op
+    // unless the input matches an agent-declared command.
+    render::paint_ai_command_completions(backend, engine, q_area);
 }
 
 // ─── Debug sidebar panel ──────────────────────────────────────────────────────
@@ -1051,6 +1021,7 @@ pub(super) fn render_ai_sidebar(
 /// was already trait-pure, same rationale as `render_search_panel` above.
 pub(super) fn render_debug_sidebar(
     backend: &mut dyn quadraui::Backend,
+    screen: &render::ScreenLayout,
     area: Rect,
     engine: &Engine,
     theme: &Theme,
@@ -1059,17 +1030,9 @@ pub(super) fn render_debug_sidebar(
         return;
     }
 
-    // Build minimal screen layout to get debug_sidebar data.
-    let screen = render::build_screen_layout(
-        engine,
-        theme,
-        &[],
-        1.0,
-        1.0,
-        true,
-        0.0,
-        render::TUI_MINIMAP_SIZING,
-    );
+    // #1252: reads the frame's own `screen` — see `render_sidebar_content`'s
+    // doc comment — instead of rebuilding a second `ScreenLayout` just to
+    // read `debug_sidebar`.
     let sidebar = &screen.debug_sidebar;
 
     // ── Chrome rows (panel-specific): header + Run/Stop button via StatusBar. ──
@@ -1162,6 +1125,19 @@ mod sc_panel_tests {
             width,
             height,
         };
+        // #1252: `render_source_control` now reads the frame's own `screen`
+        // instead of rebuilding one itself — build it once here, matching
+        // what `render_content` does via `build_screen_for_shell_content`.
+        let screen = render::build_screen_layout(
+            engine,
+            &theme,
+            &[],
+            1.0,
+            1.0,
+            true,
+            0.0,
+            render::TUI_MINIMAP_SIZING,
+        );
         terminal
             .draw(|frame| {
                 // #600: `render_source_control` calls `Backend::draw_*` trait
@@ -1172,7 +1148,7 @@ mod sc_panel_tests {
                 // the scope entry is still what gives its `draw_*` calls a
                 // buffer to land in.
                 super::with_frame_scope(&mut tui_backend, frame, |backend, _frame| {
-                    render_source_control(backend, area, engine, &theme);
+                    render_source_control(backend, &screen, area, engine, &theme);
                 });
             })
             .unwrap();

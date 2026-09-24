@@ -1,6 +1,239 @@
 # VimCode Project State
 
-**Last updated:** September 20, 2026 (#1102 — deleted GTK's `gdk_pixbuf`
+**Last updated:** September 24, 2026 (#955, ACP-4 — tool-call rendering
+plus a source-agnostic change-review surface, on top of ACP-1's #952
+transport; shares its review surface with the future #525 git-branch-diff
+slice, whichever lands second consumes it). `src/core/acp.rs` gained
+`AcpToolCall`/`AcpToolCallStatus`/`AcpToolCallContentBlock` plus
+`parse_tool_call`/`parse_tool_call_update`/`tool_call_summary_line` —
+`tool_call` is a full announcement, `tool_call_update` is a *patch*
+(status replaces, `content` **appends**, never replaces) keyed by
+`toolCallId`. New `Engine::acp_tool_calls: Vec<AcpToolCall>`
+(`src/core/engine/acp_ops.rs`'s `acp_upsert_tool_call`/
+`acp_apply_tool_call_update`) is upserted by id, not append-only, and
+renders as one collapsed one-line summary turn per call (status glyph +
+kind + title, `render::populate_ai_chat_controller`) appended after the
+real conversation — same "synthetic turn" treatment #956 gave the plan
+checklist. New module `src/core/review.rs` (deliberately free of any
+`Engine`/buffer/backend knowledge): `ProposedChange{path, old_text,
+new_text}` is the source-agnostic unit both this slice and #525 build
+from; `ChangeReviewState`/`ChangeReviewEntry` wrap a real
+`quadraui::DiffView` per file (built via `quadraui::compute_hunks`, with a
+hand-rolled `pure_addition_hunks` for `old_text: None` — `"".split('\n')`
+yields one line, not zero, so routing a new file through `compute_hunks`
+directly can wrongly mark a trailing blank line `Same` instead of every
+row being a clean `Added`) plus hunk/file navigation and accept/reject.
+`src/core/engine/review_ops.rs` bridges it to the engine: `Engine::
+open_change_review`/`change_review_diff_rect` (paint-to-hit-test contract,
+same as `command_line_rect`), `handle_change_review_key` (Esc/q close,
+j/k/Down/Up scroll, `]`/`[` hunk nav, n/p/Tab file nav, a/r accept/reject,
+Return jumps to the current row's file+line), and `change_review_accept_
+current` reuses `Engine::acp_write_text_file` (#954) rather than
+duplicating the buffer-write path. New `FrameOp::ChangeReview` rung
+(`render::paint_change_review_rung`, shared verbatim by both backends) —
+painted as a full-viewport modal, so `render::route_modal_key` now also
+routes to `Engine::handle_key` whenever `change_review.is_some()` (without
+this, the AI panel's own focus route sends keys straight to
+`route_ai_chat_event`, bypassing `Engine::handle_key` entirely — exactly
+when a tool-call diff would arrive). Mouse click-to-jump
+(`render::route_change_review_click`, `ChangeReviewClickRoute`) resolves a
+click against the painted `DiffView`'s own row geometry and is wired on
+both backends the same way `route_folder_picker_click` is — checked before
+`route_modal_overlay_click`'s ladder, not folded into it, since this
+surface swallows every click while open. Extended the shared `tests/
+fixtures/fake_acp_agent.sh`: `$ACP_FAKE_TOOL_CALL_STATUS_ONLY` (status
+transitions with no diff, so the transcript stays visible to assert
+against) and `$ACP_FAKE_TOOL_CALL` (+ `$ACP_FAKE_TOOL_CALL_PATH`, the diff
+scenario that opens the review surface and exercises accept-writes-to-disk).
+Black-box coverage: three TUI `TuiDriver` tests and three GTK `GtkDriver`
+tests (status-transition, diff-review-plus-accept, and — review fix,
+same day — a real-mouse click-to-jump test per backend), each
+RED-verified against its specific regression before being confirmed
+GREEN — plus unit tests for every new parser in `core::acp`, the full
+`core::review` module (including the acceptance bar's own explicit
+non-ACP-feed test and the `oldText: null` pure-addition test), and
+`core::engine::review_ops`. Known gap, stated rather than silently
+shipped: `locations[{path, line}]` in the *transcript* (as opposed to the
+change-review surface, which does support click-to-jump) has no
+click-to-jump — `quadraui::ChatTurn`/`StyledText` carry no clickable-span
+concept yet, which is a quadraui infra gap, not a vimcode backend one; the
+keyboard path (`Return` in the review surface) exercises the same
+resolution function so the gap is "no mouse entry point yet" for that
+specific spot, not "unbuilt or untested". `cargo build`/`clippy -D
+warnings`/`fmt` clean on both feature lanes; full `cargo test --lib`
+(3675 tests, both backends compiled in) and `--no-default-features --lib`
+(3435 tests) both green.
+
+**Review fix (same day):** the driver-tier click test the review
+demanded caught a real bug the keyboard-only unit test couldn't —
+clicking a diff row landing where chrome (menu bar/CSD title bar,
+activity bar, sidebar) sits underneath the full-viewport overlay was
+silently swallowed *before* `route_and_apply_change_review_click`/
+`mouse::handle_mouse`'s change-review branch ever saw it: three separate
+chrome intercepts (quadraui's `ShellAdapter::handle` activity-bar/sidebar
+hit-test, `App::handle_dispatch`'s always-on GTK menu-bar intercept, and
+its CSD-titlebar drag-to-move check) all hit-test purely on screen
+position with no notion that an open overlay was painted on top. Fixed
+with new `render::reconcile_change_review_modal_stack` (paint-time, not
+click-time — pushes/pops the surface's full-viewport bounds on
+`quadraui::ModalStack` every frame, since the surface can open from an
+async ACP event with no correlated mouse motion to piggyback a
+handle-time reconcile on, unlike the editor-hover popup) plus three
+narrow `change_review.is_some()` guards in GTK's `App::handle_dispatch`/
+`try_route_sidebar_mouse_event`. Also: `change_review_jump_to_hit` now
+closes the surface on a successful jump (mirroring `Return`'s explicit
+close — a click that didn't close it just painted the diff right back
+over the buffer it switched to), and `ChangeReviewState::extend` skips a
+byte-identical duplicate `ProposedChange` (guards a replaying/buggy agent
+re-announcing the same `toolCallId`+diff from appending a second entry).
+
+**Review fix round 2 (same day):** the modal-stack reconcile above was
+initially popped from an `else` arm inside the frame walk's
+`FrameOp::ChangeReview` match — **dead code**, since
+`FramePresence::change_review` is the exact gate `render::compose_frame`
+uses to drop that rung from the op list the moment the surface closes, so
+the arm can never run on the frame that needs the pop. The full-viewport
+entry therefore stayed registered forever, and since `ShellAdapter::
+handle` hit-tests `ModalStack` *before* any chrome dispatch, every mouse
+event for the rest of the session was routed past `AppShell`'s own
+handling (activity-bar panel switching, sidebar/bottom-panel resize) —
+session-bricking, and invisible to the click-to-jump tests, which never
+click chrome afterwards. Same shape as #1117's `explorer_tree_rect` bug
+and the warning `render.rs` carries above `compose_frame`. Fixed by
+calling `reconcile_change_review_modal_stack(backend, presence.
+change_review, viewport)` **unconditionally, once, before the walk** on
+both backends (the `reconcile_editor_hover_modal` shape), leaving the
+rung's arm paint-only; `paint_change_review_rung` also pops rather than
+pushes when the state is open-but-entry-less, so it never registers a
+surface nothing painted. Covered by a new RED-verified driver test per
+backend (`change_review_close_restores_chrome_clicks_via_shell_app` /
+`…_via_gtk_driver`): open the surface from a plain non-ACP
+`ChangeReviewState::new(vec![ProposedChange{..}])`, close it via the real
+click-to-jump, then click the activity bar's Search icon and assert the
+Search panel actually opens. Also folds in the round's non-blocking note:
+the reconcile now calls `ModalStack::mark_painted` on the open path,
+since no quadraui rasteriser marks this surface (upstream wires
+`mark_painted` only for `draw_palette`/`draw_menu`/`draw_dialog`, and
+this surface is a `DiffView` + `StatusBar`), which was making a correctly
+painted overlay show up in `unpainted_ids()` and emit the #455
+"registered but invisible" diagnostic every frame it was open.
+
+Prior update: September 24, 2026 (#956, ACP-5 —
+plan, slash commands,
+modes and usage from the `session/update` stream, on top of ACP-1's #952
+transport; independent of ACP-3/ACP-4). `src/core/acp.rs` gained pure
+parsers for the four remaining `session/update` variants this track cared
+about: `parse_plan_update` (`AcpPlanEntry`/`AcpPlanEntryStatus`,
+`plan_to_checklist_text`), `parse_available_commands_update`
+(`AcpAvailableCommand`), `parse_session_modes`/`parse_current_mode_update`
+(`AcpSessionMode`), and `parse_usage_update`/`format_usage_summary`
+(`AcpUsage`, deliberately tolerant of a couple of plausible field-naming
+variants since usage telemetry is the least-stable corner of the v1
+schema). `AcpClient::set_mode` sends `session/set_mode`. New `Engine`
+fields (`acp_plan`, `acp_available_commands`, `acp_command_completion_idx`,
+`acp_modes`, `acp_current_mode_id`, `acp_usage`), all session-scoped
+(cleared on `ai_clear`/`AgentExited`, matching `acp_remembered_decisions`).
+`Engine::acp_handle_session_update` (`src/core/engine/acp_ops.rs`) now
+dispatches every recognized `session/update` kind; **`plan` is a full
+overwrite (`self.acp_plan = entries`), never `.extend`** — the #956
+acceptance bar ("two successive `plan` updates leave exactly one plan
+rendered") is a regression a worker could reintroduce by "fixing" this into
+an accumulator, so it's called out explicitly at every layer (doc comments,
+a dedicated `parse_plan_update` unit test, and a RED-verified TUI black-box
+test). `render::populate_ai_chat_controller` renders the current plan as
+one synthetic checklist turn appended after the real conversation (never
+mixed into `ai_messages`) and folds mode + usage into the existing AI-panel
+status header (no new widget, so #956's "no layout churn, no focus steal"
+criterion holds by construction). Slash commands surface as completions via
+`Engine::ai_command_completions`, reusing `render::CompletionMenu` /
+`quadraui::Completions` — the *same* machinery the editor's own word-
+completion popup uses, fed differently, per the issue's explicit steer away
+from a bespoke widget; `render::route_ai_chat_event` intercepts Tab (cycle)
+and Enter (accept) ahead of `ChatController::handle` when the popup is
+showing, and `render::paint_ai_command_completions` paints it anchored to
+the bottom of the panel's own rect (no exact input-box geometry needed —
+`Completions::layout`'s own "flip above on overflow" placement logic does
+that). Accepting a completion is nothing more than filling the input with
+`"/name "`; submitting it is `ai_send_message`'s existing plain-text path,
+unchanged — there is no separate slash-command RPC per the ACP v1 spec.
+New ex command `:AiMode [target]` (`src/core/engine/execute.rs`): no
+argument shows the agent's declared modes and which is current
+(`Engine::acp_mode_status_line`); an argument sends `session/set_mode`
+(`Engine::acp_set_mode`) matched by mode id or name — the displayed mode
+changes only once the agent's own `current_mode_update` notification lands,
+never optimistically on the request succeeding, which is the round-trip
+#956 asks for. `config_option_update`/`session/set_config_option` were
+explicitly left out of this slice per the issue's own "lower value...
+otherwise split it out" guidance — no follow-up issue filed yet. Extended
+the shared `tests/fixtures/fake_acp_agent.sh` (owned by the whole ACP
+track): `$ACP_FAKE_SESSION_MODES` adds a `modes` field to the `session/new`
+result; `$ACP_FAKE_PLAN` scripts two successive `plan` updates (the second
+a full replacement of the first) plus an `available_commands_update` and a
+`usage_update` in one `session/prompt` turn; a new top-level
+`session/set_mode` case replies empty and then emits a `current_mode_update`
+notification carrying back the requested mode id. Black-box coverage: two
+new TUI `TuiDriver` tests (`ai_panel_plan_update_fully_replaces_not_
+accumulates_via_shell_app`, `ai_panel_slash_command_completions_via_
+shell_app`) and one new GTK `GtkDriver` test
+(`ai_panel_mode_switch_round_trips_via_session_set_mode`), each RED-verified
+against its specific regression (the plan test against reverting to
+`.extend`; the slash-completion test against disabling the Tab/Enter
+intercept *and separately* against disabling the popup's paint call; the
+mode test against deleting the `current_mode_update` dispatch arm) before
+being confirmed GREEN — plus pure unit tests for every new parser in
+`core::acp` and two engine-level tests for `:AiMode`'s no-argument listing
+and its no-session rejection message. `cargo build`/`clippy -D warnings`/
+`fmt` clean on both feature lanes; targeted `cargo test` runs (acp/
+ai_panel/ai_mode/settings-snapshot, both lanes) all green.). Prior update:
+September 24, 2026 (#952, ACP-1 — hosted a live ACP session
+behind the existing AI panel, retiring `curl` as the *only* transport. The
+panel was already backend-neutral and already existed (`quadraui::
+ChatController`/`Engine::ai_chat`/`PANEL_AI`/`ai_send_message`/`poll_ai`/
+`dispatch_ai_chat_event`/`render::route_ai_chat_event`) — this slice was a
+transport swap plus a stream mapping, not new UI, exactly as the issue
+predicted. New setting `acp_agent_command` (`src/core/settings.rs`, parsed
+via `core::acp::parse_agent_command`): empty (default) keeps the original
+direct-provider `curl` transport (`crate::core::ai`, kept as a no-agent-
+binary escape hatch through ACP-7 per the issue's own recommendation);
+non-empty spawns that command as a live ACP agent. `Engine::ai_send_message`
+(`src/core/engine/ext_panel.rs`) now forks into `ai_send_message_via_curl`/
+`ai_send_message_via_acp`. `Engine::poll_acp` (`src/core/engine/acp_ops.rs`)
+now drives the whole session lifecycle — `initialize` -> `session/new` ->
+`session/prompt` — and maps `session/update` chunks onto `ai_messages`:
+`agent_message_chunk`/`agent_thought_chunk`/`user_message_chunk` merge
+consecutive same-kind chunks into one streamed turn rather than one turn per
+chunk. Thought chunks render under a new AiMessage role
+(`"assistant-thought"`) that `render::populate_ai_chat_controller` maps to
+`quadraui::ChatRole::System` — a different role-header label ("System" vs
+"AI") and colour, which is what makes them visually distinct from message
+chunks per the issue's acceptance criterion, with zero quadraui changes
+needed (the existing `ChatRole::System` styling already does this).
+`tool_call`/`tool_call_update`/`plan` updates and agent->client requests
+(`fs/*`, `session/request_permission`) are left unhandled — parked/ignored
+without breaking the stream — per the issue's scope (ACP-2 fs bridge,
+ACP-4/5 tool-call+plan rendering are later slices). Agent-binary-missing is
+a clear message pushed into the transcript itself (not just the status
+line), verified RED/GREEN. Extended the shared `tests/fixtures/
+fake_acp_agent.sh` (owned by the whole ACP track) to emit the real ACP v1
+`session/update` wire shape (`sessionUpdate` tag + `content.text`, replacing
+ACP-0's placeholder `kind`/`text` shape that nothing had read the values of
+yet) and added `$ACP_FAKE_NO_TOOL_REQUEST` so streaming-focused tests don't
+need the fs/* bridge. Caught and fixed a real bug while writing the first
+black-box test: `AcpEvent::SessionUpdate.update` is the *whole* notification
+`params` object (`{"sessionId":..., "update": {...}}`), not the inner
+tagged-union payload — `Engine::poll_acp` was reading `sessionUpdate`/
+`content.text` off the wrong JSON level, so every chunk silently vanished
+while the turn still completed normally (the "looks done, panel just never
+grew" failure shape). Black-box coverage: TUI (`TuiDriver`, `src/tui_main/
+shell_app.rs`) and GTK (`GtkDriver`, `src/gtk/testing.rs`) tests drive a
+real submit through a pre-spawned fixture agent and assert on rendered
+screen text (`"Hello world"` merged from two chunks, `"pondering the
+question"` thought text, and the `"System"` role label), both independently
+verified RED against the bug above before the fix and GREEN after; a third
+TUI test covers the missing-agent-binary message. `cargo build`/`clippy -D
+warnings`/`fmt` clean on both feature lanes; targeted `cargo test` runs
+(acp/acp_ops/ai_panel/settings round-trip, both lanes) all green.). Prior
+update: September 20, 2026 (#1102 — deleted GTK's `gdk_pixbuf`
 app-icon pre-rasteriser now that quadraui#1014's `draw_image` decode cache is
 already on the pinned rev (`d907a06`, an ancestor of the current pin
 `0dc8381`). `src/gtk/util.rs`: removed `app_icon_image`/`cached_app_icon_png`/

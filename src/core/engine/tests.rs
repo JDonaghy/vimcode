@@ -22812,6 +22812,41 @@ fn test_command_center_chat_with_key_shows_open_panel() {
     );
 }
 
+/// Review regression (#952): an ACP-only user (no `ai_api_key` set,
+/// `ai_provider` left at its default) must reach the palette's chat flow
+/// through `acp_agent_command` alone — `ai_send_message` already routes
+/// there, but `picker_populate_chat`'s `configured` gate didn't check it,
+/// so this exact setup showed "Configure AI provider first" and could
+/// never reach the `chat_send:` action.
+///
+/// RED verified: reverting `picker_populate_chat`'s `configured` check to
+/// only look at `ai_api_key`/`ai_provider == "ollama"` makes this test
+/// fail — the picker shows "Configure AI provider first" instead of "Open
+/// AI Panel" even though `settings.acp_agent_command` is set.
+#[test]
+fn test_command_center_chat_with_acp_agent_configured_shows_open_panel() {
+    let mut e = engine_with_text("hello");
+    e.settings.acp_agent_command = "claude-code-acp".to_string();
+    e.open_picker(PickerSource::CommandCenter);
+    e.picker_query = "chat".to_string();
+    e.picker_filter();
+    assert!(
+        e.picker_items
+            .iter()
+            .any(|i| i.display.contains("Open AI Panel")),
+        "Should show 'Open AI Panel' when only acp_agent_command is set: {:?}",
+        e.picker_items
+    );
+    assert!(
+        !e.picker_items
+            .iter()
+            .any(|i| i.display.contains("Configure AI")),
+        "Must not prompt to configure AI when an ACP agent is already \
+         configured: {:?}",
+        e.picker_items
+    );
+}
+
 #[test]
 fn test_command_center_chat_with_question() {
     let mut e = engine_with_text("hello");
@@ -26620,6 +26655,7 @@ fn test_set_option_round_trip() {
         ("spelllang", "en_GB"),
         ("ai_provider", "openai"),
         ("ai_model", "gpt-4"),
+        ("acp_agent_command", "claude-code-acp"),
         ("ctrl_f_action", "page_down"),
         ("hide_single_tab", "true"),
         ("breadcrumbs", "false"),

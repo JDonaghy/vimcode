@@ -2910,15 +2910,36 @@ impl Engine {
 
     // ── AI assistant panel ─────────────────────────────────────────────────────
 
-    /// Send `text` as a user message; spawns the background request thread.
-    /// Callers (`ChatControllerEvent::Submit` dispatch, the `:AI` command,
-    /// the palette's `chat_send:` action) own clearing whatever input widget
-    /// held the text — this only mutates the conversation/request state.
+    /// Send `text` as a user message. Callers (`ChatControllerEvent::Submit`
+    /// dispatch, the `:AI` command, the palette's `chat_send:` action) own
+    /// clearing whatever input widget held the text — this only mutates the
+    /// conversation/request state.
+    ///
+    /// Transport is picked by whether any ACP agent is configured (#952,
+    /// ACP-1; #958, ACP-7): a non-empty `settings.acp_agents` registry or a
+    /// non-empty legacy `settings.acp_agent_command` both route through a
+    /// live ACP agent subprocess (`ai_send_message_via_acp`); neither
+    /// configured keeps the original direct-provider `curl` transport
+    /// (`ai_send_message_via_curl`, `crate::core::ai`) — kept as a
+    /// no-agent-binary escape hatch per #952's "Decide in this slice"
+    /// through ACP-7.
     pub fn ai_send_message(&mut self, text: String) {
         let text = text.trim().to_string();
         if text.is_empty() || self.ai_streaming {
             return;
         }
+        let acp_configured = !self.settings.acp_agent_command.trim().is_empty()
+            || !self.settings.acp_agents.is_empty();
+        if acp_configured {
+            self.ai_send_message_via_acp(text);
+        } else {
+            self.ai_send_message_via_curl(text);
+        }
+    }
+
+    /// Direct-provider transport: spawns the blocking `curl` background
+    /// thread (`crate::core::ai::send_chat`), polled by `poll_ai`.
+    fn ai_send_message_via_curl(&mut self, text: String) {
         self.ai_messages.push(AiMessage {
             role: "user".to_string(),
             content: text,
@@ -2929,7 +2950,7 @@ impl Engine {
         let api_key = self.settings.ai_api_key.clone();
         let base_url = self.settings.ai_base_url.clone();
         let model = self.settings.ai_model.clone();
-        let messages = self.ai_messages.clone();
+        let messages = curl_transport_history(&self.ai_messages);
         let system = String::new();
 
         let (tx, rx) = std::sync::mpsc::channel();
@@ -2941,6 +2962,62 @@ impl Engine {
             );
             let _ = tx.send(result);
         });
+    }
+
+    /// ACP transport (#952, ACP-1): spawns (or reuses) a live ACP agent
+    /// subprocess and drives it through `initialize` -> `session/new` ->
+    /// `session/prompt`. All of the session-update chunk streaming and
+    /// prompt-stop handling lives in `Engine::poll_acp`
+    /// (`src/core/engine/acp_ops.rs`), driven off the non-blocking
+    /// `AcpClient::poll` — nothing here blocks the tick.
+    fn ai_send_message_via_acp(&mut self, text: String) {
+        self.ai_messages.push(AiMessage {
+            role: "user".to_string(),
+            content: text.clone(),
+        });
+        self.ai_streaming = true;
+        self.acp_streaming_turn = None;
+
+        if let Some(client) = self.acp_client.as_mut() {
+            if let Some(session_id) = self.acp_session_id.clone() {
+                client.prompt(
+                    &session_id,
+                    vec![serde_json::json!({"type": "text", "text": text})],
+                );
+            } else {
+                // The initialize -> session/new handshake from a previous
+                // message is still in flight; `poll_acp`'s `SessionCreated`
+                // handler sends this the moment the session id lands.
+                self.acp_pending_prompt = Some(text);
+            }
+            return;
+        }
+
+        // #958 (ACP-7): the registry (if configured) or the legacy
+        // single-string setting — see `acp_resolve_agent_launch`'s doc for
+        // why this is the one call site that knows the registry exists.
+        let (argv, cwd, env, agent_label) = self.acp_resolve_agent_launch();
+        let env_refs: Vec<(&str, &str)> =
+            env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        match crate::core::acp::AcpClient::spawn_with_env(&argv, &cwd, &env_refs) {
+            Ok(mut client) => {
+                client.initialize();
+                self.acp_client = Some(client);
+                self.acp_pending_prompt = Some(text);
+            }
+            Err(e) => {
+                // Acceptance (#952): agent binary missing from PATH must be
+                // a clear, actionable panel message, not a crash or a
+                // silently empty panel — so this lands in the transcript
+                // itself, not just the status line.
+                self.ai_streaming = false;
+                self.message = format!("ACP agent failed to start: {e}");
+                self.ai_messages.push(AiMessage {
+                    role: "assistant-thought".to_string(),
+                    content: format!("\u{26a0} Could not start ACP agent \"{agent_label}\": {e}"),
+                });
+            }
+        }
     }
 
     /// Non-blocking poll for a completed AI response. Returns `true` if something changed.
@@ -2970,12 +3047,133 @@ impl Engine {
     }
 
     /// Clear the AI conversation history and cancel any in-flight request.
+    ///
+    /// When the panel is on the ACP transport, this also drops the live
+    /// agent (`AcpClient::drop` kills the subprocess) rather than just
+    /// clearing the local transcript — matching the curl transport's
+    /// "conversation cleared" semantics: the next message starts a fresh
+    /// `initialize` -> `session/new` handshake, not a continuation of
+    /// whatever context the old agent process held.
     pub fn ai_clear(&mut self) {
+        // #953 (ACP-2): a parked permission prompt must get its one reply
+        // before the client (and its stdin) goes away below — the agent is
+        // still alive at this point, only about to be killed.
+        self.acp_cancel_pending_permission();
+        self.acp_remembered_decisions.clear();
+        // #957 (ACP-6): the auth-choice dialog holds no reply to send (unlike
+        // `acp_pending_permission`, it isn't a parked agent request — see
+        // `"acp_auth_choice"`'s `process_dialog_result` arm), so it just
+        // needs closing before `acp_auth_methods` (which it reads by id)
+        // clears below, same as any other dialog referencing state this
+        // function is about to drop.
+        if self
+            .dialog
+            .as_ref()
+            .is_some_and(|d| d.tag == "acp_auth_choice")
+        {
+            self.dialog = None;
+        }
         self.ai_messages.clear();
         self.ai_rx = None;
         self.ai_streaming = false;
+        self.acp_client = None;
+        self.acp_session_id = None;
+        self.acp_pending_prompt = None;
+        self.acp_streaming_turn = None;
+        // #956 (ACP-5): plan/commands/modes/usage are all session-scoped —
+        // clearing the conversation ends the session, so none of it should
+        // survive into whatever session starts next (same reasoning as
+        // `acp_remembered_decisions.clear()` above).
+        self.acp_plan.clear();
+        self.acp_available_commands.clear();
+        self.acp_command_completion_idx = 0;
+        self.acp_modes.clear();
+        self.acp_current_mode_id = None;
+        self.acp_usage = None;
+        // #957 (ACP-6): session-scoped, same as the rest above.
+        self.acp_auth_methods.clear();
+        self.acp_authenticated = false;
+        // #955 (ACP-4): tool calls and any open change-review surface are
+        // session-scoped too — closing the conversation without deciding
+        // still discards the surface itself (same "closing the session
+        // ends it" reasoning as everything else in this block).
+        self.acp_tool_calls.clear();
+        self.change_review = None;
         self.ai_chat.borrow_mut().set_transcript_scroll_top(0);
         self.message = "AI conversation cleared.".to_string();
+    }
+
+    /// Slash-command completions matching the AI panel input's current
+    /// text, if the agent has declared any via `available_commands_update`
+    /// and the input looks like a command still being typed (#956, ACP-5).
+    ///
+    /// `None` — never an empty popup — when the input doesn't start with
+    /// `/`, already has a space after the command name (the user is past
+    /// the command name into its arguments/body), or nothing matches.
+    /// Reuses `render::CompletionMenu` — the same shape the editor's own
+    /// word-completion popup uses — per the issue's "prefer vimcode's
+    /// existing completion machinery" guidance; there is no bespoke widget
+    /// here, only a different feeder for one that already exists.
+    pub fn ai_command_completions(&self) -> Option<crate::render::CompletionMenu> {
+        if self.acp_available_commands.is_empty() {
+            return None;
+        }
+        let input = self.ai_chat.borrow().input_text().to_string();
+        let prefix = input.strip_prefix('/')?;
+        if prefix.contains(char::is_whitespace) {
+            return None;
+        }
+        let prefix_lower = prefix.to_lowercase();
+        let mut candidates: Vec<String> = self
+            .acp_available_commands
+            .iter()
+            .filter(|c| c.name.to_lowercase().starts_with(&prefix_lower))
+            .map(|c| format!("/{}", c.name))
+            .collect();
+        if candidates.is_empty() {
+            return None;
+        }
+        candidates.sort();
+        let max_width = candidates
+            .iter()
+            .map(|c| c.chars().count())
+            .max()
+            .unwrap_or(0);
+        let selected_idx = self.acp_command_completion_idx.min(candidates.len() - 1);
+        Some(crate::render::CompletionMenu {
+            candidates,
+            selected_idx,
+            max_width,
+        })
+    }
+
+    /// Advance the slash-command completion selection to the next
+    /// candidate (wrapping), if the popup is currently showing. Returns
+    /// `false` (a no-op) when [`Self::ai_command_completions`] is `None`.
+    pub fn ai_command_completion_cycle(&mut self) -> bool {
+        let Some(menu) = self.ai_command_completions() else {
+            return false;
+        };
+        self.acp_command_completion_idx = (menu.selected_idx + 1) % menu.candidates.len();
+        true
+    }
+
+    /// Accept the currently-selected slash-command completion: replace the
+    /// AI panel input's whole text with `"/name "` (trailing space, ready
+    /// for arguments). Invoking the command afterward is nothing more than
+    /// submitting that text normally — the ACP v1 spec has no separate RPC
+    /// for it (`ai_send_message` already sends the input verbatim as
+    /// prompt content, slash prefix and all). Returns `false` (a no-op)
+    /// when [`Self::ai_command_completions`] is `None`.
+    pub fn ai_command_accept_selected(&mut self) -> bool {
+        let Some(menu) = self.ai_command_completions() else {
+            return false;
+        };
+        let chosen = menu.candidates[menu.selected_idx].clone();
+        let mut chat = self.ai_chat.borrow_mut();
+        chat.clear_input();
+        chat.input_insert_str(&format!("{chosen} "));
+        true
     }
 
     /// Apply a [`quadraui::ChatControllerEvent`] the AI panel's `ChatController`
@@ -3004,8 +3202,19 @@ impl Engine {
             // Ctrl+Enter/PageUp/PageDown/Ctrl+A/Ctrl+E are handled
             // internally), so it falls to this app-hotkey escape hatch,
             // exactly as its own doc comment recommends.
+            //
+            // #953 (ACP-2): while an ACP turn is actually in flight, Ctrl+C
+            // aborts *that turn* (`session/cancel`) instead of nuking the
+            // whole session — "the user must be able to abort a running
+            // turn from the panel" without losing the agent process and
+            // conversation history the way a full `ai_clear` would. Idle
+            // (not streaming) keeps the existing full-clear behaviour.
             Ev::KeyPressed { key, modifiers } if modifiers.ctrl && key == "Char('c')" => {
-                self.ai_clear();
+                if self.acp_client.is_some() && self.ai_streaming {
+                    self.acp_cancel_turn();
+                } else {
+                    self.ai_clear();
+                }
                 true
             }
             _ => true,
@@ -3349,5 +3558,78 @@ impl Engine {
             self.swap_recheck_open_buffers();
         }
         EngineAction::None
+    }
+}
+
+/// Filter an AI panel transcript down to the turns valid as conversation
+/// history for the direct-provider (`curl`) transport — only `"user"` and
+/// `"assistant"` roles.
+///
+/// Review regression (#952): if the panel previously talked over ACP
+/// (`Engine::ai_send_message_via_acp`), `self.ai_messages` can also contain
+/// ACP-only roles like `"assistant-thought"` (real `agent_thought_chunk`
+/// reasoning, and the system/error notices `Engine::poll_acp` appends — see
+/// `acp_ops.rs`). A user who switches transports mid-session by clearing
+/// `acp_agent_command` without running `:AiClear` would otherwise have
+/// those roles sent verbatim in the request body
+/// (`crate::core::ai::send_chat`'s `messages_to_json`/`send_ollama`), which
+/// none of Anthropic/OpenAI/Ollama recognise and will reject.
+fn curl_transport_history(messages: &[AiMessage]) -> Vec<AiMessage> {
+    messages
+        .iter()
+        .filter(|m| m.role == "user" || m.role == "assistant")
+        .cloned()
+        .collect()
+}
+
+#[cfg(test)]
+mod curl_transport_history_tests {
+    use super::*;
+
+    #[test]
+    fn keeps_user_and_assistant_turns_unchanged() {
+        let messages = vec![
+            AiMessage {
+                role: "user".to_string(),
+                content: "hi".to_string(),
+            },
+            AiMessage {
+                role: "assistant".to_string(),
+                content: "hello".to_string(),
+            },
+        ];
+        let filtered = curl_transport_history(&messages);
+        let roles: Vec<&str> = filtered.iter().map(|m| m.role.as_str()).collect();
+        assert_eq!(roles, vec!["user", "assistant"]);
+    }
+
+    /// RED verified: removing the `.filter(...)` call (sending
+    /// `self.ai_messages.clone()` straight through) makes this fail — the
+    /// stray `"assistant-thought"` turn survives into the direct-provider
+    /// request body.
+    #[test]
+    fn drops_acp_only_assistant_thought_role() {
+        let messages = vec![
+            AiMessage {
+                role: "user".to_string(),
+                content: "hi".to_string(),
+            },
+            AiMessage {
+                role: "assistant-thought".to_string(),
+                content: "\u{26a0} session/prompt failed: boom".to_string(),
+            },
+            AiMessage {
+                role: "assistant".to_string(),
+                content: "hello".to_string(),
+            },
+        ];
+        let filtered = curl_transport_history(&messages);
+        let roles: Vec<&str> = filtered.iter().map(|m| m.role.as_str()).collect();
+        assert_eq!(
+            roles,
+            vec!["user", "assistant"],
+            "the ACP-only assistant-thought turn must not reach a \
+             direct-provider request body: {filtered:?}"
+        );
     }
 }

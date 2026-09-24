@@ -736,39 +736,6 @@ pub(super) fn render_tab_drag_overlay(
     }
 }
 
-/// Paint the tab-hover tooltip — the small popup shown when the mouse
-/// hovers a tab and lingers, naming the buffer under the cursor. `screen
-/// .tab_tooltip` (pre-computed by `render::build_screen_layout`) is the
-/// only input; painting is a single-row `Backend::draw_status_bar` call
-/// (the `draw_rule_row`/[`draw_rule_cell_themed`] trick, #609) instead of the raw
-/// `Buffer` write this replaces, so both `draw_frame` and
-/// `TuiShellApp::render_content` can call it — the two callers differ only
-/// in `(x, y)`, since `render_content`'s `area` doesn't start at the
-/// terminal's row 0 the way `draw_frame`'s `editor_area` implicitly did
-/// (see call sites for the position math each uses).
-pub(super) fn render_tab_hover_tooltip(
-    backend: &mut dyn quadraui::Backend,
-    x: u16,
-    y: u16,
-    max_width: u16,
-    tooltip_text: &str,
-    theme: &Theme,
-) {
-    // #671: geometry now lives in `render::tab_hover_tooltip_paint`, shared
-    // with GTK's `render_content` — TUI passes `unit_w`/`unit_h` = 1.0/1.0
-    // (cell-native), matching this function's pre-#671 behavior exactly.
-    render::tab_hover_tooltip_paint(
-        backend,
-        x as f32,
-        y as f32,
-        max_width as f32,
-        tooltip_text,
-        theme,
-        1.0,
-        1.0,
-    );
-}
-
 /// Compute the drop zone for a tab drag in TUI based on cursor cell position.
 pub(super) fn compute_tui_tab_drop_zone(
     engine: &Engine,
@@ -1731,13 +1698,24 @@ mod tests {
                             ),
                             render::EditorOp::TabTooltip => {
                                 if let Some(ref tooltip_text) = screen.tab_tooltip {
-                                    render_tab_hover_tooltip(
+                                    // #1251: this test helper's one remaining
+                                    // caller of the now-deleted
+                                    // `render_tab_hover_tooltip` TUI wrapper —
+                                    // inlined directly against the shared
+                                    // `render::tab_hover_tooltip_paint`, the
+                                    // same call `render::paint_editor_band_rungs`
+                                    // makes for both live backends, with the
+                                    // same 1.0/1.0 cell-native units the
+                                    // deleted wrapper always passed.
+                                    render::tab_hover_tooltip_paint(
                                         backend,
-                                        area.x,
-                                        area.y + 1,
-                                        area.width,
+                                        area.x as f32,
+                                        (area.y + 1) as f32,
+                                        area.width as f32,
                                         tooltip_text,
                                         &theme,
+                                        1.0,
+                                        1.0,
                                     );
                                 }
                             }

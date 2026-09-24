@@ -234,9 +234,10 @@ mod tests {
     #[test]
     fn subprocess_client_parses_real_process_json() {
         let client = SubprocessToolClient;
+        let (shell, flag) = crate::core::terminal::shell_command();
         let argv = vec![
-            "sh".to_string(),
-            "-c".to_string(),
+            shell,
+            flag,
             r#"printf '%s' '{"id":"board","columns":[],"selected_card_id":null,"col_scroll_offset":0}'"#
                 .to_string(),
         ];
@@ -249,11 +250,8 @@ mod tests {
     #[test]
     fn subprocess_client_nonzero_exit_is_typed_error() {
         let client = SubprocessToolClient;
-        let argv = vec![
-            "sh".to_string(),
-            "-c".to_string(),
-            "echo oops 1>&2; exit 3".to_string(),
-        ];
+        let (shell, flag) = crate::core::terminal::shell_command();
+        let argv = vec![shell, flag, "echo oops 1>&2; exit 3".to_string()];
         match client.run_json(&argv).unwrap_err() {
             ToolError::NonZeroExit { code, stderr } => {
                 assert_eq!(code, Some(3));
@@ -267,11 +265,8 @@ mod tests {
     #[test]
     fn subprocess_client_bad_json_is_typed_error() {
         let client = SubprocessToolClient;
-        let argv = vec![
-            "sh".to_string(),
-            "-c".to_string(),
-            "printf 'not json'".to_string(),
-        ];
+        let (shell, flag) = crate::core::terminal::shell_command();
+        let argv = vec![shell, flag, "printf 'not json'".to_string()];
         assert!(matches!(
             client.run_json(&argv).unwrap_err(),
             ToolError::InvalidJson(_)

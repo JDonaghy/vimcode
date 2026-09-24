@@ -27,6 +27,16 @@ impl Engine {
         body: Vec<String>,
         buttons: Vec<DialogButton>,
     ) {
+        // #953 (ACP-2): a still-open `session/request_permission` dialog
+        // getting replaced by an unrelated one must still produce exactly
+        // one reply — a parked ACP request must never silently hang just
+        // because some other event (e.g. a file-changed-on-disk prompt)
+        // opened a different dialog over it. `acp_handle_permission_request`
+        // itself already clears this before opening its *own* new dialog,
+        // so this is a no-op on that path; it only fires for a genuinely
+        // unrelated caller.
+        self.acp_cancel_pending_permission();
+
         // Opening a dialog is a "user is now focused on this modal"
         // event — dismiss any passive overlays (LSP hover) so they
         // don't render behind the dialog (#247).
@@ -521,8 +531,12 @@ impl Engine {
                         if let Some(ca) = self.pending_code_action_choices.get(idx).cloned() {
                             self.pending_code_action_choices.clear();
                             if let Some(edit) = ca.edit {
-                                self.apply_workspace_edit(edit);
-                                self.message = format!("Applied: {}", ca.title);
+                                let errors = self.apply_workspace_edit(edit);
+                                self.message = if errors.is_empty() {
+                                    format!("Applied: {}", ca.title)
+                                } else {
+                                    format!("Applied: {} (errors: {})", ca.title, errors.join("; "))
+                                };
                             } else {
                                 self.message = format!("No edit available for '{}'", ca.title);
                             }
@@ -558,6 +572,100 @@ impl Engine {
             },
             "file_changed" => {
                 self.handle_file_watcher_action(action);
+                EngineAction::None
+            }
+            "acp_permission" => {
+                // #953 (ACP-2): the one function that turns a dialog
+                // dismissal into the ACP reply. `dialog_click_button`/
+                // `handle_dialog_key`/`dialog_cancel` have already cleared
+                // `self.dialog` by the time this runs — only
+                // `acp_pending_permission` still needs draining, and taking
+                // it here (rather than in the branches below) guarantees
+                // every branch — including a stray "acp_permission" result
+                // for a request that's somehow already gone — produces at
+                // most one reply.
+                let Some((request_id, req)) = self.acp_pending_permission.take() else {
+                    return EngineAction::None;
+                };
+                let Some(client) = self.acp_client.as_ref() else {
+                    return EngineAction::None;
+                };
+                if action == "cancel" {
+                    client.respond_to_client_request(
+                        request_id,
+                        Ok(crate::core::acp::permission_outcome_cancelled()),
+                    );
+                    return EngineAction::None;
+                }
+                // Otherwise `action` is the option_id of the button the
+                // human clicked/hotkeyed (`acp_handle_permission_request`
+                // built each `DialogButton::action` from `option_id`).
+                match req.options.iter().find(|o| o.option_id == action) {
+                    Some(opt) => {
+                        if opt.kind == "allow_always" {
+                            self.acp_remembered_decisions
+                                .insert(req.tool_call.kind.clone(), true);
+                        } else if opt.kind == "reject_always" {
+                            self.acp_remembered_decisions
+                                .insert(req.tool_call.kind.clone(), false);
+                        }
+                        client.respond_to_client_request(
+                            request_id,
+                            Ok(crate::core::acp::permission_outcome_selected(
+                                &opt.option_id,
+                            )),
+                        );
+                    }
+                    None => {
+                        // Shouldn't happen — every dialog button's action
+                        // is one of `req.options`' ids — but never leave
+                        // the request unanswered on an unrecognized action.
+                        client.respond_to_client_request(
+                            request_id,
+                            Ok(crate::core::acp::permission_outcome_cancelled()),
+                        );
+                    }
+                }
+                EngineAction::None
+            }
+            "acp_auth_choice" => {
+                // #957 (ACP-6): "cancel" (Escape) and the "Continue without
+                // auth" button both mean the same thing — the human
+                // declined to pick a method, so proceed to `session/new`
+                // unauthenticated and let the agent itself accept or
+                // reject it. An agent advertising `authMethods` doesn't
+                // necessarily mean auth is *required* right now.
+                if action == "cancel" || action == "acp_auth_skip" {
+                    self.acp_authenticated = true;
+                    self.acp_begin_session();
+                    return EngineAction::None;
+                }
+                let Some(method) = self
+                    .acp_auth_methods
+                    .iter()
+                    .find(|m| m.id == action)
+                    .cloned()
+                else {
+                    // Shouldn't happen — every dialog button's action is
+                    // either "acp_auth_skip" or one of `acp_auth_methods`'
+                    // own ids — but never strand the handshake on an
+                    // unrecognized action; fall back to unauthenticated
+                    // the same as an explicit skip.
+                    self.acp_authenticated = true;
+                    self.acp_begin_session();
+                    return EngineAction::None;
+                };
+                match method.kind {
+                    crate::core::acp::AcpAuthMethodKind::Agent => {
+                        if let Some(client) = self.acp_client.as_mut() {
+                            client.authenticate(&method.id);
+                            self.message = format!("Authenticating via {}\u{2026}", method.name);
+                        }
+                    }
+                    crate::core::acp::AcpAuthMethodKind::Terminal => {
+                        self.acp_launch_terminal_login(&method.name);
+                    }
+                }
                 EngineAction::None
             }
             "check_nerd_fonts" => {
@@ -1432,8 +1540,12 @@ impl Engine {
                         self.lsp_pending_rename = None;
                         let n = workspace_edit.changes.len();
                         if n > 0 {
-                            self.apply_workspace_edit(workspace_edit);
-                            self.message = format!("Renamed in {n} file(s)");
+                            let errors = self.apply_workspace_edit(workspace_edit);
+                            self.message = if errors.is_empty() {
+                                format!("Renamed in {n} file(s)")
+                            } else {
+                                format!("Renamed in {n} file(s) with errors: {}", errors.join("; "))
+                            };
                         } else if let Some(err) = error_message {
                             self.message = format!("Rename failed: {err}");
                         } else {
@@ -2052,10 +2164,32 @@ impl Engine {
         self.lsp_dirty_buffers.insert(buffer_id, true);
     }
 
-    /// Apply a workspace-wide rename edit.
-    pub(crate) fn apply_workspace_edit(&mut self, we: WorkspaceEdit) {
+    /// Apply a workspace-wide rename edit. Returns one error message per
+    /// file this couldn't be applied to (empty on full success) — never
+    /// swallows a failure the way the old closed-file branch did (#954
+    /// review of #1897-1964/#1967-2016).
+    ///
+    /// For a file that's already open, this delegates straight to
+    /// [`Self::apply_lsp_edits`] (undo-grouped, UTF-16-aware). For a
+    /// **closed** file, this used to fall through to a raw `fs::write` with
+    /// no undo group, no path canonicalisation (so an already-open buffer
+    /// under a differently-spelled-but-equal path could silently diverge
+    /// from what just got written to disk), and a swallowed `Result` (a
+    /// failed write — read-only file, missing parent directory, whatever —
+    /// looked identical to a no-op success). That made LSP rename-across-
+    /// files unsafe, and would have made ACP's `fs/write_text_file`
+    /// (#954) unsafe by construction had it reused this path unfixed. The
+    /// fix: open the closed file into a buffer first (`BufferManager::
+    /// open_file`, which already canonicalizes for its own dedup), then
+    /// apply through the exact same undo-grouped path an already-open file
+    /// gets — deliberately **not** an immediate disk write. This matches
+    /// how an already-open buffer behaves (dirty, undoable, saved
+    /// whenever the user next saves) instead of re-introducing a silent
+    /// background write behind the user's back.
+    pub(crate) fn apply_workspace_edit(&mut self, we: WorkspaceEdit) -> Vec<String> {
+        let mut errors = Vec::new();
         for file_edit in we.changes {
-            // Try to find an already-open buffer for this path
+            // Try to find an already-open buffer for this path.
             let buffer_id = self.buffer_manager.list().into_iter().find(|&bid| {
                 self.buffer_manager
                     .get(bid)
@@ -2064,44 +2198,19 @@ impl Engine {
                     .unwrap_or(false)
             });
 
-            if let Some(bid) = buffer_id {
-                self.apply_lsp_edits(bid, file_edit.edits);
-            } else {
-                // File not open — read, edit, and write back to disk
-                if let Ok(text) = std::fs::read_to_string(&file_edit.path) {
-                    let mut edits = file_edit.edits;
-                    // Sort in reverse order
-                    edits.sort_by(|a, b| {
-                        b.range
-                            .start
-                            .line
-                            .cmp(&a.range.start.line)
-                            .then(b.range.start.character.cmp(&a.range.start.character))
-                    });
-                    let mut rope = ropey::Rope::from_str(&text);
-                    for edit in &edits {
-                        let total_lines = rope.len_lines();
-                        let start_line =
-                            (edit.range.start.line as usize).min(total_lines.saturating_sub(1));
-                        let end_line =
-                            (edit.range.end.line as usize).min(total_lines.saturating_sub(1));
-                        let start_line_text: String = rope.line(start_line).chars().collect();
-                        let end_line_text: String = rope.line(end_line).chars().collect();
-                        let start_char =
-                            lsp::utf16_offset_to_char(&start_line_text, edit.range.start.character);
-                        let end_char =
-                            lsp::utf16_offset_to_char(&end_line_text, edit.range.end.character);
-                        let start_offset = rope.line_to_char(start_line) + start_char;
-                        let end_offset = rope.line_to_char(end_line) + end_char;
-                        if end_offset > start_offset {
-                            rope.remove(start_offset..end_offset);
-                        }
-                        rope.insert(start_offset, &edit.new_text);
+            let buffer_id = match buffer_id {
+                Some(bid) => bid,
+                None => match self.buffer_manager.open_file(&file_edit.path) {
+                    Ok(bid) => bid,
+                    Err(e) => {
+                        errors.push(format!("{}: {e}", file_edit.path.display()));
+                        continue;
                     }
-                    let _ = std::fs::write(&file_edit.path, rope.to_string());
-                }
-            }
+                },
+            };
+            self.apply_lsp_edits(buffer_id, file_edit.edits);
         }
+        errors
     }
 
     /// Get the cursor's file path, line, and UTF-16 column for LSP requests.

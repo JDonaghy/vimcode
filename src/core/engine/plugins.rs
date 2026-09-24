@@ -214,6 +214,7 @@ impl Engine {
             "ai_model",
             "ai_base_url",
             "ai_completions",
+            "acp_agent_command",
             "swapfile",
             "updatetime",
             "breadcrumbs",
@@ -721,5 +722,28 @@ impl Engine {
         // Proactively request code actions for the new cursor position (lightbulb).
         self.lsp_request_code_actions_for_line();
         true
+    }
+}
+
+#[cfg(test)]
+mod settings_snapshot_tests {
+    use crate::core::engine::Engine;
+
+    /// Review regression (#952): the VSCode-extension-settings bridge
+    /// whitelist listed `ai_provider`/`ai_model`/`ai_base_url`/
+    /// `ai_completions` but not the newer `acp_agent_command` setting, so a
+    /// plugin/extension reading `vimcode.settings` (backed by this
+    /// snapshot) could never see which ACP agent, if any, the panel is
+    /// configured to use.
+    #[test]
+    fn includes_acp_agent_command() {
+        let mut engine = Engine::new_for_test();
+        engine.settings.acp_agent_command = "claude-code-acp".to_string();
+        let snapshot = engine.settings_snapshot();
+        assert_eq!(
+            snapshot.get("acp_agent_command").map(String::as_str),
+            Some("claude-code-acp"),
+            "settings_snapshot() must surface acp_agent_command: {snapshot:?}"
+        );
     }
 }

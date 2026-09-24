@@ -20,10 +20,25 @@
 //! `WinDriver<impl AppLogic>` around the shared [`crate::app::App`] — is
 //! thin wiring that has to live next to each backend's own
 //! `driver_with_shell` import: `crate::gtk::testing::conformance_harness`,
-//! `crate::macos`'s own test module, and (Windows-only) `crate::win`'s.
-//! That split is exactly what the Platform-Neutrality Rule asks for: no
-//! decision lives in a backend directory, only the unavoidable "which
-//! driver type" plumbing.
+//! `crate::macos`'s own test module, and `crate::win`'s
+//! (`src/win/mod.rs::win_driver_tests`). That split is exactly what the
+//! Platform-Neutrality Rule asks for: no decision lives in a backend
+//! directory, only the unavoidable "which driver type" plumbing.
+//!
+//! `crate::win`'s arm used to be Windows-only in a stronger sense than
+//! `crate::macos`'s: not just "only actually runs on real hardware" (true of
+//! every native-GUI arm here, `macos` included — none of these headless
+//! drivers has a CI runner in this fleet) but "does not even *type-check*
+//! off Windows", because quadraui's own `win::testing` module was gated on
+//! `target_os = "windows"` rather than stubbed per WinAPI call the way
+//! `win::backend`/`run`/`shell_runner` are. quadraui#1038 fixed that — the
+//! pinned rev's `win::testing` now compiles under `feature = "win"` alone —
+//! so `crate::win::win_driver_tests`'s `ConformanceHarness<WinDriver<...>>`
+//! instantiation is exactly as "neutral" as `crate::macos`'s now: verified
+//! on every host via `cargo check --tests`, only *run* on real Windows.
+//! That was the last of the four backends (gtk, tui, macos, win) for which
+//! this crate's own `ConformanceHarness` plumbing didn't type-check off its
+//! native platform — closing vimcode#928's acceptance criterion #2.
 //!
 //! # Why `App`, not a fresh mock
 //!

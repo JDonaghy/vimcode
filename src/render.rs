@@ -3592,7 +3592,20 @@ pub enum ModalKeyRoute {
 pub fn route_modal_key(engine: &Engine) -> ModalKeyRoute {
     // Spell-suggestion selection intercepts all keys (`keys.rs`'s first
     // branch); a dialog is modal and intercepts everything below it.
-    if engine.spell_suggestions.is_some() || engine.dialog.is_some() {
+    // The change-review surface (#955, shared with #525) is the same
+    // shape: a full-viewport overlay that must own every keypress
+    // regardless of which panel would otherwise have focus — in
+    // particular, the AI panel's own focus route sends keys straight to
+    // `render::route_ai_chat_event`, bypassing `Engine::handle_key`
+    // entirely, so without this a keypress meant for a diff opened
+    // *while* the AI panel has focus (exactly when a tool-call diff
+    // arrives) would type into the chat input instead.
+    // `handle_change_review_key` (inside `Engine::handle_key`, same place
+    // as the other two) is the actual interception.
+    if engine.spell_suggestions.is_some()
+        || engine.dialog.is_some()
+        || engine.change_review.is_some()
+    {
         return ModalKeyRoute::Engine;
     }
 
@@ -4404,12 +4417,30 @@ pub fn dispatch_sidebar_panel_key(
 /// the legacy TUI loop had and GTK never did — GTK carried no Ctrl+L tier at
 /// all, so the chord was dispatched like any other Ctrl-modified `l`.
 ///
-/// Neither backend can honour the *full* semantics yet — the TUI shell runner
-/// owns the `ratatui::Terminal` whose previous-frame buffer would have to be
-/// reset, and neither `Backend` nor `ShellApp` exposes a
-/// `request_full_repaint`-shaped hook. Tracked as an upstream gap alongside
-/// the popup-disappearance clear in `TuiShellApp::render_content`; until it
-/// lands, both backends do the honest thing and request an ordinary redraw.
+/// #1243: TUI now honours the *full* semantics via
+/// `quadraui::Backend::request_full_repaint` (quadraui#1037) —
+/// `TuiShellApp::handle_key_pressed` calls it on this chord before returning
+/// `Reaction::Redraw`, and `tui::run::run_inner`'s frame loop clears
+/// `ratatui::Terminal`'s previous-frame buffer the next time it paints. GTK's
+/// `DrawingArea` repaints in full every frame via Cairo (no incremental diff
+/// to desync in the first place), so `GtkBackend` never overrides the hook
+/// and `App::handle_key_press` requests only an ordinary redraw — see
+/// `Backend::request_full_repaint`'s own doc for why that default is
+/// correct rather than a gap. The same hook also covers the
+/// popup-disappearance clear this comment used to point at —
+/// `TuiShellApp::render_content`'s `had_popup_overlay` transition check.
+///
+/// **No driver test covers the Ctrl+L call site, by measurement not by
+/// omission.** One was written and RED-verified by disabling this rung —
+/// and stayed green: a fall-through Ctrl+L is inert in every reachable
+/// mode (Normal, unbound; Insert, where `Engine::handle_key` drops
+/// `Ctrl`-modified printables; picker/dialog, whose rungs intercept
+/// first), so the chord's *only* effect is the repaint — which is
+/// unobservable under the only driver vimcode can reach. See
+/// [`popup_overlay_closed_this_frame`]'s doc for the proof and for the
+/// ready-to-file upstream gap in `docs/PENDING_QUADRAUI_ISSUES.md`. The
+/// decision logic here is unit-tested in `slice7_router_tests` below; the
+/// wiring at the call site is a one-line delegation.
 ///
 /// `insert_ctrl_x_pending` is `engine.insert_ctrl_x_pending` (only ever true
 /// in the one-keystroke window right after `<C-x>` in Insert mode): right
@@ -4430,6 +4461,70 @@ pub fn is_force_redraw_key(
         return false;
     }
     ctrl && (matches!(unicode, Some('l') | Some('L')) || key_name == "l" || key_name == "L")
+}
+
+/// Did an editor-anchored popup (the completions/hover-doc picker or the
+/// modal folder picker) that was visible last frame close this frame?
+/// (#1243, TUI-only — `TuiShellApp::render_content`'s `had_popup_overlay`.)
+///
+/// The transition that must call `quadraui::Backend::request_full_repaint`
+/// (quadraui#1037): a popup staying open, staying closed, or newly opening
+/// all paint their own content this frame regardless of ratatui's diff
+/// cache, so only the *closing* transition can leave stale glyphs — ones
+/// the popup itself painted last frame, in cells nothing repaints this
+/// frame — for that cache to wrongly believe are still correct and skip.
+/// Pulled out as its own pure function (mirroring [`is_force_redraw_key`]
+/// just above) because it is the one piece of this wiring that *is*
+/// directly unit-testable from here.
+///
+/// **Why no driver test can assert on the *repaint* itself yet, only on
+/// this edge-detection predicate plus `tui_main::shell_app`'s
+/// paint-integrity black-box test
+/// (`picker_dismiss_leaves_no_popup_glyphs_on_the_grid_via_shell_app`) —
+/// verified directly against quadraui checkout rev `215e9e4`
+/// (`Cargo.toml`'s pin), not assumed:**
+/// `quadraui::tui::testing::TuiDriver` (`TestBackend`-backed) already
+/// consumes `request_full_repaint` in its own `render()` (it calls
+/// `Terminal::clear()` when the flag is set, exactly like the live
+/// runner) — that part isn't the blocker. The blocker is that
+/// `ratatui`'s `Terminal::clear()` is *provably output-identical* under a
+/// `TestBackend`: it blanks the backend buffer and resets the back
+/// buffer, so the following `draw` diffs a fully-desired frame against a
+/// blank previous frame and writes every non-blank cell — landing on
+/// byte-for-byte the same buffer the incremental path lands on, because
+/// `Terminal::draw`'s own contract already requires the render callback
+/// to repaint the whole frame. There is therefore no stale cell for a
+/// `TestBackend`-based driver to observe, and no `screen()` /
+/// `style_at()` / `terminal_cursor_position()` assertion that can
+/// distinguish the two paths. Only content written *outside* ratatui's
+/// `Buffer`/diff tracking (e.g. an embedded PTY writing raw bytes
+/// straight into the terminal) can produce the "diff believes this cell
+/// is unchanged" condition the hook exists to fix, and only
+/// [`TuiVtDriver`] (vt100-backed, real ANSI byte stream) can model that —
+/// see its own `render_actually_clears_stale_content_outside_the_diff_cache`
+/// test, which proves the *mechanism* works upstream. Two seams block
+/// reusing it from vimcode for a `ShellApp` impl: `TuiVtDriver::new`
+/// takes `AppLogic`, not `ShellApp` (no `driver_with_shell`-equivalent
+/// exists for it, and the only adapter between the two,
+/// `shell_adapter::build_shell_adapter`, is `pub(crate)`), and
+/// `TuiVtDriver`'s `parser: Rc<RefCell<vt100::Parser>>` field — the only
+/// way to inject the out-of-band bytes that test's technique relies on —
+/// is private with no public equivalent. `quadraui::Backend` is also
+/// `sealed::Sealed`, so a vimcode-side spy `Backend` that merely counts
+/// `request_full_repaint` calls cannot be written either.
+///
+/// That upstream test-infrastructure gap is **drafted in full, ready to
+/// file, in `docs/PENDING_QUADRAUI_ISSUES.md`** ("TUI test drivers can't
+/// observe `Backend::request_full_repaint`…") — the repo's standing
+/// convention for exactly this, since worker sessions are `git`-only and
+/// cannot file GitHub issues themselves. Filing it is the coordinator
+/// action that unblocks the real black-box test; this doc comment is the
+/// grep-able pointer that keeps the finding from being lost in the
+/// meantime.
+///
+/// [`TuiVtDriver`]: https://github.com/JDonaghy/quadraui/blob/215e9e4/quadraui/src/tui/vt_testing.rs
+pub fn popup_overlay_closed_this_frame(was_open: bool, is_open_now: bool) -> bool {
+    was_open && !is_open_now
 }
 
 /// Popup rect for the folder-picker modal (`quadraui::FolderPickerController`,
@@ -4520,6 +4615,49 @@ pub fn set_folder_picker_selected(picker: &mut quadraui::FolderPickerController,
     }
     while picker.selected() > idx {
         picker.move_up();
+    }
+}
+
+/// Where a mouse press against the open change-review surface (#955,
+/// shared with #525) lands, resolved against the *exact* geometry
+/// [`paint_change_review_rung`] last painted
+/// (`diff_rect`/`line_height` — both backends read these from
+/// `Engine::change_review_diff_rect`/`Backend::line_height`, same
+/// "paint writes it, click routing reads it" contract as
+/// `command_line_rect`).
+///
+/// Deliberately *not* folded into [`route_modal_overlay_click`] /
+/// [`MOUSE_ARBITRATION_ORDER`] — same call [`route_folder_picker_click`]
+/// makes and for the same reason: this surface swallows every click while
+/// open (like a modal dialog) rather than competing for z-order with the
+/// other overlays, so both backends check it first and return early.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChangeReviewClickRoute {
+    /// Landed on a real diff row — jump to the file/line it represents
+    /// (`Engine::change_review_jump_to_hit`).
+    Jump(quadraui::DiffViewHit),
+    /// Landed inside the surface but not on a row (a unified hunk header,
+    /// the status footer, or empty space) — swallow, no navigation.
+    Consume,
+}
+
+/// Resolve a click at `(x, y)` (ABSOLUTE, backend-native units) against the
+/// currently-shown entry's `DiffView`, re-deriving the same geometry
+/// [`paint_change_review_rung`] painted from (`entry.view.layout(diff_rect,
+/// line_height)`) rather than trusting a cached one, so paint and
+/// hit-testing can never disagree (`DiffViewGeometry::hit_test`'s own
+/// contract).
+pub fn route_change_review_click(
+    diff_rect: quadraui::Rect,
+    view: &quadraui::DiffView,
+    line_height: f32,
+    x: f32,
+    y: f32,
+) -> ChangeReviewClickRoute {
+    let geometry = view.layout(diff_rect, line_height);
+    match geometry.hit_test(x, y) {
+        hit @ quadraui::DiffViewHit::Row { .. } => ChangeReviewClickRoute::Jump(hit),
+        _ => ChangeReviewClickRoute::Consume,
     }
 }
 
@@ -7889,6 +8027,32 @@ pub fn route_ai_chat_event(
         return engine.ai_has_focus;
     }
     populate_ai_chat_controller(engine, theme);
+
+    // #956 (ACP-5): while the slash-command completion popup is showing,
+    // steal Tab (cycle selection) and Enter (accept) before handing the
+    // event to `ChatController::handle` — the same "intercept the
+    // accept/cycle keys, let everything else fall through unchanged" shape
+    // the editor's own word-completion popup uses
+    // (`Engine::insert_completion_intercepts_key`). This one shared call
+    // site is what makes it zero-backend-specific: GTK and TUI both route
+    // every AI-panel key through here already.
+    if let quadraui::UiEvent::KeyPressed { key, modifiers, .. } = event {
+        let no_modifiers = !modifiers.shift && !modifiers.ctrl && !modifiers.alt && !modifiers.cmd;
+        if no_modifiers && engine.ai_command_completions().is_some() {
+            match key {
+                quadraui::Key::Named(quadraui::NamedKey::Tab) => {
+                    engine.ai_command_completion_cycle();
+                    return engine.ai_has_focus;
+                }
+                quadraui::Key::Named(quadraui::NamedKey::Enter) => {
+                    engine.ai_command_accept_selected();
+                    return engine.ai_has_focus;
+                }
+                _ => {}
+            }
+        }
+    }
+
     let chat_event = engine.ai_chat.borrow_mut().handle(event, backend, rect);
     engine.dispatch_ai_chat_event(chat_event)
 }
@@ -8121,6 +8285,188 @@ pub(crate) fn editor_band_fixture(drag: bool) -> Vec<EditorOp> {
         .copied()
         .filter(|op| drag || !matches!(op, EditorOp::TabDragOverlay))
         .collect()
+}
+
+/// The unit system one backend composes [`paint_editor_band_rungs`] in —
+/// [`BottomPanelUnits`]'s sibling for the editor band. `metrics` answers the
+/// same "at least one line tall / one column wide" question [`FrameMetrics`]
+/// exists for; `tab_row_h` is a second, independent unit because the tab
+/// strip's own row is *not* one text line on GTK (it runs ~1.6× a line
+/// height there) while it is unconditionally exactly one cell on TUI
+/// regardless of the breadcrumbs setting — see the [`EditorOp::TabTooltip`]
+/// call site below for the one rung that reads it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EditorBandUnits {
+    pub metrics: FrameMetrics,
+    /// Row height of the tab strip itself, in the caller's units.
+    pub tab_row_h: f32,
+}
+
+impl EditorBandUnits {
+    /// One terminal cell — what `TuiShellApp::paint_editor_band` composes in.
+    pub const CELL: Self = Self {
+        metrics: FrameMetrics::CELL,
+        tab_row_h: 1.0,
+    };
+
+    /// Real pixels — what `gtk::App::compose_editor_band_rungs` composes in.
+    /// `tab_row_h` is the caller's own measured tab-strip row height, not
+    /// derived from `line_height` (see the struct doc for why the two
+    /// disagree on GTK).
+    pub fn px(line_height: f64, char_width: f64, tab_row_h: f64) -> Self {
+        Self {
+            metrics: FrameMetrics::px(line_height, char_width),
+            tab_row_h: tab_row_h as f32,
+        }
+    }
+}
+
+/// Host hook for [`paint_editor_band_rungs`] — the four [`EditorOp`] rungs
+/// whose paint body still differs enough per backend that the shared walk
+/// cannot inline them directly. `Minimap`, `Breadcrumbs` and `TabTooltip`
+/// need no hook at all: their bodies are already byte-identical between GTK
+/// and TUI (see [`paint_editor_band_rungs`]'s match arms), which is exactly
+/// what made them safe to inline into the shared walk instead of leaving
+/// them here as a fifth/sixth/seventh trivial forwarding method.
+///
+/// `'screen` ties every method's `screen` parameter to the *same*
+/// `ScreenLayout` borrow for the whole walk, so a host (GTK's) that needs to
+/// carry a `&'screen quadraui::TabBar` past the `TabBars` call — for the
+/// `FrameHitMap` it builds after the walk returns — can store it in its own
+/// fields without a lifetime mismatch.
+pub trait EditorBandHost<'screen> {
+    /// [`EditorOp::Windows`]: every editor window's text, gutter, per-window
+    /// status line and the `:split`/`:vsplit` divider lines within each
+    /// group.
+    ///
+    /// Genuinely per-backend: GTK accumulates each window's owned
+    /// `quadraui::Editor` into its own `FrameHitMap` (#449) so later click
+    /// routing hit-tests the exact objects just painted, never a second copy
+    /// that could drift; TUI carries no such map (its hit-testing recomputes
+    /// geometry from `ScreenLayout` directly) but instead wants an optional
+    /// raw `ratatui::Frame` for cursor placement that this trait's `&mut dyn
+    /// Backend`-only signature has no room for (see `render_window`'s own
+    /// doc comment for why `frame: Option<&mut Frame>` exists there).
+    fn paint_windows(
+        &mut self,
+        backend: &mut dyn quadraui::Backend,
+        engine: &Engine,
+        screen: &'screen ScreenLayout,
+        theme: &Theme,
+    );
+
+    /// [`EditorOp::TabBars`]: one tab bar per editor group.
+    ///
+    /// Genuinely per-backend: GTK recovers the rasteriser's exact *pixel* hit
+    /// geometry (`cached_tab_pixel_hits`/`cached_tab_close_abs`/
+    /// `cached_tab_slots_abs`) for pixel-accurate click/hover resolution
+    /// (#515, #703, #764); TUI's hit-testing works in whole cells and needs
+    /// none of that bookkeeping.
+    fn paint_tab_bars(
+        &mut self,
+        backend: &mut dyn quadraui::Backend,
+        engine: &Engine,
+        screen: &'screen ScreenLayout,
+        theme: &Theme,
+    );
+
+    /// [`EditorOp::GroupDividers`]: the between-*group* `Ctrl+W v`/`Ctrl+W s`
+    /// boundary lines.
+    ///
+    /// Genuinely per-backend: GTK rasterises through quadraui's `Split`
+    /// primitive ([`draw_dividers_as_splits`]); TUI rasterises cell-by-cell
+    /// instead, because it alone carries the #481 guard that suppresses a
+    /// divider column immediately beside a neighbouring window's scrollbar —
+    /// a coalescence problem that exists only in a character grid. See
+    /// [`draw_dividers_as_splits`]'s own doc comment for the full story.
+    fn paint_group_dividers(
+        &mut self,
+        backend: &mut dyn quadraui::Backend,
+        screen: &'screen ScreenLayout,
+        theme: &Theme,
+    );
+
+    /// [`EditorOp::TabDragOverlay`]: the tab-drag drop-zone highlight,
+    /// insertion bar and dragged-tab ghost.
+    ///
+    /// Genuinely per-backend: GTK's drop geometry is cached every frame
+    /// (`cache_tab_drop_geometry`) so the drag hit-test has it whether or not
+    /// this rung ran that frame; TUI recomputes it inline and additionally
+    /// paints the dragged buffer's name at the ghost position — the decision
+    /// [`paint_tab_drop_overlay`]'s own doc comment already records GTK
+    /// leaves to quadraui's rasteriser instead.
+    fn paint_tab_drag_overlay(
+        &mut self,
+        backend: &mut dyn quadraui::Backend,
+        engine: &Engine,
+        screen: &'screen ScreenLayout,
+        theme: &Theme,
+    );
+}
+
+/// The shared **editor band** walk (#1251): the single ordered loop both
+/// `TuiShellApp::paint_editor_band` and `App::compose_editor_band_rungs` run
+/// over [`compose_editor_band`], replacing what used to be two hand-written
+/// copies of the same seven-armed `match`. `Minimap`, `Breadcrumbs` and
+/// `TabTooltip` paint identically on both backends (modulo `units`) and are
+/// inlined here directly; the four rungs that still need a per-backend body
+/// go through `host` — see [`EditorBandHost`]'s own doc for exactly which
+/// parts of each and why.
+///
+/// `band` is the editor column's bounds in the caller's units (only `x`, `y`
+/// and `width` are read, by the `TabTooltip` rung); `units` carries the
+/// metrics and tab-row height the same rung needs. Returns the rungs actually
+/// composed, in order, for the caller to stash and validate with
+/// [`check_editor_band_order`] — callers do that themselves (rather than this
+/// function doing it) so the assertion message keeps each backend's own
+/// "TUI "/"GTK " prefix, unchanged from before this convergence.
+#[allow(clippy::too_many_arguments)]
+pub fn paint_editor_band_rungs<'screen>(
+    backend: &mut dyn quadraui::Backend,
+    engine: &Engine,
+    screen: &'screen ScreenLayout,
+    theme: &Theme,
+    band: quadraui::Rect,
+    units: EditorBandUnits,
+    drag_active: bool,
+    host: &mut impl EditorBandHost<'screen>,
+) -> Vec<EditorOp> {
+    let mut composed = Vec::new();
+    for op in compose_editor_band(engine, screen, drag_active, engine.terminal_maximized) {
+        match op {
+            EditorOp::Windows => host.paint_windows(backend, engine, screen, theme),
+            // #35/#722: minimap strips on every window's right edge (one
+            // entry per `WindowId` in `screen.minimap`, not just the active
+            // window's) — one call, the rasteriser is quadraui's.
+            EditorOp::Minimap => draw_minimap_strip(backend, screen),
+            EditorOp::TabBars => host.paint_tab_bars(backend, engine, screen, theme),
+            EditorOp::Breadcrumbs => {
+                paint_breadcrumb_bars(backend, screen, engine.terminal_maximized)
+            }
+            EditorOp::GroupDividers => host.paint_group_dividers(backend, screen, theme),
+            EditorOp::TabDragOverlay => host.paint_tab_drag_overlay(backend, engine, screen, theme),
+            // Positioned one *tab row* below the top of the editor column —
+            // `units.tab_row_h`, not `units.metrics.line_height` — mirroring
+            // GTK's `tab_row_h` / TUI's always-one-cell tab strip; see
+            // `EditorBandUnits`'s doc for why the two units genuinely differ.
+            EditorOp::TabTooltip => {
+                if let Some(ref tooltip_text) = screen.tab_tooltip {
+                    tab_hover_tooltip_paint(
+                        backend,
+                        band.x,
+                        band.y + units.tab_row_h,
+                        band.width,
+                        tooltip_text,
+                        theme,
+                        units.metrics.char_width,
+                        units.metrics.line_height,
+                    );
+                }
+            }
+        }
+        composed.push(op);
+    }
+    composed
 }
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -9017,6 +9363,12 @@ pub enum FrameOp {
     TabSwitcher,
     /// `Backend::draw_context_menu`.
     ContextMenu,
+    /// The change-review surface (#955, shared with #525) —
+    /// [`paint_change_review_rung`] on both backends. A full-viewport
+    /// `quadraui::DiffView` for the currently-shown proposed change, so it
+    /// sits above every other overlay except a modal dialog (an
+    /// "agent exited" dialog, say, should still win) and the toast stack.
+    ChangeReview,
     /// `Backend::draw_dialog` — modal, so above every rung but the toasts,
     /// matching [`route_modal_overlay_click`]'s own arbitration.
     Dialog,
@@ -9043,6 +9395,7 @@ impl FrameOp {
                 | FrameOp::UnifiedPicker
                 | FrameOp::TabSwitcher
                 | FrameOp::ContextMenu
+                | FrameOp::ChangeReview
                 | FrameOp::Dialog
                 | FrameOp::ToastStack
         )
@@ -9063,7 +9416,7 @@ impl FrameOp {
 /// The five chrome rungs come first, the eight overlay rungs
 /// ([`FrameOp::is_overlay`]) are the tail: every chrome rung is composed before
 /// the first overlay rung, on both backends.
-pub const FRAME_Z_ORDER: [FrameOp; 14] = [
+pub const FRAME_Z_ORDER: [FrameOp; 15] = [
     // ── chrome ───────────────────────────────────────────────────────────
     FrameOp::MenuRow,
     FrameOp::SidebarPanel,
@@ -9078,6 +9431,7 @@ pub const FRAME_Z_ORDER: [FrameOp; 14] = [
     FrameOp::UnifiedPicker,
     FrameOp::TabSwitcher,
     FrameOp::ContextMenu,
+    FrameOp::ChangeReview,
     FrameOp::Dialog,
     FrameOp::ToastStack,
 ];
@@ -9089,7 +9443,7 @@ pub const FRAME_Z_ORDER: [FrameOp; 14] = [
 /// exactly these rungs must have been composed, in this order" — the #735
 /// headline acceptance criterion.
 ///
-/// Eleven of the thirteen fields are derived from `ScreenLayout` +
+/// Twelve of the fourteen fields are derived from `ScreenLayout` +
 /// `AppShellLayout` by [`Self::from_screen`]. The two that are not
 /// (`toast_stack`, and any backend-specific suppression) are left to the
 /// caller, because they are engine/geometry state rather than screen state.
@@ -9111,6 +9465,7 @@ pub struct FramePresence {
     pub unified_picker: bool,
     pub tab_switcher: bool,
     pub context_menu: bool,
+    pub change_review: bool,
     pub dialog: bool,
     pub toast_stack: bool,
 }
@@ -9172,6 +9527,7 @@ impl FramePresence {
                 .context_menu
                 .as_ref()
                 .is_some_and(|p| !p.items.is_empty()),
+            change_review: screen.change_review.is_some(),
             dialog: screen.dialog.is_some(),
             toast_stack: false,
         }
@@ -9192,6 +9548,7 @@ impl FramePresence {
             FrameOp::UnifiedPicker => self.unified_picker,
             FrameOp::TabSwitcher => self.tab_switcher,
             FrameOp::ContextMenu => self.context_menu,
+            FrameOp::ChangeReview => self.change_review,
             FrameOp::Dialog => self.dialog,
             FrameOp::ToastStack => self.toast_stack,
         }
@@ -9488,6 +9845,174 @@ pub fn paint_toast_stack_rung(
     engine.toast_layout.replace(Some(layout));
 }
 
+/// The change-review surface's modal-stack id — see
+/// [`reconcile_change_review_modal_stack`].
+fn change_review_modal_id() -> quadraui::WidgetId {
+    quadraui::WidgetId::new("change_review")
+}
+
+/// Keep the change-review surface's full-viewport bounds on the backend's
+/// `quadraui::ModalStack` in step with whether it's open (#955, review fix:
+/// the click-routing test this exists for). Same "reconcile so chrome
+/// hit-testing yields to an open overlay" pattern `app.rs`'s
+/// `reconcile_editor_hover_modal` and `mouse.rs`'s context-menu/picker
+/// reconcile blocks already use — see quadraui's `ShellAdapter::handle`
+/// doc (issue #411) for why an overlay that visually covers shell chrome
+/// but never registers with the modal stack has its clicks silently
+/// swallowed by that chrome instead.
+///
+/// Unlike those precedents, this reconcile has to run from *paint*, not
+/// from `handle_mouse`/`handle_mouse_click_msg`: TUI's
+/// `ShellAdapter::handle` consults the modal stack **before** its own
+/// activity-bar/sidebar hit-test, and before ever calling into
+/// `ShellApp::handle` (where `handle_mouse` lives) — so a stack entry
+/// written only while a mouse event is *already* being dispatched can
+/// never be there in time for the very first click after the surface
+/// opens. The editor-hover popup gets away with reconciling from inside
+/// `handle_mouse` because it only ever opens *from* a `MouseMoved`
+/// already flowing through that same function; the change-review surface
+/// opens from an async ACP `tool_call_update` completing, with no
+/// correlated mouse event to piggyback the reconcile on. Paint is the one
+/// place guaranteed to run before that first click.
+///
+/// Registers the *whole* `viewport` (diff pane + status footer), not just
+/// the diff pane `engine.change_review_diff_rect` caches: a click on the
+/// footer must also bypass chrome rather than being swallowed by whatever
+/// activity-bar icon happens to occupy that row underneath —
+/// `route_change_review_click` still resolves a footer click to
+/// `Consume` on its own, this only decides who gets to see the click at
+/// all.
+///
+/// **Call this unconditionally, once per frame, *before* the
+/// [`compose_frame`] walk** — never from an `else` arm inside the
+/// `FrameOp::ChangeReview` match arm. `presence.change_review` *is* the
+/// gate `compose_frame` uses to decide whether that rung is in the op list
+/// at all, so the arm only ever runs on a frame where the surface is open:
+/// an `else` there is dead code on exactly the frame that needs the pop
+/// (the #1117 `explorer_tree_rect` bug and this file's own
+/// "gates drop rungs, so callers reset before the walk" note above
+/// [`compose_frame`], in miniature). Leaving the entry pushed after the
+/// surface closes hands *every* subsequent click to the app's own
+/// `handle()` — `ShellAdapter::handle` consults `ModalStack::hit_test`
+/// before any chrome dispatch — which silently kills activity-bar panel
+/// switching, sidebar resize and the rest for the remainder of the
+/// session. `app.rs`'s `reconcile_editor_hover_modal` is the shape to
+/// copy: called every time regardless of visibility, with the `false` arm
+/// always reachable.
+pub fn reconcile_change_review_modal_stack(
+    b: &mut dyn quadraui::Backend,
+    open: bool,
+    viewport: quadraui::Rect,
+) {
+    let stack_rc = b.modal_stack_handle();
+    let mut stack = stack_rc.borrow_mut();
+    if open {
+        stack.push(change_review_modal_id(), viewport);
+        // #455: no quadraui rasteriser marks this surface painted — the
+        // three `mark_painted` call sites upstream are wired only for
+        // `draw_palette`/`draw_menu`/`draw_dialog`, and the change-review
+        // surface is a `DiffView` + `StatusBar`, neither of which is
+        // modal-capable there. Without this the entry shows up in
+        // `ModalStack::unpainted_ids()` every frame it is open and each
+        // backend's `end_frame` emits the "registered but invisible"
+        // diagnostic against a surface that is, in fact, painted. Only the
+        // `open` arm marks: a popped id is a no-op for `mark_painted`
+        // anyway.
+        stack.mark_painted(&change_review_modal_id());
+    } else {
+        stack.pop(&change_review_modal_id());
+    }
+}
+
+/// Does the backend's `quadraui::ModalStack` currently hold the
+/// change-review surface's entry? Test-facing: the regression guard for
+/// "the overlay closed but its full-viewport entry stayed registered and
+/// ate every later chrome click" (#955 review) asserts on this directly,
+/// since the symptom is otherwise only observable several clicks later.
+pub fn change_review_modal_registered(b: &mut dyn quadraui::Backend) -> bool {
+    let stack_rc = b.modal_stack_handle();
+    let stack = stack_rc.borrow();
+    let id = change_review_modal_id();
+    let registered = stack.iter_top_down().any(|e| e.id == id);
+    registered
+}
+
+/// The change-review surface's whole paint body (#955, shared with #525):
+/// a full-viewport `quadraui::DiffView` for the currently-shown entry,
+/// plus a one-row status footer ("file i of n", the entry's path, and key
+/// hints). Both backends call this verbatim from their own frame-op walk —
+/// no per-backend diff-rendering logic, matching every other primitive
+/// under `docs/QUADRAUI_GUIDE.md`.
+///
+/// Caches the diff pane's own rect on `engine.change_review_diff_rect` so
+/// a later mouse click can resolve through the *exact* geometry this call
+/// painted (`entry.view.layout(rect, line_height).hit_test`) — same
+/// "paint writes it, click routing reads it" contract as
+/// `command_line_rect`.
+///
+/// Also reconciles the surface's modal-stack entry (see
+/// [`reconcile_change_review_modal_stack`]) — required for click-to-jump
+/// to actually reach `mouse::handle_mouse`/`App::handle_mouse_click_msg`
+/// rather than being swallowed by whatever chrome (activity-bar icon,
+/// sidebar row) happens to occupy those columns underneath the
+/// full-viewport overlay.
+pub fn paint_change_review_rung(
+    b: &mut dyn quadraui::Backend,
+    engine: &Engine,
+    review: &crate::core::review::ChangeReviewState,
+    viewport: quadraui::Rect,
+    theme: &Theme,
+) {
+    let Some(entry) = review.current_entry() else {
+        // Open-but-empty: nothing reaches the canvas, so nothing may
+        // claim the viewport's clicks either (the same
+        // registered-but-invisible defect #455 detects).
+        reconcile_change_review_modal_stack(b, false, viewport);
+        return;
+    };
+    reconcile_change_review_modal_stack(b, true, viewport);
+    let line_height = b.line_height().max(1.0);
+    let footer_h = line_height.min(viewport.height);
+    let diff_rect = quadraui::Rect::new(
+        viewport.x,
+        viewport.y,
+        viewport.width,
+        (viewport.height - footer_h).max(0.0),
+    );
+    let _ = b.draw_diff_view(diff_rect, &entry.view);
+    engine.change_review_diff_rect.set(diff_rect);
+
+    let decision = match entry.decision {
+        crate::core::review::ChangeDecision::Pending => "pending",
+        crate::core::review::ChangeDecision::Accepted => "accepted",
+        crate::core::review::ChangeDecision::Rejected => "rejected",
+    };
+    let msg = format!(
+        " Change {}/{} ({decision}) \u{b7} {} \u{b7} a=accept r=reject ]/[=hunk n/p=file Esc=close ",
+        review.current + 1,
+        review.entries.len(),
+        entry.change.path,
+    );
+    let status = quadraui::StatusBar {
+        id: quadraui::WidgetId::new("change-review-status"),
+        left_segments: vec![quadraui::StatusBarSegment {
+            text: msg,
+            fg: theme.status_fg,
+            bg: theme.status_bg,
+            bold: false,
+            action_id: None,
+        }],
+        right_segments: vec![],
+    };
+    let footer_rect = quadraui::Rect::new(
+        viewport.x,
+        diff_rect.y + diff_rect.height,
+        viewport.width,
+        footer_h,
+    );
+    let _ = b.draw_status_bar_interactive(footer_rect, &status, &quadraui::InteractionState::new());
+}
+
 /// Where the menu bar's labels end, in absolute coordinates.
 ///
 /// `vi.bounds.x` is already absolute — quadraui's `MenuBar::layout` starts its
@@ -9704,9 +10229,10 @@ pub fn command_line_view(command: &CommandLineData) -> quadraui::CommandLine {
 ///
 /// It could not be written before #766: until the chrome and overlay halves
 /// were one sequence there was no single artefact to compare, only two that a
-/// backend could get individually right and jointly wrong. Nine of the fourteen
-/// rungs are live and five are not, which is what keeps it *discriminating* —
-/// it must never degenerate into "whatever [`FRAME_Z_ORDER`] contains".
+/// backend could get individually right and jointly wrong. Nine of the
+/// fifteen rungs are live and six are not, which is what keeps it
+/// *discriminating* — it must never degenerate into "whatever
+/// [`FRAME_Z_ORDER`] contains".
 #[cfg(test)]
 pub(crate) fn frame_sequence_fixture() -> Vec<FrameOp> {
     compose_frame(&FramePresence {
@@ -9724,6 +10250,7 @@ pub(crate) fn frame_sequence_fixture() -> Vec<FrameOp> {
         unified_picker: false,
         tab_switcher: false,
         context_menu: true,
+        change_review: false,
         dialog: true,
         toast_stack: false,
     })
@@ -11521,6 +12048,13 @@ pub struct ScreenLayout {
     pub editor_hover: Option<EditorHoverPopupData>,
     /// Git diff peek popup — `Some` when the user is previewing a diff hunk.
     pub diff_peek: Option<DiffPeekPopup>,
+    /// The change-review surface (#955, shared with #525) — `Some` when a
+    /// tool-call `diff` (or a future #525 git-branch diff feed) is open
+    /// for review. Cloned wholesale from `Engine::change_review` rather
+    /// than converted field-by-field like `DiffPeekPopup`: it already
+    /// carries a fully paint-ready `quadraui::DiffView` per entry, so
+    /// there is nothing this projection needs to compute.
+    pub change_review: Option<crate::core::review::ChangeReviewState>,
     // `diff_toolbar` used to sit here — the single-group mirror of
     // `GroupTabBar::diff_toolbar`.
     //
@@ -12112,42 +12646,47 @@ pub fn build_minimap_data(
     let k = desired_window_lines
         .div_ceil(target_lines.max(1))
         .clamp(1, MINIMAP_MAX_COMPRESSION);
-    // quadraui's own `MinimapSizing::FixedPitch` already implements this
-    // slide (`slide_window_start_row`) — but only engages once it's handed
-    // more `lines` than the strip can hold. Handing it the *whole* buffer
-    // to get that engagement would cost O(file) per frame (the
-    // #728/#1085 regression this function exists to avoid), so the window
-    // is computed here, host-side, over a `lines` vector that never
-    // exceeds `target_lines` — `slide_window_start_row` then always takes
-    // its "already fits" branch and returns `0`, by construction.
+    // #1247 (quadraui#1044): the window's *sizing* (`window_len`, via `k`
+    // above) stays host-side — it depends on this strip's own geometry
+    // (`target_lines`/`editor_visible_rows`), which quadraui has no way to
+    // know — but where the window *starts* is now quadraui's own decision,
+    // via `window_start_line`. Before #1044 that primitive didn't exist, so
+    // this function pre-sliced the buffer down to a `window_len`-sized
+    // range by hand and handed quadraui only the already-sliced result;
+    // quadraui's own post-sample slide (`Minimap::layout_with_sizing`'s
+    // `FixedPitch` arm, `slide_window_start_row`) never saw more `lines`
+    // than the strip could already hold, so it always took its "already
+    // fits" branch and returned `0` — permanently defeated, as that
+    // function's own doc comment used to note. `window_start_line` is the
+    // pre-sample counterpart #1044 added specifically to close that gap:
+    // calling it here, instead of re-deriving the same fraction-of-buffer
+    // arithmetic host-side, makes the slide live rather than defeated,
+    // while still costing O(window_len) per frame, not O(file) (the
+    // #728/#1085 regression this function exists to avoid — `window_len`
+    // is still capped below `total_buffer_lines` before this call runs).
     let window_len = target_lines.saturating_mul(k).min(total_buffer_lines);
-    let max_start = total_buffer_lines - window_len;
-    let window_start_line = if max_start == 0 {
-        // The whole file already fits in one window — top-aligned, no
-        // slide, byte-for-byte the pre-#1093 behaviour.
-        0
-    } else {
-        // Slide in lockstep with the editor's own scroll position: `0` at
-        // the top of the file, `max_start` (the window's own last
-        // reachable position) once the editor can't scroll down any
-        // further. Anchored to the editor's own scroll *ceiling*
-        // (`total_buffer_lines - editor_visible_rows`, the same arithmetic
-        // `View::ensure_cursor_visible` clamps `scroll_top` against)
-        // rather than `total_buffer_lines` itself, so the window reaches
-        // its own bottom exactly when the editor viewport reaches the real
-        // bottom of the file — not some fraction short of it (which a
-        // `scroll_top / total_buffer_lines` fraction would leave: the
-        // editor's own `scroll_top` never reaches `total_buffer_lines - 1`
-        // except in a one-row viewport).
-        let max_scroll_top = total_buffer_lines.saturating_sub(editor_visible_rows.max(1));
-        if max_scroll_top == 0 {
-            0
-        } else {
-            let scroll_top = window.view.scroll_top.min(max_scroll_top);
-            let fraction = scroll_top as f64 / max_scroll_top as f64;
-            ((fraction * max_start as f64).round() as usize).min(max_start)
-        }
-    };
+    // `total_at_position` is `max_scroll_top + 1`, the number of distinct
+    // scroll positions the editor itself can reach — not `total_buffer_lines`
+    // — so the slide is anchored to the editor's own scroll *ceiling*
+    // (`total_buffer_lines - editor_visible_rows`, the same arithmetic
+    // `View::ensure_cursor_visible` clamps `scroll_top` against) exactly the
+    // way #1093/#1211 always have: the window reaches its own bottom exactly
+    // when the editor viewport reaches the real bottom of the file, not some
+    // fraction short of it (which a `scroll_top / total_buffer_lines`
+    // fraction would leave — the editor's own `scroll_top` never reaches
+    // `total_buffer_lines - 1` except in a one-row viewport).
+    // `window_start_line`'s own `total_at_position <= 1` branch returns `0`
+    // here exactly when `max_scroll_top == 0`, so a one-screen file still
+    // stays top-aligned with no slide, byte-for-byte the pre-#1093
+    // behaviour.
+    let max_scroll_top = total_buffer_lines.saturating_sub(editor_visible_rows.max(1));
+    let scroll_top_for_window = window.view.scroll_top.min(max_scroll_top);
+    let window_start_line = quadraui::window_start_line(
+        total_buffer_lines,
+        window_len,
+        scroll_top_for_window,
+        max_scroll_top + 1,
+    );
     // Downstream code (the viewport-highlight band `build_minimap_data`
     // paints further below, and every consumer of `Minimap::visible_row_start`)
     // relies on `scroll_top` always landing inside
@@ -16003,6 +16542,7 @@ pub fn build_screen_layout_with_breadcrumb_row(
             anchor_line: dp.anchor_line,
             hunk_lines: dp.hunk_lines.clone(),
         }),
+        change_review: engine.change_review.clone(),
         panel_hover: engine.panel_hover.as_ref().map(|ph| PanelHoverPopupData {
             markdown: ph.markdown.clone(),
             line_text: ph.line_text.clone(),
@@ -17761,6 +18301,73 @@ pub fn ext_panel_to_tree_view(panel: &ExtPanelData, theme: &Theme) -> quadraui::
     }
 }
 
+// ─── Sidebar-panel-body composition (quadraui#1041, vimcode#1242) ─────────
+//
+// `quadraui::compose::sidebar_panel_body::SidebarPanelBody` composes
+// "background fill, optional header/search chrome, body, optional
+// scrollbar gutter" — the layer order sidebar-panel renderers used to
+// hand-roll per backend (`docs/TUI_AUDIT_R2.md` §2.9). Its `render()`
+// convenience method takes the body as `&dyn BackendWidget`, which
+// requires `Self: Send + 'static` — a bound vimcode's *stateful* sidebar
+// bodies (`TreeController`/`FormController`, `Rc<RefCell<_>>`-backed on
+// the `!Send` `Engine`) can't satisfy: they're mutated in place by
+// `populate_*` and read back through a live `&Engine` borrow, never
+// rebuilt as an owned value. [`paint_sidebar_panel_chrome`] is `render()`'s
+// background+chrome half, factored out so those callers still share the
+// primitive's layer order and row-slicing, painting their own body into
+// the returned [`SidebarPanelBodyLayout::body_rect`]. [`ExtPanelTreeBody`]
+// is the one rung with a genuinely owned per-frame body
+// (`ext_panel_to_tree_view`'s fresh `TreeView`), so it uses the real
+// `SidebarPanelBody::render` path directly.
+pub use quadraui::compose::sidebar_panel_body::{
+    SidebarPanelBody, SidebarPanelBodyLayout, SidebarPanelChrome,
+};
+
+/// [`SidebarPanelBody::render`]'s background+chrome half, for hosts whose
+/// body can't be a `&dyn BackendWidget` — see the module note above.
+/// Returns the layout so the caller paints its own body into `body_rect`.
+pub fn paint_sidebar_panel_chrome(
+    backend: &mut dyn quadraui::Backend,
+    panel: &SidebarPanelBody,
+    rect: quadraui::Rect,
+) -> SidebarPanelBodyLayout {
+    let layout = panel.layout(rect, backend.line_height());
+    if let Some(bg) = panel.background {
+        backend.draw_solid_fill(rect, bg);
+    }
+    if let Some(chrome_rect) = layout.chrome_rect {
+        match &panel.chrome {
+            SidebarPanelChrome::None => {}
+            SidebarPanelChrome::Header(text) => {
+                backend.draw_settings_chrome(chrome_rect, text, "", "", false);
+            }
+            SidebarPanelChrome::HeaderAndSearch {
+                header,
+                query,
+                placeholder,
+                active,
+            } => {
+                backend.draw_settings_chrome(chrome_rect, header, query, placeholder, *active);
+            }
+        }
+    }
+    layout
+}
+
+/// Owned per-frame body for the plugin extension panel (`ext:<name>`) —
+/// unlike the stateful controllers [`paint_sidebar_panel_chrome`] exists
+/// for, [`ext_panel_to_tree_view`]'s output is already a fresh, owned
+/// `quadraui::TreeView`, so it satisfies `BackendWidget: Send + 'static`.
+/// Public field so a caller can read the `TreeView` back out after the
+/// borrow ends (e.g. to feed `Backend::tree_layout`).
+pub struct ExtPanelTreeBody(pub quadraui::TreeView);
+
+impl quadraui::BackendWidget for ExtPanelTreeBody {
+    fn render(&self, backend: &mut dyn quadraui::Backend, rect: quadraui::Rect) {
+        backend.draw_tree(rect, &self.0);
+    }
+}
+
 /// Adapt the engine-side `ExtSidebarData` into a `quadraui::MultiSectionView`
 /// (#293).
 ///
@@ -18505,14 +19112,23 @@ fn build_ext_panel_data(engine: &Engine) -> Option<ExtPanelData> {
 pub fn populate_ai_chat_controller(engine: &Engine, theme: &Theme) {
     let user_fg = theme.keyword;
     let asst_fg = theme.string_lit;
-    let turns: Vec<quadraui::ChatTurn> = engine
+    // ACP-1 (#952): agent "thought" chunks (`session/update`'s
+    // `agent_thought_chunk`, role "assistant-thought" — see
+    // `Engine::acp_append_chunk`) render under `ChatRole::System`, not
+    // `Assistant` — `ChatController::build_transcript_rows` gives `System`
+    // both its own role-header label ("System" vs "AI") and its own colour,
+    // which is the acceptance criterion: thought chunks must be visually
+    // distinct from message chunks, not merely a different tint on the same
+    // "AI" label.
+    let thought_fg = theme.comment;
+    let mut turns: Vec<quadraui::ChatTurn> = engine
         .ai_messages
         .iter()
         .map(|m| {
-            let (role, fg) = if m.role == "user" {
-                (quadraui::ChatRole::User, user_fg)
-            } else {
-                (quadraui::ChatRole::Assistant, asst_fg)
+            let (role, fg) = match m.role.as_str() {
+                "user" => (quadraui::ChatRole::User, user_fg),
+                "assistant-thought" => (quadraui::ChatRole::System, thought_fg),
+                _ => (quadraui::ChatRole::Assistant, asst_fg),
             };
             quadraui::ChatTurn {
                 role,
@@ -18523,16 +19139,121 @@ pub fn populate_ai_chat_controller(engine: &Engine, theme: &Theme) {
         })
         .collect();
 
+    // #955 (ACP-4): tool calls, rendered as one collapsed one-line summary
+    // turn per call, appended *after* the real conversation — same
+    // "synthetic turn, never mixed into `ai_messages`" treatment #956 gave
+    // the plan checklist below. `tool_call_summary_line` already bakes in
+    // the status glyph, so a `tool_call_update`'s `pending -> in_progress
+    // -> completed | failed` transition is visible here without any
+    // expand/collapse state to track — every call always renders its
+    // current status, every frame.
+    for call in &engine.acp_tool_calls {
+        turns.push(quadraui::ChatTurn {
+            role: quadraui::ChatRole::System,
+            text: quadraui::StyledText::colored(
+                crate::core::acp::tool_call_summary_line(call),
+                thought_fg,
+            ),
+            timestamp_unix: None,
+            line_scales: Vec::new(),
+        });
+    }
+
+    // #956 (ACP-5): the agent's current plan, rendered as one synthetic
+    // checklist turn appended *after* the real conversation — never mixed
+    // into `engine.ai_messages` itself. `engine.acp_plan` already holds
+    // only the latest `plan` update (a full replacement, not a delta — see
+    // that field's doc), so this turn is rebuilt fresh from it every call:
+    // two successive `plan` updates leave exactly one checklist rendered,
+    // reflecting the second, by construction (there is only ever one
+    // `acp_plan` value to read). Appending at the end rather than inline
+    // where the update actually streamed keeps "current plan state" always
+    // visible without scrolling (`ChatController` stays stuck-to-bottom),
+    // at the deliberate cost of it not being in strict chronological order
+    // with any later message chunks in the same turn.
+    if !engine.acp_plan.is_empty() {
+        turns.push(quadraui::ChatTurn {
+            role: quadraui::ChatRole::System,
+            text: quadraui::StyledText::colored(
+                crate::core::acp::plan_to_checklist_text(&engine.acp_plan),
+                thought_fg,
+            ),
+            timestamp_unix: None,
+            line_scales: Vec::new(),
+        });
+    }
+
     let mut chat = engine.ai_chat.borrow_mut();
     chat.set_transcript(turns);
     chat.set_busy(engine.ai_streaming);
     let header_fg = theme.status_fg;
-    let header = if engine.ai_streaming {
-        " \u{f0e5} AI ASSISTANT  (thinking\u{2026})"
+    let mut header = if engine.ai_streaming {
+        " \u{f0e5} AI ASSISTANT  (thinking\u{2026})".to_string()
     } else {
-        " \u{f0e5} AI ASSISTANT"
+        " \u{f0e5} AI ASSISTANT".to_string()
     };
+    // #956 (ACP-5): current mode + usage telemetry both fold into this one
+    // existing status line rather than a new widget — "unobtrusive status
+    // indicator" per the issue, and by construction can't steal focus or
+    // churn layout since the header is already repainted every frame at a
+    // fixed position.
+    if let Some(mode_id) = engine.acp_current_mode_id.as_deref() {
+        let mode_label = engine
+            .acp_modes
+            .iter()
+            .find(|m| m.id == mode_id)
+            .map(|m| m.name.as_str())
+            .unwrap_or(mode_id);
+        header.push_str(&format!("  \u{b7} mode: {mode_label}"));
+    }
+    if let Some(usage) = &engine.acp_usage {
+        let summary = crate::core::acp::format_usage_summary(usage);
+        if !summary.is_empty() {
+            header.push_str(&format!("  \u{b7} {summary}"));
+        }
+    }
     chat.set_status(quadraui::StyledText::colored(header, header_fg));
+}
+
+/// Paint the slash-command completion popup above the AI panel's input box
+/// when [`Engine::ai_command_completions`] has a match (#956, ACP-5).
+/// Reuses [`completion_menu_to_quadraui_completions`] and the
+/// `quadraui::Completions` primitive verbatim — the same machinery the
+/// editor's own word-completion popup uses — rather than a bespoke widget.
+///
+/// `chat_rect` must be the same rect the caller's last `ai_chat.render()`
+/// call used (`Engine::ai_chat_rect`), matching every other AI-panel
+/// helper's contract. Anchoring at the rect's bottom edge with the rect
+/// itself as the viewport makes `Completions::layout`'s own "prefer below,
+/// flip above on overflow" placement logic put the popup just above the
+/// panel's bottom edge — where `ChatController`'s input box always is —
+/// without this function needing to know that box's exact pixel/cell
+/// geometry (`ChatController` doesn't expose it).
+pub fn paint_ai_command_completions(
+    backend: &mut dyn quadraui::Backend,
+    engine: &Engine,
+    chat_rect: quadraui::Rect,
+) {
+    if chat_rect.width <= 0.0 || chat_rect.height <= 0.0 {
+        return;
+    }
+    let Some(menu) = engine.ai_command_completions() else {
+        return;
+    };
+    let completions = completion_menu_to_quadraui_completions(&menu);
+    let unit_h = backend.line_height().max(1.0);
+    let popup_width = chat_rect.width.max(unit_h * 4.0);
+    let max_popup_height = (unit_h * (menu.candidates.len() as f32 + 1.0)).min(chat_rect.height);
+    let layout = completions.layout(
+        chat_rect.x,
+        chat_rect.y + chat_rect.height,
+        unit_h,
+        chat_rect,
+        popup_width,
+        max_popup_height,
+        |_| quadraui::CompletionItemMeasure::new(unit_h),
+    );
+    backend.draw_completions(&completions, &layout);
 }
 
 /// Build the cell grid for a single terminal session.
@@ -24122,6 +24843,7 @@ mod tests {
                 FrameOp::UnifiedPicker,
                 FrameOp::TabSwitcher,
                 FrameOp::ContextMenu,
+                FrameOp::ChangeReview,
                 FrameOp::Dialog,
                 FrameOp::ToastStack,
             ],
@@ -24222,9 +24944,14 @@ mod tests {
             // `FolderPicker`: shared on both backends since #815, but not
             // folded into this ladder — see `route_folder_picker_click`'s
             // doc comment for why it is checked directly instead.
+            // `ChangeReview` (#955): same policy — see
+            // `route_change_review_click`'s doc comment.
             let routed_elsewhere = matches!(
                 op,
-                FrameOp::MenuDropdown | FrameOp::CommandCenter | FrameOp::FolderPicker
+                FrameOp::MenuDropdown
+                    | FrameOp::CommandCenter
+                    | FrameOp::FolderPicker
+                    | FrameOp::ChangeReview
             );
             assert_eq!(
                 arbitrated, !routed_elsewhere,
@@ -24284,6 +25011,7 @@ mod tests {
             unified_picker: true,
             tab_switcher: true,
             context_menu: true,
+            change_review: true,
             dialog: true,
             toast_stack: true,
         };
@@ -31613,6 +32341,34 @@ mod slice7_router_tests {
     fn ctrl_l_falls_through_when_ctrl_x_completion_is_pending() {
         assert!(!is_force_redraw_key("", Some('l'), true, true));
         assert!(!is_force_redraw_key("l", None, true, true));
+    }
+
+    /// #1243: only the popup-was-up-last-frame-and-is-gone-this-frame edge
+    /// must fire `Backend::request_full_repaint` — every other transition
+    /// (staying open, staying closed, or newly opening) repaints its own
+    /// content this frame regardless of the diff cache, so requesting a
+    /// full repaint there would just be wasted work, not a correctness bug,
+    /// but pinning all four keeps the predicate from drifting into
+    /// "request it whenever a popup isn't open" (which would fire on every
+    /// popup-free frame forever).
+    #[test]
+    fn popup_overlay_closed_this_frame_fires_only_on_the_closing_edge() {
+        assert!(
+            popup_overlay_closed_this_frame(true, false),
+            "open → closed must fire"
+        );
+        assert!(
+            !popup_overlay_closed_this_frame(true, true),
+            "staying open must not fire"
+        );
+        assert!(
+            !popup_overlay_closed_this_frame(false, false),
+            "staying closed must not fire"
+        );
+        assert!(
+            !popup_overlay_closed_this_frame(false, true),
+            "newly opening must not fire"
+        );
     }
 
     #[test]

@@ -67,6 +67,13 @@ pub struct TerminalSlot {
     pub session: TerminalSession,
     /// `Some` only for panes opened by `terminal_run_command` (extension installs).
     pub install_ctx: Option<InstallContext>,
+    /// `true` only for the pane opened by `Engine::acp_launch_terminal_login`
+    /// (#957, ACP-6) — an ACP `type: "terminal"` auth login, re-running the
+    /// agent's own command interactively. `poll_terminal`'s exit handling
+    /// and `terminal_close_active_tab` both read this to know an
+    /// exiting/closed pane was a login flow (never a regular shell or an
+    /// extension install) and route to `Engine::acp_finish_terminal_login`.
+    pub acp_auth_pending: bool,
 }
 
 /// How a register's contents were captured, and therefore how `p`/`P` put them
@@ -3511,10 +3518,120 @@ pub struct Engine {
     /// True while a DAP debug session is active.
     pub dap_session_active: bool,
 
-    // --- ACP (Agent Client Protocol) state (#951, ACP-0 — transport only, no UI) ---
+    // --- ACP (Agent Client Protocol) state ---
     /// The live ACP agent subprocess + session, if one has been started.
-    /// `None` until a later slice starts one; `poll_acp` is a no-op then.
+    /// `None` until `ai_send_message` starts one (#952, ACP-1); `poll_acp`
+    /// is a no-op until then.
     pub acp_client: Option<crate::core::acp::AcpClient>,
+    /// The agent's `session/new` `sessionId`, once the handshake
+    /// (`initialize` -> `session/new`) has completed. `None` while a fresh
+    /// `acp_client` is still initializing.
+    pub acp_session_id: Option<String>,
+    /// A user prompt queued because `ai_send_message` was called before
+    /// `acp_session_id` was known (spawning the agent and running the
+    /// handshake takes at least one `poll_acp` round trip). Drained by
+    /// `poll_acp` the moment `AcpEvent::SessionCreated` lands.
+    pub acp_pending_prompt: Option<String>,
+    /// The `ai_messages` index + role of the transcript turn currently
+    /// being streamed via `session/update` chunks, so consecutive chunks
+    /// of the same kind (`AcpChunkKind`) append to it instead of each
+    /// starting a new turn. Reset to `None` on `PromptStopped`/
+    /// `RequestFailed`/`AgentExited` so the next chunk of a later turn
+    /// starts fresh rather than appending to a finished one.
+    pub acp_streaming_turn: Option<(usize, crate::core::acp::AcpChunkKind)>,
+    /// A parked `session/request_permission` request, if the dialog tagged
+    /// `"acp_permission"` is currently open for it (#953, ACP-2). Holds the
+    /// JSON-RPC request id (needed to reply) alongside the parsed request
+    /// (needed to interpret which button the human picked, and to key
+    /// `acp_remembered_decisions`). `None` whenever no permission dialog is
+    /// open — every path that closes that dialog must clear this at the
+    /// same time it sends the reply, so the two never drift apart; see
+    /// `Engine::acp_cancel_pending_permission` and the `"acp_permission"`
+    /// arm of `process_dialog_result`, the only two places that do either.
+    pub acp_pending_permission: Option<(i64, crate::core::acp::AcpPermissionRequest)>,
+    /// Session-scoped remembered `allow_always`/`reject_always` answers to
+    /// `session/request_permission`, keyed by the tool call's ACP `kind`
+    /// (`AcpToolCallInfo::kind` — e.g. `"edit"`, `"execute"`; *not* the
+    /// per-option `kind`). `true` = always allow, `false` = always reject.
+    /// Cleared whenever the session itself ends (`ai_clear`, `AgentExited`)
+    /// — never persisted across sessions, per #953's non-goal #1 (no
+    /// blanket/global auto-approve).
+    pub acp_remembered_decisions: std::collections::HashMap<String, bool>,
+    /// The agent's current task-plan breakdown (`session/update`'s `plan`
+    /// variant, #956 ACP-5). Each update is a **full replacement**, not a
+    /// delta — this holds only the latest one, never an accumulated
+    /// history, so `render::populate_ai_chat_controller` always renders
+    /// exactly one plan checklist regardless of how many `plan` updates
+    /// have streamed by. Source-agnostic shape (`crate::core::acp::
+    /// AcpPlanEntry`) shared with #529's future remote-worker
+    /// plan preview — "same renderer, different feeder" per that issue's
+    /// note. Cleared on `ai_clear`/`AgentExited` (session-scoped).
+    pub acp_plan: Vec<crate::core::acp::AcpPlanEntry>,
+    /// Slash commands the agent declared via `available_commands_update`
+    /// (#956, ACP-5) — full replacement each update, same policy as
+    /// `acp_plan`. Surfaced as completions in the AI panel's input via
+    /// `Engine::ai_command_completions`.
+    pub acp_available_commands: Vec<crate::core::acp::AcpAvailableCommand>,
+    /// Selected index into the slash-command completions currently
+    /// matching the AI panel's input (`Engine::ai_command_completions`).
+    /// Reset to 0 whenever `acp_available_commands` changes so a stale
+    /// selection never points past a shrunk list's end.
+    pub acp_command_completion_idx: usize,
+    /// The agent's declared modes (`session/new`'s `modes.availableModes`,
+    /// #956 ACP-5). The set itself only ever comes from the handshake —
+    /// `current_mode_update` changes which one is current, not this list.
+    pub acp_modes: Vec<crate::core::acp::AcpSessionMode>,
+    /// Which of `acp_modes` is current. Driven **only** by the agent's own
+    /// `current_mode_update` notification (never set optimistically by
+    /// `Engine::acp_set_mode` on request) — see that method's doc for why.
+    pub acp_current_mode_id: Option<String>,
+    /// Latest `usage_update` telemetry, if the agent has sent one this
+    /// session (#956, ACP-5). Rendered as a compact status-header suffix —
+    /// never a separate widget, so it can't steal focus or churn layout.
+    pub acp_usage: Option<crate::core::acp::AcpUsage>,
+    /// The `authMethods` from the live agent's `initialize` response
+    /// (#957, ACP-6) — cached so the `"acp_auth_choice"` dialog and
+    /// `Engine::acp_launch_terminal_login` can look a chosen method back up
+    /// by id after the dialog closes. Session-scoped: cleared alongside
+    /// `acp_client` (`AgentExited`, `ai_clear`).
+    pub acp_auth_methods: Vec<crate::core::acp::AcpAuthMethod>,
+    /// Whether auth has been resolved (skipped, a `type: "agent"` method
+    /// succeeded, or a `type: "terminal"` login exited `0`) for the
+    /// *current* `acp_client`'s lifetime. Gates whether `poll_acp`'s
+    /// `Initialized` handler shows the `"acp_auth_choice"` dialog again —
+    /// without this, the re-`initialize()` that
+    /// `Engine::acp_finish_terminal_login` sends after a successful
+    /// terminal login would immediately reopen the same dialog, since a
+    /// real agent's `authMethods` list does not empty out just because a
+    /// previous login already succeeded. Reset to `false` alongside
+    /// `acp_client`/`acp_auth_methods` (new client, new handshake, new
+    /// choice) — never persisted across sessions.
+    pub acp_authenticated: bool,
+    /// Tool calls the agent has announced this session (#955, ACP-4),
+    /// upserted by `toolCallId` — an addressable collection, not an
+    /// append-only log, so a `tool_call_update`'s status transition or
+    /// appended content lands on the same entry `tool_call` created.
+    /// Rendered as collapsed one-line summaries after the real
+    /// conversation (`render::populate_ai_chat_controller`), same
+    /// "synthetic turn appended after" treatment as `acp_plan`.
+    /// Session-scoped: cleared on `ai_clear`/`AgentExited`.
+    pub acp_tool_calls: Vec<crate::core::acp::AcpToolCall>,
+    /// The change-review surface (#955, shared with #525): opened
+    /// automatically when a tool call's content includes a `diff` block.
+    /// Source-agnostic (`crate::core::review::ChangeReviewState`) — this
+    /// field just holds whichever review is currently open, regardless of
+    /// what fed it. Session-scoped: cleared on `ai_clear`/`AgentExited`,
+    /// same as `acp_tool_calls`.
+    pub change_review: Option<crate::core::review::ChangeReviewState>,
+    /// The diff-pane rect (excludes the status footer)
+    /// `render::paint_change_review_rung` last painted the current entry's
+    /// `DiffView` into — ABSOLUTE, backend-native units, same "paint
+    /// writes it, click routing reads it" convention as
+    /// `command_line_rect`. Both backends' mouse-click arms resolve a
+    /// click through `entry.view.layout(this_rect, line_height).hit_test`
+    /// before calling `Engine::change_review_jump_to_hit`, so paint and
+    /// hit-test can never disagree about geometry.
+    pub change_review_diff_rect: std::cell::Cell<quadraui::Rect>,
 
     // --- DAP (Debug Adapter Protocol) state ---
     /// Multi-adapter DAP coordinator. None until first debug session is started.
@@ -3874,6 +3991,21 @@ pub struct Engine {
     /// Channel for receiving the registry fetch result from the background thread.
     pub ext_registry_rx:
         Option<std::sync::mpsc::Receiver<Option<Vec<extensions::ExtensionManifest>>>>,
+
+    // --- Native tool acquisition (#1345) ---
+    /// In-flight background acquisitions (`tool_acquire::acquire_and_install`),
+    /// keyed by the same `install_key` scheme `lsp_installing` uses (e.g.
+    /// `"ext:{ext}:lsp"`, `"dap:{adapter}"`) so an LSP leg and a DAP leg of
+    /// the same `:ExtInstall` can run concurrently without clobbering each
+    /// other — mirrors `async_shell_tasks`'s `HashMap<String, Receiver<_>>`
+    /// pattern (`plugins.rs`).
+    pub(crate) tool_acquire_tasks:
+        HashMap<String, std::sync::mpsc::Receiver<lsp_ops::ToolAcquireOutcome>>,
+    /// Per-extension status-text accumulator for those acquisitions, keyed
+    /// by extension name. Keeps a leg that finishes in a *later* tick from
+    /// erasing the status text of one that finished earlier — see
+    /// `lsp_ops::ToolAcquireGroup`.
+    pub(crate) tool_acquire_groups: HashMap<String, lsp_ops::ToolAcquireGroup>,
 
     // --- Extensions sidebar state ---
     /// quadraui SidebarSystem — owns extensions sidebar (2 sections:
@@ -4580,6 +4712,22 @@ impl Engine {
             debug_button_pressed: None,
             dap_session_active: false,
             acp_client: None,
+            acp_session_id: None,
+            acp_pending_prompt: None,
+            acp_streaming_turn: None,
+            acp_pending_permission: None,
+            acp_remembered_decisions: HashMap::new(),
+            acp_plan: Vec::new(),
+            acp_available_commands: Vec::new(),
+            acp_command_completion_idx: 0,
+            acp_modes: Vec::new(),
+            acp_current_mode_id: None,
+            acp_usage: None,
+            acp_auth_methods: Vec::new(),
+            acp_authenticated: false,
+            acp_tool_calls: Vec::new(),
+            change_review: None,
+            change_review_diff_rect: std::cell::Cell::new(quadraui::Rect::default()),
             dap_manager: None,
             dap_stopped_thread: None,
             dap_breakpoints: HashMap::new(),
@@ -4670,6 +4818,8 @@ impl Engine {
             ext_registry: registry::load_cache(),
             ext_registry_fetching: false,
             ext_registry_rx: None,
+            tool_acquire_tasks: HashMap::new(),
+            tool_acquire_groups: HashMap::new(),
             ext_sidebar_system: {
                 let mut s = quadraui::SidebarSystem::new(vec![
                     quadraui::SidebarSectionDef::new("installed", "INSTALLED"),
@@ -4939,6 +5089,7 @@ impl Engine {
         redraw |= self.poll_terminal();
         redraw |= self.poll_dap();
         redraw |= self.poll_ext_registry();
+        redraw |= self.poll_tool_acquire();
         redraw |= self.poll_sc_diff();
         redraw |= self.poll_ai();
         redraw |= self.poll_async_shells();
@@ -5027,7 +5178,6 @@ impl Engine {
 
     /// Mark a notification as done (switches from spinner to bell).
     /// If `new_message` is `Some`, updates the display text.
-    #[allow(dead_code)]
     pub fn notify_done(&mut self, id: u64, new_message: Option<&str>) {
         if let Some(n) = self.notifications.iter_mut().find(|n| n.id == id) {
             n.done = true;
@@ -5318,9 +5468,6 @@ fn is_word_char(ch: char) -> bool {
 }
 
 /// Return the number of visual rows a buffer line of `line_char_len` characters
-/// Returns true if `binary` is found anywhere on the current process PATH.
-/// Walks PATH directories directly (no subprocess) so it works even when
-/// the user's shell aliases or profile scripts are not sourced.
 /// List custom VSCode theme names from `~/.config/vimcode/themes/*.json`.
 fn list_custom_theme_names() -> Vec<String> {
     let mut names = Vec::new();
@@ -5341,41 +5488,42 @@ fn list_custom_theme_names() -> Vec<String> {
     names
 }
 
+/// Returns true if `binary` is found and runnable.
+///
+/// Delegates to [`super::lsp_manager::resolve_command`] — the exact resolver
+/// `LspManager` uses to launch servers — rather than walking `PATH` on its own
+/// (#1344). Before this, install-time checks (this function) and server launch
+/// used two different lookups: this one scanned only the process `PATH`, while
+/// `resolve_command` also probes the Mason bin dir, `~/.local/bin`,
+/// `~/.cargo/bin`, `~/go/bin`, `~/.dotnet/tools`, `~/.npm-global/bin` and the
+/// Homebrew prefixes — directories a desktop-launched vimcode needs because it
+/// doesn't inherit a login shell's `PATH`. The mismatch meant a successful
+/// install into e.g. `~/.local/bin` was reported as "not found on PATH" and the
+/// extensions sidebar kept re-offering an install for a tool that was already
+/// present. One shared function means install checks, install finalization,
+/// and server launch always agree on where a tool lives.
 fn binary_on_path(binary: &str) -> bool {
-    let path_var = std::env::var_os("PATH").unwrap_or_default();
-    for dir in std::env::split_paths(&path_var) {
-        let full = dir.join(binary);
-        if full.exists() {
-            if !super::lsp_manager::cargo_bin_probe_ok(&full, binary) {
-                continue;
-            }
+    match super::lsp_manager::resolve_command(binary) {
+        Some(path) => {
             super::lsp_manager::install_log(&format!(
                 "[ext-check] FOUND {binary} at {}",
-                full.display()
+                path.display()
             ));
-            return true;
+            true
         }
-        // On Windows, also check with .exe suffix
-        #[cfg(target_os = "windows")]
-        if !binary.ends_with(".exe") {
-            let exe = dir.join(format!("{binary}.exe"));
-            if exe.exists() {
-                if !super::lsp_manager::cargo_bin_probe_ok(&exe, binary) {
-                    continue;
-                }
-                super::lsp_manager::install_log(&format!(
-                    "[ext-check] FOUND {binary}.exe at {}",
-                    exe.display()
-                ));
-                return true;
-            }
+        None => {
+            // Names every probed directory (not just `PATH`, unlike the
+            // pre-#1344 log line) since `resolve_command` now spans the
+            // Mason bin dir, `~/.local/bin`, and friends too — a bare
+            // "NOT FOUND {binary}" would otherwise regress the diagnostic
+            // detail this line used to carry.
+            super::lsp_manager::install_log(&format!(
+                "[ext-check] NOT FOUND {binary} — looked in {}",
+                super::lsp_manager::probed_tool_dirs_description(binary)
+            ));
+            false
         }
     }
-    super::lsp_manager::install_log(&format!(
-        "[ext-check] NOT FOUND {binary} in PATH={}",
-        path_var.to_string_lossy()
-    ));
-    false
 }
 
 // ── Auto-pair helpers ────────────────────────────────────────────────────────
@@ -5650,6 +5798,7 @@ mod picker;
 mod plugins;
 mod search;
 pub use search::{find_word_boundaries, SearchKeyResult};
+mod review_ops;
 pub mod sidebar;
 mod source_control;
 pub use source_control::ScKeyResult;

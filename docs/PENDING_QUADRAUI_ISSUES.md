@@ -32,7 +32,107 @@ zero cost instead.
 
 ---
 
-## TUI runner has no host-facing "force full repaint" hook (blocks vimcode#58)
+## TUI test drivers can't observe `Backend::request_full_repaint`'s effect from a downstream `ShellApp` (blocks vimcode#1243's black-box test)
+
+**Title:** `tui::vt_testing::TuiVtDriver` has no `ShellApp` constructor and no
+public out-of-band write hook, so a downstream crate cannot black-box-test
+`Backend::request_full_repaint` (quadraui#1037) at all
+
+**Body:**
+
+quadraui#1037 shipped `Backend::request_full_repaint` and vimcode#1243 adopted
+it (Ctrl+L and the popup-dismiss transition in `TuiShellApp`). vimcode's
+`CLAUDE.md` requires every behaviour-changing PR to ship a black-box test that
+drives the running app and asserts on rendered output, and #1243's own
+acceptance criteria ask for "a `tui_prod` test proving Ctrl+L repaints cells an
+incremental diff would skip". **That test cannot currently be written by any
+consumer of this crate.** Verified against pinned rev `215e9e4`:
+
+1. `quadraui::tui::testing::TuiDriver::render` *does* consume
+   `take_full_repaint_requested` and call `Terminal::clear()` — so the driver
+   honours the hook. But under a `ratatui` `TestBackend` that clear is
+   **provably output-identical**: it blanks the backend buffer and resets the
+   back buffer, so the next `draw` diffs a fully-desired frame against a blank
+   previous frame and writes every non-blank cell — byte-for-byte the same
+   buffer the incremental path produces, because `Terminal::draw`'s contract
+   already requires the callback to repaint the whole frame. No `screen()` /
+   `style_at()` / `styled_row()` / `terminal_cursor_position()` assertion can
+   distinguish "hook fired" from "hook did not fire".
+2. The only harness in this crate that *can* reproduce the real condition is
+   `tui::vt_testing::TuiVtDriver`, whose own
+   `render_actually_clears_stale_content_outside_the_diff_cache` test injects
+   out-of-band ANSI bytes into its `vt100::Parser` to create a cell ratatui's
+   diff wrongly believes is current. A downstream crate cannot reuse that
+   technique: `TuiVtDriver::new` takes `A: AppLogic`, there is **no
+   `vt_testing::driver_with_shell`** equivalent, the only `ShellApp → AppLogic`
+   adapter (`shell_adapter::build_shell_adapter` / `ShellAdapter`) is
+   `pub(crate)` despite `pub mod shell_adapter`, and `TuiVtDriver`'s
+   `parser: Rc<RefCell<vt100::Parser>>` field is private with no public
+   injection method.
+3. `TuiBackend::take_full_repaint_requested` is `pub(crate)`,
+   `TuiDriver::backend()` returns `&TuiBackend` (immutable, and `TuiBackend`
+   has no `Debug`), and `Backend` is `sealed::Sealed` — so the fallbacks of
+   "read the flag back" or "write a spy `Backend` that counts the calls" are
+   both closed too.
+
+Net effect: `request_full_repaint` is a public API that **no downstream
+consumer can write a regression test for**, in a repo whose consumers are
+required to.
+
+**Ask** — any one of these unblocks it; (1) is the smallest and most
+conventional:
+
+1. Add `quadraui::tui::vt_testing::driver_with_shell<A: ShellApp>(app, config,
+   width, height) -> TuiVtDriver<impl AppLogic>`, mirroring
+   `quadraui::tui::testing::driver_with_shell` exactly, **and** a public
+   out-of-band write hook on `TuiVtDriver` (e.g.
+   `pub fn inject_raw(&self, bytes: &[u8])`) so a downstream test can
+   reproduce the stale-cell condition the same way
+   `render_actually_clears_stale_content_outside_the_diff_cache` does.
+2. Alternatively, make `shell_adapter::build_shell_adapter` (and
+   `ShellAdapter`) `pub` behind the existing feature gates, plus the
+   `inject_raw`-shaped hook — downstream can then compose the driver itself.
+3. Failing either, expose a read-only observation seam on the existing
+   `TestBackend` driver — e.g. `pub fn full_repaint_requested(&self) -> bool`
+   on `TuiDriver` (peek, not take), or a frame-level counter in
+   `FrameInventory`. This is weaker (it asserts on a flag rather than on
+   rendered output, which vimcode's own testing rules discourage) but it is
+   strictly better than the current "untestable by construction".
+
+**Blocks:** `JDonaghy/vimcode#1243` — leave that issue open behind this one,
+per `GOALS.md`'s milestone-discipline rule. The vimcode side of #1243 (both
+call sites plus the `popup_overlay_closed_this_frame` edge-detector and its
+unit test) is already written and merged-pending; only the driver-level proof
+is waiting on this.
+
+---
+
+## ~~TUI runner has no host-facing "force full repaint" hook (blocks vimcode#58)~~ — **SHIPPED, do not file (struck 2026-09-23, #1243)**
+
+> **This draft is retired. The API exists, is pinned, and is now adopted.**
+> quadraui#1037 shipped exactly the "Ask" shape 2 below —
+> `Backend::request_full_repaint()`, default no-op, implemented on
+> `TuiBackend` as a flag `tui::run::run_inner` consumes via
+> `take_full_repaint_requested` and answers with `Terminal::clear()` before
+> the next `render_frame`. Verified present at vimcode's pin `215e9e4` by
+> reading `quadraui/src/backend.rs:1368`, `quadraui/src/tui/backend.rs:1543`
+> and `quadraui/src/tui/run.rs:338`, not inferred from the issue being closed.
+>
+> vimcode#1243 consumed it: `render::is_force_redraw_key`'s Ctrl+L rung and
+> `TuiShellApp::render_content`'s `had_popup_overlay` transition — the two
+> "consumers waiting on this" named in the draft below — both call the hook
+> now, so `had_popup_overlay` has a reader again.
+>
+> **What is left is test infrastructure, not the hook**, and it is filed as its
+> own entry directly above ("TUI test drivers can't observe
+> `Backend::request_full_repaint`'s effect…"): the shipped hook has no
+> downstream-observable effect under any public driver, so vimcode#1243 cannot
+> yet ship the black-box test its own acceptance criteria require.
+>
+> The original draft is kept below, struck, so the history of the verdict is
+> readable — **do not file it.**
+
+### ~~Original draft (superseded by quadraui#1037)~~
 
 **Title:** `tui::run`/`run_with_shell` internalised the `Terminal`, silently
 dropping the only mitigation vimcode#58 (stale-character rendering artifacts)
@@ -121,7 +221,20 @@ per `GOALS.md`'s milestone-discipline rule.
 
 ---
 
-## `quadraui::win::testing` is hard `target_os = "windows"`-gated, not WinAPI-stubbed like `win::backend`/`run`/`shell_runner` (blocks vimcode#928 AC2)
+## ~~`quadraui::win::testing` is hard `target_os = "windows"`-gated, not WinAPI-stubbed like `win::backend`/`run`/`shell_runner` (blocks vimcode#928 AC2)~~ — **SHIPPED, do not file (struck 2026-09-23, #1244)**
+
+> quadraui#1038 (landed in the rev this crate is pinned to, `Cargo.toml`)
+> gated `win::testing` on `feature = "win"` alone with every real
+> Direct2D/GDI call individually `cfg(target_os = "windows")`-stubbed,
+> exactly the ask below. vimcode#1244 consumed it: `src/win/mod.rs`'s
+> `win_driver_tests` module dropped its `#[cfg(target_os = "windows")]`
+> double-gate down to `#[cfg(test)]` alone (each `#[test]` attribute is now
+> individually `cfg_attr(target_os = "windows", test)`-gated instead, so the
+> bodies type-check everywhere but only actually run on real Windows),
+> closing vimcode#928's acceptance criterion #2. This draft is retired — do
+> not file it.
+
+### ~~Original draft (superseded by quadraui#1038)~~
 
 **Title:** `win::testing` needs the same `cfg(target_os = "windows")`-per-call
 stubbing as `win::backend`/`run`/`shell_runner`, not a module-level
@@ -276,106 +389,74 @@ this same PR, see that file's new §2c).
 
 ---
 
-## `draw_editor`'s decoration overlays index against the caller's `area`, not the real `buf` extent — panics on terminal resize (blocks vimcode#203)
+## ~~`draw_editor`'s decoration overlays index against the caller's `area`, not the real `buf` extent — panics on terminal resize (blocks vimcode#203)~~ — **LANDED UPSTREAM, consumed by the pin (struck 2026-09-23, #1246)**
 
-**Title:** Indent guide / color column / diagnostic / spell / bracket-match
-paint in `quadraui::tui::draw_editor` bounds-check against the *caller-supplied*
-`area` rect instead of `buf.area` (the live `Buffer`'s real extent), so a
-resize that shrinks the buffer between layout and paint panics with `index
-outside of buffer`
+> Filed as quadraui#1040 (title: "`draw_editor` bounds-checks overlays against
+> `buf.area`, not stale area") and fixed there in `a0961f8` (2026-09-20),
+> which also closed the TOCTOU gap in `quadraui/src/tui/run.rs` that produced
+> the stale `area` (fix 2 of the two-part ask below — `render_frame`'s
+> `Viewport` is now derived from `frame.area()` inside the
+> `terminal.draw(...)` closure instead of a pre-draw `terminal.size()`
+> query). Confirmed via `git merge-base --is-ancestor a0961f8 <pin>` against
+> vimcode's `Cargo.toml` pin (`215e9e4...`, unchanged by this check) that the
+> fix commit is already an ancestor of the pinned rev — it landed via an
+> earlier, unrelated pin bump (the rev was already this far ahead when #1246
+> picked this up), so no `Cargo.toml` edit was needed here.
+>
+> vimcode#203/#1246's premise — "vimcode carries a host-side guard" — did not
+> hold: the #203 investigation (`51776a1`) found no such guard was ever
+> added, and none exists in `src/tui_main/render_impl.rs::render_window`
+> today (confirmed by inspection — it is still the ~25-line delegator the
+> investigation described, no bounds logic to remove). There is also no
+> `#203` regression test in vimcode to "stay green" — the crash lived
+> entirely inside `quadraui::tui::draw_editor`/`run.rs`'s TOCTOU gap between
+> a pre-draw size query and `Terminal::draw`'s internal autoresize, which
+> `ratatui::backend::TestBackend`'s fixed-size construction (what
+> `quadraui::tui::testing::TuiDriver` drives) cannot reproduce without new
+> quadraui-side test infrastructure to resize a `TestBackend` mid-`Terminal`
+> lifetime — out of scope for a vimcode-only issue. #203 is safe to close as
+> fixed upstream and consumed by the pin.
+
+---
+
+## `quadraui::tui::testing::TuiDriver` has no way to resize its `TestBackend` mid-test — a TOCTOU/resize regression (e.g. quadraui#1040's class of bug) can't be driver-tested from a downstream crate
+
+**Title:** `TuiDriver` (`quadraui/src/tui/testing.rs`) constructs a
+fixed-size `ratatui::backend::TestBackend` in `Self::new` and exposes no
+`resize`/`terminal()` accessor, so a downstream crate (vimcode) cannot write
+a black-box regression test that actually shrinks the terminal mid-session
+and re-renders — the only way to drive-test a TOCTOU gap between
+layout-time size and paint-time buffer size (quadraui#1040's bug class)
+from outside the crate.
 
 **Body:**
 
-vimcode#203 reported a TUI crash on terminal resize with the Extensions
-panel (or any overflowing sidebar/panel) visible:
+vimcode#1246 (consume side of quadraui#1040) wanted to add a driver-tier
+regression test reproducing vimcode#203's "resize while the Extensions
+panel/an overflowing sidebar is visible" crash, to confirm it stays fixed.
+`TuiDriver::new` (`quadraui/src/tui/testing.rs`) builds its own
+`Terminal<TestBackend>` internally and keeps it in a private
+`Rc<RefCell<Terminal<TestBackend>>>` field with no public accessor; `TestBackend`
+itself only grows/shrinks via `ratatui::Terminal::resize`, which nothing in
+`TuiDriver`'s public API reaches. A downstream test can call
+`TuiDriver::dispatch(UiEvent::WindowResized { .. })`, but that only updates
+`TuiBackend`'s own `Viewport` bookkeeping (what a host layout pass reads) —
+it does not touch the `TestBackend`'s actual cell grid, so the specific race
+quadraui#1040 fixed (layout computed for one size, `Buffer` already
+reallocated to a smaller one) cannot be constructed at all from a `TuiDriver`
+test today.
 
-```
-VimCode internal error: index outside of buffer: the area is Rect { x: 0, y: 0, width: 161, height: 32 } but index is (41, 32)
-```
+**Ask:** add a `TuiDriver::resize(&mut self, width: u16, height: u16)` (or
+equivalent) that calls `Terminal::resize` on the internal `TestBackend`
+*without* also updating `TuiBackend`'s cached `Viewport`/size state, so a
+test can reproduce the exact stale-layout-vs-shrunk-buffer condition:
+resize the backend buffer first, then separately drive a repaint through the
+old (larger) layout to assert the paint path degrades gracefully (truncates,
+does not panic) rather than indexing out of bounds. This is testing
+infrastructure only — no behavior change to `TuiDriver`'s existing
+constructors or `dispatch`/`render` methods.
 
-Investigating found the panicking code no longer lives in vimcode — #276
-Stage 1C (`c985d58`) lifted vimcode's `render_impl::render_window` body
-verbatim into `quadraui::tui::draw_editor`
-(`quadraui/src/tui/editor.rs`, pinned rev `7a77602`, confirmed still current
-at upstream HEAD `4253432` — no commits touch this file or `tui/run.rs`
-between the pin and HEAD). vimcode's own call site
-(`src/tui_main/render_impl.rs::render_window`) is the ~25-line delegator
-`c985d58`'s commit message describes: it converts `RenderedWindow` to
-`quadraui::Editor` and calls `backend.draw_editor(rect, &editor)` — no
-buffer indexing, no bounds logic, nothing left to fix on the vimcode side.
-
-**Root cause, `quadraui/src/tui/editor.rs`:** five decoration-overlay blocks
-in `draw_editor` guard their `buf[(cx, screen_y)]` write with:
-
-```rust
-if cx < area.x + area.width && screen_y < area.y + area.height {
-    let cell = &mut buf[(cx, screen_y)];
-    ...
-}
-```
-
-— checking the *painted-into* cell against `area`, the `Rect` the caller
-passed in for this call, not against `buf.area` (the `Buffer`'s actual
-allocated extent). The five sites, all identical in shape:
-
-- indent guides — line 221
-- color columns — line 245
-- diagnostic underlines — line 285
-- spell-error underlines — line 308
-- bracket-match highlight — line 330
-
-Three **other** overlay sites in the same function already guard correctly,
-against `buf.area` rather than `area` — proving the fix pattern already
-exists in-file and these five are simply inconsistent with it:
-
-- cursor `Block` paint — lines 449-454 (`let buf_area = buf.area;` then
-  `cursor_screen_x < buf_area.x + buf_area.width && cursor_screen_y <
-  buf_area.y + buf_area.height`)
-- secondary-cursor paint — lines 503-505
-- selection-highlight paint — lines 718-719
-
-`area` and `buf.area` are normally identical — `area` is derived from the
-same terminal size `buf` was allocated for. They diverge when the terminal
-resizes in the narrow window between when the host (vimcode, via the
-quadraui `AppShell`/`run_with_shell` runner) computed window layout rects
-from one size and when `ratatui::Terminal::draw` actually resized/reallocated
-its buffer for the *next* size: `quadraui::tui::run::render_frame`
-(`quadraui/src/tui/run.rs:443-456`) queries `terminal.size()` once, calls
-`backend.begin_frame(Viewport::new(size...))` (which the host's layout pass
-uses to size windows), and only *then* calls `terminal.draw(...)` — whose
-internal `autoresize()` re-queries the backend's real size and can observe a
-smaller value if the terminal shrank in between. The result: `draw_editor`
-is called with a stale, too-large `area` against a buffer that's already
-been shrunk to the new, smaller size — exactly the crash's `Rect { width:
-161, height: 32 }` (stale layout) vs. index `(41, 32)` (`y == 32`, one past
-the real, already-resized buffer's last row).
-
-**Ask:** two independent, complementary fixes:
-
-1. In `draw_editor`, change the five inconsistent sites (lines 221, 245,
-   285, 308, 330) to bounds-check against `buf.area` the way the three
-   already-correct sites do — a mechanical, four-line-per-site fix that
-   makes the function internally consistent and turns this class of bug
-   into a defensive no-op regardless of what `area` the caller supplies.
-2. In `quadraui/src/tui/run.rs`, close the TOCTOU gap itself: derive the
-   layout-sizing `Viewport` passed to `begin_frame` from the *same* size
-   `Terminal::draw`'s closure actually paints into (e.g. move the
-   `begin_frame` call, or the size query feeding it, inside the
-   `terminal.draw(|frame| ...)` closure and use `frame.area()`), so a
-   host's window layout is never computed against a size other than the
-   one the buffer it paints into was just resized for.
-
-Fix 1 alone stops the panic (the guard becomes correct); fix 2 removes the
-underlying stale-layout condition that produces visibly wrong (if
-non-crashing) paint in the resize frame even after fix 1 — a truncated
-window silently painting nothing in its last row/column rather than
-panicking. Recommend shipping both.
-
-**Blocks:** `JDonaghy/vimcode#203` — no vimcode-side code change is possible
-here per this repo's Platform-Neutrality Rule (the panicking code, and its
-three correctly-guarded siblings proving the intended pattern, are entirely
-inside `quadraui::tui::draw_editor`/`run.rs`). Leave #203 open behind this
-one per `GOALS.md`'s milestone-discipline rule; do not close on
-investigation alone. vimcode's panic hook already flushes swap files before
-the crash unwinds (`src/core/swap.rs:62`), so no data loss occurs today —
-this is a crash/robustness fix, not a recovery-path fix.
+**Blocks:** nothing currently open — quadraui#1040 is already fixed and
+consumed (see the struck entry above); this is filed so a *future*
+resize/TOCTOU regression in `draw_editor` or its siblings has a driver-tier
+repro path instead of requiring another investigate-only issue like #203.

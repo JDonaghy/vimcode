@@ -136,46 +136,55 @@ mod win_backend_conformance {
 
 // ── #928: `crate::harness::ConformanceHarness` on `WinDriver` ──────────────
 //
-// `quadraui::win::testing` (the module holding `WinDriver`/`driver_with_shell`)
-// is `#[cfg(target_os = "windows")]`-gated *inside* quadraui regardless of
-// `feature = "win"` alone (unlike `quadraui::win::backend`/`run`/`shell_runner`,
-// which this module's own doc explains are deliberately not target-gated so
-// `cargo check --features win` type-checks `WinBackend` on an ordinary Linux
-// host). So this test module has to carry the same double gate `src/macos/mod.rs`
-// uses for its own driver-tier tests — on any host but real Windows it simply
-// does not exist, proving nothing there (same posture, same reason).
+// #928's AC2 ("`cargo check --no-default-features --features win`
+// type-checks the Win [ConformanceHarness] instantiation on an ordinary
+// Linux host") is met as of quadraui#1038 (landed in the rev this crate is
+// pinned to — see `Cargo.toml`). Before that, `quadraui::win::testing` (the
+// module holding `WinDriver`/`driver_with_shell`) was
+// `#[cfg(target_os = "windows")]`-gated *inside* quadraui regardless of
+// `feature = "win"` alone, unlike `quadraui::win::backend`/`run`/
+// `shell_runner` — so this module had to carry a matching double gate
+// (`#[cfg(target_os = "windows")]` on top of `#[cfg(test)]`), and there was
+// no `cargo check`/`cargo check --tests`/`cargo test --no-run` invocation on
+// Linux that could even *see* `WinDriver`, let alone type-check code
+// constructing one. See `docs/PENDING_QUADRAUI_ISSUES.md`'s (now struck)
+// entry for the full history of that gap and its ask.
 //
-// **This is a known, currently-unmet acceptance criterion, not an oversight.**
-// #928's AC2 is "`cargo check --no-default-features --features win`
-// type-checks the Win [ConformanceHarness] instantiation on an ordinary Linux
-// host" — and as long as `quadraui::win::testing` is gated the way described
-// above, there is no `cargo check`/`cargo check --tests`/`cargo test --no-run`
-// invocation on Linux (or any non-Windows host) that reaches this module at
-// all, let alone type-checks the `ConformanceHarness<WinDriver<...>>`
-// instantiation inside it. The fix is a quadraui-side change — gate
-// `win::testing` on `feature = "win"` alone with internally
-// `cfg(target_os = "windows")`-stubbed WinAPI calls, the same treatment
-// `win::backend`/`run`/`shell_runner` already have — **not** a workaround
-// here. That gap is drafted, ready to file, in
-// `docs/PENDING_QUADRAUI_ISSUES.md` ("`quadraui::win::testing` is hard
-// `target_os = "windows"`-gated…", blocks vimcode#928 AC2); it is not filed
-// yet because filing GitHub issues is a coordinator/human action this
-// worker session cannot perform (`git`-only). AC2 stays unmet until that
-// lands — treat that as an open, disclosed gap, not a silently-passed
-// acceptance bar.
+// quadraui#1038 gated `win::testing` on `feature = "win"` alone instead,
+// with every real Direct2D/GDI call individually `cfg(target_os =
+// "windows")`-stubbed — the same "compiles-everywhere, only *works* on
+// Windows" posture `win::backend`/`run`/`shell_runner` already had (see this
+// module's own "Why `feature = "win"` alone" doc above). So this module now
+// only needs `#[cfg(test)]`, no `target_os` gate, to type-check on Linux —
+// `cargo check --tests --no-default-features --features win` reaches every
+// line below, including the `ConformanceHarness<WinDriver<...>>`
+// instantiations.
+//
+// Type-checking is not the same as running, though: `HeadlessSurface::new`
+// (the offscreen Direct2D DC render target `WinDriver::new` `.expect()`s)
+// always returns `Err` off Windows — there is no non-Windows Direct2D to
+// build one from — so a scenario *executed* off Windows would panic rather
+// than pass or fail meaningfully. Each `#[test]` attribute below is
+// therefore itself `cfg_attr(target_os = "windows", test)`-gated: the
+// function body (and everything it calls) is always compiled and
+// type-checked, but it is only ever registered — and run — as an actual
+// test on real Windows. `#[allow(dead_code)]` on the module (off Windows
+// only) is the corollary: with no `#[test]` attribute reaching them, these
+// functions have no caller on that host, which is expected, not a bug to
+// silence away by deleting the bodies.
 //
 // Bodies mirror `src/macos/mod.rs::mac_driver_tests::conformance_proof_slice`
 // exactly, `MacDriver`/`MacBackend` swapped for `WinDriver`/`WinBackend` — see
 // that module for the scenarios' own doc comments (RED-verification notes,
 // why scenario 3 clicks outside the popup rather than a specific row, …).
 // RED-verification itself could not be run against `WinDriver` for the same
-// reason AC2 is unmet: there is no Windows host in this fleet and no way to
-// compile this module elsewhere. GTK and macOS were both RED-verified on
-// real hardware (a Linux lane and an `aarch64-apple-darwin` Mac mini
-// respectively) against the identical vimcode-side mutation — see
-// `src/macos/mod.rs`'s copy of this scenario for that note.
-#[cfg(target_os = "windows")]
-#[cfg(test)]
+// reason actually *running* these needs real Windows: there is no Windows
+// host in this fleet. GTK and macOS were both RED-verified on real hardware
+// (a Linux lane and an `aarch64-apple-darwin` Mac mini respectively) against
+// the identical vimcode-side mutation — see `src/macos/mod.rs`'s copy of
+// this scenario for that note.
+#[cfg(all(test, feature = "win"))]
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 mod win_driver_tests {
     use std::cell::RefCell;
     use std::path::PathBuf;
@@ -238,7 +247,7 @@ mod win_driver_tests {
     /// Scenario 1 (#928): open/filter/Esc-dismiss the folder picker via
     /// `WinDriver` — the identical body `crate::gtk::testing`'s and
     /// `src/macos/mod.rs`'s own copies run against `GtkDriver`/`MacDriver`.
-    #[test]
+    #[cfg_attr(target_os = "windows", test)]
     fn folder_picker_filters_and_escape_dismisses() {
         let dir = scratch_dir("scenario1");
         std::fs::create_dir_all(dir.join("kkxxqq_distinctive_928")).unwrap();
@@ -258,7 +267,7 @@ mod win_driver_tests {
 
     /// Scenario 2 (#928): the command palette's open/filter/Esc cycle, via
     /// `WinDriver`.
-    #[test]
+    #[cfg_attr(target_os = "windows", test)]
     fn command_palette_filters_and_escape_dismisses() {
         let mut h = conformance_harness(plain_engine(), 1400, 900);
 
@@ -268,7 +277,7 @@ mod win_driver_tests {
     /// Scenario 3 (#928): a click outside the open folder picker's popup
     /// must dismiss it, via `WinDriver::click`'s raw pixel-coordinate
     /// dispatch.
-    #[test]
+    #[cfg_attr(target_os = "windows", test)]
     fn folder_picker_click_outside_dismisses_it() {
         let dir = scratch_dir("scenario3");
         std::fs::create_dir_all(dir.join("kkxxqq_distinctive_928")).unwrap();

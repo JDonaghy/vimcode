@@ -370,46 +370,76 @@ fn homebrew_prefixes() -> Vec<PathBuf> {
     }
 }
 
+/// Directories `resolve_command` probes for `binary` beyond `PATH`, in probe
+/// order (#1344). Pulled out of `resolve_command` so a failure message can
+/// name exactly where vimcode looked (`missing_dependency_message`-style)
+/// without hand-duplicating the list — which would silently drift the moment
+/// `resolve_command` gains or drops a directory, exactly the kind of
+/// two-lookups-disagree bug #1344 fixes.
+fn extra_tool_dirs(binary: &str) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    // Mason bin directory, if it exists.
+    dirs.extend(mason_bin_dir());
+    // Common tool directories that may not be in PATH when launched from a
+    // desktop environment (not a login shell).
+    let home = super::paths::home_dir();
+    dirs.push(home.join(".dotnet/tools"));
+    dirs.push(home.join(".cargo/bin"));
+    dirs.push(home.join(".local/bin"));
+    dirs.push(home.join("go/bin"));
+    dirs.push(home.join(".npm-global/bin"));
+    // #917: Homebrew prefixes (macOS only — see `homebrew_prefixes()`).
+    for prefix in homebrew_prefixes() {
+        dirs.push(prefix.join("bin"));
+        // Keg-only formulas (e.g. clangd/llvm) never reach `<prefix>/bin`;
+        // probe `<prefix>/opt/<formula>/bin` too.
+        for (kegged_binary, formula) in HOMEBREW_KEG_ONLY_FORMULAS {
+            if *kegged_binary == binary {
+                dirs.push(prefix.join("opt").join(formula).join("bin"));
+            }
+        }
+    }
+    dirs
+}
+
+/// Human-readable description of the directories `resolve_command` probes
+/// for `binary`, for use in "installed but still not found" messages (#1344)
+/// — naming where vimcode actually looked is far more actionable than just
+/// saying "not found on PATH", especially since most of these directories
+/// are *not* on PATH for a desktop-launched vimcode in the first place.
+pub fn probed_tool_dirs_description(binary: &str) -> String {
+    let mut dirs: Vec<String> = vec![super::paths::managed_tool_dir(binary).display().to_string()];
+    dirs.extend(
+        extra_tool_dirs(binary)
+            .into_iter()
+            .map(|d| d.display().to_string()),
+    );
+    dirs.push("PATH".to_string());
+    dirs.join(", ")
+}
+
 /// Resolve a command to an absolute path.
 /// Checks Mason bin directory first (if it exists), then falls back to PATH.
 ///
 /// `pub` (rather than crate-private) specifically so `tests/extensions.rs`
 /// — a separate integration-test crate — can drive it directly for #917's
-/// black-box Homebrew-resolution coverage.
+/// black-box Homebrew-resolution coverage. Also the sole lookup shared by
+/// install-time checks, install finalization, and server launch (#1344) —
+/// see `crate::core::engine::binary_on_path`, which delegates here instead of
+/// walking `PATH` on its own.
 pub fn resolve_command(cmd: &str) -> Option<PathBuf> {
     // Split on whitespace to get just the binary name
     let binary = cmd.split_whitespace().next().unwrap_or(cmd);
 
-    // Check Mason bin directory first
-    if let Some(mason_bin) = mason_bin_dir() {
-        let candidate = mason_bin.join(binary);
-        if candidate.exists() {
-            return Some(candidate);
-        }
+    // #1345: the vimcode-managed tool acquisition dir is probed first — a
+    // tool vimcode downloaded, verified and unpacked itself can never
+    // collide with a same-named binary elsewhere on the system, and needs
+    // no PATH/env changes to be found.
+    if let Some(managed) = super::paths::managed_tool_binary_path(binary) {
+        return Some(managed);
     }
 
-    // Check common tool directories that may not be in PATH when launched
-    // from a desktop environment (not a login shell).
-    let home = super::paths::home_dir();
-    let mut tool_dirs = vec![
-        home.join(".dotnet/tools"),
-        home.join(".cargo/bin"),
-        home.join(".local/bin"),
-        home.join("go/bin"),
-        home.join(".npm-global/bin"),
-    ];
-    // #917: Homebrew prefixes (macOS only — see `homebrew_prefixes()`).
-    for prefix in homebrew_prefixes() {
-        tool_dirs.push(prefix.join("bin"));
-        // Keg-only formulas (e.g. clangd/llvm) never reach `<prefix>/bin`;
-        // probe `<prefix>/opt/<formula>/bin` too.
-        for (kegged_binary, formula) in HOMEBREW_KEG_ONLY_FORMULAS {
-            if *kegged_binary == binary {
-                tool_dirs.push(prefix.join("opt").join(formula).join("bin"));
-            }
-        }
-    }
-    for dir in &tool_dirs {
+    for dir in extra_tool_dirs(binary) {
         let candidate = dir.join(binary);
         if candidate.exists() && cargo_bin_probe_ok(&candidate, binary) {
             return Some(candidate);

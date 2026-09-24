@@ -457,6 +457,15 @@ pub struct TuiShellApp {
     tab_drag: render::TabDragState,
     last_clipboard_content: Option<String>,
     pending_startup_msg: Option<String>,
+    /// Was an editor-anchored popup (the completions/hover-doc picker or the
+    /// modal folder picker) open on the *previous* frame `render_content`
+    /// painted? #1243 gives this its reader back: the field went dead when
+    /// #634 moved TUI onto quadraui's shell runner (no more `Terminal::
+    /// clear()` call for it to drive), and `render_content` now compares
+    /// this against the current frame's popup state through
+    /// [`render::popup_overlay_closed_this_frame`] to call
+    /// `quadraui::Backend::request_full_repaint` (quadraui#1037) exactly on
+    /// the closing transition — see that function's own doc.
     had_popup_overlay: Cell<bool>,
     hover_link_rects: RefCell<PanelHoverLinkRects>,
     hover_popup_rect: Cell<Option<quadraui::Rect>>,
@@ -802,19 +811,17 @@ impl TuiShellApp {
         }
     }
 
-    /// Compose the **editor band** (#764, #735 slice 3) into `backend`.
+    /// Compose the **editor band** (#764, #735 slice 3; converged into one
+    /// shared walk by #1251) into `backend`.
     ///
-    /// Walks `render::compose_editor_band` — the single ordered artefact both
-    /// backends walk for the editor column, exactly as `FRAME_Z_ORDER` is for
-    /// the surrounding chrome and the app-level overlays. Geometry stays here, in cells; the *order* and the *gates*
-    /// live in `render.rs`. `EDITOR_Z_ORDER`'s doc comment records the two
-    /// defects this convergence closed (GTK never painted the group dividers
-    /// at all, and painted its tab-drag ghost above the editor popups).
+    /// Walks `render::paint_editor_band_rungs`, the single loop both this
+    /// method and GTK's `App::compose_editor_band_rungs` now call — see that
+    /// function's doc and `TuiEditorBandHost`'s for exactly which four rungs
+    /// still need a per-backend body and why. Geometry stays here, in cells.
     ///
     /// `area` is `layout.main_content_bounds` in cells. Extracted from
     /// `render_content` so the entry point *sequences* bands rather than
-    /// inlining each one — the GTK twin splits its own heavier rungs the same
-    /// way (`paint_editor_windows_rung` / `paint_tab_bars_rung`).
+    /// inlining each one.
     fn paint_editor_band(
         &self,
         backend: &mut dyn quadraui::Backend,
@@ -822,17 +829,6 @@ impl TuiShellApp {
         area: Rect,
         theme: &Theme,
     ) {
-        // ══ Editor band (#764, #735 slice 3) ═════════════════════════════
-        //
-        // Composed from `render::compose_editor_band` — the single ordered
-        // artefact both backends walk for the editor column, exactly as
-        // `CHROME_Z_ORDER` (below) is for the surrounding chrome and
-        // `OVERLAY_Z_ORDER` (below that) for the app-level overlays. Geometry
-        // stays here, in cells; only the *order* and the *gates* moved.
-        // `EDITOR_Z_ORDER`'s doc comment records the two defects this closes
-        // (GTK never painted the group dividers at all, and painted its
-        // tab-drag ghost above the editor popups).
-        //
         // Reset per-frame: `post_draw_apply_widths` wants this frame's
         // measurements, not an ever-growing accumulation.
         self.tab_visible_counts.borrow_mut().clear();
@@ -841,122 +837,32 @@ impl TuiShellApp {
         } else {
             1.0
         };
-        let mut composed_editor: Vec<render::EditorOp> = Vec::new();
-        for op in render::compose_editor_band(
+        let mut host = TuiEditorBandHost {
+            app: self,
+            area,
+            tui_tbh,
+        };
+        let band = quadraui::Rect::new(
+            area.x as f32,
+            area.y as f32,
+            area.width as f32,
+            area.height as f32,
+        );
+        let composed_editor = render::paint_editor_band_rungs(
+            backend,
             &self.engine,
             screen,
-            // `is_dragging()`, not the `source().is_some()` this call site used
-            // to test: they agree (`begin` sets both, `handle_release` clears
-            // both), but `is_dragging` is the gate that method's own doc names
-            // as "the gate both backends' drop overlays paint behind", and it
-            // is the one GTK already used.
+            theme,
+            band,
+            render::EditorBandUnits::CELL,
+            // `is_dragging()`, not the `source().is_some()` this call site
+            // used to test: they agree (`begin` sets both, `handle_release`
+            // clears both), but `is_dragging` is the gate that method's own
+            // doc names as "the gate both backends' drop overlays paint
+            // behind", and it is the one GTK already used.
             self.tab_drag.is_dragging(),
-            self.engine.terminal_maximized,
-        ) {
-            match op {
-                // `render_all_windows` also paints the within-group
-                // (`:split`/`:vsplit`) divider lines unconditionally now
-                // (#609 routed `render_separators` through
-                // `Backend::draw_status_bar` — see its doc comment — so it no
-                // longer needs the raw `Frame` that `frame: None` used to
-                // skip it for).
-                render::EditorOp::Windows => {
-                    // #1250: cache the layout each window's status line
-                    // actually painted, keyed by its `WindowId` — the same
-                    // paint-time cache GTK's `render_content` fills at its
-                    // own per-window status-bar paint site, so
-                    // `render::status_bands` can read it back instead of
-                    // `mouse::route_and_apply_chrome_click` re-laying every
-                    // bar's text out again on each click.
-                    let status_layouts = render_all_windows(
-                        backend,
-                        None,
-                        &screen.windows,
-                        &screen.group_dividers,
-                        theme,
-                    );
-                    let mut segment_map = self.status_segment_map.borrow_mut();
-                    for (window_id, layout) in status_layouts {
-                        segment_map
-                            .insert(window_id.0, render::status_bar_zones_from_layout(&layout));
-                    }
-                }
-                // #35/#722: minimap strips on every window's right edge (one
-                // entry per `WindowId` in `screen.minimap`, not just the
-                // active window's) — one call, the braille rasteriser is
-                // quadraui's.
-                render::EditorOp::Minimap => {
-                    render::draw_minimap_strip(backend, screen);
-                }
-                render::EditorOp::TabBars => {
-                    backend.set_theme(super::quadraui_tui::q_theme(theme));
-                    let painted =
-                        render::paint_tab_bars(backend, &self.engine, screen, 1.0, tui_tbh, None);
-                    let mut counts = self.tab_visible_counts.borrow_mut();
-                    for bar in &painted {
-                        counts.push((bar.group_id, bar.hits.available_cols));
-                    }
-                }
-                render::EditorOp::Breadcrumbs => {
-                    backend.set_theme(super::quadraui_tui::q_theme(theme));
-                    render::paint_breadcrumb_bars(backend, screen, self.engine.terminal_maximized);
-                }
-                // Between-*group* dividers (`Ctrl+W v`/`Ctrl+W s`, as opposed
-                // to the `Windows` rung's within-group `render_separators`)
-                // — ported to `Backend::draw_status_bar` via
-                // `render_group_dividers` (see its doc comment, and
-                // `group_divider_cells`'s for how the #481
-                // phantom-divider-beside-scrollbar guard became a pure data
-                // computation instead of a `Buffer` read-back). GTK
-                // rasterises the same rung through quadraui's `Split`
-                // primitive instead — see `render::draw_dividers_as_splits`
-                // for why the two rasterisers legitimately differ.
-                render::EditorOp::GroupDividers => render_group_dividers(
-                    backend,
-                    &screen.group_dividers,
-                    &screen.windows,
-                    area,
-                    theme,
-                ),
-                // Drag state (the shared `render::TabDragState`) is already
-                // live here — #602 wired `handle_mouse_event` to advance it
-                // via `mouse::handle_mouse` (see `handle()` below).
-                render::EditorOp::TabDragOverlay => render_tab_drag_overlay(
-                    backend,
-                    &self.engine,
-                    screen,
-                    theme,
-                    self.tab_drag.source(),
-                    self.tab_drag.cursor(),
-                    self.tab_drag.zone(),
-                ),
-                // Unlike `draw_frame`'s `editor_area` (whose `y` is
-                // implicitly 0-based — it's the live terminal frame's own
-                // top-level split), `area` here is
-                // `layout.main_content_bounds`, already offset below whatever
-                // `AppShell::render` painted above it — see that function's
-                // doc comment for why the row math differs between the two
-                // callers. That offset already includes `AppShell`'s
-                // title-bar row whenever the menu bar is visible
-                // (`compute_layout`'s `band_y += h`), so — unlike
-                // `draw_frame`'s `menu_rows + 1` — there is no menu term to
-                // add here; adding one would double-count the row (#635 item
-                // A, and see `build_screen_for_shell_content`'s doc comment).
-                render::EditorOp::TabTooltip => {
-                    if let Some(ref tooltip_text) = screen.tab_tooltip {
-                        render_tab_hover_tooltip(
-                            backend,
-                            area.x,
-                            area.y + 1,
-                            area.width,
-                            tooltip_text,
-                            theme,
-                        );
-                    }
-                }
-            }
-            composed_editor.push(op);
-        }
+            &mut host,
+        );
         *self.composed_editor_band.borrow_mut() = composed_editor;
         // Same contract as the chrome/overlay bands: read back through the
         // field rather than the local, so the *stored* observable is what gets
@@ -2395,6 +2301,17 @@ impl ShellApp for TuiShellApp {
                 .set(quadraui::Rect::new(0.0, 0.0, 0.0, 0.0));
         }
 
+        // #955 review fix — the same #1117 shape one paragraph up, for the
+        // change-review surface's full-viewport `ModalStack` entry.
+        // `presence.change_review` gates `FrameOp::ChangeReview` out of the
+        // op list the moment the surface closes, so that rung's arm can never
+        // pop its own entry (an `else` there is dead code on precisely the
+        // frame that needs it). A stuck entry is worse than a stale rect:
+        // `ShellAdapter::handle` hit-tests the modal stack *before* any chrome
+        // dispatch, so every later click would bypass the activity bar,
+        // sidebar resize and menu bar for the rest of the session.
+        render::reconcile_change_review_modal_stack(backend, presence.change_review, win_q);
+
         let mut composed: Vec<render::FrameOp> = Vec::new();
         for op in render::compose_frame(&presence) {
             match op {
@@ -2444,6 +2361,7 @@ impl ShellApp for TuiShellApp {
                     if let Some(sb) = layout.sidebar_content_bounds {
                         render_sidebar_content(
                             backend,
+                            &screen,
                             to_cell_rect(sb),
                             &self.sidebar,
                             &self.engine,
@@ -2643,6 +2561,27 @@ impl ShellApp for TuiShellApp {
                     }
                 }
 
+                // ── Change-review surface (#955, shared with #525) ───────
+                // `render::paint_change_review_rung` is the whole body —
+                // no TUI-specific diff rendering, matching GTK's identical
+                // arm. The surface's modal-stack entry is reconciled
+                // *before* the walk (see there), not from an `else` here —
+                // this arm cannot run on a frame where the surface is
+                // closed, since `presence.change_review` gates the rung out
+                // of the op list entirely.
+                render::FrameOp::ChangeReview => {
+                    if let Some(review) = screen.change_review.as_ref() {
+                        render::paint_change_review_rung(
+                            backend,
+                            &self.engine,
+                            review,
+                            win_q,
+                            &theme,
+                        );
+                        composed.push(render::FrameOp::ChangeReview);
+                    }
+                }
+
                 // ── Modal dialog ─────────────────────────────────────────
                 // Above the context menu, matching
                 // `route_modal_overlay_click`'s own arbitration: once a dialog
@@ -2686,13 +2625,21 @@ impl ShellApp for TuiShellApp {
         // moved in rather than cloned.
         //
         // Also mirrors `mod.rs:1164`-`:1169`'s popup-disappearance tracking.
-        // The legacy loop followed it with `terminal.clear()`; the shell
-        // runner owns the `Terminal` and exposes no repaint hook, so the flag
-        // is kept (cheap, and the state it records is real) while the clear
-        // itself is an upstream gap — see the Ctrl+L note in
-        // `handle_key_pressed`.
-        self.had_popup_overlay
-            .set(screen.picker.is_some() || self.folder_picker.is_some());
+        // The legacy loop followed it with `terminal.clear()`. #1243 gives
+        // this its reader back: `Backend::request_full_repaint`
+        // (quadraui#1037) is the hook that was missing when this field was
+        // first added — a popup (the picker or the folder-picker modal)
+        // that was up last frame and is gone this frame can leave stale
+        // glyphs in cells the popup itself painted over and the app's own
+        // content never touches, which an ordinary incremental diff skips
+        // because it still believes those cells match. Only the *closing*
+        // transition needs the hook — a popup staying open or newly opening
+        // paints its own content this frame regardless.
+        let popup_open_now = screen.picker.is_some() || self.folder_picker.is_some();
+        if render::popup_overlay_closed_this_frame(self.had_popup_overlay.get(), popup_open_now) {
+            backend.request_full_repaint();
+        }
+        self.had_popup_overlay.set(popup_open_now);
         *self.last_layout.borrow_mut() = Some(screen);
     }
 
@@ -3813,6 +3760,111 @@ impl render::TickHost for TuiTickHost<'_> {
     }
 }
 
+/// [`render::EditorBandHost`] impl for TUI (#1251) — the four [`render::
+/// EditorOp`] rungs `TuiShellApp::paint_editor_band`'s shared walk still
+/// hands back per-backend. See that trait's own doc for why each of these
+/// four, specifically, can't be inlined into the walk. Holds `app: &'a
+/// TuiShellApp` as a plain borrow (`paint_editor_band` takes `&self`, unlike
+/// `tick`'s `&mut self`, so — unlike `TuiTickHost` — there is no aliasing
+/// concern in borrowing the whole app at once).
+struct TuiEditorBandHost<'a> {
+    app: &'a TuiShellApp,
+    area: Rect,
+    tui_tbh: f64,
+}
+
+impl<'screen> render::EditorBandHost<'screen> for TuiEditorBandHost<'_> {
+    fn paint_windows(
+        &mut self,
+        backend: &mut dyn quadraui::Backend,
+        _engine: &Engine,
+        screen: &'screen render::ScreenLayout,
+        theme: &Theme,
+    ) {
+        // #1250: cache the layout each window's status line actually
+        // painted, keyed by its `WindowId` — the same paint-time cache GTK's
+        // `render_content` fills at its own per-window status-bar paint
+        // site, so `render::status_bands` can read it back instead of
+        // `mouse::route_and_apply_chrome_click` re-laying every bar's text
+        // out again on each click. `render_all_windows` also paints the
+        // within-group (`:split`/`:vsplit`) divider lines unconditionally
+        // (#609 routed `render_separators` through `Backend::draw_status_bar`
+        // — see its doc comment — so it no longer needs the raw `Frame` that
+        // `frame: None` used to skip it for).
+        let status_layouts = render_all_windows(
+            backend,
+            None,
+            &screen.windows,
+            &screen.group_dividers,
+            theme,
+        );
+        let mut segment_map = self.app.status_segment_map.borrow_mut();
+        for (window_id, layout) in status_layouts {
+            segment_map.insert(window_id.0, render::status_bar_zones_from_layout(&layout));
+        }
+    }
+
+    fn paint_tab_bars(
+        &mut self,
+        backend: &mut dyn quadraui::Backend,
+        engine: &Engine,
+        screen: &'screen render::ScreenLayout,
+        theme: &Theme,
+    ) {
+        backend.set_theme(super::quadraui_tui::q_theme(theme));
+        let painted = render::paint_tab_bars(backend, engine, screen, 1.0, self.tui_tbh, None);
+        let mut counts = self.app.tab_visible_counts.borrow_mut();
+        for bar in &painted {
+            counts.push((bar.group_id, bar.hits.available_cols));
+        }
+    }
+
+    // Between-*group* dividers (`Ctrl+W v`/`Ctrl+W s`, as opposed to the
+    // `Windows` rung's within-group `render_separators`) — ported to
+    // `Backend::draw_status_bar` via `render_group_dividers` (see its doc
+    // comment, and `group_divider_cells`'s for how the #481
+    // phantom-divider-beside-scrollbar guard became a pure data computation
+    // instead of a `Buffer` read-back). GTK rasterises the same rung through
+    // quadraui's `Split` primitive instead — see
+    // `render::draw_dividers_as_splits` for why the two rasterisers
+    // legitimately differ.
+    fn paint_group_dividers(
+        &mut self,
+        backend: &mut dyn quadraui::Backend,
+        screen: &'screen render::ScreenLayout,
+        theme: &Theme,
+    ) {
+        render_group_dividers(
+            backend,
+            &screen.group_dividers,
+            &screen.windows,
+            self.area,
+            theme,
+        );
+    }
+
+    // Drag state (the shared `render::TabDragState`) is already live here —
+    // #602 wired `handle_mouse_event` to advance it via `mouse::handle_mouse`
+    // (see `handle()`).
+    fn paint_tab_drag_overlay(
+        &mut self,
+        backend: &mut dyn quadraui::Backend,
+        engine: &Engine,
+        screen: &'screen render::ScreenLayout,
+        theme: &Theme,
+    ) {
+        render_tab_drag_overlay(
+            backend,
+            engine,
+            screen,
+            theme,
+            self.app.tab_drag.source(),
+            self.app.tab_drag.cursor(),
+            self.app.tab_drag.zone(),
+        );
+    }
+}
+
 /// [`render::PanelAcceleratorHost`] impl for TUI: the five hooks that need
 /// TUI-local state — `TuiSidebar::has_focus` (the single input-focus token a
 /// terminal has to track by hand where GTK gets real widget focus from the
@@ -4474,12 +4526,20 @@ fn handle_key_pressed(
     };
 
     // ── Shared Ctrl+L force-redraw rung (#762 / #734 slice 7) ───────────
+    // #1243: `request_full_repaint` (quadraui#1037) is the hook `render.rs`'s
+    // own doc on `is_force_redraw_key` named as missing — the actual
+    // `ratatui::Terminal::clear()`-equivalent now lives one layer down, in
+    // `tui::run::run_inner`'s frame loop, and is armed by this flag rather
+    // than called directly here. An ordinary `Reaction::Redraw` alone would
+    // still just re-run the incremental diff against the same stale buffer
+    // Ctrl+L exists to escape.
     if render::is_force_redraw_key(
         &key_name,
         unicode,
         ctrl,
         engine.mode == crate::core::Mode::Insert && engine.insert_ctrl_x_pending,
     ) {
+        backend.request_full_repaint();
         return Reaction::Redraw;
     }
 
@@ -5593,6 +5653,95 @@ mod tests {
         assert!(
             !driver.screen_contains("Replace…"),
             "second click on the active icon must toggle the sidebar closed"
+        );
+    }
+
+    // ── #1243: the `Backend::request_full_repaint` call sites ──────────
+    //
+    // Black-box, through the real `driver_with_shell` shell wiring (the
+    // `tui_prod` lane's harness), asserting on the painted grid — the
+    // user-visible guarantee #1243's hook exists to make good on.
+    //
+    // **What this cannot prove, and why** (verified against pinned rev
+    // `215e9e4`, see `render::popup_overlay_closed_this_frame`'s doc for
+    // the full write-up): under a `ratatui` `TestBackend`,
+    // `Terminal::clear()` is *provably output-identical* to not clearing —
+    // it blanks the backend buffer and resets the back buffer, so the
+    // following `draw` writes every non-blank cell and lands on
+    // byte-for-byte the buffer the incremental path lands on. So no
+    // `screen()`/`style_at()`/`terminal_cursor_position()` assertion can
+    // distinguish "`request_full_repaint` fired" from "it didn't", and the
+    // test below does not go RED if the `backend.request_full_repaint()`
+    // calls are deleted. The stale-cell condition only arises for content
+    // written *outside* ratatui's `Buffer` (a PTY writing raw bytes),
+    // which needs quadraui's vt100-backed `TuiVtDriver` — unreachable from
+    // here behind two `pub(crate)` seams, drafted as a ready-to-file
+    // upstream issue in `docs/PENDING_QUADRAUI_ISSUES.md` ("TUI test
+    // drivers can't observe `Backend::request_full_repaint`'s effect…").
+    // This is therefore *paint-integrity* coverage of the popup-dismiss
+    // call site, not the repaint proof #1243's acceptance criteria ask
+    // for; that one is blocked on the filed gap. Do not read a green run
+    // here as proof the hook fires.
+    //
+    // **There is deliberately no companion Ctrl+L driver test**, and the
+    // reason is measured, not assumed: a Ctrl+L test was written, run, and
+    // then RED-verified by disabling the rung in `handle_key_pressed` —
+    // and it *stayed green*, because a fall-through Ctrl+L is inert in
+    // every reachable mode (Normal: unbound; Insert: `Engine::handle_key`
+    // drops `Ctrl`-modified printables; picker/folder-picker/dialog: those
+    // rungs intercept first). The chord's only effect is the repaint
+    // itself, which the paragraph above proves is unobservable here, so
+    // any Ctrl+L driver test is vacuous by construction — exactly the
+    // "test that cannot fail is not coverage" trap `CLAUDE.md` names, so
+    // it was deleted rather than shipped green. Ctrl+L's decision logic is
+    // covered by `render::is_force_redraw_key`'s own unit tests
+    // (`slice7_router_tests`); the wiring is a one-line delegation.
+
+    /// #1243, popup-dismiss call site: opening the unified picker must
+    /// paint its header, and dismissing it must leave **no** trace of it
+    /// on the grid — the exact stale-glyph symptom the
+    /// `had_popup_overlay` → `request_full_repaint` transition in
+    /// `render_content` exists to prevent on a real terminal.
+    ///
+    /// Drives the whole prod path: `driver_with_shell` →
+    /// `ShellAdapter::handle` → `TuiShellApp::handle` → `handle_key_pressed`
+    /// → `Engine`, then `ShellAdapter::render` → `render_content`, which is
+    /// where the new `popup_overlay_closed_this_frame` branch runs. Uses
+    /// `PickerSource::Keybindings` because `picker_populate_keybindings`
+    /// reads the in-memory keymap — no filesystem, no `cwd` dependence, so
+    /// the header and at least one row are deterministic on any machine.
+    ///
+    /// RED-verified for what it *does* cover: making the Escape rung in
+    /// `handle_key_pressed` leave `engine.picker_open` set makes the second
+    /// assertion fail ("Key Bindings" stays painted). It does **not** go
+    /// RED on removing `backend.request_full_repaint()` — see the module
+    /// comment above this test for the proof of why no `TestBackend`-based
+    /// assertion can.
+    #[test]
+    fn picker_dismiss_leaves_no_popup_glyphs_on_the_grid_via_shell_app() {
+        let mut app = TuiShellApp::new_for_test();
+        app.engine
+            .open_picker(crate::core::engine::PickerSource::Keybindings);
+        let mut driver = driver_with_shell(app, config(), 80, 24);
+
+        assert!(
+            driver.screen_contains("Key Bindings"),
+            "precondition: an open picker must paint its header through \
+             render_content — screen was:\n{}",
+            driver.screen()
+        );
+
+        let reaction = driver.press_named(quadraui::NamedKey::Escape);
+        assert_eq!(
+            reaction,
+            Reaction::Redraw,
+            "dismissing the picker must repaint"
+        );
+        assert!(
+            !driver.screen_contains("Key Bindings"),
+            "the dismissed picker must leave no glyphs behind — screen \
+             was:\n{}",
+            driver.screen()
         );
     }
 
@@ -14352,6 +14501,1273 @@ mod tests {
         );
     }
 
+    /// #952 (ACP-1): a live ACP agent's `session/update` chunks must reach
+    /// the AI panel transcript incrementally through the real
+    /// `TuiShellApp`/`TuiDriver` stack — `Ctrl+S` submits, `driver.tick()`
+    /// drives `Engine::poll_idle` -> `poll_acp` exactly as the live TUI
+    /// event loop does, and the fixture's `agent_thought_chunk` +
+    /// two `agent_message_chunk`s must land as two visually distinct
+    /// transcript turns (thought under quadraui's `System` role label,
+    /// message under `AI`) once the turn completes.
+    ///
+    /// The agent subprocess is pre-spawned with `ACP_FAKE_NO_TOOL_REQUEST`
+    /// (via `AcpClient::spawn_with_env`, unreachable through
+    /// `settings.acp_agent_command` alone, which only offers plain
+    /// `AcpClient::spawn`) so the turn completes without needing the fs/*
+    /// bridge — a later ACP slice, out of ACP-1's scope — while still
+    /// exercising the exact same `poll_acp` session/prompt/session-update
+    /// path a real agent reply would drive `ai_send_message`'s "reuse an
+    /// already-running client" branch through.
+    ///
+    /// **RED verified**: before the `update.get("update")` unwrap fix in
+    /// `Engine::poll_acp`'s `SessionUpdate` arm (the handler read
+    /// `sessionUpdate`/`content.text` off the wrong JSON level — the whole
+    /// `session/update` `params` object, not its nested `update` field),
+    /// this test failed with the transcript stuck at only the just-typed
+    /// user turn: neither "pondering the question" nor "Hello world" ever
+    /// appeared, because `session_update_chunk` silently returned `None`
+    /// for every chunk (wrong nesting level, not a wrong field name) and
+    /// `ai_streaming` still cleared on `PromptStopped`. That is exactly the
+    /// "streamed chunks silently vanish, panel still looks done" failure
+    /// shape this test exists to catch.
+    #[cfg(unix)]
+    #[test]
+    fn ai_panel_streams_acp_thought_and_message_chunks_via_shell_app() {
+        let mut app = TuiShellApp::new(None);
+        app.engine
+            .app_shell
+            .show_panel(&quadraui::WidgetId::new(PANEL_AI));
+        app.engine.ai_has_focus = true;
+        app.sidebar.has_focus = true;
+
+        let argv = vec![
+            "sh".to_string(),
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/fake_acp_agent.sh"
+            )
+            .to_string(),
+        ];
+        let cwd = std::env::temp_dir();
+        let mut client = crate::core::acp::AcpClient::spawn_with_env(
+            &argv,
+            &cwd,
+            &[("ACP_FAKE_NO_TOOL_REQUEST", "1")],
+        )
+        .expect("fixture agent should spawn");
+        client.initialize();
+        app.engine.acp_client = Some(client);
+        // Only needs to be non-empty: routing checks emptiness to pick the
+        // transport, but the client above already exists, so
+        // `ai_send_message` takes the "reuse existing client" branch, never
+        // reading this value to spawn anything.
+        app.engine.settings.acp_agent_command = "already-spawned-above".to_string();
+
+        let mut driver = driver_with_shell(app, config(), 80, 24);
+        for c in "hello agent".chars() {
+            driver.type_char(c);
+        }
+        driver.ctrl_char('s');
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("hello agent"),
+            "the submitted user turn must appear immediately; screen:\n{screen}"
+        );
+
+        // Drive real ticks until the streamed turn completes, bounded like
+        // `tick_refreshes_sc_panel_asynchronously_not_on_the_event_loop_thread`
+        // above (a background thread there, a real subprocess here — same
+        // "don't busy-loop, don't hang the suite" tradeoff).
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut screen = driver.screen();
+        while !screen.contains("Hello world") && Instant::now() < deadline {
+            driver.tick();
+            std::thread::sleep(Duration::from_millis(10));
+            screen = driver.screen();
+        }
+
+        assert!(
+            screen.contains("Hello world"),
+            "the two agent_message_chunk notifications must stream into the \
+             transcript within 5s; screen:\n{screen}"
+        );
+        assert!(
+            screen.contains("pondering the question"),
+            "the agent_thought_chunk must also reach the transcript, not be \
+             dropped as an unrecognized update kind; screen:\n{screen}"
+        );
+        assert!(
+            screen.contains("System"),
+            "the thought turn renders under ChatRole::System -- a role \
+             header distinct from the message turn's \"AI\" label, per \
+             ACP-1's \"thought chunks visually distinct from message \
+             chunks\" acceptance criterion; screen:\n{screen}"
+        );
+    }
+
+    /// #953 (ACP-2): `session/request_permission` — the human-in-the-loop
+    /// tool-call approval chokepoint — through the real `TuiShellApp`/
+    /// `TuiDriver` stack. The dialog must actually paint the agent's own
+    /// `toolCall` title/kind/location (not just flip some internal flag —
+    /// "a permission prompt with no visible target is not a decision, it
+    /// is a rubber stamp"), and pressing the "Allow Once" button's hotkey
+    /// must reply with that option's id and let the parked turn resume to
+    /// completion.
+    ///
+    /// RED verified: with the `"acp_permission"` arm of
+    /// `Engine::process_dialog_result` reverted to the default no-op, this
+    /// test times out waiting for "Hello world" to reach the transcript —
+    /// the fixture stays blocked on its `read -r _reply` forever because
+    /// nothing ever answers `respond_to_client_request`.
+    #[cfg(unix)]
+    #[test]
+    fn ai_panel_shows_permission_dialog_and_resumes_turn_on_selection_via_shell_app() {
+        let mut app = TuiShellApp::new(None);
+        app.engine
+            .app_shell
+            .show_panel(&quadraui::WidgetId::new(PANEL_AI));
+        app.engine.ai_has_focus = true;
+        app.sidebar.has_focus = true;
+
+        let argv = vec![
+            "sh".to_string(),
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/fake_acp_agent.sh"
+            )
+            .to_string(),
+        ];
+        let cwd = std::env::temp_dir();
+        let mut client = crate::core::acp::AcpClient::spawn_with_env(
+            &argv,
+            &cwd,
+            &[("ACP_FAKE_REQUEST_PERMISSION", "1")],
+        )
+        .expect("fixture agent should spawn");
+        client.initialize();
+        app.engine.acp_client = Some(client);
+        app.engine.settings.acp_agent_command = "already-spawned-above".to_string();
+
+        let mut driver = driver_with_shell(app, config(), 80, 24);
+        for c in "please edit".chars() {
+            driver.type_char(c);
+        }
+        driver.ctrl_char('s');
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut screen = driver.screen();
+        while !screen.contains("Edit src/main.rs") && Instant::now() < deadline {
+            driver.tick();
+            std::thread::sleep(Duration::from_millis(10));
+            screen = driver.screen();
+        }
+        assert!(
+            screen.contains("Edit src/main.rs"),
+            "the permission dialog must paint the tool call's title within \
+             5s; screen:\n{screen}"
+        );
+        assert!(
+            screen.contains("edit"),
+            "the tool call's kind must be visible so a human has something \
+             to decide on; screen:\n{screen}"
+        );
+        assert!(
+            screen.contains("src/main.rs:42"),
+            "the tool call's location (path + line) must be visible; \
+             screen:\n{screen}"
+        );
+        // Button labels paint with their hotkey letter bracketed
+        // (`[A]llow Once`), per this dialog widget's convention — not a
+        // rendering detail specific to this test. "Allow Once" and "Always
+        // Allow" both start with 'a'; `acp_handle_permission_request`
+        // de-duplicates hotkeys across a dialog's own buttons (#953
+        // review), so "Always Allow"'s bracketed letter lands on its next
+        // unclaimed 'l' (`A[L]ways Allow`) rather than colliding with
+        // "Allow Once"'s `[A]`.
+        assert!(
+            screen.contains("llow Once")
+                && screen.contains("A[L]ways Allow")
+                && screen.contains("eject"),
+            "the agent's own options must be presented verbatim, not a \
+             hardcoded yes/no, and each hotkey must be unique within the \
+             dialog; screen:\n{screen}"
+        );
+        // The panel's busy spinner ("AI ASSISTANT  (thinking…)",
+        // `render.rs`) must still be up here — the turn is genuinely
+        // parked on the dialog, not already finished. Asserting the
+        // *disappearance* of this same marker below (rather than
+        // re-checking "Hello world", which the fixture already streamed
+        // into the transcript **before** ever asking for permission) is
+        // what makes the post-click assertion non-vacuous: "Hello world"
+        // would stay on screen even if the reply were silently never sent.
+        assert!(
+            screen.contains("(thinking"),
+            "the panel must still be busy while the permission dialog is \
+             open, or the completion check below would pass trivially; \
+             screen:\n{screen}"
+        );
+
+        // "Allow Once" is the dialog's first button and 'a' is its hotkey —
+        // unambiguous (`handle_dialog_key` matches buttons in order, and it
+        // is index 0).
+        driver.type_char('a');
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut screen = driver.screen();
+        while screen.contains("(thinking") && Instant::now() < deadline {
+            driver.tick();
+            std::thread::sleep(Duration::from_millis(10));
+            screen = driver.screen();
+        }
+        assert!(
+            !screen.contains("(thinking"),
+            "the reply must actually reach the (fake) agent and let the \
+             turn resume to completion (busy spinner cleared) within 5s; \
+             screen:\n{screen}"
+        );
+        assert!(
+            !screen.contains("Edit src/main.rs"),
+            "the dialog must be gone once answered; screen:\n{screen}"
+        );
+    }
+
+    /// #952 (ACP-1) acceptance: "Agent binary missing from PATH -> a clear,
+    /// actionable panel message, not a crash and not a silent empty panel."
+    /// `settings.acp_agent_command` pointing at a program that doesn't exist
+    /// must surface *in the transcript itself* (not just the status line,
+    /// which a user watching the panel might not be looking at), and must
+    /// not panic the process.
+    #[test]
+    fn ai_panel_shows_actionable_message_when_agent_binary_is_missing_via_shell_app() {
+        let mut app = TuiShellApp::new(None);
+        app.engine
+            .app_shell
+            .show_panel(&quadraui::WidgetId::new(PANEL_AI));
+        app.engine.ai_has_focus = true;
+        app.sidebar.has_focus = true;
+        // No hyphens/spaces: the transcript word-wraps at ~28 columns in an
+        // 80-col frame (the sidebar is a fraction of the width), and a
+        // single unbroken token is the only shape guaranteed to survive
+        // that wrap intact for a `screen.contains` check — a hyphenated
+        // name here would (and did, in an earlier draft of this test) get
+        // split mid-word across two wrapped rows, which is a rendering
+        // detail of the panel's text wrapping, not a bug in the message
+        // itself.
+        app.engine.settings.acp_agent_command = "nosuchagentbinary952".to_string();
+
+        let mut driver = driver_with_shell(app, config(), 80, 24);
+        for c in "hello".chars() {
+            driver.type_char(c);
+        }
+        driver.ctrl_char('s');
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("Could not start ACP agent"),
+            "the panel must say why, not just that something went wrong; \
+             screen:\n{screen}"
+        );
+        assert!(
+            screen.contains("nosuchagentbinary952"),
+            "the panel must name the agent command it failed to start; \
+             screen:\n{screen}"
+        );
+        assert!(
+            !screen.trim().is_empty(),
+            "a failed agent start must not leave a silently empty panel"
+        );
+    }
+
+    /// #958 (ACP-7) acceptance: a second, differently-configured
+    /// `settings.acp_agents` entry completes its own independent session,
+    /// and `:AiAgent <name>` (the real ex-command path, typed through the
+    /// command line — not a direct `Engine::acp_switch_agent` call) hands
+    /// the *next* message to the newly-active profile without restarting
+    /// vimcode. Both registry entries spawn the exact same
+    /// `fake_acp_agent.sh` binary — only their `env` entry
+    /// (`ACP_FAKE_AGENT_LABEL`) differs — proving "a second agent" is a
+    /// config fact flowing through one generic spawn path, not a Rust
+    /// branch on agent identity.
+    ///
+    /// RED verified: pinning `Engine::acp_resolve_agent_launch` to always
+    /// return `settings.acp_agents[0]` (ignoring `acp_active_agent`
+    /// entirely, as an earlier draft of this slice did) makes this fail —
+    /// the second `:AI` send still greets as `Hello_AlphaTag958` after
+    /// `:AiAgent beta`, because the switch never reaches the spawn call.
+    #[cfg(unix)]
+    #[test]
+    fn ai_panel_switches_between_registered_agents_via_ai_agent_command_via_shell_app() {
+        let mut app = TuiShellApp::new(None);
+        app.engine
+            .app_shell
+            .show_panel(&quadraui::WidgetId::new(PANEL_AI));
+
+        let fixture = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/fake_acp_agent.sh"
+        );
+        app.engine.settings.acp_agents = vec![
+            crate::core::acp::AcpAgentProfile {
+                name: "alpha".to_string(),
+                command: format!("sh \"{fixture}\""),
+                cwd: String::new(),
+                env: vec![
+                    "ACP_FAKE_NO_TOOL_REQUEST=1".to_string(),
+                    "ACP_FAKE_AGENT_LABEL=AlphaTag958".to_string(),
+                ],
+            },
+            crate::core::acp::AcpAgentProfile {
+                name: "beta".to_string(),
+                command: format!("sh \"{fixture}\""),
+                cwd: String::new(),
+                env: vec![
+                    "ACP_FAKE_NO_TOOL_REQUEST=1".to_string(),
+                    "ACP_FAKE_AGENT_LABEL=BetaTag958".to_string(),
+                ],
+            },
+        ];
+        app.engine.settings.acp_active_agent = "alpha".to_string();
+
+        // Never sets `ai_has_focus`/sidebar focus, so `:` reaches the
+        // normal-mode command line (`route_focus_key` falls through to
+        // `FocusKeyRoute::None`) rather than being typed as literal chat
+        // input — the same reasoning `count_before_colon_prefills_range_
+        // via_shell_app` above relies on.
+        let mut driver = driver_with_shell(app, config(), 80, 24);
+        driver.press_named(quadraui::NamedKey::Escape);
+
+        driver.type_char(':');
+        for c in "AI hi".chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut screen = driver.screen();
+        while !screen.contains("Hello_AlphaTag958") && Instant::now() < deadline {
+            driver.tick();
+            std::thread::sleep(Duration::from_millis(10));
+            screen = driver.screen();
+        }
+        assert!(
+            screen.contains("Hello_AlphaTag958"),
+            "the initially-active agent (alpha) must reply within 5s; \
+             screen:\n{screen}"
+        );
+
+        driver.type_char(':');
+        for c in "AiAgent beta".chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
+
+        driver.type_char(':');
+        for c in "AI hi again".chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut screen = driver.screen();
+        while !screen.contains("Hello_BetaTag958") && Instant::now() < deadline {
+            driver.tick();
+            std::thread::sleep(Duration::from_millis(10));
+            screen = driver.screen();
+        }
+        assert!(
+            screen.contains("Hello_BetaTag958"),
+            "after `:AiAgent beta`, the next message must be answered by \
+             the beta profile within 5s; screen:\n{screen}"
+        );
+        assert!(
+            !screen.contains("AlphaTag958"),
+            "switching agents ends the old session -- the new agent's \
+             transcript must not still show the previous agent's reply; \
+             screen:\n{screen}"
+        );
+    }
+
+    /// #954 (ACP-3) acceptance: `fs/read_text_file` must serve an open,
+    /// **dirty** buffer's unsaved in-memory content, not stale on-disk
+    /// text — the single most important correctness property in the
+    /// slice, per the issue's own framing (an agent reasoning over stale
+    /// text proposes edits against lines the user already changed). Uses
+    /// the fixture's `ACP_FAKE_FS_READ_PATH` branch (see its own doc
+    /// comment), which echoes back whatever `fs/read_text_file` returned
+    /// as a transcript chunk — so this reads the answer off the rendered
+    /// screen through the real `TuiShellApp`/`TuiDriver` stack, exactly
+    /// like `ai_panel_streams_acp_thought_and_message_chunks_via_shell_app`
+    /// above does for `session/update` chunks.
+    ///
+    /// RED verified: reverting `Engine::acp_read_text_file` to always
+    /// `std::fs::read_to_string` (skipping the buffer-first lookup) makes
+    /// this fail — the screen shows `"read:on disk"` instead of
+    /// `"read:DIRTYMARKER123"`.
+    #[cfg(unix)]
+    #[test]
+    fn fs_read_text_file_serves_dirty_buffer_content_via_shell_app() {
+        let dir = std::env::temp_dir().join(format!("acp3-tui-read-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_path = dir.join("dirty.txt");
+        std::fs::write(&file_path, "on disk").unwrap();
+
+        let mut app = TuiShellApp::new(None);
+        app.engine
+            .app_shell
+            .show_panel(&quadraui::WidgetId::new(PANEL_AI));
+        app.engine.ai_has_focus = true;
+        app.sidebar.has_focus = true;
+        app.engine.workspace_root = Some(dir.clone());
+
+        let buffer_id = app
+            .engine
+            .buffer_manager
+            .open_file(&file_path)
+            .expect("should open");
+        {
+            let state = app.engine.buffer_manager.get_mut(buffer_id).unwrap();
+            let len = state.buffer.content.len_chars();
+            state.buffer.content.remove(0..len);
+            state.buffer.content.insert(0, "DIRTYMARKER123");
+            state.dirty = true;
+        }
+
+        let path_str = file_path.to_string_lossy().into_owned();
+        let argv = vec![
+            "sh".to_string(),
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/fake_acp_agent.sh"
+            )
+            .to_string(),
+        ];
+        let cwd = std::env::temp_dir();
+        let mut client = crate::core::acp::AcpClient::spawn_with_env(
+            &argv,
+            &cwd,
+            &[("ACP_FAKE_FS_READ_PATH", path_str.as_str())],
+        )
+        .expect("fixture agent should spawn");
+        client.initialize();
+        app.engine.acp_client = Some(client);
+        app.engine.settings.acp_agent_command = "already-spawned-above".to_string();
+
+        let mut driver = driver_with_shell(app, config(), 80, 24);
+        for c in "please read".chars() {
+            driver.type_char(c);
+        }
+        driver.ctrl_char('s');
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut screen = driver.screen();
+        while !screen.contains("read:DIRTYMARKER123") && Instant::now() < deadline {
+            driver.tick();
+            std::thread::sleep(Duration::from_millis(10));
+            screen = driver.screen();
+        }
+
+        assert!(
+            screen.contains("read:DIRTYMARKER123"),
+            "the agent's fs/read_text_file reply must carry the dirty \
+             buffer's unsaved content within 5s; screen:\n{screen}"
+        );
+        assert!(
+            !screen.contains("read:on disk"),
+            "must never serve stale on-disk content for an open, dirty \
+             buffer; screen:\n{screen}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #956 (ACP-5) acceptance: "Two successive `plan` updates leave
+    /// **exactly one** plan rendered, reflecting the second." The fixture's
+    /// `ACP_FAKE_PLAN` branch emits two back-to-back `plan` updates for one
+    /// `session/prompt` turn — the first marks "Write the fix" in_progress,
+    /// the second (a full replacement) marks it completed and adds a new
+    /// "Add tests" entry — plus an `available_commands_update` and a
+    /// `usage_update`, all exercised here through the real `TuiShellApp`/
+    /// `TuiDriver` stack.
+    ///
+    /// RED verified: changing `Engine::acp_handle_session_update`'s
+    /// `self.acp_plan = entries` to `self.acp_plan.extend(entries)` (the
+    /// append-only bug #956 explicitly calls out as "the single most common
+    /// way to get this wrong") makes the "exactly one occurrence" assertion
+    /// below fail — "Write the fix" then appears twice (once in_progress
+    /// from the first update, once completed from the second) instead of
+    /// once.
+    #[cfg(unix)]
+    #[test]
+    fn ai_panel_plan_update_fully_replaces_not_accumulates_via_shell_app() {
+        let mut app = TuiShellApp::new(None);
+        app.engine
+            .app_shell
+            .show_panel(&quadraui::WidgetId::new(PANEL_AI));
+        app.engine.ai_has_focus = true;
+        app.sidebar.has_focus = true;
+
+        let argv = vec![
+            "sh".to_string(),
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/fake_acp_agent.sh"
+            )
+            .to_string(),
+        ];
+        let cwd = std::env::temp_dir();
+        let mut client =
+            crate::core::acp::AcpClient::spawn_with_env(&argv, &cwd, &[("ACP_FAKE_PLAN", "1")])
+                .expect("fixture agent should spawn");
+        client.initialize();
+        app.engine.acp_client = Some(client);
+        app.engine.settings.acp_agent_command = "already-spawned-above".to_string();
+
+        let mut driver = driver_with_shell(app, config(), 80, 24);
+        for c in "please plan".chars() {
+            driver.type_char(c);
+        }
+        driver.ctrl_char('s');
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut screen = driver.screen();
+        while !screen.contains("Add tests") && Instant::now() < deadline {
+            driver.tick();
+            std::thread::sleep(Duration::from_millis(10));
+            screen = driver.screen();
+        }
+
+        assert!(
+            screen.contains("Add tests"),
+            "the second plan update's new entry must render within 5s; \
+             screen:\n{screen}"
+        );
+        assert_eq!(
+            screen.matches("Write the fix").count(),
+            1,
+            "two successive plan updates must leave exactly one rendering \
+             of a step present in both, not one per update; screen:\n{screen}"
+        );
+        assert!(
+            screen.contains("\u{2611} Write the fix"),
+            "the rendered checklist must reflect the SECOND update's status \
+             (completed), not the first's (in_progress); screen:\n{screen}"
+        );
+        assert!(
+            !screen.contains("Write the fix (in progress)"),
+            "the stale in_progress state from the first update must not \
+             survive; screen:\n{screen}"
+        );
+        assert!(
+            screen.contains("120+45 tok"),
+            "usage_update telemetry must render in the status header \
+             (the cost figure may be truncated by the narrow sidebar column \
+             here; `format_usage_summary`'s own unit tests cover the full \
+             string); screen:\n{screen}"
+        );
+    }
+
+    /// #955 (ACP-4) acceptance, end to end through the real `TuiShellApp`/
+    /// `TuiDriver` stack: a tool call's transcript summary shows `title` +
+    /// `kind`, and its status glyph reflects the LAST `tool_call_update`
+    /// (`completed`, per the fixture's `ACP_FAKE_TOOL_CALL_STATUS_ONLY`
+    /// branch — no `diff` content here, so the change-review surface never
+    /// opens and covers the transcript; see the next test for that path).
+    ///
+    /// RED verified: with `Engine::acp_apply_tool_call_update`'s status
+    /// assignment commented out, the screen never shows `"[x] execute:"`
+    /// (it stays stuck on `"[ ]"`, the initial `tool_call` announcement's
+    /// `pending` status) within the deadline — this failed exactly that
+    /// way before the status transition was wired up.
+    #[cfg(unix)]
+    #[test]
+    fn ai_panel_tool_call_status_transitions_via_shell_app() {
+        let mut app = TuiShellApp::new(None);
+        app.engine
+            .app_shell
+            .show_panel(&quadraui::WidgetId::new(PANEL_AI));
+        app.engine.ai_has_focus = true;
+        app.sidebar.has_focus = true;
+
+        let argv = vec![
+            "sh".to_string(),
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/fake_acp_agent.sh"
+            )
+            .to_string(),
+        ];
+        let cwd = std::env::temp_dir();
+        let mut client = crate::core::acp::AcpClient::spawn_with_env(
+            &argv,
+            &cwd,
+            &[("ACP_FAKE_TOOL_CALL_STATUS_ONLY", "1")],
+        )
+        .expect("fixture agent should spawn");
+        client.initialize();
+        app.engine.acp_client = Some(client);
+        app.engine.settings.acp_agent_command = "already-spawned-above".to_string();
+
+        let mut driver = driver_with_shell(app, config(), 80, 24);
+        for c in "please run tests".chars() {
+            driver.type_char(c);
+        }
+        driver.ctrl_char('s');
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut screen = driver.screen();
+        while !screen.contains("[x] execute:") && Instant::now() < deadline {
+            driver.tick();
+            std::thread::sleep(Duration::from_millis(10));
+            screen = driver.screen();
+        }
+
+        assert!(
+            screen.contains("[x] execute: Run the tests"),
+            "the tool call's LAST status update (completed) must be the \
+             one rendered, together with its title and kind; \
+             screen:\n{screen}"
+        );
+        assert!(
+            !screen.contains("[ ] execute:") && !screen.contains("[~] execute:"),
+            "only the final status should be visible once the turn has \
+             ended, not a stale pending/in_progress rendering; \
+             screen:\n{screen}"
+        );
+    }
+
+    /// #955 (ACP-4) acceptance, end to end through the real `TuiShellApp`/
+    /// `TuiDriver` stack: a `diff` content block on a `tool_call_update`
+    /// opens the change-review surface with both `oldText` and `newText`
+    /// painted (a real `quadraui::DiffView`, not just engine state — see
+    /// this crate's `CLAUDE.md` "rendered output, not state" rule), and
+    /// pressing `a` (accept) writes `newText` to the real file and closes
+    /// the surface. The surface being full-viewport is why the AI panel's
+    /// own transcript ("[x] edit: ...") is not asserted here — it is
+    /// genuinely covered, which the previous test already covers on its
+    /// own scenario.
+    ///
+    /// RED verified: with `Engine::acp_open_review_for_diffs` never called
+    /// from `acp_apply_tool_call_update`, the screen never shows
+    /// `"old line"`/`"new line"` and the accept keypress has nothing to
+    /// act on, so the file on disk is never rewritten — this failed
+    /// exactly that way (screen missing the diff text, file unchanged)
+    /// before the `diff` block was wired to the review surface.
+    #[cfg(unix)]
+    #[test]
+    fn ai_panel_tool_call_diff_opens_change_review_and_accept_writes_file_via_shell_app() {
+        let dir = std::env::temp_dir().join(format!("acp4-tui-tool-call-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("target.txt");
+        std::fs::write(&target, "old line\n").unwrap();
+        let target_str = target.to_string_lossy().into_owned();
+
+        let mut app = TuiShellApp::new(None);
+        app.engine
+            .app_shell
+            .show_panel(&quadraui::WidgetId::new(PANEL_AI));
+        app.engine.ai_has_focus = true;
+        app.sidebar.has_focus = true;
+        app.engine.workspace_root = Some(dir.clone());
+
+        let argv = vec![
+            "sh".to_string(),
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/fake_acp_agent.sh"
+            )
+            .to_string(),
+        ];
+        let cwd = std::env::temp_dir();
+        let mut client = crate::core::acp::AcpClient::spawn_with_env(
+            &argv,
+            &cwd,
+            &[
+                ("ACP_FAKE_TOOL_CALL", "1"),
+                ("ACP_FAKE_TOOL_CALL_PATH", target_str.as_str()),
+            ],
+        )
+        .expect("fixture agent should spawn");
+        client.initialize();
+        app.engine.acp_client = Some(client);
+        app.engine.settings.acp_agent_command = "already-spawned-above".to_string();
+
+        let mut driver = driver_with_shell(app, config(), 80, 24);
+        for c in "please edit".chars() {
+            driver.type_char(c);
+        }
+        driver.ctrl_char('s');
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut screen = driver.screen();
+        while !screen.contains("old line") && Instant::now() < deadline {
+            driver.tick();
+            std::thread::sleep(Duration::from_millis(10));
+            screen = driver.screen();
+        }
+
+        assert!(
+            screen.contains("old line"),
+            "the change-review surface must paint the diff's oldText; \
+             screen:\n{screen}"
+        );
+        assert!(
+            screen.contains("new line"),
+            "the change-review surface must paint the diff's newText; \
+             screen:\n{screen}"
+        );
+
+        // Accept the change: 'a' while the surface is open.
+        driver.type_char('a');
+        driver.tick();
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while std::fs::read_to_string(&target).unwrap_or_default() != "new line\n"
+            && Instant::now() < deadline
+        {
+            driver.tick();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "new line\n",
+            "accepting the change must write newText to the real file"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #955 (ACP-4) review follow-up: "clicking a `location` jumps to that
+    /// file and line" driven through a *real mouse click* against the
+    /// painted diff geometry — `driver.click(x, y)` on the row `driver.find`
+    /// locates, not `handle_change_review_key("Return", ...)` (that path is
+    /// already covered by `core::engine::review_ops`'s unit test). This is
+    /// the paint↔hit-test path the review flagged as untested: TUI's
+    /// `mouse::handle_mouse` → `render::route_change_review_click` →
+    /// `Engine::change_review_jump_to_hit`, resolved against the *exact*
+    /// `diff_rect`/`line_height` `render::paint_change_review_rung` last
+    /// cached on `Engine::change_review_diff_rect`.
+    ///
+    /// The click closes the full-viewport change-review surface (see
+    /// `change_review_jump_to_hit`'s doc comment — the jump would be
+    /// invisible otherwise, since the diff would just paint right back
+    /// over the buffer it switched to), so the assertion is: the diff's
+    /// `oldText`/`newText` markers are gone and the real on-disk file
+    /// content is what's on screen instead — the file was never accepted,
+    /// so seeing its real ("old line") content, not the proposed
+    /// ("new line") one, confirms the click jumped to the buffer rather
+    /// than accepting the change.
+    ///
+    /// RED verified: before `route_and_apply_change_review_click`/
+    /// `mouse::handle_mouse`'s change-review branch existed, a click at
+    /// this exact geometry fell through to the ordinary editor mouse
+    /// handling underneath the (still-open) full-viewport overlay, so the
+    /// screen kept showing "old line"/"new line" (the diff, unclosed) and
+    /// never showed the tab bar for `target.txt` — this failed exactly
+    /// that way before the click routing was wired.
+    #[cfg(unix)]
+    #[test]
+    fn ai_panel_tool_call_diff_click_on_row_jumps_to_file_and_line_via_shell_app() {
+        let dir =
+            std::env::temp_dir().join(format!("acp4-tui-tool-call-click-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("target.txt");
+        std::fs::write(&target, "old line\n").unwrap();
+        let target_str = target.to_string_lossy().into_owned();
+
+        let mut app = TuiShellApp::new(None);
+        app.engine
+            .app_shell
+            .show_panel(&quadraui::WidgetId::new(PANEL_AI));
+        app.engine.ai_has_focus = true;
+        app.sidebar.has_focus = true;
+        app.engine.workspace_root = Some(dir.clone());
+
+        let argv = vec![
+            "sh".to_string(),
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/fake_acp_agent.sh"
+            )
+            .to_string(),
+        ];
+        let cwd = std::env::temp_dir();
+        let mut client = crate::core::acp::AcpClient::spawn_with_env(
+            &argv,
+            &cwd,
+            &[
+                ("ACP_FAKE_TOOL_CALL", "1"),
+                ("ACP_FAKE_TOOL_CALL_PATH", target_str.as_str()),
+            ],
+        )
+        .expect("fixture agent should spawn");
+        client.initialize();
+        app.engine.acp_client = Some(client);
+        app.engine.settings.acp_agent_command = "already-spawned-above".to_string();
+
+        let mut driver = driver_with_shell(app, config(), 80, 24);
+        for c in "please edit".chars() {
+            driver.type_char(c);
+        }
+        driver.ctrl_char('s');
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut screen = driver.screen();
+        while !screen.contains("old line") && Instant::now() < deadline {
+            driver.tick();
+            std::thread::sleep(Duration::from_millis(10));
+            screen = driver.screen();
+        }
+        assert!(
+            screen.contains("old line") && screen.contains("new line"),
+            "precondition: change-review surface must be open with both \
+             sides of the diff painted before the click; screen:\n{screen}"
+        );
+
+        // A real mouse click on the painted "old line" row — the exact
+        // geometry `mouse::handle_mouse`'s change-review branch resolves
+        // through `render::route_change_review_click`.
+        let (x, y) = driver.find("old line").unwrap_or_else(|| {
+            panic!("diff row 'old line' must be locatable on screen; screen:\n{screen}")
+        });
+        driver.click(x, y);
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut screen = driver.screen();
+        while screen.contains("a=accept") && Instant::now() < deadline {
+            driver.tick();
+            std::thread::sleep(Duration::from_millis(10));
+            screen = driver.screen();
+        }
+
+        assert!(
+            !screen.contains("a=accept"),
+            "clicking a diff row must close the change-review surface \
+             (jump, not accept); screen:\n{screen}"
+        );
+        assert!(
+            !screen.contains("new line"),
+            "the surface must be gone — 'new line' (the proposed text) \
+             must no longer paint anywhere on screen; screen:\n{screen}"
+        );
+        assert!(
+            screen.contains("target.txt"),
+            "the click must have opened target.txt's own tab, proving the \
+             jump landed on the right file; screen:\n{screen}"
+        );
+        assert!(
+            screen.contains("old line"),
+            "the buffer shown after the jump must be target.txt's real, \
+             unmodified on-disk content ('old line'), not the proposed \
+             ('new line') text — confirming this was a jump, not an \
+             accept; screen:\n{screen}"
+        );
+
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "old line\n",
+            "a click-to-jump must never write to the file — that's \
+             accept's job, not jump's"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #955 review regression guard: once the change-review surface
+    /// **closes**, its full-viewport `quadraui::ModalStack` entry must be
+    /// gone, so ordinary shell chrome (activity bar, sidebar, menu bar)
+    /// keeps receiving clicks.
+    ///
+    /// Why this is worth its own test: `ShellAdapter::handle` consults
+    /// `ModalStack::hit_test` *before* any chrome dispatch, and the entry
+    /// this surface registers covers the entire viewport. A stuck entry is
+    /// therefore not a cosmetic defect — every subsequent mouse event for
+    /// the rest of the session is routed straight into
+    /// `TuiShellApp::handle` instead of `AppShell`'s own handling, so the
+    /// activity bar silently stops switching panels, the sidebar stops
+    /// resizing, and so on. The symptom shows up nowhere near the
+    /// change-review code, which is exactly why it needs to be asserted
+    /// here.
+    ///
+    /// RED verified: with the pop moved back into an `else` arm inside the
+    /// frame walk's `FrameOp::ChangeReview` match (where
+    /// `presence.change_review` gates the whole rung out of
+    /// `render::compose_frame`'s op list the moment the surface closes, so
+    /// the `else` is unreachable), the final Search-icon click below
+    /// leaves the Explorer panel up and "Replace…" never paints.
+    ///
+    /// The surface is opened from a plain `ChangeReviewState::new(vec![
+    /// ProposedChange { .. }])` — the source-agnostic constructor, no ACP
+    /// involved — and closed through the real click-to-jump path
+    /// (`driver.click` on a painted diff row), the close path the review
+    /// finding named.
+    #[test]
+    fn change_review_close_restores_chrome_clicks_via_shell_app() {
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_test_955_review_modal_pop_{:?}",
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("zqxw955.txt");
+        std::fs::write(&target, "old line\n").unwrap();
+
+        let mut app = TuiShellApp::new_for_test();
+        app.engine.cwd = dir.clone();
+        app.engine.explorer_reveal_path(&target);
+        app.engine.change_review = Some(crate::core::review::ChangeReviewState::new(vec![
+            crate::core::review::ProposedChange {
+                path: target.to_string_lossy().into_owned(),
+                old_text: Some("old line\n".to_string()),
+                new_text: "new line\n".to_string(),
+            },
+        ]));
+
+        let mut driver = driver_with_shell(app, TuiShellApp::build_shell_config(false), 80, 24);
+        driver.set_double_click_folding(false);
+        driver.dispatch(quadraui::UiEvent::WindowFocused(true));
+        driver.render();
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("old line") && screen.contains("new line"),
+            "precondition: the change-review surface must be open and \
+             painted from the source-agnostic change list; screen:\n{screen}"
+        );
+
+        // Close it the way a user would: click a diff row to jump.
+        let (x, y) = driver
+            .find("old line")
+            .unwrap_or_else(|| panic!("diff row 'old line' must be locatable; screen:\n{screen}"));
+        driver.click(x, y);
+        driver.dispatch(quadraui::UiEvent::WindowFocused(true));
+        driver.render();
+        assert!(
+            !driver.screen_contains("a=accept"),
+            "precondition: clicking a diff row must have closed the \
+             change-review surface; screen:\n{}",
+            driver.screen()
+        );
+
+        // The regression: with the surface closed, a click on the Search
+        // icon must still reach `AppShell`'s activity-bar dispatch.
+        let (sx, sy) = driver
+            .find(crate::icons::SEARCH.s())
+            .unwrap_or_else(|| panic!("Search icon must paint; screen:\n{}", driver.screen()));
+        driver.click(sx, sy);
+        driver.dispatch(quadraui::UiEvent::WindowFocused(true));
+        driver.render();
+        assert!(
+            driver.screen_contains("Replace…"),
+            "after the change-review surface closed, an activity-bar click \
+             must still switch panels — a leftover full-viewport ModalStack \
+             entry routes it past AppShell's chrome dispatch entirely; \
+             screen:\n{}",
+            driver.screen()
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #956 (ACP-5) acceptance: slash commands declared via
+    /// `available_commands_update` must appear as completions in the AI
+    /// panel's input, and accepting one must produce ordinary prompt text
+    /// (no separate RPC) — submitting it is indistinguishable from typing
+    /// it by hand.
+    #[cfg(unix)]
+    #[test]
+    fn ai_panel_slash_command_completions_via_shell_app() {
+        let mut app = TuiShellApp::new(None);
+        app.engine
+            .app_shell
+            .show_panel(&quadraui::WidgetId::new(PANEL_AI));
+        app.engine.ai_has_focus = true;
+        app.sidebar.has_focus = true;
+
+        let argv = vec![
+            "sh".to_string(),
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/fake_acp_agent.sh"
+            )
+            .to_string(),
+        ];
+        let cwd = std::env::temp_dir();
+        let mut client =
+            crate::core::acp::AcpClient::spawn_with_env(&argv, &cwd, &[("ACP_FAKE_PLAN", "1")])
+                .expect("fixture agent should spawn");
+        client.initialize();
+        app.engine.acp_client = Some(client);
+        app.engine.settings.acp_agent_command = "already-spawned-above".to_string();
+
+        let mut driver = driver_with_shell(app, config(), 80, 24);
+        // Drive one full turn first so `available_commands_update` lands.
+        for c in "please plan".chars() {
+            driver.type_char(c);
+        }
+        driver.ctrl_char('s');
+        // Wait for the turn to fully complete ("Plan ready" is the last
+        // chunk the fixture streams) rather than for "compact" to appear on
+        // screen — `available_commands_update` only updates engine state,
+        // it never paints anything by itself until the popup below renders
+        // it, so waiting on screen text for it here would just burn the
+        // whole deadline.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut screen = driver.screen();
+        while !screen.contains("Plan ready") && Instant::now() < deadline {
+            driver.tick();
+            std::thread::sleep(Duration::from_millis(10));
+            screen = driver.screen();
+        }
+        assert!(
+            screen.contains("Plan ready"),
+            "setup turn must complete within 5s so available_commands_update \
+             has landed; screen:\n{screen}"
+        );
+        // `dispatch_ai_chat_event` already cleared the input on submit.
+
+        for c in "/co".chars() {
+            driver.type_char(c);
+        }
+        let screen = driver.screen();
+        assert!(
+            screen.contains("/commit") && screen.contains("/compact"),
+            "both agent-declared commands sharing the \"co\" prefix must \
+             appear as completions; screen:\n{screen}"
+        );
+
+        // Cycle from "/commit" (alphabetically first, so selected by
+        // default) to "/compact", then accept.
+        driver.press_named(quadraui::NamedKey::Tab);
+        driver.press_named(quadraui::NamedKey::Enter);
+        let screen = driver.screen();
+        assert!(
+            screen.contains("/compact "),
+            "accepting the completion must fill the input with the full \
+             command name plus a trailing space, ready for arguments; \
+             screen:\n{screen}"
+        );
+
+        // Invoking it is nothing more than submitting that text normally —
+        // there is no separate RPC for a slash command.
+        driver.ctrl_char('s');
+        let screen = driver.screen();
+        assert!(
+            screen.contains("/compact"),
+            "the accepted command must reach the transcript as ordinary \
+             prompt text once submitted; screen:\n{screen}"
+        );
+    }
+
+    /// How long the two #957 (ACP-6) driver tests below wait on a real
+    /// child process before giving up.
+    ///
+    /// Deliberately the same 30s as `core::engine::acp_ops::tests::
+    /// TEST_DEADLINE`, and generous for the same reason: every one of
+    /// these loops exits the instant its condition holds, so the bound is
+    /// only ever reached on a *failing* run, while a loaded `cargo test`
+    /// (GTK harness + nvim oracles + ~3.6k lib tests at once) can
+    /// deschedule a `fork`/`exec` — and, for the terminal-login pane, a
+    /// whole interactive `$SHELL` startup, rc files included — for far
+    /// longer than the milliseconds any of it takes standalone. The first
+    /// cut used 5s and flaked in roughly one full-suite run in eight
+    /// (#957 smoke); nothing about the assertions changed, only the
+    /// patience behind them.
+    const ACP_DRIVER_DEADLINE: Duration = Duration::from_secs(30);
+
+    /// #957 (ACP-6) acceptance: "with `auth.terminal` advertised against a
+    /// fake agent offering a terminal auth method, ... the method is
+    /// present" and "with the capability not advertised, the method is
+    /// absent" — TUI's twin of `gtk::testing::sidebar_panel_clicks::
+    /// ai_panel_shows_auth_choice_dialog_with_agent_and_terminal_methods`.
+    ///
+    /// Unlike the buttons-only `"acp_permission"` dialog on GTK, TUI has no
+    /// native-dialog concept at all — every dialog paints in-canvas — so
+    /// this asserts directly on the painted screen text, same shape as
+    /// `ai_panel_shows_permission_dialog_and_resumes_turn_on_selection_via_shell_app`.
+    ///
+    /// RED verified: with `Engine::poll_acp`'s `Initialized` handler
+    /// changed to call `self.acp_begin_session()` unconditionally (skipping
+    /// the `!self.acp_authenticated && !self.acp_auth_methods.is_empty()`
+    /// check), no dialog ever opens and this test times out waiting for
+    /// `"Authenticate"` — the loop below exits on the deadline and the
+    /// final assertion fails. Restored before committing.
+    #[test]
+    fn ai_panel_shows_auth_choice_dialog_with_agent_and_terminal_methods_via_shell_app() {
+        let mut app = TuiShellApp::new(None);
+        app.engine
+            .app_shell
+            .show_panel(&quadraui::WidgetId::new(PANEL_AI));
+        app.engine.ai_has_focus = true;
+        app.sidebar.has_focus = true;
+
+        let argv = vec![
+            "sh".to_string(),
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/fake_acp_agent.sh"
+            )
+            .to_string(),
+        ];
+        let cwd = std::env::temp_dir();
+        let mut client = crate::core::acp::AcpClient::spawn_with_env(
+            &argv,
+            &cwd,
+            &[("ACP_FAKE_AUTH_METHODS", "1")],
+        )
+        .expect("fixture agent should spawn");
+        client.initialize();
+        app.engine.acp_client = Some(client);
+        app.engine.settings.acp_agent_command = "already-spawned-above".to_string();
+
+        let mut driver = driver_with_shell(app, config(), 80, 24);
+        for c in "hello agent".chars() {
+            driver.type_char(c);
+        }
+        driver.ctrl_char('s');
+
+        let deadline = Instant::now() + ACP_DRIVER_DEADLINE;
+        let mut screen = driver.screen();
+        while !screen.contains("Authenticate") && Instant::now() < deadline {
+            driver.tick();
+            std::thread::sleep(Duration::from_millis(10));
+            screen = driver.screen();
+        }
+        assert!(
+            screen.contains("Authenticate"),
+            "the auth-choice dialog's title must paint within ACP_DRIVER_DEADLINE; \
+             screen:\n{screen}"
+        );
+        assert!(
+            screen.contains("ways to sign in"),
+            "the dialog's explanatory body text must be painted; \
+             screen:\n{screen}"
+        );
+        // Same hotkey-collision reasoning as the GTK twin: "API Key" claims
+        // 'a'; "Claude Subscription" claims its own leading 'c'; "Continue
+        // without auth" falls to its next unclaimed letter, 'o'.
+        assert!(
+            screen.contains("[A]PI Key")
+                && screen.contains("[C]laude Subscription")
+                && screen.contains("C[O]ntinue without auth"),
+            "both the agent-type and terminal-type auth methods the fixture \
+             advertised must be presented verbatim, plus the fallback skip \
+             button, each with a unique hotkey; screen:\n{screen}"
+        );
+    }
+
+    /// #957 (ACP-6) acceptance: "choosing [the terminal method] launches
+    /// the interactive process and completion re-initializes the
+    /// session" — TUI's twin of `gtk::testing::sidebar_panel_clicks::
+    /// ai_panel_terminal_auth_choice_opens_visible_login_pane_and_resumes_session`.
+    ///
+    /// Drives the choice via the dialog's own hotkey (`'c'`, matching the
+    /// bracketed `[C]laude Subscription` label the previous test
+    /// confirmed), then proves the login pane actually **painted** —
+    /// `screen.contains` on the fixture's own PTY output, not just
+    /// `terminal_panes.len()` / `acp_authenticated` state — before it exits
+    /// and the queued turn resumes.
+    ///
+    /// `settings.acp_agent_command` here is the *real* fixture path (not
+    /// the `"already-spawned-above"` placeholder the NDJSON-only tests
+    /// use): `Engine::acp_launch_terminal_login` reads that setting
+    /// directly to spawn the interactive login process, independently of
+    /// the already-spawned NDJSON `acp_client` above. The `succeed-slow`
+    /// arg (fixture doc) gives `driver.tick()` a real window to observe the
+    /// pane's painted output before it exits and is reaped.
+    ///
+    /// RED verified: with `Engine::acp_finish_terminal_login`'s `Some(0)`
+    /// branch changed to a no-op (never calling `client.initialize()`),
+    /// this test times out waiting for `"Hello world"` — the client stays
+    /// parked after the login pane exits instead of resuming the queued
+    /// turn.
+    #[test]
+    fn ai_panel_terminal_auth_choice_opens_visible_login_pane_and_resumes_session_via_shell_app() {
+        let mut app = TuiShellApp::new(None);
+        app.engine
+            .app_shell
+            .show_panel(&quadraui::WidgetId::new(PANEL_AI));
+        app.engine.ai_has_focus = true;
+        app.sidebar.has_focus = true;
+
+        let fixture_path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/fake_acp_agent.sh"
+        );
+        let argv = vec!["sh".to_string(), fixture_path.to_string()];
+        let cwd = std::env::temp_dir();
+        let mut client = crate::core::acp::AcpClient::spawn_with_env(
+            &argv,
+            &cwd,
+            &[
+                ("ACP_FAKE_AUTH_METHODS", "1"),
+                ("ACP_FAKE_NO_TOOL_REQUEST", "1"),
+            ],
+        )
+        .expect("fixture agent should spawn");
+        client.initialize();
+        app.engine.acp_client = Some(client);
+        // Read directly by `acp_launch_terminal_login` — distinct from (and
+        // independent of) the NDJSON client spawned above.
+        app.engine.settings.acp_agent_command = format!("sh {fixture_path} succeed-slow");
+
+        let mut driver = driver_with_shell(app, config(), 80, 24);
+        for c in "hello agent".chars() {
+            driver.type_char(c);
+        }
+        driver.ctrl_char('s');
+
+        let deadline = Instant::now() + ACP_DRIVER_DEADLINE;
+        let mut screen = driver.screen();
+        while !screen.contains("Authenticate") && Instant::now() < deadline {
+            driver.tick();
+            std::thread::sleep(Duration::from_millis(10));
+            screen = driver.screen();
+        }
+        assert!(
+            screen.contains("[C]laude Subscription"),
+            "the auth-choice dialog must paint the Claude Subscription \
+             option within ACP_DRIVER_DEADLINE; screen:\n{screen}"
+        );
+
+        driver.type_char('c');
+        let screen = driver.screen();
+        assert!(
+            !screen.contains("Authenticate"),
+            "the dialog must close the moment the hotkey is pressed; \
+             screen:\n{screen}"
+        );
+
+        let deadline = Instant::now() + ACP_DRIVER_DEADLINE;
+        let mut saw_login_pane = false;
+        while Instant::now() < deadline {
+            driver.tick();
+            if driver.screen().contains("interactive login succeeded") {
+                saw_login_pane = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            saw_login_pane,
+            "the login pane's own PTY output must actually be painted on \
+             the surface within ACP_DRIVER_DEADLINE, not just recorded in engine state"
+        );
+
+        let deadline = Instant::now() + ACP_DRIVER_DEADLINE;
+        let mut screen = driver.screen();
+        while !screen.contains("Hello world") && Instant::now() < deadline {
+            driver.tick();
+            std::thread::sleep(Duration::from_millis(10));
+            screen = driver.screen();
+        }
+        assert!(
+            screen.contains("Hello world"),
+            "completing the login must re-initialize the client and resume \
+             the queued turn within ACP_DRIVER_DEADLINE; screen:\n{screen}"
+        );
+    }
+
     /// Toasts are the last thing painted, on top of every other surface.
     #[test]
     fn render_content_paints_toast_via_shell_app() {
@@ -18824,7 +20240,15 @@ mod tests {
         const WIDTH: u16 = 120;
         const HEIGHT: u16 = 40;
 
-        let dir = std::env::temp_dir().join(format!(
+        // Canonicalize the temp root before joining: on macOS
+        // `std::env::temp_dir()` returns a path under `/var/folders/...`,
+        // and `/var` is a symlink to `/private/var`. `file_a` is opened
+        // below by this un-canonicalized path, but the diagnostic is keyed
+        // by `file_a.canonicalize()` — without canonicalizing here first,
+        // those two paths differ (`/var/...` vs `/private/var/...`), the
+        // lookup misses, no diagnostic renders, and the gutter click this
+        // test exercises never opens the popup it's asserting on (#1350).
+        let dir = std::env::temp_dir().canonicalize().unwrap().join(format!(
             "vimcode_test_1292_gutter_prev_{:?}",
             std::thread::current().id()
         ));
@@ -24051,6 +25475,630 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── #1344: extension install exit status / combined LSP+DAP outcome —
+    // black-box coverage ──────────────────────────────────────────────────
+    //
+    // The first review pass on #1344 asserted only on `Engine::message`
+    // directly, via `Engine::new()` + a hand-built `InstallContext` calling
+    // the private `finalize_install_from_terminal` (see the `tests` module
+    // at the bottom of `src/core/engine/terminal_ops.rs`) — internal state,
+    // never anything painted. Exactly the anti-pattern `no_install_command_
+    // error_paints_on_command_line_via_shell_app` (#918) above already
+    // documents CLAUDE.md's Testing section calling out. The two tests
+    // below close that gap for #1344's two user-visible message changes by
+    // driving the *real* install path — `Engine::ext_install_from_registry`
+    // (which sets `pending_terminal_command`/`pending_install_context`,
+    // exactly as `:ExtInstall` does) through a real `TuiShellApp` +
+    // `driver_with_shell`, letting `driver.tick()` spawn the install
+    // terminal pane (a real PTY, `sh -c '...'`) the same way production
+    // does, letting that pane's shell terminate itself (the manifests'
+    // install strings start with `SELF_CLOSING_INSTALL_PREFIX` — see its
+    // doc, and `poll_until_screen`'s, for why synthesising a keypress
+    // instead is unsafe and was the #1345 smoke flake) so `poll_terminal`
+    // calls `finalize_install_from_terminal` for real, and reading the
+    // painted command line back with `driver.screen()`.
+    //
+    // Both commands use `sh` builtins/paths guaranteed present on any Unix
+    // box that can build vimcode (no `curl`/`pip`/network involved), and
+    // `#[cfg(unix)]`-gate for the same reason `tests/terminal_wheel.rs`'s
+    // real-PTY tests do: a Windows wrapper flavour (PowerShell) is covered
+    // separately by the pure-function tests in `terminal_ops.rs`'s own
+    // `tests` module.
+
+    /// Poll `driver.tick()` (which reaches `Engine::poll_idle` →
+    /// `poll_terminal` exactly as a live TUI event loop does) until
+    /// `predicate(driver.screen())` holds or `timeout` elapses. Real
+    /// `thread::sleep` between polls, matching the bounded-not-fixed pattern
+    /// `tick_refreshes_sc_panel_asynchronously_not_on_the_event_loop_thread`
+    /// above already uses for a background thread — this is a real PTY
+    /// child process instead, but the same "don't busy-loop, don't hang the
+    /// suite" tradeoff applies.
+    ///
+    /// # Why this sends no keystrokes (#1345 smoke-failure fix)
+    ///
+    /// It used to. `build_terminal_install_wrapper` ends every install
+    /// script with `echo 'Press Enter to close…'` / `read __dummy` /
+    /// `exit`, so the pane's shell parks on `read` until *something*
+    /// answers it, and only then exits — and only a pane exit makes
+    /// `poll_terminal` call `finalize_install_from_terminal`, which paints
+    /// the messages these tests assert on. This loop therefore used to
+    /// synthesise that answer itself, typing `exit` + Enter into the
+    /// focused pane on a backoff schedule, gated on the terminal panel
+    /// still being painted.
+    ///
+    /// That stimulus is *fundamentally* unsafe here, and the gate could
+    /// only narrow the window, never close it: `Engine::handle_key` clears
+    /// `self.message` on **any** keypress (`keys.rs`, "Clear message on any
+    /// keypress"), so the instant the pane is gone a prod lands in the
+    /// editor and wipes the very message under test — permanently, since
+    /// the install runs once. The gate reads *painted* panel presence,
+    /// which cannot be checked atomically with the key delivery that
+    /// follows it, so a prod issued in the same tick that the pane exits
+    /// and the message appears destroys it before any frame shows it. That
+    /// is the reported #1345 smoke failure, reproduced here at ~3% of runs
+    /// of these four tests (`extension_install*`) in parallel and captured
+    /// twice: a 20s timeout ending in `INSERT  [No Name] [+] … Ln 2` — the
+    /// editor holding our own `exit` keystrokes — with an empty command
+    /// line and the "Installing …" spinner still up.
+    ///
+    /// The fix is to stop needing the stimulus: the install commands these
+    /// tests declare in their manifests define a no-op POSIX `read`
+    /// function (`read() { :; } ; …`) as their first act, so the wrapper's
+    /// own `read __dummy` returns immediately, its trailing `exit` runs,
+    /// and the shell terminates **on its own** ~0.0–0.4s later (verified in
+    /// a real PTY under both `bash` and `zsh`, the two `default_shell`
+    /// candidates, with the wrapper's `$?` capture still recording the real
+    /// exit status — the override is defined *before* the command whose
+    /// status is captured). No keystroke is ever sent, so nothing can clear
+    /// the message, and the tests no longer depend on winning a race.
+    ///
+    /// If one of these tests ever times out again with the terminal panel
+    /// still painted and `Press Enter to close…` on screen, the pane's
+    /// shell ignored that override — fix it there (in the manifest's
+    /// install string), not by reinstating a keystroke prod.
+    fn poll_until_screen(
+        driver: &mut quadraui::tui::testing::TuiDriver<impl quadraui::runner::AppLogic>,
+        timeout: Duration,
+        mut predicate: impl FnMut(&str) -> bool,
+    ) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if tick_and_test(driver, &mut predicate) {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Advance the driver one tick, repaint, and report whether `predicate`
+    /// holds on the frame that tick produced.
+    ///
+    /// The explicit `render()` matters: `TuiDriver::tick` only repaints
+    /// when the app's tick returns `Reaction::Redraw`, so after a
+    /// `RedrawAfter`/`Continue` tick `screen()` still shows the *previous*
+    /// frame. Painting unconditionally keeps the predicate reading the
+    /// state the tick just produced.
+    fn tick_and_test(
+        driver: &mut quadraui::tui::testing::TuiDriver<impl quadraui::runner::AppLogic>,
+        predicate: &mut impl FnMut(&str) -> bool,
+    ) -> bool {
+        driver.tick();
+        driver.render();
+        predicate(&driver.screen())
+    }
+
+    /// Prefix for the `install_*` command strings the #1344 driver tests
+    /// declare in their fake manifests: a no-op POSIX `read` override that
+    /// makes `build_terminal_install_wrapper`'s "Press Enter to close…"
+    /// gate self-satisfying, so the install pane's shell exits without any
+    /// synthetic keystroke. See [`poll_until_screen`] for the flake this
+    /// replaces, and why a keystroke can never be safe here.
+    ///
+    /// A shell *function* (not an alias — aliases are not expanded in
+    /// non-interactive reads of a script, and these are typed into an
+    /// interactive shell that has already parsed the line) takes precedence
+    /// over the `read` builtin in `sh`, `bash` and `zsh` alike. It is
+    /// defined ahead of the command under test so the wrapper's
+    /// `__exit_code=$?` still captures that command's real status.
+    #[cfg(unix)]
+    const SELF_CLOSING_INSTALL_PREFIX: &str = "read() { :; } ; ";
+
+    /// #1344 core acceptance case: a non-zero exit code from the install
+    /// command must paint "failed (exit N)" on the command line, and must
+    /// NOT claim "not found on PATH" — the exact confusion #1344 reports
+    /// (a failed install command used to surface only as a misleading
+    /// PATH-lookup miss).
+    ///
+    /// **Verified RED against unfixed `develop`:** before #1344, a non-zero
+    /// exit code was never recorded or read back at all — finalize fell
+    /// straight through to the binary-lookup path and reported "LSP binary
+    /// '...' was not found on PATH" instead, so the `"failed (exit 7)"`
+    /// assertion below failed and the `"not found"` negative assertion
+    /// would have passed for the wrong reason (there was no non-zero-exit
+    /// handling to fail).
+    #[test]
+    #[cfg(unix)]
+    fn extension_install_failure_exit_code_paints_via_shell_app() {
+        use crate::core::extensions::{ExtensionManifest, LspConfig};
+        use crate::core::settings::TestSettingsPathGuard;
+
+        // Point `Engine::check_settings_reload` — which `TuiShellApp::tick`
+        // runs *after* `poll_idle`, and which assigns
+        // `self.message = "Settings reloaded"` — at a private, nonexistent
+        // path. Without this, anything that touches the real
+        // `~/.config/vimcode/settings.json` while this test is polling (the
+        // integration-test binaries `cargo test` runs in parallel processes
+        // are not covered by this crate's `#[cfg(test)]` overrides) wipes
+        // the "failed (exit 7)" message in the same tick that painted it,
+        // and the poll below then times out with a message it can never
+        // see again — observed as this test failing only in a full
+        // `cargo test`, never when run alone. Same guard the #1345
+        // acquisition tests below use.
+        let _settings_guard = TestSettingsPathGuard::install(std::env::temp_dir().join(format!(
+            "vimcode_test_shell_app_1344_fail_settings_{}_{:?}.json",
+            std::process::id(),
+            std::thread::current().id()
+        )));
+
+        let mut app = TuiShellApp::new_for_test();
+        let ext_name = "vimcode-test-ext-1344-fail".to_string();
+        app.engine.ext_registry = Some(vec![ExtensionManifest {
+            name: ext_name.clone(),
+            display_name: "Fake Extension (1344 failure test)".to_string(),
+            language_ids: vec!["vimcode-test-lang-1344-fail".to_string()],
+            lsp: LspConfig {
+                binary: "vimcode-test-nonexistent-binary-1344-fail".to_string(),
+                // A subshell exit, not a bare `exit 7` — the latter would
+                // terminate the *outer* interactive shell before the
+                // wrapper's own `$?`-capture line ever ran, so no exit code
+                // would be recorded and there would be nothing to report.
+                //
+                // `SELF_CLOSING_INSTALL_PREFIX` is what lets the pane's
+                // shell then reach that wrapper's trailing `exit` with no
+                // synthetic keypress — see its doc, and
+                // `poll_until_screen`'s, for why a keypress here is what
+                // made this test flake.
+                install: format!("{SELF_CLOSING_INSTALL_PREFIX}sh -c 'exit 7'"),
+                ..Default::default()
+            },
+            ..Default::default()
+        }]);
+
+        app.engine.ext_install_from_registry(&ext_name);
+        assert!(
+            app.engine.pending_terminal_command.is_some(),
+            "precondition: the manifest's install command must be queued"
+        );
+
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+
+        assert!(
+            poll_until_screen(&mut driver, Duration::from_secs(20), |screen| {
+                screen.contains("failed (exit 7)")
+            }),
+            "command line never painted the failed-install message; screen:\n{}",
+            driver.screen()
+        );
+
+        let screen = driver.screen();
+        assert!(
+            !screen.to_lowercase().contains("not found"),
+            "a failed install must not also claim the binary was 'not \
+             found on PATH' — that points at the wrong problem; screen:\n{screen}"
+        );
+    }
+
+    /// #1344 blocking review finding: a manifest that declares both an LSP
+    /// server and a DAP adapter (the `rust` shape in
+    /// `extensions::sample_manifests()` — `lsp.binary` *and*
+    /// `dap.adapter`/`dap.binary` both set) must not have a successful LSP
+    /// install message wiped out by a DAP binary that isn't resolvable.
+    /// Before this fix, `finalize_install_from_terminal` assigned straight
+    /// into `self.message` for each of the LSP/DAP checks in turn, so the
+    /// DAP block always overwrote whatever the LSP block had just set.
+    ///
+    /// Uses `sh` (guaranteed on any Unix box that can build vimcode) as the
+    /// "LSP binary" so the LSP install-time check finds it already on PATH
+    /// (no install command queued for it), and a nonexistent binary for the
+    /// DAP side so the DAP install runs but its own binary check still
+    /// fails — reproducing the "LSP already there, DAP fresh install
+    /// unresolvable" combination the review flagged as realistic and
+    /// untested.
+    ///
+    /// **Verified RED against unfixed `develop`:** reverting the `outcomes`
+    /// join back to sequential `self.message = format!(...)` assignments
+    /// makes the DAP block's "was not found" message the final value of
+    /// `self.message`, so the `"installed and started"` assertion below
+    /// fails — the LSP success text never reaches the screen at all.
+    #[test]
+    #[cfg(unix)]
+    fn extension_install_lsp_success_survives_dap_not_found_via_shell_app() {
+        use crate::core::extensions::{DapConfig, ExtensionManifest, LspConfig};
+        use crate::core::settings::TestSettingsPathGuard;
+
+        // See the sibling test above for why `check_settings_reload` is
+        // pointed away from the real settings file: this test asserts on
+        // `self.message` too, and is equally exposed to a concurrent
+        // "Settings reloaded" wiping it mid-poll.
+        let _settings_guard = TestSettingsPathGuard::install(std::env::temp_dir().join(format!(
+            "vimcode_test_shell_app_1344_combined_settings_{}_{:?}.json",
+            std::process::id(),
+            std::thread::current().id()
+        )));
+
+        let mut app = TuiShellApp::new_for_test();
+        let ext_name = "vimcode-test-ext-1344-combined".to_string();
+        app.engine.ext_registry = Some(vec![ExtensionManifest {
+            name: ext_name.clone(),
+            display_name: "Fake Extension (1344 combined test)".to_string(),
+            language_ids: vec!["vimcode-test-lang-1344-combined".to_string()],
+            lsp: LspConfig {
+                binary: "sh".to_string(),
+                ..Default::default()
+            },
+            dap: DapConfig {
+                adapter: "vimcode-test-dap-adapter-1344-combined".to_string(),
+                binary: "vimcode-test-nonexistent-dap-binary-1344-combined".to_string(),
+                // Succeeds (exit 0, so finalize runs the binary checks
+                // rather than reporting a failed command) and closes its own
+                // pane — see `SELF_CLOSING_INSTALL_PREFIX`.
+                install: format!("{SELF_CLOSING_INSTALL_PREFIX}true"),
+                ..Default::default()
+            },
+            ..Default::default()
+        }]);
+
+        app.engine.ext_install_from_registry(&ext_name);
+        assert!(
+            app.engine.pending_terminal_command.is_some(),
+            "precondition: the manifest's DAP install command must be queued \
+             (LSP's `sh` binary should already resolve, so only DAP installs)"
+        );
+
+        // Wider than the other #1344 driver tests: the combined LSP+DAP
+        // message is long (extension name repeated, plus every probed tool
+        // directory named in the DAP outcome), and a narrower row would
+        // truncate it before the "was not found" text this test checks for
+        // — a real single-line status-bar constraint, not something the fix
+        // needs to solve.
+        let mut driver = driver_with_shell(app, config(), 400, 24);
+
+        assert!(
+            poll_until_screen(&mut driver, Duration::from_secs(20), |screen| {
+                screen.contains("was not found")
+            }),
+            "command line never painted the DAP-not-found message; screen:\n{}",
+            driver.screen()
+        );
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("installed and started"),
+            "the LSP success message must survive alongside the DAP \
+             not-found message, not be overwritten by it; screen:\n{screen}"
+        );
+    }
+
+    // ── #1345: native tool acquisition — driver-tier black-box coverage ──
+    //
+    // Review finding: the only prior coverage for #1345's user-visible
+    // behaviour (a new "Acquiring X…" notification, a new no-terminal
+    // install path, a new post-install status message) drove `Engine`
+    // directly and asserted on internal state
+    // (`tests/extensions.rs::ext_install_with_acquire_runs_no_terminal_
+    // command_and_registers_lsp`), never on painted output. These two
+    // tests close that gap the same way the #1344 tests above do for the
+    // terminal-install path: real `TuiShellApp` + `driver_with_shell`,
+    // assertions on `driver.screen()`.
+    //
+    // `VIMCODE_TEST_DATA_HOME` is also mutated by `core::paths`' and
+    // `core::tool_acquire`'s own tests in this same shared `--lib` binary,
+    // so this uses `paths::VIMCODE_TEST_DATA_HOME_LOCK` rather than a
+    // module-local mutex — see that lock's doc comment for the race a
+    // module-local one produced in practice (a `tool_acquire::tests` test
+    // observed a real, non-test data dir while a `shell_app::tests` test
+    // using its own separate lock was concurrently restoring the var).
+    use crate::core::paths::VIMCODE_TEST_DATA_HOME_LOCK as TOOL_ACQUIRE_ENV_LOCK;
+
+    /// RAII guard: snapshot + restore an environment variable across a test.
+    struct AcquireEnvVarGuard {
+        key: &'static str,
+        old: Option<std::ffi::OsString>,
+    }
+
+    impl AcquireEnvVarGuard {
+        fn set(key: &'static str, value: &std::ffi::OsStr) -> Self {
+            let old = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, old }
+        }
+    }
+
+    impl Drop for AcquireEnvVarGuard {
+        fn drop(&mut self) {
+            match self.old.take() {
+                Some(v) => std::env::set_var(self.key, v),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
+    /// Build a throwaway zip fixture containing a single entry — mirrors
+    /// `tests/extensions.rs`'s `make_fixture_zip`, duplicated here rather
+    /// than shared because integration tests and this crate's own `--lib`
+    /// unit tests are separate compilation units.
+    fn make_acquire_fixture_zip(
+        dir: &std::path::Path,
+        entry_name: &str,
+        contents: &[u8],
+    ) -> std::path::PathBuf {
+        let path = dir.join("archive.zip");
+        let file = std::fs::File::create(&path).unwrap();
+        let mut writer = zip::ZipWriter::new(file);
+        let options: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default();
+        writer.start_file(entry_name, options).unwrap();
+        std::io::Write::write_all(&mut writer, contents).unwrap();
+        writer.finish().unwrap();
+        path
+    }
+
+    /// #1345 core acceptance, painted: a manifest declaring `[lsp.acquire]`
+    /// and no `install_*` must (1) paint "Acquiring …" immediately — no
+    /// terminal pane opens, confirmed via `pending_terminal_command` before
+    /// the driver is even built — and (2) once the background download/
+    /// verify/unpack completes (driven by `driver.tick()` →
+    /// `Engine::poll_idle` → `poll_tool_acquire`, exactly like a live event
+    /// loop), paint the "installed and started" status line.
+    ///
+    /// Verified RED against unfixed `develop`: reverting #1345's engine
+    /// wiring (no `acquire` branch in `ext_install_from_registry`) leaves
+    /// `status_parts` empty and nothing native ever runs, so neither string
+    /// below is ever painted and `poll_until_screen` times out.
+    #[test]
+    fn extension_install_with_acquire_paints_acquiring_then_installed_via_shell_app() {
+        use crate::core::extensions::{ExtensionManifest, LspConfig};
+        use crate::core::settings::TestSettingsPathGuard;
+        use crate::core::tool_acquire::{AcquireConfig, AcquireKind};
+
+        let _lock = TOOL_ACQUIRE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        // Points `Engine::check_settings_reload` (polled every `tick()`,
+        // see `TuiShellApp::tick`) at a private, nonexistent path instead of
+        // the real `~/.config/vimcode/settings.json` — otherwise a
+        // concurrently-running test elsewhere in this shared `--lib` binary
+        // that legitimately writes the real settings file mid-`poll_until_
+        // screen` can fire a real "Settings reloaded" reload, overwriting
+        // `self.message` out from under this test's own assertions
+        // (observed directly: flaked with the real "installed and started"
+        // message replaced by "Settings reloaded" when run alongside
+        // `terminal_ops`/`lsp_ops` tests). Mirrors `app.rs`'s
+        // `handle_poll_tick_reloads_settings_changed_on_disk` — see
+        // `TestSettingsPathGuard`'s doc for why a thread-local override
+        // rather than a `$HOME` mutation.
+        let _settings_guard = TestSettingsPathGuard::install(std::env::temp_dir().join(format!(
+            "vimcode_test_shell_app_acquire_settings_{}_{:?}.json",
+            std::process::id(),
+            std::thread::current().id()
+        )));
+
+        let data_home = std::env::temp_dir().join(format!(
+            "vimcode_test_shell_app_acquire_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&data_home);
+        std::fs::create_dir_all(&data_home).unwrap();
+        let _data_home_guard =
+            AcquireEnvVarGuard::set("VIMCODE_TEST_DATA_HOME", data_home.as_os_str());
+
+        let fixture_dir = std::env::temp_dir().join(format!(
+            "vimcode_test_shell_app_acquire_fixture_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&fixture_dir);
+        std::fs::create_dir_all(&fixture_dir).unwrap();
+        let binary_name = "vimcode-test-shell-acquire-lsp-1345";
+        let archive = make_acquire_fixture_zip(&fixture_dir, binary_name, b"#!fake-lsp-server");
+
+        let mut app = TuiShellApp::new_for_test();
+        let ext_name = "vimcode-test-shell-acquire-ext-1345".to_string();
+        app.engine.ext_registry = Some(vec![ExtensionManifest {
+            name: ext_name.clone(),
+            display_name: "Acquire Test Extension (shell_app)".to_string(),
+            language_ids: vec!["vimcode-test-shell-acquire-lang-1345".to_string()],
+            lsp: LspConfig {
+                binary: binary_name.to_string(),
+                acquire: Some(AcquireConfig {
+                    kind: AcquireKind::UrlTemplate,
+                    url: format!("file://{}", archive.display()),
+                    version: "1.0.0".to_string(),
+                    binary_path: binary_name.to_string(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            ..Default::default()
+        }]);
+
+        app.engine.ext_install_from_registry(&ext_name);
+        assert!(
+            app.engine.pending_terminal_command.is_none(),
+            "native acquisition must queue no shell command"
+        );
+
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        driver.render();
+        assert!(
+            driver.screen().to_lowercase().contains("acquiring"),
+            "status line never painted the 'Acquiring …' message; screen:\n{}",
+            driver.screen()
+        );
+
+        assert!(
+            poll_until_screen(&mut driver, Duration::from_secs(20), |screen| {
+                screen.contains("installed and started")
+            }),
+            "command line never painted the finalize message; screen:\n{}",
+            driver.screen()
+        );
+
+        let _ = std::fs::remove_dir_all(&data_home);
+        let _ = std::fs::remove_dir_all(&fixture_dir);
+    }
+
+    /// #1345 review finding: a manifest with both `[lsp.acquire]` and
+    /// `[dap.acquire]` spawns two concurrent background acquisitions, and
+    /// the second leg's outcome must not silently erase the first's status
+    /// text — whether the two land in the same `poll_tool_acquire` tick
+    /// (common for two near-instant `file://` fixtures spawned back to
+    /// back) or in different ticks, which is what actually happens
+    /// whenever the two threads are scheduled even slightly apart. The
+    /// same "DAP outcome clobbering LSP success" class already
+    /// fixed for the terminal-install path (#1344,
+    /// `extension_install_lsp_success_survives_dap_not_found_via_shell_app`
+    /// above), reproduced here for the native-acquisition path this PR
+    /// adds.
+    ///
+    /// The DAP leg's archive deliberately doesn't contain `binary_path`,
+    /// so its acquisition fails with an `Archive` error while the LSP leg
+    /// succeeds — reproducing the realistic "one leg succeeds, one leg
+    /// fails" combination.
+    ///
+    /// Verified RED against `finalize_tool_acquire_group` reverted to
+    /// per-outcome `self.message = format!(...)` assignments (this PR's
+    /// pre-fix shape): whichever leg's background thread happens to send
+    /// its outcome second overwrites `self.message` outright, so one of
+    /// the two assertions below fails depending on completion order —
+    /// exactly the flake-shaped symptom the review flagged. Also verified
+    /// RED against the intermediate, same-tick-only join (accumulate
+    /// within one `poll_tool_acquire` call, assign straight into
+    /// `self.message`): that shape failed 2 of 4 consecutive full `--lib`
+    /// runs here, because two legs landing one tick apart still clobber.
+    /// `core::engine::lsp_ops::tests::tool_acquire_outcomes_in_separate_
+    /// ticks_keep_both_messages` pins the cross-tick half of that
+    /// deterministically; this test is the painted-output half.
+    #[test]
+    fn extension_install_lsp_acquire_success_survives_dap_acquire_failure_via_shell_app() {
+        use crate::core::extensions::{DapConfig, ExtensionManifest, LspConfig};
+        use crate::core::settings::TestSettingsPathGuard;
+        use crate::core::tool_acquire::{AcquireConfig, AcquireKind};
+
+        let _lock = TOOL_ACQUIRE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        // See the sibling test above for why this points `check_settings_
+        // reload` away from the real settings file.
+        let _settings_guard = TestSettingsPathGuard::install(std::env::temp_dir().join(format!(
+            "vc_test_acq_combined_settings_{}_{:?}.json",
+            std::process::id(),
+            std::thread::current().id()
+        )));
+
+        let data_home =
+            std::env::temp_dir().join(format!("vc_test_acq_combined_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&data_home);
+        std::fs::create_dir_all(&data_home).unwrap();
+        let _data_home_guard =
+            AcquireEnvVarGuard::set("VIMCODE_TEST_DATA_HOME", data_home.as_os_str());
+
+        let fixture_dir = std::env::temp_dir().join(format!(
+            "vc_test_acq_combined_fixture_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&fixture_dir);
+        std::fs::create_dir_all(&fixture_dir).unwrap();
+
+        let lsp_binary_name = "vc-acq-lsp-1345";
+        let lsp_archive =
+            make_acquire_fixture_zip(&fixture_dir, lsp_binary_name, b"#!fake-lsp-server");
+
+        // A second, distinct archive whose one entry deliberately does NOT
+        // match the DAP leg's `binary_path` below, so extraction fails with
+        // `AcquireError::Archive("... not found in archive")`.
+        let dap_fixture_dir = fixture_dir.join("dap");
+        std::fs::create_dir_all(&dap_fixture_dir).unwrap();
+        let dap_archive =
+            make_acquire_fixture_zip(&dap_fixture_dir, "unrelated-entry", b"#!fake-dap-adapter");
+        let dap_binary_name = "vc-acq-dap-1345";
+
+        let mut app = TuiShellApp::new_for_test();
+        let ext_name = "vc-acq-ext-1345".to_string();
+        app.engine.ext_registry = Some(vec![ExtensionManifest {
+            name: ext_name.clone(),
+            display_name: "Acquire Combined Test Extension (shell_app)".to_string(),
+            language_ids: vec!["vc-acq-lang-1345".to_string()],
+            lsp: LspConfig {
+                binary: lsp_binary_name.to_string(),
+                acquire: Some(AcquireConfig {
+                    kind: AcquireKind::UrlTemplate,
+                    url: format!("file://{}", lsp_archive.display()),
+                    version: "1.0.0".to_string(),
+                    binary_path: lsp_binary_name.to_string(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            dap: DapConfig {
+                adapter: "vc-acq-adapter-1345".to_string(),
+                binary: dap_binary_name.to_string(),
+                acquire: Some(AcquireConfig {
+                    kind: AcquireKind::UrlTemplate,
+                    url: format!("file://{}", dap_archive.display()),
+                    version: "1.0.0".to_string(),
+                    binary_path: dap_binary_name.to_string(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            ..Default::default()
+        }]);
+
+        app.engine.ext_install_from_registry(&ext_name);
+        assert!(
+            app.engine.pending_terminal_command.is_none(),
+            "native acquisition must queue no shell command"
+        );
+
+        // Wide row (mirrors `extension_install_lsp_success_survives_dap_
+        // not_found_via_shell_app` above): the joined LSP+DAP message is
+        // long, and a narrower row would truncate it before the "failed to
+        // acquire" text this test checks for.
+        let mut driver = driver_with_shell(app, config(), 300, 24);
+
+        // Wait for *both* legs, not just the first one to paint: the two
+        // background threads are not synchronised, so which of them lands
+        // first — and whether they land in the same `poll_tool_acquire`
+        // tick at all — varies run to run. Polling on the conjunction is
+        // what makes the assertion below order-independent; polling on the
+        // DAP failure alone and then asserting the LSP success was already
+        // on screen is a race that fails whenever the LSP leg is the
+        // slower of the two (observed: 2 of 4 consecutive full `--lib`
+        // runs).
+        let both_painted = poll_until_screen(&mut driver, Duration::from_secs(20), |screen| {
+            screen.contains("failed to acquire") && screen.contains("installed and started")
+        });
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("failed to acquire"),
+            "command line never painted the DAP acquisition failure; screen:\n{screen}"
+        );
+        assert!(
+            both_painted && screen.contains("installed and started"),
+            "the LSP acquisition success message must survive alongside the \
+             DAP acquisition failure, not be overwritten by it — neither \
+             within one poll tick nor across two; screen:\n{screen}"
+        );
+
+        let _ = std::fs::remove_dir_all(&data_home);
+        let _ = std::fs::remove_dir_all(&fixture_dir);
     }
 
     // ── #990: v0.11.0 TUI minimap rendering bug suite ───────────────────

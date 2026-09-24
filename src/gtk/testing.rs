@@ -4741,6 +4741,1146 @@ second line here
             "scrolling up over the panel must reveal earlier messages (#819)"
         );
     }
+
+    /// #952 (ACP-1): a live ACP agent's `session/update` chunks must reach
+    /// the AI panel transcript incrementally through the real
+    /// `App`/`GtkDriver` stack — GTK's twin of
+    /// `tui_main::shell_app::tests::
+    /// ai_panel_streams_acp_thought_and_message_chunks_via_shell_app`. The
+    /// fixture's `agent_thought_chunk` and two `agent_message_chunk`s must
+    /// land as two visually distinct transcript turns (thought under
+    /// quadraui's `System` role label, message under `AI`) once the turn
+    /// completes.
+    ///
+    /// `GtkDriver` has no `tick()` (unlike `TuiDriver` — GTK's poll_idle is
+    /// driven by a `glib` timer this headless harness never runs), so the
+    /// background agent's progress is drained directly via
+    /// `Engine::poll_acp` (reachable through `h.engine`'s exposed
+    /// `Rc<RefCell<Engine>>`, unlike `TuiDriver`'s opaque handle) and each
+    /// poll is followed by an explicit `h.driver.render()` to repaint —
+    /// the same "poll state, force a repaint, sample the screen" shape
+    /// `ai_panel_scrolls_transcript` above already uses for its seeded
+    /// transcript.
+    ///
+    /// RED verified the same way as the TUI twin: reverting
+    /// `Engine::poll_acp`'s `SessionUpdate` handler to read
+    /// `sessionUpdate`/`content.text` directly off the notification's
+    /// `params` object (skipping the nested `update` field) makes this
+    /// test fail — the transcript never grows past the just-typed user
+    /// turn within the 5s deadline, because `session_update_chunk` silently
+    /// returns `None` for every chunk.
+    #[cfg(unix)]
+    #[test]
+    fn ai_panel_streams_acp_thought_and_message_chunks() {
+        let mut h = panel_harness(PANEL_AI);
+        {
+            let mut engine = h.engine.borrow_mut();
+            let argv = vec![
+                "sh".to_string(),
+                concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/tests/fixtures/fake_acp_agent.sh"
+                )
+                .to_string(),
+            ];
+            let cwd = std::env::temp_dir();
+            let mut client = crate::core::acp::AcpClient::spawn_with_env(
+                &argv,
+                &cwd,
+                &[("ACP_FAKE_NO_TOOL_REQUEST", "1")],
+            )
+            .expect("fixture agent should spawn");
+            client.initialize();
+            engine.acp_client = Some(client);
+            // Only needs to be non-empty: routing checks emptiness to pick
+            // the transport, but the client above already exists, so
+            // `ai_send_message` takes the "reuse existing client" branch,
+            // never reading this value to spawn anything.
+            engine.settings.acp_agent_command = "already-spawned-above".to_string();
+        }
+
+        let sb = h.painted_sidebar_bounds.get().unwrap();
+        h.driver.click(sb.x + 20.0, sb.y + 20.0);
+        for c in "hello agent".chars() {
+            h.driver.type_char(c);
+        }
+        h.driver.ctrl_char('s');
+
+        assert!(
+            h.driver.screen_contains("hello agent"),
+            "the submitted user turn must appear immediately"
+        );
+
+        // Bounded poll-and-repaint loop, matching
+        // `tick_refreshes_sc_panel_asynchronously_not_on_the_event_loop_thread`'s
+        // shape for a background thread/subprocess this harness doesn't
+        // drive on its own.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !h.driver.screen_contains("Hello world") && std::time::Instant::now() < deadline {
+            h.engine.borrow_mut().poll_acp();
+            h.driver.render();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        assert!(
+            h.driver.screen_contains("Hello world"),
+            "the two agent_message_chunk notifications must stream into the \
+             transcript within 5s"
+        );
+        assert!(
+            h.driver.screen_contains("pondering the question"),
+            "the agent_thought_chunk must also reach the transcript, not be \
+             dropped as an unrecognized update kind"
+        );
+        assert!(
+            h.driver.screen_contains("System"),
+            "the thought turn renders under ChatRole::System -- a role \
+             header distinct from the message turn's \"AI\" label, per \
+             ACP-1's \"thought chunks visually distinct from message \
+             chunks\" acceptance criterion"
+        );
+    }
+
+    /// #953 (ACP-2): `session/request_permission` on GTK, the twin of
+    /// `tui_main::shell_app::tests::
+    /// ai_panel_shows_permission_dialog_and_resumes_turn_on_selection_via_shell_app`.
+    ///
+    /// The `"acp_permission"` dialog has buttons only, no text input, so —
+    /// same as `quit_unsaved` in `native_dialog_presented_exactly_once_
+    /// across_repeated_frames` above — `quadraui::native_dialog_options`
+    /// takes it native on GTK: it never paints in-canvas, so this asserts
+    /// on the queued `MessageDialogOptions` (title/body/buttons) rather
+    /// than painted pixels, exactly like that sibling test's established
+    /// pattern for this exact shape of dialog. `GtkDriver` never pumps a
+    /// live native `AlertDialog` window (that module's own doc), so the
+    /// human's choice is simulated the same way `App::
+    /// run_pending_native_dialog` maps a real one back —
+    /// `Engine::dialog_click_button`.
+    ///
+    /// RED verified the same way as the TUI twin: with the
+    /// `"acp_permission"` arm of `Engine::process_dialog_result` reverted
+    /// to the default no-op, this test times out waiting for
+    /// `ai_streaming` to clear — the fixture stays blocked on its
+    /// `read -r _reply` forever.
+    #[cfg(unix)]
+    #[test]
+    fn ai_panel_shows_permission_dialog_and_resumes_turn_on_selection() {
+        let mut h = panel_harness(PANEL_AI);
+        {
+            let mut engine = h.engine.borrow_mut();
+            let argv = vec![
+                "sh".to_string(),
+                concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/tests/fixtures/fake_acp_agent.sh"
+                )
+                .to_string(),
+            ];
+            let cwd = std::env::temp_dir();
+            let mut client = crate::core::acp::AcpClient::spawn_with_env(
+                &argv,
+                &cwd,
+                &[("ACP_FAKE_REQUEST_PERMISSION", "1")],
+            )
+            .expect("fixture agent should spawn");
+            client.initialize();
+            engine.acp_client = Some(client);
+            engine.settings.acp_agent_command = "already-spawned-above".to_string();
+        }
+
+        let sb = h.painted_sidebar_bounds.get().unwrap();
+        h.driver.click(sb.x + 20.0, sb.y + 20.0);
+        for c in "please edit".chars() {
+            h.driver.type_char(c);
+        }
+        h.driver.ctrl_char('s');
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !h
+            .engine
+            .borrow()
+            .dialog
+            .as_ref()
+            .is_some_and(|d| d.tag == "acp_permission")
+            && std::time::Instant::now() < deadline
+        {
+            h.engine.borrow_mut().poll_acp();
+            h.driver.render();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            h.engine
+                .borrow()
+                .dialog
+                .as_ref()
+                .is_some_and(|d| d.tag == "acp_permission"),
+            "the permission dialog should be open within 5s"
+        );
+        assert!(
+            h.dialog_layout.borrow().is_none(),
+            "a buttons-only dialog with no text input must go native on \
+             GTK, never paint in-canvas (#727)"
+        );
+        let opts = h.pending_native_dialog.take().expect(
+            "the native dialog present must be queued once the permission \
+             dialog opens",
+        );
+        assert_eq!(
+            opts.title, "Edit src/main.rs",
+            "the tool call's title must reach the native dialog options"
+        );
+        assert!(
+            opts.body.contains("edit"),
+            "the tool call's kind must be visible so a human has something \
+             to decide on: {opts:?}"
+        );
+        assert!(
+            opts.body.contains("src/main.rs:42"),
+            "the tool call's location (path + line) must be visible: {opts:?}"
+        );
+        // Labels carry a bracketed hotkey letter (`[A]llow Once`) —
+        // `dialog_panel_to_quadraui_dialog`'s formatting, same as the
+        // in-canvas TUI dialog's twin test. "Allow Once" and "Always
+        // Allow" both start with 'a'; `acp_handle_permission_request`
+        // de-duplicates hotkeys across a dialog's own buttons (#953
+        // review), so "Always Allow" gets its *next* unclaimed letter
+        // ('l', the first letter after the leading 'a') rather than being
+        // silently unreachable by keyboard.
+        let labels: Vec<&str> = opts.buttons.iter().map(|b| b.label.as_str()).collect();
+        assert_eq!(
+            labels,
+            vec!["[A]llow Once", "A[L]ways Allow", "[R]eject"],
+            "the agent's own options must be presented verbatim, not a \
+             hardcoded yes/no, and each hotkey must be unique within the \
+             dialog"
+        );
+
+        assert!(
+            h.engine.borrow().ai_streaming,
+            "the panel must still be busy while the permission dialog is \
+             open, or the completion check below would pass trivially"
+        );
+
+        // Simulate the human picking "Allow Once" (button index 0).
+        h.engine.borrow_mut().dialog_click_button(0);
+        assert!(
+            h.engine.borrow().dialog.is_none(),
+            "the dialog must close the moment a button is clicked"
+        );
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while h.engine.borrow().ai_streaming && std::time::Instant::now() < deadline {
+            h.engine.borrow_mut().poll_acp();
+            h.driver.render();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            !h.engine.borrow().ai_streaming,
+            "the reply must actually reach the (fake) agent and let the \
+             turn resume to completion within 5s"
+        );
+    }
+
+    /// #954 (ACP-3) acceptance: `fs/read_text_file` must serve an open,
+    /// **dirty** buffer's unsaved in-memory content, not stale on-disk
+    /// text — GTK's twin of `tui_main::shell_app::tests::
+    /// fs_read_text_file_serves_dirty_buffer_content_via_shell_app`. Same
+    /// "poll state, force a repaint, sample the screen" shape
+    /// `ai_panel_streams_acp_thought_and_message_chunks` above uses, since
+    /// `GtkDriver` has no `tick()` of its own.
+    ///
+    /// RED verified the same way as the TUI twin: reverting
+    /// `Engine::acp_read_text_file` to always `std::fs::read_to_string`
+    /// makes this fail — the screen shows `"read:on disk"` instead of
+    /// `"read:DIRTYMARKER123"`.
+    #[cfg(unix)]
+    #[test]
+    fn fs_read_text_file_serves_dirty_buffer_content() {
+        let dir = std::env::temp_dir().join(format!("acp3-gtk-read-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_path = dir.join("dirty.txt");
+        std::fs::write(&file_path, "on disk").unwrap();
+
+        let mut h = panel_harness(PANEL_AI);
+        {
+            let mut engine = h.engine.borrow_mut();
+            engine.workspace_root = Some(dir.clone());
+            let buffer_id = engine
+                .buffer_manager
+                .open_file(&file_path)
+                .expect("should open");
+            {
+                let state = engine.buffer_manager.get_mut(buffer_id).unwrap();
+                let len = state.buffer.content.len_chars();
+                state.buffer.content.remove(0..len);
+                state.buffer.content.insert(0, "DIRTYMARKER123");
+                state.dirty = true;
+            }
+
+            let path_str = file_path.to_string_lossy().into_owned();
+            let argv = vec![
+                "sh".to_string(),
+                concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/tests/fixtures/fake_acp_agent.sh"
+                )
+                .to_string(),
+            ];
+            let cwd = std::env::temp_dir();
+            let mut client = crate::core::acp::AcpClient::spawn_with_env(
+                &argv,
+                &cwd,
+                &[("ACP_FAKE_FS_READ_PATH", path_str.as_str())],
+            )
+            .expect("fixture agent should spawn");
+            client.initialize();
+            engine.acp_client = Some(client);
+            engine.settings.acp_agent_command = "already-spawned-above".to_string();
+        }
+
+        let sb = h.painted_sidebar_bounds.get().unwrap();
+        h.driver.click(sb.x + 20.0, sb.y + 20.0);
+        for c in "please read".chars() {
+            h.driver.type_char(c);
+        }
+        h.driver.ctrl_char('s');
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !h.driver.screen_contains("read:DIRTYMARKER123")
+            && std::time::Instant::now() < deadline
+        {
+            h.engine.borrow_mut().poll_acp();
+            h.driver.render();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        assert!(
+            h.driver.screen_contains("read:DIRTYMARKER123"),
+            "the agent's fs/read_text_file reply must carry the dirty \
+             buffer's unsaved content within 5s"
+        );
+        assert!(
+            !h.driver.screen_contains("read:on disk"),
+            "must never serve stale on-disk content for an open, dirty buffer"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #956 (ACP-5) acceptance: "Mode switch round-trips via
+    /// `session/set_mode` and the displayed mode follows
+    /// `current_mode_update`." GTK's twin of the mode-related unit coverage
+    /// in `core::acp`/`core::engine::acp_ops`, but through the real
+    /// `App`/`GtkDriver` stack: `:AiMode <name>` (the real ex-command path,
+    /// not calling `Engine::acp_set_mode` directly) must reach the agent
+    /// via `session/set_mode`, and the header must only flip to the new
+    /// mode once the fixture's `current_mode_update` notification — not the
+    /// request's own (empty) response — lands.
+    ///
+    /// RED verified: with `Engine::acp_handle_session_update`'s
+    /// `current_mode_update` arm deleted (so the notification is silently
+    /// dropped as an unrecognized update kind, the same "forward-compatible
+    /// no-op" fate `tool_call` still gets), this test fails — the header
+    /// stays on "mode: Code" forever even though the fixture did reply to
+    /// `session/set_mode` and did emit the notification.
+    #[cfg(unix)]
+    #[test]
+    fn ai_panel_mode_switch_round_trips_via_session_set_mode() {
+        let mut h = panel_harness(PANEL_AI);
+        {
+            let mut engine = h.engine.borrow_mut();
+            let argv = vec![
+                "sh".to_string(),
+                concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/tests/fixtures/fake_acp_agent.sh"
+                )
+                .to_string(),
+            ];
+            let cwd = std::env::temp_dir();
+            let mut client = crate::core::acp::AcpClient::spawn_with_env(
+                &argv,
+                &cwd,
+                &[("ACP_FAKE_SESSION_MODES", "1")],
+            )
+            .expect("fixture agent should spawn");
+            client.initialize();
+            engine.acp_client = Some(client);
+            engine.settings.acp_agent_command = "already-spawned-above".to_string();
+        }
+
+        // Drive the handshake (initialize -> session/new) so `session/new`'s
+        // `modes` field lands and the panel has a session id to address
+        // `session/set_mode` to.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !h.driver.screen_contains("mode: Code") && std::time::Instant::now() < deadline {
+            h.engine.borrow_mut().poll_acp();
+            h.driver.render();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            h.driver.screen_contains("mode: Code"),
+            "session/new's modes.currentModeId must render in the status \
+             header within 5s"
+        );
+
+        // The real ex-command path, not a direct `acp_set_mode` call.
+        h.engine.borrow_mut().execute_command("AiMode plan");
+        h.driver.render();
+        assert!(
+            h.driver.screen_contains("mode: Code"),
+            "the displayed mode must NOT change optimistically just because \
+             the request was sent -- only `current_mode_update` may change \
+             it"
+        );
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !h.driver.screen_contains("mode: Plan") && std::time::Instant::now() < deadline {
+            h.engine.borrow_mut().poll_acp();
+            h.driver.render();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            h.driver.screen_contains("mode: Plan"),
+            "the fixture's current_mode_update notification must flip the \
+             displayed mode within 5s of the session/set_mode round trip"
+        );
+    }
+
+    /// #958 (ACP-7) acceptance, GTK's twin of `tui_main::shell_app::tests::
+    /// ai_panel_switches_between_registered_agents_via_ai_agent_command_
+    /// via_shell_app`: a second, differently-configured
+    /// `settings.acp_agents` entry completes its own independent session,
+    /// and `:AiAgent <name>` (the real ex-command path, via
+    /// `execute_command` — same convention as
+    /// `ai_panel_mode_switch_round_trips_via_session_set_mode` above)
+    /// hands the *next* message to the newly-active profile without
+    /// restarting vimcode. Both registry entries spawn the exact same
+    /// `fake_acp_agent.sh` binary — only their `env` entry
+    /// (`ACP_FAKE_AGENT_LABEL`) differs — proving "a second agent" is a
+    /// config fact flowing through one generic spawn path, not a Rust
+    /// branch on agent identity.
+    ///
+    /// RED verified: pinning `Engine::acp_resolve_agent_launch` to always
+    /// return `settings.acp_agents[0]` (ignoring `acp_active_agent`
+    /// entirely) makes this fail — the second message still greets as
+    /// `Hello_AlphaTag958` after `:AiAgent beta`.
+    #[cfg(unix)]
+    #[test]
+    fn ai_panel_switches_between_registered_agents_via_ai_agent_command_via_gtk_driver() {
+        let mut h = panel_harness(PANEL_AI);
+
+        let fixture = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/fake_acp_agent.sh"
+        );
+        {
+            let mut engine = h.engine.borrow_mut();
+            engine.settings.acp_agents = vec![
+                crate::core::acp::AcpAgentProfile {
+                    name: "alpha".to_string(),
+                    command: format!("sh \"{fixture}\""),
+                    cwd: String::new(),
+                    env: vec![
+                        "ACP_FAKE_NO_TOOL_REQUEST=1".to_string(),
+                        "ACP_FAKE_AGENT_LABEL=AlphaTag958".to_string(),
+                    ],
+                },
+                crate::core::acp::AcpAgentProfile {
+                    name: "beta".to_string(),
+                    command: format!("sh \"{fixture}\""),
+                    cwd: String::new(),
+                    env: vec![
+                        "ACP_FAKE_NO_TOOL_REQUEST=1".to_string(),
+                        "ACP_FAKE_AGENT_LABEL=BetaTag958".to_string(),
+                    ],
+                },
+            ];
+            engine.settings.acp_active_agent = "alpha".to_string();
+        }
+
+        let sb = h.painted_sidebar_bounds.get().unwrap();
+        h.driver.click(sb.x + 20.0, sb.y + 20.0);
+        for c in "hi".chars() {
+            h.driver.type_char(c);
+        }
+        h.driver.ctrl_char('s');
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !h.driver.screen_contains("Hello_AlphaTag958") && std::time::Instant::now() < deadline
+        {
+            h.engine.borrow_mut().poll_acp();
+            h.driver.render();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            h.driver.screen_contains("Hello_AlphaTag958"),
+            "the initially-active agent (alpha) must reply within 5s"
+        );
+
+        h.engine.borrow_mut().execute_command("AiAgent beta");
+
+        h.driver.click(sb.x + 20.0, sb.y + 20.0);
+        for c in "hi again".chars() {
+            h.driver.type_char(c);
+        }
+        h.driver.ctrl_char('s');
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !h.driver.screen_contains("Hello_BetaTag958") && std::time::Instant::now() < deadline
+        {
+            h.engine.borrow_mut().poll_acp();
+            h.driver.render();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            h.driver.screen_contains("Hello_BetaTag958"),
+            "after `:AiAgent beta`, the next message must be answered by \
+             the beta profile within 5s"
+        );
+        assert!(
+            !h.driver.screen_contains("AlphaTag958"),
+            "switching agents ends the old session -- the new agent's \
+             transcript must not still show the previous agent's reply"
+        );
+    }
+
+    /// #955 (ACP-4) acceptance, GTK's twin of `tui_main::shell_app::tests::
+    /// ai_panel_tool_call_status_transitions_via_shell_app`: a tool call's
+    /// transcript summary shows `title` + `kind`, and its status glyph
+    /// reflects the LAST `tool_call_update` (`completed`).
+    ///
+    /// RED verified: with `Engine::acp_apply_tool_call_update`'s status
+    /// assignment commented out, the screen never shows `"[x] execute:"`
+    /// within the deadline (stuck on `"[ ]"`) — same failure shape as the
+    /// TUI test.
+    #[cfg(unix)]
+    #[test]
+    fn ai_panel_tool_call_status_transitions_via_gtk_driver() {
+        let mut h = panel_harness(PANEL_AI);
+        {
+            let mut engine = h.engine.borrow_mut();
+            let argv = vec![
+                "sh".to_string(),
+                concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/tests/fixtures/fake_acp_agent.sh"
+                )
+                .to_string(),
+            ];
+            let cwd = std::env::temp_dir();
+            let mut client = crate::core::acp::AcpClient::spawn_with_env(
+                &argv,
+                &cwd,
+                &[("ACP_FAKE_TOOL_CALL_STATUS_ONLY", "1")],
+            )
+            .expect("fixture agent should spawn");
+            client.initialize();
+            engine.acp_client = Some(client);
+            engine.settings.acp_agent_command = "already-spawned-above".to_string();
+        }
+
+        let sb = h.painted_sidebar_bounds.get().unwrap();
+        h.driver.click(sb.x + 20.0, sb.y + 20.0);
+        for c in "please run tests".chars() {
+            h.driver.type_char(c);
+        }
+        h.driver.ctrl_char('s');
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !h.driver.screen_contains("[x] execute:") && std::time::Instant::now() < deadline {
+            h.engine.borrow_mut().poll_acp();
+            h.driver.render();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            h.driver.screen_contains("[x] execute: Run the tests"),
+            "the tool call's LAST status update (completed) must be the \
+             one rendered, together with its title and kind"
+        );
+        assert!(
+            !h.driver.screen_contains("[ ] execute:") && !h.driver.screen_contains("[~] execute:"),
+            "only the final status should be visible once the turn has \
+             ended"
+        );
+    }
+
+    /// #955 (ACP-4) acceptance, GTK's twin of `tui_main::shell_app::tests::
+    /// ai_panel_tool_call_diff_opens_change_review_and_accept_writes_file_via_shell_app`:
+    /// a `diff` content block opens the change-review surface (a real
+    /// `quadraui::DiffView`, painted through `render::paint_change_review_rung`
+    /// — the same shared function TUI calls), and accepting it writes the
+    /// new text to the real file.
+    ///
+    /// RED verified: with `Engine::acp_open_review_for_diffs` never called
+    /// from `acp_apply_tool_call_update`, the screen never shows `"old
+    /// line"`/`"new line"` and the file on disk is never rewritten — same
+    /// failure shape as the TUI test.
+    #[cfg(unix)]
+    #[test]
+    fn ai_panel_tool_call_diff_opens_change_review_and_accept_writes_file_via_gtk_driver() {
+        let dir = std::env::temp_dir().join(format!("acp4-gtk-tool-call-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("target.txt");
+        std::fs::write(&target, "old line\n").unwrap();
+        let target_str = target.to_string_lossy().into_owned();
+
+        let mut h = panel_harness(PANEL_AI);
+        {
+            let mut engine = h.engine.borrow_mut();
+            engine.workspace_root = Some(dir.clone());
+            let argv = vec![
+                "sh".to_string(),
+                concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/tests/fixtures/fake_acp_agent.sh"
+                )
+                .to_string(),
+            ];
+            let cwd = std::env::temp_dir();
+            let mut client = crate::core::acp::AcpClient::spawn_with_env(
+                &argv,
+                &cwd,
+                &[
+                    ("ACP_FAKE_TOOL_CALL", "1"),
+                    ("ACP_FAKE_TOOL_CALL_PATH", target_str.as_str()),
+                ],
+            )
+            .expect("fixture agent should spawn");
+            client.initialize();
+            engine.acp_client = Some(client);
+            engine.settings.acp_agent_command = "already-spawned-above".to_string();
+        }
+
+        let sb = h.painted_sidebar_bounds.get().unwrap();
+        h.driver.click(sb.x + 20.0, sb.y + 20.0);
+        for c in "please edit".chars() {
+            h.driver.type_char(c);
+        }
+        h.driver.ctrl_char('s');
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !h.driver.screen_contains("old line") && std::time::Instant::now() < deadline {
+            h.engine.borrow_mut().poll_acp();
+            h.driver.render();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            h.driver.screen_contains("old line"),
+            "the change-review surface must paint the diff's oldText"
+        );
+        assert!(
+            h.driver.screen_contains("new line"),
+            "the change-review surface must paint the diff's newText"
+        );
+
+        h.driver.type_char('a');
+        h.driver.render();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::fs::read_to_string(&target).unwrap_or_default() != "new line\n"
+            && std::time::Instant::now() < deadline
+        {
+            h.engine.borrow_mut().poll_acp();
+            h.driver.render();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "new line\n",
+            "accepting the change must write newText to the real file"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #955 (ACP-4) review follow-up, GTK's twin of `tui_main::shell_app::
+    /// tests::ai_panel_tool_call_diff_click_on_row_jumps_to_file_and_line_
+    /// via_shell_app`: "clicking a `location` jumps to that file and line"
+    /// driven through a *real mouse click* (`h.driver.click(x, y)`) against
+    /// the painted diff geometry, not `handle_change_review_key("Return",
+    /// ...)`.
+    ///
+    /// This is also the regression test for the fix this review round
+    /// shipped: before `render::reconcile_change_review_modal_stack`
+    /// existed, a click landing where the activity bar / sidebar chrome
+    /// sits underneath the full-viewport diff overlay never reached
+    /// `App::handle_mouse_click_msg` at all — quadraui's `ShellAdapter::
+    /// handle` claimed it as chrome first (issue #411's exact failure
+    /// shape) — so this deliberately clicks on `"old line"`, which paints
+    /// in the diff's *left* pane starting at column 0, squarely inside
+    /// where the activity bar/sidebar normally live.
+    ///
+    /// RED verified: with the click routed but the surface never
+    /// registered on the modal stack, this click never reached
+    /// `route_and_apply_change_review_click` — the screen kept showing the
+    /// diff/footer instead of jumping, and the on-disk file was never
+    /// touched (same failure shape confirmed live against this branch
+    /// before the modal-stack reconcile was added).
+    #[cfg(unix)]
+    #[test]
+    fn ai_panel_tool_call_diff_click_on_row_jumps_to_file_and_line_via_gtk_driver() {
+        let dir =
+            std::env::temp_dir().join(format!("acp4-gtk-tool-call-click-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("target.txt");
+        std::fs::write(&target, "old line\n").unwrap();
+        let target_str = target.to_string_lossy().into_owned();
+
+        let mut h = panel_harness(PANEL_AI);
+        {
+            let mut engine = h.engine.borrow_mut();
+            engine.workspace_root = Some(dir.clone());
+            let argv = vec![
+                "sh".to_string(),
+                concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/tests/fixtures/fake_acp_agent.sh"
+                )
+                .to_string(),
+            ];
+            let cwd = std::env::temp_dir();
+            let mut client = crate::core::acp::AcpClient::spawn_with_env(
+                &argv,
+                &cwd,
+                &[
+                    ("ACP_FAKE_TOOL_CALL", "1"),
+                    ("ACP_FAKE_TOOL_CALL_PATH", target_str.as_str()),
+                ],
+            )
+            .expect("fixture agent should spawn");
+            client.initialize();
+            engine.acp_client = Some(client);
+            engine.settings.acp_agent_command = "already-spawned-above".to_string();
+        }
+
+        let sb = h.painted_sidebar_bounds.get().unwrap();
+        h.driver.click(sb.x + 20.0, sb.y + 20.0);
+        for c in "please edit".chars() {
+            h.driver.type_char(c);
+        }
+        h.driver.ctrl_char('s');
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !h.driver.screen_contains("old line") && std::time::Instant::now() < deadline {
+            h.engine.borrow_mut().poll_acp();
+            h.driver.render();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            h.driver.screen_contains("old line") && h.driver.screen_contains("new line"),
+            "precondition: change-review surface must be open with both \
+             sides of the diff painted before the click"
+        );
+
+        // A real mouse click on the painted "old line" row, at the exact
+        // geometry `App::route_and_apply_change_review_click` resolves
+        // through `render::route_change_review_click`.
+        let (x, y) = h
+            .driver
+            .find("old line")
+            .unwrap_or_else(|| panic!("diff row 'old line' must be locatable on screen"));
+        h.driver.click(x, y);
+        h.driver.render();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while h.driver.screen_contains("a=accept") && std::time::Instant::now() < deadline {
+            h.driver.render();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        assert!(
+            !h.driver.screen_contains("a=accept"),
+            "clicking a diff row must close the change-review surface \
+             (jump, not accept)"
+        );
+        assert!(
+            !h.driver.screen_contains("new line"),
+            "the surface must be gone — 'new line' (the proposed text) \
+             must no longer paint anywhere on screen"
+        );
+        assert!(
+            h.driver.screen_contains("target.txt"),
+            "the click must have opened target.txt's own tab, proving the \
+             jump landed on the right file"
+        );
+        assert!(
+            h.driver.screen_contains("old line"),
+            "the buffer shown after the jump must be target.txt's real, \
+             unmodified on-disk content ('old line'), not the proposed \
+             ('new line') text — confirming this was a jump, not an accept"
+        );
+
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "old line\n",
+            "a click-to-jump must never write to the file — that's \
+             accept's job, not jump's"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #955 review regression guard, GTK's twin of `tui_main::shell_app::
+    /// tests::change_review_close_restores_chrome_clicks_via_shell_app`:
+    /// once the change-review surface **closes**, its full-viewport
+    /// `quadraui::ModalStack` entry must be gone so shell chrome keeps
+    /// receiving clicks.
+    ///
+    /// `ShellAdapter::handle` hit-tests the modal stack *before* any chrome
+    /// dispatch, and this surface's entry covers the whole viewport, so a
+    /// leftover entry routes every later mouse event straight into
+    /// `App::handle` instead of `AppShell`'s own handling — the activity
+    /// bar stops switching panels for the rest of the session. The defect
+    /// is invisible at the change-review surface itself, which is why it
+    /// needs its own assertion here.
+    ///
+    /// RED verified: with the reconcile put back inside the frame walk's
+    /// `FrameOp::ChangeReview` `else` arm (dead code — `presence.
+    /// change_review` gates the rung out of `render::compose_frame`'s op
+    /// list the moment the surface closes), the Search-icon click below
+    /// never switches the panel.
+    ///
+    /// Opened from a plain `ChangeReviewState::new(vec![ProposedChange
+    /// { .. }])` — the source-agnostic constructor, no ACP — and closed
+    /// through the real click-to-jump path, the close path the review
+    /// finding named.
+    #[test]
+    fn change_review_close_restores_chrome_clicks_via_gtk_driver() {
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_test_955_gtk_review_modal_pop_{:?}",
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("zqxw955.txt");
+        std::fs::write(&target, "old line\n").unwrap();
+
+        let mut engine = Engine::new();
+        engine.cwd = dir.clone();
+        engine.change_review = Some(crate::core::review::ChangeReviewState::new(vec![
+            crate::core::review::ProposedChange {
+                path: target.to_string_lossy().into_owned(),
+                old_text: Some("old line\n".to_string()),
+                new_text: "new line\n".to_string(),
+            },
+        ]));
+        let mut h = harness(engine, 1400, 900);
+        h.driver.render();
+
+        assert!(
+            h.driver.screen_contains("old line") && h.driver.screen_contains("new line"),
+            "precondition: the change-review surface must be open and \
+             painted from the source-agnostic change list"
+        );
+
+        // Close it the way a user would: click a diff row to jump.
+        let (x, y) = h
+            .driver
+            .find("old line")
+            .unwrap_or_else(|| panic!("diff row 'old line' must be locatable on screen"));
+        h.driver.click(x, y);
+        h.driver.render();
+        assert!(
+            !h.driver.screen_contains("a=accept"),
+            "precondition: clicking a diff row must have closed the \
+             change-review surface"
+        );
+
+        // The regression: with the surface closed, a click on the Search
+        // icon must still reach `AppShell`'s activity-bar dispatch.
+        let (sx, sy) = h
+            .driver
+            .find(crate::icons::SEARCH.s())
+            .unwrap_or_else(|| panic!("Search icon must paint on the activity bar"));
+        h.driver.click(sx, sy);
+        h.driver.render();
+        assert!(
+            h.driver.screen_contains("Replace…"),
+            "after the change-review surface closed, an activity-bar click \
+             must still switch panels — a leftover full-viewport ModalStack \
+             entry routes it past AppShell's chrome dispatch entirely"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// How long the two #957 (ACP-6) driver tests below wait on a real
+    /// child process before giving up. Same value, and same rationale, as
+    /// `tui_main::shell_app::tests::ACP_DRIVER_DEADLINE` — see that
+    /// constant's doc comment for why 5s was not enough under full-suite
+    /// load (#957 smoke).
+    const ACP_DRIVER_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
+    /// #957 (ACP-6) acceptance: "with `auth.terminal` advertised against a
+    /// fake agent offering a terminal auth method, ... the method is
+    /// present" and "with the capability not advertised, the method is
+    /// absent" — GTK's twin of `tui_main::shell_app::tests::
+    /// ai_panel_shows_auth_choice_dialog_with_agent_and_terminal_methods_via_shell_app`.
+    ///
+    /// Same buttons-only-dialog shape as `"acp_permission"`
+    /// (`ai_panel_shows_permission_dialog_and_resumes_turn_on_selection`
+    /// above): no text input, so `quadraui::native_dialog_options` takes it
+    /// native — the queued `MessageDialogOptions` is the proof, not
+    /// `engine.dialog`/`engine.acp_auth_methods` state.
+    ///
+    /// RED verified: with `Engine::poll_acp`'s `Initialized` handler
+    /// changed to call `self.acp_begin_session()` unconditionally (skipping
+    /// the `!self.acp_authenticated && !self.acp_auth_methods.is_empty()`
+    /// check), no dialog ever opens and this test times out waiting for one
+    /// — `pending_native_dialog.take()` panics on `None`. Restored before
+    /// committing.
+    #[cfg(unix)]
+    #[test]
+    fn ai_panel_shows_auth_choice_dialog_with_agent_and_terminal_methods() {
+        let mut h = panel_harness(PANEL_AI);
+        {
+            let mut engine = h.engine.borrow_mut();
+            let argv = vec![
+                "sh".to_string(),
+                concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/tests/fixtures/fake_acp_agent.sh"
+                )
+                .to_string(),
+            ];
+            let cwd = std::env::temp_dir();
+            let mut client = crate::core::acp::AcpClient::spawn_with_env(
+                &argv,
+                &cwd,
+                &[("ACP_FAKE_AUTH_METHODS", "1")],
+            )
+            .expect("fixture agent should spawn");
+            client.initialize();
+            engine.acp_client = Some(client);
+            engine.settings.acp_agent_command = "already-spawned-above".to_string();
+        }
+
+        let sb = h.painted_sidebar_bounds.get().unwrap();
+        h.driver.click(sb.x + 20.0, sb.y + 20.0);
+        for c in "hello agent".chars() {
+            h.driver.type_char(c);
+        }
+        h.driver.ctrl_char('s');
+
+        let deadline = std::time::Instant::now() + ACP_DRIVER_DEADLINE;
+        while !h
+            .engine
+            .borrow()
+            .dialog
+            .as_ref()
+            .is_some_and(|d| d.tag == "acp_auth_choice")
+            && std::time::Instant::now() < deadline
+        {
+            h.engine.borrow_mut().poll_acp();
+            h.driver.render();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            h.engine
+                .borrow()
+                .dialog
+                .as_ref()
+                .is_some_and(|d| d.tag == "acp_auth_choice"),
+            "the auth-choice dialog should be open within ACP_DRIVER_DEADLINE"
+        );
+        assert!(
+            h.dialog_layout.borrow().is_none(),
+            "a buttons-only dialog with no text input must go native on \
+             GTK, never paint in-canvas (#727)"
+        );
+        let opts = h.pending_native_dialog.take().expect(
+            "the native dialog present must be queued once the auth-choice \
+             dialog opens",
+        );
+        assert_eq!(
+            opts.title, "Authenticate",
+            "the dialog's title must reach the native dialog options"
+        );
+        assert!(
+            opts.body.contains("ways to sign in"),
+            "the dialog's explanatory body text must be visible: {opts:?}"
+        );
+        // Labels carry a bracketed hotkey letter, same formatting as the
+        // permission dialog's twin above. "API Key" claims 'a'; "Claude
+        // Subscription" claims 'c' (its own first letter, still free);
+        // "Continue without auth" would also want 'c' but it's taken, so it
+        // falls to the next unclaimed letter in its own text, 'o'
+        // (`acp_show_auth_choice`'s left-to-right hotkey scan).
+        let labels: Vec<&str> = opts.buttons.iter().map(|b| b.label.as_str()).collect();
+        assert_eq!(
+            labels,
+            vec![
+                "[A]PI Key",
+                "[C]laude Subscription",
+                "C[O]ntinue without auth"
+            ],
+            "both the agent-type and terminal-type auth methods the fixture \
+             advertised must be presented verbatim, plus the fallback \
+             skip button, each with a unique hotkey"
+        );
+    }
+
+    /// #957 (ACP-6) acceptance: "choosing [the terminal method] launches
+    /// the interactive process and completion re-initializes the
+    /// session" — GTK's twin of `tui_main::shell_app::tests::
+    /// ai_panel_terminal_auth_choice_opens_visible_login_pane_and_resumes_session_via_shell_app`.
+    ///
+    /// Drives the real `"Claude Subscription"` button through
+    /// `Engine::dialog_click_button` (the same native-dialog-choice
+    /// simulation `ai_panel_shows_permission_dialog_and_resumes_turn_on_selection`
+    /// uses above), then proves the login pane actually **painted** — the
+    /// bottom panel's own tab-strip chrome (`"[1]"`, `render::
+    /// build_terminal_toolbar`), absent before and present immediately
+    /// after, not just `terminal_panes.len()` / `terminal_open` state —
+    /// before it exits and the session resumes.
+    ///
+    /// The tab-strip chrome, not the login pane's own PTY text, is this
+    /// test's visibility proof: GTK paints terminal cell glyphs one Pango
+    /// layout per cell (`primitives::terminal::paint` ->
+    /// `surface_draw_text_run_styled`), so `GtkDriver`'s text-run
+    /// recording sees each cell as its own single-character run, never a
+    /// merged line — confirmed by direct probe (spawning a plain terminal
+    /// tab and injecting `echo`: the echoed text never appears via
+    /// `screen_contains`/`painted_texts` even though the same content
+    /// reliably appears via `TuiDriver::screen()`, the technique
+    /// `tui_main::shell_app::tests::
+    /// ai_panel_terminal_auth_choice_opens_visible_login_pane_and_resumes_session_via_shell_app`
+    /// uses). That is a `GtkDriver` capability gap, not a
+    /// vimcode rendering bug — worth a quadraui issue (per-cell terminal
+    /// glyph draws could call the same `record_text_run` sink the rest of
+    /// `GtkBackend` uses, merged per row). Not filed as of this PR
+    /// (`CLAUDE.md`'s Platform-Neutrality Rule: no per-backend workaround
+    /// here regardless; the tab-strip chrome is a real, already-generic
+    /// -primitive-painted signal that doesn't need one).
+    ///
+    /// `settings.acp_agent_command` here is the *real* fixture path (not
+    /// the `"already-spawned-above"` placeholder the NDJSON-only tests
+    /// use): `Engine::acp_launch_terminal_login` reads that setting
+    /// directly to spawn the interactive login process, independently of
+    /// the already-spawned NDJSON `acp_client` above.
+    ///
+    /// RED verified: with `Engine::acp_finish_terminal_login`'s `Some(0)`
+    /// branch changed to a no-op (never calling `client.initialize()`),
+    /// this test times out waiting for `"Hello world"` — the client stays
+    /// parked after the login pane exits instead of resuming the queued
+    /// turn.
+    #[cfg(unix)]
+    #[test]
+    fn ai_panel_terminal_auth_choice_opens_visible_login_pane_and_resumes_session() {
+        let mut h = panel_harness(PANEL_AI);
+        let fixture_path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/fake_acp_agent.sh"
+        );
+        {
+            let mut engine = h.engine.borrow_mut();
+            let argv = vec!["sh".to_string(), fixture_path.to_string()];
+            let cwd = std::env::temp_dir();
+            let mut client = crate::core::acp::AcpClient::spawn_with_env(
+                &argv,
+                &cwd,
+                &[
+                    ("ACP_FAKE_AUTH_METHODS", "1"),
+                    ("ACP_FAKE_NO_TOOL_REQUEST", "1"),
+                ],
+            )
+            .expect("fixture agent should spawn");
+            client.initialize();
+            engine.acp_client = Some(client);
+            // Read directly by `acp_launch_terminal_login` — distinct from
+            // (and independent of) the NDJSON client spawned above.
+            engine.settings.acp_agent_command = format!("sh {fixture_path}");
+        }
+
+        h.driver.render();
+        assert!(
+            !h.driver.screen_contains("[1]"),
+            "precondition: no terminal pane is open yet, so the bottom \
+             panel's tab strip must not be painted"
+        );
+
+        let sb = h.painted_sidebar_bounds.get().unwrap();
+        h.driver.click(sb.x + 20.0, sb.y + 20.0);
+        for c in "hello agent".chars() {
+            h.driver.type_char(c);
+        }
+        h.driver.ctrl_char('s');
+
+        let deadline = std::time::Instant::now() + ACP_DRIVER_DEADLINE;
+        while !h
+            .engine
+            .borrow()
+            .dialog
+            .as_ref()
+            .is_some_and(|d| d.tag == "acp_auth_choice")
+            && std::time::Instant::now() < deadline
+        {
+            h.engine.borrow_mut().poll_acp();
+            h.driver.render();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let idx = {
+            let engine = h.engine.borrow();
+            let dialog = engine
+                .dialog
+                .as_ref()
+                .expect("the auth-choice dialog should be open within ACP_DRIVER_DEADLINE");
+            dialog
+                .buttons
+                .iter()
+                .position(|b| b.action == "claude-ai-login")
+                .expect("the Claude Subscription button should be present")
+        };
+
+        h.engine.borrow_mut().dialog_click_button(idx);
+        assert!(
+            h.engine.borrow().dialog.is_none(),
+            "the dialog must close the moment a button is clicked"
+        );
+        assert_eq!(
+            h.engine.borrow().terminal_panes.len(),
+            1,
+            "choosing the terminal method must open exactly one login pane"
+        );
+
+        h.driver.render();
+        assert!(
+            h.driver.screen_contains("[1]"),
+            "the login pane's own tab must actually be painted on the \
+             surface immediately, not just recorded in `terminal_panes` \
+             state; painted: {:?}",
+            h.driver.painted_texts()
+        );
+
+        let deadline = std::time::Instant::now() + ACP_DRIVER_DEADLINE;
+        while !h.engine.borrow().terminal_panes.is_empty() && std::time::Instant::now() < deadline {
+            h.engine.borrow_mut().poll_terminal();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            h.engine.borrow().terminal_panes.is_empty(),
+            "the login pane should have exited (exit 0) and been reaped"
+        );
+        assert!(h.engine.borrow().acp_authenticated);
+
+        let deadline = std::time::Instant::now() + ACP_DRIVER_DEADLINE;
+        while !h.driver.screen_contains("Hello world") && std::time::Instant::now() < deadline {
+            h.engine.borrow_mut().poll_acp();
+            h.driver.render();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            h.driver.screen_contains("Hello world"),
+            "completing the login must re-initialize the client and resume \
+             the queued turn within ACP_DRIVER_DEADLINE"
+        );
+        assert!(
+            !h.driver.screen_contains("[1]"),
+            "the login pane's tab must be gone from the surface once it \
+             exited and was reaped, not left behind as a stale paint"
+        );
+    }
 }
 
 /// #669: the five editor-anchored popups (completion, LSP hover, editor
@@ -7419,15 +8559,42 @@ mod minimap {
 
     /// A buffer with a distinctive indentation shape and enough lines that
     /// the minimap has something to down-sample.
+    ///
+    /// #1350: opens a real, on-disk `.rs` file through `open_file_with_mode`
+    /// (rather than inserting text straight into an unnamed
+    /// `Engine::new()` buffer) so the buffer has a language and gets real
+    /// tree-sitter syntax highlighting — `minimap_click_at_the_middle_
+    /// scrolls_to_half_the_file`'s "syntax-colored ink" sanity check found
+    /// zero colour on macOS because an unnamed buffer never had any syntax
+    /// colour to find in the first place, unrelated to the anti-aliasing
+    /// mode it was first blamed on. Also switches to `Engine::new_for_test()`
+    /// so this fixture no longer reads the developer's own
+    /// `~/.config/vimcode/settings.json`. `syntax_max_lines` is pinned
+    /// because it's a process-global atomic another test in this binary can
+    /// have moved (mirrors `minimap_gtk_distinct_colors_for_indent` above).
     fn engine_with_shaped_buffer() -> Engine {
-        let mut engine = Engine::new();
+        crate::core::buffer_manager::set_syntax_max_lines(20_000);
+
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_test_1350_minimap_shaped_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("shaped1350.rs");
         let text: String = (0..400)
             .map(|i| {
                 let depth = if (100..300).contains(&i) { 3 } else { 0 };
                 format!("{}fn item_{i}() {{ let x = {i}; }}\n", "    ".repeat(depth))
             })
             .collect();
-        engine.buffer_mut().insert(0, &text);
+        std::fs::write(&file, &text).unwrap();
+
+        let mut engine = Engine::new_for_test();
+        engine
+            .open_file_with_mode(&file, crate::core::engine::OpenMode::Permanent)
+            .unwrap();
         engine
     }
 
@@ -7746,6 +8913,25 @@ mod minimap {
     /// out to be theme-dependent noise (see the color-vs-brightness note
     /// above) and had to be replaced with this colorfulness count — before
     /// restoring the fix.
+    ///
+    /// #1350: on macOS this test's own setup sanity check (`before > 0`)
+    /// failed outright — every pixel in the probed band was grayscale, none
+    /// colorful. Root cause: `engine_with_shaped_buffer` built its buffer
+    /// from an unnamed `Engine::new()` buffer (`buffer_mut().insert`
+    /// straight into the default buffer, no file path), so it had no
+    /// language and therefore no tree-sitter highlights — there was no
+    /// syntax colour to find on *any* platform, not just macOS; Linux
+    /// apparently stayed green only because Cairo/FreeType's colourful
+    /// subpixel AA fringing around the plain grayscale glyph ink happened to
+    /// clear `is_colorful`'s tolerance by coincidence, which macOS/Quartz's
+    /// grayscale-only AA does not reproduce. Fixed at the source in
+    /// `engine_with_shaped_buffer` (opens a real on-disk `.rs` file so the
+    /// buffer gets a language and real syntax colour) rather than by
+    /// loosening this predicate: a "differs from background" rewrite would
+    /// also count the (grayscale, always-present) indent guide as ink and
+    /// break the "after" band's must-be-zero assertion on every indented
+    /// row, so chroma — not "differs from background" — has to stay the
+    /// discriminator here.
     #[test]
     fn minimap_click_at_the_middle_scrolls_to_half_the_file() {
         let mut h = harness(engine_with_shaped_buffer(), 1400, 900);
@@ -7792,7 +8978,13 @@ mod minimap {
         // immune to the indent guide: a light theme makes background the
         // *brightest* color in the band rather than the ink, and indent
         // guides paint real (if faint) grayscale pixels in the same band
-        // even on a correctly-repainted frame.
+        // even on a correctly-repainted frame — chroma, not "differs from
+        // background", is load-bearing here, which is why #1350's fix is in
+        // `engine_with_shaped_buffer` (give the buffer a real language so
+        // there's syntax colour to find) rather than in this predicate: a
+        // "differs from background" rewrite would count the always-present
+        // grayscale indent guide as ink and break the "after" band's
+        // must-be-zero assertion on every indented row.
         //
         // #934: 3 rows, not 1. A Darwin/Quartz run reported the single-row
         // version's "before" sanity check failing outright (0 colorful
@@ -14350,5 +15542,151 @@ mod issue_1235_laststatus_frame_sizing {
             quadraui::Rect::default(),
             "laststatus=0 must clear the painted global-bar rect too"
         );
+    }
+}
+
+/// #1345 (multi-backend testing rule): the native `[lsp.acquire]` install
+/// flow's user-visible surface — the "Acquiring …" status line while the
+/// background download runs, then the "installed and started" finalize
+/// message — painted through the **GTK** backend.
+///
+/// The TUI twin lives in `tui_main::shell_app`
+/// (`extension_install_with_acquire_paints_acquiring_then_installed_via_shell_app`).
+/// Nothing in `src/gtk/` is involved in producing those strings — they are
+/// shared `Engine` state — which is exactly what this asserts: both
+/// backends really do paint them, rather than one of them silently
+/// dropping the status line the way `ScreenLayout.picker` was dropped on
+/// GTK for months (#587).
+#[cfg(test)]
+mod acquire_status_paint_1345 {
+    use super::*;
+
+    /// Shared with every other test in the crate that mutates
+    /// `VIMCODE_TEST_DATA_HOME` — see that lock's doc comment for why one
+    /// process-global lock and not a module-local one.
+    use crate::core::paths::VIMCODE_TEST_DATA_HOME_LOCK as TOOL_ACQUIRE_ENV_LOCK;
+
+    struct EnvVarGuard {
+        key: &'static str,
+        old: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &std::ffi::OsStr) -> Self {
+            let old = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, old }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match self.old.take() {
+                Some(v) => std::env::set_var(self.key, v),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
+    fn make_fixture_zip(
+        dir: &std::path::Path,
+        entry_name: &str,
+        contents: &[u8],
+    ) -> std::path::PathBuf {
+        let path = dir.join("archive.zip");
+        let file = std::fs::File::create(&path).unwrap();
+        let mut writer = zip::ZipWriter::new(file);
+        let options: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default();
+        writer.start_file(entry_name, options).unwrap();
+        std::io::Write::write_all(&mut writer, contents).unwrap();
+        writer.finish().unwrap();
+        path
+    }
+
+    #[test]
+    fn extension_install_with_acquire_paints_acquiring_then_installed_via_gtk() {
+        use crate::core::extensions::{ExtensionManifest, LspConfig};
+        use crate::core::tool_acquire::{AcquireConfig, AcquireKind};
+
+        let _lock = TOOL_ACQUIRE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let data_home = std::env::temp_dir().join(format!(
+            "vimcode_test_gtk_acquire_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&data_home);
+        std::fs::create_dir_all(&data_home).unwrap();
+        let _data_home_guard = EnvVarGuard::set("VIMCODE_TEST_DATA_HOME", data_home.as_os_str());
+
+        let fixture_dir = std::env::temp_dir().join(format!(
+            "vimcode_test_gtk_acquire_fixture_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&fixture_dir);
+        std::fs::create_dir_all(&fixture_dir).unwrap();
+        let binary_name = "vimcode-test-gtk-acquire-lsp-1345";
+        let archive = make_fixture_zip(&fixture_dir, binary_name, b"#!fake-lsp-server");
+
+        let ext_name = "vimcode-test-gtk-acquire-ext-1345".to_string();
+        let mut engine = Engine::new();
+        engine.ext_registry = Some(vec![ExtensionManifest {
+            name: ext_name.clone(),
+            display_name: "Acquire Test Extension (gtk)".to_string(),
+            language_ids: vec!["vimcode-test-gtk-acquire-lang-1345".to_string()],
+            lsp: LspConfig {
+                binary: binary_name.to_string(),
+                acquire: Some(AcquireConfig {
+                    kind: AcquireKind::UrlTemplate,
+                    url: format!("file://{}", archive.display()),
+                    version: "1.0.0".to_string(),
+                    binary_path: binary_name.to_string(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            ..Default::default()
+        }]);
+
+        let mut h = harness(engine, 1000, 640);
+        h.engine.borrow_mut().ext_install_from_registry(&ext_name);
+        assert!(
+            h.engine.borrow().pending_terminal_command.is_none(),
+            "native acquisition must queue no shell command on GTK either"
+        );
+
+        h.driver.render();
+        assert!(
+            h.driver.screen_contains("acquiring"),
+            "GTK never painted the 'Acquiring …' status line; painted: {:?}",
+            h.driver.painted_texts()
+        );
+
+        // `GtkDriver` pumps no main loop, so the background acquisition is
+        // drained by hand here — the same work `App::tick` does in the real
+        // app — with a frame painted after each poll so the assertion reads
+        // painted content, never engine state.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        let mut painted = false;
+        while std::time::Instant::now() < deadline {
+            h.engine.borrow_mut().poll_tool_acquire();
+            h.driver.render();
+            if h.driver.screen_contains("installed and started") {
+                painted = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            painted,
+            "GTK never painted the finalize message; painted: {:?}",
+            h.driver.painted_texts()
+        );
+
+        let _ = std::fs::remove_dir_all(&data_home);
+        let _ = std::fs::remove_dir_all(&fixture_dir);
     }
 }

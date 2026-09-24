@@ -680,6 +680,33 @@ pub(super) fn handle_mouse(
         }
     }
 
+    // ── Change-review surface mouse handling (#955, shared with #525) ────────
+    //
+    // Same "swallow every click while open, checked before the modal
+    // ladder" policy as the folder picker above — see
+    // `render::route_change_review_click`'s doc comment.
+    if engine.change_review.is_some() {
+        if let MouseEventKind::Down(MouseButton::Left) = ev.kind {
+            let diff_rect = engine.change_review_diff_rect.get();
+            let view = engine
+                .change_review
+                .as_ref()
+                .and_then(|r| r.current_entry())
+                .map(|e| e.view.clone());
+            if let Some(view) = view {
+                match render::route_change_review_click(
+                    diff_rect, &view, 1.0, col as f32, row as f32,
+                ) {
+                    render::ChangeReviewClickRoute::Jump(hit) => {
+                        engine.change_review_jump_to_hit(hit);
+                    }
+                    render::ChangeReviewClickRoute::Consume => {}
+                }
+            }
+            return sidebar_width;
+        }
+    }
+
     // ── Unified picker: drag / scroll follow-through ──────────────────────────
     //
     // The picker's *click* rung is shared with GTK
@@ -3879,10 +3906,26 @@ mod tests {
             width,
             height,
         };
+        // #1252: `render_sidebar_content` now reads the frame's own `screen`
+        // rather than rebuilding one itself — build it once here, the same
+        // way the live `render_content` path does via
+        // `build_screen_for_shell_content`.
+        let screen = render::build_screen_layout(
+            engine,
+            &theme,
+            &[],
+            1.0,
+            1.0,
+            true,
+            0.0,
+            render::TUI_MINIMAP_SIZING,
+        );
         terminal
             .draw(|frame| {
                 super::with_frame_scope(&mut tui_backend, frame, |backend, _frame| {
-                    super::panels::render_sidebar_content(backend, area, &sidebar, engine, &theme);
+                    super::panels::render_sidebar_content(
+                        backend, &screen, area, &sidebar, engine, &theme,
+                    );
                 });
             })
             .unwrap();
