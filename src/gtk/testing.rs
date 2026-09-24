@@ -15544,3 +15544,149 @@ mod issue_1235_laststatus_frame_sizing {
         );
     }
 }
+
+/// #1345 (multi-backend testing rule): the native `[lsp.acquire]` install
+/// flow's user-visible surface — the "Acquiring …" status line while the
+/// background download runs, then the "installed and started" finalize
+/// message — painted through the **GTK** backend.
+///
+/// The TUI twin lives in `tui_main::shell_app`
+/// (`extension_install_with_acquire_paints_acquiring_then_installed_via_shell_app`).
+/// Nothing in `src/gtk/` is involved in producing those strings — they are
+/// shared `Engine` state — which is exactly what this asserts: both
+/// backends really do paint them, rather than one of them silently
+/// dropping the status line the way `ScreenLayout.picker` was dropped on
+/// GTK for months (#587).
+#[cfg(test)]
+mod acquire_status_paint_1345 {
+    use super::*;
+
+    /// Shared with every other test in the crate that mutates
+    /// `VIMCODE_TEST_DATA_HOME` — see that lock's doc comment for why one
+    /// process-global lock and not a module-local one.
+    use crate::core::paths::VIMCODE_TEST_DATA_HOME_LOCK as TOOL_ACQUIRE_ENV_LOCK;
+
+    struct EnvVarGuard {
+        key: &'static str,
+        old: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &std::ffi::OsStr) -> Self {
+            let old = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, old }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match self.old.take() {
+                Some(v) => std::env::set_var(self.key, v),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
+    fn make_fixture_zip(
+        dir: &std::path::Path,
+        entry_name: &str,
+        contents: &[u8],
+    ) -> std::path::PathBuf {
+        let path = dir.join("archive.zip");
+        let file = std::fs::File::create(&path).unwrap();
+        let mut writer = zip::ZipWriter::new(file);
+        let options: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default();
+        writer.start_file(entry_name, options).unwrap();
+        std::io::Write::write_all(&mut writer, contents).unwrap();
+        writer.finish().unwrap();
+        path
+    }
+
+    #[test]
+    fn extension_install_with_acquire_paints_acquiring_then_installed_via_gtk() {
+        use crate::core::extensions::{ExtensionManifest, LspConfig};
+        use crate::core::tool_acquire::{AcquireConfig, AcquireKind};
+
+        let _lock = TOOL_ACQUIRE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let data_home = std::env::temp_dir().join(format!(
+            "vimcode_test_gtk_acquire_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&data_home);
+        std::fs::create_dir_all(&data_home).unwrap();
+        let _data_home_guard = EnvVarGuard::set("VIMCODE_TEST_DATA_HOME", data_home.as_os_str());
+
+        let fixture_dir = std::env::temp_dir().join(format!(
+            "vimcode_test_gtk_acquire_fixture_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&fixture_dir);
+        std::fs::create_dir_all(&fixture_dir).unwrap();
+        let binary_name = "vimcode-test-gtk-acquire-lsp-1345";
+        let archive = make_fixture_zip(&fixture_dir, binary_name, b"#!fake-lsp-server");
+
+        let ext_name = "vimcode-test-gtk-acquire-ext-1345".to_string();
+        let mut engine = Engine::new();
+        engine.ext_registry = Some(vec![ExtensionManifest {
+            name: ext_name.clone(),
+            display_name: "Acquire Test Extension (gtk)".to_string(),
+            language_ids: vec!["vimcode-test-gtk-acquire-lang-1345".to_string()],
+            lsp: LspConfig {
+                binary: binary_name.to_string(),
+                acquire: Some(AcquireConfig {
+                    kind: AcquireKind::UrlTemplate,
+                    url: format!("file://{}", archive.display()),
+                    version: "1.0.0".to_string(),
+                    binary_path: binary_name.to_string(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            ..Default::default()
+        }]);
+
+        let mut h = harness(engine, 1000, 640);
+        h.engine.borrow_mut().ext_install_from_registry(&ext_name);
+        assert!(
+            h.engine.borrow().pending_terminal_command.is_none(),
+            "native acquisition must queue no shell command on GTK either"
+        );
+
+        h.driver.render();
+        assert!(
+            h.driver.screen_contains("acquiring"),
+            "GTK never painted the 'Acquiring …' status line; painted: {:?}",
+            h.driver.painted_texts()
+        );
+
+        // `GtkDriver` pumps no main loop, so the background acquisition is
+        // drained by hand here — the same work `App::tick` does in the real
+        // app — with a frame painted after each poll so the assertion reads
+        // painted content, never engine state.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        let mut painted = false;
+        while std::time::Instant::now() < deadline {
+            h.engine.borrow_mut().poll_tool_acquire();
+            h.driver.render();
+            if h.driver.screen_contains("installed and started") {
+                painted = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            painted,
+            "GTK never painted the finalize message; painted: {:?}",
+            h.driver.painted_texts()
+        );
+
+        let _ = std::fs::remove_dir_all(&data_home);
+        let _ = std::fs::remove_dir_all(&fixture_dir);
+    }
+}

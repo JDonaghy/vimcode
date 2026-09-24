@@ -3075,6 +3075,15 @@ impl EnvVarGuard {
         std::env::set_var(key, value);
         Self { key, old }
     }
+
+    /// Remove `key` for the lifetime of the guard, restoring whatever was
+    /// there before on drop. Used to assert *default* behaviour for an
+    /// opt-in env var when the ambient environment might already set it.
+    fn unset(key: &'static str) -> Self {
+        let old = std::env::var_os(key);
+        std::env::remove_var(key);
+        Self { key, old }
+    }
 }
 
 impl Drop for EnvVarGuard {
@@ -3980,6 +3989,15 @@ fn ext_install_with_acquire_runs_no_terminal_command_and_registers_lsp() {
     let _ = std::fs::remove_dir_all(&data_home);
     std::fs::create_dir_all(&data_home).unwrap();
     let _data_home_guard = EnvVarGuard::set("VIMCODE_TEST_DATA_HOME", data_home.as_os_str());
+    // `file://` download URLs are a *test-build* allowance only (second
+    // review round on #1345 — a registry manifest must not be able to turn
+    // `curl` into an arbitrary-file-read). This is a separate integration
+    // crate, so the library's own `cfg(test)` allowance doesn't apply here
+    // and the fixture has to opt in explicitly.
+    let _file_url_guard = EnvVarGuard::set(
+        vimcode_core::core::tool_acquire::ALLOW_FILE_URL_DOWNLOADS_ENV,
+        std::ffi::OsStr::new("1"),
+    );
 
     let fixture_dir = std::env::temp_dir().join(format!(
         "vimcode_test_ext_install_acquire_fixture_{}",
@@ -4052,6 +4070,72 @@ fn ext_install_with_acquire_runs_no_terminal_command_and_registers_lsp() {
 
     let _ = std::fs::remove_dir_all(&data_home);
     let _ = std::fs::remove_dir_all(&fixture_dir);
+}
+
+#[test]
+fn acquire_rejects_file_url_without_the_test_only_override() {
+    // Second review round on #1345: `validate_download_url` used to accept
+    // `file://` unconditionally, in production code. A community-submitted
+    // or compromised registry manifest could therefore declare
+    // `[lsp.acquire] url = "file:///home/user/.ssh/id_rsa"` and have vimcode
+    // `curl` an arbitrary readable file into a predictable staging path.
+    //
+    // This runs in a separate integration crate, so the library's
+    // `cfg(test)` fixture allowance is *off* here — exactly the
+    // configuration a shipped binary is in, modulo the `debug_assertions`
+    // env-var opt-in which this test explicitly clears.
+    //
+    // RED against the previous commit: `acquire_and_install_for` there
+    // downloaded the file and got as far as the archive-format check.
+    use vimcode_core::core::extensions::Platform;
+    use vimcode_core::core::tool_acquire::{
+        acquire_and_install_for, AcquireConfig, AcquireError, AcquireKind, Arch,
+        ALLOW_FILE_URL_DOWNLOADS_ENV,
+    };
+
+    let _lock = TOOL_ACQUIRE_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+
+    let data_home = std::env::temp_dir().join(format!(
+        "vimcode_test_acquire_file_url_denied_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&data_home);
+    std::fs::create_dir_all(&data_home).unwrap();
+    let _data_home_guard = EnvVarGuard::set("VIMCODE_TEST_DATA_HOME", data_home.as_os_str());
+    let _no_override = EnvVarGuard::unset(ALLOW_FILE_URL_DOWNLOADS_ENV);
+
+    // A real, readable file — so a pass can only mean the scheme was
+    // refused, not that the path happened not to exist.
+    let secret = data_home.join("pretend-private-key");
+    std::fs::write(&secret, b"-----BEGIN OPENSSH PRIVATE KEY-----\n").unwrap();
+
+    let cfg = AcquireConfig {
+        kind: AcquireKind::UrlTemplate,
+        url: format!("file://{}", secret.display()),
+        version: "1.0.0".to_string(),
+        binary_path: "vimcode-test-file-url-tool".to_string(),
+        ..Default::default()
+    };
+
+    let err = acquire_and_install_for(
+        "vimcode-test-file-url-tool",
+        &cfg,
+        Platform::Linux,
+        Arch::Amd64,
+    )
+    .expect_err("a file:// acquire URL must be refused outside test builds");
+    assert!(
+        matches!(err, AcquireError::BadConfig(_)),
+        "expected the https-only scheme check to reject it, got {err:?}"
+    );
+    assert!(
+        !vimcode_core::core::paths::managed_tool_dir("vimcode-test-file-url-tool").exists(),
+        "nothing should have been staged or installed for a refused URL"
+    );
+
+    let _ = std::fs::remove_dir_all(&data_home);
 }
 
 #[test]
@@ -4144,6 +4228,62 @@ fn resolve_command_finds_managed_tool_binary_with_empty_path() {
         resolved,
         Some(binary_path.clone()),
         "should resolve {binary_name} via the managed tools dir with PATH empty"
+    );
+
+    let _ = std::fs::remove_dir_all(&data_home);
+}
+
+#[test]
+fn dap_resolve_binary_finds_managed_tool_binary_with_empty_path() {
+    // Second review round on #1345: `[dap.acquire]` unpacks the adapter into
+    // the vimcode-managed tools dir and paints "DAP adapter for '…'
+    // installed — press F5 to debug", but `DapManager::start_adapter`
+    // resolved the adapter through `dap_manager::resolve_binary`, which only
+    // ever looked at Mason's bin dir and `PATH` — neither of which contains a
+    // vimcode-managed tool. F5 then failed with "DAP binary '…' not found"
+    // for an adapter vimcode had *just* installed: the same "install check
+    // and launch use two different lookups" split #1344 closed on the LSP
+    // side. `resolve_binary` now delegates to the shared
+    // `lsp_manager::resolve_command`.
+    //
+    // RED against the previous commit: `resolve_binary` returned `None` here
+    // (empty `PATH`, no Mason dir), so this assertion failed.
+    let _lock = TOOL_ACQUIRE_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+
+    let data_home = std::env::temp_dir().join(format!(
+        "vimcode_test_managed_dap_resolver_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&data_home);
+    std::fs::create_dir_all(&data_home).unwrap();
+
+    let binary_name = "vimcode-test-managed-codelldb-1345";
+    let version_dir = data_home.join("tools").join(binary_name).join("1.10.0");
+    std::fs::create_dir_all(&version_dir).unwrap();
+    let binary_path = version_dir.join(binary_name);
+    std::fs::write(&binary_path, b"#!/bin/sh\necho fake-adapter\n").unwrap();
+    std::fs::write(
+        data_home.join("tools").join(binary_name).join("current"),
+        "1.10.0",
+    )
+    .unwrap();
+
+    let _data_home_guard = EnvVarGuard::set("VIMCODE_TEST_DATA_HOME", data_home.as_os_str());
+    let _path_guard = EnvVarGuard::set("PATH", std::ffi::OsStr::new(""));
+
+    assert_eq!(
+        vimcode_core::core::dap_manager::resolve_binary(binary_name),
+        Some(binary_path.clone()),
+        "the DAP launch path must resolve a vimcode-acquired adapter via the managed tools dir"
+    );
+    // …and it agrees with the LSP-side resolver, which is the whole point of
+    // routing both through one lookup.
+    assert_eq!(
+        vimcode_core::core::dap_manager::resolve_binary(binary_name),
+        vimcode_core::core::lsp_manager::resolve_command(binary_name),
+        "install-time check and debug-start launch must resolve identically"
     );
 
     let _ = std::fs::remove_dir_all(&data_home);

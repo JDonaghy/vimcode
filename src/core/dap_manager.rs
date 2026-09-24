@@ -73,30 +73,6 @@ static ADAPTER_REGISTRY: &[AdapterInfo] = &[
     },
 ];
 
-/// Return the Mason DAP binary directory (same path as LSP: `~/.local/share/nvim/mason/bin`).
-fn mason_bin_dir() -> Option<PathBuf> {
-    #[cfg(target_os = "windows")]
-    let base = std::env::var_os("APPDATA").map(PathBuf::from)?;
-    #[cfg(not(target_os = "windows"))]
-    let base = std::env::var_os("HOME").map(PathBuf::from)?;
-
-    #[cfg(target_os = "windows")]
-    let dir = base.join("nvim-data").join("mason").join("bin");
-    #[cfg(not(target_os = "windows"))]
-    let dir = base
-        .join(".local")
-        .join("share")
-        .join("nvim")
-        .join("mason")
-        .join("bin");
-
-    if dir.is_dir() {
-        Some(dir)
-    } else {
-        None
-    }
-}
-
 /// Path to the editor-managed venv used exclusively for the debugpy adapter.
 ///
 /// Using a dedicated venv avoids PEP 668 "externally managed environment"
@@ -172,32 +148,26 @@ pub fn find_python_binary() -> Option<PathBuf> {
     resolve_binary("python3").or_else(|| resolve_binary("python"))
 }
 
-/// Resolve a binary name to an absolute path.
-/// Checks Mason bin directory first, then falls back to PATH via `which`/`where`.
+/// Resolve a DAP adapter binary name to an absolute path, using the **same**
+/// lookup the LSP launch path and every install-time check already use
+/// (`lsp_manager::resolve_command`).
+///
+/// #1345: this deliberately delegates instead of keeping its own
+/// Mason-then-`PATH` search. `[dap.acquire]` downloads, verifies and unpacks
+/// adapters into the vimcode-managed tools dir
+/// (`paths::managed_tool_binary_path`), which is neither Mason's bin dir nor
+/// on `PATH` — so the old local search reported
+/// `"DAP binary '...' not found"` at F5 time for an adapter vimcode had just
+/// installed successfully and painted a success message for. The install-time
+/// "already available" pre-check (`Engine::binary_on_path`) has routed through
+/// `resolve_command` since #1344; routing debug-start through it too means the
+/// lookup that says "installed" and the lookup that launches can no longer
+/// disagree. `resolve_command` probes a strict superset of what this function
+/// used to (managed tools dir → Mason bin → `~/.cargo/bin`, `~/.local/bin`,
+/// `go/bin`, Homebrew prefixes, … → `PATH`), so nothing that resolved before
+/// stops resolving.
 pub fn resolve_binary(name: &str) -> Option<PathBuf> {
-    if let Some(mason_bin) = mason_bin_dir() {
-        let candidate = mason_bin.join(name);
-        if candidate.exists() {
-            return Some(candidate);
-        }
-    }
-
-    #[cfg(target_os = "windows")]
-    let which_cmd = "where";
-    #[cfg(not(target_os = "windows"))]
-    let which_cmd = "which";
-
-    let mut cmd = crate::core::git::hidden_command(which_cmd);
-    cmd.arg(name);
-    let output = cmd.output().ok()?;
-    if output.status.success() {
-        let path_str = String::from_utf8_lossy(&output.stdout);
-        let first_line = path_str.lines().next()?.trim();
-        if !first_line.is_empty() {
-            return Some(PathBuf::from(first_line));
-        }
-    }
-    None
+    crate::core::lsp_manager::resolve_command(name)
 }
 
 // ---------------------------------------------------------------------------
