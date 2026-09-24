@@ -15931,8 +15931,12 @@ mod tests {
         client.initialize();
         app.engine.acp_client = Some(client);
         // Read directly by `acp_launch_terminal_login` — distinct from (and
-        // independent of) the NDJSON client spawned above.
-        app.engine.settings.acp_agent_command = format!("sh {fixture_path} succeed-slow");
+        // independent of) the NDJSON client spawned above. Quoted because
+        // `CARGO_MANIFEST_DIR` may contain spaces (a coord worktree under
+        // `~/Library/Application Support/...`), which the login pane's
+        // shell would otherwise word-split into a 127 "command not found"
+        // — see `acp6_fixture_argv_string` in `core/engine/acp_ops.rs`.
+        app.engine.settings.acp_agent_command = format!("sh \"{fixture_path}\" succeed-slow");
 
         let mut driver = driver_with_shell(app, config(), 80, 24);
         for c in "hello agent".chars() {

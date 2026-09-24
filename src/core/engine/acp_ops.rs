@@ -2226,9 +2226,25 @@ mod tests {
 
     // ── #957 (ACP-6): auth.terminal — subscription login ─────────────────
 
+    /// `settings.acp_agent_command` pointing at the fixture agent — a
+    /// *shell command string*, not an argv, because that is what
+    /// `Engine::acp_launch_terminal_login` injects verbatim into the login
+    /// pane's interactive shell.
+    ///
+    /// The fixture path is double-quoted because `CARGO_MANIFEST_DIR` is
+    /// not guaranteed to be space-free: a coord worktree lives under
+    /// `~/Library/Application Support/coord/...` on macOS, and unquoted
+    /// the login shell word-splits that into `sh /Users/…/Library/Application`
+    /// and exits 127 ("command not found") before the fixture ever runs —
+    /// so the login reads as *failed* and `acp_authenticated` never flips.
+    /// Double quotes are understood by both consumers of this string: POSIX
+    /// shells (the login pane) and `core::acp::parse_agent_command` (the
+    /// argv splitter). Same class of checkout-shaped fixture bug as #1350
+    /// and #1374, and likewise test-only — a real user's
+    /// `acp_agent_command` is their own shell string to quote.
     fn acp6_fixture_argv_string() -> String {
         format!(
-            "sh {}",
+            "sh \"{}\"",
             concat!(
                 env!("CARGO_MANIFEST_DIR"),
                 "/tests/fixtures/fake_acp_agent.sh"

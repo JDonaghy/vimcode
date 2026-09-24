@@ -6016,8 +6016,12 @@ second line here
             client.initialize();
             engine.acp_client = Some(client);
             // Read directly by `acp_launch_terminal_login` — distinct from
-            // (and independent of) the NDJSON client spawned above.
-            engine.settings.acp_agent_command = format!("sh {fixture_path}");
+            // (and independent of) the NDJSON client spawned above. Quoted
+            // because `CARGO_MANIFEST_DIR` may contain spaces (a coord
+            // worktree under `~/Library/Application Support/...`), which
+            // the login pane's shell would otherwise word-split into a
+            // 127 "command not found" — see `acp6_fixture_argv_string`.
+            engine.settings.acp_agent_command = format!("sh \"{fixture_path}\"");
         }
 
         h.driver.render();

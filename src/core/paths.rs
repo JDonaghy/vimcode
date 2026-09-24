@@ -156,10 +156,14 @@ pub fn vimcode_data_dir() -> PathBuf {
     }
     #[cfg(target_os = "macos")]
     {
-        return home_dir()
+        // Tail expression, not `return` — on macOS the `cfg(not(...))` arm
+        // below is stripped, so this block *is* the function's tail and
+        // `clippy::needless_return` (only ever evaluated on a macOS host)
+        // rejects the early return.
+        home_dir()
             .join("Library")
             .join("Application Support")
-            .join("vimcode");
+            .join("vimcode")
     }
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
