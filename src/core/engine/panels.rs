@@ -1875,8 +1875,17 @@ impl Engine {
     }
 
     /// Build a JSON array of diagnostics touching a specific line (for code action context).
-    pub(crate) fn diagnostics_json_for_line(&self, path: &Path, line: usize) -> serde_json::Value {
-        let diags = match self.lsp_diagnostics.get(path) {
+    ///
+    /// `_path` is the raw path used to identify the file in the LSP request
+    /// itself (kept for API symmetry with the caller); the diagnostics
+    /// lookup must use the canonical key `Engine::lsp_diagnostics` is
+    /// actually stored under (#1373), or it silently misses whenever the
+    /// buffer was opened through a non-canonical path.
+    pub(crate) fn diagnostics_json_for_line(&self, _path: &Path, line: usize) -> serde_json::Value {
+        let diags = match self
+            .active_buffer_diagnostics_key()
+            .and_then(|key| self.lsp_diagnostics.get(&key))
+        {
             Some(d) => d,
             None => return serde_json::json!([]),
         };
@@ -2371,5 +2380,75 @@ mod lsp_stderr_snippet_tests {
     fn falls_back_when_all_lines_empty() {
         let stderr = "\n   \n\t\n";
         assert_eq!(lsp_stderr_snippet(stderr), "no output");
+    }
+}
+
+#[cfg(test)]
+mod diagnostics_json_for_line_tests {
+    use super::*;
+
+    /// #1373: `Engine::lsp_diagnostics` is keyed by the canonical absolute
+    /// path (#208), so `diagnostics_json_for_line` — which fed diagnostic
+    /// context to LSP code-action requests — must look diagnostics up
+    /// through `active_buffer_diagnostics_key()`, the same key the gutter
+    /// and hover lookups use, not through the raw `file_path` a buffer was
+    /// opened with. Opens the file through a `..` segment so the two paths
+    /// differ on every platform, not just macOS's symlinked temp dir.
+    #[test]
+    fn finds_diagnostics_for_a_non_canonical_buffer_path() {
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_test_1373_diag_json_{:?}",
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        let file = dir.join("dk1373.txt");
+        std::fs::write(&file, "one\ntwo\nthree\n").unwrap();
+
+        let via_dotdot = dir.join("sub").join("..").join("dk1373.txt");
+        let canonical = via_dotdot.canonicalize().unwrap();
+        assert_ne!(
+            via_dotdot, canonical,
+            "test setup sanity: the open path must differ from the \
+             canonical one, otherwise this test cannot reach the bug"
+        );
+
+        let mut engine = Engine::new_for_test();
+        engine
+            .open_file_with_mode(&via_dotdot, OpenMode::Permanent)
+            .unwrap();
+
+        engine.lsp_diagnostics.insert(
+            canonical,
+            vec![Diagnostic {
+                range: lsp::LspRange {
+                    start: lsp::LspPosition {
+                        line: 1,
+                        character: 0,
+                    },
+                    end: lsp::LspPosition {
+                        line: 1,
+                        character: 3,
+                    },
+                },
+                severity: DiagnosticSeverity::Error,
+                message: "non-canonical code-action diagnostic".to_string(),
+                source: None,
+                code: None,
+            }],
+        );
+
+        let json = engine.diagnostics_json_for_line(&via_dotdot, 1);
+        let arr = json.as_array().expect("expected a JSON array");
+        assert_eq!(
+            arr.len(),
+            1,
+            "diagnostic on line 1 must be found through the canonical key \
+             even though the buffer was opened via a non-canonical path \
+             ({via_dotdot:?}); json: {json:?}"
+        );
+        assert_eq!(arr[0]["message"], "non-canonical code-action diagnostic");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
