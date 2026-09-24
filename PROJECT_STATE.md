@@ -515,6 +515,37 @@ repaints its `DrawingArea` in full every frame, confirmed against
 `gtk::backend`'s existing "full repaint after a skipped frame / modal
 closed / theme change" tests), so no GTK-side investigation was needed.
 
+## #1375 — `minimap_click_at_the_middle_scrolls_to_half_the_file` rewritten off pixel colour
+
+Follow-up to #934: #934's widened chroma tolerance (TOL=12, summed across 3 rows) was
+never actually verified on a Darwin host (its own PROJECT_STATE entry said so). #1375
+reports that a real `macmini` run at a post-#934 SHA still fails this exact test —
+confirming the tolerance-tuning approach had hit its limit, not that a slightly bigger
+number would have closed it.
+
+Root cause: the probe was asserting a property of the **rasteriser**, not of vimcode's
+behaviour. GTK's pangocairo backend composites glyph ink via Core Text on macOS and
+FreeType on Linux; Core Text's gamma-correct AA can blend a syntax-colored stroke's
+antialiased pixels arbitrarily far towards the background, past any single-pixel chroma
+threshold chosen without access to the real rasteriser to measure against. This is a
+test/fixture problem (docs/RELEASING.md §1.3b already documented the category), not a
+product bug — nothing in `apply_minimap_click`/`build_rendered_window` differs by
+platform.
+
+Fix: discovered (by probing `GtkDriver::painted_texts()` directly) that quadraui's one
+`show_layout` paint choke point records each editor line's **whole** Pango-layout text
+verbatim, regardless of the per-run colour attributes painted within it — so the exact
+buffer line on screen (`fn item_N() { let x = N; }`) is readable back with zero
+dependency on pixel colour or which rasteriser drew it. Rewrote the test's `before`/
+`after` probes to parse the lowest `fn item_N` line number out of `painted_texts()`
+instead of counting "colorful" pixels in a gutter-adjacent column band — same
+"assert on rendered output, not state" guarantee (CLAUDE.md), same RED-first
+verification (hardcoding `build_rendered_window`'s `scroll_top` to `0` still fails the
+new assertion, confirmed on Linux), but with no per-pixel AA tolerance left to tune.
+`src/render.rs`/`src/gtk/mod.rs` untouched — pure test-only change, `docs/RELEASING.md`
+§1.3b updated to drop this test from the known-red list (not yet re-measured on
+`macmini` — confirm there before trusting the doc over the fix's own reasoning).
+
 ## #934 — the three Darwin-known-red GTK pixel probes fixed to tolerate Core Text, not routed around
 
 Follow-up to the claude-coordinator#3298 config unblock. The `uname` guard in

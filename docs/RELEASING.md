@@ -274,19 +274,29 @@ see §1.0) triggered by `macmini` being a machine that has actually run
 and on any other used machine too, independent of platform. #976 landed a fix
 switching the affected fixtures to `TuiShellApp::new_for_test`; this section's
 2855/12 count is stale as of that fix and needs a fresh `macmini` measurement
-at the fix commit — expect **2855 passed, 3 failed** (the GTK pixel probes
-below only) if the fix holds. The three GTK ones are:
+at the fix commit — expect **2855 passed, 2 failed** (the two remaining GTK
+pixel probes below) if both that fix and #1375's below still hold. The two
+still-expected-red ones are:
 
 - `gtk::chrome_paint_tests::window_control_buttons_are_visible_against_their_background_in_every_theme`
-- `gtk::testing::minimap::minimap_click_at_the_middle_scrolls_to_half_the_file`
 - `gtk::testing::tests::window_split_divider_drag_repaints_the_line_at_the_new_position`
 
-All three are pixel/paint probes on in-memory Cairo surfaces (#934). On quartz, pangocairo
+Both are pixel/paint probes on in-memory Cairo surfaces (#934). On quartz, pangocairo
 rasterises via Core Text rather than freetype, so glyph ink and colour compositing
-differ from the Linux reference. **Treat these three as expected-red on Darwin and
+differ from the Linux reference. **Treat these two as expected-red on Darwin and
 green on Linux — but confirm they are green on the Linux lane at the same SHA before
 waving them through.** If they are red on Linux too, they are ordinary bugs and this
 section is wrong.
+
+`gtk::testing::minimap::minimap_click_at_the_middle_scrolls_to_half_the_file` used to
+be the third member of this list (#934), and #1375 confirmed on a real Darwin host
+that #934's widened tolerance still wasn't enough — Core Text's gamma-correct AA can
+blend a syntax-colored stroke past any pixel-chroma threshold chosen without access to
+the actual rasteriser. #1375 rewrote the probe to read `GtkDriver::painted_texts()`
+(the recorded Pango-layout text, identical on every platform regardless of how it was
+rasterised) instead of pixel colour, removing the Core-Text-vs-FreeType dependency at
+the root rather than re-tuning it a third time. Not yet re-measured on `macmini` —
+confirm green there before trusting this line over the fix commit's own reasoning.
 
 This is also why `coordinator.yml` guards vimcode's `test_command` on `uname`: the
 Darwin branch runs the GTK-less lane.
