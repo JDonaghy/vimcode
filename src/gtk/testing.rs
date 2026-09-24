@@ -9286,50 +9286,43 @@ mod minimap {
     /// Deliberately does **not** trust `scroll_top()` alone (CLAUDE.md:
     /// "Assert on rendered output — never on state being populated" — a
     /// click that mutates `scroll_top` but never actually repaints the new
-    /// position is exactly the #587/#592 bug shape). The fixture's
-    /// indentation shape (12-space indent for lines 100..300 of 400) makes
-    /// the *paint* observable even though this harness can't record
-    /// editor/gutter text (`Harness::window_center`'s doc comment): the
-    /// column band the indent occupies holds no syntax-colored glyph ink
-    /// when a row is indented, and does when it isn't, so counting
-    /// non-grayscale ("colorful") pixels in that band before/after
-    /// distinguishes "repainted the new scroll position" from "only the
-    /// state moved".
+    /// position is exactly the #587/#592 bug shape). Reads the buffer line
+    /// actually on screen from `GtkDriver::painted_texts()` instead: every
+    /// fixture line is `fn item_N() { let x = N; }\n` on buffer line `N`, and
+    /// `show_layout` (quadraui's one paint-time choke point, see its module
+    /// doc) records each editor line's *whole* Pango-layout text verbatim —
+    /// syntax colour lives in per-run colour attributes on that one layout,
+    /// never in a second recorded run — so `top_item_line` below reads back
+    /// exactly the buffer line the paint put on screen, with no reference to
+    /// pixel colour at all.
+    ///
+    /// #934/#1350 (superseded): two earlier rounds of this test asserted on
+    /// *pixel colour* instead — counting non-grayscale ("colorful") pixels in
+    /// the gutter-adjacent column band of the fixture's alternating
+    /// indented/unindented lines, on the theory that syntax-highlighted glyph
+    /// ink is chromatic and blank indentation isn't. That is fundamentally a
+    /// property of the *rasteriser*, not of vimcode's behaviour: GTK's
+    /// pangocairo backend composites glyphs via Core Text on macOS and
+    /// FreeType on Linux, and #1375 confirmed on a real Darwin host that
+    /// #934's widened tolerance (TOL=12, summed across 3 rows) still wasn't
+    /// enough — Core Text's gamma-correct AA can blend a thin syntax-colored
+    /// stroke past any single-pixel chroma threshold chosen without access to
+    /// the actual rasteriser. Reading back the recorded layout text sidesteps
+    /// the whole class of problem: it is the same string on every platform
+    /// regardless of how it was rasterised.
     ///
     /// RED-first: hardcoding `build_rendered_window`'s `scroll_top` local to
     /// `0` (so engine state moves but the paint stays pinned to the top of
-    /// the file) makes the final assertion fail with the indented row still
-    /// showing ~294 colorful pixels instead of 0 — confirmed by hand, along
-    /// with an initial brightness-based version of this probe that turned
-    /// out to be theme-dependent noise (see the color-vs-brightness note
-    /// above) and had to be replaced with this colorfulness count — before
-    /// restoring the fix.
-    ///
-    /// #1350: on macOS this test's own setup sanity check (`before > 0`)
-    /// failed outright — every pixel in the probed band was grayscale, none
-    /// colorful. Root cause: `engine_with_shaped_buffer` built its buffer
-    /// from an unnamed `Engine::new()` buffer (`buffer_mut().insert`
-    /// straight into the default buffer, no file path), so it had no
-    /// language and therefore no tree-sitter highlights — there was no
-    /// syntax colour to find on *any* platform, not just macOS; Linux
-    /// apparently stayed green only because Cairo/FreeType's colourful
-    /// subpixel AA fringing around the plain grayscale glyph ink happened to
-    /// clear `is_colorful`'s tolerance by coincidence, which macOS/Quartz's
-    /// grayscale-only AA does not reproduce. Fixed at the source in
-    /// `engine_with_shaped_buffer` (opens a real on-disk `.rs` file so the
-    /// buffer gets a language and real syntax colour) rather than by
-    /// loosening this predicate: a "differs from background" rewrite would
-    /// also count the (grayscale, always-present) indent guide as ink and
-    /// break the "after" band's must-be-zero assertion on every indented
-    /// row, so chroma — not "differs from background" — has to stay the
-    /// discriminator here.
+    /// the file) makes the final assertion fail — `top_item_line` after the
+    /// click still reports `Some(0)` instead of `Some(scroll_top)` —
+    /// confirmed by hand before restoring the fix.
     #[test]
     fn minimap_click_at_the_middle_scrolls_to_half_the_file() {
         let mut h = harness(engine_with_shaped_buffer(), 1400, 900);
         let win = h.engine.borrow().active_window_id();
         h.window_center(win).expect("editor pane must paint");
 
-        let (strip, total, rect, gutter_px, char_w, lh) = {
+        let (strip, total) = {
             let layout = h.screen_layout.borrow();
             let l = layout.as_ref().unwrap();
             let mm = l
@@ -9337,20 +9330,7 @@ mod minimap {
                 .iter()
                 .find(|m| m.window_id == win)
                 .expect("minimap must be present for the active pane");
-            let rw = l
-                .windows
-                .iter()
-                .find(|w| w.window_id == win)
-                .expect("the active pane must be in the painted layout");
-            (
-                mm.rect,
-                mm.minimap.total_buffer_lines,
-                rw.rect,
-                rw.gutter_char_width as f64 * h.painted_char_width(),
-                h.painted_char_width(),
-                h.painted_line_height()
-                    .expect("frame must publish the line height it painted with"),
-            )
+            (mm.rect, mm.minimap.total_buffer_lines)
         };
         assert_eq!(
             h.engine.borrow().scroll_top(),
@@ -9358,65 +9338,30 @@ mod minimap {
             "fixture must start at the top of the file"
         );
 
-        // The 12-column band right after the gutter, on the top 3 visible
-        // rows: unindented content ("fn item_0() ...") paints syntax-colored
-        // glyph ink *somewhere* in this band before the click, while a row
-        // from the indented band (100..300) paints nothing there but blank
-        // indentation (background plus, at most, an indent-guide line —
-        // grayscale, `r == g == b`). Counting *colorful* pixels (channels
-        // that disagree, i.e. not grayscale) rather than comparing raw
-        // brightness or the full color set keeps this theme-agnostic and
-        // immune to the indent guide: a light theme makes background the
-        // *brightest* color in the band rather than the ink, and indent
-        // guides paint real (if faint) grayscale pixels in the same band
-        // even on a correctly-repainted frame — chroma, not "differs from
-        // background", is load-bearing here, which is why #1350's fix is in
-        // `engine_with_shaped_buffer` (give the buffer a real language so
-        // there's syntax colour to find) rather than in this predicate: a
-        // "differs from background" rewrite would count the always-present
-        // grayscale indent guide as ink and break the "after" band's
-        // must-be-zero assertion on every indented row.
-        //
-        // #934: 3 rows, not 1. A Darwin/Quartz run reported the single-row
-        // version's "before" sanity check failing outright (0 colorful
-        // pixels found) — Core Text's gamma-correct glyph compositing can
-        // blend a thin syntax-colored stroke so far towards the background
-        // that one row's worth of ink dips under `is_colorful`'s TOL, even
-        // though the line plainly painted. Every unindented/indented line in
-        // the fixture repeats the identical token shape
-        // (`fn item_N() { let x = N; }`), so summing ink across 3 rows
-        // multiplies the sampled ink without changing what's being proven.
-        // It stays safe for the "after" (must-be-zero) band too: `frac`'s
-        // `< 0.1` tolerance keeps `scroll_top` inside roughly (160, 240) of
-        // the fixture's 400 lines, so the widened band (`scroll_top` ..
-        // `scroll_top + 2`) tops out around line 242 — comfortably inside
-        // the indented (100..300) range with margin to spare.
-        let band_x0 = (rect.x + gutter_px) as i32;
-        let band_x1 = (rect.x + gutter_px + 12.0 * char_w) as i32;
-        let row_y0 = (rect.y).ceil() as i32;
-        let row_y1 = (rect.y + 3.0 * lh).floor() as i32;
-        let is_colorful = |(r, g, b): (u8, u8, u8)| {
-            let (r, g, b) = (r as i32, g as i32, b as i32);
-            const TOL: i32 = 12; // AA-rounding tolerance, matching `near()` above
-            (r - g).abs() > TOL || (g - b).abs() > TOL || (r - b).abs() > TOL
-        };
-        let colorful_pixel_count = |h: &mut Harness<_>| -> usize {
-            let mut n = 0;
-            for y in row_y0..row_y1 {
-                for x in band_x0..band_x1 {
-                    if is_colorful(h.driver.pixel(x, y)) {
-                        n += 1;
-                    }
-                }
-            }
-            n
-        };
-        let before = colorful_pixel_count(&mut h);
-        assert!(
-            before > 0,
-            "test setup sanity: the unindented top row must paint some \
-             syntax-colored glyph ink in the probed band, not a blank/gray \
-             block"
+        // The lowest `fn item_N` buffer line number among the frame's
+        // painted text runs — the paint-time twin of `scroll_top`, read from
+        // what was actually drawn rather than engine state (mirrors
+        // `dragging_the_minimap_viewport_highlight_scrolls_the_whole_file_on_gtk`'s
+        // `top_line` helper below).
+        fn top_item_line(texts: &[&str]) -> Option<usize> {
+            texts
+                .iter()
+                .filter_map(|t| {
+                    let rest = t.trim_start().strip_prefix("fn item_")?;
+                    rest.split(|c: char| !c.is_ascii_digit())
+                        .next()?
+                        .parse()
+                        .ok()
+                })
+                .min()
+        }
+
+        let before = top_item_line(&h.driver.painted_texts());
+        assert_eq!(
+            before,
+            Some(0),
+            "test setup sanity: the editor's first visible line must be \
+             `fn item_0`, the fixture's own top line"
         );
 
         h.driver.click(
@@ -9432,24 +9377,17 @@ mod minimap {
             "clicking the middle of the minimap must scroll to ~50% of the \
              file, got scroll_top={scroll_top} of {total} ({frac:.3})"
         );
-        assert!(
-            (100..300).contains(&scroll_top),
-            "the ~50% scroll must land inside the fixture's indented band \
-             (lines 100..300) for the paint probe below to be meaningful; \
-             got scroll_top={scroll_top}"
-        );
 
-        // The band that used to hold "fn item_N(...)" ink must now show no
-        // colorful (syntax-highlighted) pixels at all — proof the view
-        // actually repainted the indented band, not just moved `scroll_top`
-        // in engine state while the paint stayed on the old lines.
-        let after = colorful_pixel_count(&mut h);
+        // The view must have actually repainted at the new scroll position —
+        // not just moved `scroll_top` in engine state while the paint stayed
+        // on the old lines.
+        let after = top_item_line(&h.driver.painted_texts());
         assert_eq!(
-            after, 0,
-            "the band right after the gutter must show no syntax-colored \
-             glyph ink once the view scrolls into the indented band — found \
-             {after} colorful pixels; scroll_top moved to {scroll_top} but \
-             the paint didn't follow it"
+            after,
+            Some(scroll_top),
+            "the editor's first visible line after the click must be \
+             `fn item_{scroll_top}` — scroll_top moved to {scroll_top} but \
+             the paint didn't follow it (painted top line: {after:?})"
         );
     }
 
