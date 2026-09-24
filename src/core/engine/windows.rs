@@ -2899,11 +2899,11 @@ impl Engine {
     /// Apply a resolved tab-drag [`DropZone`] to the engine.
     ///
     /// This is the single, backend-agnostic entry point for committing a tab
-    /// drag-and-drop. Both the GTK and TUI backends resolve the drop zone with
-    /// `quadraui::compute_drop_zone` (via `render::compute_tab_drop_zone`) and
-    /// then call this method, so the mutation semantics live in exactly one
-    /// place. `source_gid` / `source_tab_idx` identify the dragged tab, captured
-    /// when the drag started.
+    /// drag-and-drop. Both the GTK and TUI backends resolve the drop zone via
+    /// `quadraui::compose::resolve_tab_drop` (through `render::resolve_tab_drop_zone`,
+    /// #1370) and then call this method, so the mutation semantics live in
+    /// exactly one place. `source_gid` / `source_tab_idx` identify the dragged
+    /// tab, captured when the drag started.
     pub fn apply_tab_drop_zone(
         &mut self,
         source_gid: GroupId,

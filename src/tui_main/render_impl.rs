@@ -594,35 +594,33 @@ pub(super) fn tab_tooltip_at_col(
 }
 
 /// Extract per-tab drag-and-drop slot bounds — `(x_start, x_end)` pairs in
-/// absolute screen-column units, ordered by tab index — from a tab bar's
-/// layout. `base_x` is the absolute left edge the region columns are
-/// relative to (bar left edge = column 0).
+/// absolute screen-column units, index-aligned to the group's own `Vec<Tab>`
+/// with a `(0.0, 0.0)` sentinel for any tab scrolled off the bar — from a
+/// tab bar's layout. `base_x` is the absolute left edge the region columns
+/// are relative to (bar left edge = column 0); `tab_count` sizes the
+/// sentinel-filled result to the group's real tab count.
 ///
 /// #477: `visible_tabs` is the single source of truth already used for mouse
 /// click routing (`render::resolve_tab_bar_click`'s `hit_test`); this just
-/// re-slices it into the `(f32, f32)` shape the drag overlay / drop-zone
-/// geometry expects, instead of hand-rolling `name.chars().count() +
-/// TAB_CLOSE_COLS` per tab (which had drifted from the real per-tab
-/// close-button width and from an obsolete "+2 for the scroll indicator"
-/// adjustment that the quadraui TUI tab bar rasteriser doesn't actually
-/// reserve space for).
+/// re-slices it into the shape `quadraui::DropGroupRect::tab_slots` /
+/// `PaneDragRect::tab_slots` document — index-aligned with sentinels, not a
+/// contiguous visible-only run (#1370) — instead of hand-rolling
+/// `name.chars().count() + TAB_CLOSE_COLS` per tab (which had drifted from
+/// the real per-tab close-button width and from an obsolete "+2 for the
+/// scroll indicator" adjustment that the quadraui TUI tab bar rasteriser
+/// doesn't actually reserve space for).
 fn tab_drag_slots_from_hit_regions(
     hit_regions: &quadraui::TabBarLayout,
     base_x: f32,
+    tab_count: usize,
 ) -> Vec<(f32, f32)> {
-    let mut tabs: Vec<(usize, f32, f32)> = hit_regions
-        .visible_tabs
-        .iter()
-        .map(|vt| {
-            (
-                vt.tab_idx,
-                base_x + vt.bounds.x,
-                base_x + vt.bounds.x + vt.bounds.width,
-            )
-        })
-        .collect();
-    tabs.sort_unstable_by_key(|(idx, ..)| *idx);
-    tabs.into_iter().map(|(_, s, e)| (s, e)).collect()
+    let mut slots = vec![(0.0f32, 0.0f32); tab_count];
+    for vt in &hit_regions.visible_tabs {
+        if let Some(slot) = slots.get_mut(vt.tab_idx) {
+            *slot = (base_x + vt.bounds.x, base_x + vt.bounds.x + vt.bounds.width);
+        }
+    }
+    slots
 }
 
 /// Build the per-group tab-drag slot map consumed by the drag overlay and
@@ -638,15 +636,21 @@ fn tab_drag_slots_from_hit_regions(
 /// generic arm reproduces it exactly and the special case is gone.
 fn build_tui_tab_slots(
     screen: &render::ScreenLayout,
+    engine: &Engine,
 ) -> std::collections::HashMap<usize, Vec<(f32, f32)>> {
     let mut map = std::collections::HashMap::new();
     for gtb in &screen.group_tab_bars {
         // #550: `gtb.bounds` is already absolute terminal-screen space
         // (same convention as GTK), so no `editor_x` offset addition.
         let abs_x = gtb.bounds.x as f32;
+        let tab_count = engine
+            .editor_groups
+            .get(&gtb.group_id)
+            .map(|g| g.tabs.len())
+            .unwrap_or(0);
         map.insert(
             gtb.group_id.0,
-            tab_drag_slots_from_hit_regions(&gtb.hit_regions, abs_x),
+            tab_drag_slots_from_hit_regions(&gtb.hit_regions, abs_x, tab_count),
         );
     }
     map
@@ -656,8 +660,12 @@ fn build_tui_tab_slots(
 ///
 /// `tab_drag_source` is the (GroupId, tab_index) captured when the drag started.
 /// `tab_drag_cursor` is the current cursor position during the drag.
-/// `tab_drop_zone` is the most recently computed drop zone.
-#[allow(clippy::too_many_arguments)]
+///
+/// #1370: resolves fresh each call from `ctx` + `tab_drag_cursor`, via
+/// quadraui's own `drop_zone_hit_test`/`drop_zone_overlay`
+/// (`render::tab_drop_overlay`) — no cached `DropZone` parameter needed, since
+/// this is a pure query over the same painted geometry `resolve_tab_drop_zone`
+/// (the drop *mutation*) reads.
 pub(super) fn render_tab_drag_overlay(
     backend: &mut dyn quadraui::Backend,
     engine: &Engine,
@@ -665,9 +673,8 @@ pub(super) fn render_tab_drag_overlay(
     theme: &render::Theme,
     tab_drag_source: Option<(crate::core::window::GroupId, usize)>,
     tab_drag_cursor: Option<(f64, f64)>,
-    tab_drop_zone: &crate::core::window::DropZone,
 ) {
-    let tab_slots = build_tui_tab_slots(screen);
+    let tab_slots = build_tui_tab_slots(screen, engine);
     let tbh_f = if engine.settings.breadcrumbs {
         2.0f32
     } else {
@@ -678,25 +685,17 @@ pub(super) fn render_tab_drag_overlay(
     // `screen_to_drop_group_bounds` needs no origin argument and this call
     // site no longer has to pick one based on split-vs-single.
     let bounds = render::screen_to_drop_group_bounds(screen);
-    let (groups, tbh) = render::build_tab_drop_groups(&bounds, engine, tbh_f, &tab_slots);
+    let ctx = render::build_tab_drop_ctx(&bounds, engine, tbh_f, &tab_slots);
     let cursor = tab_drag_cursor
         .map(|(mx, my)| (mx as f32, my as f32))
         .unwrap_or((0.0, 0.0));
-    let overlay =
-        match render::compute_tab_drop_overlay(tab_drop_zone, &groups, cursor, tbh, 1.0, 2.0) {
-            Some(o) => o,
-            None => return,
-        };
+    let overlay = match render::tab_drop_overlay(&ctx, cursor.0, cursor.1, 1.0, 2.0) {
+        Some(o) => o,
+        None => return,
+    };
 
-    {
-        let q_overlay = quadraui::DropOverlay {
-            highlight: overlay.highlight,
-            insertion_bar: overlay.insertion_bar,
-            ghost_position: Some(overlay.ghost_position),
-        };
-        backend.set_theme(super::quadraui_tui::q_theme(theme));
-        backend.draw_drop_overlay(&q_overlay);
-    }
+    backend.set_theme(super::quadraui_tui::q_theme(theme));
+    backend.draw_drop_overlay(&overlay);
 
     // Look up the tab label from engine using the captured drag source.
     let drag_label: String = if let Some((src_gid, src_tab_idx)) = tab_drag_source {
@@ -716,8 +715,9 @@ pub(super) fn render_tab_drag_overlay(
 
     if tab_drag_cursor.is_some() && !drag_label.is_empty() {
         let label = &drag_label;
-        let gx = overlay.ghost_position.0 as u16;
-        let gy = overlay.ghost_position.1 as u16;
+        let (ghost_x, ghost_y) = overlay.ghost_position.unwrap_or((0.0, 0.0));
+        let gx = ghost_x as u16;
+        let gy = ghost_y as u16;
         // #609: was a raw `Buffer` write (`frame.buffer_mut()`); routed
         // through `draw_rule_row` (the `Backend::draw_status_bar` trick —
         // see `draw_rule_cell_themed`'s doc comment) so this reaches the screen
@@ -736,9 +736,16 @@ pub(super) fn render_tab_drag_overlay(
     }
 }
 
-/// Compute the drop zone for a tab drag in TUI based on cursor cell position.
-pub(super) fn compute_tui_tab_drop_zone(
+/// Resolve the drop zone for a live tab drag in TUI based on cursor cell
+/// position, via quadraui's host-owned-model `resolve_tab_drop` (#1370,
+/// replaces the old geometry-only `compute_tui_tab_drop_zone`). `source` is
+/// `(group, tab index)` of the tab being dragged, captured when the drag
+/// began — `resolve_tab_drop` needs it up front, unlike the old
+/// `compute_tab_drop_zone`, which deferred the same-group-vs-cross-group
+/// decision to `apply_tab_drop_zone` at commit time.
+pub(super) fn resolve_tui_tab_drop_zone(
     engine: &Engine,
+    source: (crate::core::window::GroupId, usize),
     col: u16,
     row: u16,
     editor_left: u16,
@@ -758,7 +765,7 @@ pub(super) fn compute_tui_tab_drop_zone(
     if terminal_size.is_none() {
         return crate::core::window::DropZone::None;
     }
-    let tab_slots = build_tui_tab_slots(layout);
+    let tab_slots = build_tui_tab_slots(layout, engine);
     let tbh_f = if engine.settings.breadcrumbs {
         2.0f32
     } else {
@@ -767,8 +774,8 @@ pub(super) fn compute_tui_tab_drop_zone(
     // #550/#515/#551: `gtb.bounds` is always absolute for every group count,
     // so no origin argument and no split-vs-single choice here.
     let bounds = render::screen_to_drop_group_bounds(layout);
-    let (groups, tbh) = render::build_tab_drop_groups(&bounds, engine, tbh_f, &tab_slots);
-    render::compute_tab_drop_zone(col as f32, row as f32, &groups, tbh)
+    let ctx = render::build_tab_drop_ctx(&bounds, engine, tbh_f, &tab_slots);
+    render::resolve_tab_drop_zone(&ctx, source, col as f32, row as f32)
 }
 
 // `render_tab_bar` and `draw_breadcrumb_bar` used to sit here — two
@@ -1688,13 +1695,7 @@ mod tests {
                                 &theme,
                             ),
                             render::EditorOp::TabDragOverlay => render_tab_drag_overlay(
-                                backend,
-                                engine,
-                                &screen,
-                                &theme,
-                                None,
-                                None,
-                                &crate::core::window::DropZone::None,
+                                backend, engine, &screen, &theme, None, None,
                             ),
                             render::EditorOp::TabTooltip => {
                                 if let Some(ref tooltip_text) = screen.tab_tooltip {
@@ -2151,11 +2152,12 @@ mod tests {
     /// branch: it passed the whole-editor origin/size (top-left at the
     /// global tab bar's row, per the "tab bar at row 0 of editor_area"
     /// convention) straight through as `DropGroupBounds` content bounds,
-    /// which `build_tab_drop_groups` then shifted *up* by `tab_bar_height`
-    /// again to reconstruct the full rect. That double-shift made the
-    /// computed tab-bar band sit one row above the screen (`bounds.y`
-    /// negative), so a cursor sitting on the real tab-bar row (row 0)
-    /// tested as being *above* the bar — landing in the `Split(Top)`
+    /// which the geometry builder (`build_tab_drop_ctx` today, `build_tab_drop_groups`
+    /// at the time this regression was found) then shifted *up* by
+    /// `tab_bar_height` again to reconstruct the full rect. That double-shift
+    /// made the computed tab-bar band sit one row above the screen
+    /// (`bounds.y` negative), so a cursor sitting on the real tab-bar row
+    /// (row 0) tested as being *above* the bar — landing in the `Split(Top)`
     /// branch of `quadraui::compute_drop_zone` instead of `TabReorder`.
     #[test]
     fn test_tui_single_group_tab_drag_reorder_not_split_477() {
@@ -2184,19 +2186,20 @@ mod tests {
             "test setup must stay a single tab group"
         );
 
-        let slots = build_tui_tab_slots(&screen);
+        let slots = build_tui_tab_slots(&screen, &e);
         let group_slots = slots
             .get(&e.active_group.0)
             .expect("single-group tab slots must be keyed by the active group id");
-        assert_eq!(group_slots.len(), 4, "expected 4 visible tab slots");
+        assert_eq!(group_slots.len(), 4, "expected 4 tab slots");
 
         // Cursor over the middle of tab index 2 (3rd tab), row 0 — the tab
-        // bar's own row. A drop here reorders within the group; it must
-        // never be resolved as a split.
+        // bar's own row. Dragging tab 0 and dropping here reorders within
+        // the group; it must never be resolved as a split.
         let (s2, e2) = group_slots[2];
         let cursor_col = ((s2 + e2) / 2.0).round() as u16;
-        let zone = compute_tui_tab_drop_zone(
+        let zone = resolve_tui_tab_drop_zone(
             &e,
+            (e.active_group, 0),
             cursor_col,
             0,
             0,

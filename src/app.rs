@@ -501,20 +501,11 @@ impl<'a> render::EditorBandHost<'a> for GtkEditorBandHost<'a> {
         screen: &'a render::ScreenLayout,
         _theme: &Theme,
     ) {
-        let eff_tbh = self
-            .app
+        self.app
             .cache_tab_drop_geometry(screen, engine, self.tab_bar_h);
-        let groups = self.app.cached_drop_groups.borrow();
+        let ctx = self.app.cached_drop_ctx.borrow();
         let (mx, my) = self.app.mouse_pos_cell.get();
-        render::paint_tab_drop_overlay(
-            backend,
-            self.app.tab_drag.zone(),
-            &groups,
-            (mx as f32, my as f32),
-            eff_tbh,
-            2.0,
-            self.lh as f32,
-        );
+        render::paint_tab_drop_overlay(backend, &ctx, (mx as f32, my as f32), 2.0, self.lh as f32);
     }
 }
 
@@ -881,10 +872,11 @@ pub(crate) struct App {
     /// Per-group tab-drop geometry (absolute pixel bounds) computed each frame in
     /// `render_content`. Both the drag overlay (same frame) and the drag hit-test
     /// in `handle_mouse_drag_msg` (next mouse-move) read this, so the drop-zone
-    /// detection and the highlight always use one identical bounds source. (#515)
-    pub(crate) cached_drop_groups: Rc<RefCell<Vec<render::TabDropGroup>>>,
-    /// Effective tab-bar height (px) paired with `cached_drop_groups`.
-    pub(crate) cached_drop_tbh: Rc<Cell<f32>>,
+    /// detection and the highlight always use one identical bounds source. (#515;
+    /// #1370 switched the payload from vimcode's own `TabDropGroup` to
+    /// `render::TabDropCtx`, the index-aligned shape quadraui's `resolve_tab_drop`
+    /// / `drop_zone_hit_test` both key off of.)
+    pub(crate) cached_drop_ctx: Rc<RefCell<render::TabDropCtx>>,
     /// Backend (line_height, char_width) captured at the instant the file
     /// explorer tree was rendered. The backend's `current_line_height` is mutable
     /// per-frame state and may differ by click time, which made the explorer
@@ -1856,8 +1848,7 @@ impl App {
             cached_sc_bands: Cell::new(None),
             cached_dap_action_rect: Cell::new(None),
             cached_tab_bar_zones: Rc::new(RefCell::new(HashMap::new())),
-            cached_drop_groups: Rc::new(RefCell::new(Vec::new())),
-            cached_drop_tbh: Rc::new(Cell::new(0.0)),
+            cached_drop_ctx: Rc::new(RefCell::new(render::TabDropCtx::default())),
             cached_explorer_metrics: Rc::new(Cell::new((16.0, 8.0))),
             cached_ai_chat_metrics: Rc::new(Cell::new((16.0, 8.0))),
             debug_toolbar_y_offset: Rc::new(Cell::new(0.0)),
@@ -4376,18 +4367,17 @@ impl App {
                 bar.group_id.0,
                 abs_close_record(&ph.close, bar.rect.x as f64, bar_top, bar_top + tab_row_h),
             );
-            slots_abs.insert(bar.group_id.0, abs_visible_slots(&bar.hits));
+            slots_abs.insert(bar.group_id.0, abs_slot_positions(&bar.hits));
             pixel_hits.insert(bar.group_id.0, ph);
             hit_bars.push((bar.group_id, bar.rect, bar.bar));
         }
     }
 
     /// Recompute the per-group tab-drop geometry from this frame's screen
-    /// layout and stash it in `cached_drop_groups` / `cached_drop_tbh`;
-    /// returns the effective tab-bar height the same call resolved.
+    /// layout and stash it in `cached_drop_ctx`.
     ///
     /// One source for two consumers that must never disagree: the drag
-    /// hit-test (`handle_mouse_drag_msg` → `render::compute_tab_drop_zone`)
+    /// hit-test (`handle_mouse_drag_msg` → `render::resolve_tab_drop_zone`)
     /// and the `EditorOp::TabDragOverlay` rung's own highlight. `render_content`
     /// calls this unconditionally once per frame — a drag has to be able to
     /// *start*, so the cache must be current on frames where no drag is live —
@@ -4407,19 +4397,16 @@ impl App {
         screen: &render::ScreenLayout,
         engine: &Engine,
         tab_bar_h: f64,
-    ) -> f32 {
+    ) {
         let bounds = render::screen_to_drop_group_bounds(screen);
         // Per-tab slot x-positions (absolute) are captured by the `TabBars`
         // rung while drawing. Feeding them here makes a drag inside a group's
         // own tab bar resolve to a `TabReorder` (insertion bar) instead of
         // falling through to a new-split/center overlay. (#515)
         let slots_abs = self.cached_tab_slots_abs.borrow();
-        let (groups, eff_tbh) =
-            render::build_tab_drop_groups(&bounds, engine, tab_bar_h as f32, &slots_abs);
+        let ctx = render::build_tab_drop_ctx(&bounds, engine, tab_bar_h as f32, &slots_abs);
         drop(slots_abs);
-        *self.cached_drop_groups.borrow_mut() = groups;
-        self.cached_drop_tbh.set(eff_tbh);
-        eff_tbh
+        *self.cached_drop_ctx.borrow_mut() = ctx;
     }
 
     /// Re-resolve a tab-drag press point to `(group, tab index)`, or `None`
@@ -5622,15 +5609,13 @@ impl App {
                         // Cursor and the cached per-group bounds are both in
                         // absolute surface coordinates, so the hit-test matches
                         // what the overlay draws (#515).
-                        let groups = self.cached_drop_groups.borrow();
-                        let zone = render::compute_tab_drop_zone(
-                            x as f32,
-                            y as f32,
-                            &groups,
-                            self.cached_drop_tbh.get(),
-                        );
-                        drop(groups);
-                        self.tab_drag.track(zone);
+                        if let Some(source) = self.tab_drag.source() {
+                            let ctx = self.cached_drop_ctx.borrow();
+                            let zone =
+                                render::resolve_tab_drop_zone(&ctx, source, x as f32, y as f32);
+                            drop(ctx);
+                            self.tab_drag.track(zone);
+                        }
                     }
                     render::TabDragMove::Crossed { press_x, press_y } => {
                         // Unlike TUI, this backend's arm fires for the whole

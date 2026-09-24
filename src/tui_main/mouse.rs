@@ -867,14 +867,17 @@ pub(super) fn handle_mouse(
                 render::MouseDragRoute::TabDrag => {
                     match tab_drag.handle_move(col as f64, row as f64, 2.0) {
                         render::TabDragMove::Tracking => {
-                            tab_drag.track(compute_tui_tab_drop_zone(
-                                engine,
-                                col,
-                                row,
-                                editor_left,
-                                last_layout,
-                                *terminal_size,
-                            ));
+                            if let Some(source) = tab_drag.source() {
+                                tab_drag.track(resolve_tui_tab_drop_zone(
+                                    engine,
+                                    source,
+                                    col,
+                                    row,
+                                    editor_left,
+                                    last_layout,
+                                    *terminal_size,
+                                ));
+                            }
                         }
                         render::TabDragMove::Crossed { .. } => {
                             // Only the tab-bar arm arms the drag here, so the press

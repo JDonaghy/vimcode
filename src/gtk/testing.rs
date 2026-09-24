@@ -964,8 +964,17 @@ mod tests {
             left_before.x + left_before.width / 2.0,
             left_before.y + left_before.height / 2.0,
         );
+        // Three-quarters into the target's slot, not its exact centre:
+        // `quadraui::compose::resolve_tab_drop` (#1370) resolves a drop
+        // exactly at (or a fraction of a px either side of) a slot's own
+        // midpoint by comparing the cursor to that same midpoint, so a
+        // dead-centre target is a coin flip between "insert before" and
+        // "insert after" depending on which way float rounding falls that
+        // frame — the old geometry-only `compute_tab_drop_zone` this
+        // replaced was less precise here and always landed the same way
+        // by accident. Comfortably past the midpoint removes the ambiguity.
         let to = (
-            right_before.x + right_before.width / 2.0,
+            right_before.x + right_before.width * 0.75,
             right_before.y + right_before.height / 2.0,
         );
         // Two moves, not one: the first crosses the 8px threshold and *starts*
@@ -990,6 +999,200 @@ mod tests {
             right_before.x,
             left_after.x,
             right_after.x
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1370 acceptance, GTK half of the cross-group merge case: dragging a
+    /// tab from one editor **group** onto another group's own tab bar must
+    /// merge it in and collapse the now-empty source pane —
+    /// `TabDropInstruction::MoveToPane`, resolved via
+    /// `render::resolve_tab_drop_zone` / `quadraui::compose::resolve_tab_drop`
+    /// (quadraui#998) instead of vimcode's own hand-rolled
+    /// `compute_tab_drop_zone` geometry walk this issue replaces. Only the
+    /// same-group reorder case (the sibling test above) had driver coverage
+    /// before this issue on either backend; this cross-group merge path was
+    /// untested.
+    ///
+    /// Behaviour-preserving refactor, not a bug fix: this gesture already
+    /// worked on unfixed `develop` through the old `compute_tab_drop_zone`
+    /// path (`Engine::apply_tab_drop_zone`'s cross-group arms are untouched
+    /// by this issue). This test guards the geometry-resolution path #1370
+    /// replaces, the same way the TUI twin
+    /// (`tui_tab_drag_into_another_group_merges_and_collapses_the_source` in
+    /// `tui_main/shell_app.rs`) does.
+    #[test]
+    fn tab_drag_into_another_group_merges_and_collapses_the_source_on_gtk() {
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_test_1370_gtk_merge_{:?}",
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = dir.join("zleft1370.txt");
+        let b = dir.join("zright1370.txt");
+        std::fs::write(&a, "a\n").unwrap();
+        std::fs::write(&b, "b\n").unwrap();
+
+        let mut engine = Engine::new();
+        engine
+            .open_file_with_mode(&a, crate::core::engine::OpenMode::Permanent)
+            .unwrap();
+        engine.open_editor_group(SplitDirection::Vertical);
+        engine
+            .open_file_with_mode(&b, crate::core::engine::OpenMode::Permanent)
+            .unwrap();
+
+        let mut h = harness(engine, 1400, 900);
+        h.driver.render();
+
+        let tab_label = |name: &str| format!("{name}.txt ");
+        let bounds = |h: &Harness<_>, name: &str| {
+            let needle = tab_label(name);
+            h.driver
+                .find_bounds(&needle)
+                .unwrap_or_else(|| panic!("tab label {needle:?} must be painted"))
+        };
+        let left_before = bounds(&h, "zleft1370");
+        let right_before = bounds(&h, "zright1370");
+        assert!(
+            left_before.x < right_before.x,
+            "the left group's own tab must paint left of the right group's"
+        );
+
+        let from = (
+            left_before.x + left_before.width / 2.0,
+            left_before.y + left_before.height / 2.0,
+        );
+        // Three-quarters into the target's slot, not its exact centre — see
+        // the reorder test above's identical comment for why a dead-centre
+        // target is ambiguous under `quadraui::compose::resolve_tab_drop`'s
+        // own midpoint comparison.
+        let to = (
+            right_before.x + right_before.width * 0.75,
+            right_before.y + right_before.height / 2.0,
+        );
+        h.driver.mouse_down(from.0, from.1);
+        h.driver.mouse_move(to.0, to.1);
+        h.driver.mouse_move(to.0, to.1);
+        h.driver.mouse_up(to.0, to.1);
+        h.driver.render();
+
+        let left_after = bounds(&h, "zleft1370");
+        let right_after = bounds(&h, "zright1370");
+        assert!(
+            left_after.x > right_after.x,
+            "dropping onto the right group's own tab slot must insert after \
+             it (was left={} right={}, now left={} right={})",
+            left_before.x,
+            right_before.x,
+            left_after.x,
+            right_after.x
+        );
+        assert!(
+            right_after.x < right_before.x,
+            "the target group's tab must repaint further LEFT once the \
+             source group collapses and its pane widens to fill the whole \
+             editor column (was {}, now {})",
+            right_before.x,
+            right_after.x
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1370 acceptance, GTK half of the drag-to-split case: dragging a tab
+    /// to a group's own left edge (a content-area drop, not a tab-bar drop)
+    /// must split it into a new pane — `TabDropInstruction::SplitToNewPane`,
+    /// resolved the same way as the merge test above.
+    ///
+    /// Two tabs in the one starting group (not one) so the "only tab of the
+    /// only pane" no-op guard in `quadraui::compose::resolve_tab_drop`
+    /// (splitting a pane's sole tab onto its own only edge is defined as a
+    /// no-op) does not swallow the drop.
+    ///
+    /// Behaviour-preserving refactor: this gesture already worked on
+    /// unfixed `develop` through the old `compute_tab_drop_zone` /
+    /// `Engine::apply_tab_drop_zone`'s `DropZone::Split` arm, both untouched
+    /// by this issue; this test guards the geometry-resolution path #1370
+    /// replaces, mirroring the TUI twin
+    /// (`tui_tab_drag_to_the_left_edge_splits_into_a_new_group`).
+    #[test]
+    fn tab_drag_to_the_left_edge_splits_into_a_new_group_on_gtk() {
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_test_1370_gtk_split_{:?}",
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = dir.join("zonly1370a.txt");
+        let b = dir.join("zonly1370b.txt");
+        std::fs::write(&a, "a\n").unwrap();
+        std::fs::write(&b, "b\n").unwrap();
+
+        let mut engine = Engine::new();
+        // `open_file_with_mode` replaces the default tab's own content in
+        // place rather than appending a new one (unlike `new_tab`) — needed
+        // here so tab "a" is genuinely the group's *first* tab, painted
+        // flush against the group's left edge, which the left-edge drop
+        // target below depends on.
+        engine
+            .open_file_with_mode(&a, crate::core::engine::OpenMode::Permanent)
+            .unwrap();
+        engine.new_tab(Some(&b));
+
+        let mut h = harness(engine, 1400, 900);
+        h.driver.render();
+
+        let tab_label = |name: &str| format!("{name}.txt ");
+        let bounds = |h: &Harness<_>, name: &str| {
+            let needle = tab_label(name);
+            h.driver
+                .find_bounds(&needle)
+                .unwrap_or_else(|| panic!("tab label {needle:?} must be painted"))
+        };
+        let a_before = bounds(&h, "zonly1370a");
+        let b_before = bounds(&h, "zonly1370b");
+
+        let from = (
+            a_before.x + a_before.width / 2.0,
+            a_before.y + a_before.height / 2.0,
+        );
+        // Well inside the group's own left edge (a few px in from where tab
+        // a itself painted) and well below the tab row, into the content
+        // area — a content-area drop near the left edge resolves to
+        // `Split(Left)`, not a same-group tab-bar reorder.
+        let to = (a_before.x + 3.0, a_before.y + 200.0);
+        h.driver.mouse_down(from.0, from.1);
+        h.driver.mouse_move(to.0, to.1);
+        h.driver.mouse_move(to.0, to.1);
+        h.driver.mouse_up(to.0, to.1);
+        h.driver.render();
+
+        let a_after = bounds(&h, "zonly1370a");
+        let b_after = bounds(&h, "zonly1370b");
+        assert!(
+            a_after.x < b_after.x,
+            "dropping on the LEFT edge must create the new pane to the left \
+             of the target — a's tab should now paint left of b's; \
+             a={a_after:?} b={b_after:?}"
+        );
+        // `new_first: true` (the `Left` edge) keeps the *new* pane at the
+        // group's original left edge and pushes the *target* (original)
+        // pane — the one that keeps tab b behind — right to make room, so
+        // b's own tab bar is the one that must have visibly moved. Checking
+        // b rather than a is deliberate: a's new pane could paint at
+        // approximately its old x by coincidence (it starts flush against
+        // the same original left edge the whole group used to), which would
+        // make an "a moved" assertion pass even for a same-group reorder
+        // that happened to land a left of b.
+        assert!(
+            b_after.x > b_before.x,
+            "the target pane (still holding b) must repaint further RIGHT \
+             once a new sibling pane appears to its left: was {}, now {}",
+            b_before.x,
+            b_after.x
         );
 
         let _ = std::fs::remove_dir_all(&dir);
