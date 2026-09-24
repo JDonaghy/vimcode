@@ -2910,15 +2910,32 @@ impl Engine {
 
     // ── AI assistant panel ─────────────────────────────────────────────────────
 
-    /// Send `text` as a user message; spawns the background request thread.
-    /// Callers (`ChatControllerEvent::Submit` dispatch, the `:AI` command,
-    /// the palette's `chat_send:` action) own clearing whatever input widget
-    /// held the text — this only mutates the conversation/request state.
+    /// Send `text` as a user message. Callers (`ChatControllerEvent::Submit`
+    /// dispatch, the `:AI` command, the palette's `chat_send:` action) own
+    /// clearing whatever input widget held the text — this only mutates the
+    /// conversation/request state.
+    ///
+    /// Transport is picked by `settings.acp_agent_command` (#952, ACP-1):
+    /// non-empty routes through a live ACP agent subprocess
+    /// (`ai_send_message_via_acp`); empty keeps the original direct-provider
+    /// `curl` transport (`ai_send_message_via_curl`, `crate::core::ai`) —
+    /// kept as a no-agent-binary escape hatch per the issue's "Decide in
+    /// this slice" through ACP-7.
     pub fn ai_send_message(&mut self, text: String) {
         let text = text.trim().to_string();
         if text.is_empty() || self.ai_streaming {
             return;
         }
+        if self.settings.acp_agent_command.trim().is_empty() {
+            self.ai_send_message_via_curl(text);
+        } else {
+            self.ai_send_message_via_acp(text);
+        }
+    }
+
+    /// Direct-provider transport: spawns the blocking `curl` background
+    /// thread (`crate::core::ai::send_chat`), polled by `poll_ai`.
+    fn ai_send_message_via_curl(&mut self, text: String) {
         self.ai_messages.push(AiMessage {
             role: "user".to_string(),
             content: text,
@@ -2941,6 +2958,62 @@ impl Engine {
             );
             let _ = tx.send(result);
         });
+    }
+
+    /// ACP transport (#952, ACP-1): spawns (or reuses) a live ACP agent
+    /// subprocess and drives it through `initialize` -> `session/new` ->
+    /// `session/prompt`. All of the session-update chunk streaming and
+    /// prompt-stop handling lives in `Engine::poll_acp`
+    /// (`src/core/engine/acp_ops.rs`), driven off the non-blocking
+    /// `AcpClient::poll` — nothing here blocks the tick.
+    fn ai_send_message_via_acp(&mut self, text: String) {
+        self.ai_messages.push(AiMessage {
+            role: "user".to_string(),
+            content: text.clone(),
+        });
+        self.ai_streaming = true;
+        self.acp_streaming_turn = None;
+
+        if let Some(client) = self.acp_client.as_mut() {
+            if let Some(session_id) = self.acp_session_id.clone() {
+                client.prompt(
+                    &session_id,
+                    vec![serde_json::json!({"type": "text", "text": text})],
+                );
+            } else {
+                // The initialize -> session/new handshake from a previous
+                // message is still in flight; `poll_acp`'s `SessionCreated`
+                // handler sends this the moment the session id lands.
+                self.acp_pending_prompt = Some(text);
+            }
+            return;
+        }
+
+        let agent_cmd = self.settings.acp_agent_command.clone();
+        let argv = crate::core::acp::parse_agent_command(&agent_cmd);
+        let cwd = self
+            .workspace_root
+            .clone()
+            .unwrap_or_else(|| self.cwd.clone());
+        match crate::core::acp::AcpClient::spawn(&argv, &cwd) {
+            Ok(mut client) => {
+                client.initialize();
+                self.acp_client = Some(client);
+                self.acp_pending_prompt = Some(text);
+            }
+            Err(e) => {
+                // Acceptance (#952): agent binary missing from PATH must be
+                // a clear, actionable panel message, not a crash or a
+                // silently empty panel — so this lands in the transcript
+                // itself, not just the status line.
+                self.ai_streaming = false;
+                self.message = format!("ACP agent failed to start: {e}");
+                self.ai_messages.push(AiMessage {
+                    role: "assistant-thought".to_string(),
+                    content: format!("\u{26a0} Could not start ACP agent \"{agent_cmd}\": {e}"),
+                });
+            }
+        }
     }
 
     /// Non-blocking poll for a completed AI response. Returns `true` if something changed.
@@ -2970,10 +3043,21 @@ impl Engine {
     }
 
     /// Clear the AI conversation history and cancel any in-flight request.
+    ///
+    /// When the panel is on the ACP transport, this also drops the live
+    /// agent (`AcpClient::drop` kills the subprocess) rather than just
+    /// clearing the local transcript — matching the curl transport's
+    /// "conversation cleared" semantics: the next message starts a fresh
+    /// `initialize` -> `session/new` handshake, not a continuation of
+    /// whatever context the old agent process held.
     pub fn ai_clear(&mut self) {
         self.ai_messages.clear();
         self.ai_rx = None;
         self.ai_streaming = false;
+        self.acp_client = None;
+        self.acp_session_id = None;
+        self.acp_pending_prompt = None;
+        self.acp_streaming_turn = None;
         self.ai_chat.borrow_mut().set_transcript_scroll_top(0);
         self.message = "AI conversation cleared.".to_string();
     }

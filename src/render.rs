@@ -18841,14 +18841,23 @@ fn build_ext_panel_data(engine: &Engine) -> Option<ExtPanelData> {
 pub fn populate_ai_chat_controller(engine: &Engine, theme: &Theme) {
     let user_fg = theme.keyword;
     let asst_fg = theme.string_lit;
+    // ACP-1 (#952): agent "thought" chunks (`session/update`'s
+    // `agent_thought_chunk`, role "assistant-thought" — see
+    // `Engine::acp_append_chunk`) render under `ChatRole::System`, not
+    // `Assistant` — `ChatController::build_transcript_rows` gives `System`
+    // both its own role-header label ("System" vs "AI") and its own colour,
+    // which is the acceptance criterion: thought chunks must be visually
+    // distinct from message chunks, not merely a different tint on the same
+    // "AI" label.
+    let thought_fg = theme.comment;
     let turns: Vec<quadraui::ChatTurn> = engine
         .ai_messages
         .iter()
         .map(|m| {
-            let (role, fg) = if m.role == "user" {
-                (quadraui::ChatRole::User, user_fg)
-            } else {
-                (quadraui::ChatRole::Assistant, asst_fg)
+            let (role, fg) = match m.role.as_str() {
+                "user" => (quadraui::ChatRole::User, user_fg),
+                "assistant-thought" => (quadraui::ChatRole::System, thought_fg),
+                _ => (quadraui::ChatRole::Assistant, asst_fg),
             };
             quadraui::ChatTurn {
                 role,

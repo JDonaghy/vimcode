@@ -26620,6 +26620,7 @@ fn test_set_option_round_trip() {
         ("spelllang", "en_GB"),
         ("ai_provider", "openai"),
         ("ai_model", "gpt-4"),
+        ("acp_agent_command", "claude-code-acp"),
         ("ctrl_f_action", "page_down"),
         ("hide_single_tab", "true"),
         ("breadcrumbs", "false"),

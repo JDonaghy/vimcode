@@ -545,6 +545,20 @@ pub struct Settings {
     #[serde(default)]
     pub ai_completions: bool,
 
+    /// ACP (Agent Client Protocol) agent command line, e.g.
+    /// `"claude-code-acp"` — parsed into argv via
+    /// `crate::core::acp::parse_agent_command`. The agent is spawned with
+    /// the workspace root (falling back to the CWD vimcode was started in)
+    /// as its `session/new` `cwd` (#952, ACP-1).
+    ///
+    /// Empty (the default) means "no live agent configured": the AI panel
+    /// falls back to `ai_provider`/`ai_api_key`'s direct-provider `curl`
+    /// transport (`crate::core::ai`), kept as a no-agent-binary-required
+    /// escape hatch per #952's "Decide in this slice" — through ACP-7, at
+    /// which point a follow-up issue retires it.
+    #[serde(default)]
+    pub acp_agent_command: String,
+
     // ── Explorer ──────────────────────────────────────────────────────────────
     /// Show hidden files (dotfiles) in the file explorer (default: false).
     #[serde(default)]
@@ -1484,6 +1498,7 @@ impl Default for Settings {
             ai_model: String::new(),
             ai_base_url: String::new(),
             ai_completions: false,
+            acp_agent_command: String::new(),
             show_hidden_files: false,
             explorer_sort_case_insensitive: true,
             swap_file: default_swap_file(),
@@ -3335,6 +3350,7 @@ impl Settings {
             "ai_model" => self.ai_model.clone(),
             "ai_base_url" => self.ai_base_url.clone(),
             "ai_completions" => self.ai_completions.to_string(),
+            "acp_agent_command" => self.acp_agent_command.clone(),
             "showhiddenfiles" | "shf" | "show_hidden_files" => self.show_hidden_files.to_string(),
             "explorersortcaseinsensitive" | "esci" | "explorer_sort_case_insensitive" => {
                 self.explorer_sort_case_insensitive.to_string()
@@ -3470,6 +3486,7 @@ impl Settings {
             "ai_model" => self.ai_model = value.to_string(),
             "ai_base_url" => self.ai_base_url = value.to_string(),
             "ai_completions" => self.ai_completions = value == "true",
+            "acp_agent_command" => self.acp_agent_command = value.to_string(),
             "showhiddenfiles" | "shf" | "show_hidden_files" => {
                 self.show_hidden_files = value == "true"
             }
@@ -4015,6 +4032,13 @@ pub static SETTING_DEFS: &[SettingDef] = &[
         description: "Show AI ghost-text completions at the cursor in insert mode (Tab to accept, Alt+]/Alt+[ to cycle alternatives)",
         category: "AI",
         setting_type: SettingType::Bool,
+    },
+    SettingDef {
+        key: "acp_agent_command",
+        label: "ACP Agent Command",
+        description: "Command line of a live ACP agent to launch for the AI panel (e.g. \"claude-code-acp\"); empty falls back to the direct ai_provider/ai_api_key transport",
+        category: "AI",
+        setting_type: SettingType::StringVal,
     },
     SettingDef {
         key: "indent_guides",

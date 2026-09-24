@@ -743,7 +743,12 @@ Browse extensions in the sidebar (click the extensions icon in the activity bar)
 
 ### AI Assistant
 
-Built-in AI chat panel supporting Anthropic Claude, OpenAI, or local Ollama. Click the chat icon in the activity bar to open. Configure `ai_provider` and `ai_api_key` in `settings.json` (or set `ANTHROPIC_API_KEY`/`OPENAI_API_KEY` env vars).
+Built-in AI chat panel. Click the chat icon in the activity bar to open.
+
+Two transports, picked by whether `acp_agent_command` is set:
+
+- **ACP (Agent Client Protocol)** — set `acp_agent_command` in `settings.json` to a live agent's command line (e.g. `"claude-code-acp"`). vimcode spawns it, drives the `initialize` → `session/new` → `session/prompt` handshake, and streams the agent's reply into the panel as it's generated. Requires the agent binary on `PATH`.
+- **Direct provider** (no agent binary required) — leave `acp_agent_command` empty and configure `ai_provider`/`ai_api_key` for Anthropic Claude, OpenAI, or local Ollama (or set `ANTHROPIC_API_KEY`/`OPENAI_API_KEY` env vars instead of `ai_api_key`).
 
 - `i` — enter input mode; type and press `Enter` to send
 - `:AI <message>` — send from command mode; `:AiClear` — clear history

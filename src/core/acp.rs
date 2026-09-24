@@ -87,6 +87,11 @@ pub enum AcpEvent {
         stop_reason: String,
     },
     /// A `session/update` notification streamed during a prompt turn.
+    /// `update` is the notification's whole `params` object, i.e.
+    /// `{"sessionId": ..., "update": {"sessionUpdate": "...", "content":
+    /// {...}}}` — callers that want the tagged-union chunk payload (as
+    /// [`session_update_chunk`] parses) must read `update.get("update")`
+    /// first; `session_id` is hoisted out already for convenience/dispatch.
     SessionUpdate {
         session_id: String,
         update: serde_json::Value,
@@ -205,6 +210,83 @@ pub(crate) fn classify_line(line: &str) -> ParsedLine {
 fn absolute_path_string(path: &Path) -> String {
     let abs = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
     abs.to_string_lossy().into_owned()
+}
+
+/// Split a user-configured ACP agent command line (`settings.
+/// acp_agent_command`) into `argv` for [`AcpClient::spawn`].
+///
+/// Supports plain whitespace-separated tokens and double-quoted segments
+/// (`"..."`) for a single arg containing spaces (e.g. a path). No other
+/// shell syntax — `$VAR` expansion, globs, pipes, single quotes — is
+/// interpreted; this is argv construction for `Command::args`, not a shell
+/// (`core::terminal::shell_command` is the seam for actual `sh -c` use, and
+/// does not apply here per #1255's reasoning: this is a fixed program
+/// invocation, not a user-supplied shell command string).
+pub fn parse_agent_command(cmd: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes = false;
+    for c in cmd.chars() {
+        match c {
+            '"' => in_quotes = !in_quotes,
+            c if c.is_whitespace() && !in_quotes => {
+                if !current.is_empty() {
+                    out.push(std::mem::take(&mut current));
+                }
+            }
+            c => current.push(c),
+        }
+    }
+    if !current.is_empty() {
+        out.push(current);
+    }
+    out
+}
+
+/// Which kind of `session/update` chunk a notification carries, as mapped
+/// onto the AI panel's own transcript roles by
+/// `Engine::acp_append_chunk` (`src/core/engine/acp_ops.rs`, ACP-1,
+/// #952). Kept here rather than in the engine because recognizing the
+/// wire shape (`sessionUpdate` tag + `content.text`) is transport-schema
+/// knowledge, not panel policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AcpChunkKind {
+    /// `agent_message_chunk` — the assistant's visible reply text.
+    Message,
+    /// `agent_thought_chunk` — the assistant's internal reasoning.
+    /// Rendered under a visually distinct role from `Message` per ACP-1's
+    /// acceptance criteria (do not merge the two).
+    Thought,
+    /// `user_message_chunk` — the agent echoing back user-authored
+    /// content (e.g. from another client sharing the same session).
+    UserEcho,
+}
+
+/// Extract `(kind, text)` from a `session/update` notification's `update`
+/// object, per the ACP v1 schema: a `sessionUpdate` string tag plus a
+/// `content` [`ContentBlock`](https://agentclientprotocol.com/protocol/content)
+/// (`{"type": "text", "text": "..."}`).
+///
+/// Returns `None` for update kinds this slice does not render —
+/// `tool_call`/`tool_call_update`/`plan`, left to ACP-4/ACP-5 per #952's
+/// scope — or for a malformed/unrecognized shape. Never panics; a missing
+/// `content.text` yields an empty string rather than dropping the chunk,
+/// so a still-loading tool-adjacent update doesn't desync the stream.
+pub fn session_update_chunk(update: &serde_json::Value) -> Option<(AcpChunkKind, String)> {
+    let kind = update.get("sessionUpdate").and_then(|v| v.as_str())?;
+    let chunk_kind = match kind {
+        "agent_message_chunk" => AcpChunkKind::Message,
+        "agent_thought_chunk" => AcpChunkKind::Thought,
+        "user_message_chunk" => AcpChunkKind::UserEcho,
+        _ => return None,
+    };
+    let text = update
+        .get("content")
+        .and_then(|c| c.get("text"))
+        .and_then(|t| t.as_str())
+        .unwrap_or_default()
+        .to_string();
+    Some((chunk_kind, text))
 }
 
 // ---------------------------------------------------------------------------
@@ -736,6 +818,74 @@ mod tests {
         assert_eq!(
             classify_line("{ this is not valid json"),
             ParsedLine::Unusable
+        );
+    }
+
+    // ---- parse_agent_command / session_update_chunk: pure, no subprocess ----
+
+    #[test]
+    fn parse_agent_command_splits_plain_whitespace() {
+        assert_eq!(
+            parse_agent_command("claude-code-acp --flag value"),
+            vec!["claude-code-acp", "--flag", "value"]
+        );
+    }
+
+    #[test]
+    fn parse_agent_command_honours_double_quotes() {
+        assert_eq!(
+            parse_agent_command(r#"/opt/my agent/run.sh "--name=has space" last"#),
+            vec!["/opt/my", "agent/run.sh", "--name=has space", "last"]
+        );
+    }
+
+    #[test]
+    fn parse_agent_command_empty_and_whitespace_only_is_empty_argv() {
+        assert!(parse_agent_command("").is_empty());
+        assert!(parse_agent_command("   \t  ").is_empty());
+    }
+
+    #[test]
+    fn session_update_chunk_maps_message_thought_and_user_echo() {
+        let msg = serde_json::json!({
+            "sessionUpdate": "agent_message_chunk",
+            "content": {"type": "text", "text": "hello"},
+        });
+        assert_eq!(
+            session_update_chunk(&msg),
+            Some((AcpChunkKind::Message, "hello".to_string()))
+        );
+
+        let thought = serde_json::json!({
+            "sessionUpdate": "agent_thought_chunk",
+            "content": {"type": "text", "text": "pondering"},
+        });
+        assert_eq!(
+            session_update_chunk(&thought),
+            Some((AcpChunkKind::Thought, "pondering".to_string()))
+        );
+
+        let echo = serde_json::json!({
+            "sessionUpdate": "user_message_chunk",
+            "content": {"type": "text", "text": "hi from another client"},
+        });
+        assert_eq!(
+            session_update_chunk(&echo),
+            Some((AcpChunkKind::UserEcho, "hi from another client".to_string()))
+        );
+    }
+
+    #[test]
+    fn session_update_chunk_ignores_tool_call_and_plan_without_panicking() {
+        for kind in ["tool_call", "tool_call_update", "plan"] {
+            let update = serde_json::json!({"sessionUpdate": kind, "content": {}});
+            assert_eq!(session_update_chunk(&update), None, "kind={kind}");
+        }
+        assert_eq!(session_update_chunk(&serde_json::json!({})), None);
+        assert_eq!(
+            session_update_chunk(&serde_json::json!({"sessionUpdate": "agent_message_chunk"})),
+            Some((AcpChunkKind::Message, String::new())),
+            "missing content should yield empty text, not None"
         );
     }
 

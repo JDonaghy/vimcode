@@ -3511,10 +3511,27 @@ pub struct Engine {
     /// True while a DAP debug session is active.
     pub dap_session_active: bool,
 
-    // --- ACP (Agent Client Protocol) state (#951, ACP-0 — transport only, no UI) ---
+    // --- ACP (Agent Client Protocol) state ---
     /// The live ACP agent subprocess + session, if one has been started.
-    /// `None` until a later slice starts one; `poll_acp` is a no-op then.
+    /// `None` until `ai_send_message` starts one (#952, ACP-1); `poll_acp`
+    /// is a no-op until then.
     pub acp_client: Option<crate::core::acp::AcpClient>,
+    /// The agent's `session/new` `sessionId`, once the handshake
+    /// (`initialize` -> `session/new`) has completed. `None` while a fresh
+    /// `acp_client` is still initializing.
+    pub acp_session_id: Option<String>,
+    /// A user prompt queued because `ai_send_message` was called before
+    /// `acp_session_id` was known (spawning the agent and running the
+    /// handshake takes at least one `poll_acp` round trip). Drained by
+    /// `poll_acp` the moment `AcpEvent::SessionCreated` lands.
+    pub acp_pending_prompt: Option<String>,
+    /// The `ai_messages` index + role of the transcript turn currently
+    /// being streamed via `session/update` chunks, so consecutive chunks
+    /// of the same kind (`AcpChunkKind`) append to it instead of each
+    /// starting a new turn. Reset to `None` on `PromptStopped`/
+    /// `RequestFailed`/`AgentExited` so the next chunk of a later turn
+    /// starts fresh rather than appending to a finished one.
+    pub acp_streaming_turn: Option<(usize, crate::core::acp::AcpChunkKind)>,
 
     // --- DAP (Debug Adapter Protocol) state ---
     /// Multi-adapter DAP coordinator. None until first debug session is started.
@@ -4580,6 +4597,9 @@ impl Engine {
             debug_button_pressed: None,
             dap_session_active: false,
             acp_client: None,
+            acp_session_id: None,
+            acp_pending_prompt: None,
+            acp_streaming_turn: None,
             dap_manager: None,
             dap_stopped_thread: None,
             dap_breakpoints: HashMap::new(),
