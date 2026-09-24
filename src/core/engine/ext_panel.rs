@@ -3086,6 +3086,12 @@ impl Engine {
         // #957 (ACP-6): session-scoped, same as the rest above.
         self.acp_auth_methods.clear();
         self.acp_authenticated = false;
+        // #955 (ACP-4): tool calls and any open change-review surface are
+        // session-scoped too — closing the conversation without deciding
+        // still discards the surface itself (same "closing the session
+        // ends it" reasoning as everything else in this block).
+        self.acp_tool_calls.clear();
+        self.change_review = None;
         self.ai_chat.borrow_mut().set_transcript_scroll_top(0);
         self.message = "AI conversation cleared.".to_string();
     }

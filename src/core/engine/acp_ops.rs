@@ -78,6 +78,10 @@ impl Engine {
                     // #957 (ACP-6): session-scoped, same as the rest above.
                     self.acp_auth_methods.clear();
                     self.acp_authenticated = false;
+                    // #955 (ACP-4): session-scoped, same as the rest above
+                    // — see `Engine::ai_clear`'s matching reset.
+                    self.acp_tool_calls.clear();
+                    self.change_review = None;
                     self.ai_streaming = false;
                     redraw = true;
                 }
@@ -557,10 +561,86 @@ impl Engine {
             self.acp_current_mode_id = Some(mode_id);
         } else if let Some(usage) = crate::core::acp::parse_usage_update(inner) {
             self.acp_usage = Some(usage);
+        } else if let Some(call) = crate::core::acp::parse_tool_call(inner) {
+            // #955 (ACP-4).
+            self.acp_upsert_tool_call(call);
+        } else if let Some(update) = crate::core::acp::parse_tool_call_update(inner) {
+            // #955 (ACP-4).
+            self.acp_apply_tool_call_update(update);
         }
-        // Anything else (tool_call, tool_call_update, or an update kind
-        // this client doesn't know about yet) is a forward-compatible
-        // no-op, same policy ACP-1 established for the whole stream.
+        // Anything else (an update kind this client doesn't know about
+        // yet) is a forward-compatible no-op, same policy ACP-1
+        // established for the whole stream.
+    }
+
+    // ── tool_call / tool_call_update (#955, ACP-4) ──────────────────────────
+
+    /// Insert or replace `call` in `self.acp_tool_calls`, keyed by
+    /// `AcpToolCall::id` — the "addressable collection, not an
+    /// append-only log" the issue asks for. Any `diff` content block the
+    /// call already carries opens (or extends) the change-review surface
+    /// immediately, same as a `tool_call_update` adding one later.
+    fn acp_upsert_tool_call(&mut self, call: crate::core::acp::AcpToolCall) {
+        self.acp_open_review_for_diffs(&call.content);
+        match self.acp_tool_calls.iter_mut().find(|t| t.id == call.id) {
+            Some(existing) => *existing = call,
+            None => self.acp_tool_calls.push(call),
+        }
+    }
+
+    /// Apply a `tool_call_update` patch by id: `status`, when present,
+    /// replaces the call's status — the `pending -> in_progress ->
+    /// completed | failed` transition the issue's acceptance bar checks —
+    /// and `content`, when present, is **appended** to the call's
+    /// existing content (never replaces it), per `AcpToolCallUpdate`'s
+    /// doc. An update for an id this client never saw a `tool_call` for is
+    /// a no-op — nothing to patch, and inventing a call from a bare update
+    /// would render with an empty title.
+    fn acp_apply_tool_call_update(&mut self, update: crate::core::acp::AcpToolCallUpdate) {
+        if let Some(blocks) = &update.content {
+            self.acp_open_review_for_diffs(blocks);
+        }
+        let Some(call) = self.acp_tool_calls.iter_mut().find(|t| t.id == update.id) else {
+            return;
+        };
+        if let Some(status) = update.status {
+            call.status = status;
+        }
+        if let Some(mut blocks) = update.content {
+            call.content.append(&mut blocks);
+        }
+    }
+
+    /// Open (or extend) the change-review surface for every `diff` block
+    /// in `blocks` — "a `diff` content block opens the change-review
+    /// surface" (#955's acceptance bar). Non-diff blocks are ignored here;
+    /// they're already stored on the call itself by the caller.
+    /// Source-agnostic: builds `crate::core::review::ProposedChange`, the
+    /// exact shape a non-ACP feeder (e.g. #525's git-branch diff list)
+    /// would construct directly.
+    fn acp_open_review_for_diffs(&mut self, blocks: &[crate::core::acp::AcpToolCallContentBlock]) {
+        let changes: Vec<crate::core::review::ProposedChange> = blocks
+            .iter()
+            .filter_map(|b| match b {
+                crate::core::acp::AcpToolCallContentBlock::Diff {
+                    path,
+                    old_text,
+                    new_text,
+                } => Some(crate::core::review::ProposedChange {
+                    path: path.clone(),
+                    old_text: old_text.clone(),
+                    new_text: new_text.clone(),
+                }),
+                _ => None,
+            })
+            .collect();
+        if changes.is_empty() {
+            return;
+        }
+        match &mut self.change_review {
+            Some(review) => review.extend(changes),
+            None => self.change_review = Some(crate::core::review::ChangeReviewState::new(changes)),
+        }
     }
 
     /// Human-readable summary of the ACP agent's declared modes and which

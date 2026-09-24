@@ -259,6 +259,13 @@ impl Engine {
             return EngineAction::None;
         }
 
+        // Change-review surface (#955, ACP-4/#525) intercepts all keys
+        // while open — same "modal overlay owns the keyboard" policy as
+        // diff peek above.
+        if self.change_review.is_some() && self.handle_change_review_key(key_name, unicode) {
+            return EngineAction::None;
+        }
+
         // Editor hover popup intercepts keys when it has focus.
         if self.editor_hover_has_focus {
             // Use unicode char for printable keys (TUI sends key_name="" for them)

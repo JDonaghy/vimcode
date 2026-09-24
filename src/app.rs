@@ -4676,6 +4676,16 @@ impl App {
             return;
         }
 
+        // ── Change-review surface mouse handling (#955, shared with #525) ─
+        // Same "checked before every other rung, swallows every click"
+        // policy as the folder picker above — see
+        // `render::route_change_review_click`'s doc comment. TUI's
+        // `mouse::handle_mouse` checks the identical shared helper.
+        if self.engine.borrow().change_review.is_some() {
+            self.route_and_apply_change_review_click(x, y);
+            return;
+        }
+
         self.reconcile_editor_hover_modal(backend);
 
         // ── Modal-overlay rung (#733) ─────────────────────────────────────
@@ -6923,6 +6933,32 @@ impl App {
         self.draw_needed.set(true);
     }
 
+    /// #955 (ACP-4, shared with #525): the change-review surface's mouse
+    /// handling, called from `handle_mouse_click_msg` — same shared
+    /// `render::route_change_review_click` TUI's `mouse::handle_mouse`
+    /// calls.
+    fn route_and_apply_change_review_click(&mut self, x: f64, y: f64) {
+        let diff_rect = self.engine.borrow().change_review_diff_rect.get();
+        let view = self
+            .engine
+            .borrow()
+            .change_review
+            .as_ref()
+            .and_then(|r| r.current_entry())
+            .map(|e| e.view.clone());
+        let Some(view) = view else {
+            return;
+        };
+        let lh = self.cached_line_height.max(1.0) as f32;
+        match render::route_change_review_click(diff_rect, &view, lh, x as f32, y as f32) {
+            render::ChangeReviewClickRoute::Jump(hit) => {
+                self.engine.borrow_mut().change_review_jump_to_hit(hit);
+            }
+            render::ChangeReviewClickRoute::Consume => {}
+        }
+        self.draw_needed.set(true);
+    }
+
     /// Show a native "Save Workspace As" dialog.
     fn save_workspace_as_dialog(&mut self) {
         // Deferred to tick() — see PendingFileDialog (#572).
@@ -8606,6 +8642,24 @@ impl quadraui::ShellApp for App {
                         if painted {
                             composed.push(render::FrameOp::ContextMenu);
                         }
+                    }
+                }
+
+                // ── Change-review surface (#955, shared with #525) ───────────
+                // `render::paint_change_review_rung` is the whole body — no
+                // GTK-specific diff rendering, matching every other
+                // `quadraui::DiffView` consumer. Uses the same
+                // `popup_viewport` every other overlay rung anchors to.
+                render::FrameOp::ChangeReview => {
+                    if let Some(review) = screen.change_review.as_ref() {
+                        render::paint_change_review_rung(
+                            backend,
+                            &engine,
+                            review,
+                            popup_viewport,
+                            &theme,
+                        );
+                        composed.push(render::FrameOp::ChangeReview);
                     }
                 }
 

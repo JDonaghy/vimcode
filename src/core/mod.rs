@@ -18,6 +18,7 @@ pub mod paths;
 pub mod plugin;
 pub mod project_search;
 pub mod registry;
+pub mod review;
 pub mod session;
 pub mod settings;
 pub mod spell;
