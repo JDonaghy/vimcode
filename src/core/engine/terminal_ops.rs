@@ -136,8 +136,13 @@ impl Engine {
             shell.to_lowercase().contains("powershell") || shell.to_lowercase().contains("pwsh");
         // Build a wrapper script that runs the command, shows the exit status, waits
         // for Enter, then exits the shell so `TerminalSession::is_exited()` fires and
-        // `poll_terminal` can call `finalize_install_from_terminal`.
-        let wrapped = build_terminal_install_wrapper(command, is_powershell);
+        // `poll_terminal` can call `finalize_install_from_terminal`. Keyed by the
+        // install's `install_key` so the wrapper can hand the command's real exit
+        // status back across the PTY boundary (#1344) — falls back to a shared
+        // "adhoc" key for terminal runs with no install context, whose exit code
+        // nothing reads.
+        let install_key = ctx.as_ref().map_or("adhoc", |c| c.install_key.as_str());
+        let wrapped = build_terminal_install_wrapper(command, is_powershell, install_key);
         match TerminalSession::spawn(cols, rows, &shell, &cwd, history_cap) {
             Ok(mut sess) => {
                 // Inject the wrapped command immediately.  The PTY master writer is
@@ -744,14 +749,36 @@ impl Engine {
         got_data
     }
 
-    /// Called when an install terminal pane exits. Checks if the binary is now
-    /// available on PATH and registers the LSP/DAP server if so.
+    /// Called when an install terminal pane exits. Checks the install command's
+    /// recorded exit status (#1344) and, if it succeeded, whether the binary is
+    /// now resolvable via the shared `binary_on_path` lookup, registering the
+    /// LSP/DAP server if so.
     fn finalize_install_from_terminal(&mut self, ctx: &InstallContext) {
         self.lsp_installing.remove(&ctx.install_key);
         // Clear the "Installing …" spinner notification.
         self.notify_done_by_kind(&NotificationKind::LspInstall, None);
 
         let ext_name = &ctx.ext_name;
+
+        // #1344: the wrapper script records the install command's real exit
+        // status to a scratch file (see `build_terminal_install_wrapper`)
+        // because a PTY only tells us the *shell* exited, not what the command
+        // it ran returned. A non-zero code is reported as a failure up front —
+        // previously this was invisible and surfaced only as a confusing
+        // "binary not found on PATH", which pointed at the wrong problem.
+        if let Some(code) = read_install_exit_code(&ctx.install_key) {
+            crate::core::lsp_manager::install_log(&format!(
+                "[ext-install] '{ext_name}' install (key={}) exited with code {code}",
+                ctx.install_key
+            ));
+            if code != 0 {
+                self.message = format!(
+                    "Install for '{ext_name}' failed (exit {code}) — see the terminal output"
+                );
+                return;
+            }
+        }
+
         let manifest = self
             .ext_available_manifests()
             .into_iter()
@@ -761,7 +788,7 @@ impl Engine {
             None => return,
         };
 
-        // Check if LSP binary is now on PATH and register it.
+        // Check if LSP binary is now resolvable and register it.
         if !manifest.lsp.binary.is_empty() {
             let all_lsp: Vec<&str> = std::iter::once(manifest.lsp.binary.as_str())
                 .chain(manifest.lsp.fallback_binaries.iter().map(|s| s.as_str()))
@@ -785,18 +812,25 @@ impl Engine {
                 self.message = format!("LSP server for '{ext_name}' installed and started ({bin})");
             } else {
                 self.message = format!(
-                    "Install for '{ext_name}' finished — LSP binary '{}' not found on PATH",
-                    manifest.lsp.binary
+                    "Install for '{ext_name}' finished but LSP binary '{}' was not found — looked in {}",
+                    manifest.lsp.binary,
+                    crate::core::lsp_manager::probed_tool_dirs_description(&manifest.lsp.binary)
                 );
             }
         }
 
-        // Check if DAP binary is now on PATH.
-        if !manifest.dap.adapter.is_empty()
-            && !manifest.dap.binary.is_empty()
-            && binary_on_path(&manifest.dap.binary)
-        {
-            self.message = format!("DAP adapter for '{ext_name}' installed — press F5 to debug");
+        // Check if DAP binary is now resolvable.
+        if !manifest.dap.adapter.is_empty() && !manifest.dap.binary.is_empty() {
+            if binary_on_path(&manifest.dap.binary) {
+                self.message =
+                    format!("DAP adapter for '{ext_name}' installed — press F5 to debug");
+            } else {
+                self.message = format!(
+                    "Install for '{ext_name}' finished but DAP binary '{}' was not found — looked in {}",
+                    manifest.dap.binary,
+                    crate::core::lsp_manager::probed_tool_dirs_description(&manifest.dap.binary)
+                );
+            }
         }
     }
 
@@ -1200,27 +1234,76 @@ impl Engine {
     }
 }
 
+/// Path to the per-install exit-code scratch file for `install_key` (#1344).
+///
+/// A PTY only tells `TerminalSession::is_exited()` that the *shell* exited —
+/// not what exit status the command it ran returned. `build_terminal_install_wrapper`
+/// writes that status here so `finalize_install_from_terminal` can read it back
+/// once the pane closes. Keyed by `install_key` (e.g. `"ext:bicep:lsp"`) so two
+/// installs — say an LSP and a DAP install for the same extension, run
+/// back-to-back — never collide on the same scratch file. The key is sanitized
+/// because it contains `:`, which is illegal in Windows filenames.
+fn install_exit_code_path(install_key: &str) -> PathBuf {
+    let safe: String = install_key
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    std::env::temp_dir().join(format!("vimcode-install-exit-{safe}.status"))
+}
+
+/// Read back the exit code `build_terminal_install_wrapper` recorded for
+/// `install_key`, consuming (deleting) the scratch file so a stale code left
+/// over from an earlier install under the same key is never mistaken for the
+/// current one (#1344).
+///
+/// Returns `None` when the wrapper never got as far as writing the file —
+/// e.g. the pane was closed before the command finished, or the run had no
+/// install context (`terminal_run_command`'s "adhoc" key) in the first place.
+/// Callers must treat `None` as "unknown", not "failed".
+fn read_install_exit_code(install_key: &str) -> Option<i32> {
+    let path = install_exit_code_path(install_key);
+    let contents = std::fs::read_to_string(&path).ok()?;
+    let _ = std::fs::remove_file(&path);
+    contents.trim().parse::<i32>().ok()
+}
+
 /// Build the PTY-injected wrapper script for `terminal_run_command`.
 ///
 /// Wraps `command` in a shell fragment that:
 /// 1. Runs the command.
-/// 2. Prints a colour-coded success/failure banner.
-/// 3. Prints "Press Enter to close…" and waits for the user.
-/// 4. **Exits the shell** — without this final `exit` / `Exit`, the interactive
+/// 2. Records its exit status to the `install_exit_code_path(install_key)` scratch
+///    file (#1344) so `finalize_install_from_terminal` can tell a failed install
+///    apart from a successful one whose binary just isn't resolvable.
+/// 3. Prints a colour-coded success/failure banner.
+/// 4. Prints "Press Enter to close…" and waits for the user.
+/// 5. **Exits the shell** — without this final `exit` / `Exit`, the interactive
 ///    shell returns to its PS1 prompt and `TerminalSession::is_exited()` never
 ///    fires, so `poll_terminal` would never call `finalize_install_from_terminal`
 ///    and the LSP/DAP server would never be registered.
 ///
-/// Extracted as a pure function so the exit-suffix invariant can be tested
-/// without spawning a real PTY.
-pub fn build_terminal_install_wrapper(command: &str, is_powershell: bool) -> String {
+/// Extracted as a pure function so both the exit-suffix invariant and the
+/// exit-code handoff can be tested without spawning a real PTY.
+pub fn build_terminal_install_wrapper(
+    command: &str,
+    is_powershell: bool,
+    install_key: &str,
+) -> String {
+    let exit_code_path = install_exit_code_path(install_key);
     if is_powershell {
         format!(
             concat!(
                 "{cmd}; ",
                 "$__ec = $LASTEXITCODE; ",
+                "if ($null -eq $__ec) {{ $__ec = 0 }}; ",
+                "Set-Content -Path '{path}' -Value $__ec -NoNewline; ",
                 "Write-Host ''; ",
-                "if ($__ec -eq 0 -or $null -eq $__ec) {{ ",
+                "if ($__ec -eq 0) {{ ",
                 "Write-Host \"`e[32m✓ Command completed successfully`e[0m\" ",
                 "}} else {{ ",
                 "Write-Host \"`e[31m✗ Command failed (exit code $__ec)`e[0m\" ",
@@ -1229,12 +1312,14 @@ pub fn build_terminal_install_wrapper(command: &str, is_powershell: bool) -> Str
                 "Write-Host 'Press Enter to close…'; ",
                 "Read-Host; Exit\n"
             ),
-            cmd = command
+            cmd = command,
+            path = exit_code_path.display(),
         )
     } else {
         format!(
-            "{cmd}\n__exit_code=$?\necho ''\nif [ $__exit_code -eq 0 ]; then echo '\\033[32m✓ Command completed successfully\\033[0m'; else echo \"\\033[31m✗ Command failed (exit code $__exit_code)\\033[0m\"; fi\necho ''\necho 'Press Enter to close…'\nread __dummy\nexit\n",
-            cmd = command
+            "{cmd}\n__exit_code=$?\necho \"$__exit_code\" > \"{path}\" 2>/dev/null\necho ''\nif [ $__exit_code -eq 0 ]; then echo '\\033[32m✓ Command completed successfully\\033[0m'; else echo \"\\033[31m✗ Command failed (exit code $__exit_code)\\033[0m\"; fi\necho ''\necho 'Press Enter to close…'\nread __dummy\nexit\n",
+            cmd = command,
+            path = exit_code_path.display(),
         )
     }
 }
@@ -1301,14 +1386,15 @@ pub fn key_to_pty_bytes(key_name: &str, unicode: Option<char>, ctrl: bool) -> Ve
 
 #[cfg(test)]
 mod tests {
-    use super::build_terminal_install_wrapper;
+    use super::{build_terminal_install_wrapper, install_exit_code_path, read_install_exit_code};
+    use std::path::PathBuf;
 
     /// Verify that the POSIX wrapper ends with `\nexit\n` so the shell process
     /// exits after the user presses Enter, enabling `poll_terminal` to call
     /// `finalize_install_from_terminal` and register the LSP/DAP server.
     #[test]
     fn posix_wrapper_ends_with_exit() {
-        let script = build_terminal_install_wrapper("pip install foo", false);
+        let script = build_terminal_install_wrapper("pip install foo", false, "test:posix-exit");
         assert!(
             script.contains("read __dummy\nexit\n"),
             "POSIX wrapper must end with `read __dummy\\nexit\\n` so the shell exits; got:\n{script}"
@@ -1319,7 +1405,7 @@ mod tests {
     /// same reason.
     #[test]
     fn powershell_wrapper_ends_with_exit() {
-        let script = build_terminal_install_wrapper("pip install foo", true);
+        let script = build_terminal_install_wrapper("pip install foo", true, "test:ps-exit");
         assert!(
             script.contains("Read-Host; Exit\n"),
             "PowerShell wrapper must end with `Read-Host; Exit\\n` so the shell exits; got:\n{script}"
@@ -1330,8 +1416,8 @@ mod tests {
     #[test]
     fn wrapper_contains_command() {
         let cmd = "cargo install my-tool";
-        let posix = build_terminal_install_wrapper(cmd, false);
-        let ps = build_terminal_install_wrapper(cmd, true);
+        let posix = build_terminal_install_wrapper(cmd, false, "test:contains-cmd-sh");
+        let ps = build_terminal_install_wrapper(cmd, true, "test:contains-cmd-ps");
         assert!(
             posix.starts_with(cmd),
             "POSIX wrapper must start with the command"
@@ -1340,5 +1426,319 @@ mod tests {
             ps.starts_with(cmd),
             "PowerShell wrapper must start with the command"
         );
+    }
+
+    /// #1344: the POSIX wrapper must write the command's `$?` to the scratch
+    /// file `finalize_install_from_terminal` reads back via
+    /// `read_install_exit_code`, using the exact path `install_exit_code_path`
+    /// computes for the same key — otherwise the writer and reader would silently
+    /// disagree on where the handoff lives.
+    #[test]
+    fn posix_wrapper_writes_exit_code_to_expected_path() {
+        let key = "test:posix-writes-exit-code";
+        let script = build_terminal_install_wrapper("false", false, key);
+        let expected_path = install_exit_code_path(key);
+        assert!(
+            script.contains(&format!(
+                "__exit_code=$?\necho \"$__exit_code\" > \"{}\"",
+                expected_path.display()
+            )),
+            "POSIX wrapper must record $? to the install_exit_code_path for its key; got:\n{script}"
+        );
+    }
+
+    /// #1344: same handoff, PowerShell flavour — `$LASTEXITCODE` written via
+    /// `Set-Content` to the same path `install_exit_code_path` computes.
+    #[test]
+    fn powershell_wrapper_writes_exit_code_to_expected_path() {
+        let key = "test:ps-writes-exit-code";
+        let script = build_terminal_install_wrapper("exit 1", true, key);
+        let expected_path = install_exit_code_path(key);
+        assert!(
+            script.contains(&format!(
+                "Set-Content -Path '{}' -Value $__ec",
+                expected_path.display()
+            )),
+            "PowerShell wrapper must record $LASTEXITCODE to the install_exit_code_path for its key; got:\n{script}"
+        );
+    }
+
+    /// `install_key` values contain `:` (e.g. `"ext:bicep:lsp"`), which is
+    /// illegal in Windows filenames — confirm the sanitized path never contains
+    /// it, and that two different keys never collide on the same file.
+    #[test]
+    fn install_exit_code_path_sanitizes_key_and_avoids_collisions() {
+        let lsp_path = install_exit_code_path("ext:bicep:lsp");
+        let dap_path = install_exit_code_path("dap:bicep");
+        assert!(!lsp_path.display().to_string().contains(':'));
+        assert_ne!(lsp_path, dap_path);
+    }
+
+    /// #1344 core acceptance case: a wrapper-recorded non-zero exit code round-trips
+    /// through `read_install_exit_code`, and reading consumes (deletes) the scratch
+    /// file so a stale code can never leak into a later install reusing the same key.
+    #[test]
+    fn read_install_exit_code_round_trips_and_consumes_file() {
+        let key = "test:round-trip-nonzero";
+        let path = install_exit_code_path(key);
+        std::fs::write(&path, "1").unwrap();
+        assert_eq!(read_install_exit_code(key), Some(1));
+        assert!(
+            !path.exists(),
+            "reading the exit code must delete the scratch file"
+        );
+        // A second read with nothing written finds nothing — never a stale hit.
+        assert_eq!(read_install_exit_code(key), None);
+    }
+
+    /// A key that was never written (e.g. the pane was closed before the wrapper's
+    /// exit-code line ran) must read back `None`, not `Some(0)` — callers rely on
+    /// `None` meaning "unknown" so they fall through to the binary-lookup path
+    /// instead of claiming success or failure they can't actually back up.
+    #[test]
+    fn read_install_exit_code_is_none_when_never_written() {
+        let key = "test:never-written-exit-code";
+        assert_eq!(read_install_exit_code(key), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // #1344: one shared tool lookup — install-time check, finalize, and server
+    // launch all agree on where a tool lives.
+    // -----------------------------------------------------------------------
+    //
+    // Before this fix, `binary_on_path` (install-time checks + finalize) only
+    // walked `PATH`, while `lsp_manager::resolve_command` (server launch) also
+    // probed `~/.local/bin` and friends. A binary a desktop-launched vimcode
+    // installed into `~/.local/bin` would resolve for server launch but read
+    // as "not found on PATH" for the install check that decides whether to
+    // register it — so a *successful* install never got its server started.
+    // `binary_on_path` now delegates straight to `resolve_command`, so driving
+    // it (and `finalize_install_from_terminal`, which calls it) with a fake
+    // `$HOME/.local/bin` binary and a `PATH` that deliberately excludes it
+    // proves the two are the same lookup now.
+    use super::{binary_on_path, Engine, InstallContext};
+    use crate::core::extensions::{ExtensionManifest, LspConfig};
+
+    /// Serializes tests that mutate the process-global `HOME`/`USERPROFILE`/`PATH`
+    /// env vars, mirroring the `HOMEBREW_ENV_LOCK` pattern in `tests/extensions.rs`
+    /// (#917) — same tradeoff, scoped to this file's tests only.
+    static HOME_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// RAII guard: snapshot + restore an environment variable across a test.
+    struct EnvVarGuard {
+        key: &'static str,
+        old: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &std::ffi::OsStr) -> Self {
+            let old = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, old }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match self.old.take() {
+                Some(v) => std::env::set_var(self.key, v),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
+    /// Create a fake `$HOME/.local/bin/<binary_name>` script and return
+    /// `(home_dir, binary_path)`. Caller is responsible for cleanup.
+    fn fake_home_with_local_bin_binary(tag: &str, binary_name: &str) -> (PathBuf, PathBuf) {
+        let home = std::env::temp_dir().join(format!(
+            "vimcode_test_home_{tag}_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let local_bin = home.join(".local").join("bin");
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&local_bin).unwrap();
+        let binary_path = local_bin.join(binary_name);
+        std::fs::write(&binary_path, "#!/bin/sh\necho fake\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&binary_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        (home, binary_path)
+    }
+
+    /// A binary present only in a fake `~/.local/bin` (never on `PATH`) is found
+    /// by the shared install-time check (`binary_on_path`) — the exact scenario
+    /// #1344 reports as broken pre-fix (successful install into `~/.local/bin`
+    /// reported as "not found on PATH").
+    #[test]
+    fn binary_on_path_finds_binary_in_local_bin_when_not_on_path() {
+        let _lock = HOME_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let binary_name = "vimcode-test-fake-lsp-1344-check";
+        let (home, _binary_path) = fake_home_with_local_bin_binary("check", binary_name);
+
+        let _home_guard = EnvVarGuard::set("HOME", home.as_os_str());
+        let _profile_guard = EnvVarGuard::set("USERPROFILE", home.as_os_str());
+        // Deliberately excludes the fake bin dir — this can only pass via the
+        // dedicated `~/.local/bin` probe, not a plain `PATH` walk.
+        let _path_guard = EnvVarGuard::set(
+            "PATH",
+            std::ffi::OsStr::new(if cfg!(windows) {
+                "C:\\Windows"
+            } else {
+                "/usr/bin:/bin"
+            }),
+        );
+
+        assert!(
+            binary_on_path(binary_name),
+            "binary_on_path should find {binary_name} via ~/.local/bin even though PATH excludes it"
+        );
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// #1344 core acceptance case: same fake `~/.local/bin` binary, but driven
+    /// through `finalize_install_from_terminal` end-to-end — it must register
+    /// and start an LSP server for the extension's language, not report
+    /// "not found on PATH" for a tool that plainly *is* findable.
+    #[test]
+    fn finalize_install_from_terminal_registers_server_for_binary_in_local_bin() {
+        let _lock = HOME_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let binary_name = "vimcode-test-fake-lsp-1344-finalize";
+        let (home, _binary_path) = fake_home_with_local_bin_binary("finalize", binary_name);
+
+        let _home_guard = EnvVarGuard::set("HOME", home.as_os_str());
+        let _profile_guard = EnvVarGuard::set("USERPROFILE", home.as_os_str());
+        let _path_guard = EnvVarGuard::set(
+            "PATH",
+            std::ffi::OsStr::new(if cfg!(windows) {
+                "C:\\Windows"
+            } else {
+                "/usr/bin:/bin"
+            }),
+        );
+
+        let mut engine = Engine::new();
+        let ext_name = "vimcode-test-ext-1344".to_string();
+        let language_id = "vimcode-test-lang-1344".to_string();
+        engine.ext_registry = Some(vec![ExtensionManifest {
+            name: ext_name.clone(),
+            display_name: ext_name.clone(),
+            language_ids: vec![language_id.clone()],
+            lsp: LspConfig {
+                binary: binary_name.to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        }]);
+        // Mirrors what `ext_install_from_registry` does before ever launching
+        // the install terminal — without this, `ensure_lsp_manager` wouldn't
+        // treat the extension as installed and would skip it entirely.
+        engine
+            .extension_state
+            .mark_installed_version(&ext_name, "0.0.1");
+
+        let ctx = InstallContext {
+            ext_name: ext_name.clone(),
+            install_key: "test:finalize-local-bin".to_string(),
+        };
+        engine.finalize_install_from_terminal(&ctx);
+
+        assert!(
+            engine.message.contains("installed and started"),
+            "finalize should report the server as installed and started, not \
+             'not found'; got: {}",
+            engine.message
+        );
+        let mgr = engine
+            .lsp_manager
+            .as_ref()
+            .expect("finalize should have initialized the LSP manager");
+        assert!(
+            mgr.server_id_for_language(&language_id).is_some(),
+            "finalize should have registered and started a server for the \
+             extension's language"
+        );
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// #1344: a non-zero recorded exit code must be reported as an install
+    /// failure — even though the binary is findable — and must NOT claim
+    /// "not found on PATH", which is exactly the misleading message this issue
+    /// reports (a failed install command, e.g. vimcode-ext's broken terraform
+    /// installer, used to surface only as a PATH-lookup miss).
+    #[test]
+    fn finalize_install_from_terminal_reports_failure_for_nonzero_exit_code() {
+        let _lock = HOME_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Deliberately give the binary a `~/.local/bin` home so it WOULD
+        // resolve if finalize fell through to the binary-lookup path — this
+        // proves failure reporting takes priority over a coincidentally
+        // resolvable binary, not merely that lookup was skipped because the
+        // binary happened to be absent.
+        let binary_name = "vimcode-test-fake-lsp-1344-failure";
+        let (home, _binary_path) = fake_home_with_local_bin_binary("failure", binary_name);
+
+        let _home_guard = EnvVarGuard::set("HOME", home.as_os_str());
+        let _profile_guard = EnvVarGuard::set("USERPROFILE", home.as_os_str());
+        let _path_guard = EnvVarGuard::set(
+            "PATH",
+            std::ffi::OsStr::new(if cfg!(windows) {
+                "C:\\Windows"
+            } else {
+                "/usr/bin:/bin"
+            }),
+        );
+
+        let mut engine = Engine::new();
+        let ext_name = "vimcode-test-ext-1344-failure".to_string();
+        engine.ext_registry = Some(vec![ExtensionManifest {
+            name: ext_name.clone(),
+            display_name: ext_name.clone(),
+            language_ids: vec!["vimcode-test-lang-1344-failure".to_string()],
+            lsp: LspConfig {
+                binary: binary_name.to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        }]);
+        engine
+            .extension_state
+            .mark_installed_version(&ext_name, "0.0.1");
+
+        let install_key = "test:finalize-nonzero-exit".to_string();
+        // Simulate the wrapper script having recorded a failed install.
+        std::fs::write(install_exit_code_path(&install_key), "3").unwrap();
+
+        let ctx = InstallContext {
+            ext_name: ext_name.clone(),
+            install_key,
+        };
+        engine.finalize_install_from_terminal(&ctx);
+
+        assert!(
+            engine.message.contains("failed") && engine.message.contains("exit 3"),
+            "finalize should report the recorded non-zero exit code as a \
+             failure; got: {}",
+            engine.message
+        );
+        assert!(
+            !engine.message.to_lowercase().contains("not found"),
+            "a failed install must not be reported as 'not found on PATH' — \
+             that points at the wrong problem; got: {}",
+            engine.message
+        );
+        assert!(
+            engine.lsp_manager.is_none(),
+            "a failed install must not register/start a server; lsp_manager \
+             should still be uninitialized"
+        );
+
+        let _ = std::fs::remove_dir_all(&home);
     }
 }
