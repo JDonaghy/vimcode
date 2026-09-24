@@ -3550,6 +3550,38 @@ pub struct Engine {
     /// — never persisted across sessions, per #953's non-goal #1 (no
     /// blanket/global auto-approve).
     pub acp_remembered_decisions: std::collections::HashMap<String, bool>,
+    /// The agent's current task-plan breakdown (`session/update`'s `plan`
+    /// variant, #956 ACP-5). Each update is a **full replacement**, not a
+    /// delta — this holds only the latest one, never an accumulated
+    /// history, so `render::populate_ai_chat_controller` always renders
+    /// exactly one plan checklist regardless of how many `plan` updates
+    /// have streamed by. Source-agnostic shape (`crate::core::acp::
+    /// AcpPlanEntry`) shared with #529's future coord-fed remote-worker
+    /// plan preview — "same renderer, different feeder" per that issue's
+    /// note. Cleared on `ai_clear`/`AgentExited` (session-scoped).
+    pub acp_plan: Vec<crate::core::acp::AcpPlanEntry>,
+    /// Slash commands the agent declared via `available_commands_update`
+    /// (#956, ACP-5) — full replacement each update, same policy as
+    /// `acp_plan`. Surfaced as completions in the AI panel's input via
+    /// `Engine::ai_command_completions`.
+    pub acp_available_commands: Vec<crate::core::acp::AcpAvailableCommand>,
+    /// Selected index into the slash-command completions currently
+    /// matching the AI panel's input (`Engine::ai_command_completions`).
+    /// Reset to 0 whenever `acp_available_commands` changes so a stale
+    /// selection never points past a shrunk list's end.
+    pub acp_command_completion_idx: usize,
+    /// The agent's declared modes (`session/new`'s `modes.availableModes`,
+    /// #956 ACP-5). The set itself only ever comes from the handshake —
+    /// `current_mode_update` changes which one is current, not this list.
+    pub acp_modes: Vec<crate::core::acp::AcpSessionMode>,
+    /// Which of `acp_modes` is current. Driven **only** by the agent's own
+    /// `current_mode_update` notification (never set optimistically by
+    /// `Engine::acp_set_mode` on request) — see that method's doc for why.
+    pub acp_current_mode_id: Option<String>,
+    /// Latest `usage_update` telemetry, if the agent has sent one this
+    /// session (#956, ACP-5). Rendered as a compact status-header suffix —
+    /// never a separate widget, so it can't steal focus or churn layout.
+    pub acp_usage: Option<crate::core::acp::AcpUsage>,
 
     // --- DAP (Debug Adapter Protocol) state ---
     /// Multi-adapter DAP coordinator. None until first debug session is started.
@@ -4620,6 +4652,12 @@ impl Engine {
             acp_streaming_turn: None,
             acp_pending_permission: None,
             acp_remembered_decisions: HashMap::new(),
+            acp_plan: Vec::new(),
+            acp_available_commands: Vec::new(),
+            acp_command_completion_idx: 0,
+            acp_modes: Vec::new(),
+            acp_current_mode_id: None,
+            acp_usage: None,
             dap_manager: None,
             dap_stopped_thread: None,
             dap_breakpoints: HashMap::new(),

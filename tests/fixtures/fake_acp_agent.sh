@@ -26,7 +26,12 @@
 #                           doesn't exit) — for the non-fatal-handshake-error
 #                           regression: `RequestFailed` for a method other
 #                           than session/prompt must still clear the panel's
-#                           busy state (#952 review finding).
+#                           busy state (#952 review finding). If
+#                           $ACP_FAKE_SESSION_MODES is set (#956, ACP-5), the
+#                           result also carries a `modes` field with two
+#                           modes ("code" current, "plan" available) — for a
+#                           test to drive `:AiMode`/`session/set_mode`
+#                           against.
 #   - session/prompt     -> emits a session/update "agent_thought_chunk"
 #                           notification, then two "agent_message_chunk"
 #                           notifications (split across two lines, to prove
@@ -95,8 +100,26 @@
 #                           "write:ok" or "write:error:<message>" depending
 #                           on whether the reply was a JSON-RPC error —
 #                           same "drive it for real, read the transcript"
-#                           shape as the read case.
+#                           shape as the read case. With $ACP_FAKE_PLAN set
+#                           (#956, ACP-5): emits an available_commands_update
+#                           (two commands, "commit" and "compact", sharing
+#                           the "co" prefix on purpose so a test can confirm
+#                           completion narrows on it), then TWO successive
+#                           "plan" updates back to back — the first with one
+#                           in_progress entry, the second (a full
+#                           replacement, not a delta) with that entry marked
+#                           completed plus a new pending one — so a test can
+#                           confirm exactly one plan renders afterward,
+#                           reflecting the second update. Then a usage_update
+#                           (inputTokens/outputTokens/totalCostUsd), then the
+#                           usual agent_message_chunk + end_turn, no fs/*
+#                           request (out of scope for this scenario).
 #   - session/cancel     -> notification, silently acknowledged (no reply).
+#   - session/set_mode   -> replies with an empty result, then emits a
+#                           current_mode_update notification carrying the
+#                           same modeId the request asked for (#956, ACP-5)
+#                           — proving the displayed mode follows the
+#                           notification, not the request succeeding.
 #   - anything else      -> logged to stderr, ignored.
 #
 # Always logs a startup line to stderr, to prove stderr noise is never
@@ -134,6 +157,8 @@ while IFS= read -r line; do
       id=$(extract_id "$line")
       if [ -n "$ACP_FAKE_SESSION_NEW_ERROR" ]; then
         printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32000,"message":"cwd not permitted"}}\n' "$id"
+      elif [ -n "$ACP_FAKE_SESSION_MODES" ]; then
+        printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"sess-1","modes":{"currentModeId":"code","availableModes":[{"id":"code","name":"Code"},{"id":"plan","name":"Plan"}]}}}\n' "$id"
       else
         printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"sess-1"}}\n' "$id"
       fi
@@ -144,6 +169,13 @@ while IFS= read -r line; do
       printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Hello"}}}}\n'
       printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":" world"}}}}\n'
       if [ -n "$ACP_FAKE_NO_TOOL_REQUEST" ]; then
+        printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id"
+      elif [ -n "$ACP_FAKE_PLAN" ]; then
+        printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"available_commands_update","availableCommands":[{"name":"commit","description":"Commit staged changes"},{"name":"compact","description":"Compact the conversation"}]}}}\n'
+        printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"plan","entries":[{"content":"Write the fix","status":"in_progress"}]}}}\n'
+        printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"plan","entries":[{"content":"Write the fix","status":"completed"},{"content":"Add tests","status":"pending"}]}}}\n'
+        printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"usage_update","usage":{"inputTokens":120,"outputTokens":45,"totalCostUsd":0.0067}}}}\n'
+        printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Plan ready"}}}}\n'
         printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id"
       elif [ -n "$ACP_FAKE_REQUEST_PERMISSION" ]; then
         printf '{"jsonrpc":"2.0","id":9002,"method":"session/request_permission","params":{"sessionId":"sess-1","toolCall":{"title":"Edit src/main.rs","kind":"edit","locations":[{"path":"src/main.rs","line":42}]},"options":[{"optionId":"allow-once","name":"Allow Once","kind":"allow_once"},{"optionId":"allow-always","name":"Always Allow","kind":"allow_always"},{"optionId":"reject-once","name":"Reject","kind":"reject_once"}]}}\n'
@@ -192,6 +224,12 @@ while IFS= read -r line; do
       ;;
     *'"method":"session/cancel"'*)
       : # fire-and-forget notification, no reply expected
+      ;;
+    *'"method":"session/set_mode"'*)
+      id=$(extract_id "$line")
+      mode_id=$(printf '%s' "$line" | sed -n 's/.*"modeId":"\([^"]*\)".*/\1/p')
+      printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id"
+      printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"current_mode_update","currentModeId":"%s"}}}\n' "$mode_id"
       ;;
     *)
       echo "fake-acp-agent: unrecognized line: $line" 1>&2

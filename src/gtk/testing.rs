@@ -5066,6 +5066,86 @@ second line here
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// #956 (ACP-5) acceptance: "Mode switch round-trips via
+    /// `session/set_mode` and the displayed mode follows
+    /// `current_mode_update`." GTK's twin of the mode-related unit coverage
+    /// in `core::acp`/`core::engine::acp_ops`, but through the real
+    /// `App`/`GtkDriver` stack: `:AiMode <name>` (the real ex-command path,
+    /// not calling `Engine::acp_set_mode` directly) must reach the agent
+    /// via `session/set_mode`, and the header must only flip to the new
+    /// mode once the fixture's `current_mode_update` notification — not the
+    /// request's own (empty) response — lands.
+    ///
+    /// RED verified: with `Engine::acp_handle_session_update`'s
+    /// `current_mode_update` arm deleted (so the notification is silently
+    /// dropped as an unrecognized update kind, the same "forward-compatible
+    /// no-op" fate `tool_call` still gets), this test fails — the header
+    /// stays on "mode: Code" forever even though the fixture did reply to
+    /// `session/set_mode` and did emit the notification.
+    #[cfg(unix)]
+    #[test]
+    fn ai_panel_mode_switch_round_trips_via_session_set_mode() {
+        let mut h = panel_harness(PANEL_AI);
+        {
+            let mut engine = h.engine.borrow_mut();
+            let argv = vec![
+                "sh".to_string(),
+                concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/tests/fixtures/fake_acp_agent.sh"
+                )
+                .to_string(),
+            ];
+            let cwd = std::env::temp_dir();
+            let mut client = crate::core::acp::AcpClient::spawn_with_env(
+                &argv,
+                &cwd,
+                &[("ACP_FAKE_SESSION_MODES", "1")],
+            )
+            .expect("fixture agent should spawn");
+            client.initialize();
+            engine.acp_client = Some(client);
+            engine.settings.acp_agent_command = "already-spawned-above".to_string();
+        }
+
+        // Drive the handshake (initialize -> session/new) so `session/new`'s
+        // `modes` field lands and the panel has a session id to address
+        // `session/set_mode` to.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !h.driver.screen_contains("mode: Code") && std::time::Instant::now() < deadline {
+            h.engine.borrow_mut().poll_acp();
+            h.driver.render();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            h.driver.screen_contains("mode: Code"),
+            "session/new's modes.currentModeId must render in the status \
+             header within 5s"
+        );
+
+        // The real ex-command path, not a direct `acp_set_mode` call.
+        h.engine.borrow_mut().execute_command("AiMode plan");
+        h.driver.render();
+        assert!(
+            h.driver.screen_contains("mode: Code"),
+            "the displayed mode must NOT change optimistically just because \
+             the request was sent -- only `current_mode_update` may change \
+             it"
+        );
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !h.driver.screen_contains("mode: Plan") && std::time::Instant::now() < deadline {
+            h.engine.borrow_mut().poll_acp();
+            h.driver.render();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            h.driver.screen_contains("mode: Plan"),
+            "the fixture's current_mode_update notification must flip the \
+             displayed mode within 5s of the session/set_mode round trip"
+        );
+    }
 }
 
 /// #669: the five editor-anchored popups (completion, LSP hover, editor

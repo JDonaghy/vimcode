@@ -9592,6 +9592,7 @@ impl Engine {
             // AI
             "AI ",
             "AiClear",
+            "AiMode",
             // Markdown
             "MarkdownPreview",
             "MdPreview",
