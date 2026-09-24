@@ -109,10 +109,21 @@ impl Engine {
                 AcpEvent::RequestFailed {
                     method, message, ..
                 } => {
-                    if method == "session/prompt" {
-                        self.ai_streaming = false;
-                        self.acp_streaming_turn = None;
-                    }
+                    // Any non-fatal JSON-RPC error while a turn is in
+                    // flight must clear the busy state, not just a failed
+                    // `session/prompt` — an `initialize` or `session/new`
+                    // that errors without exiting the process (bad `cwd`,
+                    // protocol mismatch, ...) would otherwise leave
+                    // `ai_streaming` stuck `true` forever: the warning below
+                    // lands in the transcript, but the spinner never clears
+                    // and `ai_send_message` silently no-ops on every
+                    // subsequent call (see `ext_panel.rs`'s early return on
+                    // `self.ai_streaming`). `acp_pending_prompt` is also
+                    // dropped so a queued prompt from the failed handshake
+                    // isn't replayed against a later, unrelated session.
+                    self.ai_streaming = false;
+                    self.acp_streaming_turn = None;
+                    self.acp_pending_prompt = None;
                     self.message = format!("ACP {method} failed: {message}");
                     self.ai_messages.push(AiMessage {
                         role: "assistant-thought".to_string(),
@@ -138,7 +149,12 @@ impl Engine {
     /// root if one is open, else the process's own cwd. `AcpClient::
     /// new_session` canonicalizes it, but resolving *which* directory is
     /// engine/workspace policy, not transport plumbing.
-    fn acp_workspace_cwd(&self) -> std::path::PathBuf {
+    ///
+    /// `pub(crate)` so `ext_panel.rs`'s `ai_send_message_via_acp` (which
+    /// needs the same cwd to spawn the agent in the first place, before any
+    /// `Initialized` event exists to drive this module's handler) can reuse
+    /// it instead of re-deriving the same fallback inline.
+    pub(crate) fn acp_workspace_cwd(&self) -> std::path::PathBuf {
         self.workspace_root
             .clone()
             .unwrap_or_else(|| self.cwd.clone())
@@ -364,6 +380,88 @@ mod tests {
             engine.ai_messages[2].content, "Hello world",
             "the two agent_message_chunk notifications must merge into one \
              streamed turn, not create a turn each"
+        );
+    }
+
+    /// Review regression (#952): a `RequestFailed` for `session/new` — a
+    /// non-fatal JSON-RPC error during the handshake, agent stays alive —
+    /// must clear `ai_streaming`/`acp_streaming_turn`/`acp_pending_prompt`
+    /// just like a failed `session/prompt` does, not just log the warning.
+    /// Before the fix, `poll_acp`'s `RequestFailed` arm only reset the busy
+    /// state `if method == "session/prompt"`, so this exact sequence left
+    /// `ai_streaming` stuck `true` forever and `ai_send_message` would
+    /// silently no-op on every subsequent call (`ext_panel.rs`'s early
+    /// return on `self.ai_streaming`) — a permanently wedged panel with no
+    /// crash and no further transcript growth.
+    ///
+    /// RED verified: reverting the `RequestFailed` arm to only reset state
+    /// `if method == "session/prompt"` makes this test fail — `ai_streaming`
+    /// stays `true` and a follow-up `ai_send_message` is silently dropped.
+    #[cfg(unix)]
+    #[test]
+    fn request_failed_during_session_new_clears_busy_state_not_just_session_prompt() {
+        let mut engine = engine_with_fixture_agent(&[("ACP_FAKE_SESSION_NEW_ERROR", "1")]);
+        engine.settings.acp_agent_command = "already-spawned-above".to_string();
+
+        engine.ai_send_message("hello agent".to_string());
+        assert!(
+            engine.ai_streaming,
+            "sending a message must mark the panel busy immediately"
+        );
+
+        // Wait for the transcript to grow past just the user's turn: the
+        // warning `poll_acp` pushes on `RequestFailed` is the signal the
+        // error was actually drained (not just that the busy flag flipped
+        // some other way).
+        poll_acp_until(&mut engine, |e| e.ai_messages.len() > 1);
+        assert_eq!(
+            engine.ai_messages.len(),
+            2,
+            "the session/new error should land as one warning turn: {:?}",
+            engine.ai_messages
+        );
+        assert!(
+            engine.ai_messages[1].content.contains("session/new failed"),
+            "warning should name the failed method: {:?}",
+            engine.ai_messages[1]
+        );
+
+        assert!(
+            !engine.ai_streaming,
+            "a non-fatal error response to session/new must clear the busy \
+             state, not just a failed session/prompt — otherwise the panel \
+             is wedged and silently drops every further message"
+        );
+        assert!(
+            engine.acp_streaming_turn.is_none(),
+            "no turn was ever streamed, so this must stay None"
+        );
+        assert!(
+            engine.acp_pending_prompt.is_none(),
+            "the queued prompt from the failed handshake must not survive \
+             to be replayed against a later, unrelated session"
+        );
+
+        // And the panel must actually be usable again, not just internally
+        // "not streaming": a second send should reach the transport instead
+        // of being silently swallowed by ai_send_message's busy-check
+        // (`if text.is_empty() || self.ai_streaming { return; }` in
+        // `ext_panel.rs`). Checking `ai_streaming` alone would pass
+        // vacuously even with the bug reinstated — it was already `true` —
+        // so assert the message was actually recorded.
+        engine.ai_send_message("still there?".to_string());
+        assert_eq!(
+            engine.ai_messages.len(),
+            3,
+            "a second message after the failed handshake must actually be \
+             recorded, not silently dropped by a still-stuck busy flag: {:?}",
+            engine.ai_messages
+        );
+        assert_eq!(engine.ai_messages[2].content, "still there?");
+        assert!(
+            engine.ai_streaming,
+            "the panel must accept a new message after the failed handshake \
+             cleared the busy state"
         );
     }
 }

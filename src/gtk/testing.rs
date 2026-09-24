@@ -4769,6 +4769,7 @@ second line here
     /// test fail — the transcript never grows past the just-typed user
     /// turn within the 5s deadline, because `session_update_chunk` silently
     /// returns `None` for every chunk.
+    #[cfg(unix)]
     #[test]
     fn ai_panel_streams_acp_thought_and_message_chunks() {
         let mut h = panel_harness(PANEL_AI);

@@ -1639,8 +1639,15 @@ impl Engine {
     /// If a question is provided, shows a "Send to AI" item.
     /// Otherwise shows "Open AI Panel".
     fn picker_populate_chat(&mut self, question: &str) {
-        let configured =
-            !self.settings.ai_api_key.is_empty() || self.settings.ai_provider == "ollama";
+        // An ACP agent (`acp_agent_command`) is a third valid transport
+        // alongside a direct-provider API key or Ollama (#952 ACP-1) —
+        // `ai_send_message` already routes to it, so the palette's gate
+        // must recognise it too, or an ACP-only user (no `ai_api_key`,
+        // default `ai_provider`) hits "Configure AI provider first" and
+        // never reaches the `chat_send:` action.
+        let configured = !self.settings.ai_api_key.is_empty()
+            || self.settings.ai_provider == "ollama"
+            || !self.settings.acp_agent_command.trim().is_empty();
 
         if !configured {
             self.picker_items = vec![PickerItem {
