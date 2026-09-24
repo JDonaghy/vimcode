@@ -75,19 +75,42 @@ impl Engine {
                     self.acp_modes.clear();
                     self.acp_current_mode_id = None;
                     self.acp_usage = None;
+                    // #957 (ACP-6): session-scoped, same as the rest above.
+                    self.acp_auth_methods.clear();
+                    self.acp_authenticated = false;
                     self.ai_streaming = false;
                     redraw = true;
                 }
-                AcpEvent::Initialized { .. } => {
-                    // Handshake step 2: now that the agent answered
-                    // `initialize`, open a session. `ai_send_message`
-                    // already queued the user's prompt in
-                    // `acp_pending_prompt`, sent once `SessionCreated`
-                    // lands below.
-                    let cwd = self.acp_workspace_cwd();
-                    if let Some(client) = self.acp_client.as_mut() {
-                        client.new_session(&cwd, vec![]);
+                AcpEvent::Initialized { auth_methods, .. } => {
+                    // Handshake step 2. #957 (ACP-6): if the agent offers
+                    // any `authMethods` and this client hasn't resolved
+                    // auth yet for this session (skipped, a `type: "agent"`
+                    // method succeeded, or a `type: "terminal"` login
+                    // exited `0` — see `acp_authenticated`'s doc), present
+                    // the choice instead of opening a session straight
+                    // away. Otherwise (no auth methods at all — every
+                    // pre-#957 agent and test — or auth already resolved,
+                    // e.g. this is the re-`initialize()` after a successful
+                    // terminal login) proceed exactly as before.
+                    self.acp_auth_methods = crate::core::acp::parse_auth_methods(&auth_methods);
+                    if !self.acp_authenticated && !self.acp_auth_methods.is_empty() {
+                        self.acp_show_auth_choice();
+                    } else {
+                        self.acp_begin_session();
                     }
+                    redraw = true;
+                }
+                AcpEvent::Authenticated { .. } => {
+                    // #957 (ACP-6): a `type: "agent"` auth method
+                    // succeeded — proceed exactly like an agent that never
+                    // required auth in the first place. A failure instead
+                    // comes through `AcpEvent::RequestFailed` below, whose
+                    // existing generic handling already clears the busy
+                    // state and surfaces a message — no special-casing
+                    // needed there.
+                    self.acp_authenticated = true;
+                    self.message = "Authenticated.".to_string();
+                    self.acp_begin_session();
                     redraw = true;
                 }
                 AcpEvent::SessionCreated {
@@ -209,6 +232,119 @@ impl Engine {
         self.workspace_root
             .clone()
             .unwrap_or_else(|| self.cwd.clone())
+    }
+
+    // ── authMethods / authenticate / terminal login (#957, ACP-6) ───────────
+
+    /// Send `session/new` for the live `acp_client` — the second half of
+    /// the handshake, run either immediately after `Initialized` (no auth
+    /// required) or after auth resolves (`AcpEvent::Authenticated`, the
+    /// `"acp_auth_choice"` dialog's skip button, or a successful terminal
+    /// login). Factored out of the `Initialized` handler so all four call
+    /// sites share it instead of re-deriving the same two lines.
+    ///
+    /// `pub(crate)` so `panels.rs`'s `"acp_auth_choice"` dialog arm (the
+    /// "Continue without auth" / cancel path, which produces no
+    /// `AcpEvent`) can call it directly — the other three call sites are
+    /// all in this same module.
+    pub(crate) fn acp_begin_session(&mut self) {
+        let cwd = self.acp_workspace_cwd();
+        if let Some(client) = self.acp_client.as_mut() {
+            client.new_session(&cwd, vec![]);
+        }
+    }
+
+    /// Open the `"acp_auth_choice"` dialog listing `self.acp_auth_methods`
+    /// plus a "Continue without auth" fallback — an agent advertising
+    /// `authMethods` doesn't necessarily mean auth is *required* right now
+    /// (it may already be logged in from a previous run), so the human can
+    /// always decline and let `session/new` itself succeed or fail. Button
+    /// `action` is the chosen method's `id` (looked back up against
+    /// `acp_auth_methods` by `"acp_auth_choice"`'s `process_dialog_result`
+    /// arm in `panels.rs`), or `"acp_auth_skip"` for the fallback — same
+    /// "hotkey scanned left-to-right, first free letter wins" collision
+    /// avoidance `acp_handle_permission_request` already uses, extended to
+    /// cover the fallback button too so it can never silently steal a
+    /// method's letter or vice versa.
+    fn acp_show_auth_choice(&mut self) {
+        let mut labeled_actions: Vec<(String, String)> = self
+            .acp_auth_methods
+            .iter()
+            .map(|m| (m.name.clone(), m.id.clone()))
+            .collect();
+        labeled_actions.push((
+            "Continue without auth".to_string(),
+            "acp_auth_skip".to_string(),
+        ));
+
+        let mut used_hotkeys: std::collections::HashSet<char> = std::collections::HashSet::new();
+        let buttons: Vec<DialogButton> = labeled_actions
+            .into_iter()
+            .map(|(label, action)| {
+                let hotkey = label
+                    .chars()
+                    .map(|c| c.to_ascii_lowercase())
+                    .find(|c| c.is_ascii_alphabetic() && !used_hotkeys.contains(c))
+                    .unwrap_or('\0');
+                if hotkey != '\0' {
+                    used_hotkeys.insert(hotkey);
+                }
+                DialogButton {
+                    label,
+                    hotkey,
+                    action,
+                }
+            })
+            .collect();
+
+        self.show_dialog(
+            "acp_auth_choice",
+            "Authenticate",
+            vec!["This agent offers the following ways to sign in:".to_string()],
+            buttons,
+        );
+    }
+
+    /// Called once an ACP terminal-auth login pane is gone — either it
+    /// exited on its own (`poll_terminal`'s exit handling, `exit_code =
+    /// Some(_)`) or the human closed it first
+    /// (`terminal_close_active_tab`, `exit_code = None`, i.e. abandoned).
+    /// `Some(0)` resumes the handshake exactly per the issue's acceptance
+    /// bar ("completion re-initializes the session"): re-send `initialize`
+    /// on the *same* still-alive `acp_client` — its `Initialized` handler
+    /// above will skip the dialog this time (`acp_authenticated` is now
+    /// `true`) and proceed straight to `session/new`. Anything else
+    /// (non-zero exit, or abandoned) must leave the panel usable per the
+    /// issue's other acceptance bar, not wedged: drop `acp_client`
+    /// entirely so the next `:AI`/panel message starts a clean
+    /// spawn+initialize+dialog rather than silently queuing a prompt
+    /// against a client that will never send another `session/new`.
+    pub(crate) fn acp_finish_terminal_login(&mut self, exit_code: Option<u32>) {
+        if exit_code == Some(0) {
+            self.acp_authenticated = true;
+            self.message = "Sign-in complete, resuming\u{2026}".to_string();
+            if let Some(client) = self.acp_client.as_mut() {
+                client.initialize();
+            }
+            return;
+        }
+
+        let detail = match exit_code {
+            Some(code) => format!("exited with code {code}"),
+            None => "was abandoned".to_string(),
+        };
+        self.message = format!("ACP sign-in {detail} \u{2014} try again from the AI panel");
+        self.ai_messages.push(AiMessage {
+            role: "assistant-thought".to_string(),
+            content: format!("\u{26a0} Sign-in {detail}."),
+        });
+        self.ai_streaming = false;
+        self.acp_streaming_turn = None;
+        self.acp_pending_prompt = None;
+        self.acp_client = None;
+        self.acp_session_id = None;
+        self.acp_auth_methods.clear();
+        self.acp_authenticated = false;
     }
 
     // ── fs/read_text_file, fs/write_text_file (#954, ACP-3) ─────────────────
@@ -1809,5 +1945,325 @@ mod tests {
         let mut engine = Engine::new_for_test();
         engine.execute_command("AiMode nonexistent");
         assert_eq!(engine.message, "No active ACP session");
+    }
+
+    // ── #957 (ACP-6): auth.terminal — subscription login ─────────────────
+
+    fn acp6_fixture_argv_string() -> String {
+        format!(
+            "sh {}",
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/fake_acp_agent.sh"
+            )
+        )
+    }
+
+    fn poll_until_auth_choice_dialog(engine: &mut Engine) {
+        poll_acp_until(engine, |e| {
+            e.dialog
+                .as_ref()
+                .is_some_and(|d| d.tag == "acp_auth_choice")
+        });
+    }
+
+    /// The gate itself, at the engine level: every pre-#957 fixture
+    /// response (`authMethods: []`, the default with no extra env) must
+    /// proceed straight to `session/new` exactly as before — no dialog, no
+    /// behavior change for every agent that doesn't advertise auth. This is
+    /// the engine-level half of "with the capability not advertised, the
+    /// method is absent, confirming the gate is real" (the wire-level half
+    /// — the fixture only offers a `type: "terminal"` entry when it
+    /// actually saw `auth.terminal: true` on the request — lives in
+    /// `core::acp`'s own tests).
+    #[cfg(unix)]
+    #[test]
+    fn no_auth_methods_skips_the_dialog_same_as_before_957() {
+        let mut engine = engine_with_fixture_agent(&[]);
+        engine.settings.acp_agent_command = "already-spawned-above".to_string();
+        engine.ai_send_message("hello agent".to_string());
+        poll_acp_until(&mut engine, |e| e.acp_session_id.is_some());
+        assert!(
+            engine.dialog.is_none(),
+            "an agent with no authMethods must never see an auth dialog"
+        );
+        assert_eq!(engine.acp_session_id.as_deref(), Some("sess-1"));
+    }
+
+    /// An agent that offers `authMethods` must present the choice — with
+    /// both the agent-kind and terminal-kind methods rendered as their own
+    /// buttons — instead of silently opening a session.
+    ///
+    /// RED verified: with the `!self.acp_auth_methods.is_empty()` branch of
+    /// `poll_acp`'s `Initialized` handler deleted (always calling
+    /// `acp_begin_session()` unconditionally, i.e. #957 reverted), this
+    /// test fails — `engine.dialog` stays `None` and `acp_session_id`
+    /// becomes `Some("sess-1")` immediately instead.
+    #[cfg(unix)]
+    #[test]
+    fn auth_methods_present_opens_choice_dialog_before_session_new() {
+        let mut engine = engine_with_fixture_agent(&[("ACP_FAKE_AUTH_METHODS", "1")]);
+        engine.settings.acp_agent_command = "already-spawned-above".to_string();
+        engine.ai_send_message("hello agent".to_string());
+        poll_until_auth_choice_dialog(&mut engine);
+
+        assert!(
+            engine.acp_session_id.is_none(),
+            "session/new must wait for the auth choice, not fire immediately"
+        );
+        let dialog = engine.dialog.as_ref().unwrap();
+        let actions: Vec<&str> = dialog.buttons.iter().map(|b| b.action.as_str()).collect();
+        assert_eq!(
+            actions,
+            vec!["api-key", "claude-ai-login", "acp_auth_skip"],
+            "both auth methods plus the skip fallback must be offered: {actions:?}"
+        );
+    }
+
+    /// "Continue without auth" must resume the handshake unauthenticated —
+    /// an agent advertising `authMethods` doesn't necessarily mean auth is
+    /// required right now.
+    #[cfg(unix)]
+    #[test]
+    fn skipping_auth_choice_proceeds_to_session_new() {
+        let mut engine = engine_with_fixture_agent(&[("ACP_FAKE_AUTH_METHODS", "1")]);
+        engine.settings.acp_agent_command = "already-spawned-above".to_string();
+        engine.ai_send_message("hello agent".to_string());
+        poll_until_auth_choice_dialog(&mut engine);
+
+        let idx = engine
+            .dialog
+            .as_ref()
+            .unwrap()
+            .buttons
+            .iter()
+            .position(|b| b.action == "acp_auth_skip")
+            .expect("skip button should be present");
+        engine.dialog_click_button(idx);
+
+        assert!(engine.dialog.is_none());
+        poll_acp_until(&mut engine, |e| e.acp_session_id.is_some());
+        assert_eq!(engine.acp_session_id.as_deref(), Some("sess-1"));
+        assert!(engine.acp_authenticated);
+    }
+
+    /// A `type: "agent"` auth method calls the plain `authenticate` RPC and,
+    /// on success, resumes the handshake — the turn the user's message
+    /// started actually completes end to end.
+    #[cfg(unix)]
+    #[test]
+    fn agent_auth_method_authenticates_and_resumes_the_turn() {
+        let mut engine = engine_with_fixture_agent(&[("ACP_FAKE_AUTH_METHODS", "1")]);
+        engine.settings.acp_agent_command = "already-spawned-above".to_string();
+        engine.ai_send_message("hello agent".to_string());
+        poll_until_auth_choice_dialog(&mut engine);
+
+        let idx = engine
+            .dialog
+            .as_ref()
+            .unwrap()
+            .buttons
+            .iter()
+            .position(|b| b.action == "api-key")
+            .expect("API Key button should be present");
+        engine.dialog_click_button(idx);
+
+        poll_acp_until(&mut engine, |e| !e.ai_streaming);
+        assert!(engine.acp_authenticated);
+        assert_eq!(engine.acp_session_id.as_deref(), Some("sess-1"));
+        let roles: Vec<&str> = engine.ai_messages.iter().map(|m| m.role.as_str()).collect();
+        assert!(
+            roles.contains(&"assistant"),
+            "the turn queued before auth should resume and complete: {:?}",
+            engine.ai_messages
+        );
+    }
+
+    /// A failed `authenticate` call must leave the panel usable — clear the
+    /// busy state and surface a message — never wedge it, matching the
+    /// established `RequestFailed` contract (#952 review) this reuses
+    /// unmodified.
+    #[cfg(unix)]
+    #[test]
+    fn agent_auth_method_failure_leaves_panel_usable() {
+        let mut engine = engine_with_fixture_agent(&[
+            ("ACP_FAKE_AUTH_METHODS", "1"),
+            ("ACP_FAKE_AUTH_FAIL", "1"),
+        ]);
+        engine.settings.acp_agent_command = "already-spawned-above".to_string();
+        engine.ai_send_message("hello agent".to_string());
+        poll_until_auth_choice_dialog(&mut engine);
+
+        let idx = engine
+            .dialog
+            .as_ref()
+            .unwrap()
+            .buttons
+            .iter()
+            .position(|b| b.action == "api-key")
+            .expect("API Key button should be present");
+        engine.dialog_click_button(idx);
+
+        poll_acp_until(&mut engine, |e| !e.ai_streaming);
+        assert!(!engine.ai_streaming);
+        assert!(
+            engine.message.contains("authenticate failed"),
+            "expected a clear failure message: {:?}",
+            engine.message
+        );
+        assert!(
+            engine
+                .ai_messages
+                .iter()
+                .any(|m| m.content.contains("authenticate")),
+            "the failure should land in the transcript: {:?}",
+            engine.ai_messages
+        );
+    }
+
+    /// Choosing a `type: "terminal"` method launches the agent's own
+    /// command interactively in a visible terminal pane; on a successful
+    /// login (exit 0) the client re-initializes and resumes the queued
+    /// turn — the full round trip the issue's acceptance bar describes.
+    ///
+    /// RED verified: with `Engine::acp_finish_terminal_login`'s `Some(0)`
+    /// branch changed to a no-op (never calling `client.initialize()`),
+    /// this test times out waiting for `acp_session_id` — the client stays
+    /// parked after the login pane exits instead of resuming.
+    #[cfg(unix)]
+    #[test]
+    fn terminal_auth_method_launches_login_and_resumes_on_success() {
+        let mut engine = engine_with_fixture_agent(&[("ACP_FAKE_AUTH_METHODS", "1")]);
+        engine.settings.acp_agent_command = acp6_fixture_argv_string();
+        engine.ai_send_message("hello agent".to_string());
+        poll_until_auth_choice_dialog(&mut engine);
+
+        let idx = engine
+            .dialog
+            .as_ref()
+            .unwrap()
+            .buttons
+            .iter()
+            .position(|b| b.action == "claude-ai-login")
+            .expect("Claude Subscription button should be present");
+        engine.dialog_click_button(idx);
+
+        assert_eq!(
+            engine.terminal_panes.len(),
+            1,
+            "choosing a terminal method should open exactly one login pane"
+        );
+        assert!(engine.terminal_open);
+
+        let start = std::time::Instant::now();
+        while !engine.terminal_panes.is_empty() && start.elapsed() < TEST_DEADLINE {
+            engine.poll_terminal();
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(
+            engine.terminal_panes.is_empty(),
+            "the login pane should have exited (exit 0) and been reaped"
+        );
+        assert!(engine.acp_authenticated);
+
+        poll_acp_until(&mut engine, |e| !e.ai_streaming);
+        assert!(!engine.ai_streaming);
+        assert_eq!(engine.acp_session_id.as_deref(), Some("sess-1"));
+        let roles: Vec<&str> = engine.ai_messages.iter().map(|m| m.role.as_str()).collect();
+        assert!(
+            roles.contains(&"assistant"),
+            "the turn queued before login should resume and complete: {:?}",
+            engine.ai_messages
+        );
+    }
+
+    /// A failed interactive login (non-zero exit) must leave the panel
+    /// usable with a clear message — not wedged, and not silently treated
+    /// as success.
+    #[cfg(unix)]
+    #[test]
+    fn terminal_auth_login_failure_leaves_panel_usable() {
+        let mut engine = engine_with_fixture_agent(&[("ACP_FAKE_AUTH_METHODS", "1")]);
+        engine.settings.acp_agent_command = format!("{} fail", acp6_fixture_argv_string());
+        engine.ai_send_message("hello agent".to_string());
+        poll_until_auth_choice_dialog(&mut engine);
+
+        let idx = engine
+            .dialog
+            .as_ref()
+            .unwrap()
+            .buttons
+            .iter()
+            .position(|b| b.action == "claude-ai-login")
+            .expect("Claude Subscription button should be present");
+        engine.dialog_click_button(idx);
+
+        let start = std::time::Instant::now();
+        while !engine.terminal_panes.is_empty() && start.elapsed() < TEST_DEADLINE {
+            engine.poll_terminal();
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(engine.terminal_panes.is_empty());
+        assert!(!engine.acp_authenticated);
+        assert!(
+            !engine.ai_streaming,
+            "a failed login must clear the busy state, not wedge the panel"
+        );
+        assert!(
+            engine.message.contains("exited with code"),
+            "expected a clear failure message: {:?}",
+            engine.message
+        );
+        assert!(
+            engine.acp_client.is_none(),
+            "a failed login should drop the client so the next attempt \
+             starts a clean handshake"
+        );
+    }
+
+    /// Closing the login pane before it exits on its own — the user
+    /// abandoning the login — must be treated the same as a failed login:
+    /// panel left usable, clear message, no silent "authenticated" state.
+    #[cfg(unix)]
+    #[test]
+    fn terminal_auth_login_abandoned_by_closing_pane_leaves_panel_usable() {
+        let mut engine = engine_with_fixture_agent(&[("ACP_FAKE_AUTH_METHODS", "1")]);
+        engine.settings.acp_agent_command = format!("{} hang", acp6_fixture_argv_string());
+        engine.ai_send_message("hello agent".to_string());
+        poll_until_auth_choice_dialog(&mut engine);
+
+        let idx = engine
+            .dialog
+            .as_ref()
+            .unwrap()
+            .buttons
+            .iter()
+            .position(|b| b.action == "claude-ai-login")
+            .expect("Claude Subscription button should be present");
+        engine.dialog_click_button(idx);
+
+        // Give the fixture a moment to actually enter its hang state (block
+        // on `read`) before racing a close against it — otherwise this
+        // would also pass if the pane merely exited fast on its own,
+        // proving nothing about the *abandon* path specifically.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        engine.poll_terminal();
+        assert_eq!(engine.terminal_panes.len(), 1);
+        assert!(
+            !engine.terminal_panes[0].session.is_exited(),
+            "the fixture should still be hung waiting for input"
+        );
+
+        engine.terminal_close_active_tab();
+
+        assert!(engine.terminal_panes.is_empty());
+        assert!(!engine.acp_authenticated);
+        assert!(!engine.ai_streaming);
+        assert!(
+            engine.message.contains("abandoned"),
+            "expected a clear abandon message: {:?}",
+            engine.message
+        );
+        assert!(engine.acp_client.is_none());
     }
 }

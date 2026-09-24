@@ -106,6 +106,7 @@ impl Engine {
                 self.terminal_panes.push(TerminalSlot {
                     session: sess,
                     install_ctx: None,
+                    acp_auth_pending: false,
                 });
                 self.terminal_active = self.terminal_panes.len() - 1;
                 self.terminal_open = true;
@@ -154,6 +155,7 @@ impl Engine {
                 self.terminal_panes.push(TerminalSlot {
                     session: sess,
                     install_ctx: ctx,
+                    acp_auth_pending: false,
                 });
                 self.terminal_active = self.terminal_panes.len() - 1;
                 self.terminal_open = true;
@@ -163,15 +165,90 @@ impl Engine {
         }
     }
 
+    /// Launch the ACP agent's own command line as an *interactive* process
+    /// in a visible terminal pane, for a `type: "terminal"` auth method
+    /// (#957, ACP-6). Terminal auth is not the `authenticate` RPC — per the
+    /// ACP spec's distinction (`core::acp`'s module doc), the client must
+    /// run the adapter attached to a real TTY so its own CLI can drive an
+    /// interactive login (a browser OAuth flow, a device code prompt, ...),
+    /// then re-initialize once that process exits
+    /// (`Engine::acp_finish_terminal_login`, called from `poll_terminal`
+    /// below / `terminal_close_active_tab`). This re-runs the exact same
+    /// `settings.acp_agent_command` used for the NDJSON transport — vimcode
+    /// has no agent-specific knowledge of what flag would force "login
+    /// mode" (nor should it, per the ACP track's agent-neutral design), so
+    /// the same command is trusted to behave differently when its stdio is
+    /// a real PTY instead of piped NDJSON (`isatty(stdin)`, in practice).
+    ///
+    /// `TerminalSession::spawn` takes a shell *path*, not an argv
+    /// (`quadraui::terminal_engine::TerminalSession::spawn`) — the same
+    /// constraint `terminal_run_command` above already works around: spawn
+    /// the user's interactive shell, then inject the command as PTY input
+    /// (`build_acp_auth_wrapper`), reusing that existing pattern rather
+    /// than inventing a second one.
+    pub fn acp_launch_terminal_login(&mut self, method_name: &str) {
+        let agent_cmd = self.settings.acp_agent_command.trim().to_string();
+        if agent_cmd.is_empty() {
+            self.message = "No ACP agent command configured".to_string();
+            return;
+        }
+        let cwd = self.acp_workspace_cwd();
+        let history_cap = self.settings.terminal_scrollback_lines;
+        let shell = default_shell();
+        let is_powershell =
+            shell.to_lowercase().contains("powershell") || shell.to_lowercase().contains("pwsh");
+        let wrapped = build_acp_auth_wrapper(&agent_cmd, is_powershell);
+        // Reuse an already-open pane's dimensions if one exists (the most
+        // recently painted size); otherwise fall back to a conventional
+        // default — no viewport is available from this call site (invoked
+        // from `process_dialog_result`, not a backend's resize/layout
+        // path), and the pane can still be resized later like any other.
+        let (cols, rows) = self
+            .terminal_panes
+            .first()
+            .map(|slot| (slot.session.cols(), slot.session.rows()))
+            .unwrap_or((80, 24));
+        match TerminalSession::spawn(cols, rows, &shell, &cwd, history_cap) {
+            Ok(mut sess) => {
+                sess.write_input(wrapped.as_bytes());
+                self.terminal_panes.push(TerminalSlot {
+                    session: sess,
+                    install_ctx: None,
+                    acp_auth_pending: true,
+                });
+                self.terminal_active = self.terminal_panes.len() - 1;
+                self.terminal_open = true;
+                self.terminal_has_focus = true;
+                self.message =
+                    format!("Complete {method_name} sign-in in the terminal panel\u{2026}");
+            }
+            Err(e) => {
+                self.message = format!("ACP terminal auth failed to start: {e}");
+            }
+        }
+    }
+
     /// Close the active terminal tab. If it was the last tab, close the panel.
     /// Closing either pane while in split mode also exits split view.
     pub fn terminal_close_active_tab(&mut self) {
         if self.terminal_panes.is_empty() {
             return;
         }
+        // #957 (ACP-6): closing the pane before an ACP terminal-auth login
+        // process exits on its own is "abandoned", not "succeeded" —
+        // `acp_finish_terminal_login(None)` must run *before* the pane is
+        // removed below reports it, matching `poll_terminal`'s exit-path
+        // handling of the same field.
+        let was_acp_auth = self
+            .terminal_panes
+            .get(self.terminal_active)
+            .is_some_and(|s| s.acp_auth_pending);
         // Exiting split mode before removing the pane keeps tab indices sane.
         self.terminal_split = false;
         self.terminal_panes.remove(self.terminal_active);
+        if was_acp_auth {
+            self.acp_finish_terminal_login(None);
+        }
         if self.terminal_panes.is_empty() {
             self.terminal_open = false;
             self.terminal_has_focus = false;
@@ -196,6 +273,7 @@ impl Engine {
                         self.terminal_panes.push(TerminalSlot {
                             session: sess,
                             install_ctx: None,
+                            acp_auth_pending: false,
                         });
                     }
                     Err(e) => {
@@ -216,6 +294,7 @@ impl Engine {
                     self.terminal_panes.push(TerminalSlot {
                         session: sess,
                         install_ctx: None,
+                        acp_auth_pending: false,
                     });
                 }
                 Err(e) => {
@@ -721,10 +800,19 @@ impl Engine {
             i -= 1;
             if self.terminal_panes[i].session.is_exited() {
                 let ctx = self.terminal_panes[i].install_ctx.take();
+                let was_acp_auth = self.terminal_panes[i].acp_auth_pending;
+                let exit_code = self.terminal_panes[i].session.exit_code();
                 if let Some(ctx) = ctx {
                     self.finalize_install_from_terminal(&ctx);
                 }
                 self.terminal_panes.remove(i);
+                // #957 (ACP-6): call after `remove` so `acp_finish_terminal_login`
+                // (which may itself touch `terminal_panes` indirectly via
+                // `acp_launch_terminal_login` on a later retry) never sees
+                // the just-exited pane still present.
+                if was_acp_auth {
+                    self.acp_finish_terminal_login(exit_code);
+                }
                 if self.terminal_active > i {
                     self.terminal_active = self.terminal_active.saturating_sub(1);
                 }
@@ -1351,6 +1439,27 @@ pub fn build_terminal_install_wrapper(
     }
 }
 
+/// Build the PTY-injected wrapper for an ACP terminal-auth login pane
+/// (#957, ACP-6). Unlike [`build_terminal_install_wrapper`], there is no
+/// scratch-file exit-code handoff and no "press Enter to close" pause —
+/// `exit $?` / `Exit $LASTEXITCODE` runs immediately after the command,
+/// with nothing in between to disturb `$?`/`$LASTEXITCODE`, so the outer
+/// interactive shell's own exit status *is* the login command's exit
+/// status directly. The pane is expected to close itself the moment the
+/// login command finishes: `poll_terminal`'s exit handling reads
+/// `TerminalSession::exit_code()` straight off the session it just
+/// detected exited, no scratch file needed.
+///
+/// Extracted as a pure function, same rationale as
+/// [`build_terminal_install_wrapper`]: testable without a real PTY.
+pub fn build_acp_auth_wrapper(command: &str, is_powershell: bool) -> String {
+    if is_powershell {
+        format!("{command}\nExit $LASTEXITCODE\n")
+    } else {
+        format!("{command}\nexit $?\n")
+    }
+}
+
 /// Translate a key event to PTY input bytes. Shared by both backends (#351).
 pub fn key_to_pty_bytes(key_name: &str, unicode: Option<char>, ctrl: bool) -> Vec<u8> {
     if ctrl {
@@ -1413,7 +1522,10 @@ pub fn key_to_pty_bytes(key_name: &str, unicode: Option<char>, ctrl: bool) -> Ve
 
 #[cfg(test)]
 mod tests {
-    use super::{build_terminal_install_wrapper, install_exit_code_path, read_install_exit_code};
+    use super::{
+        build_acp_auth_wrapper, build_terminal_install_wrapper, install_exit_code_path,
+        read_install_exit_code,
+    };
     use std::path::PathBuf;
 
     /// Verify that the POSIX wrapper ends with `\nexit\n` so the shell process
@@ -1452,6 +1564,31 @@ mod tests {
         assert!(
             ps.starts_with(cmd),
             "PowerShell wrapper must start with the command"
+        );
+    }
+
+    /// #957 (ACP-6): unlike the install wrapper, the ACP auth-login wrapper
+    /// must end with `exit $?` / `Exit $LASTEXITCODE` *immediately* after
+    /// the command — no scratch-file write, no "press Enter" pause — so
+    /// the outer shell's own exit status is the login command's exit
+    /// status directly.
+    #[test]
+    fn acp_auth_wrapper_posix_ends_with_bare_exit_of_command_status() {
+        let script = build_acp_auth_wrapper("sh login.sh", false);
+        assert_eq!(
+            script, "sh login.sh\nexit $?\n",
+            "POSIX ACP auth wrapper must be exactly the command followed by \
+             `exit $?`, nothing else; got:\n{script}"
+        );
+    }
+
+    #[test]
+    fn acp_auth_wrapper_powershell_ends_with_bare_exit_of_last_exit_code() {
+        let script = build_acp_auth_wrapper("sh login.sh", true);
+        assert_eq!(
+            script, "sh login.sh\nExit $LASTEXITCODE\n",
+            "PowerShell ACP auth wrapper must be exactly the command \
+             followed by `Exit $LASTEXITCODE`, nothing else; got:\n{script}"
         );
     }
 

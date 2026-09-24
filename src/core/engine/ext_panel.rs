@@ -3053,6 +3053,19 @@ impl Engine {
         // still alive at this point, only about to be killed.
         self.acp_cancel_pending_permission();
         self.acp_remembered_decisions.clear();
+        // #957 (ACP-6): the auth-choice dialog holds no reply to send (unlike
+        // `acp_pending_permission`, it isn't a parked agent request — see
+        // `"acp_auth_choice"`'s `process_dialog_result` arm), so it just
+        // needs closing before `acp_auth_methods` (which it reads by id)
+        // clears below, same as any other dialog referencing state this
+        // function is about to drop.
+        if self
+            .dialog
+            .as_ref()
+            .is_some_and(|d| d.tag == "acp_auth_choice")
+        {
+            self.dialog = None;
+        }
         self.ai_messages.clear();
         self.ai_rx = None;
         self.ai_streaming = false;
@@ -3070,6 +3083,9 @@ impl Engine {
         self.acp_modes.clear();
         self.acp_current_mode_id = None;
         self.acp_usage = None;
+        // #957 (ACP-6): session-scoped, same as the rest above.
+        self.acp_auth_methods.clear();
+        self.acp_authenticated = false;
         self.ai_chat.borrow_mut().set_transcript_scroll_top(0);
         self.message = "AI conversation cleared.".to_string();
     }

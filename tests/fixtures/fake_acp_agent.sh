@@ -120,10 +120,49 @@
 #                           same modeId the request asked for (#956, ACP-5)
 #                           — proving the displayed mode follows the
 #                           notification, not the request succeeding.
+#   - authenticate       -> (#957, ACP-6) if $ACP_FAKE_AUTH_FAIL is set,
+#                           replies with a JSON-RPC error; otherwise replies
+#                           with an empty success result.
 #   - anything else      -> logged to stderr, ignored.
 #
-# Always logs a startup line to stderr, to prove stderr noise is never
-# mistaken for protocol traffic.
+# #957 (ACP-6): `initialize`'s `authMethods`. With $ACP_FAKE_AUTH_METHODS
+# set, the initialize reply's `authMethods` always includes one `type:
+# "agent"` entry ("api-key" / "API Key"), and additionally includes one
+# `type: "terminal"` entry ("claude-ai-login" / "Claude Subscription") —
+# but *only* if this request's own `clientCapabilities.auth.terminal` was
+# `true` on the wire (a real substring check on the request line, same
+# style as the sawReadCap/sawWriteCap echo above), also echoed back as
+# agentInfo.sawAuthTerminalCap regardless of $ACP_FAKE_AUTH_METHODS. This
+# makes "the terminal method is absent when the capability isn't
+# advertised" a real, request-driven branch rather than a hardcoded stub —
+# see `core::acp`'s `parse_auth_methods` tests for the client-side half of
+# that contract (an authMethods array with no `type: "terminal"` entry at
+# all yields no `AcpAuthMethodKind::Terminal` results).
+#
+# #957 (ACP-6) interactive terminal-auth login. When this script's own
+# stdin is a real TTY — i.e. it was launched by `Engine::
+# acp_launch_terminal_login`'s `TerminalSession` (a real PTY) rather than
+# piped NDJSON — it skips the JSON-RPC loop entirely and simulates an
+# interactive CLI login instead, the same behavioral split a real ACP
+# adapter would make on `isatty(stdin)`. `$1` (the first CLI arg, carried
+# unmodified through `settings.acp_agent_command`'s own trailing word — no
+# environment variable or other test-only side channel needed, since both
+# the NDJSON spawn and the interactive re-spawn share that one string)
+# selects the outcome: "fail" simulates a declined/failed login (exit 1);
+# "hang" skips this shortcut entirely and falls into the ordinary
+# NDJSON-shaped `read` loop below, which blocks forever on this real TTY
+# instead of a piped-closed one — simulating a login a human abandons by
+# closing the pane before it ever exits, for a test to race against with
+# `Engine::terminal_close_active_tab`. Anything else (including no arg)
+# succeeds (exit 0).
+if [ -t 0 ] && [ "$1" != "hang" ]; then
+  if [ "$1" = "fail" ]; then
+    echo "fake-acp-agent: interactive login failed" 1>&2
+    exit 1
+  fi
+  echo "fake-acp-agent: interactive login succeeded"
+  exit 0
+fi
 
 echo "fake-acp-agent: starting" 1>&2
 
@@ -146,9 +185,25 @@ while IFS= read -r line; do
       # own bookkeeping.
       saw_read=false
       saw_write=false
+      saw_auth_terminal=false
       case "$line" in *'"readTextFile":true'*) saw_read=true ;; esac
       case "$line" in *'"writeTextFile":true'*) saw_write=true ;; esac
-      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentCapabilities":{},"agentInfo":{"name":"fake-acp-agent","version":"0.0.1","sawReadCap":%s,"sawWriteCap":%s},"authMethods":[]}}\n' "$id" "$saw_read" "$saw_write"
+      case "$line" in *'"auth":{"terminal":true}'*) saw_auth_terminal=true ;; esac
+      # #957 (ACP-6): authMethods is empty unless $ACP_FAKE_AUTH_METHODS is
+      # set — every pre-#957 test relies on that default so a fresh
+      # `session/new` proceeds immediately, unauthenticated. When set, the
+      # "agent"-type entry is unconditional; the "terminal"-type entry is
+      # gated on $saw_auth_terminal, i.e. on what this request actually
+      # carried — see this script's top-of-file doc for why that matters.
+      auth_methods='[]'
+      if [ -n "$ACP_FAKE_AUTH_METHODS" ]; then
+        if [ "$saw_auth_terminal" = "true" ]; then
+          auth_methods='[{"id":"api-key","name":"API Key","type":"agent"},{"id":"claude-ai-login","name":"Claude Subscription","type":"terminal"}]'
+        else
+          auth_methods='[{"id":"api-key","name":"API Key","type":"agent"}]'
+        fi
+      fi
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentCapabilities":{},"agentInfo":{"name":"fake-acp-agent","version":"0.0.1","sawReadCap":%s,"sawWriteCap":%s,"sawAuthTerminalCap":%s},"authMethods":%s}}\n' "$id" "$saw_read" "$saw_write" "$saw_auth_terminal" "$auth_methods"
       if [ -n "$ACP_FAKE_DIE_AFTER_INIT" ]; then
         exit 7
       fi
@@ -230,6 +285,14 @@ while IFS= read -r line; do
       mode_id=$(printf '%s' "$line" | sed -n 's/.*"modeId":"\([^"]*\)".*/\1/p')
       printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id"
       printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"current_mode_update","currentModeId":"%s"}}}\n' "$mode_id"
+      ;;
+    *'"method":"authenticate"'*)
+      id=$(extract_id "$line")
+      if [ -n "$ACP_FAKE_AUTH_FAIL" ]; then
+        printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32000,"message":"invalid credentials"}}\n' "$id"
+      else
+        printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id"
+      fi
       ;;
     *)
       echo "fake-acp-agent: unrecognized line: $line" 1>&2
