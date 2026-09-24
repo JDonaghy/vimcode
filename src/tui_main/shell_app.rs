@@ -3860,7 +3860,6 @@ impl<'screen> render::EditorBandHost<'screen> for TuiEditorBandHost<'_> {
             theme,
             self.app.tab_drag.source(),
             self.app.tab_drag.cursor(),
-            self.app.tab_drag.zone(),
         );
     }
 }
@@ -9417,8 +9416,13 @@ mod tests {
             left_before.x + left_before.width / 2.0,
             left_before.y + left_before.height / 2.0,
         );
+        // Three-quarters into the target's slot, not its exact centre — see
+        // the GTK twin's identical comment: `quadraui::compose::
+        // resolve_tab_drop` (#1370) compares the cursor to the target
+        // slot's own midpoint, so a dead-centre drop is ambiguous between
+        // "insert before" and "insert after".
         let to = (
-            right_before.x + right_before.width / 2.0,
+            right_before.x + right_before.width * 0.75,
             right_before.y + right_before.height / 2.0,
         );
         driver.mouse_down(from.0, from.1);
@@ -9440,6 +9444,200 @@ mod tests {
             right_before.x,
             left_after.x,
             right_after.x
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1370 acceptance, TUI half: dragging a tab from one editor **group**
+    /// (VSCode-style pane, not a `:split` window) onto another group's own
+    /// tab bar must merge it in and collapse the now-empty source group —
+    /// `TabDropInstruction::MoveToPane`, resolved via `resolve_tui_tab_drop_zone`
+    /// / `quadraui::compose::resolve_tab_drop` (quadraui#998) — rather than
+    /// vimcode's own hand-rolled `compute_tui_tab_drop_zone` geometry walk
+    /// this issue replaces. Only the same-group reorder case (the sibling
+    /// test above) had driver coverage before this issue on either backend;
+    /// this cross-group merge path was untested.
+    ///
+    /// Asserted purely on painted output — `driver_with_shell` wraps
+    /// `TuiShellApp` opaquely, so there is no `app.engine` to read after this
+    /// point (see the ghost-overlay test's doc comment above). The fixture's
+    /// two side-by-side groups must paint a divider between them up front
+    /// (sanity: the drag really starts from two panes, not one); after the
+    /// drop, the two labels must repaint in `[right, left]` order (the same
+    /// midpoint-drop insertion-index convention the reorder test above
+    /// pins) and the right group's own tab must have repainted well to the
+    /// *left* of where it started — proof its pane widened to fill the
+    /// whole editor column, which only happens if the source pane actually
+    /// collapsed away, not merely that both labels still exist somewhere.
+    ///
+    /// Behaviour-preserving refactor, not a bug fix: this same gesture
+    /// already worked on unfixed `develop` through the old
+    /// `compute_tui_tab_drop_zone` path (`Engine::apply_tab_drop_zone`'s
+    /// `DropZone::Center`/`DropZone::TabReorder` cross-group arms are
+    /// untouched by this issue). This test guards the geometry-resolution
+    /// path #1370 replaces, rather than reproducing a prior bug.
+    #[test]
+    fn tui_tab_drag_into_another_group_merges_and_collapses_the_source() {
+        let (app, dir) = app_with_two_file_groups("1370merge");
+        let mut driver = driver_with_shell(app, config(), 120, 24);
+
+        let left_before = driver
+            .find_bounds("left1039.txt")
+            .expect("the left group's tab must be painted");
+        let right_before = driver
+            .find_bounds("right1039.txt")
+            .expect("the right group's tab must be painted");
+        assert!(
+            left_before.x < right_before.x,
+            "the left group's own tab must paint left of the right group's"
+        );
+
+        let row = 5_u16;
+        let divider_before = divider_col_on_row(
+            &driver.styled_row(row),
+            (left_before.x + left_before.width) as usize,
+        );
+        assert!(
+            divider_before.is_some_and(|d| (d as f32) < right_before.x),
+            "fixture sanity: two side-by-side groups must paint a divider \
+             between them before the drag"
+        );
+
+        let from = (
+            left_before.x + left_before.width / 2.0,
+            left_before.y + left_before.height / 2.0,
+        );
+        // Three-quarters into the target's slot, not its exact centre — see
+        // `tui_tab_drag_past_a_neighbour_reorders_the_painted_tab_bar`'s
+        // identical comment above for why a dead-centre drop is ambiguous
+        // under `quadraui::compose::resolve_tab_drop`'s own midpoint
+        // comparison.
+        let to = (
+            right_before.x + right_before.width * 0.75,
+            right_before.y + right_before.height / 2.0,
+        );
+        driver.mouse_down(from.0, from.1);
+        driver.mouse_move(to.0, to.1);
+        driver.mouse_move(to.0, to.1);
+        driver.mouse_up(to.0, to.1);
+
+        let left_after = driver
+            .find_bounds("left1039.txt")
+            .expect("the merged-in tab must still be painted");
+        let right_after = driver
+            .find_bounds("right1039.txt")
+            .expect("the target group's tab must still be painted");
+        assert!(
+            left_after.x > right_after.x,
+            "dropping onto the right group's own tab slot must insert after \
+             it (was left={} right={}, now left={} right={})",
+            left_before.x,
+            right_before.x,
+            left_after.x,
+            right_after.x
+        );
+        assert!(
+            right_after.x < right_before.x,
+            "the target group's tab must repaint further LEFT once the \
+             source group collapses and its pane widens to fill the whole \
+             editor column (was {}, now {})",
+            right_before.x,
+            right_after.x
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1370 acceptance, TUI half: dragging a tab to a group's own left edge
+    /// (a content-area drop, not a tab-bar drop) must split it into a new
+    /// pane — `TabDropInstruction::SplitToNewPane`, resolved the same way as
+    /// the merge test above. `quadraui::compute_drop_zone`'s edge-split zone
+    /// is 20% of the group's width (clamped to `[3, width/2]`), so a drop one
+    /// column inside the group's left edge is comfortably inside it.
+    ///
+    /// Two tabs in the one starting group (not one) so the
+    /// "only tab of the only pane" no-op guard in
+    /// `quadraui::compose::resolve_tab_drop` — splitting a pane's sole tab
+    /// onto its own only edge is defined as a no-op — does not swallow the
+    /// drop; this fixture always has a second tab left behind in the
+    /// original pane.
+    ///
+    /// Behaviour-preserving refactor: this gesture already worked on
+    /// unfixed `develop` through the old `compute_tui_tab_drop_zone` /
+    /// `Engine::apply_tab_drop_zone`'s `DropZone::Split` arm, both untouched
+    /// by this issue; this test guards the geometry-resolution path #1370
+    /// replaces rather than reproducing a prior bug.
+    #[test]
+    fn tui_tab_drag_to_the_left_edge_splits_into_a_new_group() {
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_test_1370_tui_split_{:?}",
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = dir.join("only1370a.txt");
+        let b = dir.join("only1370b.txt");
+        std::fs::write(&a, "a\n").unwrap();
+        std::fs::write(&b, "b\n").unwrap();
+
+        let mut app = TuiShellApp::new(None);
+        // `open_file_with_mode` replaces the default `[No Name]` tab's own
+        // content in place rather than appending a new one (unlike
+        // `new_tab`) — needed here so tab "a" is genuinely the group's
+        // *first* tab, painted flush against the group's left edge, which
+        // is what the left-edge drop target below depends on.
+        app.engine
+            .open_file_with_mode(&a, crate::core::engine::OpenMode::Permanent)
+            .unwrap();
+        app.engine.new_tab(Some(&b));
+        assert_eq!(
+            app.engine.group_layout.leaf_count(),
+            1,
+            "this test starts from a single, unsplit group"
+        );
+        // A wide terminal (not the usual 100-column fixture width): the
+        // 20%-of-group-width edge-split zone needs enough clearance that the
+        // drop target stays comfortably inside it and past `editor_left`
+        // (the sidebar/activity-bar boundary `resolve_tui_tab_drop_zone`
+        // rejects drops left of) at once, without hand-deriving the exact
+        // painted sidebar width.
+        let mut driver = driver_with_shell(app, config(), 300, 24);
+
+        let a_before = driver
+            .find_bounds("only1370a.txt")
+            .expect("tab a should be painted");
+
+        let from = (
+            a_before.x + a_before.width / 2.0,
+            a_before.y + a_before.height / 2.0,
+        );
+        let to = (a_before.x + 20.0, 15.0);
+        driver.mouse_down(from.0, from.1);
+        driver.mouse_move(to.0, to.1);
+        driver.mouse_move(to.0, to.1);
+        driver.mouse_up(to.0, to.1);
+
+        let a_after = driver
+            .find_bounds("only1370a.txt")
+            .expect("tab a must still be painted after the split");
+        let b_after = driver
+            .find_bounds("only1370b.txt")
+            .expect("tab b must still be painted after the split");
+        assert!(
+            a_after.x < b_after.x,
+            "dropping on the LEFT edge must create the new pane to the left \
+             of the target — a's tab should now paint left of b's; \
+             a={a_after:?} b={b_after:?}"
+        );
+
+        let cells_after = driver.styled_row(15);
+        let screen = driver.screen();
+        let divider_after = divider_col_on_row(&cells_after, (a_after.x + a_after.width) as usize);
+        assert!(
+            divider_after.is_some_and(|d| (d as f32) < b_after.x),
+            "dropping on a group's edge must split it into two groups, \
+             painting a new divider between them; screen:\n{screen}"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -15656,6 +15854,29 @@ mod tests {
         );
     }
 
+    /// #1374 (review round 1): see `core::engine::acp_ops::tests::
+    /// ensure_no_zsh_newuser_wizard`'s doc comment for the full rationale —
+    /// same helper, duplicated here rather than shared because
+    /// `core::engine::acp_ops` is a private module (its `mod acp_ops;`
+    /// declaration in `engine/mod.rs` has no `pub(crate)`), so nothing
+    /// outside `core::engine` can name a path through it regardless of the
+    /// visibility of items inside. Kept intentionally tiny and duplicated
+    /// rather than widening that module's visibility just for test
+    /// plumbing.
+    #[cfg(unix)]
+    fn ensure_no_zsh_newuser_wizard() {
+        static INIT: std::sync::Once = std::sync::Once::new();
+        INIT.call_once(|| {
+            let dir = std::env::temp_dir()
+                .join(format!("vimcode_test_zdotdir_tui_{}", std::process::id()));
+            let _ = std::fs::create_dir_all(&dir);
+            for name in [".zshenv", ".zprofile", ".zshrc", ".zlogin"] {
+                let _ = std::fs::write(dir.join(name), "");
+            }
+            std::env::set_var("ZDOTDIR", &dir);
+        });
+    }
+
     /// #957 (ACP-6) acceptance: "choosing [the terminal method] launches
     /// the interactive process and completion re-initializes the
     /// session" — TUI's twin of `gtk::testing::sidebar_panel_clicks::
@@ -15683,6 +15904,8 @@ mod tests {
     /// turn.
     #[test]
     fn ai_panel_terminal_auth_choice_opens_visible_login_pane_and_resumes_session_via_shell_app() {
+        #[cfg(unix)]
+        ensure_no_zsh_newuser_wizard();
         let mut app = TuiShellApp::new(None);
         app.engine
             .app_shell
@@ -20407,6 +20630,117 @@ mod tests {
             "`<C-w>p` must actually move focus away from the pane the \
              gutter click focused, not stay put; cursor cell \
              {cell_after_prev:?};\nscreen:\n{screen}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A gutter click must open the diagnostic hover for a buffer opened
+    /// through a **non-canonical** path.
+    ///
+    /// `Engine::lsp_diagnostics` is keyed by the canonical absolute path
+    /// (#208), and that is the key `build_rendered_window` uses when it
+    /// fills `RenderedWindow::diagnostic_gutter` — so the gutter *marker*
+    /// paints. The hover lookups on the engine side used the buffer's raw
+    /// `file_path` instead, so clicking that marker found no diagnostic and
+    /// popped no hover: a painted affordance that did nothing.
+    ///
+    /// This is invisible on a Linux CI box, where `std::env::temp_dir()` is
+    /// already canonical, and unconditional on macOS, where it is
+    /// `/var/folders/…` — a symlink to `/private/var/folders/…`. That
+    /// platform asymmetry is why
+    /// `gutter_click_on_a_background_pane_then_ctrl_w_p_returns_focus_via_shell_app`
+    /// was red on macOS and green on Linux on the same commit. To reproduce
+    /// it on *every* platform this test opens the file through a path with
+    /// a `..` segment, which `canonicalize` resolves everywhere.
+    ///
+    /// **Verified RED against unfixed `develop`**: restoring
+    /// `active_buffer_path()` (raw `file_path`) in
+    /// `Engine::trigger_editor_hover_for_line` makes the final
+    /// `screen_contains` assertion fail — the gutter marker still paints,
+    /// the click is still routed, and no hover text ever reaches the
+    /// screen.
+    #[test]
+    fn gutter_click_opens_diagnostic_hover_for_a_non_canonical_buffer_path_via_shell_app() {
+        const WIDTH: u16 = 100;
+        const HEIGHT: u16 = 30;
+        const DIAG_LINE: u32 = 2;
+        const HOVER_MSG: &str = "non-canonical gutter diagnostic";
+
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_test_1256_diag_key_{:?}",
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        let file = dir.join("dk1256.txt");
+        let content: String = (0..20).map(|i| format!("DKA1256_{i:03}\n")).collect();
+        std::fs::write(&file, &content).unwrap();
+
+        // The same file, reached through a `..` segment: `canonicalize`
+        // resolves it on every platform, so `file_path != canonical_path`
+        // on Linux too — not just on macOS's symlinked temp dir.
+        let via_dotdot = dir.join("sub").join("..").join("dk1256.txt");
+        let canonical = via_dotdot.canonicalize().unwrap();
+        assert_ne!(
+            via_dotdot, canonical,
+            "test setup sanity: the open path must differ from the \
+             canonical one, otherwise this test cannot reach the bug"
+        );
+
+        let mut app = TuiShellApp::new(None);
+        app.engine.settings.autohide_panels = false;
+        app.engine.app_shell.hide_sidebar();
+        app.engine.session.explorer_visible = false;
+        app.engine
+            .open_file_with_mode(&via_dotdot, crate::core::engine::OpenMode::Permanent)
+            .unwrap();
+
+        app.engine.lsp_diagnostics.insert(
+            canonical,
+            vec![crate::core::lsp::Diagnostic {
+                range: crate::core::lsp::LspRange {
+                    start: crate::core::lsp::LspPosition {
+                        line: DIAG_LINE,
+                        character: 0,
+                    },
+                    end: crate::core::lsp::LspPosition {
+                        line: DIAG_LINE,
+                        character: 5,
+                    },
+                },
+                severity: crate::core::lsp::DiagnosticSeverity::Error,
+                message: HOVER_MSG.to_string(),
+                source: None,
+                code: None,
+            }],
+        );
+
+        let mut driver = driver_with_shell(app, config(), WIDTH, HEIGHT);
+        driver.mouse_move(0.0, 0.0);
+        driver.render();
+
+        let screen_before = driver.screen();
+        let (diag_x, diag_y) = driver
+            .find(&format!("DKA1256_{:03}", DIAG_LINE))
+            .unwrap_or_else(|| {
+                panic!("the diagnostic's line must be painted;\nscreen:\n{screen_before}")
+            });
+        assert!(
+            diag_x >= 1.0,
+            "test setup sanity: the text must leave at least one gutter \
+             column to its left; text x {diag_x};\nscreen:\n{screen_before}"
+        );
+
+        driver.click(diag_x - 1.0, diag_y);
+        driver.render();
+
+        assert!(
+            driver.screen_contains(HOVER_MSG),
+            "clicking the diagnostic gutter marker must paint the \
+             diagnostic hover even though the buffer was opened through a \
+             non-canonical path ({via_dotdot:?});\nscreen:\n{}",
+            driver.screen()
         );
 
         let _ = std::fs::remove_dir_all(&dir);

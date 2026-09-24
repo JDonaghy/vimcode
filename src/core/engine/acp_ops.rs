@@ -1031,6 +1031,68 @@ mod tests {
         engine
     }
 
+    /// #1374 (review round 1): on an account with no zsh startup files — a
+    /// freshly provisioned CI runner account is the realistic case, since
+    /// any real user who has already installed/configured vimcode and an
+    /// ACP agent has used a terminal before and therefore has dotfiles —
+    /// interactively spawning zsh auto-launches its own
+    /// `zsh-newuser-install` wizard before running anything else. The
+    /// wizard reads exactly one raw keystroke to pick a menu option, which
+    /// swallows the first character of whatever
+    /// `Engine::acp_launch_terminal_login` injects into the shell right
+    /// after spawn — every test below that drives a `type: "terminal"`
+    /// auth method through to a real login pane (and this file's GTK/TUI
+    /// driver twins, `gtk::testing::…ai_panel_terminal_auth_choice_…` and
+    /// `tui_main::shell_app::tests::…ai_panel_terminal_auth_choice_…`) hit
+    /// exactly this on a bare macOS CI runner.
+    ///
+    /// The first attempt at this fix (#1374 round 1) worked around it in
+    /// *production* code, unconditionally prefixing the injected command
+    /// with a bare `q\n` (the wizard's own "quit and do nothing" option) —
+    /// rejected on review: it is a real, if narrow, user-visible behaviour
+    /// change for every real login on every Unix shell (a stray `q` /
+    /// "command not found" line ahead of the real prompt), and outright
+    /// breaks the flow for any user with a `q` alias (e.g. `alias
+    /// q=exit`, common pager/vim muscle memory). The bare CI account with
+    /// no dotfiles is a property of the *test runner*, not of real users —
+    /// #1374's own root-cause writeup already frames it as narrow — so per
+    /// this repo's rule for fixture problems (as in #1350), the fix
+    /// belongs in test setup, not product code.
+    ///
+    /// Pointing `$ZDOTDIR` at a throwaway directory that already contains
+    /// empty `.zshenv`/`.zprofile`/`.zshrc`/`.zlogin` files satisfies
+    /// zsh's own "not a brand-new account" check directly — no injected
+    /// keystroke or command line involved at all, so there is nothing for
+    /// an alias or a wizard-absent prompt to mis-swallow. `$ZDOTDIR` is
+    /// read by zsh alone; nothing else in vimcode or its tests consults
+    /// it, so — unlike `$HOME` (see `core::paths::TEST_HOME_OVERRIDE`'s
+    /// doc comment for the real cross-test corruption a shared `$HOME`
+    /// mutation caused, #957 smoke) — overriding it for the rest of the
+    /// test process can't disturb any other test's path resolution.
+    /// `std::sync::Once` makes the one-time global mutation race-free
+    /// against `cargo test`'s parallel threads without needing a
+    /// restore-on-drop guard: every caller wants the exact same "some
+    /// directory with empty dotfiles" state (unlike e.g.
+    /// `VIMCODE_TEST_DATA_HOME`, where distinct tests need distinct
+    /// throwaway values and therefore do need a lock), so there is nothing
+    /// to race over, and leaving the override in place for the rest of the
+    /// process is harmless — it only ever affects a freshly spawned
+    /// interactive zsh, and does so by *suppressing* wizard behaviour that
+    /// no test anywhere in this suite wants to exercise.
+    #[cfg(unix)]
+    fn ensure_no_zsh_newuser_wizard() {
+        static INIT: std::sync::Once = std::sync::Once::new();
+        INIT.call_once(|| {
+            let dir =
+                std::env::temp_dir().join(format!("vimcode_test_zdotdir_{}", std::process::id()));
+            let _ = std::fs::create_dir_all(&dir);
+            for name in [".zshenv", ".zprofile", ".zshrc", ".zlogin"] {
+                let _ = std::fs::write(dir.join(name), "");
+            }
+            std::env::set_var("ZDOTDIR", &dir);
+        });
+    }
+
     /// How long the fixture-backed tests below wait before giving up.
     ///
     /// Kept in step with `core::acp::tests::TEST_DEADLINE` (private to that
@@ -1660,7 +1722,21 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        dir
+        // #1374: canonicalize before handing back. On macOS `std::env::
+        // temp_dir()` is `/var/folders/...`, and `/var` is a symlink to
+        // `/private/var` — but `Engine::acp_write_text_file`'s
+        // `resolve_path_within_roots` canonicalizes both the workspace
+        // root and the resolved target path before opening the buffer, so
+        // the buffer ends up keyed by the `/private/var/...` form while a
+        // caller comparing against this un-canonicalized `dir`-derived
+        // path (e.g. `buffer_manager.get(id).file_path == Some(file_path.
+        // as_path())`, an exact-path comparison, not the canonicalizing
+        // one `BufferManager::open_file`/`Engine::acp_read_text_file` use
+        // for their own buffer lookups) never matches on that platform —
+        // same class of bug as #1350. Canonicalizing here once, up front,
+        // makes every path this helper hands out agree with what
+        // `resolve_path_within_roots` resolves to, on every platform.
+        dir.canonicalize().unwrap_or(dir)
     }
 
     /// #954's core correctness property: a dirty (unsaved) open buffer's
@@ -2334,6 +2410,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn terminal_auth_method_launches_login_and_resumes_on_success() {
+        ensure_no_zsh_newuser_wizard();
         let mut engine = engine_with_fixture_agent(&[("ACP_FAKE_AUTH_METHODS", "1")]);
         engine.settings.acp_agent_command = acp6_fixture_argv_string();
         engine.ai_send_message("hello agent".to_string());
@@ -2384,6 +2461,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn terminal_auth_login_failure_leaves_panel_usable() {
+        ensure_no_zsh_newuser_wizard();
         let mut engine = engine_with_fixture_agent(&[("ACP_FAKE_AUTH_METHODS", "1")]);
         engine.settings.acp_agent_command = format!("{} fail", acp6_fixture_argv_string());
         engine.ai_send_message("hello agent".to_string());
@@ -2428,6 +2506,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn terminal_auth_login_abandoned_by_closing_pane_leaves_panel_usable() {
+        ensure_no_zsh_newuser_wizard();
         let mut engine = engine_with_fixture_agent(&[("ACP_FAKE_AUTH_METHODS", "1")]);
         engine.settings.acp_agent_command = format!("{} hang", acp6_fixture_argv_string());
         engine.ai_send_message("hello agent".to_string());

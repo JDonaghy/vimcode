@@ -964,8 +964,17 @@ mod tests {
             left_before.x + left_before.width / 2.0,
             left_before.y + left_before.height / 2.0,
         );
+        // Three-quarters into the target's slot, not its exact centre:
+        // `quadraui::compose::resolve_tab_drop` (#1370) resolves a drop
+        // exactly at (or a fraction of a px either side of) a slot's own
+        // midpoint by comparing the cursor to that same midpoint, so a
+        // dead-centre target is a coin flip between "insert before" and
+        // "insert after" depending on which way float rounding falls that
+        // frame — the old geometry-only `compute_tab_drop_zone` this
+        // replaced was less precise here and always landed the same way
+        // by accident. Comfortably past the midpoint removes the ambiguity.
         let to = (
-            right_before.x + right_before.width / 2.0,
+            right_before.x + right_before.width * 0.75,
             right_before.y + right_before.height / 2.0,
         );
         // Two moves, not one: the first crosses the 8px threshold and *starts*
@@ -990,6 +999,200 @@ mod tests {
             right_before.x,
             left_after.x,
             right_after.x
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1370 acceptance, GTK half of the cross-group merge case: dragging a
+    /// tab from one editor **group** onto another group's own tab bar must
+    /// merge it in and collapse the now-empty source pane —
+    /// `TabDropInstruction::MoveToPane`, resolved via
+    /// `render::resolve_tab_drop_zone` / `quadraui::compose::resolve_tab_drop`
+    /// (quadraui#998) instead of vimcode's own hand-rolled
+    /// `compute_tab_drop_zone` geometry walk this issue replaces. Only the
+    /// same-group reorder case (the sibling test above) had driver coverage
+    /// before this issue on either backend; this cross-group merge path was
+    /// untested.
+    ///
+    /// Behaviour-preserving refactor, not a bug fix: this gesture already
+    /// worked on unfixed `develop` through the old `compute_tab_drop_zone`
+    /// path (`Engine::apply_tab_drop_zone`'s cross-group arms are untouched
+    /// by this issue). This test guards the geometry-resolution path #1370
+    /// replaces, the same way the TUI twin
+    /// (`tui_tab_drag_into_another_group_merges_and_collapses_the_source` in
+    /// `tui_main/shell_app.rs`) does.
+    #[test]
+    fn tab_drag_into_another_group_merges_and_collapses_the_source_on_gtk() {
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_test_1370_gtk_merge_{:?}",
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = dir.join("zleft1370.txt");
+        let b = dir.join("zright1370.txt");
+        std::fs::write(&a, "a\n").unwrap();
+        std::fs::write(&b, "b\n").unwrap();
+
+        let mut engine = Engine::new();
+        engine
+            .open_file_with_mode(&a, crate::core::engine::OpenMode::Permanent)
+            .unwrap();
+        engine.open_editor_group(SplitDirection::Vertical);
+        engine
+            .open_file_with_mode(&b, crate::core::engine::OpenMode::Permanent)
+            .unwrap();
+
+        let mut h = harness(engine, 1400, 900);
+        h.driver.render();
+
+        let tab_label = |name: &str| format!("{name}.txt ");
+        let bounds = |h: &Harness<_>, name: &str| {
+            let needle = tab_label(name);
+            h.driver
+                .find_bounds(&needle)
+                .unwrap_or_else(|| panic!("tab label {needle:?} must be painted"))
+        };
+        let left_before = bounds(&h, "zleft1370");
+        let right_before = bounds(&h, "zright1370");
+        assert!(
+            left_before.x < right_before.x,
+            "the left group's own tab must paint left of the right group's"
+        );
+
+        let from = (
+            left_before.x + left_before.width / 2.0,
+            left_before.y + left_before.height / 2.0,
+        );
+        // Three-quarters into the target's slot, not its exact centre — see
+        // the reorder test above's identical comment for why a dead-centre
+        // target is ambiguous under `quadraui::compose::resolve_tab_drop`'s
+        // own midpoint comparison.
+        let to = (
+            right_before.x + right_before.width * 0.75,
+            right_before.y + right_before.height / 2.0,
+        );
+        h.driver.mouse_down(from.0, from.1);
+        h.driver.mouse_move(to.0, to.1);
+        h.driver.mouse_move(to.0, to.1);
+        h.driver.mouse_up(to.0, to.1);
+        h.driver.render();
+
+        let left_after = bounds(&h, "zleft1370");
+        let right_after = bounds(&h, "zright1370");
+        assert!(
+            left_after.x > right_after.x,
+            "dropping onto the right group's own tab slot must insert after \
+             it (was left={} right={}, now left={} right={})",
+            left_before.x,
+            right_before.x,
+            left_after.x,
+            right_after.x
+        );
+        assert!(
+            right_after.x < right_before.x,
+            "the target group's tab must repaint further LEFT once the \
+             source group collapses and its pane widens to fill the whole \
+             editor column (was {}, now {})",
+            right_before.x,
+            right_after.x
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1370 acceptance, GTK half of the drag-to-split case: dragging a tab
+    /// to a group's own left edge (a content-area drop, not a tab-bar drop)
+    /// must split it into a new pane — `TabDropInstruction::SplitToNewPane`,
+    /// resolved the same way as the merge test above.
+    ///
+    /// Two tabs in the one starting group (not one) so the "only tab of the
+    /// only pane" no-op guard in `quadraui::compose::resolve_tab_drop`
+    /// (splitting a pane's sole tab onto its own only edge is defined as a
+    /// no-op) does not swallow the drop.
+    ///
+    /// Behaviour-preserving refactor: this gesture already worked on
+    /// unfixed `develop` through the old `compute_tab_drop_zone` /
+    /// `Engine::apply_tab_drop_zone`'s `DropZone::Split` arm, both untouched
+    /// by this issue; this test guards the geometry-resolution path #1370
+    /// replaces, mirroring the TUI twin
+    /// (`tui_tab_drag_to_the_left_edge_splits_into_a_new_group`).
+    #[test]
+    fn tab_drag_to_the_left_edge_splits_into_a_new_group_on_gtk() {
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_test_1370_gtk_split_{:?}",
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = dir.join("zonly1370a.txt");
+        let b = dir.join("zonly1370b.txt");
+        std::fs::write(&a, "a\n").unwrap();
+        std::fs::write(&b, "b\n").unwrap();
+
+        let mut engine = Engine::new();
+        // `open_file_with_mode` replaces the default tab's own content in
+        // place rather than appending a new one (unlike `new_tab`) — needed
+        // here so tab "a" is genuinely the group's *first* tab, painted
+        // flush against the group's left edge, which the left-edge drop
+        // target below depends on.
+        engine
+            .open_file_with_mode(&a, crate::core::engine::OpenMode::Permanent)
+            .unwrap();
+        engine.new_tab(Some(&b));
+
+        let mut h = harness(engine, 1400, 900);
+        h.driver.render();
+
+        let tab_label = |name: &str| format!("{name}.txt ");
+        let bounds = |h: &Harness<_>, name: &str| {
+            let needle = tab_label(name);
+            h.driver
+                .find_bounds(&needle)
+                .unwrap_or_else(|| panic!("tab label {needle:?} must be painted"))
+        };
+        let a_before = bounds(&h, "zonly1370a");
+        let b_before = bounds(&h, "zonly1370b");
+
+        let from = (
+            a_before.x + a_before.width / 2.0,
+            a_before.y + a_before.height / 2.0,
+        );
+        // Well inside the group's own left edge (a few px in from where tab
+        // a itself painted) and well below the tab row, into the content
+        // area — a content-area drop near the left edge resolves to
+        // `Split(Left)`, not a same-group tab-bar reorder.
+        let to = (a_before.x + 3.0, a_before.y + 200.0);
+        h.driver.mouse_down(from.0, from.1);
+        h.driver.mouse_move(to.0, to.1);
+        h.driver.mouse_move(to.0, to.1);
+        h.driver.mouse_up(to.0, to.1);
+        h.driver.render();
+
+        let a_after = bounds(&h, "zonly1370a");
+        let b_after = bounds(&h, "zonly1370b");
+        assert!(
+            a_after.x < b_after.x,
+            "dropping on the LEFT edge must create the new pane to the left \
+             of the target — a's tab should now paint left of b's; \
+             a={a_after:?} b={b_after:?}"
+        );
+        // `new_first: true` (the `Left` edge) keeps the *new* pane at the
+        // group's original left edge and pushes the *target* (original)
+        // pane — the one that keeps tab b behind — right to make room, so
+        // b's own tab bar is the one that must have visibly moved. Checking
+        // b rather than a is deliberate: a's new pane could paint at
+        // approximately its old x by coincidence (it starts flush against
+        // the same original left edge the whole group used to), which would
+        // make an "a moved" assertion pass even for a same-group reorder
+        // that happened to land a left of b.
+        assert!(
+            b_after.x > b_before.x,
+            "the target pane (still holding b) must repaint further RIGHT \
+             once a new sibling pane appears to its left: was {}, now {}",
+            b_before.x,
+            b_after.x
         );
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -5721,6 +5924,29 @@ second line here
         );
     }
 
+    /// #1374 (review round 1): see `core::engine::acp_ops::tests::
+    /// ensure_no_zsh_newuser_wizard`'s doc comment for the full rationale —
+    /// same helper, duplicated here rather than shared because
+    /// `core::engine::acp_ops` is a private module (its `mod acp_ops;`
+    /// declaration in `engine/mod.rs` has no `pub(crate)`), so nothing
+    /// outside `core::engine` can name a path through it regardless of the
+    /// visibility of items inside. Kept intentionally tiny and duplicated
+    /// rather than widening that module's visibility just for test
+    /// plumbing.
+    #[cfg(unix)]
+    fn ensure_no_zsh_newuser_wizard() {
+        static INIT: std::sync::Once = std::sync::Once::new();
+        INIT.call_once(|| {
+            let dir = std::env::temp_dir()
+                .join(format!("vimcode_test_zdotdir_gtk_{}", std::process::id()));
+            let _ = std::fs::create_dir_all(&dir);
+            for name in [".zshenv", ".zprofile", ".zshrc", ".zlogin"] {
+                let _ = std::fs::write(dir.join(name), "");
+            }
+            std::env::set_var("ZDOTDIR", &dir);
+        });
+    }
+
     /// #957 (ACP-6) acceptance: "choosing [the terminal method] launches
     /// the interactive process and completion re-initializes the
     /// session" — GTK's twin of `tui_main::shell_app::tests::
@@ -5768,6 +5994,7 @@ second line here
     #[cfg(unix)]
     #[test]
     fn ai_panel_terminal_auth_choice_opens_visible_login_pane_and_resumes_session() {
+        ensure_no_zsh_newuser_wizard();
         let mut h = panel_harness(PANEL_AI);
         let fixture_path = concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -6334,6 +6561,170 @@ mod editor_popups {
             "editor hover popup must cache its bounds for the click + drag handlers (#215)",
         );
         assert!(rect.width > 0.0 && rect.height > 0.0);
+    }
+
+    /// #1373, GTK half: a gutter click must open the diagnostic hover for a
+    /// buffer opened through a **non-canonical** path.
+    ///
+    /// `Engine::lsp_diagnostics` is keyed by the canonical absolute path
+    /// (#208), and that is the key `build_rendered_window` uses when it
+    /// fills `RenderedWindow::diagnostic_gutter` — so the gutter *marker*
+    /// paints and `click.rs`'s shared `execute_gutter_action` /
+    /// `render::apply_gutter_action` routes the click. The hover-side
+    /// lookups in `Engine` (`ext_panel.rs`) used the buffer's raw
+    /// `file_path` instead, so the click found no diagnostic and popped no
+    /// hover — a painted affordance that did nothing whenever the buffer
+    /// was opened through a path that isn't already canonical. TUI twin:
+    /// `tui_main::shell_app::tests::
+    /// gutter_click_opens_diagnostic_hover_for_a_non_canonical_buffer_path_via_shell_app`.
+    ///
+    /// The click's `(x, y)` is derived from the last frame's own painted
+    /// `RenderedWindow` geometry — never a hardcoded pixel (#555): the
+    /// diagnostic's row is located by scanning `rw.lines` for
+    /// `line_idx == DIAG_LINE`, and the gutter column is anything left of
+    /// `rw.gutter_char_width * painted_char_width()` (`window_zone_hit_test`,
+    /// `render.rs`). The hover text is asserted through `screen_contains`
+    /// — the editor-hover popup renders through quadraui's markdown
+    /// widget, which *is* text-recorded (unlike raw editor-pane glyphs,
+    /// see `Harness::window_center`'s doc comment), so this reads painted
+    /// content, not state.
+    ///
+    /// A `WindowResized` dispatch follows the first two settle frames,
+    /// exactly like `click_column_tracks_a_runtime_font_size_change_on_gtk`
+    /// above: `App::cached_line_height`/`cached_char_width` — what
+    /// `window_zone_hit_test`'s row/gutter-column arithmetic actually
+    /// resolves clicks against — are refreshed from `Backend::line_height`/
+    /// `char_width` only on that event (a real GTK app gets one from the OS
+    /// on basically every settle; a headless `GtkDriver` test never fires
+    /// one on its own). Without it they stay at the driver's construction-
+    /// time default, which #947 documents as no longer close to the real
+    /// painted metrics at the current default `settings.font_size` — a
+    /// gutter click at any row past the first would resolve against the
+    /// wrong view row.
+    ///
+    /// Opens the file through a `..` segment so `file_path != canonical_path`
+    /// on every platform, not just macOS's symlinked temp dir.
+    ///
+    /// **Verified RED against unfixed `develop`**: restoring
+    /// `active_buffer_path()` (raw `file_path`) in
+    /// `Engine::trigger_editor_hover_for_line` makes the final
+    /// `screen_contains` assertion below fail — the gutter marker still
+    /// paints and the click still routes, but no hover text ever reaches
+    /// the screen.
+    #[test]
+    fn gutter_click_opens_diagnostic_hover_for_a_non_canonical_buffer_path_on_gtk() {
+        const DIAG_LINE: usize = 2;
+        const HOVER_MSG: &str = "non-canonical gutter diagnostic gtk";
+
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_test_1373_diag_key_gtk_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        let file = dir.join("dk1373gtk.txt");
+        let content: String = (0..20).map(|i| format!("DKG1373_{i:03}\n")).collect();
+        std::fs::write(&file, &content).unwrap();
+
+        // The same file, reached through a `..` segment: `canonicalize`
+        // resolves it on every platform, so `file_path != canonical_path`
+        // on Linux too — not just on macOS's symlinked temp dir.
+        let via_dotdot = dir.join("sub").join("..").join("dk1373gtk.txt");
+        let canonical = via_dotdot.canonicalize().unwrap();
+        assert_ne!(
+            via_dotdot, canonical,
+            "test setup sanity: the open path must differ from the \
+             canonical one, otherwise this test cannot reach the bug"
+        );
+
+        let mut engine = Engine::new_for_test();
+        engine.settings.autohide_panels = false;
+        engine.app_shell.hide_sidebar();
+        engine.session.explorer_visible = false;
+        engine
+            .open_file_with_mode(&via_dotdot, crate::core::engine::OpenMode::Permanent)
+            .unwrap();
+
+        engine.lsp_diagnostics.insert(
+            canonical,
+            vec![crate::core::lsp::Diagnostic {
+                range: crate::core::lsp::LspRange {
+                    start: crate::core::lsp::LspPosition {
+                        line: DIAG_LINE as u32,
+                        character: 0,
+                    },
+                    end: crate::core::lsp::LspPosition {
+                        line: DIAG_LINE as u32,
+                        character: 5,
+                    },
+                },
+                severity: crate::core::lsp::DiagnosticSeverity::Error,
+                message: HOVER_MSG.to_string(),
+                source: None,
+                code: None,
+            }],
+        );
+
+        let win_id = engine.active_window_id();
+        let mut h = harness(engine, 1400, 900);
+        h.driver.render();
+        h.driver.render();
+        // Sync `cached_line_height`/`cached_char_width` to the metrics this
+        // frame actually painted with — see the doc comment above.
+        let viewport = {
+            use quadraui::Backend as _;
+            h.driver.backend().viewport()
+        };
+        h.driver
+            .dispatch(quadraui::UiEvent::WindowResized { viewport });
+        h.driver.render();
+
+        let (click_x, click_y) = {
+            let layout = h.screen_layout.borrow();
+            let layout = layout.as_ref().expect("a frame must have been painted");
+            let rw = layout
+                .windows
+                .iter()
+                .find(|w| w.window_id == win_id)
+                .expect("the active window must have painted a RenderedWindow");
+            let view_row = rw
+                .lines
+                .iter()
+                .position(|rl| rl.line_idx == DIAG_LINE)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "the diagnostic's line ({DIAG_LINE}) must be in the \
+                         painted viewport; lines: {:?}",
+                        rw.lines.iter().map(|rl| rl.line_idx).collect::<Vec<_>>()
+                    )
+                });
+            assert!(
+                rw.gutter_char_width > 0,
+                "test setup sanity: line numbers must be on so this test has \
+                 a gutter column to click"
+            );
+            let line_height = h
+                .painted_line_height()
+                .expect("a frame must have painted a line height");
+            let char_width = h.painted_char_width();
+            (
+                rw.rect.x + char_width / 2.0,
+                rw.rect.y + view_row as f64 * line_height + line_height / 2.0,
+            )
+        };
+
+        h.driver.click(click_x as f32, click_y as f32);
+        h.driver.render();
+
+        assert!(
+            h.driver.screen_contains(HOVER_MSG),
+            "clicking the diagnostic gutter marker must paint the \
+             diagnostic hover even though the buffer was opened through a \
+             non-canonical path ({via_dotdot:?})"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// #821: hover popups adopt `quadraui::compose::markdown::render_markdown_to_styled`
@@ -8895,50 +9286,43 @@ mod minimap {
     /// Deliberately does **not** trust `scroll_top()` alone (CLAUDE.md:
     /// "Assert on rendered output — never on state being populated" — a
     /// click that mutates `scroll_top` but never actually repaints the new
-    /// position is exactly the #587/#592 bug shape). The fixture's
-    /// indentation shape (12-space indent for lines 100..300 of 400) makes
-    /// the *paint* observable even though this harness can't record
-    /// editor/gutter text (`Harness::window_center`'s doc comment): the
-    /// column band the indent occupies holds no syntax-colored glyph ink
-    /// when a row is indented, and does when it isn't, so counting
-    /// non-grayscale ("colorful") pixels in that band before/after
-    /// distinguishes "repainted the new scroll position" from "only the
-    /// state moved".
+    /// position is exactly the #587/#592 bug shape). Reads the buffer line
+    /// actually on screen from `GtkDriver::painted_texts()` instead: every
+    /// fixture line is `fn item_N() { let x = N; }\n` on buffer line `N`, and
+    /// `show_layout` (quadraui's one paint-time choke point, see its module
+    /// doc) records each editor line's *whole* Pango-layout text verbatim —
+    /// syntax colour lives in per-run colour attributes on that one layout,
+    /// never in a second recorded run — so `top_item_line` below reads back
+    /// exactly the buffer line the paint put on screen, with no reference to
+    /// pixel colour at all.
+    ///
+    /// #934/#1350 (superseded): two earlier rounds of this test asserted on
+    /// *pixel colour* instead — counting non-grayscale ("colorful") pixels in
+    /// the gutter-adjacent column band of the fixture's alternating
+    /// indented/unindented lines, on the theory that syntax-highlighted glyph
+    /// ink is chromatic and blank indentation isn't. That is fundamentally a
+    /// property of the *rasteriser*, not of vimcode's behaviour: GTK's
+    /// pangocairo backend composites glyphs via Core Text on macOS and
+    /// FreeType on Linux, and #1375 confirmed on a real Darwin host that
+    /// #934's widened tolerance (TOL=12, summed across 3 rows) still wasn't
+    /// enough — Core Text's gamma-correct AA can blend a thin syntax-colored
+    /// stroke past any single-pixel chroma threshold chosen without access to
+    /// the actual rasteriser. Reading back the recorded layout text sidesteps
+    /// the whole class of problem: it is the same string on every platform
+    /// regardless of how it was rasterised.
     ///
     /// RED-first: hardcoding `build_rendered_window`'s `scroll_top` local to
     /// `0` (so engine state moves but the paint stays pinned to the top of
-    /// the file) makes the final assertion fail with the indented row still
-    /// showing ~294 colorful pixels instead of 0 — confirmed by hand, along
-    /// with an initial brightness-based version of this probe that turned
-    /// out to be theme-dependent noise (see the color-vs-brightness note
-    /// above) and had to be replaced with this colorfulness count — before
-    /// restoring the fix.
-    ///
-    /// #1350: on macOS this test's own setup sanity check (`before > 0`)
-    /// failed outright — every pixel in the probed band was grayscale, none
-    /// colorful. Root cause: `engine_with_shaped_buffer` built its buffer
-    /// from an unnamed `Engine::new()` buffer (`buffer_mut().insert`
-    /// straight into the default buffer, no file path), so it had no
-    /// language and therefore no tree-sitter highlights — there was no
-    /// syntax colour to find on *any* platform, not just macOS; Linux
-    /// apparently stayed green only because Cairo/FreeType's colourful
-    /// subpixel AA fringing around the plain grayscale glyph ink happened to
-    /// clear `is_colorful`'s tolerance by coincidence, which macOS/Quartz's
-    /// grayscale-only AA does not reproduce. Fixed at the source in
-    /// `engine_with_shaped_buffer` (opens a real on-disk `.rs` file so the
-    /// buffer gets a language and real syntax colour) rather than by
-    /// loosening this predicate: a "differs from background" rewrite would
-    /// also count the (grayscale, always-present) indent guide as ink and
-    /// break the "after" band's must-be-zero assertion on every indented
-    /// row, so chroma — not "differs from background" — has to stay the
-    /// discriminator here.
+    /// the file) makes the final assertion fail — `top_item_line` after the
+    /// click still reports `Some(0)` instead of `Some(scroll_top)` —
+    /// confirmed by hand before restoring the fix.
     #[test]
     fn minimap_click_at_the_middle_scrolls_to_half_the_file() {
         let mut h = harness(engine_with_shaped_buffer(), 1400, 900);
         let win = h.engine.borrow().active_window_id();
         h.window_center(win).expect("editor pane must paint");
 
-        let (strip, total, rect, gutter_px, char_w, lh) = {
+        let (strip, total) = {
             let layout = h.screen_layout.borrow();
             let l = layout.as_ref().unwrap();
             let mm = l
@@ -8946,20 +9330,7 @@ mod minimap {
                 .iter()
                 .find(|m| m.window_id == win)
                 .expect("minimap must be present for the active pane");
-            let rw = l
-                .windows
-                .iter()
-                .find(|w| w.window_id == win)
-                .expect("the active pane must be in the painted layout");
-            (
-                mm.rect,
-                mm.minimap.total_buffer_lines,
-                rw.rect,
-                rw.gutter_char_width as f64 * h.painted_char_width(),
-                h.painted_char_width(),
-                h.painted_line_height()
-                    .expect("frame must publish the line height it painted with"),
-            )
+            (mm.rect, mm.minimap.total_buffer_lines)
         };
         assert_eq!(
             h.engine.borrow().scroll_top(),
@@ -8967,65 +9338,30 @@ mod minimap {
             "fixture must start at the top of the file"
         );
 
-        // The 12-column band right after the gutter, on the top 3 visible
-        // rows: unindented content ("fn item_0() ...") paints syntax-colored
-        // glyph ink *somewhere* in this band before the click, while a row
-        // from the indented band (100..300) paints nothing there but blank
-        // indentation (background plus, at most, an indent-guide line —
-        // grayscale, `r == g == b`). Counting *colorful* pixels (channels
-        // that disagree, i.e. not grayscale) rather than comparing raw
-        // brightness or the full color set keeps this theme-agnostic and
-        // immune to the indent guide: a light theme makes background the
-        // *brightest* color in the band rather than the ink, and indent
-        // guides paint real (if faint) grayscale pixels in the same band
-        // even on a correctly-repainted frame — chroma, not "differs from
-        // background", is load-bearing here, which is why #1350's fix is in
-        // `engine_with_shaped_buffer` (give the buffer a real language so
-        // there's syntax colour to find) rather than in this predicate: a
-        // "differs from background" rewrite would count the always-present
-        // grayscale indent guide as ink and break the "after" band's
-        // must-be-zero assertion on every indented row.
-        //
-        // #934: 3 rows, not 1. A Darwin/Quartz run reported the single-row
-        // version's "before" sanity check failing outright (0 colorful
-        // pixels found) — Core Text's gamma-correct glyph compositing can
-        // blend a thin syntax-colored stroke so far towards the background
-        // that one row's worth of ink dips under `is_colorful`'s TOL, even
-        // though the line plainly painted. Every unindented/indented line in
-        // the fixture repeats the identical token shape
-        // (`fn item_N() { let x = N; }`), so summing ink across 3 rows
-        // multiplies the sampled ink without changing what's being proven.
-        // It stays safe for the "after" (must-be-zero) band too: `frac`'s
-        // `< 0.1` tolerance keeps `scroll_top` inside roughly (160, 240) of
-        // the fixture's 400 lines, so the widened band (`scroll_top` ..
-        // `scroll_top + 2`) tops out around line 242 — comfortably inside
-        // the indented (100..300) range with margin to spare.
-        let band_x0 = (rect.x + gutter_px) as i32;
-        let band_x1 = (rect.x + gutter_px + 12.0 * char_w) as i32;
-        let row_y0 = (rect.y).ceil() as i32;
-        let row_y1 = (rect.y + 3.0 * lh).floor() as i32;
-        let is_colorful = |(r, g, b): (u8, u8, u8)| {
-            let (r, g, b) = (r as i32, g as i32, b as i32);
-            const TOL: i32 = 12; // AA-rounding tolerance, matching `near()` above
-            (r - g).abs() > TOL || (g - b).abs() > TOL || (r - b).abs() > TOL
-        };
-        let colorful_pixel_count = |h: &mut Harness<_>| -> usize {
-            let mut n = 0;
-            for y in row_y0..row_y1 {
-                for x in band_x0..band_x1 {
-                    if is_colorful(h.driver.pixel(x, y)) {
-                        n += 1;
-                    }
-                }
-            }
-            n
-        };
-        let before = colorful_pixel_count(&mut h);
-        assert!(
-            before > 0,
-            "test setup sanity: the unindented top row must paint some \
-             syntax-colored glyph ink in the probed band, not a blank/gray \
-             block"
+        // The lowest `fn item_N` buffer line number among the frame's
+        // painted text runs — the paint-time twin of `scroll_top`, read from
+        // what was actually drawn rather than engine state (mirrors
+        // `dragging_the_minimap_viewport_highlight_scrolls_the_whole_file_on_gtk`'s
+        // `top_line` helper below).
+        fn top_item_line(texts: &[&str]) -> Option<usize> {
+            texts
+                .iter()
+                .filter_map(|t| {
+                    let rest = t.trim_start().strip_prefix("fn item_")?;
+                    rest.split(|c: char| !c.is_ascii_digit())
+                        .next()?
+                        .parse()
+                        .ok()
+                })
+                .min()
+        }
+
+        let before = top_item_line(&h.driver.painted_texts());
+        assert_eq!(
+            before,
+            Some(0),
+            "test setup sanity: the editor's first visible line must be \
+             `fn item_0`, the fixture's own top line"
         );
 
         h.driver.click(
@@ -9041,24 +9377,17 @@ mod minimap {
             "clicking the middle of the minimap must scroll to ~50% of the \
              file, got scroll_top={scroll_top} of {total} ({frac:.3})"
         );
-        assert!(
-            (100..300).contains(&scroll_top),
-            "the ~50% scroll must land inside the fixture's indented band \
-             (lines 100..300) for the paint probe below to be meaningful; \
-             got scroll_top={scroll_top}"
-        );
 
-        // The band that used to hold "fn item_N(...)" ink must now show no
-        // colorful (syntax-highlighted) pixels at all — proof the view
-        // actually repainted the indented band, not just moved `scroll_top`
-        // in engine state while the paint stayed on the old lines.
-        let after = colorful_pixel_count(&mut h);
+        // The view must have actually repainted at the new scroll position —
+        // not just moved `scroll_top` in engine state while the paint stayed
+        // on the old lines.
+        let after = top_item_line(&h.driver.painted_texts());
         assert_eq!(
-            after, 0,
-            "the band right after the gutter must show no syntax-colored \
-             glyph ink once the view scrolls into the indented band — found \
-             {after} colorful pixels; scroll_top moved to {scroll_top} but \
-             the paint didn't follow it"
+            after,
+            Some(scroll_top),
+            "the editor's first visible line after the click must be \
+             `fn item_{scroll_top}` — scroll_top moved to {scroll_top} but \
+             the paint didn't follow it (painted top line: {after:?})"
         );
     }
 
