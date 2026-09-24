@@ -15016,6 +15016,22 @@ mod tests {
         );
     }
 
+    /// How long the two #957 (ACP-6) driver tests below wait on a real
+    /// child process before giving up.
+    ///
+    /// Deliberately the same 30s as `core::engine::acp_ops::tests::
+    /// TEST_DEADLINE`, and generous for the same reason: every one of
+    /// these loops exits the instant its condition holds, so the bound is
+    /// only ever reached on a *failing* run, while a loaded `cargo test`
+    /// (GTK harness + nvim oracles + ~3.6k lib tests at once) can
+    /// deschedule a `fork`/`exec` — and, for the terminal-login pane, a
+    /// whole interactive `$SHELL` startup, rc files included — for far
+    /// longer than the milliseconds any of it takes standalone. The first
+    /// cut used 5s and flaked in roughly one full-suite run in eight
+    /// (#957 smoke); nothing about the assertions changed, only the
+    /// patience behind them.
+    const ACP_DRIVER_DEADLINE: Duration = Duration::from_secs(30);
+
     /// #957 (ACP-6) acceptance: "with `auth.terminal` advertised against a
     /// fake agent offering a terminal auth method, ... the method is
     /// present" and "with the capability not advertised, the method is
@@ -15067,7 +15083,7 @@ mod tests {
         }
         driver.ctrl_char('s');
 
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + ACP_DRIVER_DEADLINE;
         let mut screen = driver.screen();
         while !screen.contains("Authenticate") && Instant::now() < deadline {
             driver.tick();
@@ -15076,7 +15092,7 @@ mod tests {
         }
         assert!(
             screen.contains("Authenticate"),
-            "the auth-choice dialog's title must paint within 5s; \
+            "the auth-choice dialog's title must paint within ACP_DRIVER_DEADLINE; \
              screen:\n{screen}"
         );
         assert!(
@@ -15158,7 +15174,7 @@ mod tests {
         }
         driver.ctrl_char('s');
 
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + ACP_DRIVER_DEADLINE;
         let mut screen = driver.screen();
         while !screen.contains("Authenticate") && Instant::now() < deadline {
             driver.tick();
@@ -15168,7 +15184,7 @@ mod tests {
         assert!(
             screen.contains("[C]laude Subscription"),
             "the auth-choice dialog must paint the Claude Subscription \
-             option within 5s; screen:\n{screen}"
+             option within ACP_DRIVER_DEADLINE; screen:\n{screen}"
         );
 
         driver.type_char('c');
@@ -15179,7 +15195,7 @@ mod tests {
              screen:\n{screen}"
         );
 
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + ACP_DRIVER_DEADLINE;
         let mut saw_login_pane = false;
         while Instant::now() < deadline {
             driver.tick();
@@ -15192,10 +15208,10 @@ mod tests {
         assert!(
             saw_login_pane,
             "the login pane's own PTY output must actually be painted on \
-             the surface within 5s, not just recorded in engine state"
+             the surface within ACP_DRIVER_DEADLINE, not just recorded in engine state"
         );
 
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + ACP_DRIVER_DEADLINE;
         let mut screen = driver.screen();
         while !screen.contains("Hello world") && Instant::now() < deadline {
             driver.tick();
@@ -15205,7 +15221,7 @@ mod tests {
         assert!(
             screen.contains("Hello world"),
             "completing the login must re-initialize the client and resume \
-             the queued turn within 5s; screen:\n{screen}"
+             the queued turn within ACP_DRIVER_DEADLINE; screen:\n{screen}"
         );
     }
 
@@ -25005,6 +25021,23 @@ mod tests {
     /// message under test (observed: a run that ended `INSERT  [No Name]
     /// [+] … Ln 14` with an empty command line). Hence: never prod without
     /// two freshly-painted frames that both still show the panel.
+    ///
+    /// # Why the gate has to be re-checked *inside* the prod too (#957 smoke)
+    ///
+    /// Gating the prod as a whole is not enough, because a prod is five
+    /// keystrokes and **the pane can be reaped by the prod's own first
+    /// keystroke**: a key routed to the PTY reaches
+    /// `render::route_terminal_key`'s `TerminalKeyAction::SendToPty` arm,
+    /// which calls `engine.poll_terminal()` immediately after writing
+    /// (`render.rs`) — so if that write is what lets the wrapper's trailing
+    /// `exit` run, `finalize_install_from_terminal` fires and the panel
+    /// closes *between* `e` and `x`, and the remaining `x`/`i`/`t`/Enter
+    /// land in the editor and wipe the message finalize just set. That is
+    /// the same `INSERT  [No Name] [+] … Ln 2, Col 1` + empty command line
+    /// end state as above, reached with a perfectly fresh gate, and it
+    /// reproduced in roughly one full-suite run in eight. So
+    /// [`force_terminal_exit`] re-renders and re-checks the panel before
+    /// *every* keystroke, and stops the moment it is gone.
     fn poll_until_screen(
         driver: &mut quadraui::tui::testing::TuiDriver<impl quadraui::runner::AppLogic>,
         timeout: Duration,
@@ -25034,7 +25067,9 @@ mod tests {
                     return true;
                 }
                 if terminal_panel_painted(&driver.screen()) {
-                    force_terminal_exit(driver);
+                    if force_terminal_exit(driver, &mut predicate) {
+                        return true;
+                    }
                     next_prod = start.elapsed() + prod_gap;
                     prod_gap = (prod_gap * 2).min(Duration::from_secs(2));
                 }
@@ -25097,13 +25132,46 @@ mod tests {
     /// value and the wrapper's own trailing `exit` line still runs right
     /// after. Either path ends with the pane's shell process gone, which is
     /// all `poll_terminal`'s `is_exited()` check cares about.
+    ///
+    /// # Per-keystroke gating (#957 smoke)
+    ///
+    /// Each keystroke is preceded by a fresh `render()` + panel check and
+    /// followed by a `predicate` test, and the whole prod aborts the instant
+    /// the panel is no longer painted. That is not belt-and-braces: a key
+    /// routed to the PTY runs `engine.poll_terminal()` synchronously inside
+    /// the very same `type_char` call (`render::route_terminal_key`'s
+    /// `SendToPty` arm), so *this function's own first keystroke* can be
+    /// what reaps the pane, closes the panel and has
+    /// `finalize_install_from_terminal` paint the message under test —
+    /// after which the remaining keystrokes would land in the editor and
+    /// `Engine::handle_key` would clear that message again before the
+    /// caller ever got to look at it. See [`poll_until_screen`]'s doc for
+    /// the observed failure.
+    ///
+    /// Returns `true` if `predicate` became satisfied mid-prod, so the
+    /// caller can stop immediately rather than tick once more (which is
+    /// harmless, but the early return keeps "who observed it" obvious).
     fn force_terminal_exit(
         driver: &mut quadraui::tui::testing::TuiDriver<impl quadraui::runner::AppLogic>,
-    ) {
-        for ch in "exit".chars() {
-            driver.type_char(ch);
+        predicate: &mut impl FnMut(&str) -> bool,
+    ) -> bool {
+        let mut keys: Vec<quadraui::Key> = "exit".chars().map(quadraui::Key::Char).collect();
+        keys.push(quadraui::Key::Named(quadraui::NamedKey::Enter));
+        for key in keys {
+            driver.render();
+            if !terminal_panel_painted(&driver.screen()) {
+                // The pane is gone — very possibly reaped by the previous
+                // keystroke in this same loop. Anything typed from here
+                // would go to the editor and wipe the command line.
+                return false;
+            }
+            driver.press(key);
+            driver.render();
+            if predicate(&driver.screen()) {
+                return true;
+            }
         }
-        driver.press_named(quadraui::NamedKey::Enter);
+        false
     }
 
     /// #1344 core acceptance case: a non-zero exit code from the install

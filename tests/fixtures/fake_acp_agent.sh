@@ -154,7 +154,7 @@
 # instead of a piped-closed one — simulating a login a human abandons by
 # closing the pane before it ever exits, for a test to race against with
 # `Engine::terminal_close_active_tab`. "succeed-slow" is the same success
-# path plus a brief `sleep` before exiting — for a `TuiDriver` black-box
+# path plus a two-second `sleep` before exiting — for a `TuiDriver` black-box
 # test (`tui_main::shell_app::tests::
 # ai_panel_terminal_auth_choice_opens_visible_login_pane_and_resumes_session_via_shell_app`)
 # that needs a real window to poll-and-render the login pane's own painted
@@ -172,7 +172,7 @@ if [ -t 0 ] && [ "$1" != "hang" ]; then
   fi
   echo "fake-acp-agent: interactive login succeeded"
   if [ "$1" = "succeed-slow" ]; then
-    sleep 0.3
+    sleep 2
   fi
   exit 0
 fi

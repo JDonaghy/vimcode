@@ -5147,6 +5147,13 @@ second line here
         );
     }
 
+    /// How long the two #957 (ACP-6) driver tests below wait on a real
+    /// child process before giving up. Same value, and same rationale, as
+    /// `tui_main::shell_app::tests::ACP_DRIVER_DEADLINE` — see that
+    /// constant's doc comment for why 5s was not enough under full-suite
+    /// load (#957 smoke).
+    const ACP_DRIVER_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
     /// #957 (ACP-6) acceptance: "with `auth.terminal` advertised against a
     /// fake agent offering a terminal auth method, ... the method is
     /// present" and "with the capability not advertised, the method is
@@ -5198,7 +5205,7 @@ second line here
         }
         h.driver.ctrl_char('s');
 
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + ACP_DRIVER_DEADLINE;
         while !h
             .engine
             .borrow()
@@ -5217,7 +5224,7 @@ second line here
                 .dialog
                 .as_ref()
                 .is_some_and(|d| d.tag == "acp_auth_choice"),
-            "the auth-choice dialog should be open within 5s"
+            "the auth-choice dialog should be open within ACP_DRIVER_DEADLINE"
         );
         assert!(
             h.dialog_layout.borrow().is_none(),
@@ -5342,7 +5349,7 @@ second line here
         }
         h.driver.ctrl_char('s');
 
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + ACP_DRIVER_DEADLINE;
         while !h
             .engine
             .borrow()
@@ -5360,7 +5367,7 @@ second line here
             let dialog = engine
                 .dialog
                 .as_ref()
-                .expect("the auth-choice dialog should be open within 5s");
+                .expect("the auth-choice dialog should be open within ACP_DRIVER_DEADLINE");
             dialog
                 .buttons
                 .iter()
@@ -5388,7 +5395,7 @@ second line here
             h.driver.painted_texts()
         );
 
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + ACP_DRIVER_DEADLINE;
         while !h.engine.borrow().terminal_panes.is_empty() && std::time::Instant::now() < deadline {
             h.engine.borrow_mut().poll_terminal();
             std::thread::sleep(std::time::Duration::from_millis(10));
@@ -5399,7 +5406,7 @@ second line here
         );
         assert!(h.engine.borrow().acp_authenticated);
 
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + ACP_DRIVER_DEADLINE;
         while !h.driver.screen_contains("Hello world") && std::time::Instant::now() < deadline {
             h.engine.borrow_mut().poll_acp();
             h.driver.render();
@@ -5408,7 +5415,7 @@ second line here
         assert!(
             h.driver.screen_contains("Hello world"),
             "completing the login must re-initialize the client and resume \
-             the queued turn within 5s"
+             the queued turn within ACP_DRIVER_DEADLINE"
         );
         assert!(
             !h.driver.screen_contains("[1]"),
