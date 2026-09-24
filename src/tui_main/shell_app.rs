@@ -24194,8 +24194,9 @@ mod tests {
     // exactly as `:ExtInstall` does) through a real `TuiShellApp` +
     // `driver_with_shell`, letting `driver.tick()` spawn the install
     // terminal pane (a real PTY, `sh -c '...'`) the same way production
-    // does, forcing the shell to terminate once the wrapper reaches its
-    // exit prompt (see `force_terminal_exit`'s doc for why a single
+    // does, forcing the shell to terminate by prodding it with a synthetic
+    // `exit` until it does (see `poll_until_screen` for why that has to be
+    // a gated retry loop, and `force_terminal_exit`'s doc for why a single
     // synthetic Enter isn't reliable here) so `poll_terminal` calls
     // `finalize_install_from_terminal` for real, and reading the painted
     // command line back with `driver.screen()`.
@@ -24215,26 +24216,131 @@ mod tests {
     /// above already uses for a background thread — this is a real PTY
     /// child process instead, but the same "don't busy-loop, don't hang the
     /// suite" tradeoff applies.
+    ///
+    /// It also re-sends the shell-exit stimulus ([`force_terminal_exit`])
+    /// on a backoff schedule while the predicate is unsatisfied and the
+    /// terminal panel is still painted.
+    ///
+    /// # Why the stimulus is a retry loop, and why it is gated (#1344)
+    ///
+    /// The first cut of these tests sent it exactly once, after waiting for
+    /// the literal `Press Enter to close…` to appear on screen. Both halves
+    /// of that were wrong, and together they made the two tests fail in
+    /// ~50% of full-suite runs on a loaded machine with no controlling
+    /// terminal (i.e. CI) while passing every time the tests ran alone:
+    ///
+    /// * **The wait fired far too early.** `terminal_run_command` injects
+    ///   the *entire* wrapper script into the PTY with one `write_input`
+    ///   the instant `TerminalSession::spawn` returns — before the shell
+    ///   has finished starting — and the line discipline echoes those bytes
+    ///   back verbatim. Every literal the script contains, that one
+    ///   included, is therefore already on `driver.screen()` before the
+    ///   first command has run, so the wait was matching the script's own
+    ///   *source text*, not the wrapper's output. There is no dependable
+    ///   screen signal for "the shell is ready" either: the wrapper's
+    ///   output is indistinguishable from its echo once the pane wraps and
+    ///   truncates long lines, and a marker printed by the install command
+    ///   itself scrolls out of the ~12-row pane before the poll can see it.
+    ///
+    /// * **A single stimulus at that moment is lost.** Keystrokes that
+    ///   reach the PTY while the shell is still starting up are not
+    ///   reliably acted on (captured from a failing run: the synthetic
+    ///   `exit` shows up interleaved into bash's startup banner as `eTo run
+    ///   a command…` / `xitjohn@host:…$`, and the shell then sat in `read
+    ///   __dummy` forever). The pane never exited, so `poll_terminal` never
+    ///   called `finalize_install_from_terminal` and the message under test
+    ///   was never painted.
+    ///
+    /// Retrying covers both without needing that signal, and is
+    /// ordering-safe: the whole script is already in the PTY input queue
+    /// before any of these keystrokes are appended to it, so a prod can
+    /// only ever be consumed *after* the script's last line — either as
+    /// `$__dummy`'s value or as the command that follows it, never
+    /// mid-script, so the wrapper's `$?` capture always runs.
+    ///
+    /// The gate is the other half: once the pane's shell has exited the
+    /// panel is gone and a prod lands in the *editor*, where
+    /// `Engine::handle_key` clears `self.message` on **any** keypress
+    /// (`keys.rs`, "Clear message on any keypress") — wiping the very
+    /// message under test (observed: a run that ended `INSERT  [No Name]
+    /// [+] … Ln 14` with an empty command line). Hence: never prod without
+    /// two freshly-painted frames that both still show the panel.
     fn poll_until_screen(
         driver: &mut quadraui::tui::testing::TuiDriver<impl quadraui::runner::AppLogic>,
         timeout: Duration,
         mut predicate: impl FnMut(&str) -> bool,
     ) -> bool {
-        let deadline = Instant::now() + timeout;
+        let start = Instant::now();
+        let deadline = start + timeout;
+        // Backoff rather than a prod per poll: each prod is five bytes into
+        // a PTY input queue nobody is draining yet, a 20ms cadence for the
+        // whole timeout could fill the line discipline's buffer, and every
+        // prod is a chance to race the pane's removal (see the gate below).
+        let mut next_prod = Duration::from_millis(250);
+        let mut prod_gap = Duration::from_millis(250);
         loop {
-            driver.tick();
-            if predicate(&driver.screen()) {
+            if tick_and_test(driver, &mut predicate) {
                 return true;
             }
             if Instant::now() >= deadline {
                 return false;
             }
+            if start.elapsed() >= next_prod && terminal_panel_painted(&driver.screen()) {
+                // Second opinion on a second freshly-painted frame: the
+                // app's layout is allowed to lag a frame behind engine
+                // state (see `tab_visible_counts`), so one frame still
+                // showing the panel is not proof the pane is still there.
+                if tick_and_test(driver, &mut predicate) {
+                    return true;
+                }
+                if terminal_panel_painted(&driver.screen()) {
+                    force_terminal_exit(driver);
+                    next_prod = start.elapsed() + prod_gap;
+                    prod_gap = (prod_gap * 2).min(Duration::from_secs(2));
+                }
+            }
             std::thread::sleep(Duration::from_millis(20));
         }
     }
 
+    /// Advance the driver one tick, repaint, and report whether `predicate`
+    /// holds on the frame that tick produced.
+    ///
+    /// The explicit `render()` matters: `TuiDriver::tick` only repaints
+    /// when the app's tick returns `Reaction::Redraw`, so after a
+    /// `RedrawAfter`/`Continue` tick `screen()` still shows the *previous*
+    /// frame. Painting unconditionally keeps both the predicate and
+    /// [`poll_until_screen`]'s prod gate reading the state the tick just
+    /// produced.
+    fn tick_and_test(
+        driver: &mut quadraui::tui::testing::TuiDriver<impl quadraui::runner::AppLogic>,
+        predicate: &mut impl FnMut(&str) -> bool,
+    ) -> bool {
+        driver.tick();
+        driver.render();
+        predicate(&driver.screen())
+    }
+
+    /// Is the bottom terminal panel still on screen?
+    ///
+    /// [`poll_until_screen`] gates its exit prodding on this: the panel
+    /// header row is the painted proof that the install pane still exists
+    /// and therefore still owns the keyboard (`Engine::terminal_has_focus`,
+    /// which `render::route_terminal_key` checks before forwarding a key to
+    /// the PTY). Read off `driver.screen()` rather than engine state
+    /// because `driver_with_shell` wraps the app in a shell adapter that
+    /// keeps the inner `TuiShellApp` — and its `Engine` — unreachable
+    /// (#765).
+    fn terminal_panel_painted(screen: &str) -> bool {
+        screen.contains("Terminal")
+    }
+
     /// Type `exit` + Enter into the focused terminal pane to force the
     /// install shell to terminate.
+    ///
+    /// Always driven from [`poll_until_screen`]'s gated retry loop rather
+    /// than sent once — see that function for why a single shot, at any
+    /// screen-observable moment, is unreliable.
     ///
     /// The install wrapper's own `read __dummy` / `exit` tail (see
     /// `build_terminal_install_wrapper`) is written to the PTY in the same
@@ -24304,17 +24410,9 @@ mod tests {
         let mut driver = driver_with_shell(app, config(), 100, 24);
 
         assert!(
-            poll_until_screen(&mut driver, Duration::from_secs(10), |screen| screen
-                .contains("Press Enter to close"),),
-            "install wrapper never reached its exit prompt; screen:\n{}",
-            driver.screen()
-        );
-
-        force_terminal_exit(&mut driver);
-
-        assert!(
-            poll_until_screen(&mut driver, Duration::from_secs(10), |screen| screen
-                .contains("failed (exit 7)"),),
+            poll_until_screen(&mut driver, Duration::from_secs(20), |screen| {
+                screen.contains("failed (exit 7)")
+            }),
             "command line never painted the failed-install message; screen:\n{}",
             driver.screen()
         );
@@ -24389,17 +24487,9 @@ mod tests {
         let mut driver = driver_with_shell(app, config(), 400, 24);
 
         assert!(
-            poll_until_screen(&mut driver, Duration::from_secs(10), |screen| screen
-                .contains("Press Enter to close"),),
-            "install wrapper never reached its exit prompt; screen:\n{}",
-            driver.screen()
-        );
-
-        force_terminal_exit(&mut driver);
-
-        assert!(
-            poll_until_screen(&mut driver, Duration::from_secs(10), |screen| screen
-                .contains("was not found"),),
+            poll_until_screen(&mut driver, Duration::from_secs(20), |screen| {
+                screen.contains("was not found")
+            }),
             "command line never painted the DAP-not-found message; screen:\n{}",
             driver.screen()
         );
