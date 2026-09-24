@@ -819,6 +819,21 @@ since `driver.app()` has no accessor back to `Engine` state — never via
 disabling each backend's paint dispatch arm before restoring it. `cargo
 build`/`clippy -D warnings`/`fmt` clean on both feature lanes.
 
+**Bundled icon font** (test-stage follow-up): the new `icons::BOARD`
+(`\u{f0db}`, nf-fa-table_columns) is a 96th nerd codepoint, so
+`tests/icon_font_coverage.rs` went red — `data/fonts/vimcode-icons.ttf` is
+subsetted to exactly the codepoints `Icon::new` references, and an
+unbundled one paints tofu on GTK with no build signal. Regenerated with
+`scripts/gen_icon_font.py --source data/fonts/vimcode-icons.ttf
+--legacy-source SymbolsNerdFont-Regular.ttf` (upstream nerd-fonts v3.4.0)
+— i.e. the *current subset* as primary, upstream only as the donor for the
+one missing glyph, so all 95 pre-existing glyphs keep byte-identical
+outlines and metrics (verified with fontTools). Regenerating the other way
+round (upstream as `--source`) also passes, but silently restyles 9
+unrelated icons to v3.4.0's shapes — U+EA76, U+EAE6, U+EB3C, U+EB3D,
+U+EB54, U+EB85, U+F02B, U+F0140, U+F0143 — which is a deliberate font
+refresh, not a bugfix. `EXPECTED_NERD_CODEPOINT_COUNT` bumped 95 → 96.
+
 Out of scope (per the issue): provider-dispatch actions (#523), issue
 authoring as markdown buffers (#524), in-editor diff review (#525/#526),
 and the coordinator extension bundle itself (the only place `coord` will
