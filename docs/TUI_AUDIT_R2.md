@@ -56,7 +56,7 @@ name alone. Four verdicts, per #1044:
 
 `panels.rs` is TUI's rasteriser for the sidebar body (7 built-in panels + the
 plugin `ext:` panel), the panel-hover popup, and the `:`-command line. Its GTK
-twin is `App::paint_sidebar_panel_rung` (`src/app.rs:3352`), read in full for
+twin is `App::paint_sidebar_panel_rung` (`src/app.rs:3428`), read in full for
 this audit.
 
 | # | Rung | Lines | Verdict | One-line justification |
@@ -65,13 +65,13 @@ this audit.
 | 2 | `render_explorer_sidebar_content` | 51 | quadraui-gap | Same decision as `paint_sidebar_panel_rung`'s `PANEL_EXPLORER` arm (populate tree controller, set rect, `explorer_tree.render()`), but TUI additionally hand-fills the background via a `Backend::draw_status_bar` trick and pushes a `ScrollSurface` — composition-level TUI-only chrome with no shared primitive to fold into (see §2.9). |
 | 3 | `render_sidebar_content` (dispatcher) | 31 | already-shared | Dispatches on `engine.app_shell.active_panel_id()`, the same `AppShell` state `paint_sidebar_panel_rung`'s `render::sidebar_owner(engine)` resolves — one `AppShell` cursor, two thin `match` shapes over it. |
 | 4 | `fill_row_q` / `fill_row` / `fill_rect` | 40 | already-shared | A `Backend::draw_status_bar`-as-solid-fill trick — explicitly the same stand-in quadraui's own `AppShell::render` uses for its resize divider (own doc comment cites it); not a TUI-only invention, and GTK's Cairo canvas needs no fill-trait detour to begin with (native fill call), so there is nothing to converge on that side. |
-| 5 | `render_settings_panel` | 54 | quadraui-gap | Same `render::populate_settings_form_controller` + `FormController::render_and_cache` GTK's `PANEL_SETTINGS` arm calls, but TUI additionally paints its own header/search chrome via `Backend::draw_settings_chrome` — GTK's arm calls neither `draw_settings_chrome` nor any header equivalent (see §2.9, and the open question in §5 item 3). |
+| 5 | `render_settings_panel` | 54 | quadraui-gap | Same `render::populate_settings_form_controller` + `FormController::render_and_cache` GTK's `PANEL_SETTINGS` arm calls, but TUI additionally paints its own header/search chrome via `Backend::draw_settings_chrome`. **Resolved by #1256 (driven, not read): missing on GTK, not composed elsewhere.** GTK gets no filter row at all (`settings_query` still filters the form, invisibly), and its only header is quadraui `AppShell::render`'s sidebar-header row (`compose/app_shell.rs:894-912` @ pin `215e9e4`), which titles itself from `panels[active_panel]` — Settings is a *bottom item* that never becomes `active_panel`, so GTK heads the Settings body with the **previous** panel's title (" EXPLORER "). Shipped TUI's runner header is stale the same way ("Menu"), masked by this rung's own " SETTINGS" row. Recorded as `KNOWN_BUGS`-gated divergences in `src/harness.rs` (`issue_1256_sidebar_chrome::settings_*`); fix ruled on by #1258. |
 | 6 | `render_search_panel` | 34 | already-shared | Doc comment: "already trait-pure... #607 widened the parameter... letting `render_content` call it via `render_sidebar_content` without a concrete backend" — same `populate_search_sidebar_system` + `SidebarSystem::render` GTK's `PANEL_SEARCH` arm calls; the only TUI-local code is two caret-clamp guards, unrelated to painting. |
 | 7 | `render_command_line` | 15 | already-shared | Doc comment names the whole body as quadraui#1001's shared primitive: `render::command_line_view` + `render::command_line_selection_bytes` + `Backend::draw_command_line_selection` — the exact rung `GOALS.md`'s own table (item "`FrameOp::CommandLine` selection-highlight paint") already tracks as converged. |
 | 8 | `render_source_control` | 181 | quadraui-gap | Same `render::sc_*` adapters (`sc_header_text`, `sc_commit_message_to_text_input`, `draw_sc_sidebar_panel`, `populate_sc_sidebar_system`, `sc_branch_picker_to_palette`, `sc_help_dialog_layout`) `paint_sidebar_panel_rung`'s `PANEL_GIT` arm calls — same decisions, same adapters, but the *band geometry* is derived twice: TUI from `sc_commit_input_box_height`/manual row arithmetic, GTK from `render::sc_sidebar_bands`. This is the largest single rung in the file and the biggest concrete instance of the D3-10 lead (see §2.9 and §4). |
 | 9 | `render_ext_panel` | 190 | quadraui-gap | Same `render::ext_panel_to_tree_view` + `Backend::draw_tree` + `backend.tree_layout()` cache GTK's `id if id.starts_with("ext:")` arm uses; TUI additionally hand-rolls its own scrollbar (`draw_tree` "doesn't render scrollbars yet", own doc comment) and its own help-popup `TooltipLayout` construction — real per-panel composition GTK's arm doesn't need at all (that arm has neither). Second-largest rung; see §2.9. |
 | 10 | `render_panel_hover_popup` | 134 | already-shared | Doc comment: "the same shared `render::ext_panel_hover_screen_row`/`ext_panel_chrome_rows` derivation `panel_hover_anchor_y` (GTK's twin of this function) now uses" — anchor math only, cell vs. pixel; the popup layout/paint itself is one call to the shared `RichTextPopup::layout()` + `Backend::draw_rich_text_popup`. |
-| 11 | `render_ext_sidebar` | 84 | quadraui-gap | Same `render::ext_sidebar_to_multi_section_view` + `MultiSectionView::render` GTK's `PANEL_EXTENSIONS` arm calls, but TUI paints two additional header/search chrome rows by hand (`fill_row`, not even the shared `draw_settings_chrome`) that GTK's arm has no equivalent of at all — see the open question in §5 item 3. |
+| 11 | `render_ext_sidebar` | 84 | quadraui-gap | Same `render::ext_sidebar_to_multi_section_view` + `MultiSectionView::render` GTK's `PANEL_EXTENSIONS` arm calls, but TUI paints two additional header/search chrome rows by hand (`fill_row`, not even the shared `draw_settings_chrome`). **Resolved by #1256 (driven): the header is composed elsewhere on GTK, the search row is missing.** GTK's " EXTENSIONS " header is quadraui `AppShell::render`'s sidebar-header row, titled from the engine's `PanelDefinition.title` (`src/core/engine/sidebar.rs:140`, handed to the runner by `App::shell_config`, `src/app.rs:1678`) — so shipped TUI actually paints the header **twice** (runner "Extensions" row + this rung's " EXTENSIONS" row). GTK has no "Search extensions" row at all. Header: ungated test `issue_1256_sidebar_chrome::extensions_header_is_painted`; search row: `KNOWN_BUGS`-gated `extensions_search_row_is_painted::{gtk,tui}`, fix ruled on by #1258. |
 | 12 | `render_ai_sidebar` | 21 | already-shared | Doc comment: "delegates its entire paint to the shared `engine.ai_chat` (`quadraui::ChatController`), the same controller GTK's `render_content` `PANEL_AI` arm now also renders — one implementation instead of two" (#819). Confirmed: `paint_sidebar_panel_rung`'s `PANEL_AI` arm is the same three calls (`populate_ai_chat_controller`, set rect, `.render()`), modulo `Cell`-vs-field caching of backend metrics. |
 | 13 | `render_debug_sidebar` | 56 | quadraui-gap | Same `render::debug_sidebar_chrome_to_status_bars` + four `quadraui::TreeView`s (`populate_dap_sidebar_system`) GTK's `PANEL_DEBUG` arm calls; TUI's body is a superset only in how it slices the chrome rows into `Rect`s (cell arithmetic) vs. GTK's `f32` pixel arithmetic for the same two bars — same composition shape as the rest of §2.9's bucket, smaller because the chrome here really is just two `StatusBar`s, no extra TUI-only chrome layer. |
 | 14 | Doc-comment/module overhead (headers, the deleted-`draw_frame` note at line 1103, section dividers) | ~231 | irreducible | Prose, not logic — accounts for the gap between the sum of the rows above (891 = 616 quadraui-gap + 275 already-shared) and the measured 1,122; not a rung. |
@@ -86,9 +86,11 @@ what's independently written on each side is the panel's **chrome
 composition** — which rows get a background fill, a header, a search box, a
 scrollbar overlay, and in what order, before the shared widget body paints.
 `paint_sidebar_panel_rung`'s arms are correspondingly smaller (its whole
-match, all 8 panels, is **272 lines** — see `src/app.rs:3352-3623`) because
-GTK either omits this chrome layer entirely (Settings, Extensions — see §5
-item 3) or gets it from the pixel-space primitive directly where TUI has to
+match, all 8 panels, is **288 lines** — see `src/app.rs:3442-3729`) because
+GTK either omits this chrome layer entirely (Settings, and Extensions'
+search row — #1256 drove both backends and found them missing on GTK, see
+§2 rows 5/11; Extensions' *header* is the `AppShell` runner's own) or gets
+it from the pixel-space primitive directly where TUI has to
 hand-roll a cell-space equivalent (Git's band geometry, ext-panel's
 scrollbar).
 
@@ -202,6 +204,13 @@ referencing #1108.
    itself) or is genuinely missing it. Either outcome is a one-line
    correction to this document's §2 rows 5/11 or a real GTK bug fix — file
    whichever it turns out to be.
+   **Done — #1256.** Both, split by row: the Extensions *header* is
+   composed by the `AppShell` runner (and so is doubled on shipped TUI);
+   the Extensions search row, the Settings filter row and a correct
+   Settings header are **missing on GTK** (GTK shows " EXPLORER " over the
+   Settings body). §2 rows 5/11 corrected; divergences recorded as
+   `KNOWN_BUGS`-gated driver tests in `src/harness.rs`; the fix is #1258's
+   call.
 
 **Wave 2 — convergeable, no design decision needed:**
 

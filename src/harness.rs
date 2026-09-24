@@ -1339,7 +1339,21 @@ pub(crate) fn assert_text_metrics_backend_applies_metrics<B: TextMetricsBackend>
 /// deleted. Every scenario in this suite now takes the plain `Pass` /
 /// `Regression` arms of [`GateOutcome`] — there is currently no bug this
 /// table needs to track.
-pub(crate) const KNOWN_BUGS: &[&str] = &[];
+pub(crate) const KNOWN_BUGS: &[&str] = &[
+    // #1256: the shared `App` (GTK, and the `::tui` control arm that wraps
+    // the same `App`) paints no search/filter row for the Settings and
+    // Extensions sidebars, and titles the Settings sidebar with the
+    // *previous* top panel's header. The shipped TUI (`::tui_prod`) paints
+    // all three. Whether to converge (and in which direction) is ruled on
+    // by #1258 — delete these entries in whichever PR lands that ruling's
+    // fix. See `issue_1256_sidebar_chrome` below.
+    "issue_1256_sidebar_chrome::settings_header_names_settings::gtk",
+    "issue_1256_sidebar_chrome::settings_header_names_settings::tui",
+    "issue_1256_sidebar_chrome::settings_filter_row_is_painted::gtk",
+    "issue_1256_sidebar_chrome::settings_filter_row_is_painted::tui",
+    "issue_1256_sidebar_chrome::extensions_search_row_is_painted::gtk",
+    "issue_1256_sidebar_chrome::extensions_search_row_is_painted::tui",
+];
 
 /// A saved `std::panic::set_hook`/`take_hook` closure — named so
 /// `known_bug_gate_outcome`'s suppress/restore `RestoreHook` doesn't need
@@ -3959,4 +3973,141 @@ mod issue_1064_take_requested_panel {
              agrees with App's new one"
         );
     }
+}
+
+/// #1256: does GTK compose the Settings/Extensions sidebar header and
+/// search chrome somewhere other than `App::paint_sidebar_panel_rung`
+/// (whose `PANEL_SETTINGS`/`PANEL_EXTENSIONS` arms paint only the body
+/// widget), or is it missing? Answered here by driving all three shells,
+/// each panel opened by a real click on its activity-bar icon:
+///
+/// | | `gtk` / `tui` (shared `App`) | `tui_prod` (`TuiShellApp`) |
+/// |---|---|---|
+/// | Extensions header | " EXTENSIONS " — quadraui `AppShell::render`'s sidebar-header row, titled from `PanelDefinition.title` (`core/engine/sidebar.rs`) | runner header "Extensions" **and** `render_ext_sidebar`'s own " EXTENSIONS" row (doubled) |
+/// | Extensions search row | **none** | "Search extensions (press /)" |
+/// | Settings header | **" EXPLORER "** — stale: Settings is an `AppShell` *bottom item*, which never becomes `active_panel`, so the header keeps the previous top panel's title | runner header stale too ("Menu"), masked by `render_settings_panel`'s own " SETTINGS" row |
+/// | Settings filter row | **none** — `settings_query` still filters the form, invisibly | "/ <query>" via `draw_settings_chrome` |
+///
+/// So the Extensions *header* is composed elsewhere on GTK (ungated test
+/// below); everything else is missing on the shared `App` and is recorded
+/// as a `KNOWN_BUGS`-gated divergence whose fix #1258 rules on. The gated
+/// bodies encode the shipped TUI's behaviour, so they turn `FixLanded`
+/// (red) the moment the shared `App` gains the row.
+#[cfg(test)]
+mod issue_1256_sidebar_chrome {
+    use super::*;
+
+    /// A query no settings label contains, so it can only reach the screen
+    /// through a painted filter row.
+    const SETTINGS_QUERY: &str = "qqzz1256";
+
+    fn engine_fixture() -> crate::core::Engine {
+        let mut engine = crate::core::Engine::new_for_test();
+        engine.settings.use_nerd_fonts = Some(false);
+        engine
+    }
+
+    fn engine_with_settings_query() -> crate::core::Engine {
+        let mut engine = engine_fixture();
+        engine.settings_query = SETTINGS_QUERY.to_string();
+        engine
+    }
+
+    fn open_extensions<D: ConformanceDriver>(driver: &mut D) {
+        driver.click_text(crate::icons::EXTENSIONS.s());
+        assert!(
+            driver.screen_has("AVAILABLE"),
+            "precondition: clicking the Extensions icon must paint the \
+             extensions sidebar body"
+        );
+    }
+
+    fn open_settings<D: ConformanceDriver>(driver: &mut D) {
+        driver.click_text(crate::icons::SETTINGS.s());
+    }
+
+    fn extensions_header_is_painted<D: ConformanceDriver>(driver: &mut D) {
+        open_extensions(driver);
+        assert!(
+            driver.screen_has("EXTENSIONS"),
+            "#1256: the Extensions sidebar must paint a header naming it"
+        );
+    }
+
+    fn extensions_search_row_is_painted<D: ConformanceDriver>(driver: &mut D) {
+        open_extensions(driver);
+        assert!(
+            driver.screen_has("Search extensions"),
+            "#1256: the Extensions sidebar must paint its search row"
+        );
+    }
+
+    fn settings_header_names_settings<D: ConformanceDriver>(driver: &mut D) {
+        open_settings(driver);
+        assert!(
+            driver.screen_has("Appearance"),
+            "precondition: clicking the Settings icon must paint the \
+             settings form body"
+        );
+        assert!(
+            driver.screen_has("SETTINGS") && !driver.screen_has("EXPLORER"),
+            "#1256: the Settings sidebar must be headed SETTINGS, not the \
+             previous panel's title"
+        );
+    }
+
+    fn settings_filter_row_is_painted<D: ConformanceDriver>(driver: &mut D) {
+        open_settings(driver);
+        assert!(
+            driver.screen_has(SETTINGS_QUERY),
+            "#1256: the Settings sidebar must paint its filter row showing \
+             the active query"
+        );
+    }
+
+    macro_rules! arms {
+        ($name:ident, $engine:expr) => {
+            mod $name {
+                use super::*;
+
+                #[cfg(feature = "gui")]
+                #[test]
+                fn gtk() {
+                    let mut h = crate::gtk::testing::conformance_harness($engine, 800, 480);
+                    known_bug_gate(
+                        concat!("issue_1256_sidebar_chrome::", stringify!($name), "::gtk"),
+                        || super::$name(&mut h.driver),
+                    );
+                }
+
+                #[test]
+                fn tui() {
+                    let mut h = crate::tui_main::testing::conformance_harness($engine, 100, 30);
+                    known_bug_gate(
+                        concat!("issue_1256_sidebar_chrome::", stringify!($name), "::tui"),
+                        || super::$name(&mut h.driver),
+                    );
+                }
+
+                #[test]
+                fn tui_prod() {
+                    let mut h =
+                        crate::tui_main::testing::conformance_harness_prod($engine, 100, 30);
+                    known_bug_gate(
+                        concat!(
+                            "issue_1256_sidebar_chrome::",
+                            stringify!($name),
+                            "::tui_prod"
+                        ),
+                        || super::$name(&mut h.driver),
+                    );
+                }
+            }
+        };
+    }
+
+    arms!(extensions_header_is_painted, engine_fixture());
+    arms!(extensions_search_row_is_painted, engine_fixture());
+    arms!(settings_header_names_settings, engine_fixture());
+    arms!(settings_filter_row_is_painted, engine_with_settings_query());
 }
