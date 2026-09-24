@@ -24,7 +24,7 @@
 use crate::core::buffer::Buffer;
 use crate::core::dap::DapVariable;
 use crate::core::engine::sidebar::{
-    PANEL_AI, PANEL_DEBUG, PANEL_EXTENSIONS, PANEL_GIT, PANEL_SEARCH, PANEL_SETTINGS,
+    PANEL_AI, PANEL_BOARD, PANEL_DEBUG, PANEL_EXTENSIONS, PANEL_GIT, PANEL_SEARCH, PANEL_SETTINGS,
 };
 use crate::core::engine::{AlignedDiffEntry, DiffLine, Engine, PanelChromeDesc, SearchDirection};
 pub use crate::core::engine::{BottomPanelKind, DebugSidebarSection};
@@ -3710,6 +3710,8 @@ pub enum FocusKeyRoute {
     Ai,
     /// The source-control panel — `dispatch_sc_sidebar_key_unified`.
     SourceControl,
+    /// The Board panel (#521) — `Engine::dispatch_board_key_unified`.
+    Board,
     /// The file explorer — `Engine::dispatch_explorer_key`. Also the
     /// terminal fallback: a key that reaches the sidebar band and matches no
     /// other panel lands here rather than falling through to the editor,
@@ -3776,6 +3778,9 @@ pub fn route_focus_key(engine: &Engine, sidebar_band_focused: bool) -> FocusKeyR
     }
     if engine.sc_has_focus || engine.active_panel_is(PANEL_GIT) {
         return FocusKeyRoute::SourceControl;
+    }
+    if engine.board_has_focus || engine.active_panel_is(PANEL_BOARD) {
+        return FocusKeyRoute::Board;
     }
 
     // The explorer is the unguarded fallback, not a guarded arm — see the
@@ -4406,6 +4411,7 @@ pub fn dispatch_sidebar_panel_key(
             engine.dispatch_sc_sidebar_key_unified(key_name, ctrl, sc_unicode);
             engine.sc_has_focus
         }
+        FocusKeyRoute::Board => engine.dispatch_board_key_unified(key_name),
         FocusKeyRoute::Debug | FocusKeyRoute::Explorer | FocusKeyRoute::Ai => return None,
         FocusKeyRoute::ActivityBar | FocusKeyRoute::None => return None,
     })
@@ -7497,6 +7503,8 @@ pub enum SidebarOwner {
     Extensions,
     Settings,
     Ai,
+    /// The Board panel (#521).
+    Board,
     /// A plugin-provided panel, by bare name (no `ext:` prefix).
     ExtPanel(String),
     /// A panel id nothing paints — a click on it belongs to whatever is
@@ -7517,6 +7525,7 @@ impl SidebarOwner {
             SidebarOwner::Extensions => PANEL_EXTENSIONS,
             SidebarOwner::Settings => PANEL_SETTINGS,
             SidebarOwner::Ai => PANEL_AI,
+            SidebarOwner::Board => PANEL_BOARD,
             SidebarOwner::ExtPanel(_) | SidebarOwner::Unknown => return None,
         })
     }
@@ -7563,6 +7572,7 @@ pub fn sidebar_owner(engine: &Engine) -> SidebarOwner {
         PANEL_EXTENSIONS => SidebarOwner::Extensions,
         PANEL_SETTINGS => SidebarOwner::Settings,
         PANEL_AI => SidebarOwner::Ai,
+        PANEL_BOARD => SidebarOwner::Board,
         other => match other.strip_prefix("ext:") {
             Some(name) => SidebarOwner::ExtPanel(name.to_string()),
             None => SidebarOwner::Unknown,
@@ -7706,6 +7716,51 @@ pub fn ext_panel_hit_flat_index(engine: &Engine, pos: quadraui::Point) -> Option
 ///
 /// A no-op (selection unchanged) when `pos` doesn't land on a row, or when
 /// the resolved index is past the end of the flat row list (stale cache).
+/// Route a click at `pos` (sidebar-local, same units the last frame painted
+/// the Board with) against the [`quadraui::BoardLayout`] cached at paint
+/// time. Phase 0 (#521) only handles selection + open — a double-click (or
+/// Enter, via [`Engine::dispatch_board_key_unified`]) opens the card, a
+/// single click selects it. A column-header click and a miss are both
+/// no-ops; there is nothing to collapse/expand yet.
+///
+/// Returns whether the click landed on something the panel owns — the same
+/// "consumed" contract [`route_ext_panel_click`]'s callers use.
+pub fn route_board_click(engine: &mut Engine, pos: quadraui::Point, is_double_click: bool) -> bool {
+    let hit = engine
+        .board_layout
+        .borrow()
+        .as_ref()
+        .map(|layout| layout.hit_test(pos.x, pos.y))
+        .unwrap_or(quadraui::BoardHit::Empty);
+    match hit {
+        quadraui::BoardHit::Card(id) => {
+            engine.apply_board_action(quadraui::BoardAction::SelectCard(id.clone()));
+            if is_double_click {
+                engine.apply_board_action(quadraui::BoardAction::OpenIssue(id));
+            }
+            true
+        }
+        quadraui::BoardHit::ColumnHeader(_) | quadraui::BoardHit::Empty => false,
+    }
+}
+
+/// A one-line status banner for the Board panel — "no provider configured",
+/// "fetching…", or the last fetch error (see [`BoardData::status`]). Shared
+/// by both backends so a status message can't drift in wording or style.
+pub fn board_status_bar(status: &str, theme: &Theme) -> quadraui::StatusBar {
+    quadraui::StatusBar {
+        id: quadraui::WidgetId::new("board:status"),
+        left_segments: vec![quadraui::StatusBarSegment {
+            text: format!("  {status}"),
+            fg: theme.status_fg,
+            bg: theme.status_bg,
+            bold: false,
+            action_id: None,
+        }],
+        right_segments: Vec::new(),
+    }
+}
+
 pub fn route_ext_panel_click(engine: &mut Engine, pos: quadraui::Point, is_double_click: bool) {
     let Some(flat_idx) = ext_panel_hit_flat_index(engine, pos) else {
         return;
@@ -10453,6 +10508,26 @@ pub struct ExtSidebarData {
     pub panel_scroll: f32,
 }
 
+// ─── BoardData ─────────────────────────────────────────────────────────────────
+
+/// Rendering data for the Board panel (#521) — a generic host for the shared
+/// `quadraui::Board` component. `model` comes straight from vimcode's board
+/// contract (`Engine::board_model`, populated via the #522 `ToolClient`
+/// seam); this type adds only what the panel's own chrome needs on top of
+/// it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BoardData {
+    /// Whether the panel currently has keyboard focus.
+    pub has_focus: bool,
+    /// The last successfully fetched board, or `None` before the first
+    /// fetch completes (or when no provider is configured).
+    pub model: Option<quadraui::BoardModel>,
+    /// A one-line status to show in place of the board when `model` is
+    /// `None`: "no provider configured", "fetching…", or the last error.
+    /// `None` alongside a `Some(model)` means nothing needs to be said.
+    pub status: Option<String>,
+}
+
 // ─── ExtPanelData (extension-provided sidebar panels) ────────────────────────
 
 /// Rendering data for a single extension-provided sidebar panel.
@@ -12028,6 +12103,9 @@ pub struct ScreenLayout {
     pub group_dividers: Vec<GroupDivider>,
     /// Extensions sidebar data — `Some` when the Extensions panel is the active sidebar panel.
     pub ext_sidebar: Option<ExtSidebarData>,
+    /// Board panel data (#521) — always `Some` so backends can check
+    /// `has_focus`, mirroring [`ExtSidebarData`]'s own doc.
+    pub board: Option<BoardData>,
     /// Extension-provided panel data — `Some` when an extension panel is the active sidebar panel.
     pub ext_panel: Option<ExtPanelData>,
     /// Breadcrumb bars for each editor group (empty when breadcrumbs are disabled).
@@ -16392,6 +16470,7 @@ pub fn build_screen_layout_with_breadcrumb_row(
     });
 
     let ext_sidebar = build_ext_sidebar_data(engine);
+    let board = build_board_data(engine);
 
     // Build breadcrumbs for each editor group
     let breadcrumbs = if engine.settings.breadcrumbs {
@@ -16526,6 +16605,7 @@ pub fn build_screen_layout_with_breadcrumb_row(
         window_dividers,
         minimap,
         ext_sidebar,
+        board,
         ext_panel: build_ext_panel_data(engine),
         breadcrumbs,
         diff_peek: engine.diff_peek.as_ref().map(|dp| DiffPeekPopup {
@@ -18009,8 +18089,8 @@ pub fn build_activity_bar(
     active_ext_panel: Option<&str>,
 ) -> quadraui::ActivityBar {
     use crate::core::engine::sidebar::{
-        ext_panel_id, HAMBURGER_PANEL_ID, PANEL_AI, PANEL_DEBUG, PANEL_EXPLORER, PANEL_EXTENSIONS,
-        PANEL_GIT, PANEL_SEARCH, PANEL_SETTINGS,
+        ext_panel_id, HAMBURGER_PANEL_ID, PANEL_AI, PANEL_BOARD, PANEL_DEBUG, PANEL_EXPLORER,
+        PANEL_EXTENSIONS, PANEL_GIT, PANEL_SEARCH, PANEL_SETTINGS,
     };
 
     // #536: the keyboard ring is matched by *panel id*, not by re-deriving each
@@ -18041,7 +18121,7 @@ pub fn build_activity_bar(
     }
 
     // (panel_id, icon, tooltip, activity_id)
-    let fixed: [(&str, &str, &str, &str); 6] = [
+    let fixed: [(&str, &str, &str, &str); 7] = [
         (
             PANEL_EXPLORER,
             icons::EXPLORER.s(),
@@ -18068,6 +18148,7 @@ pub fn build_activity_bar(
             "activity:extensions",
         ),
         (PANEL_AI, icons::AI_CHAT.s(), "AI Assistant", "activity:ai"),
+        (PANEL_BOARD, icons::BOARD.s(), "Board", "activity:board"),
     ];
 
     // #635 (Stage 6b): `tui_main::shell_app::TuiShellApp::shell_config` derives
@@ -19019,6 +19100,31 @@ fn build_ext_sidebar_data(engine: &Engine) -> Option<ExtSidebarData> {
         input_active: engine.ext_sidebar_input_active,
         fetching: engine.ext_registry_fetching,
         panel_scroll: engine.ext_sidebar_panel_scroll,
+    })
+}
+
+/// Build [`BoardData`] from engine state (#521). Always builds so backends
+/// can check `has_focus` even when there's nothing to paint yet.
+fn build_board_data(engine: &Engine) -> Option<BoardData> {
+    // A status banner is only shown in place of the board, never over it —
+    // a stale-but-present model from an earlier successful fetch keeps
+    // rendering even if the *next* refresh failed, so `board_error` only
+    // becomes a banner when there is nothing else to show.
+    let status = if engine.board_model.is_some() {
+        None
+    } else if let Some(err) = &engine.board_error {
+        Some(err.clone())
+    } else if engine.board_fetching {
+        Some("Fetching board…".to_string())
+    } else if engine.board_provider().is_none() {
+        Some("No board provider configured".to_string())
+    } else {
+        Some("Fetching board…".to_string())
+    };
+    Some(BoardData {
+        has_focus: engine.board_has_focus,
+        model: engine.board_model.clone(),
+        status,
     })
 }
 

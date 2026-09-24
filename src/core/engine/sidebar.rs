@@ -63,6 +63,12 @@ pub const PANEL_DEBUG: &str = "panel:debug";
 pub const PANEL_GIT: &str = "panel:git";
 pub const PANEL_EXTENSIONS: &str = "panel:extensions";
 pub const PANEL_AI: &str = "panel:ai";
+/// The Board panel (#521) — a generic host for `quadraui::Board`, sourced
+/// from whatever provider an extension declares via the #522 seam. Named
+/// after the *component*, not any one provider — see
+/// `crate::core::tool_client`'s module doc for the placement rule
+/// (`src/core/` names no specific external provider) this satisfies.
+pub const PANEL_BOARD: &str = "panel:board";
 pub const PANEL_SETTINGS: &str = "bottom:settings";
 
 /// Activity-bar item id for the hamburger (menu) slot — keyboard index 0.
@@ -113,13 +119,14 @@ pub fn ext_panel_name_from_id(id: &str) -> Option<&str> {
 /// `PanelDefinition` list both iterate this rather than hand-transcribing the
 /// order twice — a reordering here is now a one-line change both call sites
 /// pick up, instead of a silent drift only a snapshot test would catch.
-pub const FIXED_ACTIVITY_PANEL_IDS: [&str; 6] = [
+pub const FIXED_ACTIVITY_PANEL_IDS: [&str; 7] = [
     PANEL_EXPLORER,
     PANEL_SEARCH,
     PANEL_DEBUG,
     PANEL_GIT,
     PANEL_EXTENSIONS,
     PANEL_AI,
+    PANEL_BOARD,
 ];
 
 /// Title/tooltip pair the engine's own "shadow" `AppShell` (see
@@ -139,6 +146,7 @@ fn fixed_panel_title_tooltip(id: &str) -> (&'static str, &'static str) {
         PANEL_GIT => ("SOURCE CONTROL", "Source Control"),
         PANEL_EXTENSIONS => ("EXTENSIONS", "Extensions"),
         PANEL_AI => ("AI", "AI"),
+        PANEL_BOARD => ("BOARD", "Board"),
         PANEL_SETTINGS => ("SETTINGS", "Settings"),
         _ => unreachable!("fixed_panel_title_tooltip called with a non-fixed panel id: {id:?}"),
     }
@@ -281,6 +289,12 @@ impl Engine {
                 }
             }
             PANEL_AI => self.ai_has_focus = true,
+            PANEL_BOARD => {
+                self.board_has_focus = true;
+                if self.board_model.is_none() && !self.board_fetching {
+                    self.board_refresh();
+                }
+            }
             PANEL_SETTINGS => self.settings_has_focus = true,
             _ => {}
         }

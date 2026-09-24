@@ -143,6 +143,7 @@ pub(super) fn render_sidebar_content(
         // #635 (Stage 6b item C): AI is no longer deferred — `render_ai_sidebar`
         // dropped its `buf: &mut Buffer` parameter for `&mut dyn Backend`.
         Some(PANEL_AI) => render_ai_sidebar(backend, area, engine, theme),
+        Some(PANEL_BOARD) => render_board_panel(backend, screen, area, engine, theme),
         _ => render_explorer_sidebar_content(backend, area, engine, theme),
     }
 }
@@ -1010,6 +1011,46 @@ pub(super) fn render_ai_sidebar(
     render::paint_ai_command_completions(backend, engine, q_area);
 }
 
+// ─── Board panel (#521) ─────────────────────────────────────────────────────
+
+/// Render the Board panel — a generic host for the shared `quadraui::Board`
+/// component. Per the Platform-Neutrality Rule, the *only* TUI-specific code
+/// here is picking the rect and calling `Backend::draw_board`/
+/// `Backend::draw_status_bar`; GTK's `App::paint_sidebar_panel_rung`
+/// `PANEL_BOARD` arm makes the identical pair of calls.
+pub(super) fn render_board_panel(
+    backend: &mut dyn quadraui::Backend,
+    screen: &render::ScreenLayout,
+    area: Rect,
+    engine: &Engine,
+    theme: &Theme,
+) {
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+    let Some(ref board) = screen.board else {
+        return;
+    };
+    let q_area = quadraui::Rect::new(
+        area.x as f32,
+        area.y as f32,
+        area.width as f32,
+        area.height as f32,
+    );
+    backend.set_theme(super::quadraui_tui::q_theme(theme));
+    if let Some(ref model) = board.model {
+        let layout = backend.draw_board(q_area, model);
+        engine.board_layout.replace(Some(layout));
+    } else {
+        engine.board_layout.replace(None);
+        if let Some(ref status) = board.status {
+            let bar = render::board_status_bar(status, theme);
+            let row = quadraui::Rect::new(q_area.x, q_area.y, q_area.width, 1.0);
+            let _ = backend.draw_status_bar(row, &bar, None, None);
+        }
+    }
+}
+
 // ─── Debug sidebar panel ──────────────────────────────────────────────────────
 
 /// Render the debug sidebar: header + run button + 4 sections (Variables, Watch, Call Stack, Breakpoints).
@@ -1293,10 +1334,10 @@ mod sc_panel_tests {
 // selection index that moves correctly but paints on the wrong icon (the
 // #587/#592 failure mode: state populated, nothing painted) still fails here.
 //
-// The ring's ordering is the thing under test: hamburger, the six fixed
+// The ring's ordering is the thing under test: hamburger, the seven fixed
 // panels, the dynamic extension panels spliced in *before* Settings, and
 // Settings pinned last — while the legacy `activity_bar_selected` index space
-// numbers Settings at 7 and extension panels at 8+. Before #536 that mismatch
+// numbers Settings at 8 and extension panels at 9+. Before #536 that mismatch
 // was reconciled by a hand-rolled `if sel < 6 { … } else if sel == 6 && …`
 // chain in `core::engine::sidebar`; it is now `AppShell`'s cursor.
 #[cfg(test)]
@@ -1380,7 +1421,7 @@ mod activity_bar_keyboard_ring_tests {
         let (hamburger_row, _) = painted_ring(&e).expect("focusing the bar must paint a ring");
         assert_eq!(hamburger_row, 0, "index 0 is the hamburger, the top row");
 
-        for expected_row in 1..=6 {
+        for expected_row in 1..=7 {
             e.activity_bar_move_down();
             let (row, _) = painted_ring(&e).expect("ring must stay painted while stepping");
             assert_eq!(
@@ -1392,14 +1433,14 @@ mod activity_bar_keyboard_ring_tests {
         }
     }
 
-    /// With no extension panels, `j` past the last fixed panel (AI) lands on
-    /// Settings — which paints *pinned to the bottom edge*, not on row 7 — and
-    /// saturates there. `k` comes straight back to AI.
+    /// With no extension panels, `j` past the last fixed panel (Board, #521)
+    /// lands on Settings — which paints *pinned to the bottom edge*, not on
+    /// row 8 — and saturates there. `k` comes straight back to Board.
     #[test]
-    fn ring_steps_from_ai_to_bottom_pinned_settings_and_saturates() {
+    fn ring_steps_from_board_to_bottom_pinned_settings_and_saturates() {
         let mut e = ring_engine();
-        e.activity_bar_focus_in_at(6); // AI, the last fixed panel
-        assert_eq!(painted_ring(&e).map(|(r, _)| r), Some(6));
+        e.activity_bar_focus_in_at(7); // Board, the last fixed panel
+        assert_eq!(painted_ring(&e).map(|(r, _)| r), Some(7));
 
         e.activity_bar_move_down();
         assert_eq!(
@@ -1407,7 +1448,7 @@ mod activity_bar_keyboard_ring_tests {
             Some(BAR_H - 1),
             "Settings is bottom-pinned, so the ring must jump to the last row"
         );
-        assert_eq!(e.activity_bar_selected, 7, "Settings is toolbar index 7");
+        assert_eq!(e.activity_bar_selected, 8, "Settings is toolbar index 8");
 
         e.activity_bar_move_down();
         assert_eq!(
@@ -1419,8 +1460,8 @@ mod activity_bar_keyboard_ring_tests {
         e.activity_bar_move_up();
         assert_eq!(
             painted_ring(&e).map(|(r, _)| r),
-            Some(6),
-            "k from Settings with no extension panels returns to AI"
+            Some(7),
+            "k from Settings with no extension panels returns to Board"
         );
     }
 
@@ -1434,32 +1475,33 @@ mod activity_bar_keyboard_ring_tests {
         assert_eq!(e.activity_bar_selected, 0);
     }
 
-    /// The headline ordering claim: extension panels splice in **between** AI
-    /// and Settings in painted order (sorted by name), even though the legacy
-    /// index space numbers them *after* Settings. Walking `j` from AI must
-    /// visit both extension icons and only then reach Settings.
+    /// The headline ordering claim: extension panels splice in **between**
+    /// Board (#521) and Settings in painted order (sorted by name), even
+    /// though the legacy index space numbers them *after* Settings. Walking
+    /// `j` from Board must visit both extension icons and only then reach
+    /// Settings.
     #[test]
-    fn ring_splices_extension_panels_between_ai_and_settings() {
+    fn ring_splices_extension_panels_between_board_and_settings() {
         let mut e = ring_engine();
         add_ext(&mut e, "zz-last", 'Z');
         add_ext(&mut e, "aa-first", 'A');
-        e.activity_bar_focus_in_at(6); // AI
+        e.activity_bar_focus_in_at(7); // Board
 
         e.activity_bar_move_down();
         assert_eq!(
             painted_ring(&e),
-            Some((7, 'A')),
-            "j from AI must land on the first extension panel (sorted by name)"
+            Some((8, 'A')),
+            "j from Board must land on the first extension panel (sorted by name)"
         );
-        assert_eq!(e.activity_bar_selected, 8, "…which is toolbar index 8");
+        assert_eq!(e.activity_bar_selected, 9, "…which is toolbar index 9");
 
         e.activity_bar_move_down();
         assert_eq!(
             painted_ring(&e),
-            Some((8, 'Z')),
+            Some((9, 'Z')),
             "j must then land on the second extension panel"
         );
-        assert_eq!(e.activity_bar_selected, 9);
+        assert_eq!(e.activity_bar_selected, 10);
 
         e.activity_bar_move_down();
         assert_eq!(
@@ -1467,23 +1509,23 @@ mod activity_bar_keyboard_ring_tests {
             Some(BAR_H - 1),
             "only after the last extension panel does j reach bottom-pinned Settings"
         );
-        assert_eq!(e.activity_bar_selected, 7);
+        assert_eq!(e.activity_bar_selected, 8);
 
         // …and `k` from Settings walks back onto the *last* extension panel.
         e.activity_bar_move_up();
-        assert_eq!(painted_ring(&e), Some((8, 'Z')));
-        assert_eq!(e.activity_bar_selected, 9);
+        assert_eq!(painted_ring(&e), Some((9, 'Z')));
+        assert_eq!(e.activity_bar_selected, 10);
 
         e.activity_bar_move_up();
-        assert_eq!(painted_ring(&e), Some((7, 'A')));
+        assert_eq!(painted_ring(&e), Some((8, 'A')));
 
         e.activity_bar_move_up();
         assert_eq!(
             painted_ring(&e).map(|(r, _)| r),
-            Some(6),
-            "k off the first extension panel returns to AI, not to Settings"
+            Some(7),
+            "k off the first extension panel returns to Board, not to Settings"
         );
-        assert_eq!(e.activity_bar_selected, 6);
+        assert_eq!(e.activity_bar_selected, 7);
     }
 
     /// A selection left pointing at an extension panel that has since been
@@ -1495,7 +1537,7 @@ mod activity_bar_keyboard_ring_tests {
     fn ring_recovers_from_a_stale_extension_index() {
         let mut e = ring_engine();
         add_ext(&mut e, "only-one", 'O');
-        e.activity_bar_focus_in_at(9); // second ext panel — no longer exists
+        e.activity_bar_focus_in_at(10); // second ext panel — no longer exists
         assert_eq!(
             painted_ring(&e),
             None,
@@ -1504,9 +1546,9 @@ mod activity_bar_keyboard_ring_tests {
 
         e.activity_bar_move_up();
         assert_eq!(
-            e.activity_bar_selected, 8,
+            e.activity_bar_selected, 9,
             "k must recover onto the one extension panel that does exist"
         );
-        assert_eq!(painted_ring(&e).map(|(r, _)| r), Some(7));
+        assert_eq!(painted_ring(&e).map(|(r, _)| r), Some(8));
     }
 }

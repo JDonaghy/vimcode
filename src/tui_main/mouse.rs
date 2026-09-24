@@ -2132,6 +2132,15 @@ pub(super) fn handle_mouse(
                 let rect = engine.settings_form_rect.get();
                 render::handle_settings_form_ui_event(engine, &click_ev, rect);
             }
+        } else if owner == render::SidebarOwner::Board {
+            // #521: `render::route_board_click` resolves the press against
+            // the `quadraui::BoardLayout` cached at paint time
+            // (`Engine::board_layout`) — the same "paint caches, click
+            // reads" dispatch GTK's `App::route_board_sidebar_event` calls.
+            sidebar.has_focus = true;
+            engine.board_has_focus = true;
+            let pos = quadraui::Point::new(col as f32, row as f32);
+            render::route_board_click(engine, pos, is_double_click);
         }
         return sidebar_width;
     }

@@ -752,6 +752,79 @@ field and `tool_client.rs`/`fetch_board_model` are not yet called from the engin
 backend, so per CLAUDE.md's black-box-coverage rule no driver test is added — there is no
 engine/GTK/TUI codepath yet for one to exercise.
 
+## #521 — Track A Phase 0: generic Board activity panel (read-only)
+
+Builds on #522's seam. New activity-bar entry **Board** (`PANEL_BOARD =
+"panel:board"`), appended to `sidebar::FIXED_ACTIVITY_PANEL_IDS` (now 7 —
+Explorer/Search/Debug/Git/Extensions/AI/Board), so `TOOLBAR_IDX_SETTINGS`
+shifted 7→8 and `TOOLBAR_IDX_EXT_BASE` 8→9; every hand-written test that
+hardcoded the old numbers (activity-bar keyboard-ring tests in
+`tui_main/panels.rs`, the GTK "click the first ext-panel icon" test in
+`gtk/testing.rs`, `test_ext_panel_h_focuses_activity_bar`/`_left_...` in
+`core/engine/tests.rs`, and a stale hand-rolled `8 + idx` in
+`core/engine/ext_panel.rs` that should have been reading
+`TOOLBAR_IDX_EXT_BASE` all along) needed a one-line bump — all caught by
+running the full `sidebar`/`activity`/`ext_panel` test scopes, not just the
+new tests.
+
+**`src/core/engine/board_ops.rs`** (new): `Engine::board_provider()` finds
+the first installed extension manifest with `[board]` set (`ext_installed_
+manifests()`, #522's `BoardProviderConfig`) — no coordinator (or other
+specific provider) vocabulary anywhere, enforced by the existing
+`no_coord_vocabulary_in_core` test. `board_refresh()`/`poll_board()` follow
+the established `ext_refresh`/`poll_ext_registry` background-thread +
+`mpsc` pattern, wired into `poll_idle` alongside a new `tick_board()` that
+refreshes on the provider's declared `poll_interval_secs` while the Board
+panel is active. `apply_board_action()` handles Phase 0's read-only subset
+of `quadraui::BoardAction` (`SelectCard`, `MoveSelection`, `JumpToTop/
+Bottom`, `OpenIssue` → a status-bar message) — `Dispatch`/`RecordTest`/
+`Merge`/etc. are #523. New `Engine` fields: `board_model`, `board_error`,
+`board_has_focus`, `board_fetching`, `board_rx`, `board_last_refresh`,
+`board_layout` (paint-time `quadraui::BoardLayout` cache for click
+hit-testing, same contract as `ext_panel_tree_layout`), and a
+test-swappable `board_client: Arc<dyn ToolClient>`.
+
+**`src/render.rs`**: new `BoardData` view model (`has_focus`, `model`,
+`status`) and `ScreenLayout.board`, built by `build_board_data` (always
+`Some`, mirroring `ExtSidebarData`'s doc). `SidebarOwner::Board` +
+`FocusKeyRoute::Board` slot into the existing shared routers
+(`sidebar_owner`, `route_focus_key`, `dispatch_sidebar_panel_key`) —
+`Engine::dispatch_board_key_unified` is the "unified key dispatch" every
+other panel already has. `route_board_click` resolves a press against the
+cached `BoardLayout` (`BoardLayout::hit_test`) — the same "paint caches,
+click reads" contract as `route_ext_panel_click`. `board_status_bar` is
+the one-line "no provider configured"/"fetching…"/error banner shown when
+there's no model to render (never painted over a stale-but-good model).
+
+**Backends** — GTK's `App::paint_sidebar_panel_rung` `PANEL_BOARD` arm and
+TUI's new `panels::render_board_panel` each do the *same* two calls:
+`backend.draw_board(rect, model)` (quadraui#638's rasteriser, already
+shipped for both backends at the pinned rev) or `board_status_bar` +
+`draw_status_bar`. No bespoke board-drawing code on either side — the
+Platform-Neutrality Rule holds. Click routing
+(`App::route_board_sidebar_event` / `mouse.rs`'s `SidebarOwner::Board` arm)
+is likewise a 1-line call into `render::route_board_click`.
+
+**Tests**: `board_ops.rs` unit tests (mock-provider fetch success/error,
+action application, key dispatch, focus-triggers-refresh) plus black-box
+driver coverage on both backends — TUI (`tui_main/shell_app.rs`,
+`TuiDriver`): paints a mock provider's card + column header, shows the
+"no provider configured" status, and a real click selects a card (asserted
+via the TUI board rasteriser's selected-card background style change,
+since `driver.app()` has no accessor back to `Engine` state — never via
+`Engine::board_model` being populated). GTK (`gtk/testing.rs`,
+`GtkDriver`): same three scenarios, the click one asserting the actual
+`selected_card_id` mutation since GTK's harness *does* keep an
+`Rc<RefCell<Engine>>` handle. All new tests RED-verified by temporarily
+disabling each backend's paint dispatch arm before restoring it. `cargo
+build`/`clippy -D warnings`/`fmt` clean on both feature lanes.
+
+Out of scope (per the issue): provider-dispatch actions (#523), issue
+authoring as markdown buffers (#524), in-editor diff review (#525/#526),
+and the coordinator extension bundle itself (the only place `coord` will
+ever be named) — this ships the generic host only, provable end-to-end
+with a mock provider and zero coordinator code anywhere in the tree.
+
 ## #970 — the two "failing" GTK click-geometry tests are the #926/#933 Darwin font divergence, already documented; no fix needed
 
 #970 reported `gtk::testing::minimap::minimap_click_at_the_middle_scrolls_to_half_the_file`

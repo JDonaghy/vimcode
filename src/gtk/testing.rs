@@ -3723,6 +3723,146 @@ mod sidebar_panel_clicks {
         harness(engine, 1400, 900)
     }
 
+    /// A mock board provider — no coordinator (or any other specific
+    /// provider) anywhere in this test, per #521's "generic host" scope.
+    /// Installing an extension manifest with `[board]` populated is what
+    /// `Engine::board_provider` looks for (#522's seam).
+    fn install_mock_board_provider(engine: &mut Engine) {
+        let mut manifest = crate::core::extensions::ExtensionManifest {
+            name: "mock-board".to_string(),
+            ..Default::default()
+        };
+        manifest.board = Some(crate::core::extensions::BoardProviderConfig {
+            refresh_command: vec!["mock-provider".to_string()],
+            poll_interval_secs: 30,
+            actions: Default::default(),
+        });
+        engine
+            .extension_state
+            .installed
+            .push(crate::core::session::InstalledExtension {
+                name: manifest.name.clone(),
+                version: String::new(),
+            });
+        engine.ext_registry = Some(vec![manifest]);
+    }
+
+    fn mock_board_model() -> quadraui::BoardModel {
+        quadraui::BoardModel {
+            id: quadraui::WidgetId::new("board"),
+            columns: vec![quadraui::BoardColumn {
+                id: quadraui::WidgetId::new("col:backlog"),
+                title: "Backlog".to_string(),
+                cards: vec![quadraui::BoardCard {
+                    id: quadraui::WidgetId::new("card:1"),
+                    title: "Improve board host".to_string(),
+                    labels: vec![],
+                    badges: vec![],
+                    hint: None,
+                }],
+                scroll_offset: 0,
+            }],
+            selected_card_id: Some(quadraui::WidgetId::new("card:1")),
+            col_scroll_offset: 0,
+        }
+    }
+
+    /// #521 Phase 0 acceptance: selecting Board renders a board sourced from
+    /// a mock provider — proving the generic host works with no coordinator
+    /// present anywhere. Asserts on the *rasterised* card title
+    /// (`Backend::draw_board`'s Cairo/Pango output via `painted_text`), not
+    /// on `Engine::board_model` being populated (#587/#592's lesson: state
+    /// populated is not evidence of paint).
+    #[test]
+    fn board_panel_paints_mock_provider_board() {
+        let mut engine = Engine::new();
+        engine.settings.use_nerd_fonts = Some(false);
+        install_mock_board_provider(&mut engine);
+        engine.board_model = Some(mock_board_model());
+        engine
+            .app_shell
+            .show_panel(&quadraui::WidgetId::new(PANEL_BOARD));
+
+        let h = harness(engine, 1400, 900);
+        assert!(
+            h.driver.screen_contains("Improve board host"),
+            "Board panel should paint the mock provider's card via \
+             Backend::draw_board; painted: {:?}",
+            h.driver.painted_texts()
+        );
+        assert!(
+            h.driver.screen_contains("Backlog"),
+            "the column header should paint too"
+        );
+    }
+
+    /// With no provider configured at all, the generic host says so rather
+    /// than implying a missing coordinator (design doc §7) — and does so
+    /// with zero coordinator (or other provider) code anywhere in `src/gtk/`.
+    #[test]
+    fn board_panel_shows_status_when_no_provider_configured() {
+        let h = panel_harness(PANEL_BOARD);
+        assert!(
+            h.driver.screen_contains("No board provider configured"),
+            "painted: {:?}",
+            h.driver.painted_texts()
+        );
+    }
+
+    /// Clicking a card selects it (#521 Phase 0: "Key/click -> BoardAction;
+    /// only selection/open are handled"). Uses the real
+    /// `quadraui::BoardLayout` cached at paint time
+    /// (`Engine::board_layout`), the same "paint caches, click reads"
+    /// contract every other sidebar panel follows — not a guessed offset.
+    #[test]
+    fn board_panel_click_selects_the_clicked_card() {
+        let mut engine = Engine::new();
+        engine.settings.use_nerd_fonts = Some(false);
+        install_mock_board_provider(&mut engine);
+        let mut model = mock_board_model();
+        model.columns[0].cards.push(quadraui::BoardCard {
+            id: quadraui::WidgetId::new("card:2"),
+            title: "Second card".to_string(),
+            labels: vec![],
+            badges: vec![],
+            hint: None,
+        });
+        model.selected_card_id = Some(quadraui::WidgetId::new("card:1"));
+        engine.board_model = Some(model);
+        engine
+            .app_shell
+            .show_panel(&quadraui::WidgetId::new(PANEL_BOARD));
+
+        let mut h = harness(engine, 1400, 900);
+        let layout = h
+            .engine
+            .borrow()
+            .board_layout
+            .borrow()
+            .clone()
+            .expect("draw_board must have cached a layout for click hit-testing");
+        let card = layout.columns[0]
+            .cards
+            .iter()
+            .find(|c| c.id.as_str() == "card:2")
+            .expect("second card must have a resolved layout");
+        let cx = card.bounds.x + card.bounds.width / 2.0;
+        let cy = card.bounds.y + card.bounds.height / 2.0;
+
+        h.driver.click(cx, cy);
+
+        assert_eq!(
+            h.engine
+                .borrow()
+                .board_model
+                .as_ref()
+                .unwrap()
+                .selected_card_id,
+            Some(quadraui::WidgetId::new("card:2")),
+            "clicking a card must select it"
+        );
+    }
+
     /// Settings: a click on a category row must expand/collapse it.
     ///
     /// The pre-fix path reached the since-retired `Msg::SettingsClick` arm, whose geometry was read
@@ -4559,13 +4699,14 @@ mod sidebar_panel_clicks {
     /// painter and the runner's own hit-test use) puts the newly-registered
     /// ext panel at. GTK's activity bar has no menu-toggle row (unlike
     /// TUI's optional menu bar, GTK's is always the CSD title bar), so the
-    /// six fixed top-pinned items — explorer, search, debug, git,
-    /// extensions, ai (`sidebar::FIXED_ACTIVITY_PANEL_IDS`, the same shared
-    /// order both backends' shell config builds from) — occupy indices 0-5
-    /// and the ext panel lands at index 6; found empirically with a probe
-    /// harness clicking each row and checking `ext_panel_active`, since
-    /// this backend has no cached hit-region equivalent to
-    /// `bottom_tab_bar_hits` to read the geometry from directly.
+    /// seven fixed top-pinned items — explorer, search, debug, git,
+    /// extensions, ai, board (`sidebar::FIXED_ACTIVITY_PANEL_IDS`, the same
+    /// shared order both backends' shell config builds from) — occupy
+    /// indices 0-6 and the ext panel lands at index 7; found empirically
+    /// with a probe harness clicking each row and checking
+    /// `ext_panel_active`, since this backend has no cached hit-region
+    /// equivalent to `bottom_tab_bar_hits` to read the geometry from
+    /// directly.
     #[test]
     fn switching_to_a_plugin_panel_clears_stale_marketplace_focus() {
         let mut engine = Engine::new();
@@ -4592,9 +4733,9 @@ mod sidebar_panel_clicks {
         h.driver.render();
         let ab_top = (h.menu_row_rect.get().y + h.menu_row_rect.get().height) as f32;
 
-        // Click the plugin panel's activity-bar icon (index 6 — see doc
+        // Click the plugin panel's activity-bar icon (index 7 — see doc
         // comment above).
-        let y = ab_top + (6.0 + 0.5) * quadraui::gtk::ACTIVITY_ROW_PX as f32;
+        let y = ab_top + (7.0 + 0.5) * quadraui::gtk::ACTIVITY_ROW_PX as f32;
         h.driver.click(20.0, y);
 
         assert_eq!(

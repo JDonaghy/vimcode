@@ -33586,7 +33586,7 @@ fn test_ext_panel_h_focuses_activity_bar() {
             sections: vec![],
         },
     );
-    // Simulate "beta" ext panel being focused (sorted index 1 → toolbar idx 9).
+    // Simulate "beta" ext panel being focused (sorted index 1 → toolbar idx 10).
     engine.ext_panel_has_focus = true;
     engine.ext_panel_active = Some("beta".to_string());
 
@@ -33600,10 +33600,11 @@ fn test_ext_panel_h_focuses_activity_bar() {
         engine.activity_bar_focused,
         "activity_bar_focused should be set"
     );
-    // "beta" is sorted index 1 (["alpha", "beta"]) → toolbar index 9.
+    // "beta" is sorted index 1 (["alpha", "beta"]) → toolbar index 10 (#521
+    // added Board as a 7th fixed panel, moving TOOLBAR_IDX_EXT_BASE 8 -> 9).
     assert_eq!(
-        engine.activity_bar_selected, 9,
-        "toolbar index should be 8 + sorted_idx"
+        engine.activity_bar_selected, 10,
+        "toolbar index should be TOOLBAR_IDX_EXT_BASE + sorted_idx"
     );
 }
 
@@ -33611,7 +33612,7 @@ fn test_ext_panel_h_focuses_activity_bar() {
 fn test_ext_panel_left_focuses_activity_bar() {
     use crate::core::plugin::PanelRegistration;
     let mut engine = Engine::new();
-    // Register one ext panel (sorted index 0 → toolbar idx 8).
+    // Register one ext panel (sorted index 0 → toolbar idx 9).
     engine.ext_panels.insert(
         "mypanel".to_string(),
         PanelRegistration {
@@ -33629,7 +33630,7 @@ fn test_ext_panel_left_focuses_activity_bar() {
 
     assert!(!engine.ext_panel_has_focus);
     assert!(engine.activity_bar_focused);
-    assert_eq!(engine.activity_bar_selected, 8);
+    assert_eq!(engine.activity_bar_selected, 9);
 }
 
 // --- #1088: ext panel reveal-by-id match rule ---
