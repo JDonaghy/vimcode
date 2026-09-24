@@ -5924,6 +5924,29 @@ second line here
         );
     }
 
+    /// #1374 (review round 1): see `core::engine::acp_ops::tests::
+    /// ensure_no_zsh_newuser_wizard`'s doc comment for the full rationale —
+    /// same helper, duplicated here rather than shared because
+    /// `core::engine::acp_ops` is a private module (its `mod acp_ops;`
+    /// declaration in `engine/mod.rs` has no `pub(crate)`), so nothing
+    /// outside `core::engine` can name a path through it regardless of the
+    /// visibility of items inside. Kept intentionally tiny and duplicated
+    /// rather than widening that module's visibility just for test
+    /// plumbing.
+    #[cfg(unix)]
+    fn ensure_no_zsh_newuser_wizard() {
+        static INIT: std::sync::Once = std::sync::Once::new();
+        INIT.call_once(|| {
+            let dir = std::env::temp_dir()
+                .join(format!("vimcode_test_zdotdir_gtk_{}", std::process::id()));
+            let _ = std::fs::create_dir_all(&dir);
+            for name in [".zshenv", ".zprofile", ".zshrc", ".zlogin"] {
+                let _ = std::fs::write(dir.join(name), "");
+            }
+            std::env::set_var("ZDOTDIR", &dir);
+        });
+    }
+
     /// #957 (ACP-6) acceptance: "choosing [the terminal method] launches
     /// the interactive process and completion re-initializes the
     /// session" — GTK's twin of `tui_main::shell_app::tests::
@@ -5971,6 +5994,7 @@ second line here
     #[cfg(unix)]
     #[test]
     fn ai_panel_terminal_auth_choice_opens_visible_login_pane_and_resumes_session() {
+        ensure_no_zsh_newuser_wizard();
         let mut h = panel_harness(PANEL_AI);
         let fixture_path = concat!(
             env!("CARGO_MANIFEST_DIR"),

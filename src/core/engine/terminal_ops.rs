@@ -1450,35 +1450,13 @@ pub fn build_terminal_install_wrapper(
 /// `TerminalSession::exit_code()` straight off the session it just
 /// detected exited, no scratch file needed.
 ///
-/// #1374: the POSIX form is prefixed with a bare `q\n` line ahead of
-/// `command`. On a brand-new account with no zsh startup files
-/// (`~/.zshenv`/`~/.zprofile`/`~/.zshrc`/`~/.zlogin` — a real, if
-/// uncommon, state: a freshly provisioned CI runner account, or a user's
-/// first time opening a terminal at all), interactively spawning zsh
-/// auto-launches its own `zsh-newuser-install` wizard, which reads
-/// exactly one raw keystroke to pick a menu option before anything typed
-/// after it reaches the real shell. Without this prefix, that one
-/// keystroke swallows the first character of `command` itself, so the
-/// wizard rejects it as an invalid choice and aborts to a normal prompt —
-/// but the *rest* of `command` (now missing its first character) lands at
-/// that prompt as a bogus command line instead of running the intended
-/// login command at all, and the outer shell exits with whatever
-/// unrelated status that produced instead of the real login result. `q`
-/// is the wizard's own "Quit and do nothing" option (a verified reference:
-/// empirically reproduced against real zsh 5.9 with a from-scratch
-/// `$HOME`, both with and without this prefix), so this line is swallowed
-/// cleanly when the wizard is showing and is merely a harmless "command
-/// not found" no-op at an ordinary prompt when it isn't — verified against
-/// bash/dash/sh too. PowerShell has no equivalent first-run wizard, so its
-/// branch is unchanged.
-///
 /// Extracted as a pure function, same rationale as
 /// [`build_terminal_install_wrapper`]: testable without a real PTY.
 pub fn build_acp_auth_wrapper(command: &str, is_powershell: bool) -> String {
     if is_powershell {
         format!("{command}\nExit $LASTEXITCODE\n")
     } else {
-        format!("q\n{command}\nexit $?\n")
+        format!("{command}\nexit $?\n")
     }
 }
 
@@ -1594,18 +1572,13 @@ mod tests {
     /// the command — no scratch-file write, no "press Enter" pause — so
     /// the outer shell's own exit status is the login command's exit
     /// status directly.
-    ///
-    /// #1374: the POSIX form is now also prefixed with a bare `q\n` line —
-    /// see `build_acp_auth_wrapper`'s doc comment for why (dismissing
-    /// zsh's `zsh-newuser-install` wizard on a from-scratch `$HOME` without
-    /// swallowing the first character of the real command).
     #[test]
     fn acp_auth_wrapper_posix_ends_with_bare_exit_of_command_status() {
         let script = build_acp_auth_wrapper("sh login.sh", false);
         assert_eq!(
-            script, "q\nsh login.sh\nexit $?\n",
-            "POSIX ACP auth wrapper must be a leading `q` line, then the \
-             command, then `exit $?`, nothing else; got:\n{script}"
+            script, "sh login.sh\nexit $?\n",
+            "POSIX ACP auth wrapper must be exactly the command followed by \
+             `exit $?`, nothing else; got:\n{script}"
         );
     }
 
@@ -1615,9 +1588,7 @@ mod tests {
         assert_eq!(
             script, "sh login.sh\nExit $LASTEXITCODE\n",
             "PowerShell ACP auth wrapper must be exactly the command \
-             followed by `Exit $LASTEXITCODE`, nothing else — no `q` \
-             prefix, since PowerShell has no equivalent first-run wizard; \
-             got:\n{script}"
+             followed by `Exit $LASTEXITCODE`, nothing else; got:\n{script}"
         );
     }
 
