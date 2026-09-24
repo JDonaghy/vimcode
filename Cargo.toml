@@ -253,8 +253,11 @@ notify = { version = "7", default-features = false, features = ["macos_kqueue"] 
 # crates); pinned here as direct deps since `tool_acquire.rs` uses them
 # itself. `tar` and `zip` are new — `zip`'s default features pull in every
 # supported compression method (bzip2/zstd/lzma); extension archives only
-# ever use plain DEFLATE, so this trims to `deflate` only, no C dependency
-# beyond what deflate already needs.
+# ever use plain DEFLATE, so this trims to `deflate` only. That avoids a C
+# dependency beyond what deflate already needs (bzip2/zstd/lzma each pull
+# their own), but doesn't trim `zip`'s dependency tree overall — `zopfli`,
+# `arbitrary`/`derive_arbitrary` and `displaydoc` are unconditional deps of
+# `zip` 2.x regardless of enabled features (confirmed in `Cargo.lock`).
 sha2 = "0.10"
 flate2 = "1"
 tar = "0.4"

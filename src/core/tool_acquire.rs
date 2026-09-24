@@ -442,6 +442,56 @@ fn http_get_bytes(url: &str, timeout_secs: u32) -> Result<Vec<u8>, AcquireError>
     Ok(output.stdout)
 }
 
+/// Reject any download URL that isn't `https://` (or, for the test suite
+/// and the `#[ignore]`d live smoke test's own fixtures, `file://`). A pure,
+/// network-free check so it's independently unit-testable (review finding
+/// on #1345 — the acceptance criteria say "Download over https only", and
+/// neither `resolve_url_template` nor the old inline check in
+/// `install_resolved_asset` enforced it): a manifest (or a compromised/
+/// typo'd registry entry) declaring a plain `http://` URL is rejected here
+/// rather than fetched in the clear, for every acquire kind
+/// (`hashicorp-release`, `github-release`, `url-template` all funnel
+/// through `install_resolved_asset`, so this is the one choke point that
+/// covers all three).
+fn validate_download_url(url: &str) -> Result<(), AcquireError> {
+    if url.starts_with("https://") || url.starts_with("file://") {
+        Ok(())
+    } else {
+        Err(AcquireError::BadConfig(format!(
+            "refusing to download over a non-https URL: {url}"
+        )))
+    }
+}
+
+/// Download the resolved asset archive to `dest`. Deliberately its own
+/// `curl` invocation rather than reusing `registry::download_script`
+/// (review finding on #1345): that helper omits `-L`, and a GitHub release
+/// asset's `browser_download_url` is well known to 302-redirect through
+/// `objects.githubusercontent.com` — without `-L`, `curl -f` doesn't treat
+/// the redirect as an error, so the "download" can silently succeed while
+/// writing a near-empty/HTML body instead of the real archive. `-sfL`
+/// matches the flag set `http_get_bytes` above already uses for the JSON
+/// API calls in this module. `file://` URLs (used by this module's own
+/// tests, see the `tests` block below) are unaffected by `-L`.
+fn download_asset(url: &str, dest: &Path) -> Result<(), AcquireError> {
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let status = crate::core::git::hidden_command("curl")
+        .args(["-sfL", "--max-time", "120", "-o"])
+        .arg(dest)
+        .arg(url)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map_err(|e| AcquireError::Network(e.to_string()))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(AcquireError::Http(format!("curl failed to download {url}")))
+    }
+}
+
 /// Field names below (`url_shasums`, no per-build `filename`) were
 /// confirmed against the live API
 /// (`https://api.releases.hashicorp.com/v1/releases/terraform-ls/latest`)
@@ -656,13 +706,25 @@ fn install_resolved_asset(
     asset: &ResolvedAsset,
     binary_path: &str,
 ) -> Result<PathBuf, AcquireError> {
-    let tmp_dir = std::env::temp_dir().join(format!(
-        "vimcode-acquire-{tool_name}-{}-{}",
+    if !is_safe_relative_path(tool_name) || tool_name.is_empty() {
+        return Err(AcquireError::PathTraversal(tool_name.to_string()));
+    }
+    if !is_safe_relative_path(&asset.version) || asset.version.is_empty() {
+        return Err(AcquireError::PathTraversal(asset.version.clone()));
+    }
+    validate_download_url(&asset.url)?;
+
+    // Download + extract scratch space: a plain system temp dir is fine
+    // here because nothing under it is ever `rename`d across a filesystem
+    // boundary — only the *staging* directory below (built inside the
+    // managed tools tree itself) is.
+    let dl_tmp_dir = std::env::temp_dir().join(format!(
+        "vimcode-acquire-dl-{tool_name}-{}-{}",
         std::process::id(),
         unique_suffix()
     ));
-    std::fs::create_dir_all(&tmp_dir)?;
-    let cleanup = |dir: &Path| {
+    std::fs::create_dir_all(&dl_tmp_dir)?;
+    let cleanup_dl = |dir: &Path| {
         let _ = std::fs::remove_dir_all(dir);
     };
 
@@ -672,15 +734,15 @@ fn install_resolved_asset(
         .next()
         .filter(|s| !s.is_empty())
         .unwrap_or("download");
-    let archive_path = tmp_dir.join(archive_name);
-    if let Err(e) = super::registry::download_script(&asset.url, &archive_path) {
-        cleanup(&tmp_dir);
-        return Err(AcquireError::Http(e.to_string()));
+    let archive_path = dl_tmp_dir.join(archive_name);
+    if let Err(e) = download_asset(&asset.url, &archive_path) {
+        cleanup_dl(&dl_tmp_dir);
+        return Err(e);
     }
 
     if let Some(expected) = &asset.sha256 {
         if let Err(e) = verify_sha256(&archive_path, expected) {
-            cleanup(&tmp_dir);
+            cleanup_dl(&dl_tmp_dir);
             return Err(e);
         }
     }
@@ -690,28 +752,88 @@ fn install_resolved_asset(
         .map(|f| f.to_string_lossy().to_string())
         .unwrap_or_else(|| tool_name.to_string());
 
-    let stage_dir = tmp_dir.join("install");
-    std::fs::create_dir_all(&stage_dir)?;
+    // Stage the unpacked binary *inside the managed tools tree* rather than
+    // under the system temp dir (review finding on #1345): staging under
+    // `std::env::temp_dir()` and then `rename`-ing into
+    // `managed_tool_version_dir` fails with `EXDEV` whenever `/tmp` and the
+    // data dir are on different filesystems/mounts — a common layout
+    // (tmpfs `/tmp`, or a separate `/home` partition on many distros).
+    // Staging as a sibling of the final version dir under the same tool
+    // directory guarantees the swap-in `rename` is same-filesystem;
+    // `rename_or_copy` below still falls back to copy+remove for the rare
+    // case (e.g. a read-only bind mount split across the tool dir) where it
+    // somehow isn't.
+    let tool_dir = super::paths::managed_tool_dir(tool_name);
+    std::fs::create_dir_all(&tool_dir)?;
+    let stage_dir = tool_dir.join(format!(
+        ".tmp-{}-{}-{}",
+        asset.version,
+        std::process::id(),
+        unique_suffix()
+    ));
+    let cleanup_stage = |dir: &Path| {
+        let _ = std::fs::remove_dir_all(dir);
+    };
+    if let Err(e) = std::fs::create_dir_all(&stage_dir) {
+        cleanup_dl(&dl_tmp_dir);
+        return Err(e.into());
+    }
     let staged_binary = stage_dir.join(&extracted_name);
     if let Err(e) = extract_binary_from_archive(&archive_path, binary_path, &staged_binary) {
-        cleanup(&tmp_dir);
+        cleanup_stage(&stage_dir);
+        cleanup_dl(&dl_tmp_dir);
         return Err(e);
     }
+    cleanup_dl(&dl_tmp_dir);
 
-    // Atomic install: the whole version directory is built in a temp
-    // location, then a single `rename` swaps it into place.
+    // Atomic install: the whole version directory is built in a staging
+    // location alongside it, then a single `rename` (or copy+remove
+    // fallback) swaps it into place.
     let version_dir = super::paths::managed_tool_version_dir(tool_name, &asset.version);
-    if let Some(parent) = version_dir.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
     if version_dir.exists() {
         std::fs::remove_dir_all(&version_dir)?;
     }
-    std::fs::rename(&stage_dir, &version_dir)?;
-    cleanup(&tmp_dir);
+    if let Err(e) = rename_or_copy(&stage_dir, &version_dir) {
+        cleanup_stage(&stage_dir);
+        return Err(e.into());
+    }
 
     super::paths::set_managed_tool_current(tool_name, &asset.version)?;
     Ok(version_dir.join(&extracted_name))
+}
+
+/// Move `src` to `dst` via `rename`, falling back to a recursive copy +
+/// `remove_dir_all` of `src` when `rename` fails (e.g. `EXDEV` if `src` and
+/// `dst` somehow end up on different filesystems despite `src` being staged
+/// as a sibling of `dst`— a read-only bind mount split across the tool
+/// directory, for instance). `install_resolved_asset` always stages `src`
+/// under the same parent directory as `dst`, so the fallback path is
+/// defense in depth rather than the common case.
+fn rename_or_copy(src: &Path, dst: &Path) -> std::io::Result<()> {
+    if std::fs::rename(src, dst).is_ok() {
+        return Ok(());
+    }
+    copy_dir_recursive(src, dst)?;
+    std::fs::remove_dir_all(src)
+}
+
+fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        let dest_path = dst.join(entry.file_name());
+        if file_type.is_dir() {
+            copy_dir_recursive(&entry.path(), &dest_path)?;
+        } else {
+            // `fs::copy` already preserves the source file's permission
+            // bits (including the executable bit `set_executable` set
+            // during extraction) on every platform where that concept
+            // exists, so no separate `set_permissions` call is needed here.
+            std::fs::copy(entry.path(), &dest_path)?;
+        }
+    }
+    Ok(())
 }
 
 /// Cheap per-call uniqueness for the scratch dir name — `std::process::id()`
@@ -1072,8 +1194,12 @@ cafebabe00000000000000000000000000000000000000000000000000000000  terraform-ls_0
     // github-release branches actually need the network, and those are
     // covered instead by the `#[ignore]`d live smoke test in
     // `tests/extensions.rs`.
-
-    static DATA_HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    //
+    // Locking: uses `paths::VIMCODE_TEST_DATA_HOME_LOCK` rather than a
+    // module-local mutex — see that lock's doc comment for why every test
+    // anywhere in the crate that mutates `VIMCODE_TEST_DATA_HOME` must
+    // share one lock, not one per module.
+    use super::super::paths::VIMCODE_TEST_DATA_HOME_LOCK as DATA_HOME_LOCK;
 
     struct DataHomeGuard {
         old: Option<std::ffi::OsString>,
@@ -1186,4 +1312,142 @@ cafebabe00000000000000000000000000000000000000000000000000000000  terraform-ls_0
 
         let _ = std::fs::remove_dir_all(&fixture_dir);
     }
+
+    // ── https-only enforcement (review finding on #1345) ───────────────
+
+    #[test]
+    fn install_resolved_asset_rejects_plain_http_url() {
+        let _lock = DATA_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = DataHomeGuard::new("http_rejected");
+
+        let asset = ResolvedAsset {
+            url: "http://example.com/terraform-ls.zip".to_string(),
+            version: "1.2.3".to_string(),
+            sha256: None,
+        };
+        let err = install_resolved_asset("terraform-ls", &asset, "terraform-ls").unwrap_err();
+        assert!(
+            matches!(err, AcquireError::BadConfig(_)),
+            "expected a BadConfig rejection for a non-https URL, got {err:?}"
+        );
+        // Never even attempted a download: no version dir, no `current` pointer.
+        assert_eq!(
+            super::super::paths::managed_tool_current_version("terraform-ls"),
+            None
+        );
+        assert!(!super::super::paths::managed_tool_version_dir("terraform-ls", "1.2.3").exists());
+    }
+
+    #[test]
+    fn validate_download_url_accepts_https_and_file_rejects_others() {
+        // Pure, network-free check (review finding on #1345) — exercised
+        // directly rather than through `install_resolved_asset`, which
+        // would otherwise need a real network call for any URL that gets
+        // past the scheme check.
+        assert!(validate_download_url("https://example.com/tool.zip").is_ok());
+        assert!(validate_download_url("file:///tmp/tool.zip").is_ok());
+        for bad in [
+            "http://example.com/tool.zip",
+            "ftp://example.com/tool.zip",
+            "example.com/tool.zip",
+            "",
+        ] {
+            let err = validate_download_url(bad).unwrap_err();
+            assert!(
+                matches!(err, AcquireError::BadConfig(_)),
+                "expected {bad:?} to be rejected as BadConfig, got {err:?}"
+            );
+        }
+    }
+
+    // ── path-traversal guard on `tool_name`/`version` (review finding) ──
+
+    #[test]
+    fn install_resolved_asset_rejects_traversal_in_version() {
+        let _lock = DATA_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = DataHomeGuard::new("traversal_version");
+
+        let asset = ResolvedAsset {
+            url: "https://example.com/terraform-ls.zip".to_string(),
+            version: "../../../etc".to_string(),
+            sha256: None,
+        };
+        let err = install_resolved_asset("terraform-ls", &asset, "terraform-ls").unwrap_err();
+        assert!(matches!(err, AcquireError::PathTraversal(_)));
+    }
+
+    #[test]
+    fn install_resolved_asset_rejects_traversal_in_tool_name() {
+        let _lock = DATA_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = DataHomeGuard::new("traversal_tool_name");
+
+        let asset = ResolvedAsset {
+            url: "https://example.com/terraform-ls.zip".to_string(),
+            version: "1.2.3".to_string(),
+            sha256: None,
+        };
+        let err = install_resolved_asset("../../etc", &asset, "terraform-ls").unwrap_err();
+        assert!(matches!(err, AcquireError::PathTraversal(_)));
+    }
+
+    // ── atomic-install staging (EXDEV review finding) ────────────────────
+
+    #[test]
+    fn copy_dir_recursive_copies_nested_files_and_dirs() {
+        let root = std::env::temp_dir().join(format!("vimcode_test_copy_dir_{}", unique_suffix()));
+        let src = root.join("src");
+        let dst = root.join("dst");
+        std::fs::create_dir_all(src.join("nested")).unwrap();
+        std::fs::write(src.join("top.txt"), b"top").unwrap();
+        std::fs::write(src.join("nested").join("inner.txt"), b"inner").unwrap();
+
+        copy_dir_recursive(&src, &dst).unwrap();
+
+        assert_eq!(std::fs::read(dst.join("top.txt")).unwrap(), b"top");
+        assert_eq!(
+            std::fs::read(dst.join("nested").join("inner.txt")).unwrap(),
+            b"inner"
+        );
+        // Source is left untouched — only `rename_or_copy`'s caller decides
+        // whether to remove it.
+        assert!(src.join("top.txt").exists());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rename_or_copy_falls_back_to_copy_when_rename_fails() {
+        // `std::fs::rename` onto a non-empty directory fails on Linux/macOS
+        // (`ENOTEMPTY`) the same way it would for a genuine cross-filesystem
+        // `EXDEV` — both make `rename_or_copy` fall back to
+        // `copy_dir_recursive` + removing `src`. This is the fallback
+        // `install_resolved_asset` leans on if staging next to the version
+        // dir ever still isn't same-filesystem (review finding on #1345).
+        let root =
+            std::env::temp_dir().join(format!("vimcode_test_rename_fallback_{}", unique_suffix()));
+        let src = root.join("src");
+        let dst = root.join("dst");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("payload.bin"), b"payload").unwrap();
+        // Make `dst` non-empty so a plain `rename` is refused.
+        std::fs::create_dir_all(&dst).unwrap();
+        std::fs::write(dst.join("existing.txt"), b"pre-existing").unwrap();
+
+        rename_or_copy(&src, &dst).unwrap();
+
+        assert_eq!(std::fs::read(dst.join("payload.bin")).unwrap(), b"payload");
+        assert!(
+            !src.exists(),
+            "src should be removed after falling back to copy"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── github asset download uses -L (review finding, doc-only note) ───
+    //
+    // `download_asset`'s `-sfL` flags (vs. `registry::download_script`'s
+    // `-sf`) aren't independently unit-testable without a real HTTP
+    // redirect server; covered by inspection — see `download_asset`'s doc
+    // comment for the GitHub redirect scenario this avoids.
 }
