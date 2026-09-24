@@ -35,8 +35,8 @@
 //! - Protocol version is pinned at `1` (a draft v2 restructures capabilities
 //!   and drops `fs/*`/`terminal/*` in favour of MCP-over-ACP).
 //! - Capabilities advertised in `initialize` are **only** what later slices
-//!   actually implement. Omitted means unsupported. This slice advertises
-//!   nothing beyond the mandatory surface (`clientCapabilities: {}`).
+//!   actually implement. Omitted means unsupported. As of #954 (ACP-3) that
+//!   is `fs.readTextFile` and `fs.writeTextFile` — see [`AcpClient::initialize`].
 //! - `terminal/*` is out of scope (optional in v1, removed in the v2 draft).
 //! - No async runtime: everything here is sync threads + `mpsc`, matching
 //!   `lsp.rs`/`dap.rs` and vimcode's <=250ms sync tick.
@@ -287,6 +287,179 @@ pub fn session_update_chunk(update: &serde_json::Value) -> Option<(AcpChunkKind,
         .unwrap_or_default()
         .to_string();
     Some((chunk_kind, text))
+}
+
+// ---------------------------------------------------------------------------
+// fs/read_text_file, fs/write_text_file — wire-shape parsing + path safety
+// (#954, ACP-3)
+// ---------------------------------------------------------------------------
+
+/// A parsed `fs/read_text_file` request: `{sessionId, path, line?, limit?}`
+/// per the ACP v1 schema. `line` is 1-based (matching the wire), `limit` is
+/// a line count — see [`select_text_lines`] for how the two combine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadTextFileParams {
+    pub session_id: String,
+    pub path: String,
+    pub line: Option<u32>,
+    pub limit: Option<u32>,
+}
+
+/// Parse a `fs/read_text_file` request's `params`. Returns `None` for a
+/// malformed request (missing `sessionId` or `path`) — the caller must still
+/// answer such a request with a JSON-RPC error, never silence.
+pub fn parse_read_text_file_params(params: &serde_json::Value) -> Option<ReadTextFileParams> {
+    let session_id = params.get("sessionId")?.as_str()?.to_string();
+    let path = params.get("path")?.as_str()?.to_string();
+    let line = params
+        .get("line")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as u32);
+    let limit = params
+        .get("limit")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as u32);
+    Some(ReadTextFileParams {
+        session_id,
+        path,
+        line,
+        limit,
+    })
+}
+
+/// Build the `result` value for a `fs/read_text_file` reply: `{content}`.
+pub fn read_text_file_result(content: &str) -> serde_json::Value {
+    serde_json::json!({"content": content})
+}
+
+/// Apply `fs/read_text_file`'s optional `line` (1-based start line) /
+/// `limit` (max number of lines to return) to a file's full text content.
+/// Missing `line` starts at the beginning; missing `limit` returns
+/// everything from `line` onward; both missing returns `content` unchanged.
+/// Never panics on an out-of-range `line`/`limit` — clamps instead of
+/// indexing past the end.
+pub fn select_text_lines(content: &str, line: Option<u32>, limit: Option<u32>) -> String {
+    if line.is_none() && limit.is_none() {
+        return content.to_string();
+    }
+    let lines: Vec<&str> = content.split('\n').collect();
+    let start = line
+        .map(|l| l.saturating_sub(1) as usize)
+        .unwrap_or(0)
+        .min(lines.len());
+    let end = match limit {
+        Some(n) => start.saturating_add(n as usize).min(lines.len()),
+        None => lines.len(),
+    };
+    lines[start..end].join("\n")
+}
+
+/// A parsed `fs/write_text_file` request: `{sessionId, path, content}` per
+/// the ACP v1 schema.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WriteTextFileParams {
+    pub session_id: String,
+    pub path: String,
+    pub content: String,
+}
+
+/// Parse a `fs/write_text_file` request's `params`. Returns `None` for a
+/// malformed request (missing `sessionId`, `path`, or `content`).
+pub fn parse_write_text_file_params(params: &serde_json::Value) -> Option<WriteTextFileParams> {
+    let session_id = params.get("sessionId")?.as_str()?.to_string();
+    let path = params.get("path")?.as_str()?.to_string();
+    let content = params.get("content")?.as_str()?.to_string();
+    Some(WriteTextFileParams {
+        session_id,
+        path,
+        content,
+    })
+}
+
+/// Resolve `..`/`.` components purely lexically (no filesystem access) —
+/// the same technique `path-clean`-style crates use. This is the first half
+/// of [`resolve_path_within_roots`]'s traversal defence: a request for
+/// `<cwd>/../../etc/passwd` must not pass a `starts_with(cwd)` check just
+/// because the string happens to start with the right prefix before the
+/// `..` components are accounted for.
+fn lexically_normalize(path: &Path) -> std::path::PathBuf {
+    let mut out = std::path::PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            std::path::Component::CurDir => {}
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// Resolve `path` (absolute, or joined onto `roots[0]` if relative — ACP
+/// paths are supposed to be absolute already, but this is defensive rather
+/// than a panic) and confirm it falls inside one of `roots` (the session
+/// `cwd`, plus any future `additionalDirectories` — see
+/// `Engine::acp_workspace_roots`'s doc for why that list is one entry today).
+///
+/// Two traversal vectors are guarded against: lexical `..` components (via
+/// [`lexically_normalize`]) and a symlink inside an allowed root pointing
+/// outside it (by canonicalizing the nearest existing ancestor and
+/// re-attaching whatever suffix doesn't exist on disk yet — the target of a
+/// `fs/write_text_file` call creating a brand new file, most commonly).
+///
+/// Returns the resolved, safe-to-use path on success, or an error message
+/// naming the offending path on failure — never silently narrows to "no" by
+/// returning a root instead of erroring.
+pub fn resolve_path_within_roots(
+    path: &Path,
+    roots: &[std::path::PathBuf],
+) -> Result<std::path::PathBuf, String> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        roots
+            .first()
+            .cloned()
+            .unwrap_or_else(|| std::path::PathBuf::from("/"))
+            .join(path)
+    };
+    let normalized = lexically_normalize(&absolute);
+
+    let mut base = normalized.clone();
+    let mut suffix: Vec<std::ffi::OsString> = Vec::new();
+    while !base.exists() {
+        match base.file_name().map(|n| n.to_os_string()) {
+            Some(name) => {
+                suffix.push(name);
+                if !base.pop() {
+                    break;
+                }
+            }
+            None => break,
+        }
+    }
+    let canonical_base = base
+        .canonicalize()
+        .map_err(|e| format!("cannot resolve {}: {e}", normalized.display()))?;
+    let mut resolved = canonical_base;
+    for part in suffix.into_iter().rev() {
+        resolved.push(part);
+    }
+
+    let allowed = roots.iter().any(|root| {
+        root.canonicalize()
+            .map(|canonical_root| resolved.starts_with(&canonical_root))
+            .unwrap_or(false)
+    });
+    if allowed {
+        Ok(resolved)
+    } else {
+        Err(format!(
+            "{} is outside the session workspace",
+            resolved.display()
+        ))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -589,15 +762,23 @@ impl AcpClient {
         }
     }
 
-    /// Send the `initialize` request. Advertises no `clientCapabilities`
-    /// beyond the mandatory surface — see the module doc's capability
-    /// negotiation commitment.
+    /// Send the `initialize` request. Advertises `fs.readTextFile` and
+    /// `fs.writeTextFile` (#954, ACP-3) — the only two `clientCapabilities`
+    /// this client implements so far, per the module doc's capability
+    /// negotiation commitment ("omitted means unsupported"). `terminal` is
+    /// deliberately never advertised (out of scope for the whole track — see
+    /// the module doc).
     pub fn initialize(&mut self) -> i64 {
         self.send_request(
             "initialize",
             serde_json::json!({
                 "protocolVersion": PROTOCOL_VERSION,
-                "clientCapabilities": {},
+                "clientCapabilities": {
+                    "fs": {
+                        "readTextFile": true,
+                        "writeTextFile": true,
+                    },
+                },
                 "clientInfo": {
                     "name": "vimcode",
                     "version": env!("CARGO_PKG_VERSION"),
@@ -1170,6 +1351,162 @@ mod tests {
         );
     }
 
+    // ---- fs/read_text_file, fs/write_text_file: pure, no subprocess (#954, ACP-3) ----
+
+    #[test]
+    fn parse_read_text_file_params_reads_path_line_and_limit() {
+        let params = serde_json::json!({
+            "sessionId": "sess-1",
+            "path": "/tmp/x.txt",
+            "line": 3,
+            "limit": 10,
+        });
+        let req = parse_read_text_file_params(&params).expect("should parse");
+        assert_eq!(req.session_id, "sess-1");
+        assert_eq!(req.path, "/tmp/x.txt");
+        assert_eq!(req.line, Some(3));
+        assert_eq!(req.limit, Some(10));
+    }
+
+    #[test]
+    fn parse_read_text_file_params_line_and_limit_are_optional() {
+        let params = serde_json::json!({"sessionId": "s", "path": "/tmp/x.txt"});
+        let req = parse_read_text_file_params(&params).expect("should parse");
+        assert_eq!(req.line, None);
+        assert_eq!(req.limit, None);
+    }
+
+    #[test]
+    fn parse_read_text_file_params_rejects_missing_path_or_session() {
+        assert!(parse_read_text_file_params(&serde_json::json!({"path": "/tmp/x"})).is_none());
+        assert!(parse_read_text_file_params(&serde_json::json!({"sessionId": "s"})).is_none());
+    }
+
+    #[test]
+    fn parse_write_text_file_params_reads_path_and_content() {
+        let params = serde_json::json!({
+            "sessionId": "sess-1",
+            "path": "/tmp/x.txt",
+            "content": "hello\nworld\n",
+        });
+        let req = parse_write_text_file_params(&params).expect("should parse");
+        assert_eq!(req.session_id, "sess-1");
+        assert_eq!(req.path, "/tmp/x.txt");
+        assert_eq!(req.content, "hello\nworld\n");
+    }
+
+    #[test]
+    fn parse_write_text_file_params_rejects_missing_fields() {
+        assert!(parse_write_text_file_params(&serde_json::json!({
+            "sessionId": "s", "path": "/tmp/x",
+        }))
+        .is_none());
+        assert!(parse_write_text_file_params(&serde_json::json!({
+            "sessionId": "s", "content": "c",
+        }))
+        .is_none());
+    }
+
+    #[test]
+    fn read_text_file_result_matches_the_acp_v1_wire_shape() {
+        assert_eq!(
+            read_text_file_result("hello"),
+            serde_json::json!({"content": "hello"})
+        );
+    }
+
+    #[test]
+    fn select_text_lines_returns_everything_when_line_and_limit_are_absent() {
+        let content = "a\nb\nc\n";
+        assert_eq!(select_text_lines(content, None, None), content);
+    }
+
+    #[test]
+    fn select_text_lines_honours_line_and_limit() {
+        let content = "one\ntwo\nthree\nfour\nfive";
+        // 1-based `line: 2` starts at "two".
+        assert_eq!(
+            select_text_lines(content, Some(2), None),
+            "two\nthree\nfour\nfive"
+        );
+        assert_eq!(select_text_lines(content, Some(2), Some(2)), "two\nthree");
+        assert_eq!(select_text_lines(content, None, Some(1)), "one");
+    }
+
+    #[test]
+    fn select_text_lines_clamps_out_of_range_line_and_limit_without_panicking() {
+        let content = "one\ntwo";
+        assert_eq!(select_text_lines(content, Some(100), None), "");
+        assert_eq!(select_text_lines(content, Some(1), Some(100)), "one\ntwo");
+        assert_eq!(select_text_lines(content, Some(0), None), "one\ntwo");
+    }
+
+    #[test]
+    fn resolve_path_within_roots_accepts_a_path_inside_an_existing_root() {
+        let dir = std::env::temp_dir().join(format!("acp3-root-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("existing.txt");
+        std::fs::write(&file, "hi").unwrap();
+
+        let resolved = resolve_path_within_roots(&file, &[dir.clone()])
+            .expect("path inside the root should resolve");
+        assert_eq!(resolved, file.canonicalize().unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_path_within_roots_accepts_a_not_yet_existing_file_inside_the_root() {
+        let dir = std::env::temp_dir().join(format!("acp3-newfile-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("brand-new.txt"); // does not exist yet
+
+        let resolved = resolve_path_within_roots(&file, &[dir.clone()])
+            .expect("a not-yet-existing file inside the root should still resolve");
+        assert_eq!(resolved, dir.canonicalize().unwrap().join("brand-new.txt"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_path_within_roots_rejects_a_path_outside_every_root() {
+        let dir = std::env::temp_dir().join(format!("acp3-outside-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let outside = std::env::temp_dir().join(format!("acp3-elsewhere-{}", std::process::id()));
+        std::fs::create_dir_all(&outside).unwrap();
+        let target = outside.join("secret.txt");
+        std::fs::write(&target, "nope").unwrap();
+
+        let err = resolve_path_within_roots(&target, &[dir.clone()])
+            .expect_err("a path outside the only root must be refused");
+        assert!(
+            err.contains("outside the session workspace"),
+            "error should name the reason: {err:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    /// The traversal case the whole function exists for: a lexical `..`
+    /// escape must not slip past a naive `starts_with(root)` check just
+    /// because the un-normalized string happens to start with the root.
+    #[test]
+    fn resolve_path_within_roots_rejects_dot_dot_traversal_out_of_the_root() {
+        let dir = std::env::temp_dir().join(format!("acp3-traversal-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let escaping = dir.join("..").join(
+            std::env::temp_dir()
+                .file_name()
+                .map(|_| "escaped.txt")
+                .unwrap_or("escaped.txt"),
+        );
+
+        let err = resolve_path_within_roots(&escaping, &[dir.clone()]);
+        assert!(
+            err.is_err(),
+            "`..` must not be able to walk out of the only allowed root: {err:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // ---- Integration: fake NDJSON echo agent subprocess ----
     //
     // `tests/fixtures/fake_acp_agent.sh` is the fixture the whole ACP track
@@ -1352,6 +1689,36 @@ mod tests {
         match &events[0] {
             AcpEvent::PromptStopped { stop_reason, .. } => assert_eq!(stop_reason, "end_turn"),
             other => panic!("expected PromptStopped, got {other:?}"),
+        }
+    }
+
+    /// #954 (ACP-3): the `fs.readTextFile`/`fs.writeTextFile`
+    /// clientCapabilities must actually reach the wire in the `initialize`
+    /// request, not just exist as a `serde_json::json!` literal nobody
+    /// sends. The fixture echoes back whether it saw each flag — see its
+    /// own doc comment — so this is a real round trip through
+    /// `AcpClient::initialize`, not a unit test of JSON construction.
+    #[cfg(unix)]
+    #[test]
+    fn initialize_advertises_fs_capabilities_the_agent_actually_receives() {
+        let mut client = spawn_fixture(&[]);
+        client.initialize();
+        let events = poll_until(&mut client, TEST_DEADLINE);
+        assert_eq!(events.len(), 1, "expected exactly one event: {events:?}");
+        match &events[0] {
+            AcpEvent::Initialized { agent_info, .. } => {
+                assert_eq!(
+                    agent_info["sawReadCap"], true,
+                    "the agent's initialize handler never saw readTextFile:true \
+                     on the wire: {agent_info:?}"
+                );
+                assert_eq!(
+                    agent_info["sawWriteCap"], true,
+                    "the agent's initialize handler never saw writeTextFile:true \
+                     on the wire: {agent_info:?}"
+                );
+            }
+            other => panic!("expected Initialized, got {other:?}"),
         }
     }
 

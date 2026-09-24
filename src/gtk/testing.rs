@@ -4980,6 +4980,92 @@ second line here
              turn resume to completion within 5s"
         );
     }
+
+    /// #954 (ACP-3) acceptance: `fs/read_text_file` must serve an open,
+    /// **dirty** buffer's unsaved in-memory content, not stale on-disk
+    /// text — GTK's twin of `tui_main::shell_app::tests::
+    /// fs_read_text_file_serves_dirty_buffer_content_via_shell_app`. Same
+    /// "poll state, force a repaint, sample the screen" shape
+    /// `ai_panel_streams_acp_thought_and_message_chunks` above uses, since
+    /// `GtkDriver` has no `tick()` of its own.
+    ///
+    /// RED verified the same way as the TUI twin: reverting
+    /// `Engine::acp_read_text_file` to always `std::fs::read_to_string`
+    /// makes this fail — the screen shows `"read:on disk"` instead of
+    /// `"read:DIRTYMARKER123"`.
+    #[cfg(unix)]
+    #[test]
+    fn fs_read_text_file_serves_dirty_buffer_content() {
+        let dir = std::env::temp_dir().join(format!("acp3-gtk-read-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_path = dir.join("dirty.txt");
+        std::fs::write(&file_path, "on disk").unwrap();
+
+        let mut h = panel_harness(PANEL_AI);
+        {
+            let mut engine = h.engine.borrow_mut();
+            engine.workspace_root = Some(dir.clone());
+            let buffer_id = engine
+                .buffer_manager
+                .open_file(&file_path)
+                .expect("should open");
+            {
+                let state = engine.buffer_manager.get_mut(buffer_id).unwrap();
+                let len = state.buffer.content.len_chars();
+                state.buffer.content.remove(0..len);
+                state.buffer.content.insert(0, "DIRTYMARKER123");
+                state.dirty = true;
+            }
+
+            let path_str = file_path.to_string_lossy().into_owned();
+            let argv = vec![
+                "sh".to_string(),
+                concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/tests/fixtures/fake_acp_agent.sh"
+                )
+                .to_string(),
+            ];
+            let cwd = std::env::temp_dir();
+            let mut client = crate::core::acp::AcpClient::spawn_with_env(
+                &argv,
+                &cwd,
+                &[("ACP_FAKE_FS_READ_PATH", path_str.as_str())],
+            )
+            .expect("fixture agent should spawn");
+            client.initialize();
+            engine.acp_client = Some(client);
+            engine.settings.acp_agent_command = "already-spawned-above".to_string();
+        }
+
+        let sb = h.painted_sidebar_bounds.get().unwrap();
+        h.driver.click(sb.x + 20.0, sb.y + 20.0);
+        for c in "please read".chars() {
+            h.driver.type_char(c);
+        }
+        h.driver.ctrl_char('s');
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !h.driver.screen_contains("read:DIRTYMARKER123")
+            && std::time::Instant::now() < deadline
+        {
+            h.engine.borrow_mut().poll_acp();
+            h.driver.render();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        assert!(
+            h.driver.screen_contains("read:DIRTYMARKER123"),
+            "the agent's fs/read_text_file reply must carry the dirty \
+             buffer's unsaved content within 5s"
+        );
+        assert!(
+            !h.driver.screen_contains("read:on disk"),
+            "must never serve stale on-disk content for an open, dirty buffer"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 /// #669: the five editor-anchored popups (completion, LSP hover, editor

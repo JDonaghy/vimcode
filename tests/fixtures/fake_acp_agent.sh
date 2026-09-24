@@ -9,12 +9,17 @@
 # `/bin/sh` with no jq/python/node dependency, deliberately.
 #
 # Scripted behaviour (see src/core/acp.rs's tests for what exercises each):
-#   - initialize        -> canned success result. If $ACP_FAKE_EMIT_GARBAGE
-#                           is set, a non-JSON line is printed to stdout
-#                           immediately before the real response, to prove
-#                           the reader skips it without desyncing. If
-#                           $ACP_FAKE_DIE_AFTER_INIT is set, this process
-#                           exits right after replying.
+#   - initialize        -> canned success result, with agentInfo.sawReadCap /
+#                           .sawWriteCap echoing back whether the request
+#                           actually carried clientCapabilities.fs.
+#                           {readTextFile,writeTextFile}: true (#954, ACP-3)
+#                           — so a test can confirm the capability reached
+#                           the wire, not just the client's own bookkeeping.
+#                           If $ACP_FAKE_EMIT_GARBAGE is set, a non-JSON line
+#                           is printed to stdout immediately before the real
+#                           response, to prove the reader skips it without
+#                           desyncing. If $ACP_FAKE_DIE_AFTER_INIT is set,
+#                           this process exits right after replying.
 #   - session/new        -> canned sessionId "sess-1". If
 #                           $ACP_FAKE_SESSION_NEW_ERROR is set, replies with a
 #                           JSON-RPC error instead (agent stays alive,
@@ -71,7 +76,26 @@
 #                           shape as the well-formed variant, so a test can
 #                           confirm the client answers with a JSON-RPC error
 #                           immediately (never opens a dialog) and that
-#                           reply still reaches this process.
+#                           reply still reaches this process. With
+#                           $ACP_FAKE_FS_READ_PATH set (#954, ACP-3): emits a
+#                           scripted fs/read_text_file request (fixed id
+#                           9010) for that path, BLOCKS for the reply, then
+#                           emits an agent_message_chunk with text
+#                           "read:<content>" — so a test can drive a real
+#                           `path -> reply` round trip through the engine's
+#                           actual buffer-first dispatch (not just the
+#                           transport layer) and assert on what came back,
+#                           by reading the transcript. With
+#                           $ACP_FAKE_FS_WRITE_PATH (and optionally
+#                           $ACP_FAKE_FS_WRITE_CONTENT, default "written by
+#                           acp") set instead: emits a scripted
+#                           fs/write_text_file request (fixed id 9011) for
+#                           that path/content, BLOCKS for the reply, then
+#                           emits an agent_message_chunk with text
+#                           "write:ok" or "write:error:<message>" depending
+#                           on whether the reply was a JSON-RPC error —
+#                           same "drive it for real, read the transcript"
+#                           shape as the read case.
 #   - session/cancel     -> notification, silently acknowledged (no reply).
 #   - anything else      -> logged to stderr, ignored.
 #
@@ -91,7 +115,17 @@ while IFS= read -r line; do
       if [ -n "$ACP_FAKE_EMIT_GARBAGE" ]; then
         echo 'this line is not JSON and must be skipped by the reader'
       fi
-      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentCapabilities":{},"agentInfo":{"name":"fake-acp-agent","version":"0.0.1"},"authMethods":[]}}\n' "$id"
+      # Echo back whether this client's own `initialize` request actually
+      # carried the fs/* clientCapabilities (#954, ACP-3) — a substring
+      # check on the raw request line, not a real JSON parse (this script
+      # stays jq/python/node-free deliberately), so a test can confirm the
+      # capability flags reached the wire instead of trusting the client's
+      # own bookkeeping.
+      saw_read=false
+      saw_write=false
+      case "$line" in *'"readTextFile":true'*) saw_read=true ;; esac
+      case "$line" in *'"writeTextFile":true'*) saw_write=true ;; esac
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentCapabilities":{},"agentInfo":{"name":"fake-acp-agent","version":"0.0.1","sawReadCap":%s,"sawWriteCap":%s},"authMethods":[]}}\n' "$id" "$saw_read" "$saw_write"
       if [ -n "$ACP_FAKE_DIE_AFTER_INIT" ]; then
         exit 7
       fi
@@ -126,6 +160,28 @@ while IFS= read -r line; do
         # there is no "options" array to select from, never opening a
         # dialog first.
         read -r _reply
+        printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id"
+      elif [ -n "$ACP_FAKE_FS_READ_PATH" ]; then
+        printf '{"jsonrpc":"2.0","id":9010,"method":"fs/read_text_file","params":{"sessionId":"sess-1","path":"%s"}}\n' "$ACP_FAKE_FS_READ_PATH"
+        # Park: block until the client answers request 9010 out of band.
+        read -r fsreply
+        content=$(printf '%s' "$fsreply" | sed -n 's/.*"content":"\([^"]*\)".*/\1/p')
+        printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"read:%s"}}}}\n' "$content"
+        printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id"
+      elif [ -n "$ACP_FAKE_FS_WRITE_PATH" ]; then
+        write_content="${ACP_FAKE_FS_WRITE_CONTENT:-written by acp}"
+        printf '{"jsonrpc":"2.0","id":9011,"method":"fs/write_text_file","params":{"sessionId":"sess-1","path":"%s","content":"%s"}}\n' "$ACP_FAKE_FS_WRITE_PATH" "$write_content"
+        # Park: block until the client answers request 9011 out of band.
+        read -r fsreply
+        case "$fsreply" in
+          *'"error"'*)
+            message=$(printf '%s' "$fsreply" | sed -n 's/.*"message":"\([^"]*\)".*/\1/p')
+            printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"write:error:%s"}}}}\n' "$message"
+            ;;
+          *)
+            printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"write:ok"}}}}\n'
+            ;;
+        esac
         printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id"
       else
         printf '{"jsonrpc":"2.0","id":9001,"method":"fs/read_text_file","params":{"sessionId":"sess-1","path":"/tmp/fake.txt"}}\n'

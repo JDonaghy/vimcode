@@ -544,6 +544,43 @@ impl Engine {
         }
     }
 
+    /// Save `buffer_id`'s current content back to its file path, refreshing
+    /// the same secondary state a normal `:w` on the active buffer does
+    /// (git diff, LSP `didSave`, swap-file cleanup, `save`/`BufWrite`
+    /// plugin events) — but parameterized by buffer id instead of assuming
+    /// the active buffer/window, so a background write can drive it without
+    /// switching windows first. Used by ACP's `fs/write_text_file` (#954,
+    /// ACP-3), which must persist to disk on a buffer that may not even be
+    /// the one currently shown.
+    ///
+    /// Deliberately a thin sibling of [`Self::save`] rather than a
+    /// refactor of it: `save()` also handles the keymaps/registries scratch
+    /// buffers and writes into `self.message`, neither of which apply to a
+    /// background write a caller wants to report through its own channel
+    /// (a JSON-RPC error reply, here) instead.
+    pub(crate) fn save_buffer_by_id(&mut self, buffer_id: BufferId) -> Result<(), String> {
+        let path = self
+            .buffer_manager
+            .get(buffer_id)
+            .and_then(|s| s.file_path.clone())
+            .ok_or_else(|| "no file name".to_string())?;
+        let state = self
+            .buffer_manager
+            .get_mut(buffer_id)
+            .ok_or_else(|| "buffer no longer exists".to_string())?;
+        state
+            .save()
+            .map_err(|e| format!("failed to write {}: {e}", path.display()))?;
+        self.refresh_git_diff(buffer_id);
+        self.lsp_did_save(buffer_id);
+        self.swap_delete_for_buffer(buffer_id);
+        self.swap_write_needed.remove(&buffer_id);
+        let path_str = path.to_string_lossy().into_owned();
+        self.plugin_event("save", &path_str);
+        self.plugin_event("BufWrite", &path_str);
+        Ok(())
+    }
+
     /// Check all open buffers for external file modifications.
     ///
     /// For each buffer with a file path, compare the on-disk mtime against the
