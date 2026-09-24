@@ -3547,6 +3547,24 @@ impl ShellApp for TuiShellApp {
         }
         #[allow(deprecated)]
         self.on_shell_event(event);
+        // #1356 (quadraui bump for quadraui#1055): mirrors the identical
+        // GTK fix in `App::on_shell_event_ctx` — a bottom item's click
+        // never moves the *real* `AppShell` on its own (the
+        // `BottomItemClicked` arm above only toggles the engine-side
+        // shadow via `render::apply_activity_panel_switch`); `show_panel`
+        // now accepts a bottom item's id, but an app has to opt in
+        // explicitly from its own `BottomItemClicked` handler — exactly
+        // what quadraui's own `AppShellDemo` does. Without this, the
+        // runner's own `AppShell` never learns Settings now owns the
+        // sidebar, and the header stays stuck on whatever top panel was
+        // open before.
+        if let quadraui::AppShellEvent::BottomItemClicked { id } = event {
+            if self.engine.app_shell.sidebar_visible() {
+                ctx.shell_mut().show_panel(id);
+            } else {
+                ctx.shell_mut().hide_sidebar();
+            }
+        }
         ctx.shell_mut()
             .set_title_bar_visible(self.engine.menu_bar_visible);
     }
