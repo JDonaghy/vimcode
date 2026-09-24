@@ -811,19 +811,17 @@ impl TuiShellApp {
         }
     }
 
-    /// Compose the **editor band** (#764, #735 slice 3) into `backend`.
+    /// Compose the **editor band** (#764, #735 slice 3; converged into one
+    /// shared walk by #1251) into `backend`.
     ///
-    /// Walks `render::compose_editor_band` — the single ordered artefact both
-    /// backends walk for the editor column, exactly as `FRAME_Z_ORDER` is for
-    /// the surrounding chrome and the app-level overlays. Geometry stays here, in cells; the *order* and the *gates*
-    /// live in `render.rs`. `EDITOR_Z_ORDER`'s doc comment records the two
-    /// defects this convergence closed (GTK never painted the group dividers
-    /// at all, and painted its tab-drag ghost above the editor popups).
+    /// Walks `render::paint_editor_band_rungs`, the single loop both this
+    /// method and GTK's `App::compose_editor_band_rungs` now call — see that
+    /// function's doc and `TuiEditorBandHost`'s for exactly which four rungs
+    /// still need a per-backend body and why. Geometry stays here, in cells.
     ///
     /// `area` is `layout.main_content_bounds` in cells. Extracted from
     /// `render_content` so the entry point *sequences* bands rather than
-    /// inlining each one — the GTK twin splits its own heavier rungs the same
-    /// way (`paint_editor_windows_rung` / `paint_tab_bars_rung`).
+    /// inlining each one.
     fn paint_editor_band(
         &self,
         backend: &mut dyn quadraui::Backend,
@@ -831,17 +829,6 @@ impl TuiShellApp {
         area: Rect,
         theme: &Theme,
     ) {
-        // ══ Editor band (#764, #735 slice 3) ═════════════════════════════
-        //
-        // Composed from `render::compose_editor_band` — the single ordered
-        // artefact both backends walk for the editor column, exactly as
-        // `CHROME_Z_ORDER` (below) is for the surrounding chrome and
-        // `OVERLAY_Z_ORDER` (below that) for the app-level overlays. Geometry
-        // stays here, in cells; only the *order* and the *gates* moved.
-        // `EDITOR_Z_ORDER`'s doc comment records the two defects this closes
-        // (GTK never painted the group dividers at all, and painted its
-        // tab-drag ghost above the editor popups).
-        //
         // Reset per-frame: `post_draw_apply_widths` wants this frame's
         // measurements, not an ever-growing accumulation.
         self.tab_visible_counts.borrow_mut().clear();
@@ -850,122 +837,32 @@ impl TuiShellApp {
         } else {
             1.0
         };
-        let mut composed_editor: Vec<render::EditorOp> = Vec::new();
-        for op in render::compose_editor_band(
+        let mut host = TuiEditorBandHost {
+            app: self,
+            area,
+            tui_tbh,
+        };
+        let band = quadraui::Rect::new(
+            area.x as f32,
+            area.y as f32,
+            area.width as f32,
+            area.height as f32,
+        );
+        let composed_editor = render::paint_editor_band_rungs(
+            backend,
             &self.engine,
             screen,
-            // `is_dragging()`, not the `source().is_some()` this call site used
-            // to test: they agree (`begin` sets both, `handle_release` clears
-            // both), but `is_dragging` is the gate that method's own doc names
-            // as "the gate both backends' drop overlays paint behind", and it
-            // is the one GTK already used.
+            theme,
+            band,
+            render::EditorBandUnits::CELL,
+            // `is_dragging()`, not the `source().is_some()` this call site
+            // used to test: they agree (`begin` sets both, `handle_release`
+            // clears both), but `is_dragging` is the gate that method's own
+            // doc names as "the gate both backends' drop overlays paint
+            // behind", and it is the one GTK already used.
             self.tab_drag.is_dragging(),
-            self.engine.terminal_maximized,
-        ) {
-            match op {
-                // `render_all_windows` also paints the within-group
-                // (`:split`/`:vsplit`) divider lines unconditionally now
-                // (#609 routed `render_separators` through
-                // `Backend::draw_status_bar` — see its doc comment — so it no
-                // longer needs the raw `Frame` that `frame: None` used to
-                // skip it for).
-                render::EditorOp::Windows => {
-                    // #1250: cache the layout each window's status line
-                    // actually painted, keyed by its `WindowId` — the same
-                    // paint-time cache GTK's `render_content` fills at its
-                    // own per-window status-bar paint site, so
-                    // `render::status_bands` can read it back instead of
-                    // `mouse::route_and_apply_chrome_click` re-laying every
-                    // bar's text out again on each click.
-                    let status_layouts = render_all_windows(
-                        backend,
-                        None,
-                        &screen.windows,
-                        &screen.group_dividers,
-                        theme,
-                    );
-                    let mut segment_map = self.status_segment_map.borrow_mut();
-                    for (window_id, layout) in status_layouts {
-                        segment_map
-                            .insert(window_id.0, render::status_bar_zones_from_layout(&layout));
-                    }
-                }
-                // #35/#722: minimap strips on every window's right edge (one
-                // entry per `WindowId` in `screen.minimap`, not just the
-                // active window's) — one call, the braille rasteriser is
-                // quadraui's.
-                render::EditorOp::Minimap => {
-                    render::draw_minimap_strip(backend, screen);
-                }
-                render::EditorOp::TabBars => {
-                    backend.set_theme(super::quadraui_tui::q_theme(theme));
-                    let painted =
-                        render::paint_tab_bars(backend, &self.engine, screen, 1.0, tui_tbh, None);
-                    let mut counts = self.tab_visible_counts.borrow_mut();
-                    for bar in &painted {
-                        counts.push((bar.group_id, bar.hits.available_cols));
-                    }
-                }
-                render::EditorOp::Breadcrumbs => {
-                    backend.set_theme(super::quadraui_tui::q_theme(theme));
-                    render::paint_breadcrumb_bars(backend, screen, self.engine.terminal_maximized);
-                }
-                // Between-*group* dividers (`Ctrl+W v`/`Ctrl+W s`, as opposed
-                // to the `Windows` rung's within-group `render_separators`)
-                // — ported to `Backend::draw_status_bar` via
-                // `render_group_dividers` (see its doc comment, and
-                // `group_divider_cells`'s for how the #481
-                // phantom-divider-beside-scrollbar guard became a pure data
-                // computation instead of a `Buffer` read-back). GTK
-                // rasterises the same rung through quadraui's `Split`
-                // primitive instead — see `render::draw_dividers_as_splits`
-                // for why the two rasterisers legitimately differ.
-                render::EditorOp::GroupDividers => render_group_dividers(
-                    backend,
-                    &screen.group_dividers,
-                    &screen.windows,
-                    area,
-                    theme,
-                ),
-                // Drag state (the shared `render::TabDragState`) is already
-                // live here — #602 wired `handle_mouse_event` to advance it
-                // via `mouse::handle_mouse` (see `handle()` below).
-                render::EditorOp::TabDragOverlay => render_tab_drag_overlay(
-                    backend,
-                    &self.engine,
-                    screen,
-                    theme,
-                    self.tab_drag.source(),
-                    self.tab_drag.cursor(),
-                    self.tab_drag.zone(),
-                ),
-                // Unlike `draw_frame`'s `editor_area` (whose `y` is
-                // implicitly 0-based — it's the live terminal frame's own
-                // top-level split), `area` here is
-                // `layout.main_content_bounds`, already offset below whatever
-                // `AppShell::render` painted above it — see that function's
-                // doc comment for why the row math differs between the two
-                // callers. That offset already includes `AppShell`'s
-                // title-bar row whenever the menu bar is visible
-                // (`compute_layout`'s `band_y += h`), so — unlike
-                // `draw_frame`'s `menu_rows + 1` — there is no menu term to
-                // add here; adding one would double-count the row (#635 item
-                // A, and see `build_screen_for_shell_content`'s doc comment).
-                render::EditorOp::TabTooltip => {
-                    if let Some(ref tooltip_text) = screen.tab_tooltip {
-                        render_tab_hover_tooltip(
-                            backend,
-                            area.x,
-                            area.y + 1,
-                            area.width,
-                            tooltip_text,
-                            theme,
-                        );
-                    }
-                }
-            }
-            composed_editor.push(op);
-        }
+            &mut host,
+        );
         *self.composed_editor_band.borrow_mut() = composed_editor;
         // Same contract as the chrome/overlay bands: read back through the
         // field rather than the local, so the *stored* observable is what gets
@@ -3828,6 +3725,111 @@ impl render::TickHost for TuiTickHost<'_> {
         if let Some(w) = self.backend.window() {
             let _ = w.set_title(&tui_title);
         }
+    }
+}
+
+/// [`render::EditorBandHost`] impl for TUI (#1251) — the four [`render::
+/// EditorOp`] rungs `TuiShellApp::paint_editor_band`'s shared walk still
+/// hands back per-backend. See that trait's own doc for why each of these
+/// four, specifically, can't be inlined into the walk. Holds `app: &'a
+/// TuiShellApp` as a plain borrow (`paint_editor_band` takes `&self`, unlike
+/// `tick`'s `&mut self`, so — unlike `TuiTickHost` — there is no aliasing
+/// concern in borrowing the whole app at once).
+struct TuiEditorBandHost<'a> {
+    app: &'a TuiShellApp,
+    area: Rect,
+    tui_tbh: f64,
+}
+
+impl<'screen> render::EditorBandHost<'screen> for TuiEditorBandHost<'_> {
+    fn paint_windows(
+        &mut self,
+        backend: &mut dyn quadraui::Backend,
+        _engine: &Engine,
+        screen: &'screen render::ScreenLayout,
+        theme: &Theme,
+    ) {
+        // #1250: cache the layout each window's status line actually
+        // painted, keyed by its `WindowId` — the same paint-time cache GTK's
+        // `render_content` fills at its own per-window status-bar paint
+        // site, so `render::status_bands` can read it back instead of
+        // `mouse::route_and_apply_chrome_click` re-laying every bar's text
+        // out again on each click. `render_all_windows` also paints the
+        // within-group (`:split`/`:vsplit`) divider lines unconditionally
+        // (#609 routed `render_separators` through `Backend::draw_status_bar`
+        // — see its doc comment — so it no longer needs the raw `Frame` that
+        // `frame: None` used to skip it for).
+        let status_layouts = render_all_windows(
+            backend,
+            None,
+            &screen.windows,
+            &screen.group_dividers,
+            theme,
+        );
+        let mut segment_map = self.app.status_segment_map.borrow_mut();
+        for (window_id, layout) in status_layouts {
+            segment_map.insert(window_id.0, render::status_bar_zones_from_layout(&layout));
+        }
+    }
+
+    fn paint_tab_bars(
+        &mut self,
+        backend: &mut dyn quadraui::Backend,
+        engine: &Engine,
+        screen: &'screen render::ScreenLayout,
+        theme: &Theme,
+    ) {
+        backend.set_theme(super::quadraui_tui::q_theme(theme));
+        let painted = render::paint_tab_bars(backend, engine, screen, 1.0, self.tui_tbh, None);
+        let mut counts = self.app.tab_visible_counts.borrow_mut();
+        for bar in &painted {
+            counts.push((bar.group_id, bar.hits.available_cols));
+        }
+    }
+
+    // Between-*group* dividers (`Ctrl+W v`/`Ctrl+W s`, as opposed to the
+    // `Windows` rung's within-group `render_separators`) — ported to
+    // `Backend::draw_status_bar` via `render_group_dividers` (see its doc
+    // comment, and `group_divider_cells`'s for how the #481
+    // phantom-divider-beside-scrollbar guard became a pure data computation
+    // instead of a `Buffer` read-back). GTK rasterises the same rung through
+    // quadraui's `Split` primitive instead — see
+    // `render::draw_dividers_as_splits` for why the two rasterisers
+    // legitimately differ.
+    fn paint_group_dividers(
+        &mut self,
+        backend: &mut dyn quadraui::Backend,
+        screen: &'screen render::ScreenLayout,
+        theme: &Theme,
+    ) {
+        render_group_dividers(
+            backend,
+            &screen.group_dividers,
+            &screen.windows,
+            self.area,
+            theme,
+        );
+    }
+
+    // Drag state (the shared `render::TabDragState`) is already live here —
+    // #602 wired `handle_mouse_event` to advance it via `mouse::handle_mouse`
+    // (see `handle()`).
+    fn paint_tab_drag_overlay(
+        &mut self,
+        backend: &mut dyn quadraui::Backend,
+        engine: &Engine,
+        screen: &'screen render::ScreenLayout,
+        theme: &Theme,
+    ) {
+        render_tab_drag_overlay(
+            backend,
+            engine,
+            screen,
+            theme,
+            self.app.tab_drag.source(),
+            self.app.tab_drag.cursor(),
+            self.app.tab_drag.zone(),
+        );
     }
 }
 

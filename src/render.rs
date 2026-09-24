@@ -8205,6 +8205,188 @@ pub(crate) fn editor_band_fixture(drag: bool) -> Vec<EditorOp> {
         .collect()
 }
 
+/// The unit system one backend composes [`paint_editor_band_rungs`] in —
+/// [`BottomPanelUnits`]'s sibling for the editor band. `metrics` answers the
+/// same "at least one line tall / one column wide" question [`FrameMetrics`]
+/// exists for; `tab_row_h` is a second, independent unit because the tab
+/// strip's own row is *not* one text line on GTK (it runs ~1.6× a line
+/// height there) while it is unconditionally exactly one cell on TUI
+/// regardless of the breadcrumbs setting — see the [`EditorOp::TabTooltip`]
+/// call site below for the one rung that reads it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EditorBandUnits {
+    pub metrics: FrameMetrics,
+    /// Row height of the tab strip itself, in the caller's units.
+    pub tab_row_h: f32,
+}
+
+impl EditorBandUnits {
+    /// One terminal cell — what `TuiShellApp::paint_editor_band` composes in.
+    pub const CELL: Self = Self {
+        metrics: FrameMetrics::CELL,
+        tab_row_h: 1.0,
+    };
+
+    /// Real pixels — what `gtk::App::compose_editor_band_rungs` composes in.
+    /// `tab_row_h` is the caller's own measured tab-strip row height, not
+    /// derived from `line_height` (see the struct doc for why the two
+    /// disagree on GTK).
+    pub fn px(line_height: f64, char_width: f64, tab_row_h: f64) -> Self {
+        Self {
+            metrics: FrameMetrics::px(line_height, char_width),
+            tab_row_h: tab_row_h as f32,
+        }
+    }
+}
+
+/// Host hook for [`paint_editor_band_rungs`] — the four [`EditorOp`] rungs
+/// whose paint body still differs enough per backend that the shared walk
+/// cannot inline them directly. `Minimap`, `Breadcrumbs` and `TabTooltip`
+/// need no hook at all: their bodies are already byte-identical between GTK
+/// and TUI (see [`paint_editor_band_rungs`]'s match arms), which is exactly
+/// what made them safe to inline into the shared walk instead of leaving
+/// them here as a fifth/sixth/seventh trivial forwarding method.
+///
+/// `'screen` ties every method's `screen` parameter to the *same*
+/// `ScreenLayout` borrow for the whole walk, so a host (GTK's) that needs to
+/// carry a `&'screen quadraui::TabBar` past the `TabBars` call — for the
+/// `FrameHitMap` it builds after the walk returns — can store it in its own
+/// fields without a lifetime mismatch.
+pub trait EditorBandHost<'screen> {
+    /// [`EditorOp::Windows`]: every editor window's text, gutter, per-window
+    /// status line and the `:split`/`:vsplit` divider lines within each
+    /// group.
+    ///
+    /// Genuinely per-backend: GTK accumulates each window's owned
+    /// `quadraui::Editor` into its own `FrameHitMap` (#449) so later click
+    /// routing hit-tests the exact objects just painted, never a second copy
+    /// that could drift; TUI carries no such map (its hit-testing recomputes
+    /// geometry from `ScreenLayout` directly) but instead wants an optional
+    /// raw `ratatui::Frame` for cursor placement that this trait's `&mut dyn
+    /// Backend`-only signature has no room for (see `render_window`'s own
+    /// doc comment for why `frame: Option<&mut Frame>` exists there).
+    fn paint_windows(
+        &mut self,
+        backend: &mut dyn quadraui::Backend,
+        engine: &Engine,
+        screen: &'screen ScreenLayout,
+        theme: &Theme,
+    );
+
+    /// [`EditorOp::TabBars`]: one tab bar per editor group.
+    ///
+    /// Genuinely per-backend: GTK recovers the rasteriser's exact *pixel* hit
+    /// geometry (`cached_tab_pixel_hits`/`cached_tab_close_abs`/
+    /// `cached_tab_slots_abs`) for pixel-accurate click/hover resolution
+    /// (#515, #703, #764); TUI's hit-testing works in whole cells and needs
+    /// none of that bookkeeping.
+    fn paint_tab_bars(
+        &mut self,
+        backend: &mut dyn quadraui::Backend,
+        engine: &Engine,
+        screen: &'screen ScreenLayout,
+        theme: &Theme,
+    );
+
+    /// [`EditorOp::GroupDividers`]: the between-*group* `Ctrl+W v`/`Ctrl+W s`
+    /// boundary lines.
+    ///
+    /// Genuinely per-backend: GTK rasterises through quadraui's `Split`
+    /// primitive ([`draw_dividers_as_splits`]); TUI rasterises cell-by-cell
+    /// instead, because it alone carries the #481 guard that suppresses a
+    /// divider column immediately beside a neighbouring window's scrollbar —
+    /// a coalescence problem that exists only in a character grid. See
+    /// [`draw_dividers_as_splits`]'s own doc comment for the full story.
+    fn paint_group_dividers(
+        &mut self,
+        backend: &mut dyn quadraui::Backend,
+        screen: &'screen ScreenLayout,
+        theme: &Theme,
+    );
+
+    /// [`EditorOp::TabDragOverlay`]: the tab-drag drop-zone highlight,
+    /// insertion bar and dragged-tab ghost.
+    ///
+    /// Genuinely per-backend: GTK's drop geometry is cached every frame
+    /// (`cache_tab_drop_geometry`) so the drag hit-test has it whether or not
+    /// this rung ran that frame; TUI recomputes it inline and additionally
+    /// paints the dragged buffer's name at the ghost position — the decision
+    /// [`paint_tab_drop_overlay`]'s own doc comment already records GTK
+    /// leaves to quadraui's rasteriser instead.
+    fn paint_tab_drag_overlay(
+        &mut self,
+        backend: &mut dyn quadraui::Backend,
+        engine: &Engine,
+        screen: &'screen ScreenLayout,
+        theme: &Theme,
+    );
+}
+
+/// The shared **editor band** walk (#1251): the single ordered loop both
+/// `TuiShellApp::paint_editor_band` and `App::compose_editor_band_rungs` run
+/// over [`compose_editor_band`], replacing what used to be two hand-written
+/// copies of the same seven-armed `match`. `Minimap`, `Breadcrumbs` and
+/// `TabTooltip` paint identically on both backends (modulo `units`) and are
+/// inlined here directly; the four rungs that still need a per-backend body
+/// go through `host` — see [`EditorBandHost`]'s own doc for exactly which
+/// parts of each and why.
+///
+/// `band` is the editor column's bounds in the caller's units (only `x`, `y`
+/// and `width` are read, by the `TabTooltip` rung); `units` carries the
+/// metrics and tab-row height the same rung needs. Returns the rungs actually
+/// composed, in order, for the caller to stash and validate with
+/// [`check_editor_band_order`] — callers do that themselves (rather than this
+/// function doing it) so the assertion message keeps each backend's own
+/// "TUI "/"GTK " prefix, unchanged from before this convergence.
+#[allow(clippy::too_many_arguments)]
+pub fn paint_editor_band_rungs<'screen>(
+    backend: &mut dyn quadraui::Backend,
+    engine: &Engine,
+    screen: &'screen ScreenLayout,
+    theme: &Theme,
+    band: quadraui::Rect,
+    units: EditorBandUnits,
+    drag_active: bool,
+    host: &mut impl EditorBandHost<'screen>,
+) -> Vec<EditorOp> {
+    let mut composed = Vec::new();
+    for op in compose_editor_band(engine, screen, drag_active, engine.terminal_maximized) {
+        match op {
+            EditorOp::Windows => host.paint_windows(backend, engine, screen, theme),
+            // #35/#722: minimap strips on every window's right edge (one
+            // entry per `WindowId` in `screen.minimap`, not just the active
+            // window's) — one call, the rasteriser is quadraui's.
+            EditorOp::Minimap => draw_minimap_strip(backend, screen),
+            EditorOp::TabBars => host.paint_tab_bars(backend, engine, screen, theme),
+            EditorOp::Breadcrumbs => {
+                paint_breadcrumb_bars(backend, screen, engine.terminal_maximized)
+            }
+            EditorOp::GroupDividers => host.paint_group_dividers(backend, screen, theme),
+            EditorOp::TabDragOverlay => host.paint_tab_drag_overlay(backend, engine, screen, theme),
+            // Positioned one *tab row* below the top of the editor column —
+            // `units.tab_row_h`, not `units.metrics.line_height` — mirroring
+            // GTK's `tab_row_h` / TUI's always-one-cell tab strip; see
+            // `EditorBandUnits`'s doc for why the two units genuinely differ.
+            EditorOp::TabTooltip => {
+                if let Some(ref tooltip_text) = screen.tab_tooltip {
+                    tab_hover_tooltip_paint(
+                        backend,
+                        band.x,
+                        band.y + units.tab_row_h,
+                        band.width,
+                        tooltip_text,
+                        theme,
+                        units.metrics.char_width,
+                        units.metrics.line_height,
+                    );
+                }
+            }
+        }
+        composed.push(op);
+    }
+    composed
+}
+
 // ══════════════════════════════════════════════════════════════════════════
 // Bottom band (#765, #735 slice 4)
 // ══════════════════════════════════════════════════════════════════════════
