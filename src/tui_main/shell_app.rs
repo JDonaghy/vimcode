@@ -5983,9 +5983,17 @@ mod tests {
             "SOURCE CONTROL",
             "Source Control",
         );
-        click_icon_and_expect(crate::icons::EXTENSIONS.s(), "EXTENSIONS", "Extensions");
+        // #1343: "Extensions"/"Settings", not the all-caps "EXTENSIONS"/
+        // "SETTINGS" the other panels below still hand-paint — those two
+        // panels' own duplicate header rows are deleted now (#1256's
+        // double-header bug), so the only header left is the shell's own
+        // `AppShell` one, which uses this config's title-case
+        // `title_tooltip` strings, not the shared `App`'s all-caps
+        // `PanelDefinition` titles (see `issue_1256_sidebar_chrome`'s doc
+        // table in `harness.rs` for why the casing differs by arm).
+        click_icon_and_expect(crate::icons::EXTENSIONS.s(), "Extensions", "Extensions");
         click_icon_and_expect(crate::icons::AI_CHAT.s(), "AI ASSISTANT", "AI");
-        click_icon_and_expect(crate::icons::SETTINGS.s(), "SETTINGS", "Settings");
+        click_icon_and_expect(crate::icons::SETTINGS.s(), "Settings", "Settings");
         click_icon_and_expect(crate::icons::EXPLORER.s(), "zqxw1053.txt", "Explorer");
 
         // Hamburger last: `ActivityBarTarget::MenuToggle`, the specific arm
@@ -13148,9 +13156,12 @@ mod tests {
     fn chrome_band_composes_in_canonical_order_via_shell_app() {
         let mut app = app_with_sidebar_open();
         // The *settings* panel, not the explorer: its body paints a fixed
-        // "SETTINGS" heading, where the explorer's would be this checkout's
-        // own directory listing — ambient state a test must not depend on
-        // (#762).
+        // "Appearance" category heading, where the explorer's would be this
+        // checkout's own directory listing — ambient state a test must not
+        // depend on (#762). Not "SETTINGS" (#1343): that was
+        // `render_settings_panel`'s own hand-painted duplicate header,
+        // deleted now that the shell's `AppShell` owns the sidebar header
+        // alone — see `issue_1256_sidebar_chrome` in `harness.rs`.
         app.engine
             .app_shell
             .show_panel(&quadraui::WidgetId::new(PANEL_SETTINGS));
@@ -13188,7 +13199,7 @@ mod tests {
             "MenuRow was composed but the menu bar never painted; screen:\n{screen}"
         );
         assert!(
-            driver.find_bounds("SETTINGS").is_some(),
+            driver.find_bounds("Appearance").is_some(),
             "SidebarPanel was composed but the settings panel never painted; \
              screen:\n{screen}"
         );
@@ -13640,10 +13651,20 @@ mod tests {
     /// The *settings* sidebar panel must now paint through `render_content`
     /// too — it was one of #607's documented gaps, blocked on
     /// `quadraui::tui::draw_settings_chrome` being a free `&mut Buffer`
-    /// rasteriser. #635 (Stage 6b item B) switches this to the real
-    /// `Backend::draw_settings_chrome` trait method (`quadraui#531`), so the
-    /// `" SETTINGS"` header row (a literal, hence deterministic) should
-    /// reach the screen.
+    /// rasteriser. #635 (Stage 6b item B) switched this to the real
+    /// `Backend::draw_settings_chrome` trait method (`quadraui#531`).
+    ///
+    /// #1343: this used to assert on a literal `" SETTINGS"` header row
+    /// `render_settings_panel` hand-painted on top of the shell's own —
+    /// exactly the double-header #1256 found. That row is deleted now;
+    /// the shell (`AppShell`) owns the *one* header, and this local `config()`
+    /// fixture (unlike `TuiShellApp::build_shell_config`) never registers
+    /// Settings as a bottom item, so its header wouldn't reach "Settings"
+    /// either. What this test actually needs to prove is unchanged —
+    /// `render_content` paints the settings *form body* — so it asserts on
+    /// that instead (`issue_1256_sidebar_chrome::settings_header_names_
+    /// settings` in `harness.rs` covers the real shell-header text, through
+    /// the production `shell_config`).
     #[test]
     fn render_content_paints_settings_panel_via_shell_app() {
         let mut app = TuiShellApp::new(None);
@@ -13654,8 +13675,8 @@ mod tests {
         let driver = driver_with_shell(app, config(), 80, 24);
         let screen = driver.screen();
         assert!(
-            screen.contains("SETTINGS"),
-            "settings panel chrome should paint via TuiShellApp::render_content; screen:\n{screen}"
+            screen.contains("Appearance"),
+            "settings panel body should paint via TuiShellApp::render_content; screen:\n{screen}"
         );
     }
 
@@ -14516,9 +14537,21 @@ mod tests {
         );
     }
 
-    /// The *extensions* sidebar panel, likewise — its two chrome rows (the
-    /// header and the search box) were a local raw-`set_cell` `write_row`
-    /// closure that #605 collapsed into `panels::fill_row`.
+    /// The *extensions* sidebar panel, likewise — its search-box row was a
+    /// local raw-`set_cell` `write_row` closure that #605 collapsed into
+    /// `panels::fill_row`.
+    ///
+    /// #1343: this used to also assert a literal `" EXTENSIONS"` header row
+    /// `render_ext_sidebar` hand-painted on top of the shell's own — exactly
+    /// the double-header #1256 found. That row is deleted now; the shell
+    /// (`AppShell`) owns the *one* header, and this local `config()` fixture
+    /// (unlike `TuiShellApp::build_shell_config`) never registers Extensions
+    /// as a panel, so its header wouldn't reach "Extensions" either. What
+    /// this test actually needs to prove is unchanged — `render_content`
+    /// paints the marketplace body — so it asserts on that instead
+    /// (`issue_1256_sidebar_chrome::extensions_header_is_painted` in
+    /// `harness.rs` covers the real shell-header text, through the
+    /// production `shell_config`).
     #[test]
     fn render_content_paints_extensions_panel_via_shell_app() {
         let mut app = TuiShellApp::new(None);
@@ -14529,8 +14562,8 @@ mod tests {
         let driver = driver_with_shell(app, config(), 80, 24);
         let screen = driver.screen();
         assert!(
-            screen.contains("EXTENSIONS"),
-            "extensions panel chrome should paint via TuiShellApp::render_content; screen:\n{screen}"
+            screen.contains("INSTALLED") && screen.contains("AVAILABLE"),
+            "extensions panel body should paint via TuiShellApp::render_content; screen:\n{screen}"
         );
     }
 
@@ -23460,15 +23493,21 @@ mod tests {
     /// so Ctrl-L in the toolbar switched panels on TUI and did nothing on
     /// GTK — one table, two behaviours.
     ///
-    /// Asserts on the painted sidebar (does the Settings panel's `SETTINGS`
+    /// Asserts on the painted sidebar (does the Settings panel's `Settings`
     /// header reach the screen?), never on `activity_bar_focused`, and pairs
     /// the negative with a positive: a bare `l` immediately afterwards
     /// *must* activate, so a fixture that simply cannot activate could not
     /// pass this test by accident.
     ///
     /// **Verified RED against unfixed `develop`:** the pre-#757 activity-bar
-    /// tier reaches `activity_bar_activate()` for Ctrl-L, so `SETTINGS`
+    /// tier reaches `activity_bar_activate()` for Ctrl-L, so `Settings`
     /// paints after the first keypress and the first assertion fires.
+    ///
+    /// #1343: the marker is title-case `"Settings"`, not `"SETTINGS"` —
+    /// that all-caps text used to come from `render_settings_panel`'s own
+    /// hand-painted duplicate header, deleted now that the shell's
+    /// `AppShell` (whose `config()`/`build_shell_config` title for this
+    /// bottom item is title-case) owns the sidebar header alone.
     #[test]
     fn activity_bar_ctrl_l_does_not_activate_via_shell_app() {
         use crate::core::engine::sidebar::TOOLBAR_IDX_SETTINGS;
@@ -23479,7 +23518,7 @@ mod tests {
 
         let before = driver.screen();
         assert!(
-            !before.contains("SETTINGS"),
+            !before.contains("Settings"),
             "precondition: the Settings panel must not already be open; \
              screen:\n{before}"
         );
@@ -23495,7 +23534,7 @@ mod tests {
 
         let after_ctrl = driver.screen();
         assert!(
-            !after_ctrl.contains("SETTINGS"),
+            !after_ctrl.contains("Settings"),
             "Ctrl-L in the activity bar must not activate the selected item \
              (`render::activity_bar_key_action` guards Activate on !ctrl); \
              screen:\n{after_ctrl}"
@@ -23510,7 +23549,7 @@ mod tests {
 
         let after_plain = driver.screen();
         assert!(
-            after_plain.contains("SETTINGS"),
+            after_plain.contains("Settings"),
             "a bare `l` on the Settings slot must still activate it; \
              screen:\n{after_plain}"
         );

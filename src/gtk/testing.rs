@@ -3734,10 +3734,21 @@ mod sidebar_panel_clicks {
     #[test]
     fn settings_panel_click_toggles_the_clicked_category() {
         let mut h = panel_harness(PANEL_SETTINGS);
-        let sb = h
-            .painted_sidebar_bounds
-            .get()
-            .expect("the settings panel must have painted into a sidebar rect");
+        // #1343: not `painted_sidebar_bounds` — that's the *whole* sidebar
+        // content rect the shell hands this frame, one row taller than what
+        // `FormController` actually painted into now that
+        // `App::paint_sidebar_panel_rung`'s `PANEL_SETTINGS` arm reserves a
+        // row above the form for the shared `render::paint_sidebar_search_
+        // row`. `engine.settings_form_rect` is the exact rect that arm
+        // painted the form into (and caches for click routing, same as TUI's
+        // `panels::render_settings_panel` always has) — clicking off the
+        // stale, unshrunk `sb` here landed on the search row instead of the
+        // first category, so the toggle never fired.
+        let sb = h.engine.borrow().settings_form_rect.get();
+        assert!(
+            sb.height > 0.0,
+            "the settings panel must have painted its form into a non-degenerate rect"
+        );
         assert!(
             matches!(
                 h.engine.borrow().settings_flat_list().first(),

@@ -3610,28 +3610,58 @@ impl App {
                 }
             }
             PANEL_EXTENSIONS => {
+                // #1343: the shell's own `AppShell` sidebar header already
+                // paints " EXTENSIONS " above `q_sb` — this arm paints only
+                // the search/filter row through the shared
+                // `render::paint_sidebar_search_row` (#1256 found GTK
+                // painting neither row at all).
+                let body_rect = render::paint_sidebar_search_row(
+                    backend,
+                    q_sb,
+                    &engine.ext_sidebar_query,
+                    "Search extensions (press /)",
+                    engine.ext_sidebar_input_active,
+                    theme,
+                );
                 Self::refresh_ext_sidebar_metrics(backend, engine);
                 render::populate_ext_sidebar_system(engine);
-                engine.ext_sidebar_body_rect.set(q_sb);
-                engine.ext_sidebar_system.borrow().render(backend, q_sb);
+                engine.ext_sidebar_body_rect.set(body_rect);
+                engine
+                    .ext_sidebar_system
+                    .borrow()
+                    .render(backend, body_rect);
             }
             PANEL_SETTINGS => {
-                // #1242: `chrome: None` reproduces this arm's pre-existing
-                // "no header/search chrome" behaviour exactly — a
-                // pre-existing asymmetry with TUI's
-                // `panels::render_settings_panel`, tracked separately by
-                // `TUI_AUDIT_R2.md` §5 Wave 1 item 2, not resolved here.
-                let panel = render::SidebarPanelBody {
-                    background: None,
-                    chrome: render::SidebarPanelChrome::None,
-                    scrollbar_gutter: None,
-                };
-                let layout = render::paint_sidebar_panel_chrome(backend, &panel, q_sb);
+                // #1343: Settings is a shell bottom item that owns the
+                // sidebar header (quadraui#1055, #1356's pin bump) — the
+                // shell paints " SETTINGS " above `q_sb`, so this arm
+                // paints only the filter row through the same shared
+                // function the `PANEL_EXTENSIONS` arm above uses, instead
+                // of the pre-#1343 `SidebarPanelChrome::None` (no chrome at
+                // all — #1256's `settings_filter_row_is_painted::gtk` gap).
+                let body_rect = render::paint_sidebar_search_row(
+                    backend,
+                    q_sb,
+                    &engine.settings_query,
+                    "",
+                    engine.settings_input_active,
+                    theme,
+                );
+                // Cache the exact rect this frame painted the form into
+                // (mirrors TUI's `panels::render_settings_panel`, #1238) —
+                // `try_route_sidebar_mouse_event`'s `Settings` arm reads
+                // this back instead of the raw, unshrunk `q_sb`, which
+                // would resolve clicks against `FormController`'s row
+                // geometry one search-row off from what was actually
+                // painted (#1343 review: this is exactly the
+                // `settings_row_click_below_its_glyph_hits_its_own_row_gtk`
+                // regression a stale `sb` reintroduced).
+                engine.settings_form_rect.set(body_rect);
                 render::populate_settings_form_controller(engine);
                 engine
                     .settings_form_controller
                     .borrow_mut()
-                    .render_and_cache(backend, layout.body_rect);
+                    .render_and_cache(backend, body_rect);
             }
             id if id.starts_with("ext:") => {
                 // #1089: a plugin-provided panel — paint its own sections +
@@ -6364,7 +6394,20 @@ impl App {
                 // click fall through to `handle_mouse_click_msg` at sidebar-local
                 // coordinates, which is exactly the leak every other arm in this
                 // match also guards against by returning `true` unconditionally.
-                render::handle_settings_form_ui_event(&mut engine, event, sb);
+                //
+                // #1343: `engine.settings_form_rect`, not the raw `sb` —
+                // `paint_sidebar_panel_rung`'s `PANEL_SETTINGS` arm now
+                // reserves one row above the form for the shared search row
+                // (`render::paint_sidebar_search_row`), so `sb` (the whole
+                // sidebar content rect the shell hands this frame) is one
+                // row taller than what `FormController::render_and_cache`
+                // actually painted into. `handle_settings_form_ui_event`'s
+                // own doc says `rect` must be "the *same* rect the last
+                // frame passed to `FormController::render_and_cache`" —
+                // `sb` stopped being that the moment the search row was
+                // added.
+                let settings_rect = engine.settings_form_rect.get();
+                render::handle_settings_form_ui_event(&mut engine, event, settings_rect);
                 true
             }
             render::SidebarOwner::ExtPanel(_) => {
