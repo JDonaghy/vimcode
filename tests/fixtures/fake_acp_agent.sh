@@ -15,7 +15,13 @@
 #                           the reader skips it without desyncing. If
 #                           $ACP_FAKE_DIE_AFTER_INIT is set, this process
 #                           exits right after replying.
-#   - session/new        -> canned sessionId "sess-1".
+#   - session/new        -> canned sessionId "sess-1". If
+#                           $ACP_FAKE_SESSION_NEW_ERROR is set, replies with a
+#                           JSON-RPC error instead (agent stays alive,
+#                           doesn't exit) — for the non-fatal-handshake-error
+#                           regression: `RequestFailed` for a method other
+#                           than session/prompt must still clear the panel's
+#                           busy state (#952 review finding).
 #   - session/prompt     -> emits a session/update "agent_thought_chunk"
 #                           notification, then two "agent_message_chunk"
 #                           notifications (split across two lines, to prove
@@ -63,7 +69,11 @@ while IFS= read -r line; do
       ;;
     *'"method":"session/new"'*)
       id=$(extract_id "$line")
-      printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"sess-1"}}\n' "$id"
+      if [ -n "$ACP_FAKE_SESSION_NEW_ERROR" ]; then
+        printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32000,"message":"cwd not permitted"}}\n' "$id"
+      else
+        printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"sess-1"}}\n' "$id"
+      fi
       ;;
     *'"method":"session/prompt"'*)
       id=$(extract_id "$line")

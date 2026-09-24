@@ -2946,7 +2946,7 @@ impl Engine {
         let api_key = self.settings.ai_api_key.clone();
         let base_url = self.settings.ai_base_url.clone();
         let model = self.settings.ai_model.clone();
-        let messages = self.ai_messages.clone();
+        let messages = curl_transport_history(&self.ai_messages);
         let system = String::new();
 
         let (tx, rx) = std::sync::mpsc::channel();
@@ -2991,10 +2991,7 @@ impl Engine {
 
         let agent_cmd = self.settings.acp_agent_command.clone();
         let argv = crate::core::acp::parse_agent_command(&agent_cmd);
-        let cwd = self
-            .workspace_root
-            .clone()
-            .unwrap_or_else(|| self.cwd.clone());
+        let cwd = self.acp_workspace_cwd();
         match crate::core::acp::AcpClient::spawn(&argv, &cwd) {
             Ok(mut client) => {
                 client.initialize();
@@ -3433,5 +3430,78 @@ impl Engine {
             self.swap_recheck_open_buffers();
         }
         EngineAction::None
+    }
+}
+
+/// Filter an AI panel transcript down to the turns valid as conversation
+/// history for the direct-provider (`curl`) transport — only `"user"` and
+/// `"assistant"` roles.
+///
+/// Review regression (#952): if the panel previously talked over ACP
+/// (`Engine::ai_send_message_via_acp`), `self.ai_messages` can also contain
+/// ACP-only roles like `"assistant-thought"` (real `agent_thought_chunk`
+/// reasoning, and the system/error notices `Engine::poll_acp` appends — see
+/// `acp_ops.rs`). A user who switches transports mid-session by clearing
+/// `acp_agent_command` without running `:AiClear` would otherwise have
+/// those roles sent verbatim in the request body
+/// (`crate::core::ai::send_chat`'s `messages_to_json`/`send_ollama`), which
+/// none of Anthropic/OpenAI/Ollama recognise and will reject.
+fn curl_transport_history(messages: &[AiMessage]) -> Vec<AiMessage> {
+    messages
+        .iter()
+        .filter(|m| m.role == "user" || m.role == "assistant")
+        .cloned()
+        .collect()
+}
+
+#[cfg(test)]
+mod curl_transport_history_tests {
+    use super::*;
+
+    #[test]
+    fn keeps_user_and_assistant_turns_unchanged() {
+        let messages = vec![
+            AiMessage {
+                role: "user".to_string(),
+                content: "hi".to_string(),
+            },
+            AiMessage {
+                role: "assistant".to_string(),
+                content: "hello".to_string(),
+            },
+        ];
+        let filtered = curl_transport_history(&messages);
+        let roles: Vec<&str> = filtered.iter().map(|m| m.role.as_str()).collect();
+        assert_eq!(roles, vec!["user", "assistant"]);
+    }
+
+    /// RED verified: removing the `.filter(...)` call (sending
+    /// `self.ai_messages.clone()` straight through) makes this fail — the
+    /// stray `"assistant-thought"` turn survives into the direct-provider
+    /// request body.
+    #[test]
+    fn drops_acp_only_assistant_thought_role() {
+        let messages = vec![
+            AiMessage {
+                role: "user".to_string(),
+                content: "hi".to_string(),
+            },
+            AiMessage {
+                role: "assistant-thought".to_string(),
+                content: "\u{26a0} session/prompt failed: boom".to_string(),
+            },
+            AiMessage {
+                role: "assistant".to_string(),
+                content: "hello".to_string(),
+            },
+        ];
+        let filtered = curl_transport_history(&messages);
+        let roles: Vec<&str> = filtered.iter().map(|m| m.role.as_str()).collect();
+        assert_eq!(
+            roles,
+            vec!["user", "assistant"],
+            "the ACP-only assistant-thought turn must not reach a \
+             direct-provider request body: {filtered:?}"
+        );
     }
 }
