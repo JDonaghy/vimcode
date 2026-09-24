@@ -1,6 +1,69 @@
 # VimCode Project State
 
-**Last updated:** September 24, 2026 (#956, ACP-5 — plan, slash commands,
+**Last updated:** September 24, 2026 (#955, ACP-4 — tool-call rendering
+plus a source-agnostic change-review surface, on top of ACP-1's #952
+transport; shares its review surface with the future #525 git-branch-diff
+slice, whichever lands second consumes it). `src/core/acp.rs` gained
+`AcpToolCall`/`AcpToolCallStatus`/`AcpToolCallContentBlock` plus
+`parse_tool_call`/`parse_tool_call_update`/`tool_call_summary_line` —
+`tool_call` is a full announcement, `tool_call_update` is a *patch*
+(status replaces, `content` **appends**, never replaces) keyed by
+`toolCallId`. New `Engine::acp_tool_calls: Vec<AcpToolCall>`
+(`src/core/engine/acp_ops.rs`'s `acp_upsert_tool_call`/
+`acp_apply_tool_call_update`) is upserted by id, not append-only, and
+renders as one collapsed one-line summary turn per call (status glyph +
+kind + title, `render::populate_ai_chat_controller`) appended after the
+real conversation — same "synthetic turn" treatment #956 gave the plan
+checklist. New module `src/core/review.rs` (deliberately free of any
+`Engine`/buffer/backend knowledge): `ProposedChange{path, old_text,
+new_text}` is the source-agnostic unit both this slice and #525 build
+from; `ChangeReviewState`/`ChangeReviewEntry` wrap a real
+`quadraui::DiffView` per file (built via `quadraui::compute_hunks`, with a
+hand-rolled `pure_addition_hunks` for `old_text: None` — `"".split('\n')`
+yields one line, not zero, so routing a new file through `compute_hunks`
+directly can wrongly mark a trailing blank line `Same` instead of every
+row being a clean `Added`) plus hunk/file navigation and accept/reject.
+`src/core/engine/review_ops.rs` bridges it to the engine: `Engine::
+open_change_review`/`change_review_diff_rect` (paint-to-hit-test contract,
+same as `command_line_rect`), `handle_change_review_key` (Esc/q close,
+j/k/Down/Up scroll, `]`/`[` hunk nav, n/p/Tab file nav, a/r accept/reject,
+Return jumps to the current row's file+line), and `change_review_accept_
+current` reuses `Engine::acp_write_text_file` (#954) rather than
+duplicating the buffer-write path. New `FrameOp::ChangeReview` rung
+(`render::paint_change_review_rung`, shared verbatim by both backends) —
+painted as a full-viewport modal, so `render::route_modal_key` now also
+routes to `Engine::handle_key` whenever `change_review.is_some()` (without
+this, the AI panel's own focus route sends keys straight to
+`route_ai_chat_event`, bypassing `Engine::handle_key` entirely — exactly
+when a tool-call diff would arrive). Mouse click-to-jump
+(`render::route_change_review_click`, `ChangeReviewClickRoute`) resolves a
+click against the painted `DiffView`'s own row geometry and is wired on
+both backends the same way `route_folder_picker_click` is — checked before
+`route_modal_overlay_click`'s ladder, not folded into it, since this
+surface swallows every click while open. Extended the shared `tests/
+fixtures/fake_acp_agent.sh`: `$ACP_FAKE_TOOL_CALL_STATUS_ONLY` (status
+transitions with no diff, so the transcript stays visible to assert
+against) and `$ACP_FAKE_TOOL_CALL` (+ `$ACP_FAKE_TOOL_CALL_PATH`, the diff
+scenario that opens the review surface and exercises accept-writes-to-disk).
+Black-box coverage: two TUI `TuiDriver` tests and two GTK `GtkDriver`
+tests (status-transition and diff-review-plus-accept, mirrored per
+backend), each RED-verified against its specific regression (status
+assignment disabled; diff-review opening disabled) before being confirmed
+GREEN — plus unit tests for every new parser in `core::acp`, the full
+`core::review` module (including the acceptance bar's own explicit
+non-ACP-feed test and the `oldText: null` pure-addition test), and
+`core::engine::review_ops`. Known gap, stated rather than silently
+shipped: `locations[{path, line}]` in the *transcript* (as opposed to the
+change-review surface, which does support click-to-jump) has no
+click-to-jump — `quadraui::ChatTurn`/`StyledText` carry no clickable-span
+concept yet, which is a quadraui infra gap, not a vimcode backend one; the
+keyboard path (`Return` in the review surface) exercises the same
+resolution function so the gap is "no mouse entry point yet" for that
+specific spot, not "unbuilt or untested". `cargo build`/`clippy -D
+warnings`/`fmt` clean on both feature lanes; full `cargo test --lib`
+(3675 tests, both backends compiled in) and `--no-default-features --lib`
+(3435 tests) both green.). Prior update: September 24, 2026 (#956, ACP-5 —
+plan, slash commands,
 modes and usage from the `session/update` stream, on top of ACP-1's #952
 transport; independent of ACP-3/ACP-4). `src/core/acp.rs` gained pure
 parsers for the four remaining `session/update` variants this track cared

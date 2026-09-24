@@ -5147,6 +5147,155 @@ second line here
         );
     }
 
+    /// #955 (ACP-4) acceptance, GTK's twin of `tui_main::shell_app::tests::
+    /// ai_panel_tool_call_status_transitions_via_shell_app`: a tool call's
+    /// transcript summary shows `title` + `kind`, and its status glyph
+    /// reflects the LAST `tool_call_update` (`completed`).
+    ///
+    /// RED verified: with `Engine::acp_apply_tool_call_update`'s status
+    /// assignment commented out, the screen never shows `"[x] execute:"`
+    /// within the deadline (stuck on `"[ ]"`) — same failure shape as the
+    /// TUI test.
+    #[cfg(unix)]
+    #[test]
+    fn ai_panel_tool_call_status_transitions_via_gtk_driver() {
+        let mut h = panel_harness(PANEL_AI);
+        {
+            let mut engine = h.engine.borrow_mut();
+            let argv = vec![
+                "sh".to_string(),
+                concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/tests/fixtures/fake_acp_agent.sh"
+                )
+                .to_string(),
+            ];
+            let cwd = std::env::temp_dir();
+            let mut client = crate::core::acp::AcpClient::spawn_with_env(
+                &argv,
+                &cwd,
+                &[("ACP_FAKE_TOOL_CALL_STATUS_ONLY", "1")],
+            )
+            .expect("fixture agent should spawn");
+            client.initialize();
+            engine.acp_client = Some(client);
+            engine.settings.acp_agent_command = "already-spawned-above".to_string();
+        }
+
+        let sb = h.painted_sidebar_bounds.get().unwrap();
+        h.driver.click(sb.x + 20.0, sb.y + 20.0);
+        for c in "please run tests".chars() {
+            h.driver.type_char(c);
+        }
+        h.driver.ctrl_char('s');
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !h.driver.screen_contains("[x] execute:") && std::time::Instant::now() < deadline {
+            h.engine.borrow_mut().poll_acp();
+            h.driver.render();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            h.driver.screen_contains("[x] execute: Run the tests"),
+            "the tool call's LAST status update (completed) must be the \
+             one rendered, together with its title and kind"
+        );
+        assert!(
+            !h.driver.screen_contains("[ ] execute:") && !h.driver.screen_contains("[~] execute:"),
+            "only the final status should be visible once the turn has \
+             ended"
+        );
+    }
+
+    /// #955 (ACP-4) acceptance, GTK's twin of `tui_main::shell_app::tests::
+    /// ai_panel_tool_call_diff_opens_change_review_and_accept_writes_file_via_shell_app`:
+    /// a `diff` content block opens the change-review surface (a real
+    /// `quadraui::DiffView`, painted through `render::paint_change_review_rung`
+    /// — the same shared function TUI calls), and accepting it writes the
+    /// new text to the real file.
+    ///
+    /// RED verified: with `Engine::acp_open_review_for_diffs` never called
+    /// from `acp_apply_tool_call_update`, the screen never shows `"old
+    /// line"`/`"new line"` and the file on disk is never rewritten — same
+    /// failure shape as the TUI test.
+    #[cfg(unix)]
+    #[test]
+    fn ai_panel_tool_call_diff_opens_change_review_and_accept_writes_file_via_gtk_driver() {
+        let dir = std::env::temp_dir().join(format!("acp4-gtk-tool-call-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("target.txt");
+        std::fs::write(&target, "old line\n").unwrap();
+        let target_str = target.to_string_lossy().into_owned();
+
+        let mut h = panel_harness(PANEL_AI);
+        {
+            let mut engine = h.engine.borrow_mut();
+            engine.workspace_root = Some(dir.clone());
+            let argv = vec![
+                "sh".to_string(),
+                concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/tests/fixtures/fake_acp_agent.sh"
+                )
+                .to_string(),
+            ];
+            let cwd = std::env::temp_dir();
+            let mut client = crate::core::acp::AcpClient::spawn_with_env(
+                &argv,
+                &cwd,
+                &[
+                    ("ACP_FAKE_TOOL_CALL", "1"),
+                    ("ACP_FAKE_TOOL_CALL_PATH", target_str.as_str()),
+                ],
+            )
+            .expect("fixture agent should spawn");
+            client.initialize();
+            engine.acp_client = Some(client);
+            engine.settings.acp_agent_command = "already-spawned-above".to_string();
+        }
+
+        let sb = h.painted_sidebar_bounds.get().unwrap();
+        h.driver.click(sb.x + 20.0, sb.y + 20.0);
+        for c in "please edit".chars() {
+            h.driver.type_char(c);
+        }
+        h.driver.ctrl_char('s');
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !h.driver.screen_contains("old line") && std::time::Instant::now() < deadline {
+            h.engine.borrow_mut().poll_acp();
+            h.driver.render();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            h.driver.screen_contains("old line"),
+            "the change-review surface must paint the diff's oldText"
+        );
+        assert!(
+            h.driver.screen_contains("new line"),
+            "the change-review surface must paint the diff's newText"
+        );
+
+        h.driver.type_char('a');
+        h.driver.render();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::fs::read_to_string(&target).unwrap_or_default() != "new line\n"
+            && std::time::Instant::now() < deadline
+        {
+            h.engine.borrow_mut().poll_acp();
+            h.driver.render();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "new line\n",
+            "accepting the change must write newText to the real file"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// How long the two #957 (ACP-6) driver tests below wait on a real
     /// child process before giving up. Same value, and same rationale, as
     /// `tui_main::shell_app::tests::ACP_DRIVER_DEADLINE` — see that

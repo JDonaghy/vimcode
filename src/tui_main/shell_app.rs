@@ -2550,6 +2550,23 @@ impl ShellApp for TuiShellApp {
                     }
                 }
 
+                // ── Change-review surface (#955, shared with #525) ───────
+                // `render::paint_change_review_rung` is the whole body —
+                // no TUI-specific diff rendering, matching GTK's identical
+                // arm.
+                render::FrameOp::ChangeReview => {
+                    if let Some(review) = screen.change_review.as_ref() {
+                        render::paint_change_review_rung(
+                            backend,
+                            &self.engine,
+                            review,
+                            win_q,
+                            &theme,
+                        );
+                        composed.push(render::FrameOp::ChangeReview);
+                    }
+                }
+
                 // ── Modal dialog ─────────────────────────────────────────
                 // Above the context menu, matching
                 // `route_modal_overlay_click`'s own arbitration: once a dialog
@@ -14924,6 +14941,176 @@ mod tests {
              here; `format_usage_summary`'s own unit tests cover the full \
              string); screen:\n{screen}"
         );
+    }
+
+    /// #955 (ACP-4) acceptance, end to end through the real `TuiShellApp`/
+    /// `TuiDriver` stack: a tool call's transcript summary shows `title` +
+    /// `kind`, and its status glyph reflects the LAST `tool_call_update`
+    /// (`completed`, per the fixture's `ACP_FAKE_TOOL_CALL_STATUS_ONLY`
+    /// branch — no `diff` content here, so the change-review surface never
+    /// opens and covers the transcript; see the next test for that path).
+    ///
+    /// RED verified: with `Engine::acp_apply_tool_call_update`'s status
+    /// assignment commented out, the screen never shows `"[x] execute:"`
+    /// (it stays stuck on `"[ ]"`, the initial `tool_call` announcement's
+    /// `pending` status) within the deadline — this failed exactly that
+    /// way before the status transition was wired up.
+    #[cfg(unix)]
+    #[test]
+    fn ai_panel_tool_call_status_transitions_via_shell_app() {
+        let mut app = TuiShellApp::new(None);
+        app.engine
+            .app_shell
+            .show_panel(&quadraui::WidgetId::new(PANEL_AI));
+        app.engine.ai_has_focus = true;
+        app.sidebar.has_focus = true;
+
+        let argv = vec![
+            "sh".to_string(),
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/fake_acp_agent.sh"
+            )
+            .to_string(),
+        ];
+        let cwd = std::env::temp_dir();
+        let mut client = crate::core::acp::AcpClient::spawn_with_env(
+            &argv,
+            &cwd,
+            &[("ACP_FAKE_TOOL_CALL_STATUS_ONLY", "1")],
+        )
+        .expect("fixture agent should spawn");
+        client.initialize();
+        app.engine.acp_client = Some(client);
+        app.engine.settings.acp_agent_command = "already-spawned-above".to_string();
+
+        let mut driver = driver_with_shell(app, config(), 80, 24);
+        for c in "please run tests".chars() {
+            driver.type_char(c);
+        }
+        driver.ctrl_char('s');
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut screen = driver.screen();
+        while !screen.contains("[x] execute:") && Instant::now() < deadline {
+            driver.tick();
+            std::thread::sleep(Duration::from_millis(10));
+            screen = driver.screen();
+        }
+
+        assert!(
+            screen.contains("[x] execute: Run the tests"),
+            "the tool call's LAST status update (completed) must be the \
+             one rendered, together with its title and kind; \
+             screen:\n{screen}"
+        );
+        assert!(
+            !screen.contains("[ ] execute:") && !screen.contains("[~] execute:"),
+            "only the final status should be visible once the turn has \
+             ended, not a stale pending/in_progress rendering; \
+             screen:\n{screen}"
+        );
+    }
+
+    /// #955 (ACP-4) acceptance, end to end through the real `TuiShellApp`/
+    /// `TuiDriver` stack: a `diff` content block on a `tool_call_update`
+    /// opens the change-review surface with both `oldText` and `newText`
+    /// painted (a real `quadraui::DiffView`, not just engine state — see
+    /// this crate's `CLAUDE.md` "rendered output, not state" rule), and
+    /// pressing `a` (accept) writes `newText` to the real file and closes
+    /// the surface. The surface being full-viewport is why the AI panel's
+    /// own transcript ("[x] edit: ...") is not asserted here — it is
+    /// genuinely covered, which the previous test already covers on its
+    /// own scenario.
+    ///
+    /// RED verified: with `Engine::acp_open_review_for_diffs` never called
+    /// from `acp_apply_tool_call_update`, the screen never shows
+    /// `"old line"`/`"new line"` and the accept keypress has nothing to
+    /// act on, so the file on disk is never rewritten — this failed
+    /// exactly that way (screen missing the diff text, file unchanged)
+    /// before the `diff` block was wired to the review surface.
+    #[cfg(unix)]
+    #[test]
+    fn ai_panel_tool_call_diff_opens_change_review_and_accept_writes_file_via_shell_app() {
+        let dir = std::env::temp_dir().join(format!("acp4-tui-tool-call-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("target.txt");
+        std::fs::write(&target, "old line\n").unwrap();
+        let target_str = target.to_string_lossy().into_owned();
+
+        let mut app = TuiShellApp::new(None);
+        app.engine
+            .app_shell
+            .show_panel(&quadraui::WidgetId::new(PANEL_AI));
+        app.engine.ai_has_focus = true;
+        app.sidebar.has_focus = true;
+        app.engine.workspace_root = Some(dir.clone());
+
+        let argv = vec![
+            "sh".to_string(),
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/fake_acp_agent.sh"
+            )
+            .to_string(),
+        ];
+        let cwd = std::env::temp_dir();
+        let mut client = crate::core::acp::AcpClient::spawn_with_env(
+            &argv,
+            &cwd,
+            &[
+                ("ACP_FAKE_TOOL_CALL", "1"),
+                ("ACP_FAKE_TOOL_CALL_PATH", target_str.as_str()),
+            ],
+        )
+        .expect("fixture agent should spawn");
+        client.initialize();
+        app.engine.acp_client = Some(client);
+        app.engine.settings.acp_agent_command = "already-spawned-above".to_string();
+
+        let mut driver = driver_with_shell(app, config(), 80, 24);
+        for c in "please edit".chars() {
+            driver.type_char(c);
+        }
+        driver.ctrl_char('s');
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut screen = driver.screen();
+        while !screen.contains("old line") && Instant::now() < deadline {
+            driver.tick();
+            std::thread::sleep(Duration::from_millis(10));
+            screen = driver.screen();
+        }
+
+        assert!(
+            screen.contains("old line"),
+            "the change-review surface must paint the diff's oldText; \
+             screen:\n{screen}"
+        );
+        assert!(
+            screen.contains("new line"),
+            "the change-review surface must paint the diff's newText; \
+             screen:\n{screen}"
+        );
+
+        // Accept the change: 'a' while the surface is open.
+        driver.type_char('a');
+        driver.tick();
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while std::fs::read_to_string(&target).unwrap_or_default() != "new line\n"
+            && Instant::now() < deadline
+        {
+            driver.tick();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "new line\n",
+            "accepting the change must write newText to the real file"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// #956 (ACP-5) acceptance: slash commands declared via

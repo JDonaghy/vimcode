@@ -3607,6 +3607,31 @@ pub struct Engine {
     /// `acp_client`/`acp_auth_methods` (new client, new handshake, new
     /// choice) — never persisted across sessions.
     pub acp_authenticated: bool,
+    /// Tool calls the agent has announced this session (#955, ACP-4),
+    /// upserted by `toolCallId` — an addressable collection, not an
+    /// append-only log, so a `tool_call_update`'s status transition or
+    /// appended content lands on the same entry `tool_call` created.
+    /// Rendered as collapsed one-line summaries after the real
+    /// conversation (`render::populate_ai_chat_controller`), same
+    /// "synthetic turn appended after" treatment as `acp_plan`.
+    /// Session-scoped: cleared on `ai_clear`/`AgentExited`.
+    pub acp_tool_calls: Vec<crate::core::acp::AcpToolCall>,
+    /// The change-review surface (#955, shared with #525): opened
+    /// automatically when a tool call's content includes a `diff` block.
+    /// Source-agnostic (`crate::core::review::ChangeReviewState`) — this
+    /// field just holds whichever review is currently open, regardless of
+    /// what fed it. Session-scoped: cleared on `ai_clear`/`AgentExited`,
+    /// same as `acp_tool_calls`.
+    pub change_review: Option<crate::core::review::ChangeReviewState>,
+    /// The diff-pane rect (excludes the status footer)
+    /// `render::paint_change_review_rung` last painted the current entry's
+    /// `DiffView` into — ABSOLUTE, backend-native units, same "paint
+    /// writes it, click routing reads it" convention as
+    /// `command_line_rect`. Both backends' mouse-click arms resolve a
+    /// click through `entry.view.layout(this_rect, line_height).hit_test`
+    /// before calling `Engine::change_review_jump_to_hit`, so paint and
+    /// hit-test can never disagree about geometry.
+    pub change_review_diff_rect: std::cell::Cell<quadraui::Rect>,
 
     // --- DAP (Debug Adapter Protocol) state ---
     /// Multi-adapter DAP coordinator. None until first debug session is started.
@@ -4685,6 +4710,9 @@ impl Engine {
             acp_usage: None,
             acp_auth_methods: Vec::new(),
             acp_authenticated: false,
+            acp_tool_calls: Vec::new(),
+            change_review: None,
+            change_review_diff_rect: std::cell::Cell::new(quadraui::Rect::default()),
             dap_manager: None,
             dap_stopped_thread: None,
             dap_breakpoints: HashMap::new(),
@@ -5753,6 +5781,7 @@ mod picker;
 mod plugins;
 mod search;
 pub use search::{find_word_boundaries, SearchKeyResult};
+mod review_ops;
 pub mod sidebar;
 mod source_control;
 pub use source_control::ScKeyResult;

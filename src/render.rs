@@ -3592,7 +3592,20 @@ pub enum ModalKeyRoute {
 pub fn route_modal_key(engine: &Engine) -> ModalKeyRoute {
     // Spell-suggestion selection intercepts all keys (`keys.rs`'s first
     // branch); a dialog is modal and intercepts everything below it.
-    if engine.spell_suggestions.is_some() || engine.dialog.is_some() {
+    // The change-review surface (#955, shared with #525) is the same
+    // shape: a full-viewport overlay that must own every keypress
+    // regardless of which panel would otherwise have focus — in
+    // particular, the AI panel's own focus route sends keys straight to
+    // `render::route_ai_chat_event`, bypassing `Engine::handle_key`
+    // entirely, so without this a keypress meant for a diff opened
+    // *while* the AI panel has focus (exactly when a tool-call diff
+    // arrives) would type into the chat input instead.
+    // `handle_change_review_key` (inside `Engine::handle_key`, same place
+    // as the other two) is the actual interception.
+    if engine.spell_suggestions.is_some()
+        || engine.dialog.is_some()
+        || engine.change_review.is_some()
+    {
         return ModalKeyRoute::Engine;
     }
 
@@ -4602,6 +4615,49 @@ pub fn set_folder_picker_selected(picker: &mut quadraui::FolderPickerController,
     }
     while picker.selected() > idx {
         picker.move_up();
+    }
+}
+
+/// Where a mouse press against the open change-review surface (#955,
+/// shared with #525) lands, resolved against the *exact* geometry
+/// [`paint_change_review_rung`] last painted
+/// (`diff_rect`/`line_height` — both backends read these from
+/// `Engine::change_review_diff_rect`/`Backend::line_height`, same
+/// "paint writes it, click routing reads it" contract as
+/// `command_line_rect`).
+///
+/// Deliberately *not* folded into [`route_modal_overlay_click`] /
+/// [`MOUSE_ARBITRATION_ORDER`] — same call [`route_folder_picker_click`]
+/// makes and for the same reason: this surface swallows every click while
+/// open (like a modal dialog) rather than competing for z-order with the
+/// other overlays, so both backends check it first and return early.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChangeReviewClickRoute {
+    /// Landed on a real diff row — jump to the file/line it represents
+    /// (`Engine::change_review_jump_to_hit`).
+    Jump(quadraui::DiffViewHit),
+    /// Landed inside the surface but not on a row (a unified hunk header,
+    /// the status footer, or empty space) — swallow, no navigation.
+    Consume,
+}
+
+/// Resolve a click at `(x, y)` (ABSOLUTE, backend-native units) against the
+/// currently-shown entry's `DiffView`, re-deriving the same geometry
+/// [`paint_change_review_rung`] painted from (`entry.view.layout(diff_rect,
+/// line_height)`) rather than trusting a cached one, so paint and
+/// hit-testing can never disagree (`DiffViewGeometry::hit_test`'s own
+/// contract).
+pub fn route_change_review_click(
+    diff_rect: quadraui::Rect,
+    view: &quadraui::DiffView,
+    line_height: f32,
+    x: f32,
+    y: f32,
+) -> ChangeReviewClickRoute {
+    let geometry = view.layout(diff_rect, line_height);
+    match geometry.hit_test(x, y) {
+        hit @ quadraui::DiffViewHit::Row { .. } => ChangeReviewClickRoute::Jump(hit),
+        _ => ChangeReviewClickRoute::Consume,
     }
 }
 
@@ -9307,6 +9363,12 @@ pub enum FrameOp {
     TabSwitcher,
     /// `Backend::draw_context_menu`.
     ContextMenu,
+    /// The change-review surface (#955, shared with #525) —
+    /// [`paint_change_review_rung`] on both backends. A full-viewport
+    /// `quadraui::DiffView` for the currently-shown proposed change, so it
+    /// sits above every other overlay except a modal dialog (an
+    /// "agent exited" dialog, say, should still win) and the toast stack.
+    ChangeReview,
     /// `Backend::draw_dialog` — modal, so above every rung but the toasts,
     /// matching [`route_modal_overlay_click`]'s own arbitration.
     Dialog,
@@ -9333,6 +9395,7 @@ impl FrameOp {
                 | FrameOp::UnifiedPicker
                 | FrameOp::TabSwitcher
                 | FrameOp::ContextMenu
+                | FrameOp::ChangeReview
                 | FrameOp::Dialog
                 | FrameOp::ToastStack
         )
@@ -9353,7 +9416,7 @@ impl FrameOp {
 /// The five chrome rungs come first, the eight overlay rungs
 /// ([`FrameOp::is_overlay`]) are the tail: every chrome rung is composed before
 /// the first overlay rung, on both backends.
-pub const FRAME_Z_ORDER: [FrameOp; 14] = [
+pub const FRAME_Z_ORDER: [FrameOp; 15] = [
     // ── chrome ───────────────────────────────────────────────────────────
     FrameOp::MenuRow,
     FrameOp::SidebarPanel,
@@ -9368,6 +9431,7 @@ pub const FRAME_Z_ORDER: [FrameOp; 14] = [
     FrameOp::UnifiedPicker,
     FrameOp::TabSwitcher,
     FrameOp::ContextMenu,
+    FrameOp::ChangeReview,
     FrameOp::Dialog,
     FrameOp::ToastStack,
 ];
@@ -9379,7 +9443,7 @@ pub const FRAME_Z_ORDER: [FrameOp; 14] = [
 /// exactly these rungs must have been composed, in this order" — the #735
 /// headline acceptance criterion.
 ///
-/// Eleven of the thirteen fields are derived from `ScreenLayout` +
+/// Twelve of the fourteen fields are derived from `ScreenLayout` +
 /// `AppShellLayout` by [`Self::from_screen`]. The two that are not
 /// (`toast_stack`, and any backend-specific suppression) are left to the
 /// caller, because they are engine/geometry state rather than screen state.
@@ -9401,6 +9465,7 @@ pub struct FramePresence {
     pub unified_picker: bool,
     pub tab_switcher: bool,
     pub context_menu: bool,
+    pub change_review: bool,
     pub dialog: bool,
     pub toast_stack: bool,
 }
@@ -9462,6 +9527,7 @@ impl FramePresence {
                 .context_menu
                 .as_ref()
                 .is_some_and(|p| !p.items.is_empty()),
+            change_review: screen.change_review.is_some(),
             dialog: screen.dialog.is_some(),
             toast_stack: false,
         }
@@ -9482,6 +9548,7 @@ impl FramePresence {
             FrameOp::UnifiedPicker => self.unified_picker,
             FrameOp::TabSwitcher => self.tab_switcher,
             FrameOp::ContextMenu => self.context_menu,
+            FrameOp::ChangeReview => self.change_review,
             FrameOp::Dialog => self.dialog,
             FrameOp::ToastStack => self.toast_stack,
         }
@@ -9778,6 +9845,70 @@ pub fn paint_toast_stack_rung(
     engine.toast_layout.replace(Some(layout));
 }
 
+/// The change-review surface's whole paint body (#955, shared with #525):
+/// a full-viewport `quadraui::DiffView` for the currently-shown entry,
+/// plus a one-row status footer ("file i of n", the entry's path, and key
+/// hints). Both backends call this verbatim from their own frame-op walk —
+/// no per-backend diff-rendering logic, matching every other primitive
+/// under `docs/QUADRAUI_GUIDE.md`.
+///
+/// Caches the diff pane's own rect on `engine.change_review_diff_rect` so
+/// a later mouse click can resolve through the *exact* geometry this call
+/// painted (`entry.view.layout(rect, line_height).hit_test`) — same
+/// "paint writes it, click routing reads it" contract as
+/// `command_line_rect`.
+pub fn paint_change_review_rung(
+    b: &mut dyn quadraui::Backend,
+    engine: &Engine,
+    review: &crate::core::review::ChangeReviewState,
+    viewport: quadraui::Rect,
+    theme: &Theme,
+) {
+    let Some(entry) = review.current_entry() else {
+        return;
+    };
+    let line_height = b.line_height().max(1.0);
+    let footer_h = line_height.min(viewport.height);
+    let diff_rect = quadraui::Rect::new(
+        viewport.x,
+        viewport.y,
+        viewport.width,
+        (viewport.height - footer_h).max(0.0),
+    );
+    let _ = b.draw_diff_view(diff_rect, &entry.view);
+    engine.change_review_diff_rect.set(diff_rect);
+
+    let decision = match entry.decision {
+        crate::core::review::ChangeDecision::Pending => "pending",
+        crate::core::review::ChangeDecision::Accepted => "accepted",
+        crate::core::review::ChangeDecision::Rejected => "rejected",
+    };
+    let msg = format!(
+        " Change {}/{} ({decision}) \u{b7} {} \u{b7} a=accept r=reject ]/[=hunk n/p=file Esc=close ",
+        review.current + 1,
+        review.entries.len(),
+        entry.change.path,
+    );
+    let status = quadraui::StatusBar {
+        id: quadraui::WidgetId::new("change-review-status"),
+        left_segments: vec![quadraui::StatusBarSegment {
+            text: msg,
+            fg: theme.status_fg,
+            bg: theme.status_bg,
+            bold: false,
+            action_id: None,
+        }],
+        right_segments: vec![],
+    };
+    let footer_rect = quadraui::Rect::new(
+        viewport.x,
+        diff_rect.y + diff_rect.height,
+        viewport.width,
+        footer_h,
+    );
+    let _ = b.draw_status_bar_interactive(footer_rect, &status, &quadraui::InteractionState::new());
+}
+
 /// Where the menu bar's labels end, in absolute coordinates.
 ///
 /// `vi.bounds.x` is already absolute — quadraui's `MenuBar::layout` starts its
@@ -9994,9 +10125,10 @@ pub fn command_line_view(command: &CommandLineData) -> quadraui::CommandLine {
 ///
 /// It could not be written before #766: until the chrome and overlay halves
 /// were one sequence there was no single artefact to compare, only two that a
-/// backend could get individually right and jointly wrong. Nine of the fourteen
-/// rungs are live and five are not, which is what keeps it *discriminating* —
-/// it must never degenerate into "whatever [`FRAME_Z_ORDER`] contains".
+/// backend could get individually right and jointly wrong. Nine of the
+/// fifteen rungs are live and six are not, which is what keeps it
+/// *discriminating* — it must never degenerate into "whatever
+/// [`FRAME_Z_ORDER`] contains".
 #[cfg(test)]
 pub(crate) fn frame_sequence_fixture() -> Vec<FrameOp> {
     compose_frame(&FramePresence {
@@ -10014,6 +10146,7 @@ pub(crate) fn frame_sequence_fixture() -> Vec<FrameOp> {
         unified_picker: false,
         tab_switcher: false,
         context_menu: true,
+        change_review: false,
         dialog: true,
         toast_stack: false,
     })
@@ -11811,6 +11944,13 @@ pub struct ScreenLayout {
     pub editor_hover: Option<EditorHoverPopupData>,
     /// Git diff peek popup — `Some` when the user is previewing a diff hunk.
     pub diff_peek: Option<DiffPeekPopup>,
+    /// The change-review surface (#955, shared with #525) — `Some` when a
+    /// tool-call `diff` (or a future #525 git-branch diff feed) is open
+    /// for review. Cloned wholesale from `Engine::change_review` rather
+    /// than converted field-by-field like `DiffPeekPopup`: it already
+    /// carries a fully paint-ready `quadraui::DiffView` per entry, so
+    /// there is nothing this projection needs to compute.
+    pub change_review: Option<crate::core::review::ChangeReviewState>,
     // `diff_toolbar` used to sit here — the single-group mirror of
     // `GroupTabBar::diff_toolbar`.
     //
@@ -16298,6 +16438,7 @@ pub fn build_screen_layout_with_breadcrumb_row(
             anchor_line: dp.anchor_line,
             hunk_lines: dp.hunk_lines.clone(),
         }),
+        change_review: engine.change_review.clone(),
         panel_hover: engine.panel_hover.as_ref().map(|ph| PanelHoverPopupData {
             markdown: ph.markdown.clone(),
             line_text: ph.line_text.clone(),
@@ -18893,6 +19034,26 @@ pub fn populate_ai_chat_controller(engine: &Engine, theme: &Theme) {
             }
         })
         .collect();
+
+    // #955 (ACP-4): tool calls, rendered as one collapsed one-line summary
+    // turn per call, appended *after* the real conversation — same
+    // "synthetic turn, never mixed into `ai_messages`" treatment #956 gave
+    // the plan checklist below. `tool_call_summary_line` already bakes in
+    // the status glyph, so a `tool_call_update`'s `pending -> in_progress
+    // -> completed | failed` transition is visible here without any
+    // expand/collapse state to track — every call always renders its
+    // current status, every frame.
+    for call in &engine.acp_tool_calls {
+        turns.push(quadraui::ChatTurn {
+            role: quadraui::ChatRole::System,
+            text: quadraui::StyledText::colored(
+                crate::core::acp::tool_call_summary_line(call),
+                thought_fg,
+            ),
+            timestamp_unix: None,
+            line_scales: Vec::new(),
+        });
+    }
 
     // #956 (ACP-5): the agent's current plan, rendered as one synthetic
     // checklist turn appended *after* the real conversation — never mixed
@@ -24578,6 +24739,7 @@ mod tests {
                 FrameOp::UnifiedPicker,
                 FrameOp::TabSwitcher,
                 FrameOp::ContextMenu,
+                FrameOp::ChangeReview,
                 FrameOp::Dialog,
                 FrameOp::ToastStack,
             ],
@@ -24678,9 +24840,14 @@ mod tests {
             // `FolderPicker`: shared on both backends since #815, but not
             // folded into this ladder — see `route_folder_picker_click`'s
             // doc comment for why it is checked directly instead.
+            // `ChangeReview` (#955): same policy — see
+            // `route_change_review_click`'s doc comment.
             let routed_elsewhere = matches!(
                 op,
-                FrameOp::MenuDropdown | FrameOp::CommandCenter | FrameOp::FolderPicker
+                FrameOp::MenuDropdown
+                    | FrameOp::CommandCenter
+                    | FrameOp::FolderPicker
+                    | FrameOp::ChangeReview
             );
             assert_eq!(
                 arbitrated, !routed_elsewhere,
@@ -24740,6 +24907,7 @@ mod tests {
             unified_picker: true,
             tab_switcher: true,
             context_menu: true,
+            change_review: true,
             dialog: true,
             toast_stack: true,
         };

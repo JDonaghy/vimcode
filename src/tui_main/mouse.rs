@@ -680,6 +680,33 @@ pub(super) fn handle_mouse(
         }
     }
 
+    // ── Change-review surface mouse handling (#955, shared with #525) ────────
+    //
+    // Same "swallow every click while open, checked before the modal
+    // ladder" policy as the folder picker above — see
+    // `render::route_change_review_click`'s doc comment.
+    if engine.change_review.is_some() {
+        if let MouseEventKind::Down(MouseButton::Left) = ev.kind {
+            let diff_rect = engine.change_review_diff_rect.get();
+            let view = engine
+                .change_review
+                .as_ref()
+                .and_then(|r| r.current_entry())
+                .map(|e| e.view.clone());
+            if let Some(view) = view {
+                match render::route_change_review_click(
+                    diff_rect, &view, 1.0, col as f32, row as f32,
+                ) {
+                    render::ChangeReviewClickRoute::Jump(hit) => {
+                        engine.change_review_jump_to_hit(hit);
+                    }
+                    render::ChangeReviewClickRoute::Consume => {}
+                }
+            }
+            return sidebar_width;
+        }
+    }
+
     // ── Unified picker: drag / scroll follow-through ──────────────────────────
     //
     // The picker's *click* rung is shared with GTK

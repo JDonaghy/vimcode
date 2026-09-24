@@ -113,7 +113,23 @@
 #                           reflecting the second update. Then a usage_update
 #                           (inputTokens/outputTokens/totalCostUsd), then the
 #                           usual agent_message_chunk + end_turn, no fs/*
-#                           request (out of scope for this scenario).
+#                           request (out of scope for this scenario). With
+#                           $ACP_FAKE_TOOL_CALL_STATUS_ONLY set (#955,
+#                           ACP-4): the same tool_call/tool_call_update
+#                           status-transition shape as $ACP_FAKE_TOOL_CALL
+#                           below, but with no diff content, so a test can
+#                           see the transcript's status glyph without the
+#                           change-review surface covering it. With
+#                           $ACP_FAKE_TOOL_CALL set (#955, ACP-4): emits a
+#                           "tool_call" (id "tc-1", pending), a
+#                           "tool_call_update" moving it to in_progress,
+#                           then a second "tool_call_update" moving it to
+#                           completed AND attaching a "diff" content block
+#                           (path "src/main.rs") on that same update — so a
+#                           test can confirm both the status transition and
+#                           the change-review surface opening come from a
+#                           tool_call_update, not just the initial
+#                           tool_call.
 #   - session/cancel     -> notification, silently acknowledged (no reply).
 #   - session/set_mode   -> replies with an empty result, then emits a
 #                           current_mode_update notification carrying the
@@ -244,6 +260,30 @@ while IFS= read -r line; do
         printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"plan","entries":[{"content":"Write the fix","status":"completed"},{"content":"Add tests","status":"pending"}]}}}\n'
         printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"usage_update","usage":{"inputTokens":120,"outputTokens":45,"totalCostUsd":0.0067}}}}\n'
         printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Plan ready"}}}}\n'
+        printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id"
+      elif [ -n "$ACP_FAKE_TOOL_CALL_STATUS_ONLY" ]; then
+        # #955 (ACP-4): the same tool-call/status-transition shape as
+        # $ACP_FAKE_TOOL_CALL below, but with NO diff content — so a test
+        # can observe the transcript's rendered status glyph without the
+        # change-review surface (a full-viewport overlay) painting over
+        # it.
+        printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"tool_call","toolCallId":"tc-1","title":"Run the tests","kind":"execute","status":"pending"}}}\n'
+        printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"tool_call_update","toolCallId":"tc-1","status":"in_progress"}}}\n'
+        printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"tool_call_update","toolCallId":"tc-1","status":"completed"}}}\n'
+        printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id"
+      elif [ -n "$ACP_FAKE_TOOL_CALL" ]; then
+        # #955 (ACP-4): announce a tool call, transition it through
+        # in_progress -> completed via tool_call_update, then attach a
+        # `diff` content block on the *same* completed update — proving
+        # a `tool_call_update` (not just the initial `tool_call`) is what
+        # opens the change-review surface. `$ACP_FAKE_TOOL_CALL_PATH`
+        # (default "src/main.rs") lets a test point the diff at a real
+        # scratch file so an "accept" round-trip has somewhere safe to
+        # write.
+        tc_path="${ACP_FAKE_TOOL_CALL_PATH:-src/main.rs}"
+        printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"tool_call","toolCallId":"tc-1","title":"Edit %s","kind":"edit","status":"pending","locations":[{"path":"%s","line":1}]}}}\n' "$tc_path" "$tc_path"
+        printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"tool_call_update","toolCallId":"tc-1","status":"in_progress"}}}\n'
+        printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"tool_call_update","toolCallId":"tc-1","status":"completed","content":[{"type":"diff","path":"%s","oldText":"old line\\n","newText":"new line\\n"}]}}}\n' "$tc_path"
         printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id"
       elif [ -n "$ACP_FAKE_REQUEST_PERMISSION" ]; then
         printf '{"jsonrpc":"2.0","id":9002,"method":"session/request_permission","params":{"sessionId":"sess-1","toolCall":{"title":"Edit src/main.rs","kind":"edit","locations":[{"path":"src/main.rs","line":42}]},"options":[{"optionId":"allow-once","name":"Allow Once","kind":"allow_once"},{"optionId":"allow-always","name":"Always Allow","kind":"allow_always"},{"optionId":"reject-once","name":"Reject","kind":"reject_once"}]}}\n'

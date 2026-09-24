@@ -964,6 +964,218 @@ pub fn permission_outcome_cancelled() -> serde_json::Value {
 }
 
 // ---------------------------------------------------------------------------
+// tool_call / tool_call_update (#955, ACP-4)
+// ---------------------------------------------------------------------------
+
+/// Lifecycle status of an [`AcpToolCall`], per the ACP v1 `tool_call`/
+/// `tool_call_update` `status` field. Unknown/missing defaults to
+/// [`Self::Pending`] — same "never default toward done on malformed
+/// input" policy as [`AcpPlanEntryStatus`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AcpToolCallStatus {
+    Pending,
+    InProgress,
+    Completed,
+    Failed,
+}
+
+impl AcpToolCallStatus {
+    fn parse(s: Option<&str>) -> Self {
+        match s {
+            Some("in_progress") => Self::InProgress,
+            Some("completed") => Self::Completed,
+            Some("failed") => Self::Failed,
+            _ => Self::Pending,
+        }
+    }
+
+    /// Bracketed glyph used as the transcript summary line's prefix, e.g.
+    /// `[~] edit: Edit src/main.rs` — visually distinct at every stage of
+    /// `pending -> in_progress -> completed | failed` without needing
+    /// colour (both TUI and GTK render this the same plain text).
+    pub fn glyph(self) -> &'static str {
+        match self {
+            Self::Pending => "[ ]",
+            Self::InProgress => "[~]",
+            Self::Completed => "[x]",
+            Self::Failed => "[!]",
+        }
+    }
+}
+
+/// One block of an [`AcpToolCall::content`] list, per the ACP v1 schema's
+/// tagged union. `{type: "content"}` (text/image output) — only the text
+/// case renders; image content parses to `None` rather than an
+/// empty-string block, so it's visibly absent instead of a confusing
+/// blank line. `{type: "diff", path, oldText, newText}` is the shape
+/// #955 exists for — it opens the shared change-review surface
+/// (`crate::core::review`). `{type: "terminal"}` is out of scope for the
+/// whole ACP track (see this module's top doc, "Skip `terminal/*`") but
+/// still parses to a variant (rather than being dropped) so a tool call
+/// that is entirely terminal content still round-trips as "has content".
+#[derive(Debug, Clone, PartialEq)]
+pub enum AcpToolCallContentBlock {
+    Text(String),
+    Diff {
+        path: String,
+        old_text: Option<String>,
+        new_text: String,
+    },
+    Terminal,
+}
+
+fn parse_tool_call_content_block(block: &serde_json::Value) -> Option<AcpToolCallContentBlock> {
+    match block.get("type").and_then(|v| v.as_str())? {
+        "content" => {
+            let text = block.get("content")?.get("text")?.as_str()?.to_string();
+            Some(AcpToolCallContentBlock::Text(text))
+        }
+        "diff" => {
+            let path = block.get("path")?.as_str()?.to_string();
+            let new_text = block.get("newText")?.as_str()?.to_string();
+            let old_text = block
+                .get("oldText")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            Some(AcpToolCallContentBlock::Diff {
+                path,
+                old_text,
+                new_text,
+            })
+        }
+        "terminal" => Some(AcpToolCallContentBlock::Terminal),
+        _ => None,
+    }
+}
+
+fn parse_tool_call_content(update: &serde_json::Value) -> Vec<AcpToolCallContentBlock> {
+    update
+        .get("content")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(parse_tool_call_content_block)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn parse_tool_call_locations(update: &serde_json::Value) -> Vec<(String, Option<u32>)> {
+    update
+        .get("locations")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|loc| {
+                    let path = loc.get("path")?.as_str()?.to_string();
+                    let line = loc.get("line").and_then(|v| v.as_u64()).map(|n| n as u32);
+                    Some((path, line))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// One tool call the agent is executing or has executed — the addressable
+/// unit `tool_call`/`tool_call_update` operate on, keyed by `id`
+/// (`toolCallId` on the wire). Stored as an upserted `Vec` — not an
+/// append-only log — by `Engine::acp_tool_calls`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AcpToolCall {
+    pub id: String,
+    pub title: String,
+    pub kind: String,
+    pub status: AcpToolCallStatus,
+    pub locations: Vec<(String, Option<u32>)>,
+    pub content: Vec<AcpToolCallContentBlock>,
+}
+
+/// Parse a `session/update`'s `tool_call` variant — the tool call's
+/// initial announcement. Returns `None` for a non-`tool_call` update or
+/// one missing `toolCallId`/`title` (the two the issue marks required).
+/// `kind` defaults to `"other"`, `status` to `Pending` — same "never
+/// default toward done/allowed on missing data" policy used throughout
+/// this module.
+pub fn parse_tool_call(update: &serde_json::Value) -> Option<AcpToolCall> {
+    if update.get("sessionUpdate").and_then(|v| v.as_str()) != Some("tool_call") {
+        return None;
+    }
+    let id = update.get("toolCallId")?.as_str()?.to_string();
+    let title = update.get("title")?.as_str()?.to_string();
+    let kind = update
+        .get("kind")
+        .and_then(|v| v.as_str())
+        .unwrap_or("other")
+        .to_string();
+    let status = AcpToolCallStatus::parse(update.get("status").and_then(|v| v.as_str()));
+    Some(AcpToolCall {
+        id,
+        title,
+        kind,
+        status,
+        locations: parse_tool_call_locations(update),
+        content: parse_tool_call_content(update),
+    })
+}
+
+/// A parsed `tool_call_update` — a patch against an existing
+/// [`AcpToolCall`] by `id`, never a wholesale replacement. `status: None`
+/// means the update didn't touch status; `content: None` means the wire
+/// message had no `content` field at all. A present `content` is
+/// **appended** to the existing call's content by the caller (never
+/// replaced) — this issue's own framing: "status transitions and
+/// appended content".
+#[derive(Debug, Clone, PartialEq)]
+pub struct AcpToolCallUpdate {
+    pub id: String,
+    pub status: Option<AcpToolCallStatus>,
+    pub content: Option<Vec<AcpToolCallContentBlock>>,
+}
+
+/// Parse a `session/update`'s `tool_call_update` variant. Returns `None`
+/// for a non-`tool_call_update` update or one missing `toolCallId`.
+pub fn parse_tool_call_update(update: &serde_json::Value) -> Option<AcpToolCallUpdate> {
+    if update.get("sessionUpdate").and_then(|v| v.as_str()) != Some("tool_call_update") {
+        return None;
+    }
+    let id = update.get("toolCallId")?.as_str()?.to_string();
+    let status = update
+        .get("status")
+        .and_then(|v| v.as_str())
+        .map(|s| AcpToolCallStatus::parse(Some(s)));
+    let content = update.get("content").and_then(|v| v.as_array()).map(|arr| {
+        arr.iter()
+            .filter_map(parse_tool_call_content_block)
+            .collect()
+    });
+    Some(AcpToolCallUpdate {
+        id,
+        status,
+        content,
+    })
+}
+
+/// Render one [`AcpToolCall`] as its collapsed transcript summary line —
+/// `title` + `kind` per the issue's acceptance bar, prefixed by
+/// [`AcpToolCallStatus::glyph`] so `pending -> in_progress -> completed |
+/// failed` transitions are visible without expanding anything, plus one
+/// indented `-> path[:line]` line per location. Content blocks
+/// (`Text`/`Terminal`) are never inlined here — "collapsed by default" —
+/// a `Diff` block instead opens the change-review surface
+/// (`crate::core::engine::review_ops::acp_open_review_for_new_diffs`)
+/// rather than dumping a patch into the chat log.
+pub fn tool_call_summary_line(call: &AcpToolCall) -> String {
+    let mut line = format!("{} {}: {}", call.status.glyph(), call.kind, call.title);
+    for (path, ln) in &call.locations {
+        match ln {
+            Some(l) => line.push_str(&format!("\n    \u{2192} {path}:{l}")),
+            None => line.push_str(&format!("\n    \u{2192} {path}")),
+        }
+    }
+    line
+}
+
+// ---------------------------------------------------------------------------
 // AcpClient — owns one agent subprocess and its session lifecycle
 // ---------------------------------------------------------------------------
 
@@ -2006,6 +2218,176 @@ mod tests {
         assert_eq!(
             permission_outcome_cancelled(),
             serde_json::json!({"outcome": {"outcome": "cancelled"}})
+        );
+    }
+
+    // ---- tool_call / tool_call_update: pure, no subprocess (#955, ACP-4) ----
+
+    #[test]
+    fn parse_tool_call_reads_title_kind_status_locations_and_content() {
+        let update = serde_json::json!({
+            "sessionUpdate": "tool_call",
+            "toolCallId": "tc-1",
+            "title": "Edit src/main.rs",
+            "kind": "edit",
+            "status": "in_progress",
+            "locations": [{"path": "src/main.rs", "line": 10}],
+            "content": [
+                {"type": "content", "content": {"type": "text", "text": "hello"}},
+                {"type": "diff", "path": "src/main.rs", "oldText": "old\n", "newText": "new\n"},
+                {"type": "terminal", "terminalId": "t1"},
+            ],
+        });
+        let call = parse_tool_call(&update).expect("should parse");
+        assert_eq!(call.id, "tc-1");
+        assert_eq!(call.title, "Edit src/main.rs");
+        assert_eq!(call.kind, "edit");
+        assert_eq!(call.status, AcpToolCallStatus::InProgress);
+        assert_eq!(call.locations, vec![("src/main.rs".to_string(), Some(10))]);
+        assert_eq!(call.content.len(), 3);
+        assert_eq!(
+            call.content[0],
+            AcpToolCallContentBlock::Text("hello".to_string())
+        );
+        assert_eq!(
+            call.content[1],
+            AcpToolCallContentBlock::Diff {
+                path: "src/main.rs".to_string(),
+                old_text: Some("old\n".to_string()),
+                new_text: "new\n".to_string(),
+            }
+        );
+        assert_eq!(call.content[2], AcpToolCallContentBlock::Terminal);
+    }
+
+    #[test]
+    fn parse_tool_call_defaults_missing_kind_and_status() {
+        let update = serde_json::json!({
+            "sessionUpdate": "tool_call",
+            "toolCallId": "tc-1",
+            "title": "Do a thing",
+        });
+        let call = parse_tool_call(&update).expect("should parse");
+        assert_eq!(call.kind, "other");
+        assert_eq!(call.status, AcpToolCallStatus::Pending);
+        assert!(call.locations.is_empty());
+        assert!(call.content.is_empty());
+    }
+
+    #[test]
+    fn parse_tool_call_requires_id_and_title() {
+        assert!(parse_tool_call(&serde_json::json!({
+            "sessionUpdate": "tool_call", "title": "t",
+        }))
+        .is_none());
+        assert!(parse_tool_call(&serde_json::json!({
+            "sessionUpdate": "tool_call", "toolCallId": "tc-1",
+        }))
+        .is_none());
+        // Wrong kind of update entirely.
+        assert!(parse_tool_call(&serde_json::json!({
+            "sessionUpdate": "plan", "toolCallId": "tc-1", "title": "t",
+        }))
+        .is_none());
+    }
+
+    /// A `diff` block with `oldText: null` (a new file, per the ACP v1
+    /// schema's `string | null`) must parse to `old_text: None`, not a
+    /// dropped block or an `Ok(Some(String::new()))` that erases the
+    /// distinction.
+    #[test]
+    fn parse_tool_call_diff_block_null_old_text_is_new_file() {
+        let update = serde_json::json!({
+            "sessionUpdate": "tool_call",
+            "toolCallId": "tc-1",
+            "title": "Create file",
+            "content": [
+                {"type": "diff", "path": "src/new.rs", "oldText": null, "newText": "fn main() {}\n"},
+            ],
+        });
+        let call = parse_tool_call(&update).expect("should parse");
+        assert_eq!(
+            call.content[0],
+            AcpToolCallContentBlock::Diff {
+                path: "src/new.rs".to_string(),
+                old_text: None,
+                new_text: "fn main() {}\n".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_tool_call_update_reads_status_and_appends_content() {
+        let update = serde_json::json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "tc-1",
+            "status": "completed",
+            "content": [
+                {"type": "content", "content": {"type": "text", "text": "done"}},
+            ],
+        });
+        let upd = parse_tool_call_update(&update).expect("should parse");
+        assert_eq!(upd.id, "tc-1");
+        assert_eq!(upd.status, Some(AcpToolCallStatus::Completed));
+        assert_eq!(
+            upd.content,
+            Some(vec![AcpToolCallContentBlock::Text("done".to_string())])
+        );
+    }
+
+    #[test]
+    fn parse_tool_call_update_status_only_leaves_content_none() {
+        let update = serde_json::json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "tc-1",
+            "status": "failed",
+        });
+        let upd = parse_tool_call_update(&update).expect("should parse");
+        assert_eq!(upd.status, Some(AcpToolCallStatus::Failed));
+        assert_eq!(upd.content, None);
+    }
+
+    #[test]
+    fn parse_tool_call_update_requires_id() {
+        assert!(parse_tool_call_update(&serde_json::json!({
+            "sessionUpdate": "tool_call_update", "status": "completed",
+        }))
+        .is_none());
+    }
+
+    #[test]
+    fn tool_call_summary_line_includes_glyph_kind_title_and_locations() {
+        let call = AcpToolCall {
+            id: "tc-1".to_string(),
+            title: "Edit src/main.rs".to_string(),
+            kind: "edit".to_string(),
+            status: AcpToolCallStatus::InProgress,
+            locations: vec![("src/main.rs".to_string(), Some(10))],
+            content: vec![],
+        };
+        let line = tool_call_summary_line(&call);
+        assert_eq!(
+            line,
+            "[~] edit: Edit src/main.rs\n    \u{2192} src/main.rs:10"
+        );
+    }
+
+    #[test]
+    fn tool_call_status_glyph_transitions_are_visually_distinct() {
+        let glyphs: Vec<&str> = [
+            AcpToolCallStatus::Pending,
+            AcpToolCallStatus::InProgress,
+            AcpToolCallStatus::Completed,
+            AcpToolCallStatus::Failed,
+        ]
+        .iter()
+        .map(|s| s.glyph())
+        .collect();
+        let unique: std::collections::HashSet<&str> = glyphs.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            glyphs.len(),
+            "every status must have a distinct glyph"
         );
     }
 
