@@ -24178,6 +24178,240 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // ── #1344: extension install exit status / combined LSP+DAP outcome —
+    // black-box coverage ──────────────────────────────────────────────────
+    //
+    // The first review pass on #1344 asserted only on `Engine::message`
+    // directly, via `Engine::new()` + a hand-built `InstallContext` calling
+    // the private `finalize_install_from_terminal` (see the `tests` module
+    // at the bottom of `src/core/engine/terminal_ops.rs`) — internal state,
+    // never anything painted. Exactly the anti-pattern `no_install_command_
+    // error_paints_on_command_line_via_shell_app` (#918) above already
+    // documents CLAUDE.md's Testing section calling out. The two tests
+    // below close that gap for #1344's two user-visible message changes by
+    // driving the *real* install path — `Engine::ext_install_from_registry`
+    // (which sets `pending_terminal_command`/`pending_install_context`,
+    // exactly as `:ExtInstall` does) through a real `TuiShellApp` +
+    // `driver_with_shell`, letting `driver.tick()` spawn the install
+    // terminal pane (a real PTY, `sh -c '...'`) the same way production
+    // does, forcing the shell to terminate once the wrapper reaches its
+    // exit prompt (see `force_terminal_exit`'s doc for why a single
+    // synthetic Enter isn't reliable here) so `poll_terminal` calls
+    // `finalize_install_from_terminal` for real, and reading the painted
+    // command line back with `driver.screen()`.
+    //
+    // Both commands use `sh` builtins/paths guaranteed present on any Unix
+    // box that can build vimcode (no `curl`/`pip`/network involved), and
+    // `#[cfg(unix)]`-gate for the same reason `tests/terminal_wheel.rs`'s
+    // real-PTY tests do: a Windows wrapper flavour (PowerShell) is covered
+    // separately by the pure-function tests in `terminal_ops.rs`'s own
+    // `tests` module.
+
+    /// Poll `driver.tick()` (which reaches `Engine::poll_idle` →
+    /// `poll_terminal` exactly as a live TUI event loop does) until
+    /// `predicate(driver.screen())` holds or `timeout` elapses. Real
+    /// `thread::sleep` between polls, matching the bounded-not-fixed pattern
+    /// `tick_refreshes_sc_panel_asynchronously_not_on_the_event_loop_thread`
+    /// above already uses for a background thread — this is a real PTY
+    /// child process instead, but the same "don't busy-loop, don't hang the
+    /// suite" tradeoff applies.
+    fn poll_until_screen(
+        driver: &mut quadraui::tui::testing::TuiDriver<impl quadraui::runner::AppLogic>,
+        timeout: Duration,
+        mut predicate: impl FnMut(&str) -> bool,
+    ) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            driver.tick();
+            if predicate(&driver.screen()) {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Type `exit` + Enter into the focused terminal pane to force the
+    /// install shell to terminate.
+    ///
+    /// The install wrapper's own `read __dummy` / `exit` tail (see
+    /// `build_terminal_install_wrapper`) is written to the PTY in the same
+    /// `write_input` call as the rest of the script, all at once, well
+    /// before any real keypress — so on a fast command the shell's `read`
+    /// can race ahead and consume the wrapper's own trailing `exit\n` bytes
+    /// as `$__dummy`'s value before a synthetic `Enter` from this driver
+    /// ever lands, leaving the shell back at its own interactive prompt
+    /// instead of terminated (observed directly: the first cut of these
+    /// tests pressed Enter once and the pane never reached `is_exited()`).
+    /// Explicitly typing `exit` is correct either way: if the race already
+    /// fired, the shell is sitting at a fresh interactive prompt and `exit`
+    /// terminates it directly; if it hasn't, `exit` becomes `$__dummy`'s
+    /// value and the wrapper's own trailing `exit` line still runs right
+    /// after. Either path ends with the pane's shell process gone, which is
+    /// all `poll_terminal`'s `is_exited()` check cares about.
+    fn force_terminal_exit(
+        driver: &mut quadraui::tui::testing::TuiDriver<impl quadraui::runner::AppLogic>,
+    ) {
+        for ch in "exit".chars() {
+            driver.type_char(ch);
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
+    }
+
+    /// #1344 core acceptance case: a non-zero exit code from the install
+    /// command must paint "failed (exit N)" on the command line, and must
+    /// NOT claim "not found on PATH" — the exact confusion #1344 reports
+    /// (a failed install command used to surface only as a misleading
+    /// PATH-lookup miss).
+    ///
+    /// **Verified RED against unfixed `develop`:** before #1344, a non-zero
+    /// exit code was never recorded or read back at all — finalize fell
+    /// straight through to the binary-lookup path and reported "LSP binary
+    /// '...' was not found on PATH" instead, so the `"failed (exit 7)"`
+    /// assertion below failed and the `"not found"` negative assertion
+    /// would have passed for the wrong reason (there was no non-zero-exit
+    /// handling to fail).
+    #[test]
+    #[cfg(unix)]
+    fn extension_install_failure_exit_code_paints_via_shell_app() {
+        use crate::core::extensions::{ExtensionManifest, LspConfig};
+
+        let mut app = TuiShellApp::new_for_test();
+        let ext_name = "vimcode-test-ext-1344-fail".to_string();
+        app.engine.ext_registry = Some(vec![ExtensionManifest {
+            name: ext_name.clone(),
+            display_name: "Fake Extension (1344 failure test)".to_string(),
+            language_ids: vec!["vimcode-test-lang-1344-fail".to_string()],
+            lsp: LspConfig {
+                binary: "vimcode-test-nonexistent-binary-1344-fail".to_string(),
+                // A subshell exit, not a bare `exit 7` — the latter would
+                // terminate the *outer* interactive shell before the
+                // wrapper's own `$?`-capture line ever ran.
+                install: "sh -c 'exit 7'".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        }]);
+
+        app.engine.ext_install_from_registry(&ext_name);
+        assert!(
+            app.engine.pending_terminal_command.is_some(),
+            "precondition: the manifest's install command must be queued"
+        );
+
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+
+        assert!(
+            poll_until_screen(&mut driver, Duration::from_secs(10), |screen| screen
+                .contains("Press Enter to close"),),
+            "install wrapper never reached its exit prompt; screen:\n{}",
+            driver.screen()
+        );
+
+        force_terminal_exit(&mut driver);
+
+        assert!(
+            poll_until_screen(&mut driver, Duration::from_secs(10), |screen| screen
+                .contains("failed (exit 7)"),),
+            "command line never painted the failed-install message; screen:\n{}",
+            driver.screen()
+        );
+
+        let screen = driver.screen();
+        assert!(
+            !screen.to_lowercase().contains("not found"),
+            "a failed install must not also claim the binary was 'not \
+             found on PATH' — that points at the wrong problem; screen:\n{screen}"
+        );
+    }
+
+    /// #1344 blocking review finding: a manifest that declares both an LSP
+    /// server and a DAP adapter (the `rust` shape in
+    /// `extensions::sample_manifests()` — `lsp.binary` *and*
+    /// `dap.adapter`/`dap.binary` both set) must not have a successful LSP
+    /// install message wiped out by a DAP binary that isn't resolvable.
+    /// Before this fix, `finalize_install_from_terminal` assigned straight
+    /// into `self.message` for each of the LSP/DAP checks in turn, so the
+    /// DAP block always overwrote whatever the LSP block had just set.
+    ///
+    /// Uses `sh` (guaranteed on any Unix box that can build vimcode) as the
+    /// "LSP binary" so the LSP install-time check finds it already on PATH
+    /// (no install command queued for it), and a nonexistent binary for the
+    /// DAP side so the DAP install runs but its own binary check still
+    /// fails — reproducing the "LSP already there, DAP fresh install
+    /// unresolvable" combination the review flagged as realistic and
+    /// untested.
+    ///
+    /// **Verified RED against unfixed `develop`:** reverting the `outcomes`
+    /// join back to sequential `self.message = format!(...)` assignments
+    /// makes the DAP block's "was not found" message the final value of
+    /// `self.message`, so the `"installed and started"` assertion below
+    /// fails — the LSP success text never reaches the screen at all.
+    #[test]
+    #[cfg(unix)]
+    fn extension_install_lsp_success_survives_dap_not_found_via_shell_app() {
+        use crate::core::extensions::{DapConfig, ExtensionManifest, LspConfig};
+
+        let mut app = TuiShellApp::new_for_test();
+        let ext_name = "vimcode-test-ext-1344-combined".to_string();
+        app.engine.ext_registry = Some(vec![ExtensionManifest {
+            name: ext_name.clone(),
+            display_name: "Fake Extension (1344 combined test)".to_string(),
+            language_ids: vec!["vimcode-test-lang-1344-combined".to_string()],
+            lsp: LspConfig {
+                binary: "sh".to_string(),
+                ..Default::default()
+            },
+            dap: DapConfig {
+                adapter: "vimcode-test-dap-adapter-1344-combined".to_string(),
+                binary: "vimcode-test-nonexistent-dap-binary-1344-combined".to_string(),
+                install: "true".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        }]);
+
+        app.engine.ext_install_from_registry(&ext_name);
+        assert!(
+            app.engine.pending_terminal_command.is_some(),
+            "precondition: the manifest's DAP install command must be queued \
+             (LSP's `sh` binary should already resolve, so only DAP installs)"
+        );
+
+        // Wider than the other #1344 driver tests: the combined LSP+DAP
+        // message is long (extension name repeated, plus every probed tool
+        // directory named in the DAP outcome), and a narrower row would
+        // truncate it before the "was not found" text this test checks for
+        // — a real single-line status-bar constraint, not something the fix
+        // needs to solve.
+        let mut driver = driver_with_shell(app, config(), 400, 24);
+
+        assert!(
+            poll_until_screen(&mut driver, Duration::from_secs(10), |screen| screen
+                .contains("Press Enter to close"),),
+            "install wrapper never reached its exit prompt; screen:\n{}",
+            driver.screen()
+        );
+
+        force_terminal_exit(&mut driver);
+
+        assert!(
+            poll_until_screen(&mut driver, Duration::from_secs(10), |screen| screen
+                .contains("was not found"),),
+            "command line never painted the DAP-not-found message; screen:\n{}",
+            driver.screen()
+        );
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("installed and started"),
+            "the LSP success message must survive alongside the DAP \
+             not-found message, not be overwritten by it; screen:\n{screen}"
+        );
+    }
+
     // ── #990: v0.11.0 TUI minimap rendering bug suite ───────────────────
     //
     // Three separately-gated painted-output scenarios, one per reported
