@@ -5423,6 +5423,90 @@ second line here
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// #955 review regression guard, GTK's twin of `tui_main::shell_app::
+    /// tests::change_review_close_restores_chrome_clicks_via_shell_app`:
+    /// once the change-review surface **closes**, its full-viewport
+    /// `quadraui::ModalStack` entry must be gone so shell chrome keeps
+    /// receiving clicks.
+    ///
+    /// `ShellAdapter::handle` hit-tests the modal stack *before* any chrome
+    /// dispatch, and this surface's entry covers the whole viewport, so a
+    /// leftover entry routes every later mouse event straight into
+    /// `App::handle` instead of `AppShell`'s own handling — the activity
+    /// bar stops switching panels for the rest of the session. The defect
+    /// is invisible at the change-review surface itself, which is why it
+    /// needs its own assertion here.
+    ///
+    /// RED verified: with the reconcile put back inside the frame walk's
+    /// `FrameOp::ChangeReview` `else` arm (dead code — `presence.
+    /// change_review` gates the rung out of `render::compose_frame`'s op
+    /// list the moment the surface closes), the Search-icon click below
+    /// never switches the panel.
+    ///
+    /// Opened from a plain `ChangeReviewState::new(vec![ProposedChange
+    /// { .. }])` — the source-agnostic constructor, no ACP — and closed
+    /// through the real click-to-jump path, the close path the review
+    /// finding named.
+    #[test]
+    fn change_review_close_restores_chrome_clicks_via_gtk_driver() {
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_test_955_gtk_review_modal_pop_{:?}",
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("zqxw955.txt");
+        std::fs::write(&target, "old line\n").unwrap();
+
+        let mut engine = Engine::new();
+        engine.cwd = dir.clone();
+        engine.change_review = Some(crate::core::review::ChangeReviewState::new(vec![
+            crate::core::review::ProposedChange {
+                path: target.to_string_lossy().into_owned(),
+                old_text: Some("old line\n".to_string()),
+                new_text: "new line\n".to_string(),
+            },
+        ]));
+        let mut h = harness(engine, 1400, 900);
+        h.driver.render();
+
+        assert!(
+            h.driver.screen_contains("old line") && h.driver.screen_contains("new line"),
+            "precondition: the change-review surface must be open and \
+             painted from the source-agnostic change list"
+        );
+
+        // Close it the way a user would: click a diff row to jump.
+        let (x, y) = h
+            .driver
+            .find("old line")
+            .unwrap_or_else(|| panic!("diff row 'old line' must be locatable on screen"));
+        h.driver.click(x, y);
+        h.driver.render();
+        assert!(
+            !h.driver.screen_contains("a=accept"),
+            "precondition: clicking a diff row must have closed the \
+             change-review surface"
+        );
+
+        // The regression: with the surface closed, a click on the Search
+        // icon must still reach `AppShell`'s activity-bar dispatch.
+        let (sx, sy) = h
+            .driver
+            .find(crate::icons::SEARCH.s())
+            .unwrap_or_else(|| panic!("Search icon must paint on the activity bar"));
+        h.driver.click(sx, sy);
+        h.driver.render();
+        assert!(
+            h.driver.screen_contains("Replace…"),
+            "after the change-review surface closed, an activity-bar click \
+             must still switch panels — a leftover full-viewport ModalStack \
+             entry routes it past AppShell's chrome dispatch entirely"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// How long the two #957 (ACP-6) driver tests below wait on a real
     /// child process before giving up. Same value, and same rationale, as
     /// `tui_main::shell_app::tests::ACP_DRIVER_DEADLINE` — see that
