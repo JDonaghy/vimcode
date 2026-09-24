@@ -165,9 +165,10 @@ that can *host* a pipeline-management client, not one itself.
 ### Key Functions
 - `fetch_board_model(client, argv)` — run argv and parse stdout into `quadraui::BoardModel` (vimcode's board contract, reused directly from quadraui's `Board` primitive rather than duplicated)
 
-## acp.rs — 959 lines (#951, ACP-0)
+## acp.rs — 1,183 lines (#951 ACP-0, #952 ACP-1)
 ACP (Agent Client Protocol) transport — NDJSON JSON-RPC 2.0 over a subprocess's stdio, plus
-client<->agent session lifecycle. Foundation of the ACP track (epic #531); no UI here.
+client<->agent session lifecycle. Foundation of the ACP track (epic #531); no UI here — the AI
+panel lives in `src/core/engine/acp_ops.rs` and `render::populate_ai_chat_controller`.
 Differs from `lsp.rs` in two load-bearing ways: NDJSON framing (one JSON message per line, no
 `Content-Length`), and agent->client requests are dispatched by method name and **parked**
 (not blanket-answered with `result: null`) via `AcpEvent::ClientRequest` +
@@ -176,7 +177,10 @@ stdin the reader thread holds.
 ### Types
 - `AcpClient` — manages one agent subprocess (spawn, reader thread, stderr ring, shared stdin)
 - `AcpEvent` — `Initialized`, `SessionCreated`, `PromptStopped`, `SessionUpdate`,
-  `ClientRequest`, `RequestFailed`, `AgentExited`
+  `ClientRequest`, `RequestFailed`, `AgentExited`. `SessionUpdate.update` is the whole
+  notification `params` object — `.get("update")` first to reach the tagged-union chunk payload.
+- `AcpChunkKind` — `Message`/`Thought`/`UserEcho`, the ACP-1 mapping of `session/update`'s
+  `sessionUpdate` tag onto the AI panel's transcript roles
 - `ParsedLine` (private) — pure classification of one NDJSON line (request/notification/response/unusable)
 ### Key Functions
 - `AcpClient::spawn(argv, cwd)` / `spawn_with_env(argv, cwd, extra_env)` — start the agent process
@@ -184,12 +188,17 @@ stdin the reader thread holds.
 - `respond_to_client_request(id, result)` — answer a parked agent->client request
 - `poll()` — non-blocking drain, capped at 50 events/call like `LspManager::poll_events`
 - `classify_line(line)` / `encode_ndjson_line(value)` — pure NDJSON framing helpers
-- `Engine::poll_acp()` (`src/core/engine/acp_ops.rs`) — the one `poll_idle` call site; today only handles `AgentExited` (clears `acp_client`, sets `self.message`)
+- `parse_agent_command(cmd)` — split `settings.acp_agent_command` into argv (whitespace + double-quote segments, not a shell)
+- `session_update_chunk(update)` — pure parse of a `session/update`'s inner `update` object into `(AcpChunkKind, text)`; `None` for `tool_call`/`tool_call_update`/`plan` (ACP-4/5)
+- `Engine::poll_acp()` (`src/core/engine/acp_ops.rs`) — the one `poll_idle` call site; drives `initialize` -> `session/new` -> `session/prompt`, maps `session/update` chunks onto `ai_messages` (merging same-kind consecutive chunks into one streamed turn), and handles `PromptStopped`/`RequestFailed`/`AgentExited`
+- `Engine::ai_send_message` (`src/core/engine/ext_panel.rs`) — routes to the ACP transport when `settings.acp_agent_command` is non-empty, else the original `curl`-based `crate::core::ai` transport (kept as a no-agent-binary escape hatch through ACP-7)
 ### Test fixture
 `tests/fixtures/fake_acp_agent.sh` — deterministic `/bin/sh` NDJSON echo agent (no
 jq/python/node) shared by the whole ACP track; drives initialize -> session/new ->
-session/prompt -> `stopReason: end_turn`, including a scripted mid-turn agent->client request
-that blocks until answered out of band.
+session/prompt (streaming an `agent_thought_chunk` + two `agent_message_chunk`s using the real
+ACP v1 wire shape) -> `stopReason: end_turn`, including a scripted mid-turn agent->client
+request that blocks until answered out of band (skippable via `$ACP_FAKE_NO_TOOL_REQUEST` for
+tests that only exercise chunk streaming, not the fs/* bridge).
 
 ## settings.rs — 5,473 lines
 User settings with serde JSON persistence.

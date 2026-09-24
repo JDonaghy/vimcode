@@ -4741,6 +4741,104 @@ second line here
             "scrolling up over the panel must reveal earlier messages (#819)"
         );
     }
+
+    /// #952 (ACP-1): a live ACP agent's `session/update` chunks must reach
+    /// the AI panel transcript incrementally through the real
+    /// `App`/`GtkDriver` stack — GTK's twin of
+    /// `tui_main::shell_app::tests::
+    /// ai_panel_streams_acp_thought_and_message_chunks_via_shell_app`. The
+    /// fixture's `agent_thought_chunk` and two `agent_message_chunk`s must
+    /// land as two visually distinct transcript turns (thought under
+    /// quadraui's `System` role label, message under `AI`) once the turn
+    /// completes.
+    ///
+    /// `GtkDriver` has no `tick()` (unlike `TuiDriver` — GTK's poll_idle is
+    /// driven by a `glib` timer this headless harness never runs), so the
+    /// background agent's progress is drained directly via
+    /// `Engine::poll_acp` (reachable through `h.engine`'s exposed
+    /// `Rc<RefCell<Engine>>`, unlike `TuiDriver`'s opaque handle) and each
+    /// poll is followed by an explicit `h.driver.render()` to repaint —
+    /// the same "poll state, force a repaint, sample the screen" shape
+    /// `ai_panel_scrolls_transcript` above already uses for its seeded
+    /// transcript.
+    ///
+    /// RED verified the same way as the TUI twin: reverting
+    /// `Engine::poll_acp`'s `SessionUpdate` handler to read
+    /// `sessionUpdate`/`content.text` directly off the notification's
+    /// `params` object (skipping the nested `update` field) makes this
+    /// test fail — the transcript never grows past the just-typed user
+    /// turn within the 5s deadline, because `session_update_chunk` silently
+    /// returns `None` for every chunk.
+    #[test]
+    fn ai_panel_streams_acp_thought_and_message_chunks() {
+        let mut h = panel_harness(PANEL_AI);
+        {
+            let mut engine = h.engine.borrow_mut();
+            let argv = vec![
+                "sh".to_string(),
+                concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/tests/fixtures/fake_acp_agent.sh"
+                )
+                .to_string(),
+            ];
+            let cwd = std::env::temp_dir();
+            let mut client = crate::core::acp::AcpClient::spawn_with_env(
+                &argv,
+                &cwd,
+                &[("ACP_FAKE_NO_TOOL_REQUEST", "1")],
+            )
+            .expect("fixture agent should spawn");
+            client.initialize();
+            engine.acp_client = Some(client);
+            // Only needs to be non-empty: routing checks emptiness to pick
+            // the transport, but the client above already exists, so
+            // `ai_send_message` takes the "reuse existing client" branch,
+            // never reading this value to spawn anything.
+            engine.settings.acp_agent_command = "already-spawned-above".to_string();
+        }
+
+        let sb = h.painted_sidebar_bounds.get().unwrap();
+        h.driver.click(sb.x + 20.0, sb.y + 20.0);
+        for c in "hello agent".chars() {
+            h.driver.type_char(c);
+        }
+        h.driver.ctrl_char('s');
+
+        assert!(
+            h.driver.screen_contains("hello agent"),
+            "the submitted user turn must appear immediately"
+        );
+
+        // Bounded poll-and-repaint loop, matching
+        // `tick_refreshes_sc_panel_asynchronously_not_on_the_event_loop_thread`'s
+        // shape for a background thread/subprocess this harness doesn't
+        // drive on its own.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !h.driver.screen_contains("Hello world") && std::time::Instant::now() < deadline {
+            h.engine.borrow_mut().poll_acp();
+            h.driver.render();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        assert!(
+            h.driver.screen_contains("Hello world"),
+            "the two agent_message_chunk notifications must stream into the \
+             transcript within 5s"
+        );
+        assert!(
+            h.driver.screen_contains("pondering the question"),
+            "the agent_thought_chunk must also reach the transcript, not be \
+             dropped as an unrecognized update kind"
+        );
+        assert!(
+            h.driver.screen_contains("System"),
+            "the thought turn renders under ChatRole::System -- a role \
+             header distinct from the message turn's \"AI\" label, per \
+             ACP-1's \"thought chunks visually distinct from message \
+             chunks\" acceptance criterion"
+        );
+    }
 }
 
 /// #669: the five editor-anchored popups (completion, LSP hover, editor

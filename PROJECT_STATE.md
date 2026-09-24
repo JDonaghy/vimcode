@@ -1,6 +1,54 @@
 # VimCode Project State
 
-**Last updated:** September 20, 2026 (#1102 — deleted GTK's `gdk_pixbuf`
+**Last updated:** September 24, 2026 (#952, ACP-1 — hosted a live ACP session
+behind the existing AI panel, retiring `curl` as the *only* transport. The
+panel was already backend-neutral and already existed (`quadraui::
+ChatController`/`Engine::ai_chat`/`PANEL_AI`/`ai_send_message`/`poll_ai`/
+`dispatch_ai_chat_event`/`render::route_ai_chat_event`) — this slice was a
+transport swap plus a stream mapping, not new UI, exactly as the issue
+predicted. New setting `acp_agent_command` (`src/core/settings.rs`, parsed
+via `core::acp::parse_agent_command`): empty (default) keeps the original
+direct-provider `curl` transport (`crate::core::ai`, kept as a no-agent-
+binary escape hatch through ACP-7 per the issue's own recommendation);
+non-empty spawns that command as a live ACP agent. `Engine::ai_send_message`
+(`src/core/engine/ext_panel.rs`) now forks into `ai_send_message_via_curl`/
+`ai_send_message_via_acp`. `Engine::poll_acp` (`src/core/engine/acp_ops.rs`)
+now drives the whole session lifecycle — `initialize` -> `session/new` ->
+`session/prompt` — and maps `session/update` chunks onto `ai_messages`:
+`agent_message_chunk`/`agent_thought_chunk`/`user_message_chunk` merge
+consecutive same-kind chunks into one streamed turn rather than one turn per
+chunk. Thought chunks render under a new AiMessage role
+(`"assistant-thought"`) that `render::populate_ai_chat_controller` maps to
+`quadraui::ChatRole::System` — a different role-header label ("System" vs
+"AI") and colour, which is what makes them visually distinct from message
+chunks per the issue's acceptance criterion, with zero quadraui changes
+needed (the existing `ChatRole::System` styling already does this).
+`tool_call`/`tool_call_update`/`plan` updates and agent->client requests
+(`fs/*`, `session/request_permission`) are left unhandled — parked/ignored
+without breaking the stream — per the issue's scope (ACP-2 fs bridge,
+ACP-4/5 tool-call+plan rendering are later slices). Agent-binary-missing is
+a clear message pushed into the transcript itself (not just the status
+line), verified RED/GREEN. Extended the shared `tests/fixtures/
+fake_acp_agent.sh` (owned by the whole ACP track) to emit the real ACP v1
+`session/update` wire shape (`sessionUpdate` tag + `content.text`, replacing
+ACP-0's placeholder `kind`/`text` shape that nothing had read the values of
+yet) and added `$ACP_FAKE_NO_TOOL_REQUEST` so streaming-focused tests don't
+need the fs/* bridge. Caught and fixed a real bug while writing the first
+black-box test: `AcpEvent::SessionUpdate.update` is the *whole* notification
+`params` object (`{"sessionId":..., "update": {...}}`), not the inner
+tagged-union payload — `Engine::poll_acp` was reading `sessionUpdate`/
+`content.text` off the wrong JSON level, so every chunk silently vanished
+while the turn still completed normally (the "looks done, panel just never
+grew" failure shape). Black-box coverage: TUI (`TuiDriver`, `src/tui_main/
+shell_app.rs`) and GTK (`GtkDriver`, `src/gtk/testing.rs`) tests drive a
+real submit through a pre-spawned fixture agent and assert on rendered
+screen text (`"Hello world"` merged from two chunks, `"pondering the
+question"` thought text, and the `"System"` role label), both independently
+verified RED against the bug above before the fix and GREEN after; a third
+TUI test covers the missing-agent-binary message. `cargo build`/`clippy -D
+warnings`/`fmt` clean on both feature lanes; targeted `cargo test` runs
+(acp/acp_ops/ai_panel/settings round-trip, both lanes) all green.). Prior
+update: September 20, 2026 (#1102 — deleted GTK's `gdk_pixbuf`
 app-icon pre-rasteriser now that quadraui#1014's `draw_image` decode cache is
 already on the pinned rev (`d907a06`, an ancestor of the current pin
 `0dc8381`). `src/gtk/util.rs`: removed `app_icon_image`/`cached_app_icon_png`/

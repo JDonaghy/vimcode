@@ -1,12 +1,15 @@
 //! `Engine::poll_acp` — the one call site `poll_idle` uses to drain the ACP
-//! transport (#951, ACP-0). This slice is transport + session lifecycle
-//! only: **no UI**. Most event variants are just forwarded to `redraw`
-//! today; later ACP slices (session state tracking, the AI panel) will add
-//! real handling here without touching the transport in `src/core/acp.rs`
-//! or either backend.
+//! transport (#951 ACP-0 built the transport; #952 ACP-1 adds the session
+//! lifecycle drive and the `session/update` -> AI-panel chunk mapping this
+//! module implements). `tool_call`/`tool_call_update`/`plan` updates and
+//! agent -> client requests (`fs/*`, `session/request_permission`) are
+//! intentionally left unhandled here — parked/ignored without breaking the
+//! stream — per ACP-1's scope; later ACP slices (ACP-2 fs bridge, ACP-4/5
+//! tool-call + plan rendering) add real handling on top of the same
+//! `AcpEvent` stream, not a transport change.
 
 use super::*;
-use crate::core::acp::AcpEvent;
+use crate::core::acp::{AcpChunkKind, AcpEvent};
 
 impl Engine {
     /// Non-blocking drain of the live ACP agent's events, if one is
@@ -36,26 +39,141 @@ impl Engine {
                     } else {
                         let snippet: String = stderr.chars().take(200).collect();
                         self.message = format!("ACP agent failed to start: {snippet}");
+                        self.ai_messages.push(AiMessage {
+                            role: "assistant-thought".to_string(),
+                            content: format!("\u{26a0} ACP agent failed to start: {snippet}"),
+                        });
                     }
                     self.acp_client = None;
+                    self.acp_session_id = None;
+                    self.acp_pending_prompt = None;
+                    self.acp_streaming_turn = None;
+                    self.ai_streaming = false;
                     redraw = true;
                 }
-                // Session lifecycle and content events: nothing in this
-                // slice renders them (no session state field exists yet).
-                // Marking a redraw keeps the contract simple for whichever
-                // later slice adds that state — it costs nothing when
-                // nothing changed visibly.
-                AcpEvent::Initialized { .. }
-                | AcpEvent::SessionCreated { .. }
-                | AcpEvent::PromptStopped { .. }
-                | AcpEvent::SessionUpdate { .. }
-                | AcpEvent::ClientRequest { .. }
-                | AcpEvent::RequestFailed { .. } => {
+                AcpEvent::Initialized { .. } => {
+                    // Handshake step 2: now that the agent answered
+                    // `initialize`, open a session. `ai_send_message`
+                    // already queued the user's prompt in
+                    // `acp_pending_prompt`, sent once `SessionCreated`
+                    // lands below.
+                    let cwd = self.acp_workspace_cwd();
+                    if let Some(client) = self.acp_client.as_mut() {
+                        client.new_session(&cwd, vec![]);
+                    }
+                    redraw = true;
+                }
+                AcpEvent::SessionCreated { session_id, .. } => {
+                    self.acp_session_id = Some(session_id.clone());
+                    if let Some(text) = self.acp_pending_prompt.take() {
+                        if let Some(client) = self.acp_client.as_mut() {
+                            client.prompt(
+                                &session_id,
+                                vec![serde_json::json!({"type": "text", "text": text})],
+                            );
+                        }
+                    } else {
+                        // No prompt was waiting on this handshake — nothing
+                        // to stream, so the panel shouldn't sit "thinking".
+                        self.ai_streaming = false;
+                    }
+                    redraw = true;
+                }
+                AcpEvent::SessionUpdate { session_id, update } => {
+                    // `update` here is the whole `session/update` notification
+                    // `params` object (`{"sessionId": ..., "update": {...}}` —
+                    // see `AcpEvent::SessionUpdate`'s doc in `core::acp`), not
+                    // the inner tagged union `session_update_chunk` parses;
+                    // unwrap one level first.
+                    let inner = update.get("update");
+                    if self.acp_session_id.as_deref() == Some(session_id.as_str()) {
+                        if let Some((kind, text)) =
+                            inner.and_then(crate::core::acp::session_update_chunk)
+                        {
+                            self.acp_append_chunk(kind, text);
+                        }
+                    }
+                    redraw = true;
+                }
+                AcpEvent::PromptStopped { stop_reason, .. } => {
+                    self.ai_streaming = false;
+                    self.acp_streaming_turn = None;
+                    if stop_reason != "end_turn" {
+                        self.ai_messages.push(AiMessage {
+                            role: "assistant-thought".to_string(),
+                            content: format!("[turn stopped: {stop_reason}]"),
+                        });
+                    }
+                    redraw = true;
+                }
+                AcpEvent::RequestFailed {
+                    method, message, ..
+                } => {
+                    if method == "session/prompt" {
+                        self.ai_streaming = false;
+                        self.acp_streaming_turn = None;
+                    }
+                    self.message = format!("ACP {method} failed: {message}");
+                    self.ai_messages.push(AiMessage {
+                        role: "assistant-thought".to_string(),
+                        content: format!("\u{26a0} {method} failed: {message}"),
+                    });
+                    redraw = true;
+                }
+                // Agent -> client requests (`fs/read_text_file`,
+                // `session/request_permission`, ...): left parked, not
+                // answered — the fs/* bridge and permission UI are later
+                // ACP slices. Not answering doesn't break the transport
+                // (`AcpClient::poll` keeps draining), it just means a turn
+                // that needs one will not reach `PromptStopped` yet.
+                AcpEvent::ClientRequest { .. } => {
                     redraw = true;
                 }
             }
         }
         redraw
+    }
+
+    /// Absolute directory handed to `session/new`'s `cwd` — the workspace
+    /// root if one is open, else the process's own cwd. `AcpClient::
+    /// new_session` canonicalizes it, but resolving *which* directory is
+    /// engine/workspace policy, not transport plumbing.
+    fn acp_workspace_cwd(&self) -> std::path::PathBuf {
+        self.workspace_root
+            .clone()
+            .unwrap_or_else(|| self.cwd.clone())
+    }
+
+    /// Append one `session/update` chunk to the AI panel transcript
+    /// (`self.ai_messages`), appending to the in-progress streamed turn
+    /// when `kind` matches it and starting a new turn otherwise — the
+    /// "streamed assistant turn" ACP-1 asks for rather than one message
+    /// per chunk. Empty chunks (a still-loading tool-adjacent update with
+    /// no text yet) are dropped rather than starting a spurious turn.
+    fn acp_append_chunk(&mut self, kind: AcpChunkKind, text: String) {
+        if text.is_empty() {
+            return;
+        }
+        if let Some((idx, streaming_kind)) = self.acp_streaming_turn {
+            if streaming_kind == kind && idx < self.ai_messages.len() {
+                self.ai_messages[idx].content.push_str(&text);
+                return;
+            }
+        }
+        let role = match kind {
+            AcpChunkKind::Message => "assistant",
+            // Kept visually distinct from `Message` in
+            // `render::populate_ai_chat_controller` (renders as
+            // `quadraui::ChatRole::System`) — ACP-1's acceptance
+            // criteria: thought chunks must not merge into message text.
+            AcpChunkKind::Thought => "assistant-thought",
+            AcpChunkKind::UserEcho => "user",
+        };
+        self.ai_messages.push(AiMessage {
+            role: role.to_string(),
+            content: text,
+        });
+        self.acp_streaming_turn = Some((self.ai_messages.len() - 1, kind));
     }
 }
 
@@ -187,6 +305,65 @@ mod tests {
         assert_ne!(
             engine.message, "ACP agent exited",
             "no exit message while the agent is still running"
+        );
+    }
+
+    // ── ACP-1 (#952): session lifecycle drive + session/update chunk mapping ──
+
+    /// Full round trip: `Engine::ai_send_message` on an already-`initialize`d
+    /// agent queues the prompt until the `session/new` handshake completes
+    /// (`poll_acp`'s `Initialized`/`SessionCreated` handling), then the
+    /// fixture's `agent_thought_chunk` and two `agent_message_chunk`s land as
+    /// two *separate* transcript turns — the thought kept visually distinct
+    /// from the message per ACP-1's acceptance criteria — with the two
+    /// message chunks merged into one streamed turn, not two. Uses
+    /// `ACP_FAKE_NO_TOOL_REQUEST` so the turn completes without needing the
+    /// fs/* bridge (a later ACP slice, #952's own scope note).
+    #[cfg(unix)]
+    #[test]
+    fn ai_send_message_via_acp_streams_thought_and_message_then_completes() {
+        let mut engine = engine_with_fixture_agent(&[("ACP_FAKE_NO_TOOL_REQUEST", "1")]);
+        // Routing to the ACP transport only checks this is non-empty — the
+        // client itself is already spawned above, so `ai_send_message`
+        // takes the "reuse existing client" branch, not the "spawn a new
+        // one from this command line" branch.
+        engine.settings.acp_agent_command = "already-spawned-above".to_string();
+
+        engine.ai_send_message("hello agent".to_string());
+        assert!(
+            engine.ai_streaming,
+            "sending a message must mark the panel busy"
+        );
+        assert_eq!(
+            engine.ai_messages.last().map(|m| m.content.as_str()),
+            Some("hello agent"),
+            "the user's turn should be recorded immediately, before the handshake completes"
+        );
+
+        poll_acp_until(&mut engine, |e| !e.ai_streaming);
+        assert!(
+            !engine.ai_streaming,
+            "the turn should reach stopReason: end_turn within {TEST_DEADLINE:?}"
+        );
+
+        let roles: Vec<&str> = engine.ai_messages.iter().map(|m| m.role.as_str()).collect();
+        assert_eq!(
+            roles,
+            vec!["user", "assistant-thought", "assistant"],
+            "thought and message chunks must land as separate turns, not merged \
+             into one another: {:?}",
+            engine.ai_messages
+        );
+        assert_eq!(engine.ai_messages[0].content, "hello agent");
+        assert!(
+            engine.ai_messages[1].content.contains("pondering"),
+            "thought turn content: {:?}",
+            engine.ai_messages[1]
+        );
+        assert_eq!(
+            engine.ai_messages[2].content, "Hello world",
+            "the two agent_message_chunk notifications must merge into one \
+             streamed turn, not create a turn each"
         );
     }
 }

@@ -14469,6 +14469,158 @@ mod tests {
         );
     }
 
+    /// #952 (ACP-1): a live ACP agent's `session/update` chunks must reach
+    /// the AI panel transcript incrementally through the real
+    /// `TuiShellApp`/`TuiDriver` stack — `Ctrl+S` submits, `driver.tick()`
+    /// drives `Engine::poll_idle` -> `poll_acp` exactly as the live TUI
+    /// event loop does, and the fixture's `agent_thought_chunk` +
+    /// two `agent_message_chunk`s must land as two visually distinct
+    /// transcript turns (thought under quadraui's `System` role label,
+    /// message under `AI`) once the turn completes.
+    ///
+    /// The agent subprocess is pre-spawned with `ACP_FAKE_NO_TOOL_REQUEST`
+    /// (via `AcpClient::spawn_with_env`, unreachable through
+    /// `settings.acp_agent_command` alone, which only offers plain
+    /// `AcpClient::spawn`) so the turn completes without needing the fs/*
+    /// bridge — a later ACP slice, out of ACP-1's scope — while still
+    /// exercising the exact same `poll_acp` session/prompt/session-update
+    /// path a real agent reply would drive `ai_send_message`'s "reuse an
+    /// already-running client" branch through.
+    ///
+    /// **RED verified**: before the `update.get("update")` unwrap fix in
+    /// `Engine::poll_acp`'s `SessionUpdate` arm (the handler read
+    /// `sessionUpdate`/`content.text` off the wrong JSON level — the whole
+    /// `session/update` `params` object, not its nested `update` field),
+    /// this test failed with the transcript stuck at only the just-typed
+    /// user turn: neither "pondering the question" nor "Hello world" ever
+    /// appeared, because `session_update_chunk` silently returned `None`
+    /// for every chunk (wrong nesting level, not a wrong field name) and
+    /// `ai_streaming` still cleared on `PromptStopped`. That is exactly the
+    /// "streamed chunks silently vanish, panel still looks done" failure
+    /// shape this test exists to catch.
+    #[cfg(unix)]
+    #[test]
+    fn ai_panel_streams_acp_thought_and_message_chunks_via_shell_app() {
+        let mut app = TuiShellApp::new(None);
+        app.engine
+            .app_shell
+            .show_panel(&quadraui::WidgetId::new(PANEL_AI));
+        app.engine.ai_has_focus = true;
+        app.sidebar.has_focus = true;
+
+        let argv = vec![
+            "sh".to_string(),
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/fake_acp_agent.sh"
+            )
+            .to_string(),
+        ];
+        let cwd = std::env::temp_dir();
+        let mut client = crate::core::acp::AcpClient::spawn_with_env(
+            &argv,
+            &cwd,
+            &[("ACP_FAKE_NO_TOOL_REQUEST", "1")],
+        )
+        .expect("fixture agent should spawn");
+        client.initialize();
+        app.engine.acp_client = Some(client);
+        // Only needs to be non-empty: routing checks emptiness to pick the
+        // transport, but the client above already exists, so
+        // `ai_send_message` takes the "reuse existing client" branch, never
+        // reading this value to spawn anything.
+        app.engine.settings.acp_agent_command = "already-spawned-above".to_string();
+
+        let mut driver = driver_with_shell(app, config(), 80, 24);
+        for c in "hello agent".chars() {
+            driver.type_char(c);
+        }
+        driver.ctrl_char('s');
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("hello agent"),
+            "the submitted user turn must appear immediately; screen:\n{screen}"
+        );
+
+        // Drive real ticks until the streamed turn completes, bounded like
+        // `tick_refreshes_sc_panel_asynchronously_not_on_the_event_loop_thread`
+        // above (a background thread there, a real subprocess here — same
+        // "don't busy-loop, don't hang the suite" tradeoff).
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut screen = driver.screen();
+        while !screen.contains("Hello world") && Instant::now() < deadline {
+            driver.tick();
+            std::thread::sleep(Duration::from_millis(10));
+            screen = driver.screen();
+        }
+
+        assert!(
+            screen.contains("Hello world"),
+            "the two agent_message_chunk notifications must stream into the \
+             transcript within 5s; screen:\n{screen}"
+        );
+        assert!(
+            screen.contains("pondering the question"),
+            "the agent_thought_chunk must also reach the transcript, not be \
+             dropped as an unrecognized update kind; screen:\n{screen}"
+        );
+        assert!(
+            screen.contains("System"),
+            "the thought turn renders under ChatRole::System -- a role \
+             header distinct from the message turn's \"AI\" label, per \
+             ACP-1's \"thought chunks visually distinct from message \
+             chunks\" acceptance criterion; screen:\n{screen}"
+        );
+    }
+
+    /// #952 (ACP-1) acceptance: "Agent binary missing from PATH -> a clear,
+    /// actionable panel message, not a crash and not a silent empty panel."
+    /// `settings.acp_agent_command` pointing at a program that doesn't exist
+    /// must surface *in the transcript itself* (not just the status line,
+    /// which a user watching the panel might not be looking at), and must
+    /// not panic the process.
+    #[test]
+    fn ai_panel_shows_actionable_message_when_agent_binary_is_missing_via_shell_app() {
+        let mut app = TuiShellApp::new(None);
+        app.engine
+            .app_shell
+            .show_panel(&quadraui::WidgetId::new(PANEL_AI));
+        app.engine.ai_has_focus = true;
+        app.sidebar.has_focus = true;
+        // No hyphens/spaces: the transcript word-wraps at ~28 columns in an
+        // 80-col frame (the sidebar is a fraction of the width), and a
+        // single unbroken token is the only shape guaranteed to survive
+        // that wrap intact for a `screen.contains` check — a hyphenated
+        // name here would (and did, in an earlier draft of this test) get
+        // split mid-word across two wrapped rows, which is a rendering
+        // detail of the panel's text wrapping, not a bug in the message
+        // itself.
+        app.engine.settings.acp_agent_command = "nosuchagentbinary952".to_string();
+
+        let mut driver = driver_with_shell(app, config(), 80, 24);
+        for c in "hello".chars() {
+            driver.type_char(c);
+        }
+        driver.ctrl_char('s');
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("Could not start ACP agent"),
+            "the panel must say why, not just that something went wrong; \
+             screen:\n{screen}"
+        );
+        assert!(
+            screen.contains("nosuchagentbinary952"),
+            "the panel must name the agent command it failed to start; \
+             screen:\n{screen}"
+        );
+        assert!(
+            !screen.trim().is_empty(),
+            "a failed agent start must not leave a silently empty panel"
+        );
+    }
+
     /// Toasts are the last thing painted, on top of every other surface.
     #[test]
     fn render_content_paints_toast_via_shell_app() {
