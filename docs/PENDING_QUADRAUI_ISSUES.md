@@ -221,7 +221,20 @@ per `GOALS.md`'s milestone-discipline rule.
 
 ---
 
-## `quadraui::win::testing` is hard `target_os = "windows"`-gated, not WinAPI-stubbed like `win::backend`/`run`/`shell_runner` (blocks vimcode#928 AC2)
+## ~~`quadraui::win::testing` is hard `target_os = "windows"`-gated, not WinAPI-stubbed like `win::backend`/`run`/`shell_runner` (blocks vimcode#928 AC2)~~ — **SHIPPED, do not file (struck 2026-09-23, #1244)**
+
+> quadraui#1038 (landed in the rev this crate is pinned to, `Cargo.toml`)
+> gated `win::testing` on `feature = "win"` alone with every real
+> Direct2D/GDI call individually `cfg(target_os = "windows")`-stubbed,
+> exactly the ask below. vimcode#1244 consumed it: `src/win/mod.rs`'s
+> `win_driver_tests` module dropped its `#[cfg(target_os = "windows")]`
+> double-gate down to `#[cfg(test)]` alone (each `#[test]` attribute is now
+> individually `cfg_attr(target_os = "windows", test)`-gated instead, so the
+> bodies type-check everywhere but only actually run on real Windows),
+> closing vimcode#928's acceptance criterion #2. This draft is retired — do
+> not file it.
+
+### ~~Original draft (superseded by quadraui#1038)~~
 
 **Title:** `win::testing` needs the same `cfg(target_os = "windows")`-per-call
 stubbing as `win::backend`/`run`/`shell_runner`, not a module-level
