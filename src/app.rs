@@ -8958,6 +8958,23 @@ impl quadraui::ShellApp for App {
     ) {
         #[allow(deprecated)]
         self.on_shell_event(event);
+        // #1356 (quadraui bump for quadraui#1055): a bottom item's click
+        // never moves the *real* `AppShell` on its own — the `BottomItemClicked`
+        // arm above only toggles the engine-side shadow via `switch_panel`.
+        // quadraui#1055 lets `show_panel` accept a bottom item's id (e.g.
+        // "bottom:settings"), but an app has to opt in explicitly by calling
+        // it from its own `BottomItemClicked` handler — exactly what
+        // quadraui's own `AppShellDemo` does. Without this, the runner's own
+        // `AppShell` (which is what `render` titles the sidebar header from)
+        // never learns Settings now owns the sidebar, and the header stays
+        // stuck on whatever top panel was open before.
+        if let quadraui::AppShellEvent::BottomItemClicked { id } = event {
+            if self.engine.borrow().app_shell.sidebar_visible() {
+                ctx.shell_mut().show_panel(id);
+            } else {
+                ctx.shell_mut().hide_sidebar();
+            }
+        }
         self.sync_runner_sidebar_visibility(ctx);
     }
 }

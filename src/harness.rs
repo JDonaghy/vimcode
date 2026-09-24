@@ -1342,13 +1342,18 @@ pub(crate) fn assert_text_metrics_backend_applies_metrics<B: TextMetricsBackend>
 pub(crate) const KNOWN_BUGS: &[&str] = &[
     // #1256: the shared `App` (GTK, and the `::tui` control arm that wraps
     // the same `App`) paints no search/filter row for the Settings and
-    // Extensions sidebars, and titles the Settings sidebar with the
-    // *previous* top panel's header. The shipped TUI (`::tui_prod`) paints
-    // all three. Whether to converge (and in which direction) is ruled on
-    // by #1258 — delete these entries in whichever PR lands that ruling's
-    // fix. See `issue_1256_sidebar_chrome` below.
-    "issue_1256_sidebar_chrome::settings_header_names_settings::gtk",
-    "issue_1256_sidebar_chrome::settings_header_names_settings::tui",
+    // Extensions sidebars. The shipped TUI (`::tui_prod`) paints both. Whether
+    // to converge (and in which direction) is ruled on by #1258 — delete
+    // these entries in whichever PR lands that ruling's fix. See
+    // `issue_1256_sidebar_chrome` below.
+    //
+    // The Settings-header-naming pair that used to live here
+    // (`settings_header_names_settings::{gtk,tui}`) was fixed by #1356's
+    // quadraui bump (quadraui#1055: `AppShell::show_panel` now accepts a
+    // bottom item's id, so `App`/`TuiShellApp`'s `on_shell_event_ctx` can
+    // opt Settings into owning the sidebar header) and deleted here —
+    // `known_bug_gate` reported `FixLanded` once the bump landed, exactly
+    // as designed.
     "issue_1256_sidebar_chrome::settings_filter_row_is_painted::gtk",
     "issue_1256_sidebar_chrome::settings_filter_row_is_painted::tui",
     "issue_1256_sidebar_chrome::extensions_search_row_is_painted::gtk",
@@ -3985,12 +3990,14 @@ mod issue_1064_take_requested_panel {
 /// |---|---|---|
 /// | Extensions header | " EXTENSIONS " — quadraui `AppShell::render`'s sidebar-header row, titled from `PanelDefinition.title` (`core/engine/sidebar.rs`) | runner header "Extensions" **and** `render_ext_sidebar`'s own " EXTENSIONS" row (doubled) |
 /// | Extensions search row | **none** | "Search extensions (press /)" |
-/// | Settings header | **" EXPLORER "** — stale: Settings is an `AppShell` *bottom item*, which never becomes `active_panel`, so the header keeps the previous top panel's title | runner header stale too ("Menu"), masked by `render_settings_panel`'s own " SETTINGS" row |
+/// | Settings header | " SETTINGS " — fixed by #1356's quadraui bump (quadraui#1055/#1056): `AppShell::show_panel` now accepts the Settings bottom item's id, and `App::on_shell_event_ctx`'s `BottomItemClicked` arm opts into it by calling `ctx.shell_mut().show_panel(id)`, same as quadraui's own `AppShellDemo` | runner header "Menu", masked by `render_settings_panel`'s own " SETTINGS" row |
 /// | Settings filter row | **none** — `settings_query` still filters the form, invisibly | "/ <query>" via `draw_settings_chrome` |
 ///
 /// So the Extensions *header* is composed elsewhere on GTK (ungated test
-/// below); everything else is missing on the shared `App` and is recorded
-/// as a `KNOWN_BUGS`-gated divergence whose fix #1258 rules on. The gated
+/// below); the Settings header was fixed in #1356 (its `settings_header_
+/// names_settings::{gtk,tui}` scenarios are ungated now, below); the two
+/// remaining rows are missing on the shared `App` and stay recorded as a
+/// `KNOWN_BUGS`-gated divergence whose fix #1258 rules on. The gated
 /// bodies encode the shipped TUI's behaviour, so they turn `FixLanded`
 /// (red) the moment the shared `App` gains the row.
 #[cfg(test)]
@@ -4065,6 +4072,48 @@ mod issue_1256_sidebar_chrome {
         );
     }
 
+    /// #1356 (quadraui bump for quadraui#1055/#1056's second commit,
+    /// 3020d9e): once Settings — a bottom item — owns the sidebar header,
+    /// clicking a *top* panel's icon must take the header back rather than
+    /// leaving it stuck on Settings. Before 3020d9e,
+    /// `AppShell::handle_activity_click`'s top-panel branch never cleared
+    /// `sidebar_bottom_owner`, so the header (and, on the shared `App`,
+    /// the painted body) would have stayed on Settings even though
+    /// Explorer's icon was clicked.
+    fn settings_then_explorer_reclaims_header<D: ConformanceDriver>(driver: &mut D) {
+        open_settings(driver);
+        assert!(
+            driver.screen_has("Appearance"),
+            "precondition: clicking the Settings icon must paint the \
+             settings form body"
+        );
+
+        driver.click_text(crate::icons::EXPLORER.s());
+
+        // Case differs by arm: the shared `App`'s `PanelDefinition`
+        // titles are all-caps ("EXPLORER"), `TuiShellApp::shell_config`'s
+        // own are title-case ("Explorer") — see this module's doc table.
+        assert!(
+            driver.screen_has("EXPLORER") || driver.screen_has("Explorer"),
+            "#1356: clicking the Explorer icon while Settings owns the \
+             sidebar must reclaim the header for Explorer, not leave it \
+             stuck on Settings: {:?}",
+            driver.inventory()
+        );
+        assert!(
+            !driver.screen_has("SETTINGS"),
+            "#1356: clicking the Explorer icon while Settings owns the \
+             sidebar must reclaim the header for Explorer, not leave it \
+             stuck on Settings: {:?}",
+            driver.inventory()
+        );
+        assert!(
+            !driver.screen_has("Appearance"),
+            "#1356: the sidebar body must switch away from the Settings \
+             form once Explorer reclaims the sidebar"
+        );
+    }
+
     macro_rules! arms {
         ($name:ident, $engine:expr) => {
             mod $name {
@@ -4109,5 +4158,6 @@ mod issue_1256_sidebar_chrome {
     arms!(extensions_header_is_painted, engine_fixture());
     arms!(extensions_search_row_is_painted, engine_fixture());
     arms!(settings_header_names_settings, engine_fixture());
+    arms!(settings_then_explorer_reclaims_header, engine_fixture());
     arms!(settings_filter_row_is_painted, engine_with_settings_query());
 }
