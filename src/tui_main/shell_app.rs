@@ -25493,12 +25493,12 @@ mod tests {
     // exactly as `:ExtInstall` does) through a real `TuiShellApp` +
     // `driver_with_shell`, letting `driver.tick()` spawn the install
     // terminal pane (a real PTY, `sh -c '...'`) the same way production
-    // does, forcing the shell to terminate by prodding it with a synthetic
-    // `exit` until it does (see `poll_until_screen` for why that has to be
-    // a gated retry loop, and `force_terminal_exit`'s doc for why a single
-    // synthetic Enter isn't reliable here) so `poll_terminal` calls
-    // `finalize_install_from_terminal` for real, and reading the painted
-    // command line back with `driver.screen()`.
+    // does, letting that pane's shell terminate itself (the manifests'
+    // install strings start with `SELF_CLOSING_INSTALL_PREFIX` — see its
+    // doc, and `poll_until_screen`'s, for why synthesising a keypress
+    // instead is unsafe and was the #1345 smoke flake) so `poll_terminal`
+    // calls `finalize_install_from_terminal` for real, and reading the
+    // painted command line back with `driver.screen()`.
     //
     // Both commands use `sh` builtins/paths guaranteed present on any Unix
     // box that can build vimcode (no `curl`/`pip`/network involved), and
@@ -25516,106 +25516,60 @@ mod tests {
     /// child process instead, but the same "don't busy-loop, don't hang the
     /// suite" tradeoff applies.
     ///
-    /// It also re-sends the shell-exit stimulus ([`force_terminal_exit`])
-    /// on a backoff schedule while the predicate is unsatisfied and the
-    /// terminal panel is still painted.
+    /// # Why this sends no keystrokes (#1345 smoke-failure fix)
     ///
-    /// # Why the stimulus is a retry loop, and why it is gated (#1344)
+    /// It used to. `build_terminal_install_wrapper` ends every install
+    /// script with `echo 'Press Enter to close…'` / `read __dummy` /
+    /// `exit`, so the pane's shell parks on `read` until *something*
+    /// answers it, and only then exits — and only a pane exit makes
+    /// `poll_terminal` call `finalize_install_from_terminal`, which paints
+    /// the messages these tests assert on. This loop therefore used to
+    /// synthesise that answer itself, typing `exit` + Enter into the
+    /// focused pane on a backoff schedule, gated on the terminal panel
+    /// still being painted.
     ///
-    /// The first cut of these tests sent it exactly once, after waiting for
-    /// the literal `Press Enter to close…` to appear on screen. Both halves
-    /// of that were wrong, and together they made the two tests fail in
-    /// ~50% of full-suite runs on a loaded machine with no controlling
-    /// terminal (i.e. CI) while passing every time the tests ran alone:
+    /// That stimulus is *fundamentally* unsafe here, and the gate could
+    /// only narrow the window, never close it: `Engine::handle_key` clears
+    /// `self.message` on **any** keypress (`keys.rs`, "Clear message on any
+    /// keypress"), so the instant the pane is gone a prod lands in the
+    /// editor and wipes the very message under test — permanently, since
+    /// the install runs once. The gate reads *painted* panel presence,
+    /// which cannot be checked atomically with the key delivery that
+    /// follows it, so a prod issued in the same tick that the pane exits
+    /// and the message appears destroys it before any frame shows it. That
+    /// is the reported #1345 smoke failure, reproduced here at ~3% of runs
+    /// of these four tests (`extension_install*`) in parallel and captured
+    /// twice: a 20s timeout ending in `INSERT  [No Name] [+] … Ln 2` — the
+    /// editor holding our own `exit` keystrokes — with an empty command
+    /// line and the "Installing …" spinner still up.
     ///
-    /// * **The wait fired far too early.** `terminal_run_command` injects
-    ///   the *entire* wrapper script into the PTY with one `write_input`
-    ///   the instant `TerminalSession::spawn` returns — before the shell
-    ///   has finished starting — and the line discipline echoes those bytes
-    ///   back verbatim. Every literal the script contains, that one
-    ///   included, is therefore already on `driver.screen()` before the
-    ///   first command has run, so the wait was matching the script's own
-    ///   *source text*, not the wrapper's output. There is no dependable
-    ///   screen signal for "the shell is ready" either: the wrapper's
-    ///   output is indistinguishable from its echo once the pane wraps and
-    ///   truncates long lines, and a marker printed by the install command
-    ///   itself scrolls out of the ~12-row pane before the poll can see it.
+    /// The fix is to stop needing the stimulus: the install commands these
+    /// tests declare in their manifests define a no-op POSIX `read`
+    /// function (`read() { :; } ; …`) as their first act, so the wrapper's
+    /// own `read __dummy` returns immediately, its trailing `exit` runs,
+    /// and the shell terminates **on its own** ~0.0–0.4s later (verified in
+    /// a real PTY under both `bash` and `zsh`, the two `default_shell`
+    /// candidates, with the wrapper's `$?` capture still recording the real
+    /// exit status — the override is defined *before* the command whose
+    /// status is captured). No keystroke is ever sent, so nothing can clear
+    /// the message, and the tests no longer depend on winning a race.
     ///
-    /// * **A single stimulus at that moment is lost.** Keystrokes that
-    ///   reach the PTY while the shell is still starting up are not
-    ///   reliably acted on (captured from a failing run: the synthetic
-    ///   `exit` shows up interleaved into bash's startup banner as `eTo run
-    ///   a command…` / `xitjohn@host:…$`, and the shell then sat in `read
-    ///   __dummy` forever). The pane never exited, so `poll_terminal` never
-    ///   called `finalize_install_from_terminal` and the message under test
-    ///   was never painted.
-    ///
-    /// Retrying covers both without needing that signal, and is
-    /// ordering-safe: the whole script is already in the PTY input queue
-    /// before any of these keystrokes are appended to it, so a prod can
-    /// only ever be consumed *after* the script's last line — either as
-    /// `$__dummy`'s value or as the command that follows it, never
-    /// mid-script, so the wrapper's `$?` capture always runs.
-    ///
-    /// The gate is the other half: once the pane's shell has exited the
-    /// panel is gone and a prod lands in the *editor*, where
-    /// `Engine::handle_key` clears `self.message` on **any** keypress
-    /// (`keys.rs`, "Clear message on any keypress") — wiping the very
-    /// message under test (observed: a run that ended `INSERT  [No Name]
-    /// [+] … Ln 14` with an empty command line). Hence: never prod without
-    /// two freshly-painted frames that both still show the panel.
-    ///
-    /// # Why the gate has to be re-checked *inside* the prod too (#957 smoke)
-    ///
-    /// Gating the prod as a whole is not enough, because a prod is five
-    /// keystrokes and **the pane can be reaped by the prod's own first
-    /// keystroke**: a key routed to the PTY reaches
-    /// `render::route_terminal_key`'s `TerminalKeyAction::SendToPty` arm,
-    /// which calls `engine.poll_terminal()` immediately after writing
-    /// (`render.rs`) — so if that write is what lets the wrapper's trailing
-    /// `exit` run, `finalize_install_from_terminal` fires and the panel
-    /// closes *between* `e` and `x`, and the remaining `x`/`i`/`t`/Enter
-    /// land in the editor and wipe the message finalize just set. That is
-    /// the same `INSERT  [No Name] [+] … Ln 2, Col 1` + empty command line
-    /// end state as above, reached with a perfectly fresh gate, and it
-    /// reproduced in roughly one full-suite run in eight. So
-    /// [`force_terminal_exit`] re-renders and re-checks the panel before
-    /// *every* keystroke, and stops the moment it is gone.
+    /// If one of these tests ever times out again with the terminal panel
+    /// still painted and `Press Enter to close…` on screen, the pane's
+    /// shell ignored that override — fix it there (in the manifest's
+    /// install string), not by reinstating a keystroke prod.
     fn poll_until_screen(
         driver: &mut quadraui::tui::testing::TuiDriver<impl quadraui::runner::AppLogic>,
         timeout: Duration,
         mut predicate: impl FnMut(&str) -> bool,
     ) -> bool {
-        let start = Instant::now();
-        let deadline = start + timeout;
-        // Backoff rather than a prod per poll: each prod is five bytes into
-        // a PTY input queue nobody is draining yet, a 20ms cadence for the
-        // whole timeout could fill the line discipline's buffer, and every
-        // prod is a chance to race the pane's removal (see the gate below).
-        let mut next_prod = Duration::from_millis(250);
-        let mut prod_gap = Duration::from_millis(250);
+        let deadline = Instant::now() + timeout;
         loop {
             if tick_and_test(driver, &mut predicate) {
                 return true;
             }
             if Instant::now() >= deadline {
                 return false;
-            }
-            if start.elapsed() >= next_prod && terminal_panel_painted(&driver.screen()) {
-                // Second opinion on a second freshly-painted frame: the
-                // app's layout is allowed to lag a frame behind engine
-                // state (see `tab_visible_counts`), so one frame still
-                // showing the panel is not proof the pane is still there.
-                if tick_and_test(driver, &mut predicate) {
-                    return true;
-                }
-                if terminal_panel_painted(&driver.screen()) {
-                    if force_terminal_exit(driver, &mut predicate) {
-                        return true;
-                    }
-                    next_prod = start.elapsed() + prod_gap;
-                    prod_gap = (prod_gap * 2).min(Duration::from_secs(2));
-                }
             }
             std::thread::sleep(Duration::from_millis(20));
         }
@@ -25627,9 +25581,8 @@ mod tests {
     /// The explicit `render()` matters: `TuiDriver::tick` only repaints
     /// when the app's tick returns `Reaction::Redraw`, so after a
     /// `RedrawAfter`/`Continue` tick `screen()` still shows the *previous*
-    /// frame. Painting unconditionally keeps both the predicate and
-    /// [`poll_until_screen`]'s prod gate reading the state the tick just
-    /// produced.
+    /// frame. Painting unconditionally keeps the predicate reading the
+    /// state the tick just produced.
     fn tick_and_test(
         driver: &mut quadraui::tui::testing::TuiDriver<impl quadraui::runner::AppLogic>,
         predicate: &mut impl FnMut(&str) -> bool,
@@ -25639,83 +25592,21 @@ mod tests {
         predicate(&driver.screen())
     }
 
-    /// Is the bottom terminal panel still on screen?
+    /// Prefix for the `install_*` command strings the #1344 driver tests
+    /// declare in their fake manifests: a no-op POSIX `read` override that
+    /// makes `build_terminal_install_wrapper`'s "Press Enter to close…"
+    /// gate self-satisfying, so the install pane's shell exits without any
+    /// synthetic keystroke. See [`poll_until_screen`] for the flake this
+    /// replaces, and why a keystroke can never be safe here.
     ///
-    /// [`poll_until_screen`] gates its exit prodding on this: the panel
-    /// header row is the painted proof that the install pane still exists
-    /// and therefore still owns the keyboard (`Engine::terminal_has_focus`,
-    /// which `render::route_terminal_key` checks before forwarding a key to
-    /// the PTY). Read off `driver.screen()` rather than engine state
-    /// because `driver_with_shell` wraps the app in a shell adapter that
-    /// keeps the inner `TuiShellApp` — and its `Engine` — unreachable
-    /// (#765).
-    fn terminal_panel_painted(screen: &str) -> bool {
-        screen.contains("Terminal")
-    }
-
-    /// Type `exit` + Enter into the focused terminal pane to force the
-    /// install shell to terminate.
-    ///
-    /// Always driven from [`poll_until_screen`]'s gated retry loop rather
-    /// than sent once — see that function for why a single shot, at any
-    /// screen-observable moment, is unreliable.
-    ///
-    /// The install wrapper's own `read __dummy` / `exit` tail (see
-    /// `build_terminal_install_wrapper`) is written to the PTY in the same
-    /// `write_input` call as the rest of the script, all at once, well
-    /// before any real keypress — so on a fast command the shell's `read`
-    /// can race ahead and consume the wrapper's own trailing `exit\n` bytes
-    /// as `$__dummy`'s value before a synthetic `Enter` from this driver
-    /// ever lands, leaving the shell back at its own interactive prompt
-    /// instead of terminated (observed directly: the first cut of these
-    /// tests pressed Enter once and the pane never reached `is_exited()`).
-    /// Explicitly typing `exit` is correct either way: if the race already
-    /// fired, the shell is sitting at a fresh interactive prompt and `exit`
-    /// terminates it directly; if it hasn't, `exit` becomes `$__dummy`'s
-    /// value and the wrapper's own trailing `exit` line still runs right
-    /// after. Either path ends with the pane's shell process gone, which is
-    /// all `poll_terminal`'s `is_exited()` check cares about.
-    ///
-    /// # Per-keystroke gating (#957 smoke)
-    ///
-    /// Each keystroke is preceded by a fresh `render()` + panel check and
-    /// followed by a `predicate` test, and the whole prod aborts the instant
-    /// the panel is no longer painted. That is not belt-and-braces: a key
-    /// routed to the PTY runs `engine.poll_terminal()` synchronously inside
-    /// the very same `type_char` call (`render::route_terminal_key`'s
-    /// `SendToPty` arm), so *this function's own first keystroke* can be
-    /// what reaps the pane, closes the panel and has
-    /// `finalize_install_from_terminal` paint the message under test —
-    /// after which the remaining keystrokes would land in the editor and
-    /// `Engine::handle_key` would clear that message again before the
-    /// caller ever got to look at it. See [`poll_until_screen`]'s doc for
-    /// the observed failure.
-    ///
-    /// Returns `true` if `predicate` became satisfied mid-prod, so the
-    /// caller can stop immediately rather than tick once more (which is
-    /// harmless, but the early return keeps "who observed it" obvious).
-    fn force_terminal_exit(
-        driver: &mut quadraui::tui::testing::TuiDriver<impl quadraui::runner::AppLogic>,
-        predicate: &mut impl FnMut(&str) -> bool,
-    ) -> bool {
-        let mut keys: Vec<quadraui::Key> = "exit".chars().map(quadraui::Key::Char).collect();
-        keys.push(quadraui::Key::Named(quadraui::NamedKey::Enter));
-        for key in keys {
-            driver.render();
-            if !terminal_panel_painted(&driver.screen()) {
-                // The pane is gone — very possibly reaped by the previous
-                // keystroke in this same loop. Anything typed from here
-                // would go to the editor and wipe the command line.
-                return false;
-            }
-            driver.press(key);
-            driver.render();
-            if predicate(&driver.screen()) {
-                return true;
-            }
-        }
-        false
-    }
+    /// A shell *function* (not an alias — aliases are not expanded in
+    /// non-interactive reads of a script, and these are typed into an
+    /// interactive shell that has already parsed the line) takes precedence
+    /// over the `read` builtin in `sh`, `bash` and `zsh` alike. It is
+    /// defined ahead of the command under test so the wrapper's
+    /// `__exit_code=$?` still captures that command's real status.
+    #[cfg(unix)]
+    const SELF_CLOSING_INSTALL_PREFIX: &str = "read() { :; } ; ";
 
     /// #1344 core acceptance case: a non-zero exit code from the install
     /// command must paint "failed (exit N)" on the command line, and must
@@ -25764,8 +25655,15 @@ mod tests {
                 binary: "vimcode-test-nonexistent-binary-1344-fail".to_string(),
                 // A subshell exit, not a bare `exit 7` — the latter would
                 // terminate the *outer* interactive shell before the
-                // wrapper's own `$?`-capture line ever ran.
-                install: "sh -c 'exit 7'".to_string(),
+                // wrapper's own `$?`-capture line ever ran, so no exit code
+                // would be recorded and there would be nothing to report.
+                //
+                // `SELF_CLOSING_INSTALL_PREFIX` is what lets the pane's
+                // shell then reach that wrapper's trailing `exit` with no
+                // synthetic keypress — see its doc, and
+                // `poll_until_screen`'s, for why a keypress here is what
+                // made this test flake.
+                install: format!("{SELF_CLOSING_INSTALL_PREFIX}sh -c 'exit 7'"),
                 ..Default::default()
             },
             ..Default::default()
@@ -25846,7 +25744,10 @@ mod tests {
             dap: DapConfig {
                 adapter: "vimcode-test-dap-adapter-1344-combined".to_string(),
                 binary: "vimcode-test-nonexistent-dap-binary-1344-combined".to_string(),
-                install: "true".to_string(),
+                // Succeeds (exit 0, so finalize runs the binary checks
+                // rather than reporting a failed command) and closes its own
+                // pane — see `SELF_CLOSING_INSTALL_PREFIX`.
+                install: format!("{SELF_CLOSING_INSTALL_PREFIX}true"),
                 ..Default::default()
             },
             ..Default::default()

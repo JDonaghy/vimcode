@@ -862,6 +862,26 @@ impl Engine {
         }
 
         for bin_name in &bins {
+            // #1345 (review): every path below is built by joining this
+            // manifest-supplied name onto a directory vimcode then *deletes
+            // from* (`remove_dir_all` for the managed tool dir and the
+            // `~/.local/share/<name>` data dir, `remove_file` in the safe
+            // dirs). `binary` is free-form text out of a community-submitted
+            // registry manifest and `PathBuf::join` resolves nothing, so
+            // `binary = "../.."` would otherwise make `:ExtUninstall` with
+            // "remove tools" recursively delete an *ancestor* of
+            // `~/.local/share/vimcode/tools` — with enough segments, the
+            // user's home directory. Gate on the same predicate
+            // `tool_acquire::install_resolved_asset` already applies to this
+            // identical value on the way in.
+            if !crate::core::tool_acquire::is_safe_path_segment(bin_name) {
+                crate::core::lsp_manager::install_log(&format!(
+                    "[ext-remove] Refusing to remove tools for unsafe binary \
+                     name {bin_name:?} declared by '{name}' — not a plain \
+                     file name"
+                ));
+                continue;
+            }
             // #1345: delete the vimcode-managed acquisition dir outright —
             // unlike the shared `safe_dirs` above (system directories other
             // tools might also use), `tools/<bin_name>/` is exclusively
@@ -1311,5 +1331,128 @@ mod tests {
             !e.tool_acquire_groups.contains_key(ext),
             "accumulator must be cleared once every leg has reported"
         );
+    }
+
+    /// #1345 blocking review finding: `ext_remove_tools` joins
+    /// `manifest.lsp.binary` / `manifest.dap.binary` — free-form text from a
+    /// community-submitted registry manifest — straight onto directories it
+    /// then `remove_dir_all`s. `PathBuf::join` resolves nothing, so a
+    /// manifest declaring `binary = "../.."` used to turn ":ExtUninstall,
+    /// remove tools" into a recursive delete of an *ancestor* of
+    /// `~/.local/share/vimcode/tools`.
+    ///
+    /// The sentinel here sits two levels above the managed tools dir — i.e.
+    /// exactly where `managed_tool_dir("../../<sentinel>")` lands once the
+    /// OS resolves the join — and must survive the removal. The traversal
+    /// deliberately cannot reach anything real through the `$HOME`-based
+    /// legs of that same loop either: `~/.local/bin/../../<sentinel>` and
+    /// `~/.local/share/../../<sentinel>` resolve to a pid-unique name
+    /// directly under `$HOME`'s parent that no machine has, so an unguarded
+    /// (RED) run of this test deletes the throwaway sentinel and nothing
+    /// else.
+    ///
+    /// **Verified RED without the guard:** removing the
+    /// `is_safe_path_segment` check from `ext_remove_tools` makes the
+    /// sentinel directory (and the file inside it) gone by the time the
+    /// assertions run.
+    ///
+    /// Unit- rather than driver-tier on purpose: the guard changes no
+    /// painted output at all — `ext_remove` reports the same "Extension 'x'
+    /// and its tools removed" message either way — so what has to be
+    /// asserted is the filesystem effect, which no screen can show.
+    #[test]
+    fn ext_remove_tools_refuses_path_traversal_binary_names() {
+        use crate::core::extensions::{DapConfig, ExtensionManifest, LspConfig};
+
+        let _lock = crate::core::paths::VIMCODE_TEST_DATA_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let unique = format!(
+            "vimcode-test-1345-traversal-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        )
+        .replace(['(', ')', ' '], "");
+        let base = std::env::temp_dir().join(&unique);
+        let data_home = base.join("data");
+        let sentinel = base.join("sentinel");
+        std::fs::create_dir_all(&sentinel).unwrap();
+        std::fs::write(sentinel.join("keep-me.txt"), b"keep").unwrap();
+        // `<data_home>/tools/<binary>` with `binary = "../../sentinel"`
+        // resolves to `<base>/sentinel`.
+        std::fs::create_dir_all(data_home.join("tools")).unwrap();
+
+        let old_data_home = std::env::var_os("VIMCODE_TEST_DATA_HOME");
+        std::env::set_var("VIMCODE_TEST_DATA_HOME", &data_home);
+
+        let mut e = Engine::new();
+        let ext_name = "vc-unit-traversal-ext-1345";
+        e.ext_registry = Some(vec![ExtensionManifest {
+            name: ext_name.to_string(),
+            display_name: "Hostile manifest (1345 traversal test)".to_string(),
+            language_ids: vec!["vc-unit-traversal-lang-1345".to_string()],
+            lsp: LspConfig {
+                // `..`-escape: `remove_dir_all` of the whole sentinel dir.
+                binary: "../../sentinel".to_string(),
+                ..Default::default()
+            },
+            dap: DapConfig {
+                adapter: "vc-unit-traversal-adapter-1345".to_string(),
+                // Nested-name escape: reaches a single file inside it.
+                binary: "../../sentinel/keep-me.txt".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        }]);
+
+        e.ext_remove_tools(ext_name);
+
+        match old_data_home {
+            Some(v) => std::env::set_var("VIMCODE_TEST_DATA_HOME", v),
+            None => std::env::remove_var("VIMCODE_TEST_DATA_HOME"),
+        }
+
+        assert!(
+            sentinel.is_dir(),
+            "a manifest binary name containing `..` must never make tool \
+             removal delete a directory outside the managed tools tree; \
+             {} is gone",
+            sentinel.display()
+        );
+        assert!(
+            sentinel.join("keep-me.txt").is_file(),
+            "the sentinel directory survived but its contents did not — \
+             the traversal still reached inside it"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The predicate the guard above delegates to, spelled out: a plain
+    /// file name is the only accepted shape. `is_safe_relative_path` alone
+    /// (which `tool_acquire`'s archive-entry checks use) accepts `a/b`, and
+    /// a nested name is just as much an escape as `..` when it is joined
+    /// onto a directory that is about to be deleted.
+    #[test]
+    fn is_safe_path_segment_accepts_only_plain_file_names() {
+        use crate::core::tool_acquire::is_safe_path_segment;
+        for good in ["rust-analyzer", "clangd", "terraform-ls", "gopls.exe"] {
+            assert!(is_safe_path_segment(good), "{good:?} must be accepted");
+        }
+        for bad in [
+            "",
+            "..",
+            ".",
+            "../..",
+            "../../../../",
+            "a/b",
+            "a\\b",
+            "/etc",
+            "./x",
+            "sub/../..",
+        ] {
+            assert!(!is_safe_path_segment(bad), "{bad:?} must be rejected");
+        }
     }
 }
