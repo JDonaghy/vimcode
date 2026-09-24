@@ -965,7 +965,7 @@ impl Engine {
 
     #[allow(dead_code)]
     pub fn has_diagnostic_on_line(&self, line: usize) -> bool {
-        if let Some(path) = self.active_buffer_path() {
+        if let Some(path) = self.active_buffer_diagnostics_key() {
             if let Some(diags) = self.lsp_diagnostics.get(&path) {
                 return diags.iter().any(|d| {
                     let sl = d.range.start.line as usize;
@@ -981,7 +981,7 @@ impl Engine {
     /// Shows ALL diagnostics that touch this line, regardless of column.
     pub fn trigger_editor_hover_for_line(&mut self, line: usize) {
         let mut sections: Vec<String> = Vec::new();
-        if let Some(path) = self.active_buffer_path() {
+        if let Some(path) = self.active_buffer_diagnostics_key() {
             if let Some(diags) = self.lsp_diagnostics.get(&path) {
                 for diag in diags {
                     let start_line = diag.range.start.line as usize;
@@ -1046,7 +1046,7 @@ impl Engine {
         let mut sections: Vec<(EditorHoverSource, String)> = Vec::new();
 
         // 1. Diagnostics at this position
-        if let Some(path) = self.active_buffer_path() {
+        if let Some(path) = self.active_buffer_diagnostics_key() {
             if let Some(diags) = self.lsp_diagnostics.get(&path) {
                 for diag in diags {
                     let start_line = diag.range.start.line as usize;
@@ -1584,7 +1584,7 @@ impl Engine {
     /// Check if there's a diagnostic at the given position.
     #[allow(dead_code)]
     pub(crate) fn has_diagnostic_at(&self, line: usize, col: usize) -> bool {
-        if let Some(path) = self.active_buffer_path() {
+        if let Some(path) = self.active_buffer_diagnostics_key() {
             if let Some(diags) = self.lsp_diagnostics.get(&path) {
                 for diag in diags {
                     let sl = diag.range.start.line as usize;
@@ -1628,6 +1628,33 @@ impl Engine {
             .and_then(|bs| bs.file_path.clone())
     }
 
+    /// The key [`Engine::lsp_diagnostics`] is stored under for the active
+    /// buffer.
+    ///
+    /// That map is keyed by the **canonical** absolute path (#208: the LSP
+    /// flush derives its key from the server's `file://` URI, and
+    /// `panels.rs` re-keys notifications through `canonical_path`), and
+    /// `build_rendered_window` looks the gutter up through
+    /// `BufferState::canonical_path` for the same reason. Every diagnostics
+    /// lookup on this side must use the same key or it silently misses
+    /// whenever the buffer was opened through a path that is not already
+    /// canonical — a symlinked directory, or any path carrying a `.`/`..`
+    /// segment. On macOS that is the *common* case, not an exotic one:
+    /// `std::env::temp_dir()` hands back `/var/folders/…`, a symlink to
+    /// `/private/var/folders/…`, so the diagnostic gutter painted a marker
+    /// that, when clicked, opened no hover at all.
+    ///
+    /// Falls back to the raw `file_path` for a buffer whose file does not
+    /// exist on disk yet (`canonical_path` is `None` until the first
+    /// successful `canonicalize`).
+    pub(crate) fn active_buffer_diagnostics_key(&self) -> Option<PathBuf> {
+        let state = self.buffer_manager.get(self.active_window().buffer_id)?;
+        state
+            .canonical_path
+            .clone()
+            .or_else(|| state.file_path.clone())
+    }
+
     /// Handle LSP hover response by updating the editor hover popup.
     /// Called when the hover response arrives asynchronously.
     pub fn update_editor_hover_with_lsp(&mut self, hover_text: &str) {
@@ -1640,7 +1667,7 @@ impl Engine {
             let mut sections: Vec<String> = Vec::new();
 
             // Re-collect diagnostics for this anchor position
-            if let Some(path) = self.active_buffer_path() {
+            if let Some(path) = self.active_buffer_diagnostics_key() {
                 if let Some(diags) = self.lsp_diagnostics.get(&path) {
                     for diag in diags {
                         let sl = diag.range.start.line as usize;
