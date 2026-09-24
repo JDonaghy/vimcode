@@ -1660,7 +1660,21 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        dir
+        // #1374: canonicalize before handing back. On macOS `std::env::
+        // temp_dir()` is `/var/folders/...`, and `/var` is a symlink to
+        // `/private/var` — but `Engine::acp_write_text_file`'s
+        // `resolve_path_within_roots` canonicalizes both the workspace
+        // root and the resolved target path before opening the buffer, so
+        // the buffer ends up keyed by the `/private/var/...` form while a
+        // caller comparing against this un-canonicalized `dir`-derived
+        // path (e.g. `buffer_manager.get(id).file_path == Some(file_path.
+        // as_path())`, an exact-path comparison, not the canonicalizing
+        // one `BufferManager::open_file`/`Engine::acp_read_text_file` use
+        // for their own buffer lookups) never matches on that platform —
+        // same class of bug as #1350. Canonicalizing here once, up front,
+        // makes every path this helper hands out agree with what
+        // `resolve_path_within_roots` resolves to, on every platform.
+        dir.canonicalize().unwrap_or(dir)
     }
 
     /// #954's core correctness property: a dirty (unsaved) open buffer's
