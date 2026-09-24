@@ -3532,6 +3532,24 @@ pub struct Engine {
     /// `RequestFailed`/`AgentExited` so the next chunk of a later turn
     /// starts fresh rather than appending to a finished one.
     pub acp_streaming_turn: Option<(usize, crate::core::acp::AcpChunkKind)>,
+    /// A parked `session/request_permission` request, if the dialog tagged
+    /// `"acp_permission"` is currently open for it (#953, ACP-2). Holds the
+    /// JSON-RPC request id (needed to reply) alongside the parsed request
+    /// (needed to interpret which button the human picked, and to key
+    /// `acp_remembered_decisions`). `None` whenever no permission dialog is
+    /// open — every path that closes that dialog must clear this at the
+    /// same time it sends the reply, so the two never drift apart; see
+    /// `Engine::acp_cancel_pending_permission` and the `"acp_permission"`
+    /// arm of `process_dialog_result`, the only two places that do either.
+    pub acp_pending_permission: Option<(i64, crate::core::acp::AcpPermissionRequest)>,
+    /// Session-scoped remembered `allow_always`/`reject_always` answers to
+    /// `session/request_permission`, keyed by the tool call's ACP `kind`
+    /// (`AcpToolCallInfo::kind` — e.g. `"edit"`, `"execute"`; *not* the
+    /// per-option `kind`). `true` = always allow, `false` = always reject.
+    /// Cleared whenever the session itself ends (`ai_clear`, `AgentExited`)
+    /// — never persisted across sessions, per #953's non-goal #1 (no
+    /// blanket/global auto-approve).
+    pub acp_remembered_decisions: std::collections::HashMap<String, bool>,
 
     // --- DAP (Debug Adapter Protocol) state ---
     /// Multi-adapter DAP coordinator. None until first debug session is started.
@@ -4600,6 +4618,8 @@ impl Engine {
             acp_session_id: None,
             acp_pending_prompt: None,
             acp_streaming_turn: None,
+            acp_pending_permission: None,
+            acp_remembered_decisions: HashMap::new(),
             dap_manager: None,
             dap_stopped_thread: None,
             dap_breakpoints: HashMap::new(),

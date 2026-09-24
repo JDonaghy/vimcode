@@ -3048,6 +3048,11 @@ impl Engine {
     /// `initialize` -> `session/new` handshake, not a continuation of
     /// whatever context the old agent process held.
     pub fn ai_clear(&mut self) {
+        // #953 (ACP-2): a parked permission prompt must get its one reply
+        // before the client (and its stdin) goes away below — the agent is
+        // still alive at this point, only about to be killed.
+        self.acp_cancel_pending_permission();
+        self.acp_remembered_decisions.clear();
         self.ai_messages.clear();
         self.ai_rx = None;
         self.ai_streaming = false;
@@ -3085,8 +3090,19 @@ impl Engine {
             // Ctrl+Enter/PageUp/PageDown/Ctrl+A/Ctrl+E are handled
             // internally), so it falls to this app-hotkey escape hatch,
             // exactly as its own doc comment recommends.
+            //
+            // #953 (ACP-2): while an ACP turn is actually in flight, Ctrl+C
+            // aborts *that turn* (`session/cancel`) instead of nuking the
+            // whole session — "the user must be able to abort a running
+            // turn from the panel" without losing the agent process and
+            // conversation history the way a full `ai_clear` would. Idle
+            // (not streaming) keeps the existing full-clear behaviour.
             Ev::KeyPressed { key, modifiers } if modifiers.ctrl && key == "Char('c')" => {
-                self.ai_clear();
+                if self.acp_client.is_some() && self.ai_streaming {
+                    self.acp_cancel_turn();
+                } else {
+                    self.ai_clear();
+                }
                 true
             }
             _ => true,

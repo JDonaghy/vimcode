@@ -14574,6 +14574,126 @@ mod tests {
         );
     }
 
+    /// #953 (ACP-2): `session/request_permission` — the human-in-the-loop
+    /// tool-call approval chokepoint — through the real `TuiShellApp`/
+    /// `TuiDriver` stack. The dialog must actually paint the agent's own
+    /// `toolCall` title/kind/location (not just flip some internal flag —
+    /// "a permission prompt with no visible target is not a decision, it
+    /// is a rubber stamp"), and pressing the "Allow Once" button's hotkey
+    /// must reply with that option's id and let the parked turn resume to
+    /// completion.
+    ///
+    /// RED verified: with the `"acp_permission"` arm of
+    /// `Engine::process_dialog_result` reverted to the default no-op, this
+    /// test times out waiting for "Hello world" to reach the transcript —
+    /// the fixture stays blocked on its `read -r _reply` forever because
+    /// nothing ever answers `respond_to_client_request`.
+    #[cfg(unix)]
+    #[test]
+    fn ai_panel_shows_permission_dialog_and_resumes_turn_on_selection_via_shell_app() {
+        let mut app = TuiShellApp::new(None);
+        app.engine
+            .app_shell
+            .show_panel(&quadraui::WidgetId::new(PANEL_AI));
+        app.engine.ai_has_focus = true;
+        app.sidebar.has_focus = true;
+
+        let argv = vec![
+            "sh".to_string(),
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/fake_acp_agent.sh"
+            )
+            .to_string(),
+        ];
+        let cwd = std::env::temp_dir();
+        let mut client = crate::core::acp::AcpClient::spawn_with_env(
+            &argv,
+            &cwd,
+            &[("ACP_FAKE_REQUEST_PERMISSION", "1")],
+        )
+        .expect("fixture agent should spawn");
+        client.initialize();
+        app.engine.acp_client = Some(client);
+        app.engine.settings.acp_agent_command = "already-spawned-above".to_string();
+
+        let mut driver = driver_with_shell(app, config(), 80, 24);
+        for c in "please edit".chars() {
+            driver.type_char(c);
+        }
+        driver.ctrl_char('s');
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut screen = driver.screen();
+        while !screen.contains("Edit src/main.rs") && Instant::now() < deadline {
+            driver.tick();
+            std::thread::sleep(Duration::from_millis(10));
+            screen = driver.screen();
+        }
+        assert!(
+            screen.contains("Edit src/main.rs"),
+            "the permission dialog must paint the tool call's title within \
+             5s; screen:\n{screen}"
+        );
+        assert!(
+            screen.contains("edit"),
+            "the tool call's kind must be visible so a human has something \
+             to decide on; screen:\n{screen}"
+        );
+        assert!(
+            screen.contains("src/main.rs:42"),
+            "the tool call's location (path + line) must be visible; \
+             screen:\n{screen}"
+        );
+        // Button labels paint with their hotkey letter bracketed
+        // (`[A]llow Once`), per this dialog widget's convention — not a
+        // rendering detail specific to this test.
+        assert!(
+            screen.contains("llow Once")
+                && screen.contains("lways Allow")
+                && screen.contains("eject"),
+            "the agent's own options must be presented verbatim, not a \
+             hardcoded yes/no; screen:\n{screen}"
+        );
+        // The panel's busy spinner ("AI ASSISTANT  (thinking…)",
+        // `render.rs`) must still be up here — the turn is genuinely
+        // parked on the dialog, not already finished. Asserting the
+        // *disappearance* of this same marker below (rather than
+        // re-checking "Hello world", which the fixture already streamed
+        // into the transcript **before** ever asking for permission) is
+        // what makes the post-click assertion non-vacuous: "Hello world"
+        // would stay on screen even if the reply were silently never sent.
+        assert!(
+            screen.contains("(thinking"),
+            "the panel must still be busy while the permission dialog is \
+             open, or the completion check below would pass trivially; \
+             screen:\n{screen}"
+        );
+
+        // "Allow Once" is the dialog's first button and 'a' is its hotkey —
+        // unambiguous (`handle_dialog_key` matches buttons in order, and it
+        // is index 0).
+        driver.type_char('a');
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut screen = driver.screen();
+        while screen.contains("(thinking") && Instant::now() < deadline {
+            driver.tick();
+            std::thread::sleep(Duration::from_millis(10));
+            screen = driver.screen();
+        }
+        assert!(
+            !screen.contains("(thinking"),
+            "the reply must actually reach the (fake) agent and let the \
+             turn resume to completion (busy spinner cleared) within 5s; \
+             screen:\n{screen}"
+        );
+        assert!(
+            !screen.contains("Edit src/main.rs"),
+            "the dialog must be gone once answered; screen:\n{screen}"
+        );
+    }
+
     /// #952 (ACP-1) acceptance: "Agent binary missing from PATH -> a clear,
     /// actionable panel message, not a crash and not a silent empty panel."
     /// `settings.acp_agent_command` pointing at a program that doesn't exist
