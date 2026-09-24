@@ -3992,6 +3992,16 @@ pub struct Engine {
     pub ext_registry_rx:
         Option<std::sync::mpsc::Receiver<Option<Vec<extensions::ExtensionManifest>>>>,
 
+    // --- Native tool acquisition (#1345) ---
+    /// In-flight background acquisitions (`tool_acquire::acquire_and_install`),
+    /// keyed by the same `install_key` scheme `lsp_installing` uses (e.g.
+    /// `"ext:{ext}:lsp"`, `"dap:{adapter}"`) so an LSP leg and a DAP leg of
+    /// the same `:ExtInstall` can run concurrently without clobbering each
+    /// other — mirrors `async_shell_tasks`'s `HashMap<String, Receiver<_>>`
+    /// pattern (`plugins.rs`).
+    pub(crate) tool_acquire_tasks:
+        HashMap<String, std::sync::mpsc::Receiver<lsp_ops::ToolAcquireOutcome>>,
+
     // --- Extensions sidebar state ---
     /// quadraui SidebarSystem — owns extensions sidebar (2 sections:
     /// Installed, Available) selection, scroll, keyboard nav, and mouse
@@ -4803,6 +4813,7 @@ impl Engine {
             ext_registry: registry::load_cache(),
             ext_registry_fetching: false,
             ext_registry_rx: None,
+            tool_acquire_tasks: HashMap::new(),
             ext_sidebar_system: {
                 let mut s = quadraui::SidebarSystem::new(vec![
                     quadraui::SidebarSectionDef::new("installed", "INSTALLED"),
@@ -5072,6 +5083,7 @@ impl Engine {
         redraw |= self.poll_terminal();
         redraw |= self.poll_dap();
         redraw |= self.poll_ext_registry();
+        redraw |= self.poll_tool_acquire();
         redraw |= self.poll_sc_diff();
         redraw |= self.poll_ai();
         redraw |= self.poll_async_shells();

@@ -185,6 +185,13 @@ pub struct LspConfig {
     /// `{"diagnostics": {"enable": false}}` for rust-analyzer).
     #[serde(default)]
     pub initialization_options: Option<serde_json::Value>,
+    /// Native tool acquisition (#1345): download, verify and unpack the LSP
+    /// binary directly, with no shell command, `sudo`, `unzip`, or PATH
+    /// edits. When present, `ext_install_from_registry` prefers this over
+    /// `install`/`install_linux`/`install_macos`/`install_windows` — see
+    /// `crate::core::tool_acquire`.
+    #[serde(default)]
+    pub acquire: Option<crate::core::tool_acquire::AcquireConfig>,
 }
 
 // ─── Target platform (testable seam, #919) ────────────────────────────────────
@@ -322,6 +329,9 @@ pub struct DapConfig {
     /// Arguments passed to the DAP binary.
     #[serde(default)]
     pub args: Vec<String>,
+    /// Native tool acquisition (#1345) — see `LspConfig::acquire`'s doc.
+    #[serde(default)]
+    pub acquire: Option<crate::core::tool_acquire::AcquireConfig>,
 }
 
 impl DapConfig {
@@ -797,6 +807,43 @@ refresh_command = ["example-tool", "board", "--json"]
         let m = ExtensionManifest::parse(toml).expect("should parse");
         let board = m.board.expect("board provider config should be present");
         assert_eq!(board.poll_interval_secs, 30);
+    }
+
+    #[test]
+    fn lsp_acquire_absent_from_toml_parses_to_none() {
+        // #1345: every existing registry manifest has no `[lsp.acquire]` /
+        // `[dap.acquire]` table — confirm they stay unaffected.
+        let toml = r#"
+name = "rust"
+display_name = "Rust Language Support"
+[lsp]
+binary = "rust-analyzer"
+install = "cargo install rust-analyzer"
+"#;
+        let m = ExtensionManifest::parse(toml).expect("should parse");
+        assert!(m.lsp.acquire.is_none());
+        assert!(m.dap.acquire.is_none());
+    }
+
+    #[test]
+    fn lsp_acquire_table_parses_from_toml() {
+        let toml = r#"
+name = "terraform"
+display_name = "Terraform"
+[lsp]
+binary = "terraform-ls"
+[lsp.acquire]
+kind = "hashicorp-release"
+product = "terraform-ls"
+binary_path = "terraform-ls"
+"#;
+        let m = ExtensionManifest::parse(toml).expect("should parse");
+        let acquire = m.lsp.acquire.expect("acquire table should parse");
+        assert_eq!(
+            acquire.kind,
+            crate::core::tool_acquire::AcquireKind::HashicorpRelease
+        );
+        assert_eq!(acquire.product, "terraform-ls");
     }
 
     #[test]
