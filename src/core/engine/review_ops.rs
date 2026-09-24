@@ -4,24 +4,23 @@
 //! `Engine`/buffer/backend knowledge — this module is the only place that
 //! bridges the two, mirroring the `crate::core::acp` / `acp_ops.rs` split.
 //!
-//! ## Mouse click-to-jump: logic ships here, wiring is a follow-up
+//! ## Mouse click-to-jump: both the logic and the wiring ship here
 //!
 //! [`Engine::change_review_jump_to_hit`] resolves a real
 //! `quadraui::DiffViewHit` (from `DiffView::layout(..).hit_test(x, y)`)
 //! to a `(path, line)` and jumps there — the piece "clicking a location
-//! jumps to that file and line" needs. Neither backend's mouse
-//! click-arbitration ladder (`render::MOUSE_ARBITRATION_ORDER` /
-//! `route_modal_overlay_click`) routes a click into this overlay yet —
-//! that ladder's `ModalOverlayRoute` enum and both backends' consumers of
-//! it are a second, independently-sized integration surface this slice
-//! did not extend, to keep the diff bounded. The keyboard path (`Return`
-//! in [`Engine::handle_change_review_key`]) exercises the exact same
-//! resolution function today, so the gap is purely "no mouse entry point
-//! yet", not "the resolution logic is unbuilt or untested". `diff_peek`
-//! (`crate::core::engine::buffers::handle_diff_peek_key`), the closest
-//! analogous existing overlay, is keyboard-only with no mouse hit-testing
-//! at all, so this leaves the change-review surface strictly ahead of
-//! that precedent, not behind it.
+//! jumps to that file and line" needs, closing the surface on success so
+//! the jumped-to buffer is what paints next rather than the (full-viewport)
+//! diff. Both backends' mouse handling routes a real click into this
+//! overlay *before* the modal-overlay ladder, the same "swallows every
+//! click while open" precedent the folder picker set: GTK's
+//! `App::route_and_apply_change_review_click` (`src/app.rs`) and TUI's
+//! equivalent branch in `mouse::handle_mouse` (`src/tui_main/mouse.rs`)
+//! both call the shared `render::route_change_review_click` to resolve the
+//! click against the exact geometry `render::paint_change_review_rung`
+//! last painted, then this function to act on it. The keyboard path
+//! (`Return` in [`Engine::handle_change_review_key`]) exercises the same
+//! resolution function.
 
 use super::*;
 use crate::core::review::ProposedChange;
@@ -201,6 +200,15 @@ impl Engine {
     /// file and line" (#955's acceptance bar), implemented against the
     /// diff surface's own row/hunk geometry (`DiffViewHit::Row`) rather
     /// than new transcript-click infrastructure quadraui doesn't ship yet.
+    ///
+    /// Closes the change-review surface on a successful jump (same as the
+    /// keyboard `Return` path's explicit `close_change_review()`), since
+    /// the surface is full-viewport on both backends — leaving it open
+    /// would paint the diff right back over the buffer the jump just
+    /// switched to, silently undoing the whole point of the click. A
+    /// failed resolution (row not inside any hunk) leaves the surface
+    /// open, mirroring `Return`'s own `row_to_location` failure case
+    /// being a no-op rather than a forced close.
     pub(crate) fn change_review_jump_to_hit(&mut self, hit: quadraui::DiffViewHit) {
         let quadraui::DiffViewHit::Row { row_idx, .. } = hit else {
             return;
@@ -217,6 +225,7 @@ impl Engine {
         let win_id = self.active_window_id();
         self.set_cursor_for_window(win_id, line.saturating_sub(1) as usize, 0);
         self.ensure_cursor_visible();
+        self.close_change_review();
     }
 }
 

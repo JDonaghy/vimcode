@@ -6287,6 +6287,20 @@ impl App {
             return false;
         }
 
+        // #955 (ACP-4, review fix): same reasoning as the picker above, for
+        // the change-review surface — full-viewport, so its diff pane sits
+        // squarely on top of the sidebar body underneath. Without this, a
+        // click on the diff's left pane (which happens to fall inside
+        // `sidebar_content_bounds`, since the surface deliberately doesn't
+        // resize/hide the sidebar it's painted over) drove the sidebar's own
+        // `TreeController`/panel row hit-test instead of ever reaching
+        // `handle_mouse_click_msg`'s change-review block further down —
+        // `route_and_apply_change_review_click` was correct but unreachable
+        // for any click whose *coordinates* happened to land in that band.
+        if self.engine.borrow().change_review.is_some() {
+            return false;
+        }
+
         // An engine-drawn context menu (editor / tab-bar / explorer — they
         // all share `engine.context_menu`) takes priority over the sidebar's
         // own click routing. An explorer-sourced menu typically renders
@@ -7163,11 +7177,28 @@ impl App {
         // dropdown overlay must intercept keys/clicks before the sidebar or
         // editor sees them — same precedence TUI uses (mod.rs "MenuSystem
         // intercept" block) via the identical shared `menu_system.handle()`.
+        //
+        // #955 (ACP-4, review fix): also gated on the dropdown genuinely
+        // being closed OR the change-review surface being closed. The menu
+        // bar/CSD row occupies the window's full top band (`bar_rect.x`
+        // starts right after the app icon, `bar_rect.width` spans the rest
+        // of the window) — exactly where the change-review surface's first
+        // diff rows paint, since that surface is genuinely full-viewport.
+        // Without this, `menu_system.handle` treated a click on those rows
+        // as landing on "File" (or whichever label happens to share that
+        // band) and returned `StateChanged`/`Activated`, swallowing the
+        // click into a menu open/highlight instead of ever reaching
+        // `handle_mouse_click_msg`. An *already-open* dropdown still wins
+        // regardless (`menu_system.borrow().is_open()`), matching every
+        // other "topmost modal wins" precedent in this function — only the
+        // idle bar itself yields.
         let (menu_bar_visible, menu_system) = {
             let eng = self.engine.borrow();
             (eng.menu_bar_visible, eng.menu_system.clone())
         };
-        if menu_bar_visible || menu_system.borrow().is_open() {
+        let menu_open = menu_system.borrow().is_open();
+        let change_review_open = self.engine.borrow().change_review.is_some();
+        if menu_open || (menu_bar_visible && !change_review_open) {
             // `menu_items_rect`, not `menu_row_rect` (#720): the app icon
             // occupies a leading slot, so the items the last frame *painted*
             // start one slot right of the band's left edge. Hit-testing
@@ -7332,17 +7363,31 @@ impl App {
         // mirrors quadraui's `full_chrome_demo` reference. TUI has no window,
         // so `begin_window_drag`/`begin_window_resize`/`toggle_window_maximize`
         // are all documented no-ops there; this path is GTK-only.
+        //
+        // #955 (ACP-4, review fix): also gated on the change-review surface
+        // being closed. That surface is genuinely full-viewport — its first
+        // diff row paints inside `ctx.in_title_bar`'s band, underneath the
+        // (visually hidden but still logically live) CSD title bar — so
+        // without this guard, a click there was silently reinterpreted as
+        // "start dragging the window" instead of reaching
+        // `handle_mouse_click_msg`'s change-review branch further down.
+        // `ctx.in_title_bar` has no such reach today for the folder picker
+        // (its popup is centred, never touching row 0), which is why this
+        // wasn't already latent there in a way any existing test could see.
+        let change_review_open = self.engine.borrow().change_review.is_some();
         match &event {
             UiEvent::MouseDown {
                 button: MouseButton::Left,
                 position,
                 ..
-            } if ctx.in_title_bar(position.x, position.y) => {
+            } if !change_review_open && ctx.in_title_bar(position.x, position.y) => {
                 backend.begin_window_drag();
                 self.draw_needed.set(true);
                 return quadraui::Reaction::Redraw;
             }
-            UiEvent::DoubleClick { position, .. } if ctx.in_title_bar(position.x, position.y) => {
+            UiEvent::DoubleClick { position, .. }
+                if !change_review_open && ctx.in_title_bar(position.x, position.y) =>
+            {
                 backend.toggle_window_maximize();
                 self.draw_needed.set(true);
                 return quadraui::Reaction::Redraw;
@@ -8649,7 +8694,10 @@ impl quadraui::ShellApp for App {
                 // `render::paint_change_review_rung` is the whole body — no
                 // GTK-specific diff rendering, matching every other
                 // `quadraui::DiffView` consumer. Uses the same
-                // `popup_viewport` every other overlay rung anchors to.
+                // `popup_viewport` every other overlay rung anchors to. The
+                // `else` pops the surface's modal-stack entry
+                // (`render::reconcile_change_review_modal_stack`'s doc) once
+                // it closes, mirroring TUI's identical arm.
                 render::FrameOp::ChangeReview => {
                     if let Some(review) = screen.change_review.as_ref() {
                         render::paint_change_review_rung(
@@ -8660,6 +8708,8 @@ impl quadraui::ShellApp for App {
                             &theme,
                         );
                         composed.push(render::FrameOp::ChangeReview);
+                    } else {
+                        render::reconcile_change_review_modal_stack(backend, false, popup_viewport);
                     }
                 }
 
