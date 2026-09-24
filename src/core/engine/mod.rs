@@ -4001,6 +4001,11 @@ pub struct Engine {
     /// pattern (`plugins.rs`).
     pub(crate) tool_acquire_tasks:
         HashMap<String, std::sync::mpsc::Receiver<lsp_ops::ToolAcquireOutcome>>,
+    /// Per-extension status-text accumulator for those acquisitions, keyed
+    /// by extension name. Keeps a leg that finishes in a *later* tick from
+    /// erasing the status text of one that finished earlier — see
+    /// `lsp_ops::ToolAcquireGroup`.
+    pub(crate) tool_acquire_groups: HashMap<String, lsp_ops::ToolAcquireGroup>,
 
     // --- Extensions sidebar state ---
     /// quadraui SidebarSystem — owns extensions sidebar (2 sections:
@@ -4814,6 +4819,7 @@ impl Engine {
             ext_registry_fetching: false,
             ext_registry_rx: None,
             tool_acquire_tasks: HashMap::new(),
+            tool_acquire_groups: HashMap::new(),
             ext_sidebar_system: {
                 let mut s = quadraui::SidebarSystem::new(vec![
                     quadraui::SidebarSectionDef::new("installed", "INSTALLED"),

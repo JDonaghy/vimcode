@@ -29,6 +29,29 @@ pub(crate) struct ToolAcquireOutcome {
     pub notification_id: u64,
 }
 
+/// Per-extension aggregation state for the native acquisitions one
+/// `:ExtInstall` kicked off (#1345 review follow-up).
+///
+/// A manifest with both `[lsp.acquire]` and `[dap.acquire]` spawns two
+/// background threads that finish **whenever they finish** — the same
+/// `poll_tool_acquire` tick if both are fast, different ticks otherwise
+/// (a big download next to a small one, or just scheduler luck). Joining
+/// only the outcomes that happen to land in the *same* tick therefore
+/// fixes nothing on its own: the later tick's `self.message = …` still
+/// erases the earlier tick's text, which is exactly the "DAP outcome
+/// clobbering LSP success" bug (#1344) in slow motion. Carrying the
+/// finished legs' text here, across ticks, until the last leg of that
+/// extension reports, makes the final status line contain every leg's
+/// outcome regardless of completion order or tick boundaries.
+#[derive(Default)]
+pub(crate) struct ToolAcquireGroup {
+    /// Legs spawned for this extension that have not reported yet.
+    pub pending: usize,
+    /// Status text produced by each leg that has already reported, in
+    /// completion order.
+    pub messages: Vec<String>,
+}
+
 impl Engine {
     // =======================================================================
     // LSP integration
@@ -491,6 +514,13 @@ impl Engine {
         let (tx, rx) = std::sync::mpsc::channel();
         let bg_tool_name = tool_name.clone();
         let bg_install_key = install_key.clone();
+        // Register the leg before it can possibly report, so a finalize
+        // that lands in the very next tick sees a non-zero `pending` and
+        // keeps its sibling's text (see `ToolAcquireGroup`).
+        self.tool_acquire_groups
+            .entry(ext_name.clone())
+            .or_default()
+            .pending += 1;
         std::thread::spawn(move || {
             let result = crate::core::tool_acquire::acquire_and_install(&bg_tool_name, &acquire)
                 .map_err(|e| e.to_string());
@@ -530,7 +560,10 @@ impl Engine {
         // exactly the "DAP outcome clobbering LSP success" class fixed for
         // the terminal-install path in `finalize_install_from_terminal`
         // (#1344). Outcomes for the same extension are collected and joined
-        // into one status line instead; outcomes for different extensions
+        // into one status line instead — and, because two legs need not
+        // land in the same tick at all, that join is carried across ticks
+        // in `Engine::tool_acquire_groups` (see `ToolAcquireGroup`);
+        // outcomes for different extensions
         // still each get their own call (and so the last one to finalize
         // wins `self.message` — a pre-existing, unrelated property of a
         // single-line status bar shared across all engine operations).
@@ -563,12 +596,16 @@ impl Engine {
     /// cleaned up its own partial state) and surface the error. Each
     /// outcome resolves its own notification by ID (never "by kind" — see
     /// `ToolAcquireOutcome::notification_id`'s doc comment), and the
-    /// per-leg messages are joined into one status line, mirroring
-    /// `finalize_install_from_terminal`'s collect-then-join pattern so a
-    /// second leg's outcome can never silently erase the first's.
+    /// per-leg messages are accumulated in that extension's
+    /// [`ToolAcquireGroup`] and re-joined into one status line on every
+    /// finalize — mirroring `finalize_install_from_terminal`'s
+    /// collect-then-join pattern, but *across ticks* so a second leg that
+    /// finishes a tick later can never silently erase the first's text
+    /// either (see `ToolAcquireGroup`'s doc comment).
     fn finalize_tool_acquire_group(&mut self, outcomes: Vec<ToolAcquireOutcome>) {
-        let mut messages: Vec<String> = Vec::new();
+        let mut affected: Vec<String> = Vec::new();
         for outcome in outcomes {
+            let mut messages: Vec<String> = Vec::new();
             self.lsp_installing.remove(&outcome.install_key);
             self.notify_done(outcome.notification_id, None);
 
@@ -619,9 +656,31 @@ impl Engine {
                     ));
                 }
             }
+
+            let group = self
+                .tool_acquire_groups
+                .entry(ext_name.clone())
+                .or_default();
+            group.pending = group.pending.saturating_sub(1);
+            group.messages.append(&mut messages);
+            if !affected.contains(&ext_name) {
+                affected.push(ext_name);
+            }
         }
-        if !messages.is_empty() {
-            self.message = messages.join(" | ");
+
+        for ext_name in affected {
+            let Some(group) = self.tool_acquire_groups.get(&ext_name) else {
+                continue;
+            };
+            if !group.messages.is_empty() {
+                self.message = group.messages.join(" | ");
+            }
+            // Last leg of this extension reported — drop the accumulator so
+            // a later re-install of the same extension starts from a clean
+            // slate rather than re-painting the previous run's outcomes.
+            if group.pending == 0 {
+                self.tool_acquire_groups.remove(&ext_name);
+            }
         }
     }
 
@@ -1149,4 +1208,108 @@ fn is_rustup_proxy(path: &Path) -> bool {
     let proxy_len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
     let rustup_len = std::fs::metadata(&rustup_exe).map(|m| m.len()).unwrap_or(0);
     proxy_len != 0 && proxy_len == rustup_len
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a finished-leg outcome without running a real acquisition.
+    fn outcome(
+        ext: &str,
+        install_key: &str,
+        leg: ToolAcquireLeg,
+        tool: &str,
+        result: Result<std::path::PathBuf, String>,
+    ) -> ToolAcquireOutcome {
+        ToolAcquireOutcome {
+            ext_name: ext.to_string(),
+            install_key: install_key.to_string(),
+            leg,
+            tool_name: tool.to_string(),
+            result,
+            notification_id: 0,
+        }
+    }
+
+    /// #1345 review follow-up, deterministic half: two legs of the same
+    /// `:ExtInstall` that report in **different** `poll_tool_acquire`
+    /// ticks must both survive in the status line. The driver-tier test
+    /// `tui_main::shell_app::tests::extension_install_lsp_acquire_success_
+    /// survives_dap_acquire_failure_via_shell_app` covers the same rule on
+    /// painted output, but it cannot *force* the two-tick ordering — the
+    /// background threads decide that — so it reproduced the bug only
+    /// intermittently (2 of 4 full `--lib` runs). Calling finalize twice
+    /// here pins it.
+    ///
+    /// Verified RED against the same-tick-only join (`let mut messages`
+    /// local to `finalize_tool_acquire_group`, assigned straight into
+    /// `self.message`): the second call overwrites the first's text and
+    /// the DAP assertion below fails.
+    ///
+    /// The DAP leg succeeds and the LSP leg fails (rather than the other
+    /// way round) purely so neither call reaches `ensure_lsp_manager` /
+    /// `ensure_server_for_language` — no process spawn, no PATH probing,
+    /// nothing environment-dependent in a unit test.
+    #[test]
+    fn tool_acquire_outcomes_in_separate_ticks_keep_both_messages() {
+        let mut e = Engine::new();
+        let ext = "vc-unit-acq-ext-1345";
+
+        // Two legs in flight, as `spawn_tool_acquire` would have left it.
+        e.tool_acquire_groups
+            .entry(ext.to_string())
+            .or_default()
+            .pending = 2;
+
+        // Tick 1: the DAP leg lands on its own.
+        e.finalize_tool_acquire_group(vec![outcome(
+            ext,
+            &format!("dap:{ext}"),
+            ToolAcquireLeg::Dap,
+            "vc-unit-acq-dap-1345",
+            Ok(std::path::PathBuf::from(
+                "/nonexistent/vc-unit-acq-dap-1345",
+            )),
+        )]);
+        assert!(
+            e.message.contains("DAP adapter") && e.message.contains(ext),
+            "first leg must paint its own outcome; got: {}",
+            e.message
+        );
+        assert_eq!(
+            e.tool_acquire_groups.get(ext).map(|g| g.pending),
+            Some(1),
+            "the still-running LSP leg must keep the accumulator alive"
+        );
+
+        // Tick 2 (a separate `poll_tool_acquire` call): the LSP leg fails.
+        e.finalize_tool_acquire_group(vec![outcome(
+            ext,
+            &format!("ext:{ext}:lsp"),
+            ToolAcquireLeg::Lsp {
+                lang_ids: vec![],
+                args: vec![],
+            },
+            "vc-unit-acq-lsp-1345",
+            Err("boom".to_string()),
+        )]);
+        assert!(
+            e.message.contains("failed to acquire"),
+            "second leg's outcome must reach the status line; got: {}",
+            e.message
+        );
+        assert!(
+            e.message.contains("DAP adapter"),
+            "a leg finishing a tick later must not erase the earlier leg's \
+             text; got: {}",
+            e.message
+        );
+
+        // Last leg reported — accumulator dropped so a re-install starts clean.
+        assert!(
+            !e.tool_acquire_groups.contains_key(ext),
+            "accumulator must be cleared once every leg has reported"
+        );
+    }
 }
