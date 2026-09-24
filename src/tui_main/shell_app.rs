@@ -2453,6 +2453,7 @@ impl ShellApp for TuiShellApp {
                     if let Some(sb) = layout.sidebar_content_bounds {
                         render_sidebar_content(
                             backend,
+                            &screen,
                             to_cell_rect(sb),
                             &self.sidebar,
                             &self.engine,

@@ -3879,10 +3879,26 @@ mod tests {
             width,
             height,
         };
+        // #1252: `render_sidebar_content` now reads the frame's own `screen`
+        // rather than rebuilding one itself — build it once here, the same
+        // way the live `render_content` path does via
+        // `build_screen_for_shell_content`.
+        let screen = render::build_screen_layout(
+            engine,
+            &theme,
+            &[],
+            1.0,
+            1.0,
+            true,
+            0.0,
+            render::TUI_MINIMAP_SIZING,
+        );
         terminal
             .draw(|frame| {
                 super::with_frame_scope(&mut tui_backend, frame, |backend, _frame| {
-                    super::panels::render_sidebar_content(backend, area, &sidebar, engine, &theme);
+                    super::panels::render_sidebar_content(
+                        backend, &screen, area, &sidebar, engine, &theme,
+                    );
                 });
             })
             .unwrap();

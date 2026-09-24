@@ -107,8 +107,16 @@ pub(super) fn render_explorer_sidebar_content(
 /// the chat history and [`fill_row`] for its plain chrome rows). See each
 /// function's own doc comment for the specific tradeoffs.
 ///
+/// #1252: takes the frame's own `screen: &render::ScreenLayout` — built once
+/// per frame by `build_screen_for_shell_content` — instead of each panel
+/// rebuilding its own via `render::build_screen_layout(engine, theme, &[],
+/// ...)`. GTK's `paint_sidebar_panel_rung` (`src/app.rs`) already threads the
+/// frame's `screen` this way; a second, independently-built `ScreenLayout`
+/// mid-frame could disagree with the one the rest of the frame was composed
+/// from, on top of the redundant per-frame rebuild cost.
 pub(super) fn render_sidebar_content(
     backend: &mut dyn quadraui::Backend,
+    screen: &render::ScreenLayout,
     area: Rect,
     sidebar: &TuiSidebar,
     engine: &Engine,
@@ -119,19 +127,19 @@ pub(super) fn render_sidebar_content(
         // dropped its `&mut Frame` parameter (help popup + scrollbar now
         // paint through `Backend::draw_tooltip`/`fill_row`; see that
         // function's doc comment).
-        render_ext_panel(backend, area, engine, theme);
+        render_ext_panel(backend, screen, area, engine, theme);
         return;
     }
 
     match engine.app_shell.active_panel_id().map(|w| w.as_str()) {
         Some(PANEL_SEARCH) => render_search_panel(backend, area, engine, theme),
-        Some(PANEL_DEBUG) => render_debug_sidebar(backend, area, engine, theme),
+        Some(PANEL_DEBUG) => render_debug_sidebar(backend, screen, area, engine, theme),
         // #605: settings, source control and extensions are no longer
         // deferred — each had its raw `set_cell` chrome converted to the
         // rule-row trick.
         Some(PANEL_SETTINGS) => render_settings_panel(backend, area, theme, engine),
-        Some(PANEL_GIT) => render_source_control(backend, area, engine, theme),
-        Some(PANEL_EXTENSIONS) => render_ext_sidebar(backend, area, engine, theme),
+        Some(PANEL_GIT) => render_source_control(backend, screen, area, engine, theme),
+        Some(PANEL_EXTENSIONS) => render_ext_sidebar(backend, screen, area, engine, theme),
         // #635 (Stage 6b item C): AI is no longer deferred — `render_ai_sidebar`
         // dropped its `buf: &mut Buffer` parameter for `&mut dyn Backend`.
         Some(PANEL_AI) => render_ai_sidebar(backend, area, engine, theme),
@@ -356,6 +364,7 @@ pub(super) fn render_command_line(
 /// trait call.
 pub(super) fn render_source_control(
     backend: &mut dyn quadraui::Backend,
+    screen: &render::ScreenLayout,
     area: Rect,
     engine: &Engine,
     theme: &Theme,
@@ -369,17 +378,9 @@ pub(super) fn render_source_control(
     fill_rect(backend, area, theme.foreground, theme.tab_bar_bg);
     let dim_fg = theme.line_number_fg;
 
-    // Build SC data from engine state via the render abstraction.
-    let screen = render::build_screen_layout(
-        engine,
-        theme,
-        &[],
-        1.0,
-        1.0,
-        true,
-        0.0,
-        render::TUI_MINIMAP_SIZING,
-    );
+    // #1252: SC data comes from the frame's own `screen` (built once by
+    // `build_screen_for_shell_content`) instead of a second, independently
+    // built `ScreenLayout` — see `render_sidebar_content`'s doc comment.
     let Some(ref sc) = screen.source_control else {
         return;
     };
@@ -551,6 +552,7 @@ pub(super) fn render_source_control(
 /// has a `TreeView`/`SidebarPanelBody` equivalent.
 pub(super) fn render_ext_panel(
     backend: &mut dyn quadraui::Backend,
+    screen: &render::ScreenLayout,
     area: Rect,
     engine: &Engine,
     theme: &Theme,
@@ -558,16 +560,8 @@ pub(super) fn render_ext_panel(
     if area.height == 0 {
         return;
     }
-    let screen = render::build_screen_layout(
-        engine,
-        theme,
-        &[],
-        1.0,
-        1.0,
-        true,
-        0.0,
-        render::TUI_MINIMAP_SIZING,
-    );
+    // #1252: reads the frame's own `screen` — see `render_sidebar_content`'s
+    // doc comment.
     let Some(ref panel) = screen.ext_panel else {
         engine.ext_panel_tree_layout.replace(None);
         return;
@@ -904,6 +898,7 @@ pub(super) fn render_panel_hover_popup(
 /// collapsed into that.
 pub(super) fn render_ext_sidebar(
     backend: &mut dyn quadraui::Backend,
+    screen: &render::ScreenLayout,
     area: Rect,
     engine: &Engine,
     theme: &Theme,
@@ -912,16 +907,8 @@ pub(super) fn render_ext_sidebar(
         return;
     }
 
-    let screen = render::build_screen_layout(
-        engine,
-        theme,
-        &[],
-        1.0,
-        1.0,
-        true,
-        0.0,
-        render::TUI_MINIMAP_SIZING,
-    );
+    // #1252: reads the frame's own `screen` — see `render_sidebar_content`'s
+    // doc comment.
     let Some(ref ext) = screen.ext_sidebar else {
         return;
     };
@@ -1031,6 +1018,7 @@ pub(super) fn render_ai_sidebar(
 /// was already trait-pure, same rationale as `render_search_panel` above.
 pub(super) fn render_debug_sidebar(
     backend: &mut dyn quadraui::Backend,
+    screen: &render::ScreenLayout,
     area: Rect,
     engine: &Engine,
     theme: &Theme,
@@ -1039,17 +1027,9 @@ pub(super) fn render_debug_sidebar(
         return;
     }
 
-    // Build minimal screen layout to get debug_sidebar data.
-    let screen = render::build_screen_layout(
-        engine,
-        theme,
-        &[],
-        1.0,
-        1.0,
-        true,
-        0.0,
-        render::TUI_MINIMAP_SIZING,
-    );
+    // #1252: reads the frame's own `screen` — see `render_sidebar_content`'s
+    // doc comment — instead of rebuilding a second `ScreenLayout` just to
+    // read `debug_sidebar`.
     let sidebar = &screen.debug_sidebar;
 
     // ── Chrome rows (panel-specific): header + Run/Stop button via StatusBar. ──
@@ -1142,6 +1122,19 @@ mod sc_panel_tests {
             width,
             height,
         };
+        // #1252: `render_source_control` now reads the frame's own `screen`
+        // instead of rebuilding one itself — build it once here, matching
+        // what `render_content` does via `build_screen_for_shell_content`.
+        let screen = render::build_screen_layout(
+            engine,
+            &theme,
+            &[],
+            1.0,
+            1.0,
+            true,
+            0.0,
+            render::TUI_MINIMAP_SIZING,
+        );
         terminal
             .draw(|frame| {
                 // #600: `render_source_control` calls `Backend::draw_*` trait
@@ -1152,7 +1145,7 @@ mod sc_panel_tests {
                 // the scope entry is still what gives its `draw_*` calls a
                 // buffer to land in.
                 super::with_frame_scope(&mut tui_backend, frame, |backend, _frame| {
-                    render_source_control(backend, area, engine, &theme);
+                    render_source_control(backend, &screen, area, engine, &theme);
                 });
             })
             .unwrap();
