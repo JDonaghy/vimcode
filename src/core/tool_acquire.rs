@@ -303,6 +303,42 @@ fn is_safe_relative_path(p: &str) -> bool {
     true
 }
 
+/// Is `name` safe to use as a **single path segment** — i.e. as the
+/// directory/file name a manifest-supplied tool name is joined onto a
+/// vimcode-owned directory as?
+///
+/// Stricter than [`is_safe_relative_path`]: that one allows nested
+/// (`a/b/c`) relative paths, which is right for an archive entry but wrong
+/// for a tool name, since `PathBuf::join` resolves nothing and a name with
+/// separators in it escapes the tree it is supposed to be keyed inside.
+/// Both `/` and `\` are rejected explicitly because a backslash is a normal
+/// filename character on Unix — `Path::new("a\\b")` is one component there,
+/// so `components()` alone would let a Windows-flavoured traversal through
+/// on the very platform where the join would later be interpreted.
+///
+/// Exported (#1345 review) because every destructive operation keyed by a
+/// manifest-supplied name must gate on the same predicate:
+/// `tool_acquire`'s own install path does, and `Engine::ext_remove_tools`'s
+/// `remove_dir_all(managed_tool_dir(bin_name))` — the mirror-image removal
+/// of what that install path creates — has to as well. `binary` is
+/// free-form text from a community-submitted registry manifest, so
+/// `binary = "../.."` must not be able to turn tool cleanup into a
+/// recursive delete of an ancestor of `~/.local/share/vimcode/tools`.
+pub(crate) fn is_safe_path_segment(name: &str) -> bool {
+    if name.is_empty() || name.contains('/') || name.contains('\\') {
+        return false;
+    }
+    if !is_safe_relative_path(name) {
+        return false;
+    }
+    // Exactly one *ordinary* component. `"."` would otherwise pass every
+    // check above while naming the parent directory itself — i.e.
+    // `remove_dir_all(managed_tools_dir())`, every managed tool at once.
+    let mut components = Path::new(name).components();
+    matches!(components.next(), Some(std::path::Component::Normal(_)))
+        && components.next().is_none()
+}
+
 /// Whether archive entry `entry_name` is the file the manifest's
 /// `binary_path` names — either an exact match, or (when `binary_path` is a
 /// bare filename with no directory component) a basename match, since many
