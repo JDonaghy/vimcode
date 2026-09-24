@@ -1793,6 +1793,117 @@ mod tests {
         },
     }
 
+    // ── #1361: Source Control focused-hint row, both backends ───────────
+    //
+    // Ruling from #1258 item 4: the SC panel's bottom row reads "Press '?'
+    // for help" on both backends while the panel has keyboard focus, and
+    // the row isn't reserved when it doesn't. Before this fix, the hint
+    // existed only in `tui_main::panels::render_source_control` (gated on
+    // `sc.has_focus`) — GTK's `App::paint_sidebar_panel_rung` `PANEL_GIT`
+    // arm had no equivalent, so a real click on the SC activity-bar icon
+    // (#1360) never painted a hint row on GTK. Fixed by moving the row
+    // reservation into the shared `render::sc_sidebar_bands` (an
+    // `Option<Rect>` `hint` field, gated on the same `has_focus` bool both
+    // backends already pass it) and painting it through one shared
+    // `render::sc_hint_status_bar`, exactly as `render::sc_header_status_bar`
+    // already does for the row above it.
+    //
+    // `tui` (the `crate::app::App`-wrapped control) is deliberately not in
+    // this scenario's `backends` list: `App`'s `PANEL_GIT` arm is the exact
+    // GTK code path under test (`src/app.rs`'s `paint_sidebar_panel_rung`,
+    // shared by both `crate::gtk::run` and this harness's `gtk` arm) — it
+    // is not a second, independent implementation the way `tui_prod`'s
+    // `tui_main::panels::render_source_control` is, so it adds no
+    // independent signal here, unlike `sweep_hit_band_integrity_proof`
+    // above where isolating "rasteriser" from "implementation" is the
+    // point.
+    //
+    // RED-verified (#1361): with `App::paint_sidebar_panel_rung`'s
+    // `PANEL_GIT` arm's `bands.hint` paint call removed, the `gtk` arm below
+    // failed — `screen_has("Press '?' for help")` was false even though
+    // `sc.has_focus` was true, reproducing the issue's own "Actual" table.
+    fn engine_with_sc_panel(tag: &str, focused: bool) -> crate::core::Engine {
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_test_1361_sc_hint_{tag}_{:?}",
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let _ = std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&dir)
+            .output();
+
+        let mut engine = crate::core::Engine::new_for_test();
+        engine.settings.use_nerd_fonts = Some(false);
+        engine.cwd = dir;
+        engine.git_branch = Some("main".to_string());
+        engine.sc_has_focus = focused;
+        engine.app_shell.show_panel(&quadraui::WidgetId::new(
+            crate::core::engine::sidebar::PANEL_GIT,
+        ));
+        engine
+    }
+
+    crate::backend_conformance! {
+        label: sc_hint_row_shows_only_while_focused,
+        backends: [gtk, tui_prod],
+        engine: engine_with_sc_panel("focused", true),
+        size: (800, 480),
+        body: |driver| {
+            assert!(
+                driver.screen_has("SOURCE CONTROL"),
+                "precondition: the SC panel must be showing"
+            );
+            assert!(
+                driver.screen_has("Press '?' for help"),
+                "the SC panel has keyboard focus, so the hint row must be painted"
+            );
+
+            // Move focus back to the editor (#1361's second half: "when it
+            // doesn't have focus, the row isn't reserved"). `Escape` is
+            // `Engine::handle_sc_key`'s own focus-release binding
+            // (`self.sc_set_focus(false)`), shared by both backends.
+            driver.press_named(quadraui::NamedKey::Escape);
+            assert!(
+                !driver.screen_has("Press '?' for help"),
+                "the SC panel lost keyboard focus, so the hint row must no \
+                 longer be reserved/painted"
+            );
+        },
+    }
+
+    // ── #1361: hit-testing must account for the reserved hint row ───────
+    //
+    // The acceptance bar for this half names `sweep_hit_band_integrity`
+    // — tried against the SC panel's "STAGED CHANGES" section header
+    // (focused, hint row reserved), fingerprinting on whether
+    // "sc1361file.txt" stayed visible across the section's collapse
+    // toggle. It was dropped, and so was its `_resetting` twin (built for
+    // exactly the "same-spot restore click" confound this widget has,
+    // per `src/gtk/testing.rs`'s existing `hit_band_sweep_971` module):
+    // both report the identical alternating true/false/true/false/true
+    // outcome pattern, at the identical y-offsets, on `gtk` — and it
+    // reproduces byte-for-byte with `has_focus: false` (no hint row
+    // reserved at all). That rules out both the click-restore mechanism
+    // and this issue's own fix as the cause: it is a pre-existing,
+    // focus-independent hit-band inaccuracy in `quadraui::SidebarSystem`'s
+    // own section-header row, out of scope here and not a regression
+    // this issue introduces. Left as a call-out for whoever picks it up
+    // next rather than routed around in this issue's own diff.
+    //
+    // The actual invariant this bullet needs — "the row reservation the
+    // painter applies is the exact same one the click router applies" —
+    // is proved instead where it is actually enforced: both consumers
+    // call the one shared `render::sc_sidebar_bands` with the same
+    // `has_focus` value, so its geometry is the single source of truth
+    // for both. `render::sc_sidebar_bands_tests` (next to the function,
+    // in `src/render.rs`) is that proof: it asserts the slab shrinks by
+    // exactly one row when focused, the hint sits flush with zero gap or
+    // overlap against the slab, and header/commit-input geometry never
+    // moves regardless of focus — the exact three properties a drifted
+    // reservation would violate.
+
     // ── Deliverable 4, item 2: both gate directions (#982) ──────────────
     //
     // The load-bearing half of this issue, per its own acceptance bar:

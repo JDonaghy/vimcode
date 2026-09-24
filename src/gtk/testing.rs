@@ -4019,6 +4019,7 @@ mod sidebar_panel_clicks {
             sb,
             lh,
             super::super::SC_COMMIT_BORDER_PX,
+            h.engine.borrow().sc_has_focus,
         );
 
         h.driver.click(

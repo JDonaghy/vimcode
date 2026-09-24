@@ -2041,7 +2041,17 @@ pub(super) fn handle_mouse(
                 sidebar_width as f32,
                 term_height.saturating_sub(menu_rows) as f32,
             );
-            let bands = render::sc_sidebar_bands(&engine.sc_commit_message, content_rect, 1.0, 2.0);
+            // `engine.sc_has_focus` here is the state as of the *last*
+            // painted frame (before `route_sc_sidebar_click` below can
+            // change it) — matching what was actually on screen when this
+            // click landed, same as GTK's `cached_sc_bands` (#1361).
+            let bands = render::sc_sidebar_bands(
+                &engine.sc_commit_message,
+                content_rect,
+                1.0,
+                2.0,
+                engine.sc_has_focus,
+            );
             let pos = quadraui::Point::new(col as f32, row as f32);
             let click_ev = quadraui::UiEvent::MouseDown {
                 widget: None,

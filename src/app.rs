@@ -3531,6 +3531,7 @@ impl App {
                         q_sb,
                         lh as f32,
                         SC_COMMIT_BORDER_PX,
+                        sc.has_focus,
                     );
                     self.cached_sc_bands.set(Some(bands));
                     let header_bar = render::sc_header_status_bar(sc, theme);
@@ -3543,6 +3544,14 @@ impl App {
                     // header + commit input.
                     let slab_rect = bands.slab;
                     render::draw_sc_sidebar_panel(backend, engine, sc, slab_rect);
+                    // Focused-hint row (#1361): shared with TUI through
+                    // `render::sc_hint_status_bar`, painted only when
+                    // `ScSidebarBands::hint` was reserved (i.e. the panel
+                    // has focus) so it can't show unreserved space.
+                    if let Some(hint_rect) = bands.hint {
+                        let hint_bar = render::sc_hint_status_bar(theme);
+                        let _ = backend.draw_status_bar(hint_rect, &hint_bar, None, None);
+                    }
                     let body_rect = engine
                         .sc_panel_layout
                         .borrow()
