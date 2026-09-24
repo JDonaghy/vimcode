@@ -5318,9 +5318,6 @@ fn is_word_char(ch: char) -> bool {
 }
 
 /// Return the number of visual rows a buffer line of `line_char_len` characters
-/// Returns true if `binary` is found anywhere on the current process PATH.
-/// Walks PATH directories directly (no subprocess) so it works even when
-/// the user's shell aliases or profile scripts are not sourced.
 /// List custom VSCode theme names from `~/.config/vimcode/themes/*.json`.
 fn list_custom_theme_names() -> Vec<String> {
     let mut names = Vec::new();
@@ -5341,41 +5338,34 @@ fn list_custom_theme_names() -> Vec<String> {
     names
 }
 
+/// Returns true if `binary` is found and runnable.
+///
+/// Delegates to [`super::lsp_manager::resolve_command`] — the exact resolver
+/// `LspManager` uses to launch servers — rather than walking `PATH` on its own
+/// (#1344). Before this, install-time checks (this function) and server launch
+/// used two different lookups: this one scanned only the process `PATH`, while
+/// `resolve_command` also probes the Mason bin dir, `~/.local/bin`,
+/// `~/.cargo/bin`, `~/go/bin`, `~/.dotnet/tools`, `~/.npm-global/bin` and the
+/// Homebrew prefixes — directories a desktop-launched vimcode needs because it
+/// doesn't inherit a login shell's `PATH`. The mismatch meant a successful
+/// install into e.g. `~/.local/bin` was reported as "not found on PATH" and the
+/// extensions sidebar kept re-offering an install for a tool that was already
+/// present. One shared function means install checks, install finalization,
+/// and server launch always agree on where a tool lives.
 fn binary_on_path(binary: &str) -> bool {
-    let path_var = std::env::var_os("PATH").unwrap_or_default();
-    for dir in std::env::split_paths(&path_var) {
-        let full = dir.join(binary);
-        if full.exists() {
-            if !super::lsp_manager::cargo_bin_probe_ok(&full, binary) {
-                continue;
-            }
+    match super::lsp_manager::resolve_command(binary) {
+        Some(path) => {
             super::lsp_manager::install_log(&format!(
                 "[ext-check] FOUND {binary} at {}",
-                full.display()
+                path.display()
             ));
-            return true;
+            true
         }
-        // On Windows, also check with .exe suffix
-        #[cfg(target_os = "windows")]
-        if !binary.ends_with(".exe") {
-            let exe = dir.join(format!("{binary}.exe"));
-            if exe.exists() {
-                if !super::lsp_manager::cargo_bin_probe_ok(&exe, binary) {
-                    continue;
-                }
-                super::lsp_manager::install_log(&format!(
-                    "[ext-check] FOUND {binary}.exe at {}",
-                    exe.display()
-                ));
-                return true;
-            }
+        None => {
+            super::lsp_manager::install_log(&format!("[ext-check] NOT FOUND {binary}"));
+            false
         }
     }
-    super::lsp_manager::install_log(&format!(
-        "[ext-check] NOT FOUND {binary} in PATH={}",
-        path_var.to_string_lossy()
-    ));
-    false
 }
 
 // ── Auto-pair helpers ────────────────────────────────────────────────────────
