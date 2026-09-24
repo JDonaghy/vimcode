@@ -290,6 +290,140 @@ pub fn session_update_chunk(update: &serde_json::Value) -> Option<(AcpChunkKind,
 }
 
 // ---------------------------------------------------------------------------
+// session/request_permission — wire-shape parsing (#953, ACP-2)
+// ---------------------------------------------------------------------------
+
+/// One option the agent offered in a `session/request_permission` request.
+/// `kind` is one of `allow_once` / `allow_always` / `reject_once` /
+/// `reject_always` per the ACP v1 schema — the *option's* kind, not
+/// [`AcpToolCallInfo::kind`] (the tool-call's category, e.g. `"edit"`).
+/// Kept as a raw `String` rather than an enum: an agent sending a kind this
+/// client doesn't recognize should still render as a selectable button
+/// (whatever `name` says) rather than silently vanishing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcpPermissionOption {
+    pub option_id: String,
+    pub name: String,
+    pub kind: String,
+}
+
+/// The `toolCall` a `session/request_permission` request asks about, pared
+/// down to exactly what #953's acceptance bar requires a human see before
+/// deciding: `title`, `kind`, `locations`. Everything else `toolCall` may
+/// carry (`rawInput`, `content`, `status`, ...) is out of scope for this
+/// slice's dialog (ACP-4/5 render the fuller tool-call shape elsewhere).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcpToolCallInfo {
+    pub title: String,
+    /// The tool-call's category (e.g. `"edit"`, `"execute"`, `"read"`) —
+    /// coarser than a specific tool identity, and deliberately so: it is
+    /// what [`Engine::acp_remembered_decisions`](crate::core::engine::Engine)
+    /// keys `allow_always`/`reject_always` on, so "same tool" reads as
+    /// "same category of action" rather than e.g. "same file path".
+    pub kind: String,
+    /// `(path, line)` — `line` is 1-based and `None` when the agent didn't
+    /// supply one.
+    pub locations: Vec<(String, Option<u32>)>,
+}
+
+/// A parsed `session/request_permission` request — the whole payload the
+/// permission dialog needs, independent of the JSON-RPC `id` (the caller,
+/// [`crate::core::engine::Engine::poll_acp`], already has that from
+/// [`AcpEvent::ClientRequest`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcpPermissionRequest {
+    pub session_id: String,
+    pub tool_call: AcpToolCallInfo,
+    pub options: Vec<AcpPermissionOption>,
+}
+
+/// Parse a `session/request_permission` request's `params` object per the
+/// ACP v1 schema: `{sessionId, toolCall: {title, kind, locations}, options:
+/// [{optionId, name, kind}]}`. Returns `None` for a malformed request
+/// (missing `sessionId`, no `options` array, or an option missing
+/// `optionId`) — the caller must still answer such a request (with a
+/// JSON-RPC error, not silence) rather than open a dialog with nothing
+/// selectable in it.
+pub fn parse_request_permission(params: &serde_json::Value) -> Option<AcpPermissionRequest> {
+    let session_id = params.get("sessionId")?.as_str()?.to_string();
+    let tool_call_json = params.get("toolCall")?;
+    let title = tool_call_json
+        .get("title")
+        .and_then(|v| v.as_str())
+        .unwrap_or("Tool call")
+        .to_string();
+    let kind = tool_call_json
+        .get("kind")
+        .and_then(|v| v.as_str())
+        .unwrap_or("other")
+        .to_string();
+    let locations = tool_call_json
+        .get("locations")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|loc| {
+                    let path = loc.get("path")?.as_str()?.to_string();
+                    let line = loc.get("line").and_then(|v| v.as_u64()).map(|n| n as u32);
+                    Some((path, line))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let options_json = params.get("options")?.as_array()?;
+    let mut options = Vec::with_capacity(options_json.len());
+    for opt in options_json {
+        let option_id = opt.get("optionId")?.as_str()?.to_string();
+        let name = opt
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("Option")
+            .to_string();
+        let opt_kind = opt
+            .get("kind")
+            .and_then(|v| v.as_str())
+            .unwrap_or("allow_once")
+            .to_string();
+        options.push(AcpPermissionOption {
+            option_id,
+            name,
+            kind: opt_kind,
+        });
+    }
+    if options.is_empty() {
+        return None;
+    }
+
+    Some(AcpPermissionRequest {
+        session_id,
+        tool_call: AcpToolCallInfo {
+            title,
+            kind,
+            locations,
+        },
+        options,
+    })
+}
+
+/// Build the `result` value for a `session/request_permission` reply where
+/// the human picked `option_id`. Shape: `{outcome: {outcome: "selected",
+/// optionId}}` per the ACP v1 schema.
+pub fn permission_outcome_selected(option_id: &str) -> serde_json::Value {
+    serde_json::json!({"outcome": {"outcome": "selected", "optionId": option_id}})
+}
+
+/// Build the `result` value for a `session/request_permission` reply when
+/// no option was chosen (Esc-dismissed, the session was cancelled, an
+/// unrelated dialog replaced it, ...). Shape: `{outcome: {outcome:
+/// "cancelled"}}` per the ACP v1 schema. This is the reply every parked
+/// permission request must eventually get exactly one of, per #953's
+/// hang-avoidance requirement — see `Engine::acp_cancel_pending_permission`.
+pub fn permission_outcome_cancelled() -> serde_json::Value {
+    serde_json::json!({"outcome": {"outcome": "cancelled"}})
+}
+
+// ---------------------------------------------------------------------------
 // AcpClient — owns one agent subprocess and its session lifecycle
 // ---------------------------------------------------------------------------
 
@@ -902,6 +1036,97 @@ mod tests {
         );
         let reparsed: serde_json::Value = serde_json::from_str(s.trim_end()).unwrap();
         assert_eq!(reparsed["method"], "initialize");
+    }
+
+    // ---- parse_request_permission / permission_outcome_*: pure, no subprocess (#953, ACP-2) ----
+
+    #[test]
+    fn parse_request_permission_reads_tool_call_and_options() {
+        let params = serde_json::json!({
+            "sessionId": "sess-1",
+            "toolCall": {
+                "title": "Edit src/main.rs",
+                "kind": "edit",
+                "locations": [{"path": "src/main.rs", "line": 42}, {"path": "src/lib.rs"}],
+            },
+            "options": [
+                {"optionId": "allow-once", "name": "Allow Once", "kind": "allow_once"},
+                {"optionId": "allow-always", "name": "Always Allow", "kind": "allow_always"},
+                {"optionId": "reject-once", "name": "Reject", "kind": "reject_once"},
+            ],
+        });
+        let req = parse_request_permission(&params).expect("should parse");
+        assert_eq!(req.session_id, "sess-1");
+        assert_eq!(req.tool_call.title, "Edit src/main.rs");
+        assert_eq!(req.tool_call.kind, "edit");
+        assert_eq!(
+            req.tool_call.locations,
+            vec![
+                ("src/main.rs".to_string(), Some(42)),
+                ("src/lib.rs".to_string(), None),
+            ]
+        );
+        assert_eq!(req.options.len(), 3);
+        assert_eq!(req.options[0].option_id, "allow-once");
+        assert_eq!(req.options[0].name, "Allow Once");
+        assert_eq!(req.options[0].kind, "allow_once");
+        assert_eq!(req.options[1].kind, "allow_always");
+        assert_eq!(req.options[2].kind, "reject_once");
+    }
+
+    #[test]
+    fn parse_request_permission_defaults_missing_title_kind_and_locations() {
+        let params = serde_json::json!({
+            "sessionId": "sess-1",
+            "toolCall": {},
+            "options": [{"optionId": "x", "name": "Go", "kind": "allow_once"}],
+        });
+        let req = parse_request_permission(&params).expect("should parse");
+        assert_eq!(req.tool_call.title, "Tool call");
+        assert_eq!(req.tool_call.kind, "other");
+        assert!(req.tool_call.locations.is_empty());
+    }
+
+    #[test]
+    fn parse_request_permission_rejects_malformed_shapes() {
+        // No sessionId.
+        assert!(parse_request_permission(&serde_json::json!({
+            "toolCall": {}, "options": [{"optionId": "x", "name": "n", "kind": "allow_once"}],
+        }))
+        .is_none());
+        // No toolCall.
+        assert!(parse_request_permission(&serde_json::json!({
+            "sessionId": "s", "options": [{"optionId": "x", "name": "n", "kind": "allow_once"}],
+        }))
+        .is_none());
+        // No options array.
+        assert!(parse_request_permission(&serde_json::json!({
+            "sessionId": "s", "toolCall": {},
+        }))
+        .is_none());
+        // Empty options array — nothing a human could select.
+        assert!(parse_request_permission(&serde_json::json!({
+            "sessionId": "s", "toolCall": {}, "options": [],
+        }))
+        .is_none());
+        // An option missing optionId must drop the whole request (never a
+        // dialog with an unselectable/unanswerable button).
+        assert!(parse_request_permission(&serde_json::json!({
+            "sessionId": "s", "toolCall": {}, "options": [{"name": "n", "kind": "allow_once"}],
+        }))
+        .is_none());
+    }
+
+    #[test]
+    fn permission_outcome_helpers_match_the_acp_v1_wire_shape() {
+        assert_eq!(
+            permission_outcome_selected("opt-1"),
+            serde_json::json!({"outcome": {"outcome": "selected", "optionId": "opt-1"}})
+        );
+        assert_eq!(
+            permission_outcome_cancelled(),
+            serde_json::json!({"outcome": {"outcome": "cancelled"}})
+        );
     }
 
     // ---- Integration: fake NDJSON echo agent subprocess ----

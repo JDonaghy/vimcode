@@ -4840,6 +4840,140 @@ second line here
              chunks\" acceptance criterion"
         );
     }
+
+    /// #953 (ACP-2): `session/request_permission` on GTK, the twin of
+    /// `tui_main::shell_app::tests::
+    /// ai_panel_shows_permission_dialog_and_resumes_turn_on_selection_via_shell_app`.
+    ///
+    /// The `"acp_permission"` dialog has buttons only, no text input, so —
+    /// same as `quit_unsaved` in `native_dialog_presented_exactly_once_
+    /// across_repeated_frames` above — `quadraui::native_dialog_options`
+    /// takes it native on GTK: it never paints in-canvas, so this asserts
+    /// on the queued `MessageDialogOptions` (title/body/buttons) rather
+    /// than painted pixels, exactly like that sibling test's established
+    /// pattern for this exact shape of dialog. `GtkDriver` never pumps a
+    /// live native `AlertDialog` window (that module's own doc), so the
+    /// human's choice is simulated the same way `App::
+    /// run_pending_native_dialog` maps a real one back —
+    /// `Engine::dialog_click_button`.
+    ///
+    /// RED verified the same way as the TUI twin: with the
+    /// `"acp_permission"` arm of `Engine::process_dialog_result` reverted
+    /// to the default no-op, this test times out waiting for
+    /// `ai_streaming` to clear — the fixture stays blocked on its
+    /// `read -r _reply` forever.
+    #[cfg(unix)]
+    #[test]
+    fn ai_panel_shows_permission_dialog_and_resumes_turn_on_selection() {
+        let mut h = panel_harness(PANEL_AI);
+        {
+            let mut engine = h.engine.borrow_mut();
+            let argv = vec![
+                "sh".to_string(),
+                concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/tests/fixtures/fake_acp_agent.sh"
+                )
+                .to_string(),
+            ];
+            let cwd = std::env::temp_dir();
+            let mut client = crate::core::acp::AcpClient::spawn_with_env(
+                &argv,
+                &cwd,
+                &[("ACP_FAKE_REQUEST_PERMISSION", "1")],
+            )
+            .expect("fixture agent should spawn");
+            client.initialize();
+            engine.acp_client = Some(client);
+            engine.settings.acp_agent_command = "already-spawned-above".to_string();
+        }
+
+        let sb = h.painted_sidebar_bounds.get().unwrap();
+        h.driver.click(sb.x + 20.0, sb.y + 20.0);
+        for c in "please edit".chars() {
+            h.driver.type_char(c);
+        }
+        h.driver.ctrl_char('s');
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !h
+            .engine
+            .borrow()
+            .dialog
+            .as_ref()
+            .is_some_and(|d| d.tag == "acp_permission")
+            && std::time::Instant::now() < deadline
+        {
+            h.engine.borrow_mut().poll_acp();
+            h.driver.render();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            h.engine
+                .borrow()
+                .dialog
+                .as_ref()
+                .is_some_and(|d| d.tag == "acp_permission"),
+            "the permission dialog should be open within 5s"
+        );
+        assert!(
+            h.dialog_layout.borrow().is_none(),
+            "a buttons-only dialog with no text input must go native on \
+             GTK, never paint in-canvas (#727)"
+        );
+        let opts = h.pending_native_dialog.take().expect(
+            "the native dialog present must be queued once the permission \
+             dialog opens",
+        );
+        assert_eq!(
+            opts.title, "Edit src/main.rs",
+            "the tool call's title must reach the native dialog options"
+        );
+        assert!(
+            opts.body.contains("edit"),
+            "the tool call's kind must be visible so a human has something \
+             to decide on: {opts:?}"
+        );
+        assert!(
+            opts.body.contains("src/main.rs:42"),
+            "the tool call's location (path + line) must be visible: {opts:?}"
+        );
+        // Labels carry a bracketed hotkey letter (`[A]llow Once`) —
+        // `dialog_panel_to_quadraui_dialog`'s formatting, same as the
+        // in-canvas TUI dialog's twin test.
+        let labels: Vec<&str> = opts.buttons.iter().map(|b| b.label.as_str()).collect();
+        assert_eq!(
+            labels,
+            vec!["[A]llow Once", "[A]lways Allow", "[R]eject"],
+            "the agent's own options must be presented verbatim, not a \
+             hardcoded yes/no"
+        );
+
+        assert!(
+            h.engine.borrow().ai_streaming,
+            "the panel must still be busy while the permission dialog is \
+             open, or the completion check below would pass trivially"
+        );
+
+        // Simulate the human picking "Allow Once" (button index 0).
+        h.engine.borrow_mut().dialog_click_button(0);
+        assert!(
+            h.engine.borrow().dialog.is_none(),
+            "the dialog must close the moment a button is clicked"
+        );
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while h.engine.borrow().ai_streaming && std::time::Instant::now() < deadline {
+            h.engine.borrow_mut().poll_acp();
+            h.driver.render();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            !h.engine.borrow().ai_streaming,
+            "the reply must actually reach the (fake) agent and let the \
+             turn resume to completion within 5s"
+        );
+    }
 }
 
 /// #669: the five editor-anchored popups (completion, LSP hover, editor

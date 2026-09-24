@@ -27,6 +27,16 @@ impl Engine {
         body: Vec<String>,
         buttons: Vec<DialogButton>,
     ) {
+        // #953 (ACP-2): a still-open `session/request_permission` dialog
+        // getting replaced by an unrelated one must still produce exactly
+        // one reply — a parked ACP request must never silently hang just
+        // because some other event (e.g. a file-changed-on-disk prompt)
+        // opened a different dialog over it. `acp_handle_permission_request`
+        // itself already clears this before opening its *own* new dialog,
+        // so this is a no-op on that path; it only fires for a genuinely
+        // unrelated caller.
+        self.acp_cancel_pending_permission();
+
         // Opening a dialog is a "user is now focused on this modal"
         // event — dismiss any passive overlays (LSP hover) so they
         // don't render behind the dialog (#247).
@@ -558,6 +568,60 @@ impl Engine {
             },
             "file_changed" => {
                 self.handle_file_watcher_action(action);
+                EngineAction::None
+            }
+            "acp_permission" => {
+                // #953 (ACP-2): the one function that turns a dialog
+                // dismissal into the ACP reply. `dialog_click_button`/
+                // `handle_dialog_key`/`dialog_cancel` have already cleared
+                // `self.dialog` by the time this runs — only
+                // `acp_pending_permission` still needs draining, and taking
+                // it here (rather than in the branches below) guarantees
+                // every branch — including a stray "acp_permission" result
+                // for a request that's somehow already gone — produces at
+                // most one reply.
+                let Some((request_id, req)) = self.acp_pending_permission.take() else {
+                    return EngineAction::None;
+                };
+                let Some(client) = self.acp_client.as_ref() else {
+                    return EngineAction::None;
+                };
+                if action == "cancel" {
+                    client.respond_to_client_request(
+                        request_id,
+                        Ok(crate::core::acp::permission_outcome_cancelled()),
+                    );
+                    return EngineAction::None;
+                }
+                // Otherwise `action` is the option_id of the button the
+                // human clicked/hotkeyed (`acp_handle_permission_request`
+                // built each `DialogButton::action` from `option_id`).
+                match req.options.iter().find(|o| o.option_id == action) {
+                    Some(opt) => {
+                        if opt.kind == "allow_always" {
+                            self.acp_remembered_decisions
+                                .insert(req.tool_call.kind.clone(), true);
+                        } else if opt.kind == "reject_always" {
+                            self.acp_remembered_decisions
+                                .insert(req.tool_call.kind.clone(), false);
+                        }
+                        client.respond_to_client_request(
+                            request_id,
+                            Ok(crate::core::acp::permission_outcome_selected(
+                                &opt.option_id,
+                            )),
+                        );
+                    }
+                    None => {
+                        // Shouldn't happen — every dialog button's action
+                        // is one of `req.options`' ids — but never leave
+                        // the request unanswered on an unrecognized action.
+                        client.respond_to_client_request(
+                            request_id,
+                            Ok(crate::core::acp::permission_outcome_cancelled()),
+                        );
+                    }
+                }
                 EngineAction::None
             }
             "check_nerd_fonts" => {

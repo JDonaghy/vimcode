@@ -43,6 +43,25 @@
 #                           chunks — for ACP-1 tests that only exercise the
 #                           streaming/chunk-mapping path, not the fs/*
 #                           bridge (out of scope until a later ACP slice).
+#                           With $ACP_FAKE_REQUEST_PERMISSION set (ACP-2,
+#                           #953) instead: emits a scripted
+#                           session/request_permission request (fixed id
+#                           9002, toolCall title "Edit src/main.rs", kind
+#                           "edit", one location) offering allow_once/
+#                           allow_always/reject_once options, then BLOCKS
+#                           reading one line before replying end_turn — on
+#                           *every* session/prompt call in this agent
+#                           process, not just the first, so a test can drive
+#                           two turns in the same session and confirm the
+#                           second one's request never needs a dialog
+#                           (client-side allow_always memory) while still
+#                           proving the reply actually reaches this process
+#                           each time. With $ACP_FAKE_DIE_DURING_PERMISSION
+#                           set: emits that same request_permission request
+#                           and exits immediately without reading a reply —
+#                           for the "agent dies with a permission dialog
+#                           open" acceptance criterion (must not hang, must
+#                           not write to the now-dead stdin).
 #   - session/cancel     -> notification, silently acknowledged (no reply).
 #   - anything else      -> logged to stderr, ignored.
 #
@@ -82,6 +101,14 @@ while IFS= read -r line; do
       printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":" world"}}}}\n'
       if [ -n "$ACP_FAKE_NO_TOOL_REQUEST" ]; then
         printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id"
+      elif [ -n "$ACP_FAKE_REQUEST_PERMISSION" ]; then
+        printf '{"jsonrpc":"2.0","id":9002,"method":"session/request_permission","params":{"sessionId":"sess-1","toolCall":{"title":"Edit src/main.rs","kind":"edit","locations":[{"path":"src/main.rs","line":42}]},"options":[{"optionId":"allow-once","name":"Allow Once","kind":"allow_once"},{"optionId":"allow-always","name":"Always Allow","kind":"allow_always"},{"optionId":"reject-once","name":"Reject","kind":"reject_once"}]}}\n'
+        # Park: block until the client answers request 9002 out of band.
+        read -r _reply
+        printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id"
+      elif [ -n "$ACP_FAKE_DIE_DURING_PERMISSION" ]; then
+        printf '{"jsonrpc":"2.0","id":9002,"method":"session/request_permission","params":{"sessionId":"sess-1","toolCall":{"title":"Edit src/main.rs","kind":"edit","locations":[{"path":"src/main.rs","line":42}]},"options":[{"optionId":"allow-once","name":"Allow Once","kind":"allow_once"},{"optionId":"allow-always","name":"Always Allow","kind":"allow_always"},{"optionId":"reject-once","name":"Reject","kind":"reject_once"}]}}\n'
+        exit 9
       else
         printf '{"jsonrpc":"2.0","id":9001,"method":"fs/read_text_file","params":{"sessionId":"sess-1","path":"/tmp/fake.txt"}}\n'
         # Park: block until the client answers request 9001 out of band.

@@ -1,12 +1,14 @@
 //! `Engine::poll_acp` — the one call site `poll_idle` uses to drain the ACP
 //! transport (#951 ACP-0 built the transport; #952 ACP-1 adds the session
 //! lifecycle drive and the `session/update` -> AI-panel chunk mapping this
-//! module implements). `tool_call`/`tool_call_update`/`plan` updates and
-//! agent -> client requests (`fs/*`, `session/request_permission`) are
-//! intentionally left unhandled here — parked/ignored without breaking the
-//! stream — per ACP-1's scope; later ACP slices (ACP-2 fs bridge, ACP-4/5
-//! tool-call + plan rendering) add real handling on top of the same
-//! `AcpEvent` stream, not a transport change.
+//! module implements; #953 ACP-2 adds `session/request_permission` — the
+//! human-in-the-loop tool-call approval chokepoint — routed onto the
+//! existing dialog system, plus `session/cancel` wiring). `tool_call`/
+//! `tool_call_update`/`plan` updates and the `fs/*` agent -> client requests
+//! are still intentionally left unhandled here — parked/ignored without
+//! breaking the stream — per ACP-1's scope; later ACP slices (ACP-3 fs
+//! bridge, ACP-4/5 tool-call + plan rendering) add real handling on top of
+//! the same `AcpEvent` stream, not a transport change.
 
 use super::*;
 use crate::core::acp::{AcpChunkKind, AcpEvent};
@@ -44,6 +46,22 @@ impl Engine {
                             content: format!("\u{26a0} ACP agent failed to start: {snippet}"),
                         });
                     }
+                    // The agent is gone — its stdin is a dead pipe, so this
+                    // must NOT go through `acp_cancel_pending_permission`
+                    // (which writes a reply). Just close whatever dialog was
+                    // parked on it so it doesn't linger on screen forever
+                    // (#953's "agent death with a dialog open" acceptance
+                    // criterion) and drop the bookkeeping — there is no one
+                    // left to answer.
+                    if self.acp_pending_permission.take().is_some()
+                        && self
+                            .dialog
+                            .as_ref()
+                            .is_some_and(|d| d.tag == "acp_permission")
+                    {
+                        self.dialog = None;
+                    }
+                    self.acp_remembered_decisions.clear();
                     self.acp_client = None;
                     self.acp_session_id = None;
                     self.acp_pending_prompt = None;
@@ -131,13 +149,20 @@ impl Engine {
                     });
                     redraw = true;
                 }
-                // Agent -> client requests (`fs/read_text_file`,
-                // `session/request_permission`, ...): left parked, not
-                // answered — the fs/* bridge and permission UI are later
-                // ACP slices. Not answering doesn't break the transport
-                // (`AcpClient::poll` keeps draining), it just means a turn
-                // that needs one will not reach `PromptStopped` yet.
-                AcpEvent::ClientRequest { .. } => {
+                AcpEvent::ClientRequest {
+                    request_id,
+                    method,
+                    params,
+                } => {
+                    if method == "session/request_permission" {
+                        self.acp_handle_permission_request(request_id, params);
+                    }
+                    // Everything else (`fs/read_text_file`, ...) is still
+                    // left parked, not answered — the fs/* bridge is a
+                    // later ACP slice. Not answering doesn't break the
+                    // transport (`AcpClient::poll` keeps draining), it just
+                    // means a turn that needs one will not reach
+                    // `PromptStopped` yet.
                     redraw = true;
                 }
             }
@@ -190,6 +215,157 @@ impl Engine {
             content: text,
         });
         self.acp_streaming_turn = Some((self.ai_messages.len() - 1, kind));
+    }
+
+    // ── session/request_permission (#953, ACP-2) ────────────────────────────
+
+    /// Handle a parked `session/request_permission` request: either
+    /// auto-answer it from a remembered `allow_always`/`reject_always`
+    /// decision, or park it behind the `"acp_permission"` dialog
+    /// (`show_dialog`, `Dialog`/`DialogButton` — no new rendering surface;
+    /// `body`/`buttons` are already the generic `Vec<String>`/
+    /// `Vec<DialogButton>` shape every other dialog uses) for a human to
+    /// answer.
+    ///
+    /// A malformed request (missing `sessionId`/`toolCall`, no options)
+    /// still gets exactly one reply — a JSON-RPC error, since there is
+    /// nothing a human could meaningfully select — never silence.
+    fn acp_handle_permission_request(&mut self, request_id: i64, params: serde_json::Value) {
+        let Some(req) = crate::core::acp::parse_request_permission(&params) else {
+            if let Some(client) = self.acp_client.as_ref() {
+                client.respond_to_client_request(
+                    request_id,
+                    Err((
+                        -32602,
+                        "invalid session/request_permission params".to_string(),
+                    )),
+                );
+            }
+            return;
+        };
+
+        // A prior request_permission that's somehow still parked (the fake
+        // fixture and any spec-conformant real agent block for one reply
+        // at a time, but never silently strand a reply if that ever
+        // isn't true) must get its one reply before this one takes over
+        // the dialog.
+        self.acp_cancel_pending_permission();
+
+        // Session-scoped remembered decision (#953's `allow_always`/
+        // `reject_always`): if the human already decided this tool-call
+        // *kind* earlier in this session, answer immediately without
+        // reopening the dialog. Falls through to the dialog if this
+        // request's own `options` don't offer a matching option kind (an
+        // agent is free to omit "always" options on a later ask).
+        if let Some(&always_allow) = self.acp_remembered_decisions.get(&req.tool_call.kind) {
+            let wanted_prefix = if always_allow { "allow_" } else { "reject_" };
+            if let Some(opt) = req
+                .options
+                .iter()
+                .find(|o| o.kind.starts_with(wanted_prefix))
+            {
+                if let Some(client) = self.acp_client.as_ref() {
+                    client.respond_to_client_request(
+                        request_id,
+                        Ok(crate::core::acp::permission_outcome_selected(
+                            &opt.option_id,
+                        )),
+                    );
+                }
+                return;
+            }
+        }
+
+        let title = req.tool_call.title.clone();
+        let mut body = vec![format!("Tool kind: {}", req.tool_call.kind)];
+        if !req.tool_call.locations.is_empty() {
+            body.push(String::new());
+            for (path, line) in &req.tool_call.locations {
+                body.push(match line {
+                    Some(l) => format!("  {path}:{l}"),
+                    None => format!("  {path}"),
+                });
+            }
+        }
+        let buttons: Vec<DialogButton> = req
+            .options
+            .iter()
+            .map(|opt| DialogButton {
+                label: opt.name.clone(),
+                hotkey: opt
+                    .name
+                    .chars()
+                    .next()
+                    .map(|c| c.to_ascii_lowercase())
+                    .filter(|c| c.is_ascii_alphabetic())
+                    .unwrap_or('\0'),
+                action: opt.option_id.clone(),
+            })
+            .collect();
+
+        // `show_dialog` itself guards against a *stale* `acp_permission`
+        // dialog by cancelling it (`acp_cancel_pending_permission`) before
+        // opening whatever's requested — including this very one. Set the
+        // new pending request only *after* that call, or the guard would
+        // immediately cancel the request this method is in the middle of
+        // parking.
+        self.show_dialog("acp_permission", &title, body, buttons);
+        self.acp_pending_permission = Some((request_id, req));
+    }
+
+    /// Reply `cancelled` to a parked `session/request_permission` and close
+    /// its dialog, if one is open — a no-op otherwise. The one function
+    /// every "how does an open permission prompt get answered" path other
+    /// than the human's own button choice funnels through (`session/cancel`
+    /// via `acp_cancel_turn`, and `show_dialog`'s own guard below for an
+    /// unrelated dialog replacing it), so "every path out of the dialog
+    /// produces exactly one reply" (#953) is enforced in one place instead
+    /// of re-derived at each call site. Does NOT handle the agent-died case
+    /// — see `poll_acp`'s `AgentExited` arm, which must not write to a dead
+    /// stdin and clears the same state without calling this.
+    pub(crate) fn acp_cancel_pending_permission(&mut self) {
+        if let Some((request_id, _)) = self.acp_pending_permission.take() {
+            if let Some(client) = self.acp_client.as_ref() {
+                client.respond_to_client_request(
+                    request_id,
+                    Ok(crate::core::acp::permission_outcome_cancelled()),
+                );
+            }
+            if self
+                .dialog
+                .as_ref()
+                .is_some_and(|d| d.tag == "acp_permission")
+            {
+                self.dialog = None;
+            }
+        }
+    }
+
+    /// Abort the in-flight ACP turn (#953: "the user must be able to abort
+    /// a running turn from the panel"). Sends `session/cancel`, replies
+    /// `cancelled` to any open permission dialog first (never leaves it
+    /// parked once the turn it belonged to is being torn down), and clears
+    /// the panel's busy state immediately rather than waiting for a
+    /// `PromptStopped` that a hung/misbehaving agent might never send.
+    ///
+    /// A no-op when no ACP session is running — callers don't need to
+    /// guard on that themselves.
+    pub fn acp_cancel_turn(&mut self) {
+        let Some(session_id) = self.acp_session_id.clone() else {
+            return;
+        };
+        self.acp_cancel_pending_permission();
+        if let Some(client) = self.acp_client.as_ref() {
+            client.cancel(&session_id);
+        }
+        if self.ai_streaming {
+            self.ai_streaming = false;
+            self.acp_streaming_turn = None;
+            self.ai_messages.push(AiMessage {
+                role: "assistant-thought".to_string(),
+                content: "[cancelled by user]".to_string(),
+            });
+        }
     }
 }
 
@@ -462,6 +638,234 @@ mod tests {
             engine.ai_streaming,
             "the panel must accept a new message after the failed handshake \
              cleared the busy state"
+        );
+    }
+
+    // ── ACP-2 (#953): session/request_permission human-in-the-loop dialog ──
+
+    /// Poll `engine` until it has a dialog open tagged `"acp_permission"`.
+    #[cfg(unix)]
+    fn poll_until_permission_dialog(engine: &mut Engine) {
+        poll_acp_until(engine, |e| {
+            e.dialog.as_ref().is_some_and(|d| d.tag == "acp_permission")
+        });
+    }
+
+    /// A `session/request_permission` request must open the
+    /// `"acp_permission"` dialog with the tool call's `title`/`kind`/
+    /// `locations` actually rendered into it — not just some state flag
+    /// flipped. "A permission prompt with no visible target is not a
+    /// decision, it is a rubber stamp" (#953's acceptance bar).
+    #[cfg(unix)]
+    #[test]
+    fn request_permission_opens_dialog_with_tool_title_kind_and_locations() {
+        let mut engine = engine_with_fixture_agent(&[("ACP_FAKE_REQUEST_PERMISSION", "1")]);
+        engine.settings.acp_agent_command = "already-spawned-above".to_string();
+
+        engine.ai_send_message("please edit".to_string());
+        poll_until_permission_dialog(&mut engine);
+
+        let dialog = engine
+            .dialog
+            .as_ref()
+            .expect("permission dialog should be open");
+        assert_eq!(dialog.tag, "acp_permission");
+        assert_eq!(dialog.title, "Edit src/main.rs");
+        let body = dialog.body.join("\n");
+        assert!(
+            body.contains("edit"),
+            "the tool-call kind must be rendered so a human has a category \
+             to decide on: {body:?}"
+        );
+        assert!(
+            body.contains("src/main.rs:42"),
+            "the tool-call location (path + line) must be rendered: {body:?}"
+        );
+        let labels: Vec<&str> = dialog.buttons.iter().map(|b| b.label.as_str()).collect();
+        assert_eq!(
+            labels,
+            vec!["Allow Once", "Always Allow", "Reject"],
+            "the agent's own options must be presented verbatim, not a \
+             hardcoded yes/no"
+        );
+        assert!(
+            engine.acp_pending_permission.is_some(),
+            "the request must be tracked as parked while its dialog is open"
+        );
+    }
+
+    /// Selecting an option replies with that option's `optionId` and lets
+    /// the turn resume to completion — the reply actually reaches the
+    /// (fake) agent, which was blocked on it.
+    ///
+    /// RED verified: with the `"acp_permission"` arm of
+    /// `process_dialog_result` deleted (falling through to the `_ =>
+    /// EngineAction::None` default, which never calls
+    /// `respond_to_client_request`), this test times out instead of
+    /// observing `ai_streaming` clear, because the fixture stays blocked on
+    /// its `read -r _reply` forever.
+    #[cfg(unix)]
+    #[test]
+    fn selecting_an_option_replies_and_resumes_the_turn() {
+        let mut engine = engine_with_fixture_agent(&[("ACP_FAKE_REQUEST_PERMISSION", "1")]);
+        engine.settings.acp_agent_command = "already-spawned-above".to_string();
+
+        engine.ai_send_message("please edit".to_string());
+        poll_until_permission_dialog(&mut engine);
+
+        let idx = engine
+            .dialog
+            .as_ref()
+            .unwrap()
+            .buttons
+            .iter()
+            .position(|b| b.label == "Allow Once")
+            .expect("Allow Once button should be present");
+        engine.dialog_click_button(idx);
+
+        assert!(
+            engine.dialog.is_none(),
+            "the dialog must close the moment a button is clicked"
+        );
+        assert!(
+            engine.acp_pending_permission.is_none(),
+            "answering the request must clear the parked-request bookkeeping"
+        );
+
+        poll_acp_until(&mut engine, |e| !e.ai_streaming);
+        assert!(
+            !engine.ai_streaming,
+            "the turn must reach stopReason: end_turn within {TEST_DEADLINE:?} \
+             once the reply unblocks the fixture's read"
+        );
+    }
+
+    /// #953: "Esc-dismiss replies cancelled and the turn ends cleanly
+    /// rather than hanging." `dialog_cancel()` is the engine-level
+    /// equivalent of the in-canvas Escape key / GTK native dialog's
+    /// dismiss-without-a-button path (`panels.rs`'s `dialog_cancel` doc).
+    ///
+    /// RED verified the same way as the sibling test above: without the
+    /// `"acp_permission"` arm, `dialog_cancel()`'s call into
+    /// `process_dialog_result` never answers the parked request and this
+    /// test times out waiting for `ai_streaming` to clear.
+    #[cfg(unix)]
+    #[test]
+    fn escape_dismiss_replies_cancelled_and_the_turn_ends_cleanly() {
+        let mut engine = engine_with_fixture_agent(&[("ACP_FAKE_REQUEST_PERMISSION", "1")]);
+        engine.settings.acp_agent_command = "already-spawned-above".to_string();
+
+        engine.ai_send_message("please edit".to_string());
+        poll_until_permission_dialog(&mut engine);
+
+        engine.dialog_cancel();
+        assert!(engine.dialog.is_none());
+        assert!(engine.acp_pending_permission.is_none());
+
+        poll_acp_until(&mut engine, |e| !e.ai_streaming);
+        assert!(
+            !engine.ai_streaming,
+            "a cancelled reply must still unblock the fixture and let the \
+             turn end cleanly within {TEST_DEADLINE:?}, not hang forever"
+        );
+    }
+
+    /// #953: "allow_always suppresses the second prompt for the same tool
+    /// within the session, and not beyond it." Two prompts in the *same*
+    /// session — the second must complete without ever reopening the
+    /// dialog, because the fake agent still blocks on a reply each time
+    /// (see the fixture's doc comment), so a hang here means the engine
+    /// silently dropped the second request instead of answering it from
+    /// the remembered decision.
+    #[cfg(unix)]
+    #[test]
+    fn allow_always_suppresses_the_second_prompt_within_the_session() {
+        let mut engine = engine_with_fixture_agent(&[("ACP_FAKE_REQUEST_PERMISSION", "1")]);
+        engine.settings.acp_agent_command = "already-spawned-above".to_string();
+
+        engine.ai_send_message("first edit".to_string());
+        poll_until_permission_dialog(&mut engine);
+        let idx = engine
+            .dialog
+            .as_ref()
+            .unwrap()
+            .buttons
+            .iter()
+            .position(|b| b.label == "Always Allow")
+            .expect("Always Allow button should be present");
+        engine.dialog_click_button(idx);
+        poll_acp_until(&mut engine, |e| !e.ai_streaming);
+        assert!(!engine.ai_streaming, "first turn should complete");
+        assert_eq!(
+            engine.acp_remembered_decisions.get("edit"),
+            Some(&true),
+            "picking Always Allow must remember the decision, keyed by the \
+             tool-call kind"
+        );
+
+        // Second turn, same session: the fixture will emit another
+        // session/request_permission and block on its reply exactly like
+        // the first time — but the dialog must never reopen.
+        engine.ai_send_message("second edit".to_string());
+        poll_acp_until(&mut engine, |e| !e.ai_streaming);
+        assert!(
+            !engine.ai_streaming,
+            "the second turn must complete within {TEST_DEADLINE:?} — a \
+             hang here means the remembered decision wasn't applied and \
+             the fixture is still blocked waiting for a reply"
+        );
+        assert!(
+            engine.dialog.is_none(),
+            "the second permission prompt for the same tool kind must be \
+             auto-answered, never shown"
+        );
+    }
+
+    /// #953: "Agent death with a dialog open leaves no dialog on screen and
+    /// no write to a dead pipe." `poll_acp`'s `AgentExited` arm clears the
+    /// dialog directly rather than routing through
+    /// `acp_cancel_pending_permission` (which would call
+    /// `respond_to_client_request`, i.e. write to the now-dead child's
+    /// stdin) — this test proves the *observable* half (dialog gone, no
+    /// panic, clean state); the "doesn't write" half is structural (the
+    /// `AgentExited` arm never touches `acp_client` to send anything, and
+    /// `acp_client` is still `Some` — not yet dropped — for the duration of
+    /// this arm, so a write attempt would have to be an explicit call this
+    /// arm simply doesn't make).
+    #[cfg(unix)]
+    #[test]
+    fn agent_death_with_permission_dialog_open_clears_dialog_cleanly() {
+        let mut engine = engine_with_fixture_agent(&[("ACP_FAKE_DIE_DURING_PERMISSION", "1")]);
+        engine.settings.acp_agent_command = "already-spawned-above".to_string();
+
+        engine.ai_send_message("please edit".to_string());
+
+        // The fixture emits the request_permission request and exits in the
+        // same breath (no blocking read in between, unlike every other
+        // fixture branch) — same shape as `core::acp::tests::
+        // agent_death_mid_session_surfaces_as_event_no_panic`'s
+        // `ACP_FAKE_DIE_AFTER_INIT` case: the `ClientRequest` and the
+        // `AgentExited` its EOF produces can land in the *same*
+        // `AcpClient::poll()` drain, processed in order within the same
+        // `poll_acp()` call, so a dialog-open checkpoint in between is not
+        // reliably observable (see that test's doc for why asserting an
+        // intermediate state here would be a scheduling-dependent flake,
+        // not a real assertion). What's actually guaranteed — and what
+        // #953 asks for — is the *end* state: drive polls until the death
+        // is fully drained, then confirm nothing was left dangling.
+        poll_acp_until(&mut engine, |e| e.acp_client.is_none());
+        assert!(
+            engine.acp_client.is_none(),
+            "agent death should clear the client within {TEST_DEADLINE:?}"
+        );
+        assert!(
+            engine.dialog.is_none(),
+            "the permission dialog must not linger on screen once its \
+             agent is gone"
+        );
+        assert!(
+            engine.acp_pending_permission.is_none(),
+            "the parked request must be dropped, not left to answer later"
         );
     }
 }
