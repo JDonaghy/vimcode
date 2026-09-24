@@ -628,6 +628,46 @@ impl Engine {
                 }
                 EngineAction::None
             }
+            "acp_auth_choice" => {
+                // #957 (ACP-6): "cancel" (Escape) and the "Continue without
+                // auth" button both mean the same thing — the human
+                // declined to pick a method, so proceed to `session/new`
+                // unauthenticated and let the agent itself accept or
+                // reject it. An agent advertising `authMethods` doesn't
+                // necessarily mean auth is *required* right now.
+                if action == "cancel" || action == "acp_auth_skip" {
+                    self.acp_authenticated = true;
+                    self.acp_begin_session();
+                    return EngineAction::None;
+                }
+                let Some(method) = self
+                    .acp_auth_methods
+                    .iter()
+                    .find(|m| m.id == action)
+                    .cloned()
+                else {
+                    // Shouldn't happen — every dialog button's action is
+                    // either "acp_auth_skip" or one of `acp_auth_methods`'
+                    // own ids — but never strand the handshake on an
+                    // unrecognized action; fall back to unauthenticated
+                    // the same as an explicit skip.
+                    self.acp_authenticated = true;
+                    self.acp_begin_session();
+                    return EngineAction::None;
+                };
+                match method.kind {
+                    crate::core::acp::AcpAuthMethodKind::Agent => {
+                        if let Some(client) = self.acp_client.as_mut() {
+                            client.authenticate(&method.id);
+                            self.message = format!("Authenticating via {}\u{2026}", method.name);
+                        }
+                    }
+                    crate::core::acp::AcpAuthMethodKind::Terminal => {
+                        self.acp_launch_terminal_login(&method.name);
+                    }
+                }
+                EngineAction::None
+            }
             "check_nerd_fonts" => {
                 if let Some(enabled) = match action {
                     "enable" => Some(true),

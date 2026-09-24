@@ -118,6 +118,11 @@ pub enum AcpEvent {
         stderr: String,
         was_initialized: bool,
     },
+    /// Response to our `authenticate` request (#957, ACP-6) — a `type:
+    /// "agent"` auth method succeeded. A failure comes through
+    /// [`AcpEvent::RequestFailed`] instead (method `"authenticate"`), same
+    /// as every other client -> agent request.
+    Authenticated { request_id: i64 },
 }
 
 // ---------------------------------------------------------------------------
@@ -710,6 +715,70 @@ pub fn resolve_path_within_roots(
 }
 
 // ---------------------------------------------------------------------------
+// authMethods — wire-shape parsing (#957, ACP-6)
+// ---------------------------------------------------------------------------
+
+/// Which RPC flow authenticates an [`AcpAuthMethod`] — the distinction the
+/// issue calls out as "the trap": `Agent` methods answer via the plain
+/// `authenticate {methodId}` request ([`AcpClient::authenticate`]); a
+/// `Terminal` method does **not** call `authenticate` at all — the client
+/// must run the agent's own command line attached to a real TTY so its CLI
+/// can drive an interactive login, then re-initialize once that process
+/// exits (see `Engine::acp_launch_terminal_login` /
+/// `Engine::acp_finish_terminal_login`, `src/core/engine/terminal_ops.rs`
+/// and `acp_ops.rs`).
+///
+/// An unrecognized or missing `type` on the wire defaults to `Agent`:
+/// `authenticate` is the RPC every ACP v1 agent already speaks (it predates
+/// `auth.terminal`), so defaulting there means this client can still
+/// attempt one ordinary JSON-RPC call and surface a normal
+/// [`AcpEvent::RequestFailed`] on failure — never silently launching an
+/// interactive subprocess because a `type` value this client doesn't
+/// recognize came back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AcpAuthMethodKind {
+    Agent,
+    Terminal,
+}
+
+/// One entry from `initialize`'s `authMethods` array.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcpAuthMethod {
+    pub id: String,
+    /// Display name shown on the auth-choice dialog button. Falls back to
+    /// `id` when the agent omits it — still selectable, just less
+    /// friendly, matching this module's general "never silently drop
+    /// something a user could otherwise act on" policy (see
+    /// `parse_request_permission`'s doc for the same call elsewhere).
+    pub name: String,
+    pub kind: AcpAuthMethodKind,
+}
+
+/// Parse `initialize`'s `authMethods` result field: an array of `{id, name,
+/// type}`. An entry missing `id` is dropped (nothing a user could
+/// meaningfully select or key `authenticate` on); every other field is
+/// defaulted rather than dropping the whole entry — see [`AcpAuthMethod::
+/// name`] and [`AcpAuthMethodKind`]'s docs for the specific defaults and why.
+pub fn parse_auth_methods(methods: &[serde_json::Value]) -> Vec<AcpAuthMethod> {
+    methods
+        .iter()
+        .filter_map(|m| {
+            let id = m.get("id")?.as_str()?.to_string();
+            let name = m
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or(&id)
+                .to_string();
+            let kind = match m.get("type").and_then(|v| v.as_str()) {
+                Some("terminal") => AcpAuthMethodKind::Terminal,
+                _ => AcpAuthMethodKind::Agent,
+            };
+            Some(AcpAuthMethod { id, name, kind })
+        })
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
 // session/request_permission — wire-shape parsing (#953, ACP-2)
 // ---------------------------------------------------------------------------
 
@@ -1010,11 +1079,18 @@ impl AcpClient {
     }
 
     /// Send the `initialize` request. Advertises `fs.readTextFile` and
-    /// `fs.writeTextFile` (#954, ACP-3) — the only two `clientCapabilities`
-    /// this client implements so far, per the module doc's capability
-    /// negotiation commitment ("omitted means unsupported"). `terminal` is
-    /// deliberately never advertised (out of scope for the whole track — see
-    /// the module doc).
+    /// `fs.writeTextFile` (#954, ACP-3) and `auth.terminal` (#957, ACP-6) —
+    /// the only `clientCapabilities` this client implements so far, per the
+    /// module doc's capability negotiation commitment ("omitted means
+    /// unsupported"). `auth.terminal: true` is what makes an agent's
+    /// `initialize` response allowed to offer a `type: "terminal"` auth
+    /// method at all (e.g. `claude-ai-login` / "Claude Subscription" from
+    /// `@agentclientprotocol/claude-agent-acp`) — omitting it is how a
+    /// client opts out of subscription login and forces API-key-only, which
+    /// this client deliberately does not do (see the module doc's ACP-6
+    /// section). `terminal/*` — the unrelated *client-served* terminal
+    /// methods — is still never advertised (out of scope for the whole
+    /// track).
     pub fn initialize(&mut self) -> i64 {
         self.send_request(
             "initialize",
@@ -1025,6 +1101,9 @@ impl AcpClient {
                         "readTextFile": true,
                         "writeTextFile": true,
                     },
+                    "auth": {
+                        "terminal": true,
+                    },
                 },
                 "clientInfo": {
                     "name": "vimcode",
@@ -1032,6 +1111,15 @@ impl AcpClient {
                 },
             }),
         )
+    }
+
+    /// Send an `authenticate` request for a `type: "agent"` auth method
+    /// (#957, ACP-6) — `{"methodId": method_id}`. Distinct from `type:
+    /// "terminal"` methods, which never call this RPC at all; see the
+    /// module doc's "How terminal auth differs from `authenticate`" note
+    /// and [`AcpAuthMethodKind`].
+    pub fn authenticate(&mut self, method_id: &str) -> i64 {
+        self.send_request("authenticate", serde_json::json!({"methodId": method_id}))
     }
 
     /// Send `session/new`. `cwd` must be absolute per the ACP spec; this
@@ -1298,6 +1386,7 @@ fn reader_thread_main(
                             .unwrap_or("unknown")
                             .to_string(),
                     }),
+                    Some("authenticate") => Some(AcpEvent::Authenticated { request_id: id }),
                     // Response to a request we don't track by id anymore
                     // (already timed out, or the id was never ours) —
                     // tolerate and drop, don't desync.
@@ -1631,6 +1720,63 @@ mod tests {
         let (current, list) = parse_session_modes(&serde_json::json!(null));
         assert_eq!(current, None);
         assert!(list.is_empty());
+    }
+
+    /// #957 (ACP-6): the pure parser side of "the terminal method is
+    /// absent when the capability isn't advertised" — an `authMethods`
+    /// array with no `type: "terminal"` entry at all (what a real agent
+    /// would send when it never saw `auth.terminal: true`) must classify
+    /// with zero [`AcpAuthMethodKind::Terminal`] results, never one
+    /// conjured from a missing/unrecognized `type`. The wire-level half of
+    /// this contract (the client actually sends the capability, and the
+    /// fixture actually gates its response on it) lives in
+    /// `initialize_auth_methods_includes_terminal_method_when_capability_advertised`
+    /// above.
+    #[test]
+    fn parse_auth_methods_classifies_agent_and_terminal_kinds() {
+        let methods = vec![
+            serde_json::json!({"id": "api-key", "name": "API Key", "type": "agent"}),
+            serde_json::json!({"id": "claude-ai-login", "name": "Claude Subscription", "type": "terminal"}),
+        ];
+        let parsed = parse_auth_methods(&methods);
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].kind, AcpAuthMethodKind::Agent);
+        assert_eq!(parsed[1].kind, AcpAuthMethodKind::Terminal);
+
+        // An agent that never offers a terminal method (because it never
+        // saw the capability, or simply doesn't support subscription
+        // login) yields no Terminal-kind entries at all.
+        let agent_only =
+            vec![serde_json::json!({"id": "api-key", "name": "API Key", "type": "agent"})];
+        let parsed = parse_auth_methods(&agent_only);
+        assert!(parsed.iter().all(|m| m.kind == AcpAuthMethodKind::Agent));
+    }
+
+    #[test]
+    fn parse_auth_methods_defaults_missing_type_to_agent_and_drops_missing_id() {
+        let methods = vec![
+            serde_json::json!({"id": "mystery", "name": "Mystery"}),
+            serde_json::json!({"name": "No id at all", "type": "terminal"}),
+        ];
+        let parsed = parse_auth_methods(&methods);
+        assert_eq!(
+            parsed.len(),
+            1,
+            "entry missing id must be dropped: {parsed:?}"
+        );
+        assert_eq!(parsed[0].id, "mystery");
+        assert_eq!(
+            parsed[0].kind,
+            AcpAuthMethodKind::Agent,
+            "unrecognized/missing type must default to Agent, never Terminal"
+        );
+    }
+
+    #[test]
+    fn parse_auth_methods_name_falls_back_to_id() {
+        let methods = vec![serde_json::json!({"id": "api-key", "type": "agent"})];
+        let parsed = parse_auth_methods(&methods);
+        assert_eq!(parsed[0].name, "api-key");
     }
 
     #[test]
@@ -2193,6 +2339,94 @@ mod tests {
                 );
             }
             other => panic!("expected Initialized, got {other:?}"),
+        }
+    }
+
+    /// #957 (ACP-6): `auth.terminal: true` must actually reach the wire in
+    /// the `initialize` request — same "the capability flag isn't just a
+    /// `serde_json::json!` literal nobody sends" contract as the fs/* test
+    /// above, and the same fixture echo mechanism
+    /// (`agentInfo.sawAuthTerminalCap`).
+    #[cfg(unix)]
+    #[test]
+    fn initialize_advertises_auth_terminal_capability_the_agent_actually_receives() {
+        let mut client = spawn_fixture(&[]);
+        client.initialize();
+        let events = poll_until(&mut client, TEST_DEADLINE);
+        assert_eq!(events.len(), 1, "expected exactly one event: {events:?}");
+        match &events[0] {
+            AcpEvent::Initialized { agent_info, .. } => {
+                assert_eq!(
+                    agent_info["sawAuthTerminalCap"], true,
+                    "the agent's initialize handler never saw auth.terminal:true \
+                     on the wire: {agent_info:?}"
+                );
+            }
+            other => panic!("expected Initialized, got {other:?}"),
+        }
+    }
+
+    /// #957 (ACP-6): with `$ACP_FAKE_AUTH_METHODS` set, the fixture's
+    /// `authMethods` includes a `type: "terminal"` entry *because* it saw
+    /// `auth.terminal: true` on the wire (this client always sends it —
+    /// see the test above) — a real, request-driven gate, not a hardcoded
+    /// stub. `parse_auth_methods` must in turn classify that entry as
+    /// [`AcpAuthMethodKind::Terminal`] and the "api-key" entry as
+    /// [`AcpAuthMethodKind::Agent`].
+    #[cfg(unix)]
+    #[test]
+    fn initialize_auth_methods_includes_terminal_method_when_capability_advertised() {
+        let mut client = spawn_fixture(&[("ACP_FAKE_AUTH_METHODS", "1")]);
+        client.initialize();
+        let events = poll_until(&mut client, TEST_DEADLINE);
+        assert_eq!(events.len(), 1, "expected exactly one event: {events:?}");
+        match &events[0] {
+            AcpEvent::Initialized { auth_methods, .. } => {
+                let methods = parse_auth_methods(auth_methods);
+                assert_eq!(methods.len(), 2, "expected two auth methods: {methods:?}");
+                assert_eq!(methods[0].id, "api-key");
+                assert_eq!(methods[0].kind, AcpAuthMethodKind::Agent);
+                assert_eq!(methods[1].id, "claude-ai-login");
+                assert_eq!(methods[1].name, "Claude Subscription");
+                assert_eq!(methods[1].kind, AcpAuthMethodKind::Terminal);
+            }
+            other => panic!("expected Initialized, got {other:?}"),
+        }
+    }
+
+    /// #957 (ACP-6): a `type: "agent"` auth method answers via the plain
+    /// `authenticate {methodId}` RPC — a real round trip through
+    /// [`AcpClient::authenticate`], not just JSON construction.
+    #[cfg(unix)]
+    #[test]
+    fn authenticate_round_trip_succeeds() {
+        let mut client = spawn_fixture(&[]);
+        client.authenticate("api-key");
+        let events = poll_until(&mut client, TEST_DEADLINE);
+        assert_eq!(events.len(), 1, "expected exactly one event: {events:?}");
+        assert!(
+            matches!(events[0], AcpEvent::Authenticated { .. }),
+            "expected Authenticated, got {:?}",
+            events[0]
+        );
+    }
+
+    /// A failed `authenticate` call must surface as an ordinary
+    /// [`AcpEvent::RequestFailed`] (method `"authenticate"`) — never a
+    /// panic or a silently swallowed response — so
+    /// `Engine::poll_acp`'s existing generic error handling clears the
+    /// panel's busy state exactly as it does for any other failed
+    /// handshake request.
+    #[cfg(unix)]
+    #[test]
+    fn authenticate_failure_surfaces_as_request_failed() {
+        let mut client = spawn_fixture(&[("ACP_FAKE_AUTH_FAIL", "1")]);
+        client.authenticate("api-key");
+        let events = poll_until(&mut client, TEST_DEADLINE);
+        assert_eq!(events.len(), 1, "expected exactly one event: {events:?}");
+        match &events[0] {
+            AcpEvent::RequestFailed { method, .. } => assert_eq!(method, "authenticate"),
+            other => panic!("expected RequestFailed, got {other:?}"),
         }
     }
 

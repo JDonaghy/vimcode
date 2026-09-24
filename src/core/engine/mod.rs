@@ -67,6 +67,13 @@ pub struct TerminalSlot {
     pub session: TerminalSession,
     /// `Some` only for panes opened by `terminal_run_command` (extension installs).
     pub install_ctx: Option<InstallContext>,
+    /// `true` only for the pane opened by `Engine::acp_launch_terminal_login`
+    /// (#957, ACP-6) — an ACP `type: "terminal"` auth login, re-running the
+    /// agent's own command interactively. `poll_terminal`'s exit handling
+    /// and `terminal_close_active_tab` both read this to know an
+    /// exiting/closed pane was a login flow (never a regular shell or an
+    /// extension install) and route to `Engine::acp_finish_terminal_login`.
+    pub acp_auth_pending: bool,
 }
 
 /// How a register's contents were captured, and therefore how `p`/`P` put them
@@ -3582,6 +3589,24 @@ pub struct Engine {
     /// session (#956, ACP-5). Rendered as a compact status-header suffix —
     /// never a separate widget, so it can't steal focus or churn layout.
     pub acp_usage: Option<crate::core::acp::AcpUsage>,
+    /// The `authMethods` from the live agent's `initialize` response
+    /// (#957, ACP-6) — cached so the `"acp_auth_choice"` dialog and
+    /// `Engine::acp_launch_terminal_login` can look a chosen method back up
+    /// by id after the dialog closes. Session-scoped: cleared alongside
+    /// `acp_client` (`AgentExited`, `ai_clear`).
+    pub acp_auth_methods: Vec<crate::core::acp::AcpAuthMethod>,
+    /// Whether auth has been resolved (skipped, a `type: "agent"` method
+    /// succeeded, or a `type: "terminal"` login exited `0`) for the
+    /// *current* `acp_client`'s lifetime. Gates whether `poll_acp`'s
+    /// `Initialized` handler shows the `"acp_auth_choice"` dialog again —
+    /// without this, the re-`initialize()` that
+    /// `Engine::acp_finish_terminal_login` sends after a successful
+    /// terminal login would immediately reopen the same dialog, since a
+    /// real agent's `authMethods` list does not empty out just because a
+    /// previous login already succeeded. Reset to `false` alongside
+    /// `acp_client`/`acp_auth_methods` (new client, new handshake, new
+    /// choice) — never persisted across sessions.
+    pub acp_authenticated: bool,
 
     // --- DAP (Debug Adapter Protocol) state ---
     /// Multi-adapter DAP coordinator. None until first debug session is started.
@@ -4658,6 +4683,8 @@ impl Engine {
             acp_modes: Vec::new(),
             acp_current_mode_id: None,
             acp_usage: None,
+            acp_auth_methods: Vec::new(),
+            acp_authenticated: false,
             dap_manager: None,
             dap_stopped_thread: None,
             dap_breakpoints: HashMap::new(),
