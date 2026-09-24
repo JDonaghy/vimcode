@@ -5172,7 +5172,6 @@ impl Engine {
 
     /// Mark a notification as done (switches from spinner to bell).
     /// If `new_message` is `Some`, updates the display text.
-    #[allow(dead_code)]
     pub fn notify_done(&mut self, id: u64, new_message: Option<&str>) {
         if let Some(n) = self.notifications.iter_mut().find(|n| n.id == id) {
             n.done = true;
