@@ -14840,6 +14840,182 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// #956 (ACP-5) acceptance: "Two successive `plan` updates leave
+    /// **exactly one** plan rendered, reflecting the second." The fixture's
+    /// `ACP_FAKE_PLAN` branch emits two back-to-back `plan` updates for one
+    /// `session/prompt` turn — the first marks "Write the fix" in_progress,
+    /// the second (a full replacement) marks it completed and adds a new
+    /// "Add tests" entry — plus an `available_commands_update` and a
+    /// `usage_update`, all exercised here through the real `TuiShellApp`/
+    /// `TuiDriver` stack.
+    ///
+    /// RED verified: changing `Engine::acp_handle_session_update`'s
+    /// `self.acp_plan = entries` to `self.acp_plan.extend(entries)` (the
+    /// append-only bug #956 explicitly calls out as "the single most common
+    /// way to get this wrong") makes the "exactly one occurrence" assertion
+    /// below fail — "Write the fix" then appears twice (once in_progress
+    /// from the first update, once completed from the second) instead of
+    /// once.
+    #[cfg(unix)]
+    #[test]
+    fn ai_panel_plan_update_fully_replaces_not_accumulates_via_shell_app() {
+        let mut app = TuiShellApp::new(None);
+        app.engine
+            .app_shell
+            .show_panel(&quadraui::WidgetId::new(PANEL_AI));
+        app.engine.ai_has_focus = true;
+        app.sidebar.has_focus = true;
+
+        let argv = vec![
+            "sh".to_string(),
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/fake_acp_agent.sh"
+            )
+            .to_string(),
+        ];
+        let cwd = std::env::temp_dir();
+        let mut client =
+            crate::core::acp::AcpClient::spawn_with_env(&argv, &cwd, &[("ACP_FAKE_PLAN", "1")])
+                .expect("fixture agent should spawn");
+        client.initialize();
+        app.engine.acp_client = Some(client);
+        app.engine.settings.acp_agent_command = "already-spawned-above".to_string();
+
+        let mut driver = driver_with_shell(app, config(), 80, 24);
+        for c in "please plan".chars() {
+            driver.type_char(c);
+        }
+        driver.ctrl_char('s');
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut screen = driver.screen();
+        while !screen.contains("Add tests") && Instant::now() < deadline {
+            driver.tick();
+            std::thread::sleep(Duration::from_millis(10));
+            screen = driver.screen();
+        }
+
+        assert!(
+            screen.contains("Add tests"),
+            "the second plan update's new entry must render within 5s; \
+             screen:\n{screen}"
+        );
+        assert_eq!(
+            screen.matches("Write the fix").count(),
+            1,
+            "two successive plan updates must leave exactly one rendering \
+             of a step present in both, not one per update; screen:\n{screen}"
+        );
+        assert!(
+            screen.contains("\u{2611} Write the fix"),
+            "the rendered checklist must reflect the SECOND update's status \
+             (completed), not the first's (in_progress); screen:\n{screen}"
+        );
+        assert!(
+            !screen.contains("Write the fix (in progress)"),
+            "the stale in_progress state from the first update must not \
+             survive; screen:\n{screen}"
+        );
+        assert!(
+            screen.contains("120+45 tok"),
+            "usage_update telemetry must render in the status header \
+             (the cost figure may be truncated by the narrow sidebar column \
+             here; `format_usage_summary`'s own unit tests cover the full \
+             string); screen:\n{screen}"
+        );
+    }
+
+    /// #956 (ACP-5) acceptance: slash commands declared via
+    /// `available_commands_update` must appear as completions in the AI
+    /// panel's input, and accepting one must produce ordinary prompt text
+    /// (no separate RPC) — submitting it is indistinguishable from typing
+    /// it by hand.
+    #[cfg(unix)]
+    #[test]
+    fn ai_panel_slash_command_completions_via_shell_app() {
+        let mut app = TuiShellApp::new(None);
+        app.engine
+            .app_shell
+            .show_panel(&quadraui::WidgetId::new(PANEL_AI));
+        app.engine.ai_has_focus = true;
+        app.sidebar.has_focus = true;
+
+        let argv = vec![
+            "sh".to_string(),
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/fake_acp_agent.sh"
+            )
+            .to_string(),
+        ];
+        let cwd = std::env::temp_dir();
+        let mut client =
+            crate::core::acp::AcpClient::spawn_with_env(&argv, &cwd, &[("ACP_FAKE_PLAN", "1")])
+                .expect("fixture agent should spawn");
+        client.initialize();
+        app.engine.acp_client = Some(client);
+        app.engine.settings.acp_agent_command = "already-spawned-above".to_string();
+
+        let mut driver = driver_with_shell(app, config(), 80, 24);
+        // Drive one full turn first so `available_commands_update` lands.
+        for c in "please plan".chars() {
+            driver.type_char(c);
+        }
+        driver.ctrl_char('s');
+        // Wait for the turn to fully complete ("Plan ready" is the last
+        // chunk the fixture streams) rather than for "compact" to appear on
+        // screen — `available_commands_update` only updates engine state,
+        // it never paints anything by itself until the popup below renders
+        // it, so waiting on screen text for it here would just burn the
+        // whole deadline.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut screen = driver.screen();
+        while !screen.contains("Plan ready") && Instant::now() < deadline {
+            driver.tick();
+            std::thread::sleep(Duration::from_millis(10));
+            screen = driver.screen();
+        }
+        assert!(
+            screen.contains("Plan ready"),
+            "setup turn must complete within 5s so available_commands_update \
+             has landed; screen:\n{screen}"
+        );
+        // `dispatch_ai_chat_event` already cleared the input on submit.
+
+        for c in "/co".chars() {
+            driver.type_char(c);
+        }
+        let screen = driver.screen();
+        assert!(
+            screen.contains("/commit") && screen.contains("/compact"),
+            "both agent-declared commands sharing the \"co\" prefix must \
+             appear as completions; screen:\n{screen}"
+        );
+
+        // Cycle from "/commit" (alphabetically first, so selected by
+        // default) to "/compact", then accept.
+        driver.press_named(quadraui::NamedKey::Tab);
+        driver.press_named(quadraui::NamedKey::Enter);
+        let screen = driver.screen();
+        assert!(
+            screen.contains("/compact "),
+            "accepting the completion must fill the input with the full \
+             command name plus a trailing space, ready for arguments; \
+             screen:\n{screen}"
+        );
+
+        // Invoking it is nothing more than submitting that text normally —
+        // there is no separate RPC for a slash command.
+        driver.ctrl_char('s');
+        let screen = driver.screen();
+        assert!(
+            screen.contains("/compact"),
+            "the accepted command must reach the transcript as ordinary \
+             prompt text once submitted; screen:\n{screen}"
+        );
+    }
+
     /// Toasts are the last thing painted, on top of every other surface.
     #[test]
     fn render_content_paints_toast_via_shell_app() {

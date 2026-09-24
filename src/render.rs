@@ -7971,6 +7971,32 @@ pub fn route_ai_chat_event(
         return engine.ai_has_focus;
     }
     populate_ai_chat_controller(engine, theme);
+
+    // #956 (ACP-5): while the slash-command completion popup is showing,
+    // steal Tab (cycle selection) and Enter (accept) before handing the
+    // event to `ChatController::handle` — the same "intercept the
+    // accept/cycle keys, let everything else fall through unchanged" shape
+    // the editor's own word-completion popup uses
+    // (`Engine::insert_completion_intercepts_key`). This one shared call
+    // site is what makes it zero-backend-specific: GTK and TUI both route
+    // every AI-panel key through here already.
+    if let quadraui::UiEvent::KeyPressed { key, modifiers, .. } = event {
+        let no_modifiers = !modifiers.shift && !modifiers.ctrl && !modifiers.alt && !modifiers.cmd;
+        if no_modifiers && engine.ai_command_completions().is_some() {
+            match key {
+                quadraui::Key::Named(quadraui::NamedKey::Tab) => {
+                    engine.ai_command_completion_cycle();
+                    return engine.ai_has_focus;
+                }
+                quadraui::Key::Named(quadraui::NamedKey::Enter) => {
+                    engine.ai_command_accept_selected();
+                    return engine.ai_has_focus;
+                }
+                _ => {}
+            }
+        }
+    }
+
     let chat_event = engine.ai_chat.borrow_mut().handle(event, backend, rect);
     engine.dispatch_ai_chat_event(chat_event)
 }
@@ -18850,7 +18876,7 @@ pub fn populate_ai_chat_controller(engine: &Engine, theme: &Theme) {
     // distinct from message chunks, not merely a different tint on the same
     // "AI" label.
     let thought_fg = theme.comment;
-    let turns: Vec<quadraui::ChatTurn> = engine
+    let mut turns: Vec<quadraui::ChatTurn> = engine
         .ai_messages
         .iter()
         .map(|m| {
@@ -18868,16 +18894,101 @@ pub fn populate_ai_chat_controller(engine: &Engine, theme: &Theme) {
         })
         .collect();
 
+    // #956 (ACP-5): the agent's current plan, rendered as one synthetic
+    // checklist turn appended *after* the real conversation — never mixed
+    // into `engine.ai_messages` itself. `engine.acp_plan` already holds
+    // only the latest `plan` update (a full replacement, not a delta — see
+    // that field's doc), so this turn is rebuilt fresh from it every call:
+    // two successive `plan` updates leave exactly one checklist rendered,
+    // reflecting the second, by construction (there is only ever one
+    // `acp_plan` value to read). Appending at the end rather than inline
+    // where the update actually streamed keeps "current plan state" always
+    // visible without scrolling (`ChatController` stays stuck-to-bottom),
+    // at the deliberate cost of it not being in strict chronological order
+    // with any later message chunks in the same turn.
+    if !engine.acp_plan.is_empty() {
+        turns.push(quadraui::ChatTurn {
+            role: quadraui::ChatRole::System,
+            text: quadraui::StyledText::colored(
+                crate::core::acp::plan_to_checklist_text(&engine.acp_plan),
+                thought_fg,
+            ),
+            timestamp_unix: None,
+            line_scales: Vec::new(),
+        });
+    }
+
     let mut chat = engine.ai_chat.borrow_mut();
     chat.set_transcript(turns);
     chat.set_busy(engine.ai_streaming);
     let header_fg = theme.status_fg;
-    let header = if engine.ai_streaming {
-        " \u{f0e5} AI ASSISTANT  (thinking\u{2026})"
+    let mut header = if engine.ai_streaming {
+        " \u{f0e5} AI ASSISTANT  (thinking\u{2026})".to_string()
     } else {
-        " \u{f0e5} AI ASSISTANT"
+        " \u{f0e5} AI ASSISTANT".to_string()
     };
+    // #956 (ACP-5): current mode + usage telemetry both fold into this one
+    // existing status line rather than a new widget — "unobtrusive status
+    // indicator" per the issue, and by construction can't steal focus or
+    // churn layout since the header is already repainted every frame at a
+    // fixed position.
+    if let Some(mode_id) = engine.acp_current_mode_id.as_deref() {
+        let mode_label = engine
+            .acp_modes
+            .iter()
+            .find(|m| m.id == mode_id)
+            .map(|m| m.name.as_str())
+            .unwrap_or(mode_id);
+        header.push_str(&format!("  \u{b7} mode: {mode_label}"));
+    }
+    if let Some(usage) = &engine.acp_usage {
+        let summary = crate::core::acp::format_usage_summary(usage);
+        if !summary.is_empty() {
+            header.push_str(&format!("  \u{b7} {summary}"));
+        }
+    }
     chat.set_status(quadraui::StyledText::colored(header, header_fg));
+}
+
+/// Paint the slash-command completion popup above the AI panel's input box
+/// when [`Engine::ai_command_completions`] has a match (#956, ACP-5).
+/// Reuses [`completion_menu_to_quadraui_completions`] and the
+/// `quadraui::Completions` primitive verbatim — the same machinery the
+/// editor's own word-completion popup uses — rather than a bespoke widget.
+///
+/// `chat_rect` must be the same rect the caller's last `ai_chat.render()`
+/// call used (`Engine::ai_chat_rect`), matching every other AI-panel
+/// helper's contract. Anchoring at the rect's bottom edge with the rect
+/// itself as the viewport makes `Completions::layout`'s own "prefer below,
+/// flip above on overflow" placement logic put the popup just above the
+/// panel's bottom edge — where `ChatController`'s input box always is —
+/// without this function needing to know that box's exact pixel/cell
+/// geometry (`ChatController` doesn't expose it).
+pub fn paint_ai_command_completions(
+    backend: &mut dyn quadraui::Backend,
+    engine: &Engine,
+    chat_rect: quadraui::Rect,
+) {
+    if chat_rect.width <= 0.0 || chat_rect.height <= 0.0 {
+        return;
+    }
+    let Some(menu) = engine.ai_command_completions() else {
+        return;
+    };
+    let completions = completion_menu_to_quadraui_completions(&menu);
+    let unit_h = backend.line_height().max(1.0);
+    let popup_width = chat_rect.width.max(unit_h * 4.0);
+    let max_popup_height = (unit_h * (menu.candidates.len() as f32 + 1.0)).min(chat_rect.height);
+    let layout = completions.layout(
+        chat_rect.x,
+        chat_rect.y + chat_rect.height,
+        unit_h,
+        chat_rect,
+        popup_width,
+        max_popup_height,
+        |_| quadraui::CompletionItemMeasure::new(unit_h),
+    );
+    backend.draw_completions(&completions, &layout);
 }
 
 /// Build the cell grid for a single terminal session.

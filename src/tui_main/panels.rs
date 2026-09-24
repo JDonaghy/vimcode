@@ -1005,6 +1005,9 @@ pub(super) fn render_ai_sidebar(
     engine.ai_chat_rect.set(q_area);
     backend.set_theme(super::quadraui_tui::q_theme(theme));
     engine.ai_chat.borrow().render(backend, q_area);
+    // #956 (ACP-5): slash-command completions, painted on top — no-op
+    // unless the input matches an agent-declared command.
+    render::paint_ai_command_completions(backend, engine, q_area);
 }
 
 // ─── Debug sidebar panel ──────────────────────────────────────────────────────

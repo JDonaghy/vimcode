@@ -1,6 +1,72 @@
 # VimCode Project State
 
-**Last updated:** September 24, 2026 (#952, ACP-1 — hosted a live ACP session
+**Last updated:** September 24, 2026 (#956, ACP-5 — plan, slash commands,
+modes and usage from the `session/update` stream, on top of ACP-1's #952
+transport; independent of ACP-3/ACP-4). `src/core/acp.rs` gained pure
+parsers for the four remaining `session/update` variants this track cared
+about: `parse_plan_update` (`AcpPlanEntry`/`AcpPlanEntryStatus`,
+`plan_to_checklist_text`), `parse_available_commands_update`
+(`AcpAvailableCommand`), `parse_session_modes`/`parse_current_mode_update`
+(`AcpSessionMode`), and `parse_usage_update`/`format_usage_summary`
+(`AcpUsage`, deliberately tolerant of a couple of plausible field-naming
+variants since usage telemetry is the least-stable corner of the v1
+schema). `AcpClient::set_mode` sends `session/set_mode`. New `Engine`
+fields (`acp_plan`, `acp_available_commands`, `acp_command_completion_idx`,
+`acp_modes`, `acp_current_mode_id`, `acp_usage`), all session-scoped
+(cleared on `ai_clear`/`AgentExited`, matching `acp_remembered_decisions`).
+`Engine::acp_handle_session_update` (`src/core/engine/acp_ops.rs`) now
+dispatches every recognized `session/update` kind; **`plan` is a full
+overwrite (`self.acp_plan = entries`), never `.extend`** — the #956
+acceptance bar ("two successive `plan` updates leave exactly one plan
+rendered") is a regression a worker could reintroduce by "fixing" this into
+an accumulator, so it's called out explicitly at every layer (doc comments,
+a dedicated `parse_plan_update` unit test, and a RED-verified TUI black-box
+test). `render::populate_ai_chat_controller` renders the current plan as
+one synthetic checklist turn appended after the real conversation (never
+mixed into `ai_messages`) and folds mode + usage into the existing AI-panel
+status header (no new widget, so #956's "no layout churn, no focus steal"
+criterion holds by construction). Slash commands surface as completions via
+`Engine::ai_command_completions`, reusing `render::CompletionMenu` /
+`quadraui::Completions` — the *same* machinery the editor's own word-
+completion popup uses, fed differently, per the issue's explicit steer away
+from a bespoke widget; `render::route_ai_chat_event` intercepts Tab (cycle)
+and Enter (accept) ahead of `ChatController::handle` when the popup is
+showing, and `render::paint_ai_command_completions` paints it anchored to
+the bottom of the panel's own rect (no exact input-box geometry needed —
+`Completions::layout`'s own "flip above on overflow" placement logic does
+that). Accepting a completion is nothing more than filling the input with
+`"/name "`; submitting it is `ai_send_message`'s existing plain-text path,
+unchanged — there is no separate slash-command RPC per the ACP v1 spec.
+New ex command `:AiMode [target]` (`src/core/engine/execute.rs`): no
+argument shows the agent's declared modes and which is current
+(`Engine::acp_mode_status_line`); an argument sends `session/set_mode`
+(`Engine::acp_set_mode`) matched by mode id or name — the displayed mode
+changes only once the agent's own `current_mode_update` notification lands,
+never optimistically on the request succeeding, which is the round-trip
+#956 asks for. `config_option_update`/`session/set_config_option` were
+explicitly left out of this slice per the issue's own "lower value...
+otherwise split it out" guidance — no follow-up issue filed yet. Extended
+the shared `tests/fixtures/fake_acp_agent.sh` (owned by the whole ACP
+track): `$ACP_FAKE_SESSION_MODES` adds a `modes` field to the `session/new`
+result; `$ACP_FAKE_PLAN` scripts two successive `plan` updates (the second
+a full replacement of the first) plus an `available_commands_update` and a
+`usage_update` in one `session/prompt` turn; a new top-level
+`session/set_mode` case replies empty and then emits a `current_mode_update`
+notification carrying back the requested mode id. Black-box coverage: two
+new TUI `TuiDriver` tests (`ai_panel_plan_update_fully_replaces_not_
+accumulates_via_shell_app`, `ai_panel_slash_command_completions_via_
+shell_app`) and one new GTK `GtkDriver` test
+(`ai_panel_mode_switch_round_trips_via_session_set_mode`), each RED-verified
+against its specific regression (the plan test against reverting to
+`.extend`; the slash-completion test against disabling the Tab/Enter
+intercept *and separately* against disabling the popup's paint call; the
+mode test against deleting the `current_mode_update` dispatch arm) before
+being confirmed GREEN — plus pure unit tests for every new parser in
+`core::acp` and two engine-level tests for `:AiMode`'s no-argument listing
+and its no-session rejection message. `cargo build`/`clippy -D warnings`/
+`fmt` clean on both feature lanes; targeted `cargo test` runs (acp/
+ai_panel/ai_mode/settings-snapshot, both lanes) all green.). Prior update:
+September 24, 2026 (#952, ACP-1 — hosted a live ACP session
 behind the existing AI panel, retiring `curl` as the *only* transport. The
 panel was already backend-neutral and already existed (`quadraui::
 ChatController`/`Engine::ai_chat`/`PANEL_AI`/`ai_send_message`/`poll_ai`/

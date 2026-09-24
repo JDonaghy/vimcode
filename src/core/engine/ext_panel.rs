@@ -3060,8 +3060,91 @@ impl Engine {
         self.acp_session_id = None;
         self.acp_pending_prompt = None;
         self.acp_streaming_turn = None;
+        // #956 (ACP-5): plan/commands/modes/usage are all session-scoped —
+        // clearing the conversation ends the session, so none of it should
+        // survive into whatever session starts next (same reasoning as
+        // `acp_remembered_decisions.clear()` above).
+        self.acp_plan.clear();
+        self.acp_available_commands.clear();
+        self.acp_command_completion_idx = 0;
+        self.acp_modes.clear();
+        self.acp_current_mode_id = None;
+        self.acp_usage = None;
         self.ai_chat.borrow_mut().set_transcript_scroll_top(0);
         self.message = "AI conversation cleared.".to_string();
+    }
+
+    /// Slash-command completions matching the AI panel input's current
+    /// text, if the agent has declared any via `available_commands_update`
+    /// and the input looks like a command still being typed (#956, ACP-5).
+    ///
+    /// `None` — never an empty popup — when the input doesn't start with
+    /// `/`, already has a space after the command name (the user is past
+    /// the command name into its arguments/body), or nothing matches.
+    /// Reuses `render::CompletionMenu` — the same shape the editor's own
+    /// word-completion popup uses — per the issue's "prefer vimcode's
+    /// existing completion machinery" guidance; there is no bespoke widget
+    /// here, only a different feeder for one that already exists.
+    pub fn ai_command_completions(&self) -> Option<crate::render::CompletionMenu> {
+        if self.acp_available_commands.is_empty() {
+            return None;
+        }
+        let input = self.ai_chat.borrow().input_text().to_string();
+        let prefix = input.strip_prefix('/')?;
+        if prefix.contains(char::is_whitespace) {
+            return None;
+        }
+        let prefix_lower = prefix.to_lowercase();
+        let mut candidates: Vec<String> = self
+            .acp_available_commands
+            .iter()
+            .filter(|c| c.name.to_lowercase().starts_with(&prefix_lower))
+            .map(|c| format!("/{}", c.name))
+            .collect();
+        if candidates.is_empty() {
+            return None;
+        }
+        candidates.sort();
+        let max_width = candidates
+            .iter()
+            .map(|c| c.chars().count())
+            .max()
+            .unwrap_or(0);
+        let selected_idx = self.acp_command_completion_idx.min(candidates.len() - 1);
+        Some(crate::render::CompletionMenu {
+            candidates,
+            selected_idx,
+            max_width,
+        })
+    }
+
+    /// Advance the slash-command completion selection to the next
+    /// candidate (wrapping), if the popup is currently showing. Returns
+    /// `false` (a no-op) when [`Self::ai_command_completions`] is `None`.
+    pub fn ai_command_completion_cycle(&mut self) -> bool {
+        let Some(menu) = self.ai_command_completions() else {
+            return false;
+        };
+        self.acp_command_completion_idx = (menu.selected_idx + 1) % menu.candidates.len();
+        true
+    }
+
+    /// Accept the currently-selected slash-command completion: replace the
+    /// AI panel input's whole text with `"/name "` (trailing space, ready
+    /// for arguments). Invoking the command afterward is nothing more than
+    /// submitting that text normally — the ACP v1 spec has no separate RPC
+    /// for it (`ai_send_message` already sends the input verbatim as
+    /// prompt content, slash prefix and all). Returns `false` (a no-op)
+    /// when [`Self::ai_command_completions`] is `None`.
+    pub fn ai_command_accept_selected(&mut self) -> bool {
+        let Some(menu) = self.ai_command_completions() else {
+            return false;
+        };
+        let chosen = menu.candidates[menu.selected_idx].clone();
+        let mut chat = self.ai_chat.borrow_mut();
+        chat.clear_input();
+        chat.input_insert_str(&format!("{chosen} "));
+        true
     }
 
     /// Apply a [`quadraui::ChatControllerEvent`] the AI panel's `ChatController`

@@ -67,6 +67,14 @@ impl Engine {
                     self.acp_session_id = None;
                     self.acp_pending_prompt = None;
                     self.acp_streaming_turn = None;
+                    // #956 (ACP-5): session-scoped, same as the decisions
+                    // map above — see `Engine::ai_clear`'s matching reset.
+                    self.acp_plan.clear();
+                    self.acp_available_commands.clear();
+                    self.acp_command_completion_idx = 0;
+                    self.acp_modes.clear();
+                    self.acp_current_mode_id = None;
+                    self.acp_usage = None;
                     self.ai_streaming = false;
                     redraw = true;
                 }
@@ -82,8 +90,19 @@ impl Engine {
                     }
                     redraw = true;
                 }
-                AcpEvent::SessionCreated { session_id, .. } => {
+                AcpEvent::SessionCreated {
+                    session_id, modes, ..
+                } => {
                     self.acp_session_id = Some(session_id.clone());
+                    // #956 (ACP-5): `session/new`'s optional `modes` field —
+                    // an agent that doesn't support modes at all simply omits
+                    // it, which `parse_session_modes` treats as "no modes",
+                    // not an error.
+                    if let Some(modes_json) = modes {
+                        let (current, list) = crate::core::acp::parse_session_modes(&modes_json);
+                        self.acp_modes = list;
+                        self.acp_current_mode_id = current;
+                    }
                     if let Some(text) = self.acp_pending_prompt.take() {
                         if let Some(client) = self.acp_client.as_mut() {
                             client.prompt(
@@ -106,10 +125,8 @@ impl Engine {
                     // unwrap one level first.
                     let inner = update.get("update");
                     if self.acp_session_id.as_deref() == Some(session_id.as_str()) {
-                        if let Some((kind, text)) =
-                            inner.and_then(crate::core::acp::session_update_chunk)
-                        {
-                            self.acp_append_chunk(kind, text);
+                        if let Some(inner) = inner {
+                            self.acp_handle_session_update(inner);
                         }
                     }
                     redraw = true;
@@ -379,6 +396,82 @@ impl Engine {
             content: text,
         });
         self.acp_streaming_turn = Some((self.ai_messages.len() - 1, kind));
+    }
+
+    // ── plan, available_commands_update, current_mode_update, usage_update
+    //    (#956, ACP-5) ───────────────────────────────────────────────────────
+
+    /// Dispatch one `session/update` notification's inner tagged-union
+    /// payload to whichever variant it matches. `session_update_chunk`
+    /// (message/thought/user-echo streaming, ACP-1) is tried first since
+    /// it's the highest-traffic variant; the rest are each a full
+    /// wholesale replacement of the corresponding `Engine` field, never a
+    /// delta — most importantly `plan`, whose #956 acceptance bar requires
+    /// two successive updates leave exactly one plan rendered.
+    /// `tool_call`/`tool_call_update` remain unhandled here (ACP-4's scope).
+    fn acp_handle_session_update(&mut self, inner: &serde_json::Value) {
+        if let Some((kind, text)) = crate::core::acp::session_update_chunk(inner) {
+            self.acp_append_chunk(kind, text);
+        } else if let Some(entries) = crate::core::acp::parse_plan_update(inner) {
+            self.acp_plan = entries;
+        } else if let Some(commands) = crate::core::acp::parse_available_commands_update(inner) {
+            self.acp_available_commands = commands;
+            self.acp_command_completion_idx = 0;
+        } else if let Some(mode_id) = crate::core::acp::parse_current_mode_update(inner) {
+            self.acp_current_mode_id = Some(mode_id);
+        } else if let Some(usage) = crate::core::acp::parse_usage_update(inner) {
+            self.acp_usage = Some(usage);
+        }
+        // Anything else (tool_call, tool_call_update, or an update kind
+        // this client doesn't know about yet) is a forward-compatible
+        // no-op, same policy ACP-1 established for the whole stream.
+    }
+
+    /// Human-readable summary of the ACP agent's declared modes and which
+    /// one is current, for `:AiMode` with no argument.
+    pub(crate) fn acp_mode_status_line(&self) -> String {
+        if self.acp_modes.is_empty() {
+            return "ACP agent has no modes".to_string();
+        }
+        let names: Vec<String> = self
+            .acp_modes
+            .iter()
+            .map(|m| {
+                if Some(m.id.as_str()) == self.acp_current_mode_id.as_deref() {
+                    format!("*{}", m.name)
+                } else {
+                    m.name.clone()
+                }
+            })
+            .collect();
+        format!("Modes: {}", names.join(", "))
+    }
+
+    /// Send `session/set_mode` for `target`, matched against the agent's
+    /// declared modes by id or name (case-insensitive). The displayed mode
+    /// does **not** change optimistically here — it only changes once the
+    /// agent's own `current_mode_update` notification lands
+    /// (`Self::acp_handle_session_update`), matching #956's "displayed mode
+    /// follows `current_mode_update`" acceptance criterion rather than the
+    /// request succeeding.
+    pub(crate) fn acp_set_mode(&mut self, target: &str) {
+        let Some(session_id) = self.acp_session_id.clone() else {
+            self.message = "No active ACP session".to_string();
+            return;
+        };
+        let Some(mode) = self
+            .acp_modes
+            .iter()
+            .find(|m| m.id.eq_ignore_ascii_case(target) || m.name.eq_ignore_ascii_case(target))
+        else {
+            self.message = format!("Unknown ACP mode: {target}");
+            return;
+        };
+        let mode_id = mode.id.clone();
+        if let Some(client) = self.acp_client.as_mut() {
+            client.set_mode(&session_id, &mode_id);
+            self.message = format!("Switching to mode: {mode_id}\u{2026}");
+        }
     }
 
     // ── session/request_permission (#953, ACP-2) ────────────────────────────
@@ -1688,5 +1781,33 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&sibling);
+    }
+
+    /// #956 (ACP-5): `:AiMode` (no argument) must summarise the agent's
+    /// declared modes and mark which one is current — engine-level coverage
+    /// underneath the driver-tier round-trip test
+    /// (`gtk::testing::sidebar_panel_clicks::
+    /// ai_panel_mode_switch_round_trips_via_session_set_mode`), which
+    /// covers `:AiMode <target>` actually reaching the wire.
+    #[cfg(unix)]
+    #[test]
+    fn ai_mode_no_arg_lists_modes_and_marks_current() {
+        let mut engine = engine_with_fixture_agent(&[("ACP_FAKE_SESSION_MODES", "1")]);
+        // `Engine::poll_acp`'s `Initialized` handler drives `session/new`
+        // itself once the (already-sent) `initialize` response lands.
+        poll_acp_until(&mut engine, |e| e.acp_current_mode_id.is_some());
+
+        assert_eq!(engine.acp_current_mode_id.as_deref(), Some("code"));
+        engine.execute_command("AiMode");
+        assert_eq!(engine.message, "Modes: *Code, Plan");
+    }
+
+    /// An unknown mode name/id must be rejected with a clear message, never
+    /// silently sent to the agent as-is.
+    #[test]
+    fn ai_mode_unknown_target_is_rejected_without_a_client() {
+        let mut engine = Engine::new_for_test();
+        engine.execute_command("AiMode nonexistent");
+        assert_eq!(engine.message, "No active ACP session");
     }
 }

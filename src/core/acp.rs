@@ -290,6 +290,253 @@ pub fn session_update_chunk(update: &serde_json::Value) -> Option<(AcpChunkKind,
 }
 
 // ---------------------------------------------------------------------------
+// plan, available_commands_update, current_mode_update, usage_update
+// (#956, ACP-5)
+// ---------------------------------------------------------------------------
+
+/// Status of one `plan` entry, per the ACP v1 schema's `status` field.
+/// Unknown/missing values default to [`Self::Pending`] — never
+/// [`Self::Completed`], since defaulting a plan step toward "already done"
+/// on malformed input would hide unfinished work from the checklist rather
+/// than merely under-describing it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AcpPlanEntryStatus {
+    Pending,
+    InProgress,
+    Completed,
+}
+
+/// One entry in an agent's task-plan breakdown. Deliberately source-agnostic
+/// (no ACP-specific fields beyond what the wire sends) — #956's note for
+/// #529 is that a future coord-fed remote-worker plan preview reuses this
+/// exact shape with a different feeder, so nothing here should assume ACP
+/// is the only producer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcpPlanEntry {
+    pub content: String,
+    pub status: AcpPlanEntryStatus,
+}
+
+/// Parse a `session/update`'s `plan` variant: `{"sessionUpdate": "plan",
+/// "entries": [{"content", "status"}]}`. Returns `None` for a non-`plan`
+/// update (including a malformed one with no `entries` array at all — not
+/// the same as a *valid* empty plan, which is `Some(vec![])` and clears
+/// whatever was rendered before).
+///
+/// **Every call is a full replacement, never a delta** — see
+/// `Engine::acp_plan`'s doc. Treating consecutive `plan` updates as
+/// append-only is the single most common way to get this variant wrong
+/// per #956's own scope note; nothing in this function accumulates state,
+/// by construction, since it takes no previous plan as input.
+///
+/// An entry missing `content` is dropped rather than rendered as a blank
+/// checklist row; a missing/unrecognized `status` defaults to `Pending`.
+pub fn parse_plan_update(update: &serde_json::Value) -> Option<Vec<AcpPlanEntry>> {
+    if update.get("sessionUpdate").and_then(|v| v.as_str()) != Some("plan") {
+        return None;
+    }
+    let entries = update.get("entries").and_then(|v| v.as_array())?;
+    Some(
+        entries
+            .iter()
+            .filter_map(|e| {
+                let content = e.get("content")?.as_str()?.to_string();
+                let status = match e.get("status").and_then(|v| v.as_str()) {
+                    Some("in_progress") => AcpPlanEntryStatus::InProgress,
+                    Some("completed") => AcpPlanEntryStatus::Completed,
+                    _ => AcpPlanEntryStatus::Pending,
+                };
+                Some(AcpPlanEntry { content, status })
+            })
+            .collect(),
+    )
+}
+
+/// Render a plan as a plain-text checklist for the AI panel transcript
+/// (`render::populate_ai_chat_controller`). Unicode checkbox glyphs
+/// (`\u{2610}`/`\u{2611}`) rather than Markdown `- [ ]`/`- [x]` syntax,
+/// since the transcript's plain `StyledText` path (not
+/// `ChatController::push_turn_markdown`'s list-aware renderer) is what
+/// every other turn in this panel already uses — see
+/// `populate_ai_chat_controller`'s doc for why staying on that one path
+/// matters.
+pub fn plan_to_checklist_text(entries: &[AcpPlanEntry]) -> String {
+    let mut out = String::from("Plan:\n");
+    for e in entries {
+        let glyph = match e.status {
+            AcpPlanEntryStatus::Completed => "\u{2611}",
+            _ => "\u{2610}",
+        };
+        let suffix = match e.status {
+            AcpPlanEntryStatus::InProgress => " (in progress)",
+            _ => "",
+        };
+        out.push_str(&format!("{glyph} {}{suffix}\n", e.content));
+    }
+    out.pop(); // drop the trailing newline
+    out
+}
+
+/// One slash command the agent declared via `available_commands_update`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcpAvailableCommand {
+    pub name: String,
+    pub description: String,
+}
+
+/// Parse a `session/update`'s `available_commands_update` variant:
+/// `{"sessionUpdate": "available_commands_update", "availableCommands":
+/// [{"name", "description"}]}`. Like `plan`, this is a full replacement of
+/// whatever command set was known before — see `Engine::
+/// acp_available_commands`. An entry missing `name` is dropped (nothing a
+/// user could usefully type); a missing `description` defaults to `""`.
+pub fn parse_available_commands_update(
+    update: &serde_json::Value,
+) -> Option<Vec<AcpAvailableCommand>> {
+    if update.get("sessionUpdate").and_then(|v| v.as_str()) != Some("available_commands_update") {
+        return None;
+    }
+    let commands = update.get("availableCommands").and_then(|v| v.as_array())?;
+    Some(
+        commands
+            .iter()
+            .filter_map(|c| {
+                let name = c.get("name")?.as_str()?.to_string();
+                let description = c
+                    .get("description")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                Some(AcpAvailableCommand { name, description })
+            })
+            .collect(),
+    )
+}
+
+/// One mode an agent exposes (`session/new`'s `modes.availableModes`).
+/// `current_mode_update` only ever changes *which* mode id is current —
+/// this list itself is only ever supplied at the handshake.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcpSessionMode {
+    pub id: String,
+    pub name: String,
+}
+
+/// Parse `session/new`'s `modes` result field: `{"currentModeId",
+/// "availableModes": [{"id", "name"}]}`. Returns `(current_mode_id,
+/// modes)` — an absent/malformed `modes` value (an agent that doesn't
+/// support modes at all) yields `(None, vec![])`, not an error; modes are
+/// an optional agent capability, not a required one. A mode entry missing
+/// `name` falls back to its `id` (still selectable/displayable, just less
+/// friendly), matching this module's general "never silently drop
+/// something a user could otherwise act on" policy.
+pub fn parse_session_modes(modes: &serde_json::Value) -> (Option<String>, Vec<AcpSessionMode>) {
+    let current = modes
+        .get("currentModeId")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let list = modes
+        .get("availableModes")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|m| {
+                    let id = m.get("id")?.as_str()?.to_string();
+                    let name = m
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(&id)
+                        .to_string();
+                    Some(AcpSessionMode { id, name })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    (current, list)
+}
+
+/// Parse a `session/update`'s `current_mode_update` variant:
+/// `{"sessionUpdate": "current_mode_update", "currentModeId": "..."}`.
+/// This is the **only** thing that should ever change `Engine::
+/// acp_current_mode_id` — a `session/set_mode` request succeeding is not
+/// itself sufficient, per #956's acceptance bar ("the displayed mode
+/// follows `current_mode_update`").
+pub fn parse_current_mode_update(update: &serde_json::Value) -> Option<String> {
+    if update.get("sessionUpdate").and_then(|v| v.as_str()) != Some("current_mode_update") {
+        return None;
+    }
+    update
+        .get("currentModeId")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+}
+
+/// Token/cost telemetry from a `session/update`'s `usage_update` variant.
+/// Every field is independently optional — an agent may report only
+/// tokens, only cost, or both.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AcpUsage {
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub total_cost_usd: Option<f64>,
+}
+
+/// Parse a `session/update`'s `usage_update` variant. Tolerant of the
+/// fields living either nested under a `usage` object or flattened onto
+/// `update` directly, and of either `inputTokens`/`outputTokens` or
+/// `promptTokens`/`completionTokens` naming — token/cost telemetry is a
+/// newer, less-stable corner of the ACP v1 schema than the rest of this
+/// module, so this reads defensively rather than committing to one exact
+/// shape. Returns `None` when the tag doesn't match, or when it matches
+/// but *no* recognizable field is present at all (never for a
+/// partially-populated report — a cost-only or tokens-only update still
+/// renders something).
+pub fn parse_usage_update(update: &serde_json::Value) -> Option<AcpUsage> {
+    if update.get("sessionUpdate").and_then(|v| v.as_str()) != Some("usage_update") {
+        return None;
+    }
+    let usage = update.get("usage").unwrap_or(update);
+    let input_tokens = usage
+        .get("inputTokens")
+        .or_else(|| usage.get("promptTokens"))
+        .and_then(|v| v.as_u64());
+    let output_tokens = usage
+        .get("outputTokens")
+        .or_else(|| usage.get("completionTokens"))
+        .and_then(|v| v.as_u64());
+    let total_cost_usd = usage
+        .get("totalCostUsd")
+        .or_else(|| usage.get("costUsd"))
+        .or_else(|| usage.get("cost"))
+        .and_then(|v| v.as_f64());
+    if input_tokens.is_none() && output_tokens.is_none() && total_cost_usd.is_none() {
+        return None;
+    }
+    Some(AcpUsage {
+        input_tokens,
+        output_tokens,
+        total_cost_usd,
+    })
+}
+
+/// Format an [`AcpUsage`] for the AI panel's status header — compact, and
+/// only the fields actually present (never e.g. `"0 tok · $0.0000"` for a
+/// report that only carried cost).
+pub fn format_usage_summary(usage: &AcpUsage) -> String {
+    let mut parts = Vec::new();
+    match (usage.input_tokens, usage.output_tokens) {
+        (Some(i), Some(o)) => parts.push(format!("{i}+{o} tok")),
+        (Some(i), None) => parts.push(format!("{i} tok in")),
+        (None, Some(o)) => parts.push(format!("{o} tok out")),
+        (None, None) => {}
+    }
+    if let Some(cost) = usage.total_cost_usd {
+        parts.push(format!("${cost:.4}"));
+    }
+    parts.join(" \u{b7} ")
+}
+
+// ---------------------------------------------------------------------------
 // fs/read_text_file, fs/write_text_file — wire-shape parsing + path safety
 // (#954, ACP-3)
 // ---------------------------------------------------------------------------
@@ -810,6 +1057,17 @@ impl AcpClient {
         )
     }
 
+    /// Send `session/set_mode` (#956, ACP-5). The displayed mode does not
+    /// change from this call's response — only from the agent's own
+    /// `current_mode_update` notification afterward; see
+    /// `Engine::acp_set_mode`'s doc for why.
+    pub fn set_mode(&mut self, session_id: &str, mode_id: &str) -> i64 {
+        self.send_request(
+            "session/set_mode",
+            serde_json::json!({"sessionId": session_id, "modeId": mode_id}),
+        )
+    }
+
     /// Send `session/cancel` (a notification — no response expected).
     pub fn cancel(&self, session_id: &str) {
         self.send_notification(
@@ -1230,6 +1488,222 @@ mod tests {
         );
         let reparsed: serde_json::Value = serde_json::from_str(s.trim_end()).unwrap();
         assert_eq!(reparsed["method"], "initialize");
+    }
+
+    // ---- plan / available_commands_update / current_mode_update / usage_update:
+    //      pure, no subprocess (#956, ACP-5) ----
+
+    /// The core acceptance bar: two successive `plan` updates must leave
+    /// exactly one plan when applied the way `Engine::acp_handle_session_update`
+    /// applies them (`self.acp_plan = entries`, a plain overwrite — never
+    /// `.extend`/`.push`). This test proves `parse_plan_update` itself
+    /// returns a fresh, independent `Vec` each call (nothing carried over
+    /// from a previous parse) so that overwrite-not-append contract is even
+    /// possible to uphold at the call site.
+    #[test]
+    fn parse_plan_update_two_successive_updates_each_fully_replace() {
+        let first = serde_json::json!({
+            "sessionUpdate": "plan",
+            "entries": [{"content": "Write the fix", "status": "in_progress"}],
+        });
+        let second = serde_json::json!({
+            "sessionUpdate": "plan",
+            "entries": [
+                {"content": "Write the fix", "status": "completed"},
+                {"content": "Add tests", "status": "pending"},
+            ],
+        });
+
+        let mut plan = parse_plan_update(&first).expect("should parse");
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].status, AcpPlanEntryStatus::InProgress);
+
+        // Simulate the engine's actual apply site: a plain overwrite.
+        plan = parse_plan_update(&second).expect("should parse");
+        assert_eq!(
+            plan.len(),
+            2,
+            "the second update's own entries, not 1+2 accumulated: {plan:?}"
+        );
+        assert_eq!(plan[0].content, "Write the fix");
+        assert_eq!(plan[0].status, AcpPlanEntryStatus::Completed);
+        assert_eq!(plan[1].content, "Add tests");
+        assert_eq!(plan[1].status, AcpPlanEntryStatus::Pending);
+    }
+
+    #[test]
+    fn parse_plan_update_rejects_non_plan_and_missing_entries() {
+        assert_eq!(
+            parse_plan_update(&serde_json::json!({"sessionUpdate": "agent_message_chunk"})),
+            None
+        );
+        assert_eq!(
+            parse_plan_update(&serde_json::json!({"sessionUpdate": "plan"})),
+            None,
+            "no entries array at all is malformed, not a valid empty plan"
+        );
+    }
+
+    #[test]
+    fn parse_plan_update_defaults_missing_status_to_pending_never_completed() {
+        let update = serde_json::json!({
+            "sessionUpdate": "plan",
+            "entries": [{"content": "step one"}, {"content": "step two", "status": "bogus"}],
+        });
+        let plan = parse_plan_update(&update).expect("should parse");
+        assert_eq!(plan.len(), 2);
+        assert_eq!(plan[0].status, AcpPlanEntryStatus::Pending);
+        assert_eq!(plan[1].status, AcpPlanEntryStatus::Pending);
+    }
+
+    #[test]
+    fn plan_to_checklist_text_marks_completed_and_in_progress_distinctly() {
+        let entries = vec![
+            AcpPlanEntry {
+                content: "done step".to_string(),
+                status: AcpPlanEntryStatus::Completed,
+            },
+            AcpPlanEntry {
+                content: "active step".to_string(),
+                status: AcpPlanEntryStatus::InProgress,
+            },
+            AcpPlanEntry {
+                content: "queued step".to_string(),
+                status: AcpPlanEntryStatus::Pending,
+            },
+        ];
+        let text = plan_to_checklist_text(&entries);
+        assert!(text.contains("\u{2611} done step"));
+        assert!(text.contains("\u{2610} active step (in progress)"));
+        assert!(text.contains("\u{2610} queued step"));
+        assert!(
+            !text.contains("queued step (in progress)"),
+            "only the in_progress entry gets the suffix: {text:?}"
+        );
+    }
+
+    #[test]
+    fn parse_available_commands_update_reads_name_and_description() {
+        let update = serde_json::json!({
+            "sessionUpdate": "available_commands_update",
+            "availableCommands": [
+                {"name": "commit", "description": "Commit staged changes"},
+                {"name": "compact"},
+            ],
+        });
+        let commands = parse_available_commands_update(&update).expect("should parse");
+        assert_eq!(commands.len(), 2);
+        assert_eq!(commands[0].name, "commit");
+        assert_eq!(commands[0].description, "Commit staged changes");
+        assert_eq!(commands[1].name, "compact");
+        assert_eq!(
+            commands[1].description, "",
+            "missing description defaults to empty"
+        );
+    }
+
+    #[test]
+    fn parse_available_commands_update_rejects_wrong_tag() {
+        assert_eq!(
+            parse_available_commands_update(&serde_json::json!({"sessionUpdate": "plan"})),
+            None
+        );
+    }
+
+    #[test]
+    fn parse_session_modes_reads_current_and_available() {
+        let modes = serde_json::json!({
+            "currentModeId": "code",
+            "availableModes": [
+                {"id": "code", "name": "Code"},
+                {"id": "plan", "name": "Plan"},
+            ],
+        });
+        let (current, list) = parse_session_modes(&modes);
+        assert_eq!(current, Some("code".to_string()));
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0].id, "code");
+        assert_eq!(list[0].name, "Code");
+    }
+
+    #[test]
+    fn parse_session_modes_absent_yields_no_modes_not_an_error() {
+        let (current, list) = parse_session_modes(&serde_json::json!(null));
+        assert_eq!(current, None);
+        assert!(list.is_empty());
+    }
+
+    #[test]
+    fn parse_current_mode_update_reads_mode_id() {
+        let update = serde_json::json!({
+            "sessionUpdate": "current_mode_update",
+            "currentModeId": "plan",
+        });
+        assert_eq!(parse_current_mode_update(&update), Some("plan".to_string()));
+        assert_eq!(
+            parse_current_mode_update(&serde_json::json!({"sessionUpdate": "plan"})),
+            None
+        );
+    }
+
+    #[test]
+    fn parse_usage_update_reads_nested_and_flat_shapes() {
+        let nested = serde_json::json!({
+            "sessionUpdate": "usage_update",
+            "usage": {"inputTokens": 120, "outputTokens": 45, "totalCostUsd": 0.0067},
+        });
+        let usage = parse_usage_update(&nested).expect("should parse");
+        assert_eq!(usage.input_tokens, Some(120));
+        assert_eq!(usage.output_tokens, Some(45));
+        assert_eq!(usage.total_cost_usd, Some(0.0067));
+
+        // Tolerate an alternate flattened/renamed shape too.
+        let flat = serde_json::json!({
+            "sessionUpdate": "usage_update",
+            "promptTokens": 10,
+            "cost": 0.001,
+        });
+        let usage2 = parse_usage_update(&flat).expect("should parse");
+        assert_eq!(usage2.input_tokens, Some(10));
+        assert_eq!(usage2.output_tokens, None);
+        assert_eq!(usage2.total_cost_usd, Some(0.001));
+    }
+
+    #[test]
+    fn parse_usage_update_rejects_wrong_tag_and_empty_usage() {
+        assert_eq!(
+            parse_usage_update(&serde_json::json!({"sessionUpdate": "plan"})),
+            None
+        );
+        assert_eq!(
+            parse_usage_update(&serde_json::json!({"sessionUpdate": "usage_update", "usage": {}})),
+            None,
+            "no recognizable field at all should not fabricate a report"
+        );
+    }
+
+    #[test]
+    fn format_usage_summary_only_includes_fields_present() {
+        let both = AcpUsage {
+            input_tokens: Some(10),
+            output_tokens: Some(5),
+            total_cost_usd: Some(0.02),
+        };
+        assert_eq!(format_usage_summary(&both), "10+5 tok \u{b7} $0.0200");
+
+        let cost_only = AcpUsage {
+            input_tokens: None,
+            output_tokens: None,
+            total_cost_usd: Some(1.5),
+        };
+        assert_eq!(format_usage_summary(&cost_only), "$1.5000");
+
+        let nothing = AcpUsage {
+            input_tokens: None,
+            output_tokens: None,
+            total_cost_usd: None,
+        };
+        assert_eq!(format_usage_summary(&nothing), "");
     }
 
     // ---- parse_request_permission / permission_outcome_*: pure, no subprocess (#953, ACP-2) ----

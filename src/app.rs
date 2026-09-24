@@ -3714,6 +3714,9 @@ impl App {
                 render::populate_ai_chat_controller(engine, theme);
                 engine.ai_chat_rect.set(q_sb);
                 engine.ai_chat.borrow().render(backend, q_sb);
+                // #956 (ACP-5): slash-command completions, painted on top —
+                // no-op unless the input matches an agent-declared command.
+                render::paint_ai_command_completions(backend, engine, q_sb);
                 // `cached_explorer_metrics`'s drift guard, ported: `backend`'s
                 // "current" line_height/char_width are mutable and can be
                 // overwritten by whatever paints next this frame or the
