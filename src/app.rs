@@ -8928,6 +8928,26 @@ impl quadraui::ShellApp for App {
                     self.switch_panel(panel_id.as_str().to_string());
                     return;
                 }
+                // #1360: a built-in panel's activity-bar icon click must move
+                // keyboard focus into that panel, exactly as TUI's own
+                // `PanelChanged` arm does (`focus_sidebar_panel` +
+                // `sidebar.has_focus = true` in `TuiShellApp::on_shell_event`)
+                // — before this, GTK only redrew, so `render::route_focus_key`
+                // (which every keystroke passes through, see
+                // `Self::handle_key_press`'s "Shared focus-owner keyboard
+                // rung") kept reading `sidebar_has_focus() == false` and sent
+                // every subsequent key straight to the editor. `sidebar.
+                // has_focus`/`ext_panel_name` have no GTK equivalent to set —
+                // GTK's `route_focus_key` call passes
+                // `engine.sidebar_has_focus()` itself as the "band" (see
+                // that call site's own comment), so the one engine call
+                // below is the whole fix, and it is the same
+                // already-shared `Engine::focus_sidebar_panel` this method's
+                // own `toggle_focus_search`/`toggle_focus_explorer` already
+                // call for the keyboard-accelerator path.
+                self.engine
+                    .borrow_mut()
+                    .focus_sidebar_panel(panel_id.as_str());
                 self.draw_needed.set(true);
             }
             AppShellEvent::SidebarHidden => {
@@ -9472,6 +9492,44 @@ mod portable_entry_point_tests {
             "handle_poll_tick did not apply this frame's painted tab-bar \
              width -- the active tab (index 9) can stay scrolled out of \
              view forever on GTK (#1165)"
+        );
+    }
+
+    /// #1360: the GTK mirror of `TuiShellApp`'s own
+    /// `take_requested_panel_echo_does_not_steal_focus` (`src/tui_main/
+    /// shell_app.rs`) — a *reconciliation* `PanelChanged` (the one
+    /// `Self::take_requested_panel` synthesizes to steer the runner's own
+    /// `AppShell` back onto whatever the shadow `engine.app_shell` already
+    /// believes, e.g. after a DAP reveal or a keyboard accelerator) must
+    /// only update `Self::last_shell_panel`'s bookkeeping — never call
+    /// `Engine::focus_sidebar_panel` the way a genuine activity-bar click
+    /// does. Without the `suppress_shell_panel_echo` guard this issue's own
+    /// fix added a call behind, every one of those app-initiated switches
+    /// would also steal keyboard focus into the panel out from under
+    /// whatever the app itself just focused (e.g. the editor, mid-DAP-launch).
+    #[cfg(feature = "gui")]
+    #[test]
+    fn take_requested_panel_echo_does_not_steal_focus_on_gtk() {
+        use quadraui::ShellApp;
+
+        let engine = Rc::new(RefCell::new(Engine::new_for_test()));
+        engine
+            .borrow_mut()
+            .app_shell
+            .show_panel(&quadraui::WidgetId::new(PANEL_EXPLORER));
+        engine.borrow_mut().session.explorer_visible = true;
+        assert!(!engine.borrow().explorer_has_focus);
+
+        let mut app = App::new_headless(Rc::clone(&engine));
+        let _ = app.take_requested_panel(); // returns Some(explorer), arms suppress
+        app.on_shell_event(&quadraui::AppShellEvent::PanelChanged {
+            panel_id: quadraui::WidgetId::new(PANEL_EXPLORER),
+        });
+
+        assert!(
+            !engine.borrow().explorer_has_focus,
+            "the take_requested_panel echo must only update the runner-state \
+             belief, not steal focus like a user click"
         );
     }
 }
