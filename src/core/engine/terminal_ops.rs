@@ -1683,56 +1683,6 @@ mod tests {
     use super::{binary_on_path, Engine, InstallContext};
     use crate::core::extensions::{ExtensionManifest, LspConfig};
 
-    /// Serializes the tests in *this file* that mutate the process-global
-    /// `HOME`/`USERPROFILE`/`PATH` env vars against each other.
-    ///
-    /// This is a weaker guarantee than `tests/extensions.rs`'s
-    /// `HOMEBREW_ENV_LOCK` (#917): that lock lives in a separate
-    /// integration-test binary (its own OS process), so mutating `HOME`
-    /// there cannot race anything outside that file. This file compiles
-    /// into the shared `--lib` test binary alongside ~200 other `#[test]`s
-    /// (per the analogous PATH-narrowing risk called out at
-    /// `src/tui_main/shell_app.rs`'s `no_install_command_error_paints_on_
-    /// command_line_via_shell_app`), some of which call `home_dir()` /
-    /// `resolve_command()` on other threads while these three tests hold a
-    /// temp-dir `HOME` — `HOME_ENV_LOCK` only serializes this file's own
-    /// tests against each other, not against those. Accepted for now
-    /// because: (a) no other test in this crate mutates `HOME`/`PATH`
-    /// today (checked via `grep -rn 'set_var("HOME"'`), so there is no
-    /// currently-known concurrent reader to collide with; (b) the repo's
-    /// `cargo test --no-default-features --lib` gate was run twice in a
-    /// row while adding these tests with no flake observed. If a future
-    /// test starts mutating these vars too, or this one starts flaking,
-    /// move this coverage into its own `tests/*.rs` integration file
-    /// (matching `tests/extensions.rs`'s process isolation) — that would
-    /// require widening `finalize_install_from_terminal`'s and
-    /// `binary_on_path`'s visibility beyond `crate::core::engine`, which is
-    /// why it wasn't done up front.
-    static HOME_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    /// RAII guard: snapshot + restore an environment variable across a test.
-    struct EnvVarGuard {
-        key: &'static str,
-        old: Option<std::ffi::OsString>,
-    }
-
-    impl EnvVarGuard {
-        fn set(key: &'static str, value: &std::ffi::OsStr) -> Self {
-            let old = std::env::var_os(key);
-            std::env::set_var(key, value);
-            Self { key, old }
-        }
-    }
-
-    impl Drop for EnvVarGuard {
-        fn drop(&mut self) {
-            match self.old.take() {
-                Some(v) => std::env::set_var(self.key, v),
-                None => std::env::remove_var(self.key),
-            }
-        }
-    }
-
     /// Create a fake `$HOME/.local/bin/<binary_name>` script and return
     /// `(home_dir, binary_path)`. Caller is responsible for cleanup.
     fn fake_home_with_local_bin_binary(tag: &str, binary_name: &str) -> (PathBuf, PathBuf) {
@@ -1763,22 +1713,17 @@ mod tests {
     /// reported as "not found on PATH").
     #[test]
     fn binary_on_path_finds_binary_in_local_bin_when_not_on_path() {
-        let _lock = HOME_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let binary_name = "vimcode-test-fake-lsp-1344-check";
         let (home, _binary_path) = fake_home_with_local_bin_binary("check", binary_name);
 
-        let _home_guard = EnvVarGuard::set("HOME", home.as_os_str());
-        let _profile_guard = EnvVarGuard::set("USERPROFILE", home.as_os_str());
-        // Deliberately excludes the fake bin dir — this can only pass via the
-        // dedicated `~/.local/bin` probe, not a plain `PATH` walk.
-        let _path_guard = EnvVarGuard::set(
-            "PATH",
-            std::ffi::OsStr::new(if cfg!(windows) {
-                "C:\\Windows"
-            } else {
-                "/usr/bin:/bin"
-            }),
-        );
+        // Thread-local, *not* `set_var("HOME", …)` — see
+        // `core::paths::TEST_HOME_OVERRIDE` for the cross-test corruption
+        // the process-global version caused (#957 smoke). No `PATH` guard
+        // is needed alongside it: every binary name below is a
+        // `vimcode-test-…` literal that cannot exist on a real `PATH`, so
+        // the fake `~/.local/bin` probe is still the only way any of them
+        // can resolve.
+        let _home_guard = crate::core::paths::set_test_home(&home);
 
         assert!(
             binary_on_path(binary_name),
@@ -1794,20 +1739,17 @@ mod tests {
     /// "not found on PATH" for a tool that plainly *is* findable.
     #[test]
     fn finalize_install_from_terminal_registers_server_for_binary_in_local_bin() {
-        let _lock = HOME_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let binary_name = "vimcode-test-fake-lsp-1344-finalize";
         let (home, _binary_path) = fake_home_with_local_bin_binary("finalize", binary_name);
 
-        let _home_guard = EnvVarGuard::set("HOME", home.as_os_str());
-        let _profile_guard = EnvVarGuard::set("USERPROFILE", home.as_os_str());
-        let _path_guard = EnvVarGuard::set(
-            "PATH",
-            std::ffi::OsStr::new(if cfg!(windows) {
-                "C:\\Windows"
-            } else {
-                "/usr/bin:/bin"
-            }),
-        );
+        // Thread-local, *not* `set_var("HOME", …)` — see
+        // `core::paths::TEST_HOME_OVERRIDE` for the cross-test corruption
+        // the process-global version caused (#957 smoke). No `PATH` guard
+        // is needed alongside it: every binary name below is a
+        // `vimcode-test-…` literal that cannot exist on a real `PATH`, so
+        // the fake `~/.local/bin` probe is still the only way any of them
+        // can resolve.
+        let _home_guard = crate::core::paths::set_test_home(&home);
 
         let mut engine = Engine::new();
         let ext_name = "vimcode-test-ext-1344".to_string();
@@ -1861,7 +1803,6 @@ mod tests {
     /// installer, used to surface only as a PATH-lookup miss).
     #[test]
     fn finalize_install_from_terminal_reports_failure_for_nonzero_exit_code() {
-        let _lock = HOME_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Deliberately give the binary a `~/.local/bin` home so it WOULD
         // resolve if finalize fell through to the binary-lookup path — this
         // proves failure reporting takes priority over a coincidentally
@@ -1870,16 +1811,14 @@ mod tests {
         let binary_name = "vimcode-test-fake-lsp-1344-failure";
         let (home, _binary_path) = fake_home_with_local_bin_binary("failure", binary_name);
 
-        let _home_guard = EnvVarGuard::set("HOME", home.as_os_str());
-        let _profile_guard = EnvVarGuard::set("USERPROFILE", home.as_os_str());
-        let _path_guard = EnvVarGuard::set(
-            "PATH",
-            std::ffi::OsStr::new(if cfg!(windows) {
-                "C:\\Windows"
-            } else {
-                "/usr/bin:/bin"
-            }),
-        );
+        // Thread-local, *not* `set_var("HOME", …)` — see
+        // `core::paths::TEST_HOME_OVERRIDE` for the cross-test corruption
+        // the process-global version caused (#957 smoke). No `PATH` guard
+        // is needed alongside it: every binary name below is a
+        // `vimcode-test-…` literal that cannot exist on a real `PATH`, so
+        // the fake `~/.local/bin` probe is still the only way any of them
+        // can resolve.
+        let _home_guard = crate::core::paths::set_test_home(&home);
 
         let mut engine = Engine::new();
         let ext_name = "vimcode-test-ext-1344-failure".to_string();
@@ -1940,23 +1879,20 @@ mod tests {
     /// actually reaches the painted screen.
     #[test]
     fn finalize_install_from_terminal_keeps_lsp_success_alongside_dap_not_found() {
-        let _lock = HOME_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // LSP binary resolvable via the fake `~/.local/bin`; DAP binary never
         // placed anywhere, so it stays unresolvable.
         let lsp_binary_name = "vimcode-test-fake-lsp-1344-combined-unit";
         let (home, _binary_path) =
             fake_home_with_local_bin_binary("combined-unit", lsp_binary_name);
 
-        let _home_guard = EnvVarGuard::set("HOME", home.as_os_str());
-        let _profile_guard = EnvVarGuard::set("USERPROFILE", home.as_os_str());
-        let _path_guard = EnvVarGuard::set(
-            "PATH",
-            std::ffi::OsStr::new(if cfg!(windows) {
-                "C:\\Windows"
-            } else {
-                "/usr/bin:/bin"
-            }),
-        );
+        // Thread-local, *not* `set_var("HOME", …)` — see
+        // `core::paths::TEST_HOME_OVERRIDE` for the cross-test corruption
+        // the process-global version caused (#957 smoke). No `PATH` guard
+        // is needed alongside it: every binary name below is a
+        // `vimcode-test-…` literal that cannot exist on a real `PATH`, so
+        // the fake `~/.local/bin` probe is still the only way any of them
+        // can resolve.
+        let _home_guard = crate::core::paths::set_test_home(&home);
 
         let mut engine = Engine::new();
         let ext_name = "vimcode-test-ext-1344-combined-unit".to_string();
