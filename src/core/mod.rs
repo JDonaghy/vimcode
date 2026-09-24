@@ -25,6 +25,7 @@ pub mod swap;
 pub mod syntax;
 pub mod tab;
 pub mod terminal;
+pub mod tool_acquire;
 pub mod tool_client;
 pub mod undofile;
 pub mod view;
