@@ -14647,13 +14647,19 @@ mod tests {
         );
         // Button labels paint with their hotkey letter bracketed
         // (`[A]llow Once`), per this dialog widget's convention — not a
-        // rendering detail specific to this test.
+        // rendering detail specific to this test. "Allow Once" and "Always
+        // Allow" both start with 'a'; `acp_handle_permission_request`
+        // de-duplicates hotkeys across a dialog's own buttons (#953
+        // review), so "Always Allow"'s bracketed letter lands on its next
+        // unclaimed 'l' (`A[L]ways Allow`) rather than colliding with
+        // "Allow Once"'s `[A]`.
         assert!(
             screen.contains("llow Once")
-                && screen.contains("lways Allow")
+                && screen.contains("A[L]ways Allow")
                 && screen.contains("eject"),
             "the agent's own options must be presented verbatim, not a \
-             hardcoded yes/no; screen:\n{screen}"
+             hardcoded yes/no, and each hotkey must be unique within the \
+             dialog; screen:\n{screen}"
         );
         // The panel's busy spinner ("AI ASSISTANT  (thinking…)",
         // `render.rs`) must still be up here — the turn is genuinely
