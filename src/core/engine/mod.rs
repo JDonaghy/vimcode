@@ -3556,7 +3556,7 @@ pub struct Engine {
     /// history, so `render::populate_ai_chat_controller` always renders
     /// exactly one plan checklist regardless of how many `plan` updates
     /// have streamed by. Source-agnostic shape (`crate::core::acp::
-    /// AcpPlanEntry`) shared with #529's future coord-fed remote-worker
+    /// AcpPlanEntry`) shared with #529's future remote-worker
     /// plan preview — "same renderer, different feeder" per that issue's
     /// note. Cleared on `ai_clear`/`AgentExited` (session-scoped).
     pub acp_plan: Vec<crate::core::acp::AcpPlanEntry>,
