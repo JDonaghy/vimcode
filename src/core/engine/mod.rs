@@ -5362,7 +5362,15 @@ fn binary_on_path(binary: &str) -> bool {
             true
         }
         None => {
-            super::lsp_manager::install_log(&format!("[ext-check] NOT FOUND {binary}"));
+            // Names every probed directory (not just `PATH`, unlike the
+            // pre-#1344 log line) since `resolve_command` now spans the
+            // Mason bin dir, `~/.local/bin`, and friends too — a bare
+            // "NOT FOUND {binary}" would otherwise regress the diagnostic
+            // detail this line used to carry.
+            super::lsp_manager::install_log(&format!(
+                "[ext-check] NOT FOUND {binary} — looked in {}",
+                super::lsp_manager::probed_tool_dirs_description(binary)
+            ));
             false
         }
     }

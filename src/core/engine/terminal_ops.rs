@@ -788,6 +788,17 @@ impl Engine {
             None => return,
         };
 
+        // Collected rather than assigned straight into `self.message` (review
+        // finding on #1344): a manifest can declare both an LSP server and a
+        // DAP adapter (`sample_manifests()` in `src/core/extensions.rs` has a
+        // `rust` entry with both `lsp.binary` and `dap.adapter`/`dap.binary`
+        // set), and a successful LSP install followed by an unresolved DAP
+        // binary must not silently erase the LSP success message — a user
+        // who installed `rust-analyzer` but not `codelldb` should see both
+        // outcomes, not a lone "was not found" that reads like the whole
+        // install failed.
+        let mut outcomes: Vec<String> = Vec::new();
+
         // Check if LSP binary is now resolvable and register it.
         if !manifest.lsp.binary.is_empty() {
             let all_lsp: Vec<&str> = std::iter::once(manifest.lsp.binary.as_str())
@@ -809,28 +820,35 @@ impl Engine {
                     }
                     self.lsp_reopen_buffers_for_language(lsp_lang);
                 }
-                self.message = format!("LSP server for '{ext_name}' installed and started ({bin})");
+                outcomes.push(format!(
+                    "LSP server for '{ext_name}' installed and started ({bin})"
+                ));
             } else {
-                self.message = format!(
+                outcomes.push(format!(
                     "Install for '{ext_name}' finished but LSP binary '{}' was not found — looked in {}",
                     manifest.lsp.binary,
                     crate::core::lsp_manager::probed_tool_dirs_description(&manifest.lsp.binary)
-                );
+                ));
             }
         }
 
         // Check if DAP binary is now resolvable.
         if !manifest.dap.adapter.is_empty() && !manifest.dap.binary.is_empty() {
             if binary_on_path(&manifest.dap.binary) {
-                self.message =
-                    format!("DAP adapter for '{ext_name}' installed — press F5 to debug");
+                outcomes.push(format!(
+                    "DAP adapter for '{ext_name}' installed — press F5 to debug"
+                ));
             } else {
-                self.message = format!(
+                outcomes.push(format!(
                     "Install for '{ext_name}' finished but DAP binary '{}' was not found — looked in {}",
                     manifest.dap.binary,
                     crate::core::lsp_manager::probed_tool_dirs_description(&manifest.dap.binary)
-                );
+                ));
             }
+        }
+
+        if !outcomes.is_empty() {
+            self.message = outcomes.join(" | ");
         }
     }
 
@@ -1243,6 +1261,15 @@ impl Engine {
 /// installs — say an LSP and a DAP install for the same extension, run
 /// back-to-back — never collide on the same scratch file. The key is sanitized
 /// because it contains `:`, which is illegal in Windows filenames.
+///
+/// The sanitizer maps every non `[A-Za-z0-9._-]` character to `_`, so two
+/// distinct keys that differ only in such characters (e.g. `"ext:bicep:lsp"`
+/// vs. `"ext_bicep_lsp"`) could in theory collide on the same file. This is
+/// assumed safe because `install_key` is always machine-constructed —
+/// `format!("ext:{ext_name}:lsp")` / `format!("dap:{adapter}")` — never
+/// user-free-text, so a colliding pair would require two *different* code
+/// paths to independently choose the exact same literal key, which none do
+/// today.
 fn install_exit_code_path(install_key: &str) -> PathBuf {
     let safe: String = install_key
         .chars()
@@ -1519,9 +1546,31 @@ mod tests {
     use super::{binary_on_path, Engine, InstallContext};
     use crate::core::extensions::{ExtensionManifest, LspConfig};
 
-    /// Serializes tests that mutate the process-global `HOME`/`USERPROFILE`/`PATH`
-    /// env vars, mirroring the `HOMEBREW_ENV_LOCK` pattern in `tests/extensions.rs`
-    /// (#917) — same tradeoff, scoped to this file's tests only.
+    /// Serializes the tests in *this file* that mutate the process-global
+    /// `HOME`/`USERPROFILE`/`PATH` env vars against each other.
+    ///
+    /// This is a weaker guarantee than `tests/extensions.rs`'s
+    /// `HOMEBREW_ENV_LOCK` (#917): that lock lives in a separate
+    /// integration-test binary (its own OS process), so mutating `HOME`
+    /// there cannot race anything outside that file. This file compiles
+    /// into the shared `--lib` test binary alongside ~200 other `#[test]`s
+    /// (per the analogous PATH-narrowing risk called out at
+    /// `src/tui_main/shell_app.rs`'s `no_install_command_error_paints_on_
+    /// command_line_via_shell_app`), some of which call `home_dir()` /
+    /// `resolve_command()` on other threads while these three tests hold a
+    /// temp-dir `HOME` — `HOME_ENV_LOCK` only serializes this file's own
+    /// tests against each other, not against those. Accepted for now
+    /// because: (a) no other test in this crate mutates `HOME`/`PATH`
+    /// today (checked via `grep -rn 'set_var("HOME"'`), so there is no
+    /// currently-known concurrent reader to collide with; (b) the repo's
+    /// `cargo test --no-default-features --lib` gate was run twice in a
+    /// row while adding these tests with no flake observed. If a future
+    /// test starts mutating these vars too, or this one starts flaking,
+    /// move this coverage into its own `tests/*.rs` integration file
+    /// (matching `tests/extensions.rs`'s process isolation) — that would
+    /// require widening `finalize_install_from_terminal`'s and
+    /// `binary_on_path`'s visibility beyond `crate::core::engine`, which is
+    /// why it wasn't done up front.
     static HOME_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// RAII guard: snapshot + restore an environment variable across a test.
@@ -1737,6 +1786,80 @@ mod tests {
             engine.lsp_manager.is_none(),
             "a failed install must not register/start a server; lsp_manager \
              should still be uninitialized"
+        );
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// #1344 blocking review finding, pure-function-level companion to
+    /// `extension_install_lsp_success_survives_dap_not_found_via_shell_app`
+    /// (`src/tui_main/shell_app.rs`, the driver-tier black-box version): a
+    /// manifest with both an LSP server and a DAP adapter — the realistic
+    /// shape `extensions::sample_manifests()`'s `rust` entry has — must not
+    /// have a successful LSP install message erased by a DAP binary that
+    /// isn't resolvable. Fast, in-crate coverage of the exact
+    /// `Engine::message` value `finalize_install_from_terminal` produces,
+    /// alongside the slower end-to-end version that proves the same text
+    /// actually reaches the painted screen.
+    #[test]
+    fn finalize_install_from_terminal_keeps_lsp_success_alongside_dap_not_found() {
+        let _lock = HOME_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // LSP binary resolvable via the fake `~/.local/bin`; DAP binary never
+        // placed anywhere, so it stays unresolvable.
+        let lsp_binary_name = "vimcode-test-fake-lsp-1344-combined-unit";
+        let (home, _binary_path) =
+            fake_home_with_local_bin_binary("combined-unit", lsp_binary_name);
+
+        let _home_guard = EnvVarGuard::set("HOME", home.as_os_str());
+        let _profile_guard = EnvVarGuard::set("USERPROFILE", home.as_os_str());
+        let _path_guard = EnvVarGuard::set(
+            "PATH",
+            std::ffi::OsStr::new(if cfg!(windows) {
+                "C:\\Windows"
+            } else {
+                "/usr/bin:/bin"
+            }),
+        );
+
+        let mut engine = Engine::new();
+        let ext_name = "vimcode-test-ext-1344-combined-unit".to_string();
+        let language_id = "vimcode-test-lang-1344-combined-unit".to_string();
+        engine.ext_registry = Some(vec![ExtensionManifest {
+            name: ext_name.clone(),
+            display_name: ext_name.clone(),
+            language_ids: vec![language_id],
+            lsp: LspConfig {
+                binary: lsp_binary_name.to_string(),
+                ..Default::default()
+            },
+            dap: crate::core::extensions::DapConfig {
+                adapter: "vimcode-test-dap-adapter-1344-combined-unit".to_string(),
+                binary: "vimcode-test-nonexistent-dap-binary-1344-combined-unit".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        }]);
+        engine
+            .extension_state
+            .mark_installed_version(&ext_name, "0.0.1");
+
+        let ctx = InstallContext {
+            ext_name: ext_name.clone(),
+            install_key: "test:finalize-combined-unit".to_string(),
+        };
+        engine.finalize_install_from_terminal(&ctx);
+
+        assert!(
+            engine.message.contains("installed and started"),
+            "the LSP success outcome must be present in the combined \
+             message, not overwritten by the DAP outcome; got: {}",
+            engine.message
+        );
+        assert!(
+            engine.message.contains("was not found"),
+            "the DAP not-found outcome must also be present in the combined \
+             message; got: {}",
+            engine.message
         );
 
         let _ = std::fs::remove_dir_all(&home);
