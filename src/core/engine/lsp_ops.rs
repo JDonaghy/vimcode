@@ -1,5 +1,26 @@
 use super::*;
 
+/// Which half of a manifest's install (`[lsp]` or `[dap]`) a background
+/// `tool_acquire` task is acquiring — carries what `finalize_tool_acquire`
+/// needs to register the result (#1345).
+pub(crate) enum ToolAcquireLeg {
+    Lsp {
+        lang_ids: Vec<String>,
+        args: Vec<String>,
+    },
+    Dap,
+}
+
+/// Result of a completed background `tool_acquire::acquire_and_install`
+/// call, sent back to the main thread over `Engine::tool_acquire_tasks`.
+pub(crate) struct ToolAcquireOutcome {
+    pub ext_name: String,
+    pub install_key: String,
+    pub leg: ToolAcquireLeg,
+    pub tool_name: String,
+    pub result: Result<std::path::PathBuf, String>,
+}
+
 impl Engine {
     // =======================================================================
     // LSP integration
@@ -271,10 +292,21 @@ impl Engine {
 
         let mut status_parts: Vec<String> = Vec::new();
         let mut install_commands: Vec<String> = Vec::new();
+        // #1345: true once any leg has kicked off a native acquisition
+        // (download/verify/unpack, no terminal). Tracked separately from
+        // `has_install` below because both can never involve the same leg —
+        // a leg does the shared-resolver check, then EITHER native
+        // acquisition OR the terminal install script, never both — but a
+        // manifest with an LSP `acquire` and a DAP `install_*` (or vice
+        // versa) can set both flags in the same call.
+        let mut has_native_acquire = false;
 
         // ── LSP ──────────────────────────────────────────────────────────────
-        // Check if any LSP binary is already on PATH (idempotent: skip install
-        // if the server is already available, e.g. via `rustup component add`).
+        // Resolution order (#1345): (1) already resolvable via the shared
+        // tool lookup (`binary_on_path`, which now probes the vimcode-managed
+        // tools dir first) → done; (2) manifest declares `[lsp.acquire]` →
+        // native acquisition, no terminal, no shell; (3) else the legacy
+        // `install_*` shell string in the visible terminal, unchanged.
         if !manifest.lsp.binary.is_empty() {
             let all_lsp: Vec<&str> = std::iter::once(manifest.lsp.binary.as_str())
                 .chain(manifest.lsp.fallback_binaries.iter().map(|s| s.as_str()))
@@ -283,6 +315,25 @@ impl Engine {
             let found_bin = all_lsp.iter().copied().find(|b| binary_on_path(b));
             if let Some(bin) = found_bin {
                 status_parts.push(format!("LSP: {bin} ✓"));
+            } else if let Some(acquire) = manifest.lsp.acquire.clone() {
+                let lsp_key = format!("ext:{ext_name}:lsp");
+                self.lsp_installing.insert(lsp_key.clone());
+                self.notify(
+                    NotificationKind::LspInstall,
+                    &format!("Acquiring {}…", manifest.lsp.binary),
+                );
+                self.spawn_tool_acquire(
+                    ext_name.clone(),
+                    lsp_key,
+                    ToolAcquireLeg::Lsp {
+                        lang_ids: manifest.language_ids.clone(),
+                        args: manifest.lsp.args.clone(),
+                    },
+                    manifest.lsp.binary.clone(),
+                    acquire,
+                );
+                has_native_acquire = true;
+                status_parts.push(format!("LSP: acquiring {}…", manifest.lsp.binary));
             } else if !manifest.lsp.install_cmd_for_platform().is_empty() {
                 let lsp_key = format!("ext:{ext_name}:lsp");
                 self.lsp_installing.insert(lsp_key.clone());
@@ -304,17 +355,35 @@ impl Engine {
         let available_manifests = self.ext_available_manifests();
 
         // ── DAP ──────────────────────────────────────────────────────────────
-        // Check PATH first (idempotent), then consult the unified resolver
-        // that knows about both manifest-declared installs AND the built-in
-        // multi-step installers (codelldb, debugpy venv, netcoredbg archive
-        // unpack). Previously this branch read `manifest.dap.install` only,
-        // which is empty for adapters with hardcoded installers — sending
-        // the user into a `:DapInstall <lang>` loop that resolved back here.
+        // Check PATH first (idempotent), then prefer native acquisition
+        // (#1345) when the manifest declares `[dap.acquire]`, then fall back
+        // to the unified resolver that knows about both manifest-declared
+        // installs AND the built-in multi-step installers (codelldb, debugpy
+        // venv, netcoredbg archive unpack). Previously this branch read
+        // `manifest.dap.install` only, which is empty for adapters with
+        // hardcoded installers — sending the user into a `:DapInstall <lang>`
+        // loop that resolved back here.
         if !manifest.dap.adapter.is_empty() {
             let dap_binary = manifest.dap.binary.as_str();
             let already_on_path = !dap_binary.is_empty() && binary_on_path(dap_binary);
             if already_on_path {
                 status_parts.push(format!("DAP: {dap_binary} ✓"));
+            } else if let Some(acquire) = manifest.dap.acquire.clone() {
+                let dap_key = format!("dap:{}", manifest.dap.adapter);
+                self.lsp_installing.insert(dap_key.clone());
+                self.notify(
+                    NotificationKind::LspInstall,
+                    &format!("Acquiring {}…", manifest.dap.adapter),
+                );
+                self.spawn_tool_acquire(
+                    ext_name.clone(),
+                    dap_key,
+                    ToolAcquireLeg::Dap,
+                    manifest.dap.binary.clone(),
+                    acquire,
+                );
+                has_native_acquire = true;
+                status_parts.push(format!("DAP: acquiring {}…", manifest.dap.adapter));
             } else {
                 let adapter_install = crate::core::dap_manager::install_cmd_for_adapter(
                     manifest.dap.adapter.as_str(),
@@ -364,9 +433,10 @@ impl Engine {
 
         // Kick-start LSP for the current buffer if it matches this extension's languages.
         // Without this, the user would have to re-open the file to get LSP support.
-        // Skip if an install is pending — the binary isn't available yet; LSP will be
-        // started when the install terminal completes.
-        if !has_install {
+        // Skip if an install/acquisition is pending — the binary isn't available yet;
+        // LSP will be started when the install terminal (or `finalize_tool_acquire`,
+        // #1345) completes.
+        if !has_install && !has_native_acquire {
             let active_bid = self.active_buffer_id();
             if let Some(state) = self.buffer_manager.get(active_bid) {
                 let buf_lang = state.lsp_language_id.clone().or_else(|| {
@@ -392,6 +462,116 @@ impl Engine {
                 status_parts.join(", ")
             )
         };
+    }
+
+    /// Spawn a background thread that downloads, verifies and unpacks
+    /// `tool_name` per `acquire` (#1345), off the UI thread. The result
+    /// arrives via `tool_acquire_tasks`, drained by `poll_tool_acquire` —
+    /// same shape as `Engine::ext_refresh`'s background registry fetch and
+    /// `plugins.rs`'s `async_shell_tasks`.
+    fn spawn_tool_acquire(
+        &mut self,
+        ext_name: String,
+        install_key: String,
+        leg: ToolAcquireLeg,
+        tool_name: String,
+        acquire: crate::core::tool_acquire::AcquireConfig,
+    ) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let bg_tool_name = tool_name.clone();
+        let bg_install_key = install_key.clone();
+        std::thread::spawn(move || {
+            let result = crate::core::tool_acquire::acquire_and_install(&bg_tool_name, &acquire)
+                .map_err(|e| e.to_string());
+            let _ = tx.send(ToolAcquireOutcome {
+                ext_name,
+                install_key: bg_install_key,
+                leg,
+                tool_name: bg_tool_name,
+                result,
+            });
+        });
+        self.tool_acquire_tasks.insert(install_key, rx);
+    }
+
+    /// Non-blocking check for completed background tool acquisitions.
+    /// Call this from `poll_idle`. Returns `true` if a redraw is needed.
+    pub fn poll_tool_acquire(&mut self) -> bool {
+        let mut completed: Vec<(String, ToolAcquireOutcome)> = Vec::new();
+        for (key, rx) in &self.tool_acquire_tasks {
+            if let Ok(outcome) = rx.try_recv() {
+                completed.push((key.clone(), outcome));
+            }
+        }
+        if completed.is_empty() {
+            return false;
+        }
+        for (key, _) in &completed {
+            self.tool_acquire_tasks.remove(key);
+        }
+        for (_, outcome) in completed {
+            self.finalize_tool_acquire(outcome);
+        }
+        true
+    }
+
+    /// Apply the result of a completed background acquisition: on success,
+    /// register + start the LSP server (mirrors
+    /// `terminal_ops::finalize_install_from_terminal`'s LSP branch) or, for
+    /// a DAP leg, just report success — `dap_manager` re-resolves the
+    /// binary lazily at debug-start time. On failure, delete nothing further
+    /// (`tool_acquire::acquire_and_install` already cleaned up its own
+    /// partial state) and surface the error.
+    fn finalize_tool_acquire(&mut self, outcome: ToolAcquireOutcome) {
+        self.lsp_installing.remove(&outcome.install_key);
+        self.notify_done_by_kind(&NotificationKind::LspInstall, None);
+
+        let ext_name = &outcome.ext_name;
+        match outcome.result {
+            Ok(bin_path) => {
+                crate::core::lsp_manager::install_log(&format!(
+                    "[ext-install] '{ext_name}' acquired {} -> {}",
+                    outcome.tool_name,
+                    bin_path.display()
+                ));
+                match outcome.leg {
+                    ToolAcquireLeg::Lsp { lang_ids, args } => {
+                        self.ensure_lsp_manager();
+                        for lsp_lang in &lang_ids {
+                            let config = lsp::LspServerConfig {
+                                command: outcome.tool_name.clone(),
+                                args: args.clone(),
+                                languages: vec![lsp_lang.clone()],
+                                ..Default::default()
+                            };
+                            if let Some(mgr) = &mut self.lsp_manager {
+                                mgr.add_registry_entry(config);
+                                mgr.ensure_server_for_language(lsp_lang);
+                            }
+                            self.lsp_reopen_buffers_for_language(lsp_lang);
+                        }
+                        self.message = format!(
+                            "LSP server for '{ext_name}' installed and started ({})",
+                            outcome.tool_name
+                        );
+                    }
+                    ToolAcquireLeg::Dap => {
+                        self.message =
+                            format!("DAP adapter for '{ext_name}' installed — press F5 to debug");
+                    }
+                }
+            }
+            Err(e) => {
+                crate::core::lsp_manager::install_log(&format!(
+                    "[ext-install] '{ext_name}' acquisition of {} failed: {e}",
+                    outcome.tool_name
+                ));
+                self.message = format!(
+                    "Install for '{ext_name}' failed to acquire {}: {e}",
+                    outcome.tool_name
+                );
+            }
+        }
     }
 
     /// Open the README for the currently selected extension in the sidebar.
@@ -572,6 +752,16 @@ impl Engine {
         }
 
         for bin_name in &bins {
+            // #1345: delete the vimcode-managed acquisition dir outright —
+            // unlike the shared `safe_dirs` above (system directories other
+            // tools might also use), `tools/<bin_name>/` is exclusively
+            // populated by `tool_acquire::acquire_and_install`, so removing
+            // the whole directory (every version, not just `current`) can
+            // never delete anything vimcode doesn't own.
+            let managed_dir = paths::managed_tool_dir(bin_name);
+            if managed_dir.is_dir() && std::fs::remove_dir_all(&managed_dir).is_ok() {
+                removed.push(format!("{}", managed_dir.display()));
+            }
             // Remove binary from safe dirs.
             for dir in &safe_dirs {
                 let path = dir.join(bin_name);

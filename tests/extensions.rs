@@ -3809,7 +3809,14 @@ fn registry_conformance_every_manifest_resolves_install_on_all_platforms() {
         // scripts only) are correctly exempt — there is nothing to install.
         if !m.lsp.binary.is_empty() {
             for platform in Platform::ALL {
-                let resolves = !m.lsp.install_cmd_for(platform).is_empty();
+                // #1345: a manifest declaring `[lsp.acquire]` resolves an
+                // install on every platform its kind supports — all three
+                // kinds (hashicorp-release/github-release/url-template) are
+                // platform-neutral by construction (no `sh`), so `acquire`
+                // being present at all counts as "resolved" here, same as a
+                // non-empty `install_cmd_for`.
+                let resolves =
+                    !m.lsp.install_cmd_for(platform).is_empty() || m.lsp.acquire.is_some();
                 let gap = find_gap(&m.name, ExtComponent::Lsp, platform);
                 match (resolves, gap) {
                     (false, None) => unexpected_gaps.push(format!(
@@ -3843,7 +3850,10 @@ fn registry_conformance_every_manifest_resolves_install_on_all_platforms() {
         // an install command on all three platforms.
         if !m.dap.adapter.is_empty() {
             for platform in Platform::ALL {
-                let resolves = !m.dap.install_cmd_for(platform).is_empty();
+                // #1345: same "acquire resolves on every platform" rule as
+                // the lsp block above.
+                let resolves =
+                    !m.dap.install_cmd_for(platform).is_empty() || m.dap.acquire.is_some();
                 let gap = find_gap(&m.name, ExtComponent::Dap, platform);
                 match (resolves, gap) {
                     (false, None) => unexpected_gaps.push(format!(
@@ -3917,4 +3927,298 @@ fn registry_conformance_every_manifest_resolves_install_on_all_platforms() {
             ),
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// #1345: native tool acquisition — resolver + conformance-gate integration
+// ---------------------------------------------------------------------------
+
+/// Build a throwaway zip fixture containing a single entry, for driving
+/// `ext_install_from_registry`'s native-acquisition path against a
+/// `file://` URL (no real network — see `tool_acquire.rs`'s own
+/// `acquire_and_install_end_to_end_via_file_url` for why `curl file://` is
+/// a legitimate substitute for a real HTTPS round trip in tests).
+fn make_fixture_zip(
+    dir: &std::path::Path,
+    entry_name: &str,
+    contents: &[u8],
+) -> std::path::PathBuf {
+    let path = dir.join("archive.zip");
+    let file = std::fs::File::create(&path).unwrap();
+    let mut writer = zip::ZipWriter::new(file);
+    let options: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default();
+    writer.start_file(entry_name, options).unwrap();
+    std::io::Write::write_all(&mut writer, contents).unwrap();
+    writer.finish().unwrap();
+    path
+}
+
+#[test]
+fn ext_install_with_acquire_runs_no_terminal_command_and_registers_lsp() {
+    // #1345's core acceptance: `ext_install_from_registry` on a manifest
+    // with `[lsp.acquire]` and no `install_*` must (1) queue no terminal
+    // command — no shell at all — and (2) once the background acquisition
+    // completes, register and start the LSP server, the same outcome
+    // `finalize_install_from_terminal` produces for the legacy shell path.
+    //
+    // Confirmed RED against unfixed `develop` before this landed: with no
+    // `acquire` wiring, this manifest (no `install_linux`/`install_macos`/
+    // `install_windows` either) fell through both branches — `status_parts`
+    // stayed empty and the extension was marked installed with the LSP
+    // server never registered, which this test's final assertions would
+    // have failed to observe.
+    use vimcode_core::core::extensions::{ExtensionManifest, LspConfig};
+    use vimcode_core::core::tool_acquire::{AcquireConfig, AcquireKind};
+
+    let _lock = TOOL_ACQUIRE_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let data_home = std::env::temp_dir().join(format!(
+        "vimcode_test_ext_install_acquire_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&data_home);
+    std::fs::create_dir_all(&data_home).unwrap();
+    let _data_home_guard = EnvVarGuard::set("VIMCODE_TEST_DATA_HOME", data_home.as_os_str());
+
+    let fixture_dir = std::env::temp_dir().join(format!(
+        "vimcode_test_ext_install_acquire_fixture_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&fixture_dir);
+    std::fs::create_dir_all(&fixture_dir).unwrap();
+    let binary_name = "vimcode-test-acquire-lsp-1345";
+    let archive = make_fixture_zip(&fixture_dir, binary_name, b"#!fake-lsp-server");
+
+    let manifest = ExtensionManifest {
+        name: "acquire-test-ext".to_string(),
+        display_name: "Acquire Test Extension".to_string(),
+        language_ids: vec!["acquiretestlang".to_string()],
+        lsp: LspConfig {
+            binary: binary_name.to_string(),
+            acquire: Some(AcquireConfig {
+                kind: AcquireKind::UrlTemplate,
+                url: format!("file://{}", archive.display()),
+                version: "1.0.0".to_string(),
+                binary_path: binary_name.to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let mut e = engine_with("");
+    e.ext_registry = Some(vec![manifest]);
+
+    let action = exec(&mut e, "ExtInstall acquire-test-ext");
+    assert_eq!(
+        action,
+        vimcode_core::EngineAction::None,
+        "native acquisition must not open a terminal pane (no RunInTerminal action)"
+    );
+    assert!(
+        e.pending_terminal_command.is_none(),
+        "native acquisition must queue no shell command"
+    );
+    assert!(
+        e.message.to_lowercase().contains("acquiring"),
+        "status message should say acquisition is underway: {}",
+        e.message
+    );
+
+    // Drain the background acquisition thread (poll until the channel
+    // yields — bounded so a genuine regression fails fast instead of
+    // hanging the suite).
+    let mut drained = false;
+    for _ in 0..200 {
+        if e.poll_tool_acquire() {
+            drained = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(drained, "background acquisition did not complete in time");
+
+    assert!(
+        e.message.contains("installed and started"),
+        "finalize message should report the server started: {}",
+        e.message
+    );
+    assert!(
+        vimcode_core::core::lsp_manager::resolve_command(binary_name).is_some(),
+        "the acquired binary should now be resolvable via the managed tools dir"
+    );
+
+    let _ = std::fs::remove_dir_all(&data_home);
+    let _ = std::fs::remove_dir_all(&fixture_dir);
+}
+
+#[test]
+fn registry_conformance_treats_acquire_as_resolving_every_platform() {
+    // #1345's acceptance criterion, isolated from the big registry snapshot
+    // above (no live manifest declares `acquire` yet — that's the follow-up
+    // registry-side adoption, not this issue): a manifest with `[lsp.acquire]`
+    // and no `install_linux`/`install_macos`/`install_windows` resolves an
+    // install on every platform.
+    use vimcode_core::core::extensions::{ExtensionManifest, LspConfig, Platform};
+    use vimcode_core::core::tool_acquire::{AcquireConfig, AcquireKind};
+
+    let manifest = ExtensionManifest {
+        name: "terraform".to_string(),
+        display_name: "Terraform".to_string(),
+        lsp: LspConfig {
+            binary: "terraform-ls".to_string(),
+            acquire: Some(AcquireConfig {
+                kind: AcquireKind::HashicorpRelease,
+                product: "terraform-ls".to_string(),
+                binary_path: "terraform-ls".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    // No install_* fields are set at all — the old resolver would report a
+    // gap on every platform. Confirmed RED against unfixed `develop` before
+    // this landed: `install_cmd_for(platform).is_empty()` was `true` on all
+    // three platforms and nothing accounted for `acquire`.
+    for platform in Platform::ALL {
+        assert!(
+            manifest.lsp.install_cmd_for(platform).is_empty(),
+            "sanity: this manifest has no install_* command"
+        );
+        let resolves =
+            !manifest.lsp.install_cmd_for(platform).is_empty() || manifest.lsp.acquire.is_some();
+        assert!(
+            resolves,
+            "acquire should count as resolving an install on {platform}"
+        );
+    }
+}
+
+/// `VIMCODE_TEST_DATA_HOME`/`PATH` are process-global env state; serialize
+/// with a dedicated lock — mirrors `HOMEBREW_ENV_LOCK` above (#917) but kept
+/// separate since these tests touch different variables and shouldn't
+/// contend with the Homebrew ones.
+static TOOL_ACQUIRE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[test]
+fn resolve_command_finds_managed_tool_binary_with_empty_path() {
+    // #1345 acceptance: "a resolver test: a binary under the managed dir is
+    // found with an empty PATH." Simulates a vimcode-managed acquisition by
+    // writing directly into a throwaway `VIMCODE_TEST_DATA_HOME`, without
+    // going through the network-touching `tool_acquire::acquire_and_install`.
+    let _lock = TOOL_ACQUIRE_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+
+    let data_home = std::env::temp_dir().join(format!(
+        "vimcode_test_managed_resolver_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&data_home);
+    std::fs::create_dir_all(&data_home).unwrap();
+
+    let binary_name = "vimcode-test-managed-terraform-ls-1345";
+    let version_dir = data_home.join("tools").join(binary_name).join("0.32.0");
+    std::fs::create_dir_all(&version_dir).unwrap();
+    let binary_path = version_dir.join(binary_name);
+    std::fs::write(&binary_path, b"#!/bin/sh\necho fake\n").unwrap();
+    std::fs::write(
+        data_home.join("tools").join(binary_name).join("current"),
+        "0.32.0",
+    )
+    .unwrap();
+
+    let _data_home_guard = EnvVarGuard::set("VIMCODE_TEST_DATA_HOME", data_home.as_os_str());
+    // Empty PATH (well, just enough to run `which` itself if the resolver's
+    // PATH fallback were reached) — proves resolution happens via the
+    // managed dir, not by falling through to a PATH lookup that happens to
+    // find something with the same name.
+    let _path_guard = EnvVarGuard::set("PATH", std::ffi::OsStr::new(""));
+
+    let resolved = vimcode_core::core::lsp_manager::resolve_command(binary_name);
+    assert_eq!(
+        resolved,
+        Some(binary_path.clone()),
+        "should resolve {binary_name} via the managed tools dir with PATH empty"
+    );
+
+    let _ = std::fs::remove_dir_all(&data_home);
+}
+
+#[test]
+fn resolve_command_falls_through_when_no_managed_tool_current_pointer() {
+    // A tool directory can exist with old/removed versions but no `current`
+    // pointer (e.g. mid-acquisition, or after a manual cleanup) — resolution
+    // must not find a binary in that case, so this doesn't accidentally
+    // resolve to a stale/uninstalled version.
+    let _lock = TOOL_ACQUIRE_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+
+    let data_home = std::env::temp_dir().join(format!(
+        "vimcode_test_managed_no_current_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&data_home);
+    std::fs::create_dir_all(&data_home).unwrap();
+
+    let binary_name = "vimcode-test-managed-no-current-1345";
+    let version_dir = data_home.join("tools").join(binary_name).join("0.1.0");
+    std::fs::create_dir_all(&version_dir).unwrap();
+    std::fs::write(version_dir.join(binary_name), b"stale").unwrap();
+    // Deliberately no `current` pointer file written.
+
+    let _data_home_guard = EnvVarGuard::set("VIMCODE_TEST_DATA_HOME", data_home.as_os_str());
+    let _path_guard = EnvVarGuard::set("PATH", std::ffi::OsStr::new(""));
+
+    let resolved = vimcode_core::core::lsp_manager::resolve_command(binary_name);
+    assert_eq!(resolved, None);
+
+    let _ = std::fs::remove_dir_all(&data_home);
+}
+
+/// Live, network-touching operator smoke test (#1345 acceptance: "one
+/// `#[ignore]`d live test that acquires terraform-ls on the host platform").
+/// Not run by `cargo test` — run explicitly with
+/// `cargo test --test extensions -- --ignored acquire_terraform_ls_live_smoke`.
+#[test]
+#[ignore]
+fn acquire_terraform_ls_live_smoke() {
+    use vimcode_core::core::extensions::Platform;
+    use vimcode_core::core::tool_acquire::{
+        acquire_and_install_for, AcquireConfig, AcquireKind, Arch,
+    };
+
+    let _lock = TOOL_ACQUIRE_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+
+    let data_home =
+        std::env::temp_dir().join(format!("vimcode_test_live_acquire_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&data_home);
+    let _data_home_guard = EnvVarGuard::set("VIMCODE_TEST_DATA_HOME", data_home.as_os_str());
+
+    let cfg = AcquireConfig {
+        kind: AcquireKind::HashicorpRelease,
+        product: "terraform-ls".to_string(),
+        binary_path: "terraform-ls".to_string(),
+        ..Default::default()
+    };
+
+    let installed = acquire_and_install_for("terraform-ls", &cfg, Platform::host(), Arch::host())
+        .expect("live acquisition of terraform-ls should succeed against the real HashiCorp API");
+    assert!(installed.is_file(), "{} should exist", installed.display());
+
+    let resolved = vimcode_core::core::lsp_manager::resolve_command("terraform-ls");
+    assert_eq!(
+        resolved,
+        Some(installed),
+        "resolve_command should find the just-acquired terraform-ls via the managed dir"
+    );
+
+    let _ = std::fs::remove_dir_all(&data_home);
 }

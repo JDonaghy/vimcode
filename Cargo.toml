@@ -247,6 +247,18 @@ pulldown-cmark = { version = "0.13", default-features = false }
 streaming-iterator = "0.1.9"
 spellbook = "0.4.0"
 notify = { version = "7", default-features = false, features = ["macos_kqueue"] }
+# #1345: `tool_acquire.rs` — native LSP/DAP tool acquisition (download,
+# verify, unpack) with no shell, sudo, `unzip`, or `tar` binary. `sha2` and
+# `flate2` were already in the dependency tree transitively (via other
+# crates); pinned here as direct deps since `tool_acquire.rs` uses them
+# itself. `tar` and `zip` are new — `zip`'s default features pull in every
+# supported compression method (bzip2/zstd/lzma); extension archives only
+# ever use plain DEFLATE, so this trims to `deflate` only, no C dependency
+# beyond what deflate already needs.
+sha2 = "0.10"
+flate2 = "1"
+tar = "0.4"
+zip = { version = "2", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
 insta = "1.39"

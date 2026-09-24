@@ -408,10 +408,12 @@ fn extra_tool_dirs(binary: &str) -> Vec<PathBuf> {
 /// saying "not found on PATH", especially since most of these directories
 /// are *not* on PATH for a desktop-launched vimcode in the first place.
 pub fn probed_tool_dirs_description(binary: &str) -> String {
-    let mut dirs: Vec<String> = extra_tool_dirs(binary)
-        .into_iter()
-        .map(|d| d.display().to_string())
-        .collect();
+    let mut dirs: Vec<String> = vec![super::paths::managed_tool_dir(binary).display().to_string()];
+    dirs.extend(
+        extra_tool_dirs(binary)
+            .into_iter()
+            .map(|d| d.display().to_string()),
+    );
     dirs.push("PATH".to_string());
     dirs.join(", ")
 }
@@ -428,6 +430,14 @@ pub fn probed_tool_dirs_description(binary: &str) -> String {
 pub fn resolve_command(cmd: &str) -> Option<PathBuf> {
     // Split on whitespace to get just the binary name
     let binary = cmd.split_whitespace().next().unwrap_or(cmd);
+
+    // #1345: the vimcode-managed tool acquisition dir is probed first — a
+    // tool vimcode downloaded, verified and unpacked itself can never
+    // collide with a same-named binary elsewhere on the system, and needs
+    // no PATH/env changes to be found.
+    if let Some(managed) = super::paths::managed_tool_binary_path(binary) {
+        return Some(managed);
+    }
 
     for dir in extra_tool_dirs(binary) {
         let candidate = dir.join(binary);
