@@ -30,6 +30,31 @@
 //!    reader, which is why the DAP client cannot answer adapter requests —
 //!    do not repeat that here).
 //!
+//! ## ACP-6: `auth.terminal` and the terminal-login flow
+//!
+//! `initialize`'s `clientCapabilities.auth.terminal: true` (advertised
+//! unconditionally, see [`AcpClient::initialize`]) is what makes an agent's
+//! `initialize` response allowed to offer a `type: "terminal"` auth method
+//! at all — e.g. `claude-ai-login` / "Claude Subscription" from
+//! `@agentclientprotocol/claude-agent-acp`. Omitting the capability is how
+//! a client opts out of subscription login and forces API-key-only; this
+//! client deliberately does not do that.
+//!
+//! ### How terminal auth differs from `authenticate`
+//!
+//! Two distinct mechanisms, and conflating them is the trap the issue
+//! calls out:
+//!
+//! - `type: "agent"` methods -> call [`AcpClient::authenticate`]
+//!   (`authenticate {methodId}`).
+//! - `type: "terminal"` methods -> **do not** call `authenticate` at all.
+//!   The client runs the agent's own command line attached to a real TTY
+//!   so its CLI can drive an interactive login, then re-initializes once
+//!   that process exits (`Engine::acp_launch_terminal_login` /
+//!   `Engine::acp_finish_terminal_login`, `src/core/engine/terminal_ops.rs`
+//!   / `acp_ops.rs`). See [`AcpAuthMethodKind`] for the wire-level
+//!   classification.
+//!
 //! ## Standing commitments (apply to the whole ACP track, not just this file)
 //!
 //! - Protocol version is pinned at `1` (a draft v2 restructures capabilities
@@ -227,6 +252,19 @@ fn absolute_path_string(path: &Path) -> String {
 /// (`core::terminal::shell_command` is the seam for actual `sh -c` use, and
 /// does not apply here per #1255's reasoning: this is a fixed program
 /// invocation, not a user-supplied shell command string).
+///
+/// **This same `settings.acp_agent_command` string is parsed a second,
+/// different way for the `type: "terminal"` auth login path** (#957,
+/// ACP-6): `Engine::acp_launch_terminal_login`
+/// (`src/core/engine/terminal_ops.rs`) writes it verbatim into a real
+/// interactive shell via `build_acp_auth_wrapper`, where it *is*
+/// shell-interpreted (`$VAR`, backticks, `;`, pipes, …), unlike this
+/// splitter. A command containing shell metacharacters would therefore
+/// behave differently between the two paths for the same setting. The
+/// command is operator-configured, not attacker input, so this is a
+/// latent correctness surprise rather than a security bug — worth
+/// revisiting (e.g. quoting the wrapper's injected command) if it ever
+/// causes real confusion, but out of scope for #957 itself.
 pub fn parse_agent_command(cmd: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut current = String::new();
