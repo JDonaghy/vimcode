@@ -15016,6 +15016,199 @@ mod tests {
         );
     }
 
+    /// #957 (ACP-6) acceptance: "with `auth.terminal` advertised against a
+    /// fake agent offering a terminal auth method, ... the method is
+    /// present" and "with the capability not advertised, the method is
+    /// absent" — TUI's twin of `gtk::testing::sidebar_panel_clicks::
+    /// ai_panel_shows_auth_choice_dialog_with_agent_and_terminal_methods`.
+    ///
+    /// Unlike the buttons-only `"acp_permission"` dialog on GTK, TUI has no
+    /// native-dialog concept at all — every dialog paints in-canvas — so
+    /// this asserts directly on the painted screen text, same shape as
+    /// `ai_panel_shows_permission_dialog_and_resumes_turn_on_selection_via_shell_app`.
+    ///
+    /// RED verified: with `Engine::poll_acp`'s `Initialized` handler
+    /// changed to call `self.acp_begin_session()` unconditionally (skipping
+    /// the `!self.acp_authenticated && !self.acp_auth_methods.is_empty()`
+    /// check), no dialog ever opens and this test times out waiting for
+    /// `"Authenticate"` — the loop below exits on the deadline and the
+    /// final assertion fails. Restored before committing.
+    #[test]
+    fn ai_panel_shows_auth_choice_dialog_with_agent_and_terminal_methods_via_shell_app() {
+        let mut app = TuiShellApp::new(None);
+        app.engine
+            .app_shell
+            .show_panel(&quadraui::WidgetId::new(PANEL_AI));
+        app.engine.ai_has_focus = true;
+        app.sidebar.has_focus = true;
+
+        let argv = vec![
+            "sh".to_string(),
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/fake_acp_agent.sh"
+            )
+            .to_string(),
+        ];
+        let cwd = std::env::temp_dir();
+        let mut client = crate::core::acp::AcpClient::spawn_with_env(
+            &argv,
+            &cwd,
+            &[("ACP_FAKE_AUTH_METHODS", "1")],
+        )
+        .expect("fixture agent should spawn");
+        client.initialize();
+        app.engine.acp_client = Some(client);
+        app.engine.settings.acp_agent_command = "already-spawned-above".to_string();
+
+        let mut driver = driver_with_shell(app, config(), 80, 24);
+        for c in "hello agent".chars() {
+            driver.type_char(c);
+        }
+        driver.ctrl_char('s');
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut screen = driver.screen();
+        while !screen.contains("Authenticate") && Instant::now() < deadline {
+            driver.tick();
+            std::thread::sleep(Duration::from_millis(10));
+            screen = driver.screen();
+        }
+        assert!(
+            screen.contains("Authenticate"),
+            "the auth-choice dialog's title must paint within 5s; \
+             screen:\n{screen}"
+        );
+        assert!(
+            screen.contains("ways to sign in"),
+            "the dialog's explanatory body text must be painted; \
+             screen:\n{screen}"
+        );
+        // Same hotkey-collision reasoning as the GTK twin: "API Key" claims
+        // 'a'; "Claude Subscription" claims its own leading 'c'; "Continue
+        // without auth" falls to its next unclaimed letter, 'o'.
+        assert!(
+            screen.contains("[A]PI Key")
+                && screen.contains("[C]laude Subscription")
+                && screen.contains("C[O]ntinue without auth"),
+            "both the agent-type and terminal-type auth methods the fixture \
+             advertised must be presented verbatim, plus the fallback skip \
+             button, each with a unique hotkey; screen:\n{screen}"
+        );
+    }
+
+    /// #957 (ACP-6) acceptance: "choosing [the terminal method] launches
+    /// the interactive process and completion re-initializes the
+    /// session" — TUI's twin of `gtk::testing::sidebar_panel_clicks::
+    /// ai_panel_terminal_auth_choice_opens_visible_login_pane_and_resumes_session`.
+    ///
+    /// Drives the choice via the dialog's own hotkey (`'c'`, matching the
+    /// bracketed `[C]laude Subscription` label the previous test
+    /// confirmed), then proves the login pane actually **painted** —
+    /// `screen.contains` on the fixture's own PTY output, not just
+    /// `terminal_panes.len()` / `acp_authenticated` state — before it exits
+    /// and the queued turn resumes.
+    ///
+    /// `settings.acp_agent_command` here is the *real* fixture path (not
+    /// the `"already-spawned-above"` placeholder the NDJSON-only tests
+    /// use): `Engine::acp_launch_terminal_login` reads that setting
+    /// directly to spawn the interactive login process, independently of
+    /// the already-spawned NDJSON `acp_client` above. The `succeed-slow`
+    /// arg (fixture doc) gives `driver.tick()` a real window to observe the
+    /// pane's painted output before it exits and is reaped.
+    ///
+    /// RED verified: with `Engine::acp_finish_terminal_login`'s `Some(0)`
+    /// branch changed to a no-op (never calling `client.initialize()`),
+    /// this test times out waiting for `"Hello world"` — the client stays
+    /// parked after the login pane exits instead of resuming the queued
+    /// turn.
+    #[test]
+    fn ai_panel_terminal_auth_choice_opens_visible_login_pane_and_resumes_session_via_shell_app() {
+        let mut app = TuiShellApp::new(None);
+        app.engine
+            .app_shell
+            .show_panel(&quadraui::WidgetId::new(PANEL_AI));
+        app.engine.ai_has_focus = true;
+        app.sidebar.has_focus = true;
+
+        let fixture_path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/fake_acp_agent.sh"
+        );
+        let argv = vec!["sh".to_string(), fixture_path.to_string()];
+        let cwd = std::env::temp_dir();
+        let mut client = crate::core::acp::AcpClient::spawn_with_env(
+            &argv,
+            &cwd,
+            &[
+                ("ACP_FAKE_AUTH_METHODS", "1"),
+                ("ACP_FAKE_NO_TOOL_REQUEST", "1"),
+            ],
+        )
+        .expect("fixture agent should spawn");
+        client.initialize();
+        app.engine.acp_client = Some(client);
+        // Read directly by `acp_launch_terminal_login` — distinct from (and
+        // independent of) the NDJSON client spawned above.
+        app.engine.settings.acp_agent_command = format!("sh {fixture_path} succeed-slow");
+
+        let mut driver = driver_with_shell(app, config(), 80, 24);
+        for c in "hello agent".chars() {
+            driver.type_char(c);
+        }
+        driver.ctrl_char('s');
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut screen = driver.screen();
+        while !screen.contains("Authenticate") && Instant::now() < deadline {
+            driver.tick();
+            std::thread::sleep(Duration::from_millis(10));
+            screen = driver.screen();
+        }
+        assert!(
+            screen.contains("[C]laude Subscription"),
+            "the auth-choice dialog must paint the Claude Subscription \
+             option within 5s; screen:\n{screen}"
+        );
+
+        driver.type_char('c');
+        let screen = driver.screen();
+        assert!(
+            !screen.contains("Authenticate"),
+            "the dialog must close the moment the hotkey is pressed; \
+             screen:\n{screen}"
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut saw_login_pane = false;
+        while Instant::now() < deadline {
+            driver.tick();
+            if driver.screen().contains("interactive login succeeded") {
+                saw_login_pane = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            saw_login_pane,
+            "the login pane's own PTY output must actually be painted on \
+             the surface within 5s, not just recorded in engine state"
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut screen = driver.screen();
+        while !screen.contains("Hello world") && Instant::now() < deadline {
+            driver.tick();
+            std::thread::sleep(Duration::from_millis(10));
+            screen = driver.screen();
+        }
+        assert!(
+            screen.contains("Hello world"),
+            "completing the login must re-initialize the client and resume \
+             the queued turn within 5s; screen:\n{screen}"
+        );
+    }
+
     /// Toasts are the last thing painted, on top of every other surface.
     #[test]
     fn render_content_paints_toast_via_shell_app() {

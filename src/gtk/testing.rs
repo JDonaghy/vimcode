@@ -5146,6 +5146,276 @@ second line here
              displayed mode within 5s of the session/set_mode round trip"
         );
     }
+
+    /// #957 (ACP-6) acceptance: "with `auth.terminal` advertised against a
+    /// fake agent offering a terminal auth method, ... the method is
+    /// present" and "with the capability not advertised, the method is
+    /// absent" — GTK's twin of `tui_main::shell_app::tests::
+    /// ai_panel_shows_auth_choice_dialog_with_agent_and_terminal_methods_via_shell_app`.
+    ///
+    /// Same buttons-only-dialog shape as `"acp_permission"`
+    /// (`ai_panel_shows_permission_dialog_and_resumes_turn_on_selection`
+    /// above): no text input, so `quadraui::native_dialog_options` takes it
+    /// native — the queued `MessageDialogOptions` is the proof, not
+    /// `engine.dialog`/`engine.acp_auth_methods` state.
+    ///
+    /// RED verified: with `Engine::poll_acp`'s `Initialized` handler
+    /// changed to call `self.acp_begin_session()` unconditionally (skipping
+    /// the `!self.acp_authenticated && !self.acp_auth_methods.is_empty()`
+    /// check), no dialog ever opens and this test times out waiting for one
+    /// — `pending_native_dialog.take()` panics on `None`. Restored before
+    /// committing.
+    #[cfg(unix)]
+    #[test]
+    fn ai_panel_shows_auth_choice_dialog_with_agent_and_terminal_methods() {
+        let mut h = panel_harness(PANEL_AI);
+        {
+            let mut engine = h.engine.borrow_mut();
+            let argv = vec![
+                "sh".to_string(),
+                concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/tests/fixtures/fake_acp_agent.sh"
+                )
+                .to_string(),
+            ];
+            let cwd = std::env::temp_dir();
+            let mut client = crate::core::acp::AcpClient::spawn_with_env(
+                &argv,
+                &cwd,
+                &[("ACP_FAKE_AUTH_METHODS", "1")],
+            )
+            .expect("fixture agent should spawn");
+            client.initialize();
+            engine.acp_client = Some(client);
+            engine.settings.acp_agent_command = "already-spawned-above".to_string();
+        }
+
+        let sb = h.painted_sidebar_bounds.get().unwrap();
+        h.driver.click(sb.x + 20.0, sb.y + 20.0);
+        for c in "hello agent".chars() {
+            h.driver.type_char(c);
+        }
+        h.driver.ctrl_char('s');
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !h
+            .engine
+            .borrow()
+            .dialog
+            .as_ref()
+            .is_some_and(|d| d.tag == "acp_auth_choice")
+            && std::time::Instant::now() < deadline
+        {
+            h.engine.borrow_mut().poll_acp();
+            h.driver.render();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            h.engine
+                .borrow()
+                .dialog
+                .as_ref()
+                .is_some_and(|d| d.tag == "acp_auth_choice"),
+            "the auth-choice dialog should be open within 5s"
+        );
+        assert!(
+            h.dialog_layout.borrow().is_none(),
+            "a buttons-only dialog with no text input must go native on \
+             GTK, never paint in-canvas (#727)"
+        );
+        let opts = h.pending_native_dialog.take().expect(
+            "the native dialog present must be queued once the auth-choice \
+             dialog opens",
+        );
+        assert_eq!(
+            opts.title, "Authenticate",
+            "the dialog's title must reach the native dialog options"
+        );
+        assert!(
+            opts.body.contains("ways to sign in"),
+            "the dialog's explanatory body text must be visible: {opts:?}"
+        );
+        // Labels carry a bracketed hotkey letter, same formatting as the
+        // permission dialog's twin above. "API Key" claims 'a'; "Claude
+        // Subscription" claims 'c' (its own first letter, still free);
+        // "Continue without auth" would also want 'c' but it's taken, so it
+        // falls to the next unclaimed letter in its own text, 'o'
+        // (`acp_show_auth_choice`'s left-to-right hotkey scan).
+        let labels: Vec<&str> = opts.buttons.iter().map(|b| b.label.as_str()).collect();
+        assert_eq!(
+            labels,
+            vec![
+                "[A]PI Key",
+                "[C]laude Subscription",
+                "C[O]ntinue without auth"
+            ],
+            "both the agent-type and terminal-type auth methods the fixture \
+             advertised must be presented verbatim, plus the fallback \
+             skip button, each with a unique hotkey"
+        );
+    }
+
+    /// #957 (ACP-6) acceptance: "choosing [the terminal method] launches
+    /// the interactive process and completion re-initializes the
+    /// session" — GTK's twin of `tui_main::shell_app::tests::
+    /// ai_panel_terminal_auth_choice_opens_visible_login_pane_and_resumes_session_via_shell_app`.
+    ///
+    /// Drives the real `"Claude Subscription"` button through
+    /// `Engine::dialog_click_button` (the same native-dialog-choice
+    /// simulation `ai_panel_shows_permission_dialog_and_resumes_turn_on_selection`
+    /// uses above), then proves the login pane actually **painted** — the
+    /// bottom panel's own tab-strip chrome (`"[1]"`, `render::
+    /// build_terminal_toolbar`), absent before and present immediately
+    /// after, not just `terminal_panes.len()` / `terminal_open` state —
+    /// before it exits and the session resumes.
+    ///
+    /// The tab-strip chrome, not the login pane's own PTY text, is this
+    /// test's visibility proof: GTK paints terminal cell glyphs one Pango
+    /// layout per cell (`primitives::terminal::paint` ->
+    /// `surface_draw_text_run_styled`), so `GtkDriver`'s text-run
+    /// recording sees each cell as its own single-character run, never a
+    /// merged line — confirmed by direct probe (spawning a plain terminal
+    /// tab and injecting `echo`: the echoed text never appears via
+    /// `screen_contains`/`painted_texts` even though the same content
+    /// reliably appears via `TuiDriver::screen()`, the technique
+    /// `tui_main::shell_app::tests::
+    /// ai_panel_terminal_auth_choice_opens_visible_login_pane_and_resumes_session_via_shell_app`
+    /// uses). That is a `GtkDriver` capability gap, not a
+    /// vimcode rendering bug — worth a quadraui issue (per-cell terminal
+    /// glyph draws could call the same `record_text_run` sink the rest of
+    /// `GtkBackend` uses, merged per row). Not filed as of this PR
+    /// (`CLAUDE.md`'s Platform-Neutrality Rule: no per-backend workaround
+    /// here regardless; the tab-strip chrome is a real, already-generic
+    /// -primitive-painted signal that doesn't need one).
+    ///
+    /// `settings.acp_agent_command` here is the *real* fixture path (not
+    /// the `"already-spawned-above"` placeholder the NDJSON-only tests
+    /// use): `Engine::acp_launch_terminal_login` reads that setting
+    /// directly to spawn the interactive login process, independently of
+    /// the already-spawned NDJSON `acp_client` above.
+    ///
+    /// RED verified: with `Engine::acp_finish_terminal_login`'s `Some(0)`
+    /// branch changed to a no-op (never calling `client.initialize()`),
+    /// this test times out waiting for `"Hello world"` — the client stays
+    /// parked after the login pane exits instead of resuming the queued
+    /// turn.
+    #[cfg(unix)]
+    #[test]
+    fn ai_panel_terminal_auth_choice_opens_visible_login_pane_and_resumes_session() {
+        let mut h = panel_harness(PANEL_AI);
+        let fixture_path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/fake_acp_agent.sh"
+        );
+        {
+            let mut engine = h.engine.borrow_mut();
+            let argv = vec!["sh".to_string(), fixture_path.to_string()];
+            let cwd = std::env::temp_dir();
+            let mut client = crate::core::acp::AcpClient::spawn_with_env(
+                &argv,
+                &cwd,
+                &[
+                    ("ACP_FAKE_AUTH_METHODS", "1"),
+                    ("ACP_FAKE_NO_TOOL_REQUEST", "1"),
+                ],
+            )
+            .expect("fixture agent should spawn");
+            client.initialize();
+            engine.acp_client = Some(client);
+            // Read directly by `acp_launch_terminal_login` — distinct from
+            // (and independent of) the NDJSON client spawned above.
+            engine.settings.acp_agent_command = format!("sh {fixture_path}");
+        }
+
+        h.driver.render();
+        assert!(
+            !h.driver.screen_contains("[1]"),
+            "precondition: no terminal pane is open yet, so the bottom \
+             panel's tab strip must not be painted"
+        );
+
+        let sb = h.painted_sidebar_bounds.get().unwrap();
+        h.driver.click(sb.x + 20.0, sb.y + 20.0);
+        for c in "hello agent".chars() {
+            h.driver.type_char(c);
+        }
+        h.driver.ctrl_char('s');
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !h
+            .engine
+            .borrow()
+            .dialog
+            .as_ref()
+            .is_some_and(|d| d.tag == "acp_auth_choice")
+            && std::time::Instant::now() < deadline
+        {
+            h.engine.borrow_mut().poll_acp();
+            h.driver.render();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let idx = {
+            let engine = h.engine.borrow();
+            let dialog = engine
+                .dialog
+                .as_ref()
+                .expect("the auth-choice dialog should be open within 5s");
+            dialog
+                .buttons
+                .iter()
+                .position(|b| b.action == "claude-ai-login")
+                .expect("the Claude Subscription button should be present")
+        };
+
+        h.engine.borrow_mut().dialog_click_button(idx);
+        assert!(
+            h.engine.borrow().dialog.is_none(),
+            "the dialog must close the moment a button is clicked"
+        );
+        assert_eq!(
+            h.engine.borrow().terminal_panes.len(),
+            1,
+            "choosing the terminal method must open exactly one login pane"
+        );
+
+        h.driver.render();
+        assert!(
+            h.driver.screen_contains("[1]"),
+            "the login pane's own tab must actually be painted on the \
+             surface immediately, not just recorded in `terminal_panes` \
+             state; painted: {:?}",
+            h.driver.painted_texts()
+        );
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !h.engine.borrow().terminal_panes.is_empty() && std::time::Instant::now() < deadline {
+            h.engine.borrow_mut().poll_terminal();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            h.engine.borrow().terminal_panes.is_empty(),
+            "the login pane should have exited (exit 0) and been reaped"
+        );
+        assert!(h.engine.borrow().acp_authenticated);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !h.driver.screen_contains("Hello world") && std::time::Instant::now() < deadline {
+            h.engine.borrow_mut().poll_acp();
+            h.driver.render();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            h.driver.screen_contains("Hello world"),
+            "completing the login must re-initialize the client and resume \
+             the queued turn within 5s"
+        );
+        assert!(
+            !h.driver.screen_contains("[1]"),
+            "the login pane's tab must be gone from the surface once it \
+             exited and was reaped, not left behind as a stale paint"
+        );
+    }
 }
 
 /// #669: the five editor-anchored popups (completion, LSP hover, editor

@@ -153,14 +153,27 @@
 # NDJSON-shaped `read` loop below, which blocks forever on this real TTY
 # instead of a piped-closed one — simulating a login a human abandons by
 # closing the pane before it ever exits, for a test to race against with
-# `Engine::terminal_close_active_tab`. Anything else (including no arg)
-# succeeds (exit 0).
+# `Engine::terminal_close_active_tab`. "succeed-slow" is the same success
+# path plus a brief `sleep` before exiting — for a `TuiDriver` black-box
+# test (`tui_main::shell_app::tests::
+# ai_panel_terminal_auth_choice_opens_visible_login_pane_and_resumes_session_via_shell_app`)
+# that needs a real window to poll-and-render the login pane's own painted
+# PTY output ("...login succeeded") before the pane closes itself and is
+# reaped, proving the pane actually became visible/painted rather than
+# only asserting `terminal_panes.len()` / `acp_authenticated` state (#957
+# review). GTK's twin test uses a different visibility proof instead (the
+# bottom panel's tab-strip chrome, not PTY cell text — see that test's own
+# doc comment for why) so it doesn't need this arg. Anything else
+# (including no arg) succeeds (exit 0) immediately.
 if [ -t 0 ] && [ "$1" != "hang" ]; then
   if [ "$1" = "fail" ]; then
     echo "fake-acp-agent: interactive login failed" 1>&2
     exit 1
   fi
   echo "fake-acp-agent: interactive login succeeded"
+  if [ "$1" = "succeed-slow" ]; then
+    sleep 0.3
+  fi
   exit 0
 fi
 
