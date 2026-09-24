@@ -308,7 +308,7 @@ pub enum AcpPlanEntryStatus {
 
 /// One entry in an agent's task-plan breakdown. Deliberately source-agnostic
 /// (no ACP-specific fields beyond what the wire sends) — #956's note for
-/// #529 is that a future coord-fed remote-worker plan preview reuses this
+/// #529 is that a future remote-worker plan preview reuses this
 /// exact shape with a different feeder, so nothing here should assume ACP
 /// is the only producer.
 #[derive(Debug, Clone, PartialEq, Eq)]
