@@ -4042,6 +4042,50 @@ pub struct Engine {
     /// `Some(path)` for a single file, `Some("")` for discard-all.
     pub pending_sc_discard: Option<String>,
 
+    // --- Board panel state (#521) ---
+    //
+    // Generic host for the shared `quadraui::Board` component — sourced from
+    // whatever provider an extension declares via the #522 seam
+    // (`ExtensionManifest::board`). No coordinator (or any other specific
+    // provider) vocabulary lives here; see `crate::core::tool_client`'s
+    // module doc.
+    /// Whether the Board panel has keyboard focus.
+    pub board_has_focus: bool,
+    /// The last successfully fetched board, or `None` before the first
+    /// fetch completes (or when no provider is configured at all).
+    /// Host-owned thereafter — `Engine::apply_board_action` mutates
+    /// selection/scroll fields on it directly, the same way `BoardApp`
+    /// does in quadraui's own reference example.
+    pub board_model: Option<quadraui::BoardModel>,
+    /// User-facing message from the last failed fetch, if any. Cleared on
+    /// the next successful fetch. `None` with `board_model: None` and a
+    /// configured provider means a fetch is in flight or hasn't started
+    /// yet; `None` with no provider configured is the panel's normal
+    /// "nothing to show" state, not an error.
+    pub board_error: Option<String>,
+    /// True while a background refresh thread is running.
+    pub board_fetching: bool,
+    /// Channel for receiving the background refresh's result.
+    pub board_rx: Option<
+        std::sync::mpsc::Receiver<
+            Result<quadraui::BoardModel, crate::core::tool_client::ToolError>,
+        >,
+    >,
+    /// When the last refresh was *started* (fetch-in-flight or completed) —
+    /// drives the provider's declared `poll_interval_secs` cadence in
+    /// [`Self::tick_board`]. `None` means "never fetched", which always
+    /// counts as due.
+    pub board_last_refresh: Option<std::time::Instant>,
+    /// Cached layout from the last paint, used for click hit-testing
+    /// (`quadraui::BoardLayout::hit_test`) — the same "paint caches, click
+    /// reads" pattern as `explorer_tree_rect` / `ext_panel_tree_layout`.
+    pub board_layout: std::cell::RefCell<Option<quadraui::BoardLayout>>,
+    /// The [`crate::core::tool_client::ToolClient`] used to run the
+    /// provider's `refresh_command`. Real subprocess by default;
+    /// test-swappable via [`Self::set_board_client_for_test`] so every
+    /// consumer is testable with no provider binary installed anywhere.
+    pub(crate) board_client: std::sync::Arc<dyn crate::core::tool_client::ToolClient>,
+
     // --- Settings sidebar panel state ---
     /// Whether the Settings sidebar panel has keyboard focus.
     pub settings_has_focus: bool,
@@ -4840,6 +4884,14 @@ impl Engine {
             pending_ext_remove: None,
             pending_git_remote_op: None,
             pending_sc_discard: None,
+            board_has_focus: false,
+            board_model: None,
+            board_error: None,
+            board_fetching: false,
+            board_rx: None,
+            board_last_refresh: None,
+            board_layout: std::cell::RefCell::new(None),
+            board_client: std::sync::Arc::new(crate::core::tool_client::SubprocessToolClient),
             settings_has_focus: false,
             settings_selected: 0,
             settings_scroll_top: 0,
@@ -5091,6 +5143,8 @@ impl Engine {
         redraw |= self.poll_ext_registry();
         redraw |= self.poll_tool_acquire();
         redraw |= self.poll_sc_diff();
+        self.tick_board();
+        redraw |= self.poll_board();
         redraw |= self.poll_ai();
         redraw |= self.poll_async_shells();
         redraw |= self.poll_panel_hover();
@@ -5781,6 +5835,7 @@ pub(crate) fn diff_state_from_hunks(
 
 mod accessors;
 mod acp_ops;
+mod board_ops;
 mod buffers;
 mod dap_ops;
 pub use dap_ops::DEBUG_BUTTON_IDS;

@@ -1202,6 +1202,7 @@ fn activity_id_to_panel_id(id: &str) -> Option<String> {
         "activity:git" => Some(PANEL_GIT.to_string()),
         "activity:extensions" => Some(PANEL_EXTENSIONS.to_string()),
         "activity:ai" => Some(PANEL_AI.to_string()),
+        "activity:board" => Some(PANEL_BOARD.to_string()),
         "activity:settings" => Some(PANEL_SETTINGS.to_string()),
         other => other
             .strip_prefix("activity:ext:")
@@ -1630,6 +1631,7 @@ impl App {
             "panel:git" => crate::icons::GIT_BRANCH.s(),
             "panel:extensions" => crate::icons::EXTENSIONS.s(),
             "panel:ai" => crate::icons::AI_CHAT.s(),
+            "panel:board" => crate::icons::BOARD.s(),
             "bottom:settings" => crate::icons::SETTINGS.s(),
             _ => return None,
         })
@@ -3630,6 +3632,27 @@ impl App {
                     .ext_sidebar_system
                     .borrow()
                     .render(backend, body_rect);
+            }
+            PANEL_BOARD => {
+                // #521: generic Board panel host — the *only* GTK-specific
+                // code here is picking which `screen.board` field to read
+                // and where to put the rect; the actual rasterisation is
+                // `Backend::draw_board`, the same call TUI's
+                // `panels::render_board_panel` makes (Platform-Neutrality
+                // Rule: no bespoke board drawing per backend).
+                if let Some(ref board) = screen.board {
+                    if let Some(ref model) = board.model {
+                        let layout = backend.draw_board(q_sb, model);
+                        engine.board_layout.replace(Some(layout));
+                    } else {
+                        engine.board_layout.replace(None);
+                        if let Some(ref status) = board.status {
+                            let bar = render::board_status_bar(status, theme);
+                            let rect = quadraui::Rect::new(q_sb.x, q_sb.y, q_sb.width, lh as f32);
+                            let _ = backend.draw_status_bar(rect, &bar, None, None);
+                        }
+                    }
+                }
             }
             PANEL_SETTINGS => {
                 // #1343: Settings is a shell bottom item that owns the
@@ -6461,6 +6484,9 @@ impl App {
                 true
             }
             render::SidebarOwner::Ai => self.route_ai_sidebar_event(event, starts_interaction),
+            render::SidebarOwner::Board => {
+                self.route_board_sidebar_event(event, pos, starts_interaction)
+            }
             // Unknown panel id: nothing was painted, so there is nothing
             // for a click to hit — let it fall through rather than
             // swallow it.
@@ -6545,6 +6571,39 @@ impl App {
         };
         let mut engine = self.engine.borrow_mut();
         render::route_sc_sidebar_click(&mut engine, event, pos, &bands, starts_interaction);
+        true
+    }
+
+    /// Sidebar routing for the Board panel (#521).
+    ///
+    /// `render::route_board_click` resolves the press against the
+    /// `quadraui::BoardLayout` `paint_sidebar_panel_rung`'s `PANEL_BOARD`
+    /// arm cached at paint time — the same "paint caches, click reads"
+    /// contract as `Engine::ext_panel_tree_layout`. Consumed
+    /// unconditionally like every other panel arm here, per
+    /// [`Self::route_sc_sidebar_event`]'s neighbouring doc.
+    fn route_board_sidebar_event(
+        &mut self,
+        event: &quadraui::UiEvent,
+        pos: quadraui::Point,
+        starts_interaction: bool,
+    ) -> bool {
+        let mut engine = self.engine.borrow_mut();
+        if starts_interaction {
+            engine.board_has_focus = true;
+        }
+        match event {
+            quadraui::UiEvent::DoubleClick { .. } => {
+                render::route_board_click(&mut engine, pos, true);
+            }
+            quadraui::UiEvent::MouseDown {
+                button: quadraui::MouseButton::Left,
+                ..
+            } => {
+                render::route_board_click(&mut engine, pos, false);
+            }
+            _ => {}
+        }
         true
     }
 

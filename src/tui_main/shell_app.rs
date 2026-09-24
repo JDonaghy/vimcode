@@ -1209,6 +1209,7 @@ impl TuiShellApp {
                 PANEL_GIT => ("Source Control", "Source Control"),
                 PANEL_EXTENSIONS => ("Extensions", "Extensions"),
                 PANEL_AI => ("AI Assistant", "AI Assistant"),
+                PANEL_BOARD => ("Board", "Board"),
                 _ => unreachable!("title_tooltip called with a non-fixed panel id: {id:?}"),
             }
         }
@@ -5855,8 +5856,8 @@ mod tests {
     }
 
     /// End-to-end: clicking the extension panel's icon must open *that*
-    /// panel's body. Row 7 = hamburger@0, explorer@1, search@2, debug@3,
-    /// git@4, extensions@5, ai@6, ext@7 — the same index
+    /// panel's body. Row 8 = hamburger@0, explorer@1, search@2, debug@3,
+    /// git@4, extensions@5, ai@6, board@7 (#521), ext@8 — the same index
     /// `resolve_activity_bar_click` (the legacy mouse path) assigns, since
     /// `Engine::ext_activity_panels` appends in the same sorted order.
     /// "Git Insights" is the panel *title*, which only `render_ext_panel`
@@ -5872,7 +5873,7 @@ mod tests {
         driver.dispatch(quadraui::UiEvent::WindowFocused(true));
         driver.render();
 
-        driver.click(1.0, 7.0);
+        driver.click(1.0, 8.0);
         let screen = driver.screen();
         assert!(
             screen.to_uppercase().contains("GIT INSIGHTS"),
@@ -10138,11 +10139,11 @@ mod tests {
         // Same reveal-then-click sequence as
         // `driver_click_on_extension_icon_opens_the_plugin_panel`: one benign
         // event lets `take_requested_panel` steer the runner onto the shadow's
-        // real panel before the icon click, and row 7 is this fixture's only
-        // extension icon (hamburger@0 .. ai@6, ext@7).
+        // real panel before the icon click, and row 8 is this fixture's only
+        // extension icon (hamburger@0 .. ai@6, board@7 (#521), ext@8).
         driver.dispatch(quadraui::UiEvent::WindowFocused(true));
         driver.render();
-        driver.click(1.0, 7.0);
+        driver.click(1.0, 8.0);
 
         assert!(
             driver.screen_contains("AlphaItemZQXW817"),
@@ -10256,7 +10257,7 @@ mod tests {
         driver.set_double_click_folding(false);
         driver.dispatch(quadraui::UiEvent::WindowFocused(true));
         driver.render();
-        driver.click(1.0, 7.0);
+        driver.click(1.0, 8.0);
 
         assert!(
             driver.screen_contains("commit1ZQXW1086"),
@@ -10315,7 +10316,7 @@ mod tests {
         let mut driver = driver_with_shell(app, cfg, 80, 24);
         driver.dispatch(quadraui::UiEvent::WindowFocused(true));
         driver.render();
-        driver.click(1.0, 7.0);
+        driver.click(1.0, 8.0);
 
         let target = driver
             .find_bounds("commit2ZQXW1086")
@@ -10423,7 +10424,7 @@ mod tests {
         driver.set_double_click_folding(false);
         driver.dispatch(quadraui::UiEvent::WindowFocused(true));
         driver.render();
-        driver.click(1.0, 7.0);
+        driver.click(1.0, 8.0);
 
         assert!(
             driver.screen_contains("commitZQXW499") && driver.screen_contains("stashZQXW499"),
@@ -14614,6 +14615,142 @@ mod tests {
         assert!(
             screen.contains("AI ASSISTANT"),
             "AI panel chrome should paint via TuiShellApp::render_content; screen:\n{screen}"
+        );
+    }
+
+    /// Install a mock board provider — an installed extension whose
+    /// manifest declares `[board]` (#522's seam). No coordinator (or any
+    /// other specific provider) anywhere in this test, per #521's "generic
+    /// host" scope.
+    fn install_mock_board_provider(engine: &mut Engine) {
+        let mut manifest = crate::core::extensions::ExtensionManifest {
+            name: "mock-board".to_string(),
+            ..Default::default()
+        };
+        manifest.board = Some(crate::core::extensions::BoardProviderConfig {
+            refresh_command: vec!["mock-provider".to_string()],
+            poll_interval_secs: 30,
+            actions: Default::default(),
+        });
+        engine
+            .extension_state
+            .installed
+            .push(crate::core::session::InstalledExtension {
+                name: manifest.name.clone(),
+                version: String::new(),
+            });
+        engine.ext_registry = Some(vec![manifest]);
+    }
+
+    fn mock_board_model() -> quadraui::BoardModel {
+        quadraui::BoardModel {
+            id: quadraui::WidgetId::new("board"),
+            columns: vec![quadraui::BoardColumn {
+                id: quadraui::WidgetId::new("col:backlog"),
+                title: "Backlog".to_string(),
+                cards: vec![quadraui::BoardCard {
+                    id: quadraui::WidgetId::new("card:1"),
+                    title: "Improve board host".to_string(),
+                    labels: vec![],
+                    badges: vec![],
+                    hint: None,
+                }],
+                scroll_offset: 0,
+            }],
+            selected_card_id: Some(quadraui::WidgetId::new("card:1")),
+            col_scroll_offset: 0,
+        }
+    }
+
+    /// #521 Phase 0 acceptance: selecting Board renders a board sourced from
+    /// a mock provider — proving the generic host works with no coordinator
+    /// present anywhere. Asserts on the rendered screen text (`ratatui`
+    /// buffer contents via `Backend::draw_board`), not on `board_model`
+    /// being populated (#587/#592's lesson: state populated is not evidence
+    /// of paint).
+    #[test]
+    fn render_content_paints_board_panel_from_mock_provider_via_shell_app() {
+        let mut app = TuiShellApp::new(None);
+        install_mock_board_provider(&mut app.engine);
+        app.engine.board_model = Some(mock_board_model());
+        app.engine
+            .app_shell
+            .show_panel(&quadraui::WidgetId::new(PANEL_BOARD));
+
+        let driver = driver_with_shell(app, config(), 80, 24);
+        let screen = driver.screen();
+        assert!(
+            screen.contains("Improve board host"),
+            "Board panel should paint the mock provider's card via \
+             TuiShellApp::render_content; screen:\n{screen}"
+        );
+        assert!(
+            screen.contains("Backlog"),
+            "the column header should paint too; screen:\n{screen}"
+        );
+    }
+
+    /// With no provider configured at all, the generic host says so rather
+    /// than implying a missing coordinator (design doc §7).
+    #[test]
+    fn render_content_paints_board_panel_no_provider_status_via_shell_app() {
+        let mut app = TuiShellApp::new(None);
+        app.engine
+            .app_shell
+            .show_panel(&quadraui::WidgetId::new(PANEL_BOARD));
+
+        let driver = driver_with_shell(app, config(), 80, 24);
+        let screen = driver.screen();
+        // The default sidebar width truncates the full sentence — assert on
+        // the prefix that survives, which is enough to tell "no provider"
+        // apart from a stale/empty board.
+        assert!(screen.contains("No board provider"), "screen:\n{screen}");
+    }
+
+    /// Clicking a card selects it (#521 Phase 0: "Key/click -> BoardAction;
+    /// only selection/open are handled"). `driver.app()` returns an opaque
+    /// `impl AppLogic` on TUI (no accessor back to the concrete
+    /// `TuiShellApp`/`Engine`, see `Self::composed_frame`'s doc), so this
+    /// probes the *rasterised* effect instead: the TUI board rasteriser
+    /// paints the selected card's body with `theme.board_selected_card_bg`
+    /// (`quadraui::tui::board::draw_board`) — a real style change a user
+    /// would see, not `Engine::board_model` being populated (#587/#592).
+    #[test]
+    fn board_panel_click_selects_the_clicked_card_via_shell_app() {
+        let mut app = TuiShellApp::new(None);
+        install_mock_board_provider(&mut app.engine);
+        let mut model = mock_board_model();
+        model.columns[0].cards.push(quadraui::BoardCard {
+            id: quadraui::WidgetId::new("card:2"),
+            title: "Second card".to_string(),
+            labels: vec![],
+            badges: vec![],
+            hint: None,
+        });
+        model.selected_card_id = Some(quadraui::WidgetId::new("card:1"));
+        app.engine.board_model = Some(model);
+        app.engine
+            .app_shell
+            .show_panel(&quadraui::WidgetId::new(PANEL_BOARD));
+
+        let mut driver = driver_with_shell(app, config(), 80, 24);
+        let screen = driver.screen();
+        let lines: Vec<&str> = screen.lines().collect();
+        let (row, col) = lines
+            .iter()
+            .enumerate()
+            .find_map(|(i, l)| l.find("Second card").map(|c| (i, c)))
+            .unwrap_or_else(|| panic!("'Second card' must be painted; screen:\n{screen}"));
+        let before = driver.style_at(col as u16, row as u16);
+
+        driver.click(col as f32 + 1.0, row as f32);
+
+        let after = driver.style_at(col as u16, row as u16);
+        assert_ne!(
+            before.map(|s| s.bg),
+            after.map(|s| s.bg),
+            "clicking 'Second card' must repaint it as selected \
+             (a background change), before: {before:?}, after: {after:?}"
         );
     }
 

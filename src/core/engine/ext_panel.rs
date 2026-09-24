@@ -286,7 +286,7 @@ impl Engine {
                     .position(|n| self.ext_panel_active.as_deref() == Some(n.as_str()))
                     .unwrap_or(0);
                 self.ext_panel_has_focus = false;
-                self.activity_bar_focus_in_at(8 + idx as u16);
+                self.activity_bar_focus_in_at(sidebar::TOOLBAR_IDX_EXT_BASE + idx as u16);
             }
             "j" | "Down" => {
                 let max = self.ext_panel_flat_len();
@@ -2371,7 +2371,7 @@ impl Engine {
             };
             if !is_enum {
                 self.settings_has_focus = false;
-                self.activity_bar_focus_in_at(7);
+                self.activity_bar_focus_in_at(sidebar::TOOLBAR_IDX_SETTINGS);
                 return;
             }
             // is_enum == true: fall through so the existing match arm cycles the value.
