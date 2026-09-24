@@ -324,7 +324,7 @@ fn is_safe_relative_path(p: &str) -> bool {
 /// free-form text from a community-submitted registry manifest, so
 /// `binary = "../.."` must not be able to turn tool cleanup into a
 /// recursive delete of an ancestor of `~/.local/share/vimcode/tools`.
-pub(crate) fn is_safe_path_segment(name: &str) -> bool {
+pub(crate) fn is_safe_single_segment_name(name: &str) -> bool {
     if name.is_empty() || name.contains('/') || name.contains('\\') {
         return false;
     }
@@ -478,25 +478,86 @@ fn http_get_bytes(url: &str, timeout_secs: u32) -> Result<Vec<u8>, AcquireError>
     Ok(output.stdout)
 }
 
-/// Reject any download URL that isn't `https://` (or, for the test suite
-/// and the `#[ignore]`d live smoke test's own fixtures, `file://`). A pure,
-/// network-free check so it's independently unit-testable (review finding
-/// on #1345 — the acceptance criteria say "Download over https only", and
-/// neither `resolve_url_template` nor the old inline check in
+/// Env var that lets the **integration**-test crates (`tests/*.rs`, which are
+/// separate compilation units where this crate's `cfg(test)` is *off*) opt
+/// back into `file://` download fixtures. Deliberately not a plain runtime
+/// flag: the read is itself inside `#[cfg(debug_assertions)]`, so a release
+/// build — i.e. every shipped vimcode binary — has no code path that can
+/// enable `file://` downloads at all, whatever the environment says.
+///
+/// Defined in every configuration (so `tests/extensions.rs` can name it
+/// instead of hard-coding the string) but *read* in only one — see
+/// [`file_url_downloads_allowed`].
+pub const ALLOW_FILE_URL_DOWNLOADS_ENV: &str = "VIMCODE_TEST_ALLOW_FILE_URL_DOWNLOADS";
+
+/// Is a `file://` download URL acceptable in *this* build?
+///
+/// Second review round on #1345: `file://` used to be accepted
+/// unconditionally, in production code, next to `https://`. That is an
+/// arbitrary-file-read primitive reachable from a community-submitted or
+/// compromised registry manifest — `[lsp.acquire]`/`[dap.acquire]` with
+/// `kind = "url-template"` and `url = "file:///home/user/.ssh/id_rsa"` made
+/// `download_asset` shell out to `curl -sfL -o <staging> file://…` (curl
+/// enables the `file` protocol by default), copying any file the vimcode
+/// process can read into a predictable `temp_dir()` staging path before any
+/// archive-format check runs. The allowance now exists **only** in test
+/// builds:
+///
+/// * in-crate unit/driver tests (`cfg(test)`) — `tool_acquire.rs`'s own
+///   end-to-end fixtures and `tui_main::shell_app`'s driver tests — get it
+///   for free;
+/// * integration-test crates opt in explicitly via
+///   [`ALLOW_FILE_URL_DOWNLOADS_ENV`], and even that read is compiled out
+///   of `--release` builds by the `debug_assertions` gate.
+///
+/// A shipped binary therefore accepts `https://` and nothing else.
+fn file_url_downloads_allowed() -> bool {
+    #[cfg(test)]
+    {
+        true
+    }
+    #[cfg(all(not(test), debug_assertions))]
+    {
+        std::env::var_os(ALLOW_FILE_URL_DOWNLOADS_ENV).is_some_and(|v| v == "1")
+    }
+    #[cfg(all(not(test), not(debug_assertions)))]
+    {
+        false
+    }
+}
+
+/// Reject any download URL that isn't `https://`. A pure, network-free check
+/// so it's independently unit-testable (review finding on #1345 — the
+/// acceptance criteria say "Download over https only", and neither
+/// `resolve_url_template` nor the old inline check in
 /// `install_resolved_asset` enforced it): a manifest (or a compromised/
 /// typo'd registry entry) declaring a plain `http://` URL is rejected here
 /// rather than fetched in the clear, for every acquire kind
 /// (`hashicorp-release`, `github-release`, `url-template` all funnel
 /// through `install_resolved_asset`, so this is the one choke point that
 /// covers all three).
+///
+/// `file://` is accepted *only* in test builds — see
+/// [`file_url_downloads_allowed`] for why that is a compile-time property
+/// and not a runtime one.
 fn validate_download_url(url: &str) -> Result<(), AcquireError> {
-    if url.starts_with("https://") || url.starts_with("file://") {
-        Ok(())
-    } else {
-        Err(AcquireError::BadConfig(format!(
-            "refusing to download over a non-https URL: {url}"
-        )))
+    validate_download_url_with(url, file_url_downloads_allowed())
+}
+
+/// The scheme check itself, with the `file://` allowance passed in rather
+/// than read from the build configuration — so the unit tests below can
+/// assert the exact behaviour of a **release** build (`allow_file_urls =
+/// false`) even though they necessarily run in a `cfg(test)` one.
+fn validate_download_url_with(url: &str, allow_file_urls: bool) -> Result<(), AcquireError> {
+    if url.starts_with("https://") {
+        return Ok(());
     }
+    if allow_file_urls && url.starts_with("file://") {
+        return Ok(());
+    }
+    Err(AcquireError::BadConfig(format!(
+        "refusing to download over a non-https URL: {url}"
+    )))
 }
 
 /// Download the resolved asset archive to `dest`. Deliberately its own
@@ -508,7 +569,8 @@ fn validate_download_url(url: &str) -> Result<(), AcquireError> {
 /// writing a near-empty/HTML body instead of the real archive. `-sfL`
 /// matches the flag set `http_get_bytes` above already uses for the JSON
 /// API calls in this module. `file://` URLs (used by this module's own
-/// tests, see the `tests` block below) are unaffected by `-L`.
+/// tests, see the `tests` block below — and rejected outright in a release
+/// build, see `validate_download_url`) are unaffected by `-L`.
 fn download_asset(url: &str, dest: &Path) -> Result<(), AcquireError> {
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)?;
@@ -649,6 +711,16 @@ fn resolve_github_release(
     // GitHub releases have no standard checksum-file location; a mismatch
     // here is silently absent rather than fabricated. Callers should still
     // prefer `hashicorp-release` when available for exactly this reason.
+    //
+    // Review note (#1345): this makes the "SHA-256 verification is mandatory
+    // whenever the upstream publishes checksums" criterion vacuously true for
+    // this kind — the upstream publishes nothing to verify against, so the
+    // only integrity guarantee a `github-release` acquisition has is TLS
+    // (`validate_download_url` refuses anything but `https://`). A registry
+    // manifest should therefore use `hashicorp-release`, or a `url-template`
+    // pointing at a checksummed artifact, whenever the project offers one,
+    // and `github-release` only as a last resort. Worth restating in the
+    // extension-authoring docs when they land.
     Ok(ResolvedAsset {
         url,
         version,
@@ -1375,13 +1447,12 @@ cafebabe00000000000000000000000000000000000000000000000000000000  terraform-ls_0
     }
 
     #[test]
-    fn validate_download_url_accepts_https_and_file_rejects_others() {
+    fn validate_download_url_accepts_https_and_rejects_every_other_scheme() {
         // Pure, network-free check (review finding on #1345) — exercised
         // directly rather than through `install_resolved_asset`, which
         // would otherwise need a real network call for any URL that gets
         // past the scheme check.
         assert!(validate_download_url("https://example.com/tool.zip").is_ok());
-        assert!(validate_download_url("file:///tmp/tool.zip").is_ok());
         for bad in [
             "http://example.com/tool.zip",
             "ftp://example.com/tool.zip",
@@ -1394,6 +1465,40 @@ cafebabe00000000000000000000000000000000000000000000000000000000  terraform-ls_0
                 "expected {bad:?} to be rejected as BadConfig, got {err:?}"
             );
         }
+    }
+
+    #[test]
+    fn release_builds_reject_file_urls_outright() {
+        // Second review round on #1345: `file://` used to be accepted
+        // unconditionally in production code, giving a community-submitted
+        // or compromised registry manifest an arbitrary-file-read primitive
+        // (`url = "file:///home/user/.ssh/id_rsa"` → `curl -o <staging>`).
+        // The allowance is now a *build* property, so assert the release
+        // behaviour directly by passing the production value of the flag.
+        //
+        // RED against the previous commit: `validate_download_url` there had
+        // no flag at all and returned `Ok(())` for every one of these.
+        for hostile in [
+            "file:///home/user/.ssh/id_rsa",
+            "file:///etc/passwd",
+            "file://localhost/etc/shadow",
+        ] {
+            let err = validate_download_url_with(hostile, false).unwrap_err();
+            assert!(
+                matches!(err, AcquireError::BadConfig(_)),
+                "a release build must refuse {hostile:?}, got {err:?}"
+            );
+        }
+        // https is unaffected by the flag in either direction.
+        assert!(validate_download_url_with("https://example.com/t.zip", false).is_ok());
+        assert!(validate_download_url_with("https://example.com/t.zip", true).is_ok());
+        // …and the test-build allowance is what lets this module's own
+        // end-to-end fixtures work.
+        assert!(validate_download_url_with("file:///tmp/tool.zip", true).is_ok());
+        assert!(
+            file_url_downloads_allowed(),
+            "in-crate `cfg(test)` builds must keep the `file://` fixture allowance"
+        );
     }
 
     // ── path-traversal guard on `tool_name`/`version` (review finding) ──

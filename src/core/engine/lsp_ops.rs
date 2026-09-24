@@ -590,8 +590,13 @@ impl Engine {
     /// Apply the results of one or more completed background acquisitions
     /// belonging to the same extension: on success, register + start the
     /// LSP server (mirrors `terminal_ops::finalize_install_from_terminal`'s
-    /// LSP branch) or, for a DAP leg, just report success — `dap_manager`
-    /// re-resolves the binary lazily at debug-start time. On failure,
+    /// LSP branch) or, for a DAP leg, just report success — there is no
+    /// long-lived adapter process to start here; `DapManager::start_adapter`
+    /// resolves the adapter binary at debug-start time via
+    /// `dap_manager::resolve_binary`, which (since this issue) delegates to
+    /// the same `lsp_manager::resolve_command` that probes the
+    /// vimcode-managed tools dir this acquisition just populated, so the
+    /// success message painted here and the F5 launch agree. On failure,
     /// delete nothing further (`tool_acquire::acquire_and_install` already
     /// cleaned up its own partial state) and surface the error. Each
     /// outcome resolves its own notification by ID (never "by kind" — see
@@ -874,7 +879,7 @@ impl Engine {
             // user's home directory. Gate on the same predicate
             // `tool_acquire::install_resolved_asset` already applies to this
             // identical value on the way in.
-            if !crate::core::tool_acquire::is_safe_path_segment(bin_name) {
+            if !crate::core::tool_acquire::is_safe_single_segment_name(bin_name) {
                 crate::core::lsp_manager::install_log(&format!(
                     "[ext-remove] Refusing to remove tools for unsafe binary \
                      name {bin_name:?} declared by '{name}' — not a plain \
@@ -1352,7 +1357,7 @@ mod tests {
     /// else.
     ///
     /// **Verified RED without the guard:** removing the
-    /// `is_safe_path_segment` check from `ext_remove_tools` makes the
+    /// `is_safe_single_segment_name` check from `ext_remove_tools` makes the
     /// sentinel directory (and the file inside it) gone by the time the
     /// assertions run.
     ///
@@ -1435,10 +1440,13 @@ mod tests {
     /// a nested name is just as much an escape as `..` when it is joined
     /// onto a directory that is about to be deleted.
     #[test]
-    fn is_safe_path_segment_accepts_only_plain_file_names() {
-        use crate::core::tool_acquire::is_safe_path_segment;
+    fn is_safe_single_segment_name_accepts_only_plain_file_names() {
+        use crate::core::tool_acquire::is_safe_single_segment_name;
         for good in ["rust-analyzer", "clangd", "terraform-ls", "gopls.exe"] {
-            assert!(is_safe_path_segment(good), "{good:?} must be accepted");
+            assert!(
+                is_safe_single_segment_name(good),
+                "{good:?} must be accepted"
+            );
         }
         for bad in [
             "",
@@ -1452,7 +1460,10 @@ mod tests {
             "./x",
             "sub/../..",
         ] {
-            assert!(!is_safe_path_segment(bad), "{bad:?} must be rejected");
+            assert!(
+                !is_safe_single_segment_name(bad),
+                "{bad:?} must be rejected"
+            );
         }
     }
 }
