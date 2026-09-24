@@ -907,6 +907,81 @@ pub fn folder_picker_click_outside_dismisses_it<D: ConformanceDriver + DriverInp
     );
 }
 
+/// #1360: clicking a panel's activity-bar icon must move keyboard focus
+/// into that panel, on every backend — the exact repro this issue reports:
+/// with a multi-line buffer, clicking the Search icon then typing `jj` on
+/// unfixed GTK left focus on the editor (`jj` moved the cursor down two
+/// lines, `Ln 1` → `Ln 3`), while TUI already routed `jj` into the search
+/// box.
+///
+/// Locates the Search activity-bar icon via
+/// `FrameInventory::zones()` — [`crate::core::engine::sidebar::PANEL_SEARCH`]
+/// is literally the `"panel:search"` `WidgetId`
+/// `compose::app_shell::AppShell::render`'s `register_chrome_zones` keys
+/// every activity-bar item's zone by (see that struct's own doc) — rather
+/// than `click_text`, since the icon's fallback glyph (`crate::icons::
+/// SEARCH`'s ASCII fallback is `"/"`) collides with ordinary path
+/// separators the explorer tree paints for any repo with subdirectories.
+///
+/// Asserts on the painted global status bar's "Ln N, Col N" cursor-position
+/// segment (`render::build_status_line`, painted whenever `'ruler'` is on —
+/// the engine default) rather than reading `engine.search_has_focus`
+/// directly: this is the exact rendered signal a user watches, and it is
+/// what the issue's own repro named ("Ln 1 → Ln 3"). Painting-only
+/// assertions are the CLAUDE.md rule #587/#592 exist to enforce — reading
+/// the flag instead would pass even if the click moved the *shadow*
+/// `engine.app_shell`'s belief but some other bug left the real key
+/// dispatch routed to the editor regardless.
+///
+/// Two Escapes, not one, are needed to fully return focus to the editor:
+/// `Engine::dispatch_search_sidebar_key_unified`'s query-input Escape arm
+/// only demotes the query field to the panel's own results list (a second,
+/// in-panel focus move), matching the identical two-step return this
+/// scenario's `tui_prod` arm already has today — the first Escape must
+/// still block the following motion key from reaching the editor, or this
+/// scenario would not be exercising the real contract.
+pub fn activity_bar_click_focuses_search_panel<D: ConformanceDriver + DriverInput>(driver: &mut D) {
+    let search_zone = driver
+        .inventory()
+        .zones()
+        .iter()
+        .find(|z| z.id.as_str() == crate::core::engine::sidebar::PANEL_SEARCH)
+        .map(|z| z.bounds)
+        .expect("the Search activity-bar icon must register a chrome zone");
+
+    assert!(
+        driver.screen_has("Ln 1,"),
+        "precondition: a fresh buffer starts with the cursor on line 1"
+    );
+
+    driver.click(
+        search_zone.x + search_zone.width / 2.0,
+        search_zone.y + search_zone.height / 2.0,
+    );
+    driver.type_text("jj");
+
+    assert!(
+        driver.screen_has("Ln 1,"),
+        "clicking the Search icon then typing 'jj' must not move the \
+         editor cursor -- the click must move keyboard focus into the \
+         search panel, not leave it on the editor"
+    );
+    assert!(
+        driver.screen_has("jj"),
+        "'jj' must land in the search panel's query box"
+    );
+
+    ConformanceDriver::press_named(driver, NamedKey::Escape);
+    ConformanceDriver::press_named(driver, NamedKey::Escape);
+    driver.type_text("j");
+
+    assert!(
+        driver.screen_has("Ln 2,"),
+        "Esc, Esc must return keyboard focus to the editor -- a motion key \
+         typed afterwards must move the cursor"
+    );
+}
+
 /// #984: v0.11.0 bug report — a single click on the file explorer's
 /// expand/collapse chevron does nothing; expanding the directory needs a
 /// *second* click, while a single click anywhere on the same row's text
@@ -4216,4 +4291,46 @@ mod issue_1256_sidebar_chrome {
     arms!(settings_header_names_settings, engine_fixture());
     arms!(settings_then_explorer_reclaims_header, engine_fixture());
     arms!(settings_filter_row_is_painted, engine_with_settings_query());
+}
+
+/// #1360: cross-backend wiring for
+/// [`activity_bar_click_focuses_search_panel`] — see that scenario's own
+/// doc for the repro and the assertions' rationale.
+///
+/// No `tui` arm (only `gtk` and `tui_prod`, same shape as
+/// `tab_bar_click_closes_via_shared_dispatch`'s own note above): at this
+/// harness's viewport size, `App` driven by `quadraui::tui::TuiBackend`
+/// (the `tui` control arm) never paints the editor's buffer content at
+/// all — no `"line N"` text run, no status-bar `"Ln N, Col N"` segment —
+/// even though the same `engine_fixture()` and the same `App` paint both
+/// correctly under `gtk`. That is a pre-existing gap in this control
+/// fixture unrelated to this issue's `PanelChanged` focus fix (confirmed
+/// by hand: `FrameInventory::zones()` still reports a correctly-sized,
+/// non-empty `app-shell:main-content` zone on that arm, so the zone
+/// geometry itself is not the problem) — left as a call-out for whoever
+/// investigates it next, rather than routed around here.
+#[cfg(test)]
+mod issue_1360_activity_bar_click_focuses_panel {
+    use super::*;
+
+    fn engine_fixture() -> crate::core::Engine {
+        let mut engine = crate::core::Engine::new_for_test();
+        engine.settings.use_nerd_fonts = Some(false);
+        let text = (1..=30)
+            .map(|n| format!("line {n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        engine.buffer_mut().insert(0, &text);
+        engine
+    }
+
+    crate::backend_conformance! {
+        label: activity_bar_click_focuses_search_panel_proof,
+        backends: [gtk, tui_prod],
+        engine: engine_fixture(),
+        size: (800, 480),
+        body: |driver| {
+            crate::harness::activity_bar_click_focuses_search_panel(driver);
+        },
+    }
 }
