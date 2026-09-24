@@ -6563,6 +6563,170 @@ mod editor_popups {
         assert!(rect.width > 0.0 && rect.height > 0.0);
     }
 
+    /// #1373, GTK half: a gutter click must open the diagnostic hover for a
+    /// buffer opened through a **non-canonical** path.
+    ///
+    /// `Engine::lsp_diagnostics` is keyed by the canonical absolute path
+    /// (#208), and that is the key `build_rendered_window` uses when it
+    /// fills `RenderedWindow::diagnostic_gutter` — so the gutter *marker*
+    /// paints and `click.rs`'s shared `execute_gutter_action` /
+    /// `render::apply_gutter_action` routes the click. The hover-side
+    /// lookups in `Engine` (`ext_panel.rs`) used the buffer's raw
+    /// `file_path` instead, so the click found no diagnostic and popped no
+    /// hover — a painted affordance that did nothing whenever the buffer
+    /// was opened through a path that isn't already canonical. TUI twin:
+    /// `tui_main::shell_app::tests::
+    /// gutter_click_opens_diagnostic_hover_for_a_non_canonical_buffer_path_via_shell_app`.
+    ///
+    /// The click's `(x, y)` is derived from the last frame's own painted
+    /// `RenderedWindow` geometry — never a hardcoded pixel (#555): the
+    /// diagnostic's row is located by scanning `rw.lines` for
+    /// `line_idx == DIAG_LINE`, and the gutter column is anything left of
+    /// `rw.gutter_char_width * painted_char_width()` (`window_zone_hit_test`,
+    /// `render.rs`). The hover text is asserted through `screen_contains`
+    /// — the editor-hover popup renders through quadraui's markdown
+    /// widget, which *is* text-recorded (unlike raw editor-pane glyphs,
+    /// see `Harness::window_center`'s doc comment), so this reads painted
+    /// content, not state.
+    ///
+    /// A `WindowResized` dispatch follows the first two settle frames,
+    /// exactly like `click_column_tracks_a_runtime_font_size_change_on_gtk`
+    /// above: `App::cached_line_height`/`cached_char_width` — what
+    /// `window_zone_hit_test`'s row/gutter-column arithmetic actually
+    /// resolves clicks against — are refreshed from `Backend::line_height`/
+    /// `char_width` only on that event (a real GTK app gets one from the OS
+    /// on basically every settle; a headless `GtkDriver` test never fires
+    /// one on its own). Without it they stay at the driver's construction-
+    /// time default, which #947 documents as no longer close to the real
+    /// painted metrics at the current default `settings.font_size` — a
+    /// gutter click at any row past the first would resolve against the
+    /// wrong view row.
+    ///
+    /// Opens the file through a `..` segment so `file_path != canonical_path`
+    /// on every platform, not just macOS's symlinked temp dir.
+    ///
+    /// **Verified RED against unfixed `develop`**: restoring
+    /// `active_buffer_path()` (raw `file_path`) in
+    /// `Engine::trigger_editor_hover_for_line` makes the final
+    /// `screen_contains` assertion below fail — the gutter marker still
+    /// paints and the click still routes, but no hover text ever reaches
+    /// the screen.
+    #[test]
+    fn gutter_click_opens_diagnostic_hover_for_a_non_canonical_buffer_path_on_gtk() {
+        const DIAG_LINE: usize = 2;
+        const HOVER_MSG: &str = "non-canonical gutter diagnostic gtk";
+
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_test_1373_diag_key_gtk_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        let file = dir.join("dk1373gtk.txt");
+        let content: String = (0..20).map(|i| format!("DKG1373_{i:03}\n")).collect();
+        std::fs::write(&file, &content).unwrap();
+
+        // The same file, reached through a `..` segment: `canonicalize`
+        // resolves it on every platform, so `file_path != canonical_path`
+        // on Linux too — not just on macOS's symlinked temp dir.
+        let via_dotdot = dir.join("sub").join("..").join("dk1373gtk.txt");
+        let canonical = via_dotdot.canonicalize().unwrap();
+        assert_ne!(
+            via_dotdot, canonical,
+            "test setup sanity: the open path must differ from the \
+             canonical one, otherwise this test cannot reach the bug"
+        );
+
+        let mut engine = Engine::new_for_test();
+        engine.settings.autohide_panels = false;
+        engine.app_shell.hide_sidebar();
+        engine.session.explorer_visible = false;
+        engine
+            .open_file_with_mode(&via_dotdot, crate::core::engine::OpenMode::Permanent)
+            .unwrap();
+
+        engine.lsp_diagnostics.insert(
+            canonical,
+            vec![crate::core::lsp::Diagnostic {
+                range: crate::core::lsp::LspRange {
+                    start: crate::core::lsp::LspPosition {
+                        line: DIAG_LINE as u32,
+                        character: 0,
+                    },
+                    end: crate::core::lsp::LspPosition {
+                        line: DIAG_LINE as u32,
+                        character: 5,
+                    },
+                },
+                severity: crate::core::lsp::DiagnosticSeverity::Error,
+                message: HOVER_MSG.to_string(),
+                source: None,
+                code: None,
+            }],
+        );
+
+        let win_id = engine.active_window_id();
+        let mut h = harness(engine, 1400, 900);
+        h.driver.render();
+        h.driver.render();
+        // Sync `cached_line_height`/`cached_char_width` to the metrics this
+        // frame actually painted with — see the doc comment above.
+        let viewport = {
+            use quadraui::Backend as _;
+            h.driver.backend().viewport()
+        };
+        h.driver
+            .dispatch(quadraui::UiEvent::WindowResized { viewport });
+        h.driver.render();
+
+        let (click_x, click_y) = {
+            let layout = h.screen_layout.borrow();
+            let layout = layout.as_ref().expect("a frame must have been painted");
+            let rw = layout
+                .windows
+                .iter()
+                .find(|w| w.window_id == win_id)
+                .expect("the active window must have painted a RenderedWindow");
+            let view_row = rw
+                .lines
+                .iter()
+                .position(|rl| rl.line_idx == DIAG_LINE)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "the diagnostic's line ({DIAG_LINE}) must be in the \
+                         painted viewport; lines: {:?}",
+                        rw.lines.iter().map(|rl| rl.line_idx).collect::<Vec<_>>()
+                    )
+                });
+            assert!(
+                rw.gutter_char_width > 0,
+                "test setup sanity: line numbers must be on so this test has \
+                 a gutter column to click"
+            );
+            let line_height = h
+                .painted_line_height()
+                .expect("a frame must have painted a line height");
+            let char_width = h.painted_char_width();
+            (
+                rw.rect.x + char_width / 2.0,
+                rw.rect.y + view_row as f64 * line_height + line_height / 2.0,
+            )
+        };
+
+        h.driver.click(click_x as f32, click_y as f32);
+        h.driver.render();
+
+        assert!(
+            h.driver.screen_contains(HOVER_MSG),
+            "clicking the diagnostic gutter marker must paint the \
+             diagnostic hover even though the buffer was opened through a \
+             non-canonical path ({via_dotdot:?})"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// #821: hover popups adopt `quadraui::compose::markdown::render_markdown_to_styled`
     /// instead of vimcode's hand-rolled `MdStyle`-to-color span walk. GTK twin
     /// of `tui_main::shell_app::tests::
