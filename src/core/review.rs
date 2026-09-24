@@ -167,14 +167,27 @@ impl ChangeReviewState {
     /// Append more entries to an already-open review (a later
     /// `tool_call_update` streaming in another diff, say) rather than
     /// opening a second, competing surface.
+    ///
+    /// Skips any incoming `change` that is byte-identical (`path`,
+    /// `old_text`, `new_text` all equal) to an entry already present —
+    /// a guard against a replaying/buggy ACP agent that re-announces the
+    /// same `toolCallId` with the same `diff` content producing a second,
+    /// redundant entry for the same edit. This module stays source-agnostic
+    /// (no `toolCallId` in [`ProposedChange`]), so "identical" is the only
+    /// signal available here; a change to the same `path` with different
+    /// text is a real edit and is still appended, matching the "addressable
+    /// collection" intent one level up (`Engine::acp_upsert_tool_call`
+    /// upserts by id; this is the same policy applied to content it
+    /// can't key by id).
     pub fn extend(&mut self, changes: Vec<ProposedChange>) {
-        let start = self.entries.len();
-        self.entries.extend(
-            changes
-                .into_iter()
-                .enumerate()
-                .map(|(i, c)| ChangeReviewEntry::new(c, start + i)),
-        );
+        let mut next_id = self.entries.len();
+        for change in changes {
+            if self.entries.iter().any(|e| e.change == change) {
+                continue;
+            }
+            self.entries.push(ChangeReviewEntry::new(change, next_id));
+            next_id += 1;
+        }
     }
 
     pub fn current_entry(&self) -> Option<&ChangeReviewEntry> {
@@ -369,5 +382,30 @@ mod tests {
         assert_eq!(state.entries.len(), 2);
         assert_eq!(state.entries[0].change.path, "a");
         assert_eq!(state.entries[1].change.path, "b");
+    }
+
+    /// Guard against a replaying/buggy ACP agent re-announcing the same
+    /// `toolCallId` with the same `diff` content: `extend` must not
+    /// produce a second, byte-identical entry for the same edit.
+    #[test]
+    fn extend_skips_a_byte_identical_duplicate_change() {
+        let mut state = ChangeReviewState::new(vec![change("a", Some("x"), "y")]);
+        state.extend(vec![change("a", Some("x"), "y")]);
+        assert_eq!(
+            state.entries.len(),
+            1,
+            "re-announcing an identical change must not duplicate the entry"
+        );
+    }
+
+    /// A same-path change with different text IS a real edit (e.g. the
+    /// agent revising its own proposal) and must still be appended, not
+    /// swallowed by the duplicate guard above.
+    #[test]
+    fn extend_still_appends_a_same_path_change_with_different_text() {
+        let mut state = ChangeReviewState::new(vec![change("a", Some("x"), "y")]);
+        state.extend(vec![change("a", Some("x"), "z")]);
+        assert_eq!(state.entries.len(), 2);
+        assert_eq!(state.entries[1].change.new_text, "z");
     }
 }

@@ -9845,6 +9845,57 @@ pub fn paint_toast_stack_rung(
     engine.toast_layout.replace(Some(layout));
 }
 
+/// The change-review surface's modal-stack id — see
+/// [`reconcile_change_review_modal_stack`].
+fn change_review_modal_id() -> quadraui::WidgetId {
+    quadraui::WidgetId::new("change_review")
+}
+
+/// Keep the change-review surface's full-viewport bounds on the backend's
+/// `quadraui::ModalStack` in step with whether it's open (#955, review fix:
+/// the click-routing test this exists for). Same "reconcile so chrome
+/// hit-testing yields to an open overlay" pattern `app.rs`'s
+/// `reconcile_editor_hover_modal` and `mouse.rs`'s context-menu/picker
+/// reconcile blocks already use — see quadraui's `ShellAdapter::handle`
+/// doc (issue #411) for why an overlay that visually covers shell chrome
+/// but never registers with the modal stack has its clicks silently
+/// swallowed by that chrome instead.
+///
+/// Unlike those precedents, this reconcile has to run from *paint*, not
+/// from `handle_mouse`/`handle_mouse_click_msg`: TUI's
+/// `ShellAdapter::handle` consults the modal stack **before** its own
+/// activity-bar/sidebar hit-test, and before ever calling into
+/// `ShellApp::handle` (where `handle_mouse` lives) — so a stack entry
+/// written only while a mouse event is *already* being dispatched can
+/// never be there in time for the very first click after the surface
+/// opens. The editor-hover popup gets away with reconciling from inside
+/// `handle_mouse` because it only ever opens *from* a `MouseMoved`
+/// already flowing through that same function; the change-review surface
+/// opens from an async ACP `tool_call_update` completing, with no
+/// correlated mouse event to piggyback the reconcile on. Paint is the one
+/// place guaranteed to run before that first click.
+///
+/// Registers the *whole* `viewport` (diff pane + status footer), not just
+/// the diff pane `engine.change_review_diff_rect` caches: a click on the
+/// footer must also bypass chrome rather than being swallowed by whatever
+/// activity-bar icon happens to occupy that row underneath —
+/// `route_change_review_click` still resolves a footer click to
+/// `Consume` on its own, this only decides who gets to see the click at
+/// all.
+pub fn reconcile_change_review_modal_stack(
+    b: &mut dyn quadraui::Backend,
+    open: bool,
+    viewport: quadraui::Rect,
+) {
+    let stack_rc = b.modal_stack_handle();
+    let mut stack = stack_rc.borrow_mut();
+    if open {
+        stack.push(change_review_modal_id(), viewport);
+    } else {
+        stack.pop(&change_review_modal_id());
+    }
+}
+
 /// The change-review surface's whole paint body (#955, shared with #525):
 /// a full-viewport `quadraui::DiffView` for the currently-shown entry,
 /// plus a one-row status footer ("file i of n", the entry's path, and key
@@ -9857,6 +9908,13 @@ pub fn paint_toast_stack_rung(
 /// painted (`entry.view.layout(rect, line_height).hit_test`) — same
 /// "paint writes it, click routing reads it" contract as
 /// `command_line_rect`.
+///
+/// Also reconciles the surface's modal-stack entry (see
+/// [`reconcile_change_review_modal_stack`]) — required for click-to-jump
+/// to actually reach `mouse::handle_mouse`/`App::handle_mouse_click_msg`
+/// rather than being swallowed by whatever chrome (activity-bar icon,
+/// sidebar row) happens to occupy those columns underneath the
+/// full-viewport overlay.
 pub fn paint_change_review_rung(
     b: &mut dyn quadraui::Backend,
     engine: &Engine,
@@ -9864,6 +9922,7 @@ pub fn paint_change_review_rung(
     viewport: quadraui::Rect,
     theme: &Theme,
 ) {
+    reconcile_change_review_modal_stack(b, true, viewport);
     let Some(entry) = review.current_entry() else {
         return;
     };

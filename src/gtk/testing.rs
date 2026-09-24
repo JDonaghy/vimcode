@@ -5296,6 +5296,133 @@ second line here
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// #955 (ACP-4) review follow-up, GTK's twin of `tui_main::shell_app::
+    /// tests::ai_panel_tool_call_diff_click_on_row_jumps_to_file_and_line_
+    /// via_shell_app`: "clicking a `location` jumps to that file and line"
+    /// driven through a *real mouse click* (`h.driver.click(x, y)`) against
+    /// the painted diff geometry, not `handle_change_review_key("Return",
+    /// ...)`.
+    ///
+    /// This is also the regression test for the fix this review round
+    /// shipped: before `render::reconcile_change_review_modal_stack`
+    /// existed, a click landing where the activity bar / sidebar chrome
+    /// sits underneath the full-viewport diff overlay never reached
+    /// `App::handle_mouse_click_msg` at all — quadraui's `ShellAdapter::
+    /// handle` claimed it as chrome first (issue #411's exact failure
+    /// shape) — so this deliberately clicks on `"old line"`, which paints
+    /// in the diff's *left* pane starting at column 0, squarely inside
+    /// where the activity bar/sidebar normally live.
+    ///
+    /// RED verified: with the click routed but the surface never
+    /// registered on the modal stack, this click never reached
+    /// `route_and_apply_change_review_click` — the screen kept showing the
+    /// diff/footer instead of jumping, and the on-disk file was never
+    /// touched (same failure shape confirmed live against this branch
+    /// before the modal-stack reconcile was added).
+    #[cfg(unix)]
+    #[test]
+    fn ai_panel_tool_call_diff_click_on_row_jumps_to_file_and_line_via_gtk_driver() {
+        let dir =
+            std::env::temp_dir().join(format!("acp4-gtk-tool-call-click-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("target.txt");
+        std::fs::write(&target, "old line\n").unwrap();
+        let target_str = target.to_string_lossy().into_owned();
+
+        let mut h = panel_harness(PANEL_AI);
+        {
+            let mut engine = h.engine.borrow_mut();
+            engine.workspace_root = Some(dir.clone());
+            let argv = vec![
+                "sh".to_string(),
+                concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/tests/fixtures/fake_acp_agent.sh"
+                )
+                .to_string(),
+            ];
+            let cwd = std::env::temp_dir();
+            let mut client = crate::core::acp::AcpClient::spawn_with_env(
+                &argv,
+                &cwd,
+                &[
+                    ("ACP_FAKE_TOOL_CALL", "1"),
+                    ("ACP_FAKE_TOOL_CALL_PATH", target_str.as_str()),
+                ],
+            )
+            .expect("fixture agent should spawn");
+            client.initialize();
+            engine.acp_client = Some(client);
+            engine.settings.acp_agent_command = "already-spawned-above".to_string();
+        }
+
+        let sb = h.painted_sidebar_bounds.get().unwrap();
+        h.driver.click(sb.x + 20.0, sb.y + 20.0);
+        for c in "please edit".chars() {
+            h.driver.type_char(c);
+        }
+        h.driver.ctrl_char('s');
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !h.driver.screen_contains("old line") && std::time::Instant::now() < deadline {
+            h.engine.borrow_mut().poll_acp();
+            h.driver.render();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            h.driver.screen_contains("old line") && h.driver.screen_contains("new line"),
+            "precondition: change-review surface must be open with both \
+             sides of the diff painted before the click"
+        );
+
+        // A real mouse click on the painted "old line" row, at the exact
+        // geometry `App::route_and_apply_change_review_click` resolves
+        // through `render::route_change_review_click`.
+        let (x, y) = h
+            .driver
+            .find("old line")
+            .unwrap_or_else(|| panic!("diff row 'old line' must be locatable on screen"));
+        h.driver.click(x, y);
+        h.driver.render();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while h.driver.screen_contains("a=accept") && std::time::Instant::now() < deadline {
+            h.driver.render();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        assert!(
+            !h.driver.screen_contains("a=accept"),
+            "clicking a diff row must close the change-review surface \
+             (jump, not accept)"
+        );
+        assert!(
+            !h.driver.screen_contains("new line"),
+            "the surface must be gone — 'new line' (the proposed text) \
+             must no longer paint anywhere on screen"
+        );
+        assert!(
+            h.driver.screen_contains("target.txt"),
+            "the click must have opened target.txt's own tab, proving the \
+             jump landed on the right file"
+        );
+        assert!(
+            h.driver.screen_contains("old line"),
+            "the buffer shown after the jump must be target.txt's real, \
+             unmodified on-disk content ('old line'), not the proposed \
+             ('new line') text — confirming this was a jump, not an accept"
+        );
+
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "old line\n",
+            "a click-to-jump must never write to the file — that's \
+             accept's job, not jump's"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// How long the two #957 (ACP-6) driver tests below wait on a real
     /// child process before giving up. Same value, and same rationale, as
     /// `tui_main::shell_app::tests::ACP_DRIVER_DEADLINE` — see that

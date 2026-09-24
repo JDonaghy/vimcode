@@ -45,10 +45,10 @@ fixtures/fake_acp_agent.sh`: `$ACP_FAKE_TOOL_CALL_STATUS_ONLY` (status
 transitions with no diff, so the transcript stays visible to assert
 against) and `$ACP_FAKE_TOOL_CALL` (+ `$ACP_FAKE_TOOL_CALL_PATH`, the diff
 scenario that opens the review surface and exercises accept-writes-to-disk).
-Black-box coverage: two TUI `TuiDriver` tests and two GTK `GtkDriver`
-tests (status-transition and diff-review-plus-accept, mirrored per
-backend), each RED-verified against its specific regression (status
-assignment disabled; diff-review opening disabled) before being confirmed
+Black-box coverage: three TUI `TuiDriver` tests and three GTK `GtkDriver`
+tests (status-transition, diff-review-plus-accept, and — review fix,
+same day — a real-mouse click-to-jump test per backend), each
+RED-verified against its specific regression before being confirmed
 GREEN — plus unit tests for every new parser in `core::acp`, the full
 `core::review` module (including the acceptance bar's own explicit
 non-ACP-feed test and the `oldText: null` pure-addition test), and
@@ -62,7 +62,31 @@ resolution function so the gap is "no mouse entry point yet" for that
 specific spot, not "unbuilt or untested". `cargo build`/`clippy -D
 warnings`/`fmt` clean on both feature lanes; full `cargo test --lib`
 (3675 tests, both backends compiled in) and `--no-default-features --lib`
-(3435 tests) both green.). Prior update: September 24, 2026 (#956, ACP-5 —
+(3435 tests) both green.
+
+**Review fix (same day):** the driver-tier click test the review
+demanded caught a real bug the keyboard-only unit test couldn't —
+clicking a diff row landing where chrome (menu bar/CSD title bar,
+activity bar, sidebar) sits underneath the full-viewport overlay was
+silently swallowed *before* `route_and_apply_change_review_click`/
+`mouse::handle_mouse`'s change-review branch ever saw it: three separate
+chrome intercepts (quadraui's `ShellAdapter::handle` activity-bar/sidebar
+hit-test, `App::handle_dispatch`'s always-on GTK menu-bar intercept, and
+its CSD-titlebar drag-to-move check) all hit-test purely on screen
+position with no notion that an open overlay was painted on top. Fixed
+with new `render::reconcile_change_review_modal_stack` (paint-time, not
+click-time — pushes/pops the surface's full-viewport bounds on
+`quadraui::ModalStack` every frame, since the surface can open from an
+async ACP event with no correlated mouse motion to piggyback a
+handle-time reconcile on, unlike the editor-hover popup) plus three
+narrow `change_review.is_some()` guards in GTK's `App::handle_dispatch`/
+`try_route_sidebar_mouse_event`. Also: `change_review_jump_to_hit` now
+closes the surface on a successful jump (mirroring `Return`'s explicit
+close — a click that didn't close it just painted the diff right back
+over the buffer it switched to), and `ChangeReviewState::extend` skips a
+byte-identical duplicate `ProposedChange` (guards a replaying/buggy agent
+re-announcing the same `toolCallId`+diff from appending a second entry).
+Prior update: September 24, 2026 (#956, ACP-5 —
 plan, slash commands,
 modes and usage from the `session/update` stream, on top of ACP-1's #952
 transport; independent of ACP-3/ACP-4). `src/core/acp.rs` gained pure
