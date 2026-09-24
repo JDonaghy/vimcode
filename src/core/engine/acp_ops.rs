@@ -2232,8 +2232,8 @@ mod tests {
     /// pane's interactive shell.
     ///
     /// The fixture path is double-quoted because `CARGO_MANIFEST_DIR` is
-    /// not guaranteed to be space-free: a coord worktree lives under
-    /// `~/Library/Application Support/coord/...` on macOS, and unquoted
+    /// not guaranteed to be space-free: a checkout can live under a path
+    /// like `~/Library/Application Support/...` on macOS, and unquoted
     /// the login shell word-splits that into `sh /Users/…/Library/Application`
     /// and exits 127 ("command not found") before the fixture ever runs —
     /// so the login reads as *failed* and `acp_authenticated` never flips.
