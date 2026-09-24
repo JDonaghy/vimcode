@@ -9882,6 +9882,23 @@ fn change_review_modal_id() -> quadraui::WidgetId {
 /// `route_change_review_click` still resolves a footer click to
 /// `Consume` on its own, this only decides who gets to see the click at
 /// all.
+///
+/// **Call this unconditionally, once per frame, *before* the
+/// [`compose_frame`] walk** — never from an `else` arm inside the
+/// `FrameOp::ChangeReview` match arm. `presence.change_review` *is* the
+/// gate `compose_frame` uses to decide whether that rung is in the op list
+/// at all, so the arm only ever runs on a frame where the surface is open:
+/// an `else` there is dead code on exactly the frame that needs the pop
+/// (the #1117 `explorer_tree_rect` bug and this file's own
+/// "gates drop rungs, so callers reset before the walk" note above
+/// [`compose_frame`], in miniature). Leaving the entry pushed after the
+/// surface closes hands *every* subsequent click to the app's own
+/// `handle()` — `ShellAdapter::handle` consults `ModalStack::hit_test`
+/// before any chrome dispatch — which silently kills activity-bar panel
+/// switching, sidebar resize and the rest for the remainder of the
+/// session. `app.rs`'s `reconcile_editor_hover_modal` is the shape to
+/// copy: called every time regardless of visibility, with the `false` arm
+/// always reachable.
 pub fn reconcile_change_review_modal_stack(
     b: &mut dyn quadraui::Backend,
     open: bool,
@@ -9891,9 +9908,33 @@ pub fn reconcile_change_review_modal_stack(
     let mut stack = stack_rc.borrow_mut();
     if open {
         stack.push(change_review_modal_id(), viewport);
+        // #455: no quadraui rasteriser marks this surface painted — the
+        // three `mark_painted` call sites upstream are wired only for
+        // `draw_palette`/`draw_menu`/`draw_dialog`, and the change-review
+        // surface is a `DiffView` + `StatusBar`, neither of which is
+        // modal-capable there. Without this the entry shows up in
+        // `ModalStack::unpainted_ids()` every frame it is open and each
+        // backend's `end_frame` emits the "registered but invisible"
+        // diagnostic against a surface that is, in fact, painted. Only the
+        // `open` arm marks: a popped id is a no-op for `mark_painted`
+        // anyway.
+        stack.mark_painted(&change_review_modal_id());
     } else {
         stack.pop(&change_review_modal_id());
     }
+}
+
+/// Does the backend's `quadraui::ModalStack` currently hold the
+/// change-review surface's entry? Test-facing: the regression guard for
+/// "the overlay closed but its full-viewport entry stayed registered and
+/// ate every later chrome click" (#955 review) asserts on this directly,
+/// since the symptom is otherwise only observable several clicks later.
+pub fn change_review_modal_registered(b: &mut dyn quadraui::Backend) -> bool {
+    let stack_rc = b.modal_stack_handle();
+    let stack = stack_rc.borrow();
+    let id = change_review_modal_id();
+    let registered = stack.iter_top_down().any(|e| e.id == id);
+    registered
 }
 
 /// The change-review surface's whole paint body (#955, shared with #525):
@@ -9922,10 +9963,14 @@ pub fn paint_change_review_rung(
     viewport: quadraui::Rect,
     theme: &Theme,
 ) {
-    reconcile_change_review_modal_stack(b, true, viewport);
     let Some(entry) = review.current_entry() else {
+        // Open-but-empty: nothing reaches the canvas, so nothing may
+        // claim the viewport's clicks either (the same
+        // registered-but-invisible defect #455 detects).
+        reconcile_change_review_modal_stack(b, false, viewport);
         return;
     };
+    reconcile_change_review_modal_stack(b, true, viewport);
     let line_height = b.line_height().max(1.0);
     let footer_h = line_height.min(viewport.height);
     let diff_rect = quadraui::Rect::new(

@@ -86,6 +86,38 @@ close — a click that didn't close it just painted the diff right back
 over the buffer it switched to), and `ChangeReviewState::extend` skips a
 byte-identical duplicate `ProposedChange` (guards a replaying/buggy agent
 re-announcing the same `toolCallId`+diff from appending a second entry).
+
+**Review fix round 2 (same day):** the modal-stack reconcile above was
+initially popped from an `else` arm inside the frame walk's
+`FrameOp::ChangeReview` match — **dead code**, since
+`FramePresence::change_review` is the exact gate `render::compose_frame`
+uses to drop that rung from the op list the moment the surface closes, so
+the arm can never run on the frame that needs the pop. The full-viewport
+entry therefore stayed registered forever, and since `ShellAdapter::
+handle` hit-tests `ModalStack` *before* any chrome dispatch, every mouse
+event for the rest of the session was routed past `AppShell`'s own
+handling (activity-bar panel switching, sidebar/bottom-panel resize) —
+session-bricking, and invisible to the click-to-jump tests, which never
+click chrome afterwards. Same shape as #1117's `explorer_tree_rect` bug
+and the warning `render.rs` carries above `compose_frame`. Fixed by
+calling `reconcile_change_review_modal_stack(backend, presence.
+change_review, viewport)` **unconditionally, once, before the walk** on
+both backends (the `reconcile_editor_hover_modal` shape), leaving the
+rung's arm paint-only; `paint_change_review_rung` also pops rather than
+pushes when the state is open-but-entry-less, so it never registers a
+surface nothing painted. Covered by a new RED-verified driver test per
+backend (`change_review_close_restores_chrome_clicks_via_shell_app` /
+`…_via_gtk_driver`): open the surface from a plain non-ACP
+`ChangeReviewState::new(vec![ProposedChange{..}])`, close it via the real
+click-to-jump, then click the activity bar's Search icon and assert the
+Search panel actually opens. Also folds in the round's non-blocking note:
+the reconcile now calls `ModalStack::mark_painted` on the open path,
+since no quadraui rasteriser marks this surface (upstream wires
+`mark_painted` only for `draw_palette`/`draw_menu`/`draw_dialog`, and
+this surface is a `DiffView` + `StatusBar`), which was making a correctly
+painted overlay show up in `unpainted_ids()` and emit the #455
+"registered but invisible" diagnostic every frame it was open.
+
 Prior update: September 24, 2026 (#956, ACP-5 —
 plan, slash commands,
 modes and usage from the `session/update` stream, on top of ACP-1's #952

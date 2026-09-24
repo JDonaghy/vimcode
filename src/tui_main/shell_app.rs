@@ -2301,6 +2301,17 @@ impl ShellApp for TuiShellApp {
                 .set(quadraui::Rect::new(0.0, 0.0, 0.0, 0.0));
         }
 
+        // #955 review fix — the same #1117 shape one paragraph up, for the
+        // change-review surface's full-viewport `ModalStack` entry.
+        // `presence.change_review` gates `FrameOp::ChangeReview` out of the
+        // op list the moment the surface closes, so that rung's arm can never
+        // pop its own entry (an `else` there is dead code on precisely the
+        // frame that needs it). A stuck entry is worse than a stale rect:
+        // `ShellAdapter::handle` hit-tests the modal stack *before* any chrome
+        // dispatch, so every later click would bypass the activity bar,
+        // sidebar resize and menu bar for the rest of the session.
+        render::reconcile_change_review_modal_stack(backend, presence.change_review, win_q);
+
         let mut composed: Vec<render::FrameOp> = Vec::new();
         for op in render::compose_frame(&presence) {
             match op {
@@ -2553,11 +2564,11 @@ impl ShellApp for TuiShellApp {
                 // ── Change-review surface (#955, shared with #525) ───────
                 // `render::paint_change_review_rung` is the whole body —
                 // no TUI-specific diff rendering, matching GTK's identical
-                // arm. The `else` pops the surface's modal-stack entry
-                // (`render::reconcile_change_review_modal_stack`'s doc) once
-                // it closes — `paint_change_review_rung` only ever pushes,
-                // since it never runs at all while `screen.change_review` is
-                // `None`.
+                // arm. The surface's modal-stack entry is reconciled
+                // *before* the walk (see there), not from an `else` here —
+                // this arm cannot run on a frame where the surface is
+                // closed, since `presence.change_review` gates the rung out
+                // of the op list entirely.
                 render::FrameOp::ChangeReview => {
                     if let Some(review) = screen.change_review.as_ref() {
                         render::paint_change_review_rung(
@@ -2568,8 +2579,6 @@ impl ShellApp for TuiShellApp {
                             &theme,
                         );
                         composed.push(render::FrameOp::ChangeReview);
-                    } else {
-                        render::reconcile_change_review_modal_stack(backend, false, win_q);
                     }
                 }
 
@@ -15250,6 +15259,102 @@ mod tests {
             "old line\n",
             "a click-to-jump must never write to the file — that's \
              accept's job, not jump's"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #955 review regression guard: once the change-review surface
+    /// **closes**, its full-viewport `quadraui::ModalStack` entry must be
+    /// gone, so ordinary shell chrome (activity bar, sidebar, menu bar)
+    /// keeps receiving clicks.
+    ///
+    /// Why this is worth its own test: `ShellAdapter::handle` consults
+    /// `ModalStack::hit_test` *before* any chrome dispatch, and the entry
+    /// this surface registers covers the entire viewport. A stuck entry is
+    /// therefore not a cosmetic defect — every subsequent mouse event for
+    /// the rest of the session is routed straight into
+    /// `TuiShellApp::handle` instead of `AppShell`'s own handling, so the
+    /// activity bar silently stops switching panels, the sidebar stops
+    /// resizing, and so on. The symptom shows up nowhere near the
+    /// change-review code, which is exactly why it needs to be asserted
+    /// here.
+    ///
+    /// RED verified: with the pop moved back into an `else` arm inside the
+    /// frame walk's `FrameOp::ChangeReview` match (where
+    /// `presence.change_review` gates the whole rung out of
+    /// `render::compose_frame`'s op list the moment the surface closes, so
+    /// the `else` is unreachable), the final Search-icon click below
+    /// leaves the Explorer panel up and "Replace…" never paints.
+    ///
+    /// The surface is opened from a plain `ChangeReviewState::new(vec![
+    /// ProposedChange { .. }])` — the source-agnostic constructor, no ACP
+    /// involved — and closed through the real click-to-jump path
+    /// (`driver.click` on a painted diff row), the close path the review
+    /// finding named.
+    #[test]
+    fn change_review_close_restores_chrome_clicks_via_shell_app() {
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_test_955_review_modal_pop_{:?}",
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("zqxw955.txt");
+        std::fs::write(&target, "old line\n").unwrap();
+
+        let mut app = TuiShellApp::new_for_test();
+        app.engine.cwd = dir.clone();
+        app.engine.explorer_reveal_path(&target);
+        app.engine.change_review = Some(crate::core::review::ChangeReviewState::new(vec![
+            crate::core::review::ProposedChange {
+                path: target.to_string_lossy().into_owned(),
+                old_text: Some("old line\n".to_string()),
+                new_text: "new line\n".to_string(),
+            },
+        ]));
+
+        let mut driver = driver_with_shell(app, TuiShellApp::build_shell_config(false), 80, 24);
+        driver.set_double_click_folding(false);
+        driver.dispatch(quadraui::UiEvent::WindowFocused(true));
+        driver.render();
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("old line") && screen.contains("new line"),
+            "precondition: the change-review surface must be open and \
+             painted from the source-agnostic change list; screen:\n{screen}"
+        );
+
+        // Close it the way a user would: click a diff row to jump.
+        let (x, y) = driver
+            .find("old line")
+            .unwrap_or_else(|| panic!("diff row 'old line' must be locatable; screen:\n{screen}"));
+        driver.click(x, y);
+        driver.dispatch(quadraui::UiEvent::WindowFocused(true));
+        driver.render();
+        assert!(
+            !driver.screen_contains("a=accept"),
+            "precondition: clicking a diff row must have closed the \
+             change-review surface; screen:\n{}",
+            driver.screen()
+        );
+
+        // The regression: with the surface closed, a click on the Search
+        // icon must still reach `AppShell`'s activity-bar dispatch.
+        let (sx, sy) = driver
+            .find(crate::icons::SEARCH.s())
+            .unwrap_or_else(|| panic!("Search icon must paint; screen:\n{}", driver.screen()));
+        driver.click(sx, sy);
+        driver.dispatch(quadraui::UiEvent::WindowFocused(true));
+        driver.render();
+        assert!(
+            driver.screen_contains("Replace…"),
+            "after the change-review surface closed, an activity-bar click \
+             must still switch panels — a leftover full-viewport ModalStack \
+             entry routes it past AppShell's chrome dispatch entirely; \
+             screen:\n{}",
+            driver.screen()
         );
 
         let _ = std::fs::remove_dir_all(&dir);

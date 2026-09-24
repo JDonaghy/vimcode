@@ -8380,6 +8380,22 @@ impl quadraui::ShellApp for App {
             command_center_rect = Some(bands.command_center);
         }
 
+        // #955 review fix, the #1117 class: `presence.change_review` is the
+        // exact gate `compose_frame` uses to decide whether
+        // `FrameOp::ChangeReview` is even in this frame's op list, so that
+        // rung's arm below can never run on the frame the surface *closes* —
+        // an `else` inside it is dead code, and the full-viewport modal-stack
+        // entry `paint_change_review_rung` pushes would stay registered
+        // forever, routing every later click past `AppShell`'s chrome dispatch
+        // (`ShellAdapter::handle` hit-tests the modal stack first). Reconciled
+        // here, once, unconditionally, ungated by which rungs compose —
+        // exactly how `reconcile_editor_hover_modal` is called.
+        render::reconcile_change_review_modal_stack(
+            backend,
+            presence.change_review,
+            popup_viewport,
+        );
+
         let mut composed: Vec<render::FrameOp> = Vec::new();
         for op in render::compose_frame(&presence) {
             match op {
@@ -8695,9 +8711,9 @@ impl quadraui::ShellApp for App {
                 // GTK-specific diff rendering, matching every other
                 // `quadraui::DiffView` consumer. Uses the same
                 // `popup_viewport` every other overlay rung anchors to. The
-                // `else` pops the surface's modal-stack entry
-                // (`render::reconcile_change_review_modal_stack`'s doc) once
-                // it closes, mirroring TUI's identical arm.
+                // surface's modal-stack entry is reconciled *before* the walk
+                // (see there), not from an `else` here — this arm cannot run
+                // on a frame where the surface is closed.
                 render::FrameOp::ChangeReview => {
                     if let Some(review) = screen.change_review.as_ref() {
                         render::paint_change_review_rung(
@@ -8708,8 +8724,6 @@ impl quadraui::ShellApp for App {
                             &theme,
                         );
                         composed.push(render::FrameOp::ChangeReview);
-                    } else {
-                        render::reconcile_change_review_modal_stack(backend, false, popup_viewport);
                     }
                 }
 
