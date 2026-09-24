@@ -24383,6 +24383,25 @@ mod tests {
     #[cfg(unix)]
     fn extension_install_failure_exit_code_paints_via_shell_app() {
         use crate::core::extensions::{ExtensionManifest, LspConfig};
+        use crate::core::settings::TestSettingsPathGuard;
+
+        // Point `Engine::check_settings_reload` — which `TuiShellApp::tick`
+        // runs *after* `poll_idle`, and which assigns
+        // `self.message = "Settings reloaded"` — at a private, nonexistent
+        // path. Without this, anything that touches the real
+        // `~/.config/vimcode/settings.json` while this test is polling (the
+        // integration-test binaries `cargo test` runs in parallel processes
+        // are not covered by this crate's `#[cfg(test)]` overrides) wipes
+        // the "failed (exit 7)" message in the same tick that painted it,
+        // and the poll below then times out with a message it can never
+        // see again — observed as this test failing only in a full
+        // `cargo test`, never when run alone. Same guard the #1345
+        // acquisition tests below use.
+        let _settings_guard = TestSettingsPathGuard::install(std::env::temp_dir().join(format!(
+            "vimcode_test_shell_app_1344_fail_settings_{}_{:?}.json",
+            std::process::id(),
+            std::thread::current().id()
+        )));
 
         let mut app = TuiShellApp::new_for_test();
         let ext_name = "vimcode-test-ext-1344-fail".to_string();
@@ -24451,6 +24470,17 @@ mod tests {
     #[cfg(unix)]
     fn extension_install_lsp_success_survives_dap_not_found_via_shell_app() {
         use crate::core::extensions::{DapConfig, ExtensionManifest, LspConfig};
+        use crate::core::settings::TestSettingsPathGuard;
+
+        // See the sibling test above for why `check_settings_reload` is
+        // pointed away from the real settings file: this test asserts on
+        // `self.message` too, and is equally exposed to a concurrent
+        // "Settings reloaded" wiping it mid-poll.
+        let _settings_guard = TestSettingsPathGuard::install(std::env::temp_dir().join(format!(
+            "vimcode_test_shell_app_1344_combined_settings_{}_{:?}.json",
+            std::process::id(),
+            std::thread::current().id()
+        )));
 
         let mut app = TuiShellApp::new_for_test();
         let ext_name = "vimcode-test-ext-1344-combined".to_string();
@@ -24671,11 +24701,13 @@ mod tests {
     }
 
     /// #1345 review finding: a manifest with both `[lsp.acquire]` and
-    /// `[dap.acquire]` spawns two concurrent background acquisitions; when
-    /// both land in the same `poll_tool_acquire` tick (the common case for
-    /// two near-instant `file://` fixtures spawned back to back), the
-    /// second leg's outcome must not silently erase the first's status
-    /// text — the same "DAP outcome clobbering LSP success" class already
+    /// `[dap.acquire]` spawns two concurrent background acquisitions, and
+    /// the second leg's outcome must not silently erase the first's status
+    /// text — whether the two land in the same `poll_tool_acquire` tick
+    /// (common for two near-instant `file://` fixtures spawned back to
+    /// back) or in different ticks, which is what actually happens
+    /// whenever the two threads are scheduled even slightly apart. The
+    /// same "DAP outcome clobbering LSP success" class already
     /// fixed for the terminal-install path (#1344,
     /// `extension_install_lsp_success_survives_dap_not_found_via_shell_app`
     /// above), reproduced here for the native-acquisition path this PR
@@ -24691,7 +24723,14 @@ mod tests {
     /// pre-fix shape): whichever leg's background thread happens to send
     /// its outcome second overwrites `self.message` outright, so one of
     /// the two assertions below fails depending on completion order —
-    /// exactly the flake-shaped symptom the review flagged.
+    /// exactly the flake-shaped symptom the review flagged. Also verified
+    /// RED against the intermediate, same-tick-only join (accumulate
+    /// within one `poll_tool_acquire` call, assign straight into
+    /// `self.message`): that shape failed 2 of 4 consecutive full `--lib`
+    /// runs here, because two legs landing one tick apart still clobber.
+    /// `core::engine::lsp_ops::tests::tool_acquire_outcomes_in_separate_
+    /// ticks_keep_both_messages` pins the cross-tick half of that
+    /// deterministically; this test is the painted-output half.
     #[test]
     fn extension_install_lsp_acquire_success_survives_dap_acquire_failure_via_shell_app() {
         use crate::core::extensions::{DapConfig, ExtensionManifest, LspConfig};
@@ -24781,19 +24820,29 @@ mod tests {
         // acquire" text this test checks for.
         let mut driver = driver_with_shell(app, config(), 300, 24);
 
-        assert!(
-            poll_until_screen(&mut driver, Duration::from_secs(20), |screen| {
-                screen.contains("failed to acquire")
-            }),
-            "command line never painted the DAP acquisition failure; screen:\n{}",
-            driver.screen()
-        );
+        // Wait for *both* legs, not just the first one to paint: the two
+        // background threads are not synchronised, so which of them lands
+        // first — and whether they land in the same `poll_tool_acquire`
+        // tick at all — varies run to run. Polling on the conjunction is
+        // what makes the assertion below order-independent; polling on the
+        // DAP failure alone and then asserting the LSP success was already
+        // on screen is a race that fails whenever the LSP leg is the
+        // slower of the two (observed: 2 of 4 consecutive full `--lib`
+        // runs).
+        let both_painted = poll_until_screen(&mut driver, Duration::from_secs(20), |screen| {
+            screen.contains("failed to acquire") && screen.contains("installed and started")
+        });
 
         let screen = driver.screen();
         assert!(
-            screen.contains("installed and started"),
+            screen.contains("failed to acquire"),
+            "command line never painted the DAP acquisition failure; screen:\n{screen}"
+        );
+        assert!(
+            both_painted && screen.contains("installed and started"),
             "the LSP acquisition success message must survive alongside the \
-             DAP acquisition failure, not be overwritten by it; screen:\n{screen}"
+             DAP acquisition failure, not be overwritten by it — neither \
+             within one poll tick nor across two; screen:\n{screen}"
         );
 
         let _ = std::fs::remove_dir_all(&data_home);
