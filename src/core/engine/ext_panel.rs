@@ -2915,21 +2915,25 @@ impl Engine {
     /// clearing whatever input widget held the text — this only mutates the
     /// conversation/request state.
     ///
-    /// Transport is picked by `settings.acp_agent_command` (#952, ACP-1):
-    /// non-empty routes through a live ACP agent subprocess
-    /// (`ai_send_message_via_acp`); empty keeps the original direct-provider
-    /// `curl` transport (`ai_send_message_via_curl`, `crate::core::ai`) —
-    /// kept as a no-agent-binary escape hatch per the issue's "Decide in
-    /// this slice" through ACP-7.
+    /// Transport is picked by whether any ACP agent is configured (#952,
+    /// ACP-1; #958, ACP-7): a non-empty `settings.acp_agents` registry or a
+    /// non-empty legacy `settings.acp_agent_command` both route through a
+    /// live ACP agent subprocess (`ai_send_message_via_acp`); neither
+    /// configured keeps the original direct-provider `curl` transport
+    /// (`ai_send_message_via_curl`, `crate::core::ai`) — kept as a
+    /// no-agent-binary escape hatch per #952's "Decide in this slice"
+    /// through ACP-7.
     pub fn ai_send_message(&mut self, text: String) {
         let text = text.trim().to_string();
         if text.is_empty() || self.ai_streaming {
             return;
         }
-        if self.settings.acp_agent_command.trim().is_empty() {
-            self.ai_send_message_via_curl(text);
-        } else {
+        let acp_configured = !self.settings.acp_agent_command.trim().is_empty()
+            || !self.settings.acp_agents.is_empty();
+        if acp_configured {
             self.ai_send_message_via_acp(text);
+        } else {
+            self.ai_send_message_via_curl(text);
         }
     }
 
@@ -2989,10 +2993,13 @@ impl Engine {
             return;
         }
 
-        let agent_cmd = self.settings.acp_agent_command.clone();
-        let argv = crate::core::acp::parse_agent_command(&agent_cmd);
-        let cwd = self.acp_workspace_cwd();
-        match crate::core::acp::AcpClient::spawn(&argv, &cwd) {
+        // #958 (ACP-7): the registry (if configured) or the legacy
+        // single-string setting — see `acp_resolve_agent_launch`'s doc for
+        // why this is the one call site that knows the registry exists.
+        let (argv, cwd, env, agent_label) = self.acp_resolve_agent_launch();
+        let env_refs: Vec<(&str, &str)> =
+            env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        match crate::core::acp::AcpClient::spawn_with_env(&argv, &cwd, &env_refs) {
             Ok(mut client) => {
                 client.initialize();
                 self.acp_client = Some(client);
@@ -3007,7 +3014,7 @@ impl Engine {
                 self.message = format!("ACP agent failed to start: {e}");
                 self.ai_messages.push(AiMessage {
                     role: "assistant-thought".to_string(),
-                    content: format!("\u{26a0} Could not start ACP agent \"{agent_cmd}\": {e}"),
+                    content: format!("\u{26a0} Could not start ACP agent \"{agent_label}\": {e}"),
                 });
             }
         }

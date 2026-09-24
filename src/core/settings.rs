@@ -556,8 +556,49 @@ pub struct Settings {
     /// transport (`crate::core::ai`), kept as a no-agent-binary-required
     /// escape hatch per #952's "Decide in this slice" — through ACP-7, at
     /// which point a follow-up issue retires it.
+    ///
+    /// Superseded (never read) once `acp_agents` below is non-empty — see
+    /// that field's doc for the multi-agent registry this single-string
+    /// setting predates.
     #[serde(default)]
     pub acp_agent_command: String,
+
+    /// The multi-agent registry (#958, ACP-7): zero or more named ACP
+    /// agent profiles, selectable at runtime with `:AiAgent <name>`
+    /// without restarting vimcode. Each profile is spawned through the
+    /// exact same `AcpClient::spawn_with_env` the single-agent
+    /// `acp_agent_command` path always used — bringing up a *second* agent
+    /// is meant to be entirely a config fact (a second entry in this list
+    /// with a different `command`/`env`), never new Rust, per the issue's
+    /// own acceptance bar.
+    ///
+    /// Empty (the default) keeps the pre-#958 behaviour exactly:
+    /// `acp_agent_command` alone decides the (single) live agent. Once
+    /// non-empty, `acp_agent_command` is ignored — `acp_active_agent`
+    /// picks which entry here is live instead.
+    ///
+    /// Example `settings.json` fragment registering two native (no
+    /// adapter) ACP agents side by side:
+    /// ```json
+    /// "acp_agents": [
+    ///   { "name": "claude", "command": "claude-code-acp" },
+    ///   { "name": "gemini", "command": "gemini --acp" }
+    /// ],
+    /// "acp_active_agent": "claude"
+    /// ```
+    #[serde(default)]
+    pub acp_agents: Vec<crate::core::acp::AcpAgentProfile>,
+
+    /// Name of the currently active entry in `acp_agents`, matched
+    /// case-insensitively. Empty, or naming a profile no longer present,
+    /// falls back to `acp_agents[0]`. Changed only by `:AiAgent <name>`
+    /// (`Engine::acp_switch_agent`) — never optimistically elsewhere —
+    /// which also ends whatever session is currently live (a different
+    /// agent process shares no context with the old one, so continuing to
+    /// show its transcript next to a new agent's replies would be
+    /// actively misleading; same reasoning `:AiClear` already documents).
+    #[serde(default)]
+    pub acp_active_agent: String,
 
     // ── Explorer ──────────────────────────────────────────────────────────────
     /// Show hidden files (dotfiles) in the file explorer (default: false).
@@ -1499,6 +1540,8 @@ impl Default for Settings {
             ai_base_url: String::new(),
             ai_completions: false,
             acp_agent_command: String::new(),
+            acp_agents: Vec::new(),
+            acp_active_agent: String::new(),
             show_hidden_files: false,
             explorer_sort_case_insensitive: true,
             swap_file: default_swap_file(),

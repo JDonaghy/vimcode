@@ -238,6 +238,127 @@ impl Engine {
             .unwrap_or_else(|| self.cwd.clone())
     }
 
+    // ── multi-agent registry (#958, ACP-7) ───────────────────────────────────
+
+    /// Name of the entry in `settings.acp_agents` that is currently active.
+    /// `settings.acp_active_agent` if it still names a real entry, else the
+    /// registry's first entry, else empty (meaning "no registry configured
+    /// — fall back to the legacy `acp_agent_command` single string").
+    pub(crate) fn acp_active_agent_name(&self) -> String {
+        let want = self.settings.acp_active_agent.trim();
+        if !want.is_empty()
+            && self
+                .settings
+                .acp_agents
+                .iter()
+                .any(|a| a.name.eq_ignore_ascii_case(want))
+        {
+            return want.to_string();
+        }
+        self.settings
+            .acp_agents
+            .first()
+            .map(|a| a.name.clone())
+            .unwrap_or_default()
+    }
+
+    /// The active `AcpAgentProfile`, if the registry is non-empty.
+    fn acp_active_agent_profile(&self) -> Option<&crate::core::acp::AcpAgentProfile> {
+        let name = self.acp_active_agent_name();
+        if name.is_empty() {
+            return None;
+        }
+        self.settings
+            .acp_agents
+            .iter()
+            .find(|a| a.name.eq_ignore_ascii_case(&name))
+    }
+
+    /// Resolve what to hand `AcpClient::spawn_with_env` for the *next*
+    /// agent spawn: `argv`, `cwd`, extra `env`, and a human-readable label
+    /// for error messages. Reads the registry (`settings.acp_agents` +
+    /// `acp_active_agent`) when non-empty; otherwise falls back to the
+    /// pre-#958 single-string `acp_agent_command`, unchanged. This is the
+    /// **one** place that knows about the registry at all — a second agent
+    /// profile flows through the exact same argv/cwd/env-shaped spawn call
+    /// the first one always did, never a branch on which profile it is.
+    pub(crate) fn acp_resolve_agent_launch(
+        &self,
+    ) -> (
+        Vec<String>,
+        std::path::PathBuf,
+        Vec<(String, String)>,
+        String,
+    ) {
+        if let Some(profile) = self.acp_active_agent_profile() {
+            let argv = crate::core::acp::parse_agent_command(&profile.command);
+            let cwd = if profile.cwd.trim().is_empty() {
+                self.acp_workspace_cwd()
+            } else {
+                std::path::PathBuf::from(profile.cwd.trim())
+            };
+            let env = crate::core::acp::parse_agent_env(&profile.env);
+            (argv, cwd, env, profile.command.clone())
+        } else {
+            let cmd = self.settings.acp_agent_command.clone();
+            let argv = crate::core::acp::parse_agent_command(&cmd);
+            (argv, self.acp_workspace_cwd(), Vec::new(), cmd)
+        }
+    }
+
+    /// Human-readable summary of `settings.acp_agents` and which is
+    /// active, for `:AiAgent` with no argument — same shape as
+    /// `acp_mode_status_line` above.
+    pub(crate) fn acp_agent_registry_status_line(&self) -> String {
+        if self.settings.acp_agents.is_empty() {
+            return "No ACP agents configured (settings.acp_agents)".to_string();
+        }
+        let active = self.acp_active_agent_name();
+        let names: Vec<String> = self
+            .settings
+            .acp_agents
+            .iter()
+            .map(|a| {
+                if a.name.eq_ignore_ascii_case(&active) {
+                    format!("*{}", a.name)
+                } else {
+                    a.name.clone()
+                }
+            })
+            .collect();
+        format!("Agents: {}", names.join(", "))
+    }
+
+    /// Switch the active agent to `target` (matched case-insensitively
+    /// against `settings.acp_agents[].name`), for `:AiAgent <target>`.
+    /// Takes effect on the *next* message — the next `ai_send_message`
+    /// call spawns the newly-active profile, per #958's "no restart
+    /// required" acceptance bar. Ends whatever session is currently live
+    /// via `ai_clear` first: a different agent process shares no context
+    /// with the old one, so leaving the old transcript on screen next to a
+    /// new agent's replies would be actively misleading — same reasoning
+    /// `:AiClear` already documents for its own transcript wipe.
+    pub(crate) fn acp_switch_agent(&mut self, target: &str) {
+        let Some(profile) = self
+            .settings
+            .acp_agents
+            .iter()
+            .find(|a| a.name.eq_ignore_ascii_case(target))
+        else {
+            self.message = format!("Unknown ACP agent: {target}");
+            return;
+        };
+        let name = profile.name.clone();
+        if name.eq_ignore_ascii_case(&self.acp_active_agent_name()) && self.acp_client.is_none() {
+            self.message = format!("Already using agent \"{name}\"");
+            return;
+        }
+        self.ai_clear();
+        self.settings.acp_active_agent = name.clone();
+        self.message =
+            format!("Switched to agent \"{name}\" \u{2014} starts fresh on next message");
+    }
+
     // ── authMethods / authenticate / terminal login (#957, ACP-6) ───────────
 
     /// Send `session/new` for the live `acp_client` — the second half of

@@ -1108,6 +1108,21 @@ impl Engine {
             return EngineAction::None;
         }
 
+        // :AiAgent          — list configured agents (settings.acp_agents)
+        //                     and which is active (#958, ACP-7)
+        // :AiAgent <name>   — switch the active agent; takes effect on the
+        //                     next message, without restarting vimcode
+        if cmd == "AiAgent" {
+            self.message = self.acp_agent_registry_status_line();
+            return EngineAction::None;
+        }
+        if let Some(target) = cmd.strip_prefix("AiAgent ").map(|s| s.trim()) {
+            if !target.is_empty() {
+                self.acp_switch_agent(target);
+            }
+            return EngineAction::None;
+        }
+
         // Handle :e[dit]! — reload current file from disk (discard changes)
         if cmd == "edit!" {
             let buf_id = self.active_buffer_id();
