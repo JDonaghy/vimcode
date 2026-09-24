@@ -20635,6 +20635,117 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A gutter click must open the diagnostic hover for a buffer opened
+    /// through a **non-canonical** path.
+    ///
+    /// `Engine::lsp_diagnostics` is keyed by the canonical absolute path
+    /// (#208), and that is the key `build_rendered_window` uses when it
+    /// fills `RenderedWindow::diagnostic_gutter` — so the gutter *marker*
+    /// paints. The hover lookups on the engine side used the buffer's raw
+    /// `file_path` instead, so clicking that marker found no diagnostic and
+    /// popped no hover: a painted affordance that did nothing.
+    ///
+    /// This is invisible on a Linux CI box, where `std::env::temp_dir()` is
+    /// already canonical, and unconditional on macOS, where it is
+    /// `/var/folders/…` — a symlink to `/private/var/folders/…`. That
+    /// platform asymmetry is why
+    /// `gutter_click_on_a_background_pane_then_ctrl_w_p_returns_focus_via_shell_app`
+    /// was red on macOS and green on Linux on the same commit. To reproduce
+    /// it on *every* platform this test opens the file through a path with
+    /// a `..` segment, which `canonicalize` resolves everywhere.
+    ///
+    /// **Verified RED against unfixed `develop`**: restoring
+    /// `active_buffer_path()` (raw `file_path`) in
+    /// `Engine::trigger_editor_hover_for_line` makes the final
+    /// `screen_contains` assertion fail — the gutter marker still paints,
+    /// the click is still routed, and no hover text ever reaches the
+    /// screen.
+    #[test]
+    fn gutter_click_opens_diagnostic_hover_for_a_non_canonical_buffer_path_via_shell_app() {
+        const WIDTH: u16 = 100;
+        const HEIGHT: u16 = 30;
+        const DIAG_LINE: u32 = 2;
+        const HOVER_MSG: &str = "non-canonical gutter diagnostic";
+
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_test_1256_diag_key_{:?}",
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        let file = dir.join("dk1256.txt");
+        let content: String = (0..20).map(|i| format!("DKA1256_{i:03}\n")).collect();
+        std::fs::write(&file, &content).unwrap();
+
+        // The same file, reached through a `..` segment: `canonicalize`
+        // resolves it on every platform, so `file_path != canonical_path`
+        // on Linux too — not just on macOS's symlinked temp dir.
+        let via_dotdot = dir.join("sub").join("..").join("dk1256.txt");
+        let canonical = via_dotdot.canonicalize().unwrap();
+        assert_ne!(
+            via_dotdot, canonical,
+            "test setup sanity: the open path must differ from the \
+             canonical one, otherwise this test cannot reach the bug"
+        );
+
+        let mut app = TuiShellApp::new(None);
+        app.engine.settings.autohide_panels = false;
+        app.engine.app_shell.hide_sidebar();
+        app.engine.session.explorer_visible = false;
+        app.engine
+            .open_file_with_mode(&via_dotdot, crate::core::engine::OpenMode::Permanent)
+            .unwrap();
+
+        app.engine.lsp_diagnostics.insert(
+            canonical,
+            vec![crate::core::lsp::Diagnostic {
+                range: crate::core::lsp::LspRange {
+                    start: crate::core::lsp::LspPosition {
+                        line: DIAG_LINE,
+                        character: 0,
+                    },
+                    end: crate::core::lsp::LspPosition {
+                        line: DIAG_LINE,
+                        character: 5,
+                    },
+                },
+                severity: crate::core::lsp::DiagnosticSeverity::Error,
+                message: HOVER_MSG.to_string(),
+                source: None,
+                code: None,
+            }],
+        );
+
+        let mut driver = driver_with_shell(app, config(), WIDTH, HEIGHT);
+        driver.mouse_move(0.0, 0.0);
+        driver.render();
+
+        let screen_before = driver.screen();
+        let (diag_x, diag_y) = driver
+            .find(&format!("DKA1256_{:03}", DIAG_LINE))
+            .unwrap_or_else(|| {
+                panic!("the diagnostic's line must be painted;\nscreen:\n{screen_before}")
+            });
+        assert!(
+            diag_x >= 1.0,
+            "test setup sanity: the text must leave at least one gutter \
+             column to its left; text x {diag_x};\nscreen:\n{screen_before}"
+        );
+
+        driver.click(diag_x - 1.0, diag_y);
+        driver.render();
+
+        assert!(
+            driver.screen_contains(HOVER_MSG),
+            "clicking the diagnostic gutter marker must paint the \
+             diagnostic hover even though the buffer was opened through a \
+             non-canonical path ({via_dotdot:?});\nscreen:\n{}",
+            driver.screen()
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// #1297: `q:` must open the command-line window as a horizontal split
     /// in the *current* tabpage (`:h cmdwin`), not push a whole new `Tab`.
     /// Reads the answer off the painted screen, not off `Engine` state
