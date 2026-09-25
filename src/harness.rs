@@ -4346,12 +4346,15 @@ mod issue_1064_take_requested_panel {
 /// "Extensions"/"Settings" on `tui_prod`'s own `shell_config`, all-caps
 /// "EXTENSIONS"/"SETTINGS" from the shared `App`'s `PanelDefinition`s —
 /// that casing split is real and stays, see the scenarios' own doc
-/// comments below), and both panels paint a search/filter row through the
-/// one shared `render::paint_sidebar_search_row`, called by GTK's
-/// `App::paint_sidebar_panel_rung` and by the shipped TUI's
-/// `tui_main::panels::render_settings_panel`/`render_ext_sidebar` (whose
-/// own hand-painted duplicate header rows are deleted). Every scenario
-/// below is ungated (`KNOWN_BUGS` is empty) as of #1343.
+/// comments below), and both panels paint a search/filter row through
+/// `SidebarPanelBody::render_with` (quadraui#1059) with
+/// `SidebarPanelChrome::Search` chrome (quadraui#1061, consumed by #1391 —
+/// before that, a bespoke `render::paint_sidebar_search_row`), built by the
+/// shared `render::search_only_chrome`, called by GTK's `App::
+/// paint_sidebar_panel_rung` and by the shipped TUI's `tui_main::panels::
+/// render_settings_panel`/`render_ext_sidebar` (whose own hand-painted
+/// duplicate header rows are deleted). Every scenario below is ungated
+/// (`KNOWN_BUGS` is empty) as of #1343.
 #[cfg(test)]
 mod issue_1256_sidebar_chrome {
     use super::*;

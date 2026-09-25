@@ -18623,77 +18623,56 @@ pub use quadraui::compose::sidebar_panel_body::{
     SidebarPanelBody, SidebarPanelBodyLayout, SidebarPanelChrome,
 };
 
-/// Paint a borderless, single-row search/filter strip for a sidebar panel
-/// whose header the shell's own `AppShell` already owns (#1343 — the #1258
-/// items 2/3 convergence). Shared by GTK's `App::paint_sidebar_panel_rung`
-/// (`PANEL_SETTINGS`/`PANEL_EXTENSIONS` arms) and the shipped TUI's
-/// `tui_main::panels::render_settings_panel`/`render_ext_sidebar`, so the
-/// query/placeholder/active-cursor look can't drift between them the way
-/// #1256 found it had (GTK painted no search row at all; the TUI painted
-/// both a search row *and* its own duplicate header underneath the
-/// shell's).
+/// Build the search-only chrome (`SidebarPanelChrome::Search`, quadraui#1061)
+/// for a sidebar panel whose header the shell's own `AppShell` already owns
+/// (#1343 — the #1258 items 2/3 convergence). Shared by GTK's
+/// `App::paint_sidebar_panel_rung` (`PANEL_SETTINGS`/`PANEL_EXTENSIONS`
+/// arms) and the shipped TUI's `tui_main::panels::render_settings_panel`/
+/// `render_ext_sidebar`, so the query/placeholder/active-tint look can't
+/// drift between them the way #1256 found it had (GTK painted no search row
+/// at all; the TUI painted both a search row *and* its own duplicate header
+/// underneath the shell's).
 ///
+/// Before quadraui#1061, this composed a bespoke single-row `StatusBar`
+/// directly (`paint_sidebar_search_row`, deleted by #1391) because
 /// `Backend::draw_settings_chrome` (behind [`SidebarPanelChrome::
-/// HeaderAndSearch`] above) is *not* reused here: its row 0 (header)
-/// paints unconditionally on every backend
-/// (`quadraui/src/{gtk,tui}/form.rs`), so there is no rect that makes it
-/// paint a search-only strip without also painting a second header —
-/// exactly the double-header bug this issue fixes. This composes the flat
-/// single-row look through `Backend::draw_status_bar`
-/// (`quadraui::StatusBar`) instead — the same already-generic, borderless
-/// primitive `PANEL_GIT`'s header bar ([`sc_header_status_bar`]) and TUI's
-/// `render_impl::draw_rule_row_q` already paint one-row chrome through.
+/// HeaderAndSearch`] above) paints its header row unconditionally — no rect
+/// made it paint a search-only strip without also painting a second header,
+/// exactly the double-header bug #1256 fixed. `SidebarPanelChrome::Search`
+/// is quadraui's own header-less variant of that composition (a single
+/// synthetic `StatusBar` segment through `Backend::
+/// draw_status_bar_interactive`), so this now just resolves the
+/// query/placeholder `fg` the same way the old bespoke row did — the
+/// `SidebarPanelBody`/`SidebarPanelChrome` composer pair above owns the
+/// actual paint.
 ///
-/// Shows `placeholder` (muted) when `query` is empty and the row isn't
-/// active; otherwise shows `query`, with a trailing block-cursor glyph
-/// appended while `active`. Returns `rect` shrunk by one row
-/// (`Backend::line_height()`, clamped to `rect`'s own height) so the
-/// caller paints its body into the remainder — mirrors
-/// [`SidebarPanelBody`]'s `SidebarPanelBodyLayout::body_rect` split, minus
-/// the header-reservation half this panel no longer needs.
-pub fn paint_sidebar_search_row(
-    backend: &mut dyn quadraui::Backend,
-    rect: quadraui::Rect,
+/// `fg` is muted (`theme.line_number_fg`) while the placeholder is showing
+/// (`query` empty, not `active`), and full-strength (`theme.foreground`)
+/// otherwise — [`SidebarPanelChrome::Search`] takes one `fg` for both
+/// states (it has no theme of its own to consult), so callers resolve it
+/// per-frame the same way here. `bg` is always `theme.completion_bg`; the
+/// active-state tint (previously a discrete swap to `theme.fuzzy_selected_
+/// bg`) is now `SidebarPanelBody::render_with`'s own `bg.lighten(0.08)`
+/// while `active`.
+pub fn search_only_chrome(
     query: &str,
     placeholder: &str,
     active: bool,
     theme: &Theme,
-) -> quadraui::Rect {
-    let row_h = backend.line_height().max(0.0).min(rect.height.max(0.0));
-    if rect.width <= 0.0 || row_h <= 0.0 {
-        return rect;
-    }
-
+) -> SidebarPanelChrome {
     let show_placeholder = query.is_empty() && !placeholder.is_empty() && !active;
-    let (body, fg) = if show_placeholder {
-        (placeholder.to_string(), theme.line_number_fg)
+    let fg = if show_placeholder {
+        theme.line_number_fg
     } else {
-        (query.to_string(), theme.foreground)
+        theme.foreground
     };
-    let cursor = if active { "\u{2588}" } else { "" };
-    let icon = crate::icons::SEARCH.s();
-    let text = format!(" {icon} {body}{cursor}");
-    let bg = if active {
-        theme.fuzzy_selected_bg
-    } else {
-        theme.completion_bg
-    };
-
-    let bar = quadraui::StatusBar {
-        id: quadraui::WidgetId::new("sidebar:search-row"),
-        left_segments: vec![quadraui::StatusBarSegment {
-            text,
-            fg,
-            bg,
-            bold: false,
-            action_id: None,
-        }],
-        right_segments: Vec::new(),
-    };
-    let bar_rect = quadraui::Rect::new(rect.x, rect.y, rect.width, row_h);
-    let _ = backend.draw_status_bar(bar_rect, &bar, None, None);
-
-    quadraui::Rect::new(rect.x, rect.y + row_h, rect.width, rect.height - row_h)
+    SidebarPanelChrome::Search {
+        query: query.to_string(),
+        placeholder: placeholder.to_string(),
+        active,
+        fg,
+        bg: theme.completion_bg,
+    }
 }
 
 /// Owned per-frame body for the plugin extension panel (`ext:<name>`) —
