@@ -2798,6 +2798,13 @@ pub struct Engine {
     /// 0=menu, 1=Explorer, 2=Search, 3=Debug, 4=Git, 5=Extensions,
     /// 6=AI, 7=Settings, 8+=extension panels (sorted by name).
     pub activity_bar_selected: u16,
+    /// Ctrl-W sidebar chord latch (#1419): true for exactly one keypress
+    /// after Ctrl-W is pressed while a sidebar panel holds focus, armed and
+    /// consumed by [`crate::render::route_sidebar_chord_key`]. Promoted out
+    /// of TUI-only `TuiSidebar::pending_ctrl_w` (#406) so GTK, which keeps no
+    /// per-keypress chord latch of its own, gets the same Ctrl-W h/l
+    /// sidebar-to-toolbar/editor navigation as TUI by reading this field.
+    pub sidebar_ctrl_w_pending: bool,
 
     // --- Registers (yank/delete storage) ---
     /// Named registers: 'a'-'z' plus '"' (unnamed default). Value is
@@ -4643,6 +4650,7 @@ impl Engine {
             window_nav_overflow: None,
             activity_bar_focused: false,
             activity_bar_selected: 1,
+            sidebar_ctrl_w_pending: false,
             registers: HashMap::new(),
             selected_register: None,
             expr_register_pending: None,

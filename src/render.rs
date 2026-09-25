@@ -3788,6 +3788,81 @@ pub fn route_focus_key(engine: &Engine, sidebar_band_focused: bool) -> FocusKeyR
     FocusKeyRoute::Explorer
 }
 
+/// Outcome of feeding a keystroke to [`route_sidebar_chord_key`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SidebarChordAction {
+    /// Ctrl-W armed the latch (`Engine::sidebar_ctrl_w_pending`); nothing
+    /// else to do for this keypress but redraw.
+    Armed,
+    /// The chord's follow-up key moved focus out of the sidebar band —
+    /// `h`/`Left` to the activity bar toolbar, `l`/`Right` to the editor.
+    /// `Engine::clear_sidebar_focus` (and, for `h`/`Left`,
+    /// `Engine::activity_bar_focus_in_at`) already ran; the caller only
+    /// needs to clear its own "sidebar band holds the keyboard" latch, if it
+    /// keeps one (TUI's `TuiSidebar::has_focus` does; GTK has none).
+    FocusOut,
+    /// The chord's follow-up key was consumed but wasn't a recognised
+    /// direction — ignored, like an unmapped Ctrl-W combo in Vim's own
+    /// window commands.
+    Consumed,
+}
+
+/// Ctrl-W sidebar chord: arm on `Ctrl-W`, then on the very next keypress
+/// navigate `h`/`Left` to the activity bar toolbar or `l`/`Right` to the
+/// editor, consuming any other follow-up. `None` means the key was neither
+/// the arming chord nor a pending follow-up — the caller's own ladder
+/// continues unclaimed.
+///
+/// A Vim chord, so — like [`route_debug_fkey`] and the other shared rungs in
+/// this file — it stays a plain key-name match rather than a declared
+/// accelerator. Only meaningful while some sidebar panel (not the activity
+/// bar itself) holds focus; both callers only reach this after their own
+/// focus-owner routing has already claimed the key for such a panel, so
+/// there is no separate "is the sidebar band focused" gate here.
+///
+/// Promoted out of TUI-only `TuiSidebar::pending_ctrl_w` (#1419, closing
+/// #406): GTK kept no per-keypress chord latch of its own to hang that field
+/// on, so Ctrl-W h/l silently did nothing there. `Engine::sidebar_ctrl_w_pending`
+/// is the shared latch both backends now read and write through this
+/// function, so GTK gets the same navigation TUI already had.
+///
+/// `key_name`/`unicode` are [`engine_key_from_ui`]'s own output: a plain
+/// letter like `h`/`l`/`w` arrives as `unicode`, with `key_name` empty
+/// (`engine_key_from_ui` only fills `key_name` for `Ctrl`-held or named
+/// keys), while `Left`/`Right` arrive as `key_name` with `unicode: None` —
+/// so both must be checked, matching every other rung in this file
+/// ([`dispatch_sidebar_panel_key`], [`route_terminal_key`], …).
+pub fn route_sidebar_chord_key(
+    engine: &mut Engine,
+    key_name: &str,
+    unicode: Option<char>,
+    ctrl: bool,
+) -> Option<SidebarChordAction> {
+    if ctrl && key_name.eq_ignore_ascii_case("w") {
+        engine.sidebar_ctrl_w_pending = true;
+        return Some(SidebarChordAction::Armed);
+    }
+    if !engine.sidebar_ctrl_w_pending {
+        return None;
+    }
+    engine.sidebar_ctrl_w_pending = false;
+    let to_toolbar = key_name == "Left" || unicode == Some('h');
+    let to_editor = key_name == "Right" || unicode == Some('l');
+    Some(if to_toolbar {
+        // Panel -> activity bar toolbar.
+        let idx = engine.activity_bar_toolbar_idx_for_active_panel();
+        engine.clear_sidebar_focus();
+        engine.activity_bar_focus_in_at(idx);
+        SidebarChordAction::FocusOut
+    } else if to_editor {
+        // Panel -> editor.
+        engine.clear_sidebar_focus();
+        SidebarChordAction::FocusOut
+    } else {
+        SidebarChordAction::Consumed // Unknown Ctrl-W combo: ignore.
+    })
+}
+
 /// What a key does once [`FocusKeyRoute::ActivityBar`] has claimed it.
 ///
 /// The activity bar's key table was the one part of that arm both backends

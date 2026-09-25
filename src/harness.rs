@@ -982,6 +982,135 @@ pub fn activity_bar_click_focuses_search_panel<D: ConformanceDriver + DriverInpu
     );
 }
 
+/// #1419 (closes #406): `Ctrl-W` from a focused sidebar panel arms a
+/// one-keystroke chord; `l`/`Right` moves keyboard focus to the editor.
+/// `render::route_sidebar_chord_key` is the shared rung both backends now
+/// call; before this issue GTK had no per-keypress chord latch to hang the
+/// `Ctrl-W` arm on at all (TUI's own, now-deleted `TuiSidebar::
+/// pending_ctrl_w` was the only place it lived), so `Ctrl-W l` silently did
+/// nothing on GTK.
+///
+/// A motion key typed right after must move the cursor (`Ln 1,` ->
+/// `Ln 2,`), which only happens once the editor holds keyboard focus —
+/// painting-only per CLAUDE.md's #587/#592 rule (never
+/// `engine.search_has_focus` directly). Before this fix on GTK, the panel
+/// still held focus, so the following `j` stayed on `Ln 1,`.
+///
+/// See [`sidebar_ctrl_w_h_moves_focus_to_the_activity_bar_toolbar`] for the
+/// `h`/`Left` half and why it is a *separate* scenario (own fresh driver)
+/// rather than a second phase reusing this one's.
+pub fn sidebar_ctrl_w_l_returns_focus_to_the_editor<D: ConformanceDriver + DriverInput>(
+    driver: &mut D,
+) {
+    use crate::core::engine::sidebar::PANEL_SEARCH;
+
+    let (x, y) = activity_bar_zone_center(driver, PANEL_SEARCH);
+    driver.click(x, y);
+    assert!(
+        driver.screen_has("Ln 1,"),
+        "precondition: a fresh buffer starts with the cursor on line 1"
+    );
+    ConformanceDriver::ctrl_char(driver, 'w');
+    ConformanceDriver::type_char(driver, 'l');
+    driver.type_text("j");
+    assert!(
+        driver.screen_has("Ln 2,"),
+        "Ctrl-W l must return keyboard focus to the editor -- a motion key \
+         typed right after must move the cursor"
+    );
+}
+
+/// #1419 (closes #406): the `h`/`Left` half of the `Ctrl-W` sidebar chord —
+/// see [`sidebar_ctrl_w_l_returns_focus_to_the_editor`]'s doc for the shared
+/// background. `j` then `l` (`ActivityBarKeyAction::MoveDown` then
+/// `::Activate`) only move the toolbar's own selection cursor and activate
+/// whatever it lands on when the activity bar toolbar itself holds keyboard
+/// focus; a still-panel-focused or still-editor-focused `j`/`l` does
+/// something else entirely (panel-local navigation / a plain editor motion +
+/// line-join respectively), never switches the sidebar to a different
+/// panel. So Search -> `Ctrl-W h` (arm+toolbar-focus) -> `j` (select the
+/// next toolbar item, Debug) -> `l` (activate it) landing on the Debug
+/// panel's own painted content (case-insensitive `"debug"` — GTK's shared
+/// `App` titles this panel "RUN AND DEBUG", `TuiShellApp`'s own independent
+/// `shell_config` titles it "Debug"; `"debug"` is a substring of both)
+/// proves the chord actually moved focus to the toolbar.
+///
+/// Deliberately not `q` (`ActivityBarKeyAction::Collapse`): that hits an
+/// unrelated, pre-existing gap confirmed by hand while developing this
+/// scenario — `App::handle_activity_bar_key`'s call site returns before
+/// `Self::sync_runner_sidebar_visibility` ever runs, so on `gtk` the
+/// *shadow* `engine.app_shell` correctly collapses but the *runner's* own
+/// chrome (which alone decides whether `render_content`'s sidebar column
+/// exists at all — see that method's own doc) keeps painting it open. That
+/// gap is real but has nothing to do with this issue's `Ctrl-W` fix and
+/// deserves its own issue, not a workaround folded in here. `j`/`l`
+/// (`MoveDown`/`Activate`) only ever change *which panel's content* the
+/// shadow's active-panel id points at — never sidebar *visibility* — so
+/// they never touch that gap at all.
+///
+/// A fresh driver/single click, deliberately not a second phase appended to
+/// [`sidebar_ctrl_w_l_returns_focus_to_the_editor`]: a *second* real
+/// activity-bar mouse click in the same running app hits a second unrelated
+/// quadraui `ShellAdapter` quirk (also confirmed by hand — after the first
+/// click, `AppShell::handle`'s own activity-bar hit-test is never reached
+/// again for a later click; `on_shell_event` fires exactly once). One click
+/// per scenario, matching every other single-click scenario in this module
+/// (`activity_bar_click_focuses_search_panel`, above), sidesteps it
+/// entirely.
+pub fn sidebar_ctrl_w_h_moves_focus_to_the_activity_bar_toolbar<
+    D: ConformanceDriver + DriverInput,
+>(
+    driver: &mut D,
+) {
+    use crate::core::engine::sidebar::PANEL_SEARCH;
+
+    let screen_has_ci = |driver: &D, needle: &str| {
+        let needle = needle.to_ascii_lowercase();
+        driver
+            .inventory()
+            .text_runs()
+            .iter()
+            .any(|r| r.text.to_ascii_lowercase().contains(&needle))
+    };
+
+    let (x, y) = activity_bar_zone_center(driver, PANEL_SEARCH);
+    driver.click(x, y);
+    assert!(
+        screen_has_ci(driver, "search"),
+        "precondition: clicking the Search icon must open the panel"
+    );
+    ConformanceDriver::ctrl_char(driver, 'w');
+    ConformanceDriver::type_char(driver, 'h');
+    ConformanceDriver::type_char(driver, 'j');
+    ConformanceDriver::type_char(driver, 'l');
+    assert!(
+        screen_has_ci(driver, "debug"),
+        "Ctrl-W h must move keyboard focus to the activity bar toolbar -- \
+         'j' then 'l' from there must move the toolbar cursor onto Debug \
+         (the next fixed panel after Search) and activate it, which a \
+         still-panel-focused or still-editor-focused 'j'/'l' would not do"
+    );
+}
+
+/// Center of `panel_id`'s activity-bar chrome zone, shared by
+/// [`sidebar_ctrl_w_l_returns_focus_to_the_editor`] and
+/// [`sidebar_ctrl_w_h_moves_focus_to_the_activity_bar_toolbar`] (and mirrors
+/// [`activity_bar_click_focuses_search_panel`]'s own inline lookup, above).
+fn activity_bar_zone_center<D: ConformanceDriver>(driver: &D, panel_id: &str) -> (f32, f32) {
+    driver
+        .inventory()
+        .zones()
+        .iter()
+        .find(|z| z.id.as_str() == panel_id)
+        .map(|z| {
+            (
+                z.bounds.x + z.bounds.width / 2.0,
+                z.bounds.y + z.bounds.height / 2.0,
+            )
+        })
+        .unwrap_or_else(|| panic!("the {panel_id} activity-bar icon must register a chrome zone"))
+}
+
 /// #984: v0.11.0 bug report — a single click on the file explorer's
 /// expand/collapse chevron does nothing; expanding the directory needs a
 /// *second* click, while a single click anywhere on the same row's text
@@ -4617,6 +4746,55 @@ mod issue_1360_activity_bar_click_focuses_panel {
         size: (800, 480),
         body: |driver| {
             crate::harness::activity_bar_click_focuses_search_panel(driver);
+        },
+    }
+}
+
+/// #1419: cross-backend wiring for
+/// [`sidebar_ctrl_w_l_returns_focus_to_the_editor`] and
+/// [`sidebar_ctrl_w_h_moves_focus_to_the_activity_bar_toolbar`] — see those
+/// scenarios' own docs for the repro and the assertions' rationale.
+///
+/// No `tui` arm on the `l` proof, same shape and same reason as
+/// `issue_1360_activity_bar_click_focuses_panel`'s own note just above:
+/// `App` driven by `quadraui::tui::TuiBackend` never paints the editor's
+/// `"Ln N, Col N"` status-bar segment at this harness's viewport size, a
+/// pre-existing gap in that control fixture unrelated to this issue's
+/// `Ctrl-W` chord fix. `gtk` and `tui_prod` are the two *real* shells users
+/// run, and both are covered. The `h` proof only reads panel-title text
+/// (already gap-free on `tui`, per `activity_bar_click_focuses_search_panel`
+/// above running clean there in spirit) but is still pinned to `[gtk,
+/// tui_prod]` for symmetry with its sibling.
+#[cfg(test)]
+mod issue_406_sidebar_ctrl_w_navigates {
+    fn engine_fixture() -> crate::core::Engine {
+        let mut engine = crate::core::Engine::new_for_test();
+        engine.settings.use_nerd_fonts = Some(false);
+        let text = (1..=30)
+            .map(|n| format!("line {n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        engine.buffer_mut().insert(0, &text);
+        engine
+    }
+
+    crate::backend_conformance! {
+        label: sidebar_ctrl_w_l_returns_focus_to_the_editor_proof,
+        backends: [gtk, tui_prod],
+        engine: engine_fixture(),
+        size: (800, 480),
+        body: |driver| {
+            crate::harness::sidebar_ctrl_w_l_returns_focus_to_the_editor(driver);
+        },
+    }
+
+    crate::backend_conformance! {
+        label: sidebar_ctrl_w_h_moves_focus_to_the_activity_bar_toolbar_proof,
+        backends: [gtk, tui_prod],
+        engine: engine_fixture(),
+        size: (800, 480),
+        body: |driver| {
+            crate::harness::sidebar_ctrl_w_h_moves_focus_to_the_activity_bar_toolbar(driver);
         },
     }
 }
