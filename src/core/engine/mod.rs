@@ -3694,6 +3694,21 @@ pub struct Engine {
     /// know which card a reported verdict belongs to — a review with no
     /// card id (an ACP diff) simply has no verdict to report.
     pub review_card_id: Option<String>,
+    /// Which pinned comment a still-open `"review_comment"` [`Dialog`] is
+    /// editing (#527, Track A Phase 3) — set by
+    /// [`Self::change_review_start_comment`], read and cleared by
+    /// [`Self::apply_review_comment_dialog_result`] once the dialog is
+    /// dismissed. See [`ReviewCommentTarget`]'s own doc for why this lives
+    /// on `Engine` rather than inside `Dialog` itself.
+    pub review_comment_target: Option<ReviewCommentTarget>,
+    /// The [`crate::core::review::FindingsSerializer`] used to prefill a
+    /// verdict-composer buffer's body from the current review's pinned
+    /// comments (#527) — a plain function pointer, defaulting to
+    /// [`crate::core::review::markdown_findings_serializer`]. Swappable
+    /// (`#[cfg(test)]` setter below) so the findings layout stays
+    /// pluggable per #527's own acceptance bar rather than hardcoded to
+    /// one provider's format.
+    pub review_findings_serializer: crate::core::review::FindingsSerializer,
 
     // --- DAP (Debug Adapter Protocol) state ---
     /// Multi-adapter DAP coordinator. None until first debug session is started.
@@ -4857,6 +4872,8 @@ impl Engine {
             change_review_diff_rect: std::cell::Cell::new(quadraui::Rect::default()),
             review_target: None,
             review_card_id: None,
+            review_comment_target: None,
+            review_findings_serializer: crate::core::review::markdown_findings_serializer,
             dap_manager: None,
             dap_stopped_thread: None,
             dap_breakpoints: HashMap::new(),
@@ -6000,6 +6017,8 @@ mod picker;
 mod plugins;
 mod search;
 pub use search::{find_word_boundaries, SearchKeyResult};
+mod review_comment_ops;
+pub use review_comment_ops::ReviewCommentTarget;
 mod review_ops;
 mod review_verdict_ops;
 pub mod sidebar;

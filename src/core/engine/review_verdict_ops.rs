@@ -70,8 +70,17 @@ impl Engine {
             self.message = format!("Board: no {} command configured", verdict.token());
             return;
         }
+        // Captured *before* `close_change_review` clears `self.change_review`
+        // — the pinned comments (#527) collected while the diff surface was
+        // open are the findings list this verdict's body gets prefilled
+        // with.
+        let comments = self
+            .change_review
+            .as_ref()
+            .map(|r| r.comments.clone())
+            .unwrap_or_default();
         self.close_change_review();
-        self.open_review_verdict_buffer(card_id, verdict, verdict_command);
+        self.open_review_verdict_buffer(card_id, verdict, verdict_command, comments);
     }
 
     fn open_review_verdict_buffer(
@@ -79,10 +88,17 @@ impl Engine {
         card_id: String,
         verdict: ReviewVerdict,
         verdict_command: Vec<String>,
+        comments: Vec<crate::core::review::ReviewComment>,
     ) {
         let buf_id = self.buffer_manager.create();
+        // #527: fold the pinned line comments into the composed body via
+        // whichever `FindingsSerializer` is installed — pluggable, not a
+        // hardcoded format inline here (see `crate::core::review::
+        // FindingsSerializer`'s own doc for why).
+        let findings_count = comments.len();
+        let prefill = (self.review_findings_serializer)(&comments);
         if let Some(state) = self.buffer_manager.get_mut(buf_id) {
-            state.buffer.content = ropey::Rope::from_str("");
+            state.buffer.content = ropey::Rope::from_str(&prefill);
             state.syntax = crate::core::syntax::Syntax::new_from_path(Some("review.md"));
             state.review_verdict = Some(ReviewVerdictBinding {
                 card_id: card_id.clone(),
@@ -101,7 +117,24 @@ impl Engine {
         self.active_group_mut().tabs.push(tab);
         self.active_group_mut().active_tab = self.active_group().tabs.len() - 1;
 
-        self.message = "Write the review body, then :w to report it.".to_string();
+        self.message = if findings_count == 0 {
+            "Write the review body, then :w to report it.".to_string()
+        } else {
+            format!(
+                "Write the review body ({findings_count} pinned comment(s) included), then :w to report it."
+            )
+        };
+    }
+
+    /// Swap in a different [`crate::core::review::FindingsSerializer`] for
+    /// tests — proves the findings layout is genuinely pluggable, not
+    /// hardcoded, per #527's own acceptance bar.
+    #[cfg(test)]
+    pub fn set_review_findings_serializer(
+        &mut self,
+        serializer: crate::core::review::FindingsSerializer,
+    ) {
+        self.review_findings_serializer = serializer;
     }
 
     /// Save a review-verdict buffer: write the composed body to a temp file
@@ -241,6 +274,114 @@ mod tests {
         assert_eq!(binding.card_id, "card:7");
         assert_eq!(binding.verdict_command[0], "mock");
         assert_eq!(binding.verdict_command[3], "--ok");
+    }
+
+    /// #527 acceptance: pinned comments collected on the change-review
+    /// surface "appear in the submitted body" — asserted on the actual
+    /// composed buffer content, the same text `save_review_verdict_buffer`
+    /// would push through `{body_file}`.
+    #[test]
+    fn start_review_verdict_prefills_the_body_with_pinned_findings() {
+        let mut engine = Engine::new_for_test();
+        install_mock_provider_with_verdicts(&mut engine);
+        engine.review_card_id = Some("card:7".to_string());
+        engine.change_review = Some(crate::core::review::ChangeReviewState::new(vec![
+            crate::core::review::ProposedChange {
+                path: "src/lib.rs".to_string(),
+                old_text: Some("a\n".to_string()),
+                new_text: "b\n".to_string(),
+            },
+        ]));
+        engine
+            .change_review
+            .as_mut()
+            .unwrap()
+            .comments
+            .push(crate::core::review::ReviewComment {
+                file: "src/lib.rs".to_string(),
+                line: 1,
+                text: "please add a test".to_string(),
+            });
+
+        engine.start_review_verdict(ReviewVerdict::Approve);
+
+        let body = engine.buffer().to_string();
+        assert!(
+            body.contains("src/lib.rs:1"),
+            "the pinned comment's file:line must appear in the composed body: {body:?}"
+        );
+        assert!(
+            body.contains("please add a test"),
+            "the pinned comment's text must appear in the composed body: {body:?}"
+        );
+        assert!(engine.message.contains("1 pinned comment(s) included"));
+    }
+
+    /// #527's own acceptance bar: "the findings serializer is pluggable,
+    /// not hardcoded to one provider's format" — swapping
+    /// `review_findings_serializer` changes what the composed body looks
+    /// like, with no other code path touched.
+    #[test]
+    fn start_review_verdict_uses_the_installed_findings_serializer() {
+        fn shouty(comments: &[crate::core::review::ReviewComment]) -> String {
+            comments
+                .iter()
+                .map(|c| format!("!!! {} !!!", c.text.to_uppercase()))
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+
+        let mut engine = Engine::new_for_test();
+        install_mock_provider_with_verdicts(&mut engine);
+        engine.review_card_id = Some("card:7".to_string());
+        engine.change_review = Some(crate::core::review::ChangeReviewState::new(vec![
+            crate::core::review::ProposedChange {
+                path: "src/lib.rs".to_string(),
+                old_text: Some("a\n".to_string()),
+                new_text: "b\n".to_string(),
+            },
+        ]));
+        engine
+            .change_review
+            .as_mut()
+            .unwrap()
+            .comments
+            .push(crate::core::review::ReviewComment {
+                file: "src/lib.rs".to_string(),
+                line: 1,
+                text: "quiet down".to_string(),
+            });
+        engine.set_review_findings_serializer(shouty);
+
+        engine.start_review_verdict(ReviewVerdict::Approve);
+
+        let body = engine.buffer().to_string();
+        assert_eq!(body, "!!! QUIET DOWN !!!");
+    }
+
+    /// A review with no pinned comments composes exactly the blank body it
+    /// did before #527 — no stray "## Findings" heading with nothing under
+    /// it.
+    #[test]
+    fn start_review_verdict_with_no_comments_leaves_the_body_blank() {
+        let mut engine = Engine::new_for_test();
+        install_mock_provider_with_verdicts(&mut engine);
+        engine.review_card_id = Some("card:7".to_string());
+        engine.change_review = Some(crate::core::review::ChangeReviewState::new(vec![
+            crate::core::review::ProposedChange {
+                path: "src/lib.rs".to_string(),
+                old_text: Some("a\n".to_string()),
+                new_text: "b\n".to_string(),
+            },
+        ]));
+
+        engine.start_review_verdict(ReviewVerdict::Approve);
+
+        assert_eq!(engine.buffer().to_string(), "");
+        assert_eq!(
+            engine.message,
+            "Write the review body, then :w to report it."
+        );
     }
 
     /// Acceptance: "Approve / request-changes records a verdict through a

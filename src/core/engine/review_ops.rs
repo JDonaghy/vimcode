@@ -23,7 +23,7 @@
 //! resolution function.
 
 use super::*;
-use crate::core::review::ProposedChange;
+use crate::core::review::{row_to_location, ProposedChange};
 use crate::core::tool_client::BranchReviewTarget;
 
 impl Engine {
@@ -212,6 +212,8 @@ impl Engine {
     /// | `A`         | Approve — report a verdict (#526)          |
     /// | `C`         | Request changes — report a verdict (#526)  |
     /// | `M`         | Comment-only — report a verdict (#526)     |
+    /// | `c`         | Add/edit a comment on the current line (#527) |
+    /// | `d`         | Delete the comment on the current line (#527) |
     ///
     /// The three verdict keys hand off to
     /// [`Self::start_review_verdict`], which closes this surface and opens
@@ -299,6 +301,8 @@ impl Engine {
                 self.start_review_verdict(crate::core::review::ReviewVerdict::RequestChanges)
             }
             Some('M') => self.start_review_verdict(crate::core::review::ReviewVerdict::Comment),
+            Some('c') => self.change_review_start_comment(),
+            Some('d') => self.change_review_delete_comment_at_current_line(),
             _ => {}
         }
         true
@@ -391,43 +395,6 @@ impl Engine {
         self.ensure_cursor_visible();
         self.close_change_review();
     }
-}
-
-/// Derive a 1-based `(path, line)` for `row_idx` (an index into
-/// `entry.view.flat_rows()`) from the hunk that contains it — the same
-/// per-row arithmetic `quadraui::unified_hunk_header` uses per-hunk, just
-/// walked row by row. Prefers the right-side (new) line number, falling
-/// back to the left-side one for a pure-removal row that has no right
-/// side at all.
-fn row_to_location(
-    entry: &crate::core::review::ChangeReviewEntry,
-    row_idx: usize,
-) -> Option<(String, u32)> {
-    let mut acc = 0usize;
-    for hunk in &entry.view.hunks {
-        if row_idx < acc + hunk.rows.len() {
-            let offset = row_idx - acc;
-            let mut left_line = hunk.left_start as u32;
-            let mut right_line = hunk.right_start as u32;
-            for row in &hunk.rows[..offset] {
-                if row.left.is_some() {
-                    left_line += 1;
-                }
-                if row.right.is_some() {
-                    right_line += 1;
-                }
-            }
-            let row = &hunk.rows[offset];
-            let line = if row.right.is_some() {
-                right_line
-            } else {
-                left_line
-            };
-            return Some((entry.change.path.clone(), line));
-        }
-        acc += hunk.rows.len();
-    }
-    None
 }
 
 #[cfg(test)]

@@ -515,6 +515,15 @@ impl Engine {
                 }
                 EngineAction::None
             }
+            "review_comment" => {
+                // #527: `Engine::change_review_start_comment` opened this
+                // dialog and recorded which comment it's for in
+                // `self.review_comment_target`; the resolution logic all
+                // lives on that method's sibling so it can be unit-tested
+                // directly without round-tripping a `Dialog`.
+                self.apply_review_comment_dialog_result(action, input_value);
+                EngineAction::None
+            }
             tag if tag.starts_with("open_ext_url:") => {
                 // Extension-provided link — user confirmed "Open".
                 if action == "open" {
