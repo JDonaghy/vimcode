@@ -148,6 +148,17 @@ impl Engine {
         // "adhoc" key for terminal runs with no install context, whose exit code
         // nothing reads.
         let install_key = ctx.as_ref().map_or("adhoc", |c| c.install_key.as_str());
+        // #1396 review: `install_key` is deterministic per extension
+        // (`format!("ext:{ext_name}:lsp")`), so a leftover scratch file from an
+        // earlier attempt under the same key (pane closed in the narrow window
+        // after the wrapper wrote it but before this run started, or a crash)
+        // would otherwise be mistaken by `poll_terminal`'s very first idle tick
+        // for *this* run's result — finalizing immediately with a stale exit
+        // code and permanently discarding the real outcome once it lands.
+        // Deleting any stale file before the new wrapper is even injected
+        // guarantees `poll_terminal` never observes a code that didn't come
+        // from this attempt.
+        invalidate_install_exit_code(install_key);
         let wrapped = build_terminal_install_wrapper(command, is_powershell, install_key);
         match TerminalSession::spawn(cols, rows, &shell, &cwd, history_cap) {
             Ok(mut sess) => {
@@ -814,23 +825,31 @@ impl Engine {
         // Finalize any install pane whose command has already recorded its exit
         // status, ahead of the shell-exit loop below. Collected into a separate
         // Vec first because `finalize_install_from_terminal` takes `&mut self`
-        // and can't run while `terminal_panes` is borrowed by the scan.
-        let mut newly_finalized: Vec<(usize, InstallContext)> = Vec::new();
-        for (i, slot) in self.terminal_panes.iter().enumerate() {
-            if slot.install_finalized {
-                continue;
-            }
-            if let Some(ctx) = &slot.install_ctx {
-                if install_exit_code_ready(&ctx.install_key) {
-                    newly_finalized.push((i, ctx.clone()));
+        // and can't run while `terminal_panes` is borrowed by the scan. Skips
+        // the scan (and its allocation) entirely when there are no unfinalized
+        // install panes at all — the common case for plain terminal tabs.
+        if self
+            .terminal_panes
+            .iter()
+            .any(|slot| slot.install_ctx.is_some() && !slot.install_finalized)
+        {
+            let mut newly_finalized: Vec<(usize, InstallContext)> = Vec::new();
+            for (i, slot) in self.terminal_panes.iter().enumerate() {
+                if slot.install_finalized {
+                    continue;
+                }
+                if let Some(ctx) = &slot.install_ctx {
+                    if install_exit_code_ready(&ctx.install_key) {
+                        newly_finalized.push((i, ctx.clone()));
+                    }
                 }
             }
-        }
-        for (i, ctx) in newly_finalized {
-            if let Some(slot) = self.terminal_panes.get_mut(i) {
-                slot.install_finalized = true;
+            for (i, ctx) in newly_finalized {
+                if let Some(slot) = self.terminal_panes.get_mut(i) {
+                    slot.install_finalized = true;
+                }
+                self.finalize_install_from_terminal(&ctx);
             }
-            self.finalize_install_from_terminal(&ctx);
         }
         // Remove exited sessions in reverse order (preserves earlier indices during removal).
         // For install panes that weren't already finalized above (e.g. the pane was
@@ -1404,7 +1423,7 @@ impl Engine {
 /// user-free-text, so a colliding pair would require two *different* code
 /// paths to independently choose the exact same literal key, which none do
 /// today.
-fn install_exit_code_path(install_key: &str) -> PathBuf {
+pub(crate) fn install_exit_code_path(install_key: &str) -> PathBuf {
     let safe: String = install_key
         .chars()
         .map(|c| {
@@ -1446,6 +1465,23 @@ fn install_exit_code_ready(install_key: &str) -> bool {
     install_exit_code_path(install_key).exists()
 }
 
+/// Delete any leftover exit-code scratch file for `install_key` (#1396 review
+/// finding). `terminal_run_command` calls this right before injecting the
+/// wrapped command into the new pane's PTY, so a file left behind by an
+/// earlier attempt under the same (deterministic, per-extension) `install_key`
+/// can never be mistaken by `poll_terminal`'s eager `install_exit_code_ready`
+/// check for the current run's result. Without this, a leftover from a pane
+/// closed between the wrapper writing the file and the shell actually exiting
+/// (or a crash in that window) would finalize the *new* install on its very
+/// first idle tick with the *old* exit code, and — because finalization is
+/// idempotent per pane — permanently discard the real outcome once it lands.
+/// Best-effort: if the file doesn't exist, or can't be removed, there is
+/// nothing stale to worry about (a fresh write by this run's wrapper will
+/// simply create/overwrite it later).
+fn invalidate_install_exit_code(install_key: &str) {
+    let _ = std::fs::remove_file(install_exit_code_path(install_key));
+}
+
 /// Build the PTY-injected wrapper script for `terminal_run_command`.
 ///
 /// Wraps `command` in a shell fragment that:
@@ -1455,10 +1491,15 @@ fn install_exit_code_ready(install_key: &str) -> bool {
 ///    apart from a successful one whose binary just isn't resolvable.
 /// 3. Prints a colour-coded success/failure banner.
 /// 4. Prints "Press Enter to close…" and waits for the user.
-/// 5. **Exits the shell** — without this final `exit` / `Exit`, the interactive
-///    shell returns to its PS1 prompt and `TerminalSession::is_exited()` never
-///    fires, so `poll_terminal` would never call `finalize_install_from_terminal`
-///    and the LSP/DAP server would never be registered.
+/// 5. **Exits the shell** after "Press Enter to close…" — since #1396,
+///    `poll_terminal` finalizes as soon as the exit-code scratch file appears
+///    (step 2), *without* waiting for this exit, so the LSP/DAP registration no
+///    longer depends on it. This final `exit` / `Exit` still matters for a
+///    second, narrower reason: it's what makes `TerminalSession::is_exited()`
+///    eventually fire so the pane closes and its `TerminalSlot` is removed
+///    once the user is done reading the output and presses Enter — without
+///    it, the shell would return to its PS1 prompt and the pane would stay
+///    open (and unremovable) forever.
 ///
 /// Extracted as a pure function so both the exit-suffix invariant and the
 /// exit-code handoff can be tested without spawning a real PTY.
@@ -1582,7 +1623,7 @@ pub fn key_to_pty_bytes(key_name: &str, unicode: Option<char>, ctrl: bool) -> Ve
 mod tests {
     use super::{
         build_acp_auth_wrapper, build_terminal_install_wrapper, install_exit_code_path,
-        read_install_exit_code,
+        install_exit_code_ready, invalidate_install_exit_code, read_install_exit_code,
     };
     use std::path::PathBuf;
 
@@ -1721,6 +1762,77 @@ mod tests {
     fn read_install_exit_code_is_none_when_never_written() {
         let key = "test:never-written-exit-code";
         assert_eq!(read_install_exit_code(key), None);
+    }
+
+    /// #1396: `install_exit_code_ready` is `poll_terminal`'s eager-finalize
+    /// gate — it must be false before the wrapper has written anything, and
+    /// true once the scratch file exists, without consuming it (unlike
+    /// `read_install_exit_code`, a second `_ready` check right after must
+    /// still see it).
+    #[test]
+    fn install_exit_code_ready_reflects_scratch_file_existence_without_consuming() {
+        let key = "test:ready-reflects-existence";
+        let path = install_exit_code_path(key);
+        let _ = std::fs::remove_file(&path);
+
+        assert!(
+            !install_exit_code_ready(key),
+            "must be false before the wrapper has written anything"
+        );
+
+        std::fs::write(&path, "0").unwrap();
+        assert!(
+            install_exit_code_ready(key),
+            "must be true once the scratch file exists"
+        );
+        assert!(
+            install_exit_code_ready(key),
+            "checking readiness must not consume the file, unlike read_install_exit_code"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// #1396 review (blocking finding): a leftover scratch file from an
+    /// earlier attempt under the same `install_key` (e.g. the pane was closed
+    /// in the narrow window after the wrapper wrote it but before the shell
+    /// exited, or the app crashed) must not survive into a new attempt —
+    /// `terminal_run_command` calls `invalidate_install_exit_code` right
+    /// before injecting the new wrapper, and this confirms it actually clears
+    /// both `install_exit_code_ready` and a subsequent `read_install_exit_code`.
+    #[test]
+    fn invalidate_install_exit_code_clears_stale_leftover_file() {
+        let key = "test:invalidate-clears-stale-leftover";
+        let path = install_exit_code_path(key);
+        // Simulate a leftover from an earlier, never-finalized attempt.
+        std::fs::write(&path, "1").unwrap();
+        assert!(install_exit_code_ready(key), "setup: file must exist");
+
+        invalidate_install_exit_code(key);
+
+        assert!(
+            !install_exit_code_ready(key),
+            "a stale leftover must not be observed as ready after invalidation"
+        );
+        assert_eq!(
+            read_install_exit_code(key),
+            None,
+            "a stale leftover must not be readable as a real exit code after invalidation"
+        );
+    }
+
+    /// Calling `invalidate_install_exit_code` when no file exists yet (the
+    /// common case — most installs are the extension's first attempt) must be
+    /// a harmless no-op, not a panic.
+    #[test]
+    fn invalidate_install_exit_code_is_noop_when_nothing_to_invalidate() {
+        let key = "test:invalidate-noop-when-absent";
+        let path = install_exit_code_path(key);
+        let _ = std::fs::remove_file(&path);
+
+        invalidate_install_exit_code(key); // must not panic
+
+        assert!(!install_exit_code_ready(key));
     }
 
     // -----------------------------------------------------------------------

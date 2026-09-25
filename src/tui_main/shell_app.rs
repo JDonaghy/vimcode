@@ -27472,6 +27472,104 @@ mod tests {
         );
     }
 
+    /// #1396 review (blocking finding): a leftover exit-code scratch file from
+    /// an earlier, never-finalized attempt under the same (deterministic,
+    /// per-extension) `install_key` must never be mistaken for the *current*
+    /// run's result. `install_key` is `format!("ext:{ext_name}:lsp")`
+    /// (`lsp_ops.rs`) — reused verbatim on every retry — so this pre-writes a
+    /// stale "succeeded" (`0`) scratch file before the new install even
+    /// starts, matching the reviewer's scenario: the pane from an earlier
+    /// attempt was closed (or the app crashed) in the narrow window after its
+    /// wrapper wrote the file but before the shell exited, leaving the file
+    /// behind. This run's *own* command genuinely fails (exit 9); the
+    /// resolved status must reflect that real outcome, not the stale
+    /// leftover — proving `terminal_run_command` invalidates the scratch
+    /// file before injecting the new wrapper, so `poll_terminal`'s eager
+    /// `install_exit_code_ready` check on its very first idle tick can't
+    /// observe a code that didn't come from this attempt.
+    ///
+    /// **Verified RED against the unfixed eager-finalize path:** removing the
+    /// `invalidate_install_exit_code` call from `terminal_run_command` makes
+    /// the first `poll_until_screen` below observe "installed and started"
+    /// (or a spinner that just clears with no failure message) almost
+    /// instantly instead of "failed (exit 9)" — `poll_terminal`'s very first
+    /// tick sees the pre-existing stale `0` file, finalizes as success, sets
+    /// `install_finalized`, and permanently discards the real exit-9 result
+    /// once the command actually finishes.
+    #[test]
+    #[cfg(unix)]
+    fn extension_install_ignores_stale_leftover_exit_code_from_earlier_attempt_via_shell_app() {
+        use crate::core::engine::terminal_ops::install_exit_code_path;
+        use crate::core::extensions::{ExtensionManifest, LspConfig};
+        use crate::core::settings::TestSettingsPathGuard;
+
+        let _settings_guard = TestSettingsPathGuard::install(std::env::temp_dir().join(format!(
+            "vimcode_test_shell_app_1396_stale_settings_{}_{:?}.json",
+            std::process::id(),
+            std::thread::current().id()
+        )));
+
+        let ext_name = "vimcode-test-ext-1396-stale".to_string();
+        let install_key = format!("ext:{ext_name}:lsp");
+        let stale_path = install_exit_code_path(&install_key);
+        // Simulate the leftover from an earlier, never-finalized attempt: it
+        // recorded a *success* (`0`), unlike this run's real, genuine failure
+        // below — so if the stale file wins, the assertions below can tell.
+        std::fs::write(&stale_path, "0").unwrap();
+
+        let mut app = TuiShellApp::new_for_test();
+        app.engine.ext_registry = Some(vec![ExtensionManifest {
+            name: ext_name.clone(),
+            display_name: "Fake Extension (1396 stale-leftover test)".to_string(),
+            language_ids: vec!["vimcode-test-lang-1396-stale".to_string()],
+            lsp: LspConfig {
+                binary: "vimcode-test-nonexistent-binary-1396-stale".to_string(),
+                install: "sh -c 'exit 9'".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        }]);
+
+        app.engine.ext_install_from_registry(&ext_name);
+        assert!(
+            app.engine.pending_terminal_command.is_some(),
+            "precondition: the manifest's install command must be queued"
+        );
+        // The stale file must still be sitting there right up until the new
+        // wrapper is injected (below) — otherwise this wouldn't be testing
+        // the race the reviewer described.
+        assert!(
+            stale_path.exists(),
+            "precondition: the stale leftover scratch file must still exist \
+             before the new install pane is spawned"
+        );
+
+        let mut driver = driver_with_shell(app, config(), 300, 24);
+
+        // No keystroke is sent: same rationale as the success/failure tests
+        // above — the wrapper's real `read __dummy` blocks, so the pane's
+        // shell stays open at its prompt and only `poll_terminal`'s
+        // eager exit-code-file poll can resolve this.
+        let resolved = poll_until_screen(&mut driver, Duration::from_secs(20), |screen| {
+            screen.contains("failed (exit 9)") && screen.contains("Press Enter to close")
+        });
+        assert!(
+            resolved,
+            "install must resolve with THIS run's real failure (exit 9), \
+             not hang and not silently adopt the stale leftover's success; \
+             screen:\n{}",
+            driver.screen()
+        );
+        assert!(
+            !driver.screen().contains("installed and started"),
+            "a stale leftover 'success' scratch file must never be reported \
+             as this run's outcome; screen:\n{}",
+            driver.screen()
+        );
+
+        let _ = std::fs::remove_file(&stale_path);
+    }
+
     // ── #1345: native tool acquisition — driver-tier black-box coverage ──
     //
     // Review finding: the only prior coverage for #1345's user-visible
