@@ -349,6 +349,20 @@ pub fn fetch_board_model(
 /// checked out) — turning this into a real diff is pure local git
 /// (`crate::core::git::changed_files_between`), not another external-tool
 /// round trip.
+///
+/// `host` (#530, Track A Phase 5 — the fleet review seat) is an *optional*,
+/// purely descriptive label — never resolved, dialled, or `ssh`ed into by
+/// vimcode itself. It is what makes the "review-where-the-code-is" mode
+/// distinguishable from "pull-local" (`docs/COORDINATOR_INTEGRATION.md`
+/// §9/§11): a provider whose roster spans a machine fleet fills it with
+/// which worker box this branch/base pair lives on; a provider with only
+/// one checkout (or an external "pull the branch locally first" flow)
+/// leaves it `None`. Both modes reach `Engine::open_branch_review`
+/// identically — the *moat* is that vimcode already works correctly when
+/// it is itself the process running (over ssh) on that worker box, with
+/// no vimcode-side transport code at all; `host` only has to carry the
+/// provenance a human reviewing there needs to see, not make the trip
+/// happen.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
 pub struct BranchReviewTarget {
     /// The branch (or any git revision) containing the change to review.
@@ -357,6 +371,13 @@ pub struct BranchReviewTarget {
     /// cut from. Compared with three-dot semantics, see
     /// `crate::core::git::changed_files_between`.
     pub base: String,
+    /// Which fleet machine this branch/base pair's worktree lives on, if
+    /// the provider's roster spans more than one (#530). `None` when the
+    /// provider doesn't distinguish machines, or omits the field entirely
+    /// (`#[serde(default)]` — every #525-era provider response still
+    /// parses unchanged).
+    #[serde(default)]
+    pub host: Option<String>,
 }
 
 /// Run `argv` via `client` and parse the result as a [`BranchReviewTarget`]
@@ -635,6 +656,25 @@ mod tests {
             .expect("fixture should parse into BranchReviewTarget");
         assert_eq!(target.branch, "issue-525-review");
         assert_eq!(target.base, "develop");
+        // A provider that predates #530's `host` field must still parse —
+        // `#[serde(default)]` is what makes that true, not an accident of
+        // this particular fixture.
+        assert_eq!(target.host, None);
+    }
+
+    /// #530 (Track A Phase 5): a fleet provider's roster spans more than
+    /// one worker machine, so its `"OpenReview"` response names which one
+    /// this branch/base pair's worktree lives on.
+    #[test]
+    fn mock_client_fetch_branch_review_target_parses_host_when_present() {
+        let client = MockToolClient(Ok(serde_json::json!({
+            "branch": "issue-530-review",
+            "base": "develop",
+            "host": "worker-3.fleet.local",
+        })));
+        let target = fetch_branch_review_target(&client, &["whatever".to_string()])
+            .expect("fixture should parse into BranchReviewTarget");
+        assert_eq!(target.host.as_deref(), Some("worker-3.fleet.local"));
     }
 
     #[test]
