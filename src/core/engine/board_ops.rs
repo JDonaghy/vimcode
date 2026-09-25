@@ -571,7 +571,7 @@ impl Engine {
             }
             return true;
         }
-        // Both backends' `engine_key_from_ui`/`map_gtk_key_name` translate
+        // Both backends' `render::engine_key_from_ui` translates
         // an Enter keypress to the engine's own `"Return"`/`"KP_Enter"`
         // convention (see `keys.rs`), but `quadraui::BoardModel::handle_key`
         // matches the literal `"Enter"` — translate here (a real key never
