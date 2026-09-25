@@ -5705,9 +5705,9 @@ mod tests {
     // `tui_prod` lane's harness), asserting on the painted grid — the
     // user-visible guarantee #1243's hook exists to make good on.
     //
-    // **What this cannot prove, and why** (verified against pinned rev
-    // `215e9e4`, see `render::popup_overlay_closed_this_frame`'s doc for
-    // the full write-up): under a `ratatui` `TestBackend`,
+    // **What this specific test cannot prove, and why** (verified against
+    // pinned rev `215e9e4`, see `render::popup_overlay_closed_this_frame`'s
+    // doc for the full write-up): under a `ratatui` `TestBackend`,
     // `Terminal::clear()` is *provably output-identical* to not clearing —
     // it blanks the backend buffer and resets the back buffer, so the
     // following `draw` writes every non-blank cell and lands on
@@ -5715,30 +5715,21 @@ mod tests {
     // `screen()`/`style_at()`/`terminal_cursor_position()` assertion can
     // distinguish "`request_full_repaint` fired" from "it didn't", and the
     // test below does not go RED if the `backend.request_full_repaint()`
-    // calls are deleted. The stale-cell condition only arises for content
-    // written *outside* ratatui's `Buffer` (a PTY writing raw bytes),
-    // which needs quadraui's vt100-backed `TuiVtDriver` — unreachable from
-    // here behind two `pub(crate)` seams, drafted as a ready-to-file
-    // upstream issue in `docs/PENDING_QUADRAUI_ISSUES.md` ("TUI test
-    // drivers can't observe `Backend::request_full_repaint`'s effect…").
-    // This is therefore *paint-integrity* coverage of the popup-dismiss
-    // call site, not the repaint proof #1243's acceptance criteria ask
-    // for; that one is blocked on the filed gap. Do not read a green run
-    // here as proof the hook fires.
+    // calls are deleted. This is therefore *paint-integrity* coverage of
+    // the popup-dismiss call site (the popup leaves no `TestBackend`-level
+    // trace), kept alongside the repaint proof rather than replaced by it —
+    // it is cheaper to run and catches a different failure mode (the popup
+    // itself failing to actually stop rendering).
     //
-    // **There is deliberately no companion Ctrl+L driver test**, and the
-    // reason is measured, not assumed: a Ctrl+L test was written, run, and
-    // then RED-verified by disabling the rung in `handle_key_pressed` —
-    // and it *stayed green*, because a fall-through Ctrl+L is inert in
-    // every reachable mode (Normal: unbound; Insert: `Engine::handle_key`
-    // drops `Ctrl`-modified printables; picker/folder-picker/dialog: those
-    // rungs intercept first). The chord's only effect is the repaint
-    // itself, which the paragraph above proves is unobservable here, so
-    // any Ctrl+L driver test is vacuous by construction — exactly the
-    // "test that cannot fail is not coverage" trap `CLAUDE.md` names, so
-    // it was deleted rather than shipped green. Ctrl+L's decision logic is
-    // covered by `render::is_force_redraw_key`'s own unit tests
-    // (`slice7_router_tests`); the wiring is a one-line delegation.
+    // **#1393 closed the gap this comment used to point at as unfiled**:
+    // quadraui#1060 (`vt_testing::driver_with_shell` +
+    // `TuiVtDriver::inject_raw`, landed at this repo's pinned rev) exposes
+    // the vt100-backed driver needed to observe the *actual* repaint — a
+    // stale cell written out-of-band from anything `paint_frame` ever
+    // sends. See `ctrl_l_repaints_a_stale_cell_an_incremental_diff_would_skip_via_vt_driver`
+    // and `popup_dismiss_repaints_a_stale_cell_an_incremental_diff_would_skip_via_vt_driver`
+    // below (both RED-verified by disabling their respective
+    // `backend.request_full_repaint()` call sites) for that proof.
 
     /// #1243, popup-dismiss call site: opening the unified picker must
     /// paint its header, and dismissing it must leave **no** trace of it
@@ -5784,6 +5775,167 @@ mod tests {
             !driver.screen_contains("Key Bindings"),
             "the dismissed picker must leave no glyphs behind — screen \
              was:\n{}",
+            driver.screen()
+        );
+    }
+
+    // ── #1393: the actual repaint proof, via quadraui#1060's `vt_testing`
+    // `ShellApp` driver ───────────────────────────────────────────────────
+    //
+    // The module comment above `picker_dismiss_leaves_no_popup_glyphs_on_the_grid_via_shell_app`
+    // (and `render::popup_overlay_closed_this_frame`'s own doc) explains why
+    // no assertion built on `quadraui::tui::testing::TuiDriver`
+    // (`ratatui::backend::TestBackend`) can distinguish "`request_full_repaint`
+    // fired" from "it didn't": `Terminal::clear()` is output-identical to an
+    // ordinary diffed redraw under that backend, so there is no stale cell
+    // for it to observe. quadraui#1060 (landed at this repo's pinned rev —
+    // `vt_testing::driver_with_shell` + the public `TuiVtDriver::inject_raw`
+    // hook) exposes the real `vt100`-backed driver quadraui already uses
+    // in-crate to prove the mechanism
+    // (`vt_testing::render_actually_clears_stale_content_outside_the_diff_cache`)
+    // to downstream `ShellApp` consumers, so the two tests below can assert
+    // on the actual repaint instead of the paint-integrity proxy above.
+    //
+    // Technique (mirrors the upstream test exactly): `inject_raw` writes a
+    // byte straight into the `vt100::Parser` underneath `paint_frame`, out
+    // of band from anything the app's own `ratatui::Buffer` diffing ever
+    // sees — modelling a process (a PTY, a subshell, anything sharing the
+    // terminal) writing directly to the screen. As long as the app's *own*
+    // content at that cell is unchanged between frames, a plain redraw
+    // leaves the injected glyph in place: ratatui's diff believes the cell
+    // is unchanged and sends nothing for it. That plain-redraw step is
+    // deliberately asserted *before* the triggering key, in both tests
+    // below — it is what makes each test RED-capable rather than vacuous:
+    // without `request_full_repaint` wired to the trigger, the final
+    // assertion in each test would fail exactly the way the plain-redraw
+    // assertion just passed. The coordinate used (bottom-right cell) is
+    // never painted by either the status bar or the popup at 80x24, so its
+    // content is identical across every frame in both tests regardless of
+    // popup/cursor state — the injected glyph's survival is purely a
+    // function of whether a full repaint was requested, not of what the
+    // app happens to draw there.
+    const STALE_CELL_ANSI_MOVE: &[u8] = b"\x1b[24;80H";
+
+    /// #1393 acceptance: Ctrl+L (`render::is_force_redraw_key`'s call site
+    /// in `handle_key_pressed`) must force the next paint to wipe a cell an
+    /// incremental diff would otherwise skip.
+    #[test]
+    fn ctrl_l_repaints_a_stale_cell_an_incremental_diff_would_skip_via_vt_driver() {
+        let app = TuiShellApp::new_for_test();
+        let mut driver = quadraui::tui::vt_testing::driver_with_shell(app, config(), 80, 24);
+
+        driver.inject_raw(STALE_CELL_ANSI_MOVE);
+        driver.inject_raw(b"Z");
+        assert!(
+            driver.screen_contains("Z"),
+            "sanity: the injected stale glyph must be visible before either \
+             render — screen:\n{}",
+            driver.screen()
+        );
+
+        // Plain redraw, nothing pending: the app never paints that corner,
+        // so ratatui's diff still believes it's unchanged and sends
+        // nothing for it — the stale glyph survives. Proves this test can
+        // go RED: without Ctrl+L wired to `request_full_repaint`, the
+        // assertion after `ctrl_char('l')` below would fail the same way.
+        driver.render();
+        assert!(
+            driver.screen_contains("Z"),
+            "a redraw with no full-repaint request pending must not touch \
+             cells the diff cache believes are unchanged — screen:\n{}",
+            driver.screen()
+        );
+
+        let reaction = driver.ctrl_char('l');
+        assert_eq!(reaction, Reaction::Redraw, "Ctrl+L must request a redraw");
+        assert!(
+            !driver.screen_contains("Z"),
+            "Ctrl+L must call Backend::request_full_repaint and force the \
+             stale glyph to clear — screen:\n{}",
+            driver.screen()
+        );
+    }
+
+    /// #1393 acceptance: dismissing the unified picker
+    /// (`render::popup_overlay_closed_this_frame`'s `had_popup_overlay`
+    /// transition in `render_content`) must force the next paint to wipe a
+    /// cell an incremental diff would otherwise skip — the actual repaint
+    /// `picker_dismiss_leaves_no_popup_glyphs_on_the_grid_via_shell_app`
+    /// above cannot observe under `TestBackend`.
+    ///
+    /// Unlike the Ctrl+L rung (which calls `request_full_repaint` *before*
+    /// returning `Reaction::Redraw`, so the very next paint consumes it),
+    /// `render_content`'s `had_popup_overlay` check runs at the *end* of
+    /// the same render it's judging — after that frame has already drawn —
+    /// so the request lands for the *following* paint, matching
+    /// `Backend::request_full_repaint`'s own doc ("the next time it
+    /// paints"). This test therefore drives one extra plain `render()`
+    /// after the dismissing Escape before asserting the glyph is gone —
+    /// simulating any subsequent frame the live runner would paint anyway
+    /// (a cursor blink, the next keystroke, …).
+    #[test]
+    fn popup_dismiss_repaints_a_stale_cell_an_incremental_diff_would_skip_via_vt_driver() {
+        let mut app = TuiShellApp::new_for_test();
+        app.engine
+            .open_picker(crate::core::engine::PickerSource::Keybindings);
+        let mut driver = quadraui::tui::vt_testing::driver_with_shell(app, config(), 80, 24);
+
+        assert!(
+            driver.screen_contains("Key Bindings"),
+            "precondition: an open picker must paint its header — \
+             screen:\n{}",
+            driver.screen()
+        );
+
+        driver.inject_raw(STALE_CELL_ANSI_MOVE);
+        driver.inject_raw(b"Z");
+        assert!(
+            driver.screen_contains("Z"),
+            "sanity: the injected stale glyph must be visible before either \
+             render — screen:\n{}",
+            driver.screen()
+        );
+
+        // Plain redraw that leaves the picker open (typing filters the
+        // query, it does not close the popup): the bottom-right corner is
+        // outside both the status bar and the popup rect, unchanged by
+        // this keystroke, so the diff skips it and the stale glyph
+        // survives. Proves this test can go RED: without the
+        // `had_popup_overlay` transition wired to `request_full_repaint`,
+        // the assertion after Escape below would fail the same way.
+        let typed = driver.type_char('h');
+        assert_eq!(
+            typed,
+            Reaction::Redraw,
+            "typing into the picker query must redraw"
+        );
+        assert!(
+            driver.screen_contains("Z"),
+            "a redraw that leaves the popup open must not touch cells the \
+             diff cache believes are unchanged — screen:\n{}",
+            driver.screen()
+        );
+
+        let dismissed = driver.press_named(quadraui::NamedKey::Escape);
+        assert_eq!(
+            dismissed,
+            Reaction::Redraw,
+            "dismissing the picker must repaint"
+        );
+        assert!(
+            !driver.screen_contains("Key Bindings"),
+            "the dismissed picker must leave no glyphs behind — screen:\n{}",
+            driver.screen()
+        );
+
+        // The dismissing frame itself only *requests* the repaint (see the
+        // doc comment above) — consume it with one more plain render.
+        driver.render();
+        assert!(
+            !driver.screen_contains("Z"),
+            "closing the popup must call Backend::request_full_repaint and \
+             force the stale glyph to clear on the next paint — \
+             screen:\n{}",
             driver.screen()
         );
     }
