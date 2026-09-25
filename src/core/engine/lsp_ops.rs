@@ -1466,4 +1466,105 @@ mod tests {
             );
         }
     }
+
+    /// #1386 core acceptance: opening several files of a language whose
+    /// server resolves to a broken proxy (present on disk, fails its
+    /// `--version` probe — the rustup-uninstalled-component shape) must not
+    /// re-run that probe for every open. `Engine::open_file_with_mode`
+    /// calls `lsp_did_open`, which calls `ensure_server_for_language`
+    /// *twice* per open (did-open + `lsp_request_semantic_tokens`), so
+    /// without the negative cache this reads N×2 (or N×4, counting
+    /// `resolve_command`'s own internal duplicate probe) instead of 1.
+    ///
+    /// Also proves the file still opens successfully (buffer content
+    /// present, no error `Result`) despite the unresolvable server — the
+    /// bug this issue reports was a UI-thread stall on open, not a hard
+    /// failure, so a passing `open_file_with_mode` call on its own wouldn't
+    /// be new coverage; the probe count is the actual regression guard.
+    ///
+    /// **Verified RED against unfixed `develop`:** reverting the
+    /// `failed_language_resolutions` cache (`lsp_manager.rs`) makes
+    /// `probe_count` below grow with each open instead of staying at 1.
+    #[test]
+    #[cfg(unix)]
+    fn opening_multiple_files_with_unresolvable_lsp_server_probes_only_once() {
+        let binary_name = "vimcode-test-1386-engine-proxy";
+        let unique = format!(
+            "vimcode_test_1386_engine_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let base = std::env::temp_dir().join(&unique);
+        let home = base.join("home");
+        let cargo_bin = home.join(".cargo").join("bin");
+        let files_dir = base.join("files");
+        std::fs::create_dir_all(&cargo_bin).unwrap();
+        std::fs::create_dir_all(&files_dir).unwrap();
+        let counter_file = base.join("probes.log");
+
+        let binary_path = cargo_bin.join(binary_name);
+        std::fs::write(
+            &binary_path,
+            format!(
+                "#!/bin/sh\necho probe >> {}\nexit 1\n",
+                counter_file.display()
+            ),
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&binary_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        // Thread-local, not `set_var("HOME", …)` — see
+        // `core::paths::TEST_HOME_OVERRIDE` for why the process-global
+        // version corrupts concurrently-running tests (#957 smoke).
+        let _home_guard = crate::core::paths::set_test_home(&home);
+
+        let ext_name = "vc-test-1386-engine-ext";
+        // Reuse the built-in `.java` → "java" mapping (`lsp::language_id_
+        // from_path`) so this test needs no change to that table — only the
+        // manifest's `lsp.binary` needs to be unresolvable.
+        let mut e = Engine::new();
+        e.ext_registry = Some(vec![crate::core::extensions::ExtensionManifest {
+            name: ext_name.to_string(),
+            display_name: ext_name.to_string(),
+            language_ids: vec!["java".to_string()],
+            file_extensions: vec![".java".to_string()],
+            lsp: crate::core::extensions::LspConfig {
+                binary: binary_name.to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        }]);
+        e.extension_state.mark_installed(ext_name);
+
+        for i in 0..3 {
+            let file = files_dir.join(format!("File{i}.java"));
+            std::fs::write(&file, format!("class File{i} {{}}\n")).unwrap();
+            e.open_file_with_mode(&file, OpenMode::Permanent)
+                .unwrap_or_else(|e| panic!("open must succeed despite unresolvable LSP: {e}"));
+        }
+
+        // The buffer actually opened — the bug was a UI stall, not a
+        // failure to open.
+        assert!(
+            e.active_buffer_state().buffer.to_string().contains("File2"),
+            "the third file's content must be present in the active buffer"
+        );
+
+        let probes = std::fs::read_to_string(&counter_file).unwrap_or_default();
+        let probe_count = probes.lines().filter(|l| !l.is_empty()).count();
+        assert_eq!(
+            probe_count, 1,
+            "opening 3 files of a language whose server can't be resolved \
+             must probe the broken proxy at most once total, not once per \
+             open; got {probe_count} probes; log:\n{probes}"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
 }

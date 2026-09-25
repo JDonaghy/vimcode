@@ -439,17 +439,30 @@ pub fn resolve_command(cmd: &str) -> Option<PathBuf> {
         return Some(managed);
     }
 
+    // Paths already probed (and rejected) in the loop below — #1386: `which`
+    // frequently resolves to the exact same path the tool-dirs loop already
+    // rejected (e.g. a broken rustup proxy in `~/.cargo/bin`), and probing
+    // it again doubles the cost of a slow-to-fail probe for no new
+    // information.
+    let mut already_probed: Vec<PathBuf> = Vec::new();
+
     for dir in extra_tool_dirs(binary) {
         let candidate = dir.join(binary);
-        if candidate.exists() && cargo_bin_probe_ok(&candidate, binary) {
-            return Some(candidate);
+        if candidate.exists() {
+            if cargo_bin_probe_ok(&candidate, binary) {
+                return Some(candidate);
+            }
+            already_probed.push(candidate);
         }
         // On Windows, also check with .exe suffix
         #[cfg(target_os = "windows")]
         if !binary.ends_with(".exe") {
             let exe = dir.join(format!("{binary}.exe"));
-            if exe.exists() && cargo_bin_probe_ok(&exe, binary) {
-                return Some(exe);
+            if exe.exists() {
+                if cargo_bin_probe_ok(&exe, binary) {
+                    return Some(exe);
+                }
+                already_probed.push(exe);
             }
         }
     }
@@ -469,6 +482,9 @@ pub fn resolve_command(cmd: &str) -> Option<PathBuf> {
         let first_line = path_str.lines().next()?.trim();
         if !first_line.is_empty() {
             let resolved = PathBuf::from(first_line);
+            if already_probed.contains(&resolved) {
+                return None;
+            }
             // `which` happily resolves the rustup proxy in ~/.cargo/bin/
             // even after `rustup component remove`; probe to skip broken
             // proxies here too (the `tool_dirs` loop above probes only
@@ -571,6 +587,12 @@ pub struct LspManager {
     /// Last error from `ensure_server_for_language` (dependency check failure, etc.).
     /// Engine reads and clears this after calling ensure_server.
     pub last_start_error: Option<String>,
+    /// Negative cache: languages whose server resolution has already been
+    /// attempted and failed, so `ensure_server_for_language` doesn't re-run
+    /// the (possibly slow — broken rustup proxy, uninstalled binary) probe
+    /// on every buffer open (#1386). Maps language_id → the error message
+    /// that was produced the first time, so later opens still surface it.
+    failed_language_resolutions: HashMap<String, Option<String>>,
 }
 
 /// Snapshot of a `$/progress` work item shown in the status bar (#221).
@@ -782,6 +804,7 @@ impl LspManager {
             last_progress_end: HashMap::new(),
             crashed_servers: Vec::new(),
             last_start_error: None,
+            failed_language_resolutions: HashMap::new(),
         }
     }
 
@@ -796,17 +819,51 @@ impl LspManager {
     ) {
         self.ext_manifests = installed;
         self.all_ext_manifests = all;
+        // #1386: the extension set changing can change what
+        // `ensure_server_for_language` resolves to (a newly installed
+        // extension, a different manifest's dependencies) — stale negative
+        // cache entries would otherwise block the new resolution forever.
+        self.failed_language_resolutions.clear();
     }
 
     /// Ensure a server is running for the given language. Returns the server ID
     /// if a server is available (or was just started), None if no config exists
     /// or the binary is not on PATH/Mason bin.
+    ///
+    /// #1386: a failed resolution (e.g. a broken rustup proxy that takes
+    /// 200-300ms to fail its `--version` probe) is remembered in
+    /// `failed_language_resolutions` so repeat opens of files in the same
+    /// language don't pay the probe cost again — a single file open already
+    /// calls this twice (did-open + semantic tokens), and every subsequent
+    /// open of the same language used to re-run the full probe from
+    /// scratch. The cache is cleared by `set_ext_manifests`,
+    /// `add_registry_entry`, `restart_server_for_language` and
+    /// `stop_server_for_language` — anything that could change the outcome.
     pub fn ensure_server_for_language(&mut self, language_id: &str) -> Option<LspServerId> {
         // Already running?
         if let Some(&id) = self.language_to_server.get(language_id) {
             return Some(id);
         }
 
+        // Already tried and failed — don't re-probe.
+        if let Some(cached_err) = self.failed_language_resolutions.get(language_id) {
+            self.last_start_error = cached_err.clone();
+            return None;
+        }
+
+        let result = self.resolve_and_start_server(language_id);
+        if result.is_none() {
+            self.failed_language_resolutions
+                .insert(language_id.to_string(), self.last_start_error.clone());
+        }
+        result
+    }
+
+    /// Does the actual resolution/spawn work for `ensure_server_for_language`,
+    /// uncached. Split out so the cache check/populate logic above stays a
+    /// simple wrapper regardless of how many `return None` branches this
+    /// grows.
+    fn resolve_and_start_server(&mut self, language_id: &str) -> Option<LspServerId> {
         self.last_start_error = None;
 
         // Check declared dependencies from the extension manifest.
@@ -931,6 +988,13 @@ impl LspManager {
 
     /// Add a server config to the in-memory registry (does not persist to disk).
     pub fn add_registry_entry(&mut self, config: LspServerConfig) {
+        // #1386: a fresh registry entry (e.g. just installed via
+        // :ExtInstall) can resolve where the old candidate list couldn't —
+        // drop any negative-cache entries for the languages it covers so
+        // the next `ensure_server_for_language` actually re-probes.
+        for lang in &config.languages {
+            self.failed_language_resolutions.remove(lang);
+        }
         self.registry.push(config);
     }
 
@@ -1327,6 +1391,9 @@ impl LspManager {
 
     /// Shutdown and restart the server for a given language.
     pub fn restart_server_for_language(&mut self, language_id: &str) -> Option<LspServerId> {
+        // #1386: an explicit restart is a request to re-probe, even if a
+        // prior resolution attempt failed and was cached.
+        self.failed_language_resolutions.remove(language_id);
         // Shutdown existing
         if let Some(&server_id) = self.language_to_server.get(language_id) {
             self.servers[server_id].shutdown();
@@ -1376,6 +1443,9 @@ impl LspManager {
 
     /// Stop the server for a given language.
     pub fn stop_server_for_language(&mut self, language_id: &str) {
+        // #1386: also let a subsequent open re-probe rather than reusing a
+        // stale negative-cache entry from before the server was started.
+        self.failed_language_resolutions.remove(language_id);
         if let Some(&server_id) = self.language_to_server.get(language_id) {
             self.servers[server_id].shutdown();
         }
@@ -1631,5 +1701,195 @@ mod tests {
         mgr.work_progress_end(sid, "b");
         let p = mgr.current_progress(sid).expect("progress exists");
         assert_eq!(p.title, "Fetching");
+    }
+
+    // ─── #1386: negative-cache / probe-dedup coverage ──────────────────────
+    //
+    // A rustup proxy for an uninstalled component exists on disk in
+    // `~/.cargo/bin` but takes real wall-clock time (200-300ms on the
+    // reporting machine) to fail its `--version` probe. Before this fix,
+    // `ensure_server_for_language` re-ran that probe on every call — and one
+    // file open already calls it twice (did-open + semantic tokens) — so N
+    // opens of an unresolvable language cost 2N (or 4N counting
+    // `resolve_command`'s own tool-dirs-loop + `which` duplicate probe of
+    // the same path) subprocess spawns instead of one. These tests fake the
+    // proxy with a script that records each invocation to a counter file
+    // and exits non-zero, so the assertions are on an invocation count —
+    // never on wall-clock time.
+
+    /// Build `<home>/.cargo/bin/<binary_name>` as a script that appends a
+    /// line to `counter_file` on every invocation and exits non-zero —
+    /// simulating a broken rustup proxy. Returns the fake home directory;
+    /// caller is responsible for cleanup (and for calling
+    /// `crate::core::paths::set_test_home` with it).
+    #[cfg(unix)]
+    fn fake_cargo_bin_broken_proxy(tag: &str, binary_name: &str, counter_file: &Path) -> PathBuf {
+        let home = std::env::temp_dir().join(format!(
+            "vimcode_test_1386_home_{tag}_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let cargo_bin = home.join(".cargo").join("bin");
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&cargo_bin).unwrap();
+        let binary_path = cargo_bin.join(binary_name);
+        std::fs::write(
+            &binary_path,
+            format!(
+                "#!/bin/sh\necho probe >> {}\nexit 1\n",
+                counter_file.display()
+            ),
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&binary_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        home
+    }
+
+    #[cfg(unix)]
+    fn probe_count(counter_file: &Path) -> usize {
+        std::fs::read_to_string(counter_file)
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| !l.is_empty())
+            .count()
+    }
+
+    /// **Verified RED against unfixed `develop`:** without
+    /// `failed_language_resolutions`, each of the 6 `ensure_server_for_
+    /// language` calls below re-runs the full probe, so `probe_count` reads
+    /// 6 (or more, before the `resolve_command` dedup) instead of 1.
+    #[test]
+    #[cfg(unix)]
+    fn ensure_server_for_language_caches_failed_resolution_across_opens() {
+        let binary_name = "vimcode-test-1386-cache-proxy";
+        let lang = "vimcode-test-lang-1386-cache";
+        let counter_dir = std::env::temp_dir().join(format!(
+            "vimcode_test_1386_cache_counter_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&counter_dir).unwrap();
+        let counter_file = counter_dir.join("probes.log");
+
+        let home = fake_cargo_bin_broken_proxy("cache", binary_name, &counter_file);
+        // Thread-local, not `set_var("HOME", …)` — see
+        // `core::paths::TEST_HOME_OVERRIDE` for why the process-global
+        // version corrupts concurrently-running tests (#957 smoke).
+        let _home_guard = crate::core::paths::set_test_home(&home);
+
+        let mut mgr = LspManager::new(
+            PathBuf::from("."),
+            &[LspServerConfig {
+                command: binary_name.to_string(),
+                args: vec![],
+                languages: vec![lang.to_string()],
+                ..Default::default()
+            }],
+        );
+
+        // Mirrors 3 file opens, each of which calls
+        // `ensure_server_for_language` twice (did-open + semantic tokens —
+        // see `Engine::lsp_did_open` / `LspManager::server_and_uri`).
+        for _ in 0..3 {
+            assert!(mgr.ensure_server_for_language(lang).is_none());
+            assert!(mgr.ensure_server_for_language(lang).is_none());
+        }
+        assert_eq!(
+            probe_count(&counter_file),
+            1,
+            "a failed resolution must be cached — 6 calls across 3 \
+             simulated opens must probe the broken proxy at most once"
+        );
+
+        // :LspRestart-equivalent must clear the cache so a later attempt
+        // re-probes instead of replaying the stale cached failure forever.
+        mgr.restart_server_for_language(lang);
+        assert_eq!(
+            probe_count(&counter_file),
+            2,
+            "restart_server_for_language probes directly (uncached)"
+        );
+        mgr.ensure_server_for_language(lang);
+        assert_eq!(
+            probe_count(&counter_file),
+            3,
+            "ensure_server_for_language must re-probe after a restart \
+             cleared the negative cache, not reuse the pre-restart cached \
+             failure"
+        );
+
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&counter_dir);
+    }
+
+    /// #1386: `resolve_command` must not probe the same path twice within
+    /// one call — once via the `extra_tool_dirs` loop, again via `which`
+    /// resolving to that identical path (which is exactly what happens for
+    /// a real rustup proxy: it lives in `~/.cargo/bin` *and* is normally on
+    /// `PATH`). This appends (never replaces) the fake proxy's directory to
+    /// the real `PATH` so it can't affect any other concurrently-running
+    /// `--lib` test's resolution of a real binary — only this test's
+    /// uniquely-named fake binary becomes resolvable.
+    ///
+    /// **Verified RED against unfixed `develop`:** removing the
+    /// `already_probed` check makes `probe_count` read 2 instead of 1.
+    #[test]
+    #[cfg(unix)]
+    fn resolve_command_probes_cargo_bin_candidate_only_once_even_when_which_finds_it_too() {
+        static PATH_APPEND_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _lock = PATH_APPEND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let binary_name = "vimcode-test-1386-dedupe-proxy";
+        let counter_dir = std::env::temp_dir().join(format!(
+            "vimcode_test_1386_dedupe_counter_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&counter_dir).unwrap();
+        let counter_file = counter_dir.join("probes.log");
+
+        let home = fake_cargo_bin_broken_proxy("dedupe", binary_name, &counter_file);
+        let cargo_bin = home.join(".cargo").join("bin");
+        let _home_guard = crate::core::paths::set_test_home(&home);
+
+        let old_path = std::env::var_os("PATH");
+        let mut dirs: Vec<PathBuf> = old_path
+            .as_ref()
+            .map(std::env::split_paths)
+            .into_iter()
+            .flatten()
+            .collect();
+        dirs.push(cargo_bin);
+        std::env::set_var("PATH", std::env::join_paths(&dirs).unwrap());
+
+        let resolved = resolve_command(binary_name);
+
+        match old_path {
+            Some(v) => std::env::set_var("PATH", v),
+            None => std::env::remove_var("PATH"),
+        }
+
+        assert_eq!(resolved, None, "a broken proxy must still fail to resolve");
+        assert_eq!(
+            probe_count(&counter_file),
+            1,
+            "resolve_command must not probe the same rejected path twice \
+             within a single call"
+        );
+
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&counter_dir);
     }
 }
