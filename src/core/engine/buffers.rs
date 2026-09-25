@@ -515,6 +515,11 @@ impl Engine {
         if self.active_buffer_state().tool_document.is_some() {
             return self.save_tool_document_buffer();
         }
+        // Review verdict composer buffer (#526): report the verdict
+        // through the bound provider's verdict command instead of disk.
+        if self.active_buffer_state().review_verdict.is_some() {
+            return self.save_review_verdict_buffer();
+        }
 
         // Promote preview on save
         let active_id = self.active_buffer_id();

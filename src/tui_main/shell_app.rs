@@ -14884,6 +14884,7 @@ mod tests {
             refresh_command: vec!["mock-provider".to_string()],
             poll_interval_secs: 30,
             actions: Default::default(),
+            ..Default::default()
         });
         engine
             .extension_state
@@ -16458,6 +16459,77 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #526 acceptance: pressing `A` on an open change-review surface that
+    /// was opened for a board card closes the diff (same as Esc) and opens
+    /// a verdict-composer buffer bound to that card — asserted on the
+    /// *rendered* screen (the diff content disappearing, the new tab's
+    /// name painting), not on `Engine::review_verdict`/`change_review`
+    /// state being flipped (#587/#592's lesson: state populated is not
+    /// evidence of paint). Drives the real key path exactly the way a user
+    /// would trigger it: `A` -> `TuiShellApp::handle` ->
+    /// `Engine::handle_change_review_key` -> `Engine::start_review_verdict`
+    /// -> a new buffer/tab, with no coordinator anywhere in the test (a
+    /// mock `[board]` provider's `verdict_commands`, #522's seam).
+    ///
+    /// RED verified: before `handle_change_review_key` matched `'A'` (and
+    /// before `BoardProviderConfig::verdict_commands` existed at all),
+    /// pressing `A` here left the diff surface exactly as painted before —
+    /// this test failed on both assertions (the diff never closed, no new
+    /// tab ever appeared) against the pre-#526 code.
+    #[test]
+    fn change_review_shift_a_paints_a_verdict_composer_tab_via_shell_app() {
+        let mut app = TuiShellApp::new_for_test();
+        install_mock_board_provider(&mut app.engine);
+        {
+            let registry = app
+                .engine
+                .ext_registry
+                .as_mut()
+                .expect("install_mock_board_provider populates the registry");
+            let mut verdict_commands = std::collections::HashMap::new();
+            verdict_commands.insert(
+                "approve".to_string(),
+                vec![
+                    "mock-verdict".to_string(),
+                    "{id}".to_string(),
+                    "--body-file".to_string(),
+                    "{body_file}".to_string(),
+                ],
+            );
+            registry[0].board.as_mut().unwrap().verdict_commands = verdict_commands;
+        }
+        app.engine.change_review = Some(crate::core::review::ChangeReviewState::new(vec![
+            crate::core::review::ProposedChange {
+                path: "reviewed.rs".to_string(),
+                old_text: Some("old line\n".to_string()),
+                new_text: "new line\n".to_string(),
+            },
+        ]));
+        app.engine.review_card_id = Some("card:9".to_string());
+
+        let mut driver = driver_with_shell(app, config(), 80, 24);
+        let screen = driver.screen();
+        assert!(
+            screen.contains("new line"),
+            "precondition: the change-review surface must be open and \
+             painted; screen:\n{screen}"
+        );
+
+        driver.type_char('A');
+        driver.render();
+
+        let screen = driver.screen();
+        assert!(
+            !screen.contains("new line"),
+            "A must close the diff surface, same as Esc; screen:\n{screen}"
+        );
+        assert!(
+            screen.contains("[Review approve: card:9]"),
+            "A must open a verdict-composer tab named for the verdict and \
+             the reviewed card; screen:\n{screen}"
+        );
     }
 
     /// #956 (ACP-5) acceptance: slash commands declared via

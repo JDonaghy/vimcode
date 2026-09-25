@@ -392,6 +392,31 @@ pub fn fetch_branch_review_target(
     serde_json::from_value(value).map_err(|e| ToolError::InvalidJson(e.to_string()))
 }
 
+// ─── Review verdict reporting (#526) ───────────────────────────────────────
+
+/// Write a composed review body to a fresh, process- and time-unique temp
+/// file and return its path. #526's stated preference: a provider's verdict
+/// command receives the body's path substituted for `{body_file}`
+/// (`crate::core::extensions::BoardProviderConfig::verdict_argv`), never the
+/// body text inline — review bodies contain newlines, code fences and
+/// quotes unsafe to splice into a single argv token, the same reasoning
+/// [`push_tool_document`] already applies by sending its payload on stdin
+/// instead. Deliberately left on disk after the caller's command runs —
+/// deleting it is the OS's/user's job (temp dir cleanup), and a provider
+/// might read it asynchronously after this process's call returns.
+pub fn write_review_body_temp_file(body: &str) -> std::io::Result<std::path::PathBuf> {
+    let path = std::env::temp_dir().join(format!(
+        "vimcode-review-body-{}-{}.md",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    std::fs::write(&path, body)?;
+    Ok(path)
+}
+
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -682,5 +707,24 @@ mod tests {
         let client = MockToolClient(Err(ToolError::BinaryNotFound("some-provider".into())));
         let err = fetch_branch_review_target(&client, &["some-provider".to_string()]).unwrap_err();
         assert!(matches!(err, ToolError::BinaryNotFound(ref b) if b == "some-provider"));
+    }
+
+    // ── write_review_body_temp_file (#526) ──────────────────────────────
+
+    #[test]
+    fn write_review_body_temp_file_round_trips_the_body_with_newlines_and_fences() {
+        let body = "Looks good, one nit.\n\n```rust\nfn f() {}\n```\n\n> quoted line\n";
+        let path = write_review_body_temp_file(body).expect("temp file should write");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), body);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn write_review_body_temp_file_paths_are_unique_per_call() {
+        let a = write_review_body_temp_file("a").unwrap();
+        let b = write_review_body_temp_file("b").unwrap();
+        assert_ne!(a, b);
+        let _ = std::fs::remove_file(&a);
+        let _ = std::fs::remove_file(&b);
     }
 }

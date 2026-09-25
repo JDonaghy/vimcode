@@ -126,6 +126,22 @@ pub struct BoardProviderConfig {
     /// error.
     #[serde(default)]
     pub actions: std::collections::HashMap<String, Vec<String>>,
+    /// Argv template(s) for reporting a review verdict from the
+    /// change-review surface (#526), keyed by
+    /// `crate::core::review::ReviewVerdict::token()`
+    /// (`"approve"`/`"request-changes"`/`"comment"`). A provider that
+    /// supports only approve/request-changes simply omits `"comment"` —
+    /// the review surface only offers a verdict this map has an entry for
+    /// (mirrors `actions`' "no entry = not runnable"). The literal tokens
+    /// `{id}` and `{body_file}` in any argument are replaced at report
+    /// time: `{id}` with the reviewed card's id, `{body_file}` with the
+    /// path to a temp file holding the composed review body. The body is
+    /// **never** substituted inline — review bodies contain newlines, code
+    /// fences and quotes unsafe to splice into a single argv token, the
+    /// same reasoning `DocumentProviderConfig::write_command` already
+    /// applies by sending its payload on stdin instead.
+    #[serde(default)]
+    pub verdict_commands: std::collections::HashMap<String, Vec<String>>,
 }
 
 fn default_board_poll_interval_secs() -> u64 {
@@ -215,6 +231,33 @@ impl BoardProviderConfig {
             template
                 .iter()
                 .map(|arg| arg.replace("{id}", card_id))
+                .collect(),
+        )
+    }
+
+    /// Resolve the argv to run to report `verdict` on `card_id`, with
+    /// `body_file`'s path substituted for `{body_file}` (and `card_id` for
+    /// `{id}`) in every argument. Returns `None` if this provider declared
+    /// no command for that verdict, or declared one as an explicit empty
+    /// array (equivalent to "not offered").
+    pub fn verdict_argv(
+        &self,
+        verdict: crate::core::review::ReviewVerdict,
+        card_id: &str,
+        body_file: &std::path::Path,
+    ) -> Option<Vec<String>> {
+        let template = self.verdict_commands.get(verdict.token())?;
+        if template.is_empty() {
+            return None;
+        }
+        let body_file = body_file.to_string_lossy();
+        Some(
+            template
+                .iter()
+                .map(|arg| {
+                    arg.replace("{id}", card_id)
+                        .replace("{body_file}", &body_file)
+                })
                 .collect(),
         )
     }
@@ -866,6 +909,69 @@ OpenIssue = ["example-tool", "open", "{id}"]
             ])
         );
         assert_eq!(board.action_argv("Merge", "card:42"), None);
+    }
+
+    /// #526: verdict commands parse from a `[board.verdict_commands]` TOML
+    /// table (same nesting convention `[board.actions]` already uses) and
+    /// `{id}`/`{body_file}` both substitute correctly. A verdict with no
+    /// entry (`"comment"` here) resolves to `None` — "not offered", same as
+    /// `action_argv`'s existing convention.
+    #[test]
+    fn board_provider_config_verdict_commands_parse_and_substitute_from_toml() {
+        let toml = r#"
+name = "example-provider"
+display_name = "Example Board Provider"
+
+[board]
+refresh_command = ["example-tool", "board", "--json"]
+
+[board.verdict_commands]
+approve = ["example-tool", "verdict", "{id}", "--ok", "--body-file", "{body_file}"]
+request-changes = ["example-tool", "verdict", "{id}", "--changes", "--body-file", "{body_file}"]
+"#;
+        let m = ExtensionManifest::parse(toml).expect("should parse");
+        let board = m.board.expect("board provider config should be present");
+        let body_file = std::path::Path::new("/tmp/review-body.md");
+
+        assert_eq!(
+            board.verdict_argv(
+                crate::core::review::ReviewVerdict::Approve,
+                "card:42",
+                body_file
+            ),
+            Some(vec![
+                "example-tool".to_string(),
+                "verdict".to_string(),
+                "card:42".to_string(),
+                "--ok".to_string(),
+                "--body-file".to_string(),
+                "/tmp/review-body.md".to_string(),
+            ])
+        );
+        assert_eq!(
+            board.verdict_argv(
+                crate::core::review::ReviewVerdict::RequestChanges,
+                "card:42",
+                body_file
+            ),
+            Some(vec![
+                "example-tool".to_string(),
+                "verdict".to_string(),
+                "card:42".to_string(),
+                "--changes".to_string(),
+                "--body-file".to_string(),
+                "/tmp/review-body.md".to_string(),
+            ])
+        );
+        assert_eq!(
+            board.verdict_argv(
+                crate::core::review::ReviewVerdict::Comment,
+                "card:42",
+                body_file
+            ),
+            None,
+            "a verdict with no declared command must resolve to None, not a panic"
+        );
     }
 
     #[test]

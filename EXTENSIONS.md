@@ -131,6 +131,12 @@ poll_interval_secs = 30                     # Seconds between automatic refreshe
 [board.actions]
 OpenIssue = ["my-tool", "open", "{id}"]     # BoardAction variant name -> argv;
                                              # "{id}" is replaced with the card id
+[board.verdict_commands]                    # Review verdicts (#526), keyed by the
+approve = ["my-tool", "verdict", "{id}",    # generic "approve"/"request-changes"/
+  "--ok", "--body-file", "{body_file}"]     # "comment" tokens; "{body_file}" is a
+request-changes = ["my-tool", "verdict",    # temp file holding the composed review
+  "{id}", "--changes", "--body-file",       # body (never inline)
+  "{body_file}"]
 ```
 
 ### Field Reference
@@ -189,6 +195,7 @@ status badges, matching quadraui's `Board` component) on stdout works here.
 | `refresh_command` | String[] | Argv run for a board refresh. `refresh_command[0]` is the binary, the rest are arguments. Must print a `BoardModel` JSON document to stdout and exit zero. |
 | `poll_interval_secs` | Integer | Seconds between automatic background refreshes (default `30`). |
 | `actions` | Table | Maps a `BoardAction` variant name (e.g. `"OpenIssue"`, `"OpenReview"`) to an argv template run when that action fires. The literal token `{id}` in any argument is substituted with the acted-on card's id. Actions with no entry are simply not runnable. |
+| `verdict_commands` | Table | Maps a review verdict — `"approve"`, `"request-changes"`, or `"comment"` (generic code-review terms, #526) — to an argv template run when that verdict is reported from the change-review surface. `{id}` substitutes the reviewed card's id; `{body_file}` substitutes the path to a temp file holding the composed review body (never sent inline — review bodies contain newlines, code fences and quotes unsafe to splice into an argv). A verdict with no entry is simply not offered. |
 
 If no provider extension is installed/configured, the Board panel reports
 "no board provider configured" — every other part of the editor is

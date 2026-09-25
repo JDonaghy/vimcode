@@ -3836,6 +3836,7 @@ mod sidebar_panel_clicks {
             refresh_command: vec!["mock-provider".to_string()],
             poll_interval_secs: 30,
             actions: Default::default(),
+            ..Default::default()
         });
         engine
             .extension_state

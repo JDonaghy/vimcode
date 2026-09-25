@@ -3684,6 +3684,16 @@ pub struct Engine {
     /// as the main risk. Cleared only by opening a *different* branch
     /// review; a plain `Esc` out of the diff surface must not clear it.
     pub review_target: Option<crate::core::tool_client::BranchReviewTarget>,
+    /// The board card id the currently (or most recently) open
+    /// `change_review` was opened *for*, if any (#526). Set by
+    /// `Engine::open_review_card` right after a successful
+    /// `open_branch_review`; always reset to `None` at the top of
+    /// `Engine::open_change_review` so an ACP tool-call diff (which never
+    /// goes through a board card) never inherits a stale id from an
+    /// earlier board review. `Engine::start_review_verdict` reads this to
+    /// know which card a reported verdict belongs to — a review with no
+    /// card id (an ACP diff) simply has no verdict to report.
+    pub review_card_id: Option<String>,
 
     // --- DAP (Debug Adapter Protocol) state ---
     /// Multi-adapter DAP coordinator. None until first debug session is started.
@@ -4846,6 +4856,7 @@ impl Engine {
             change_review: None,
             change_review_diff_rect: std::cell::Cell::new(quadraui::Rect::default()),
             review_target: None,
+            review_card_id: None,
             dap_manager: None,
             dap_stopped_thread: None,
             dap_breakpoints: HashMap::new(),
@@ -5990,6 +6001,7 @@ mod plugins;
 mod search;
 pub use search::{find_word_boundaries, SearchKeyResult};
 mod review_ops;
+mod review_verdict_ops;
 pub mod sidebar;
 mod source_control;
 pub use source_control::ScKeyResult;
