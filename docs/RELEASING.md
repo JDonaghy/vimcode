@@ -14,12 +14,12 @@ and the per-PR CI covers exactly one of them.
 
 `.github/workflows/release.yml` produces, on a push to `main`:
 
-| Artifact | Built on | Backend | Ships in v0.11.0? |
+| Artifact | Built on | Backend | Ships in v0.13.0? |
 |---|---|---|---|
 | `vimcode-linux-x86_64`, `vimcode_*.deb` | ubuntu-24.04 | GTK4 (glibc) | **yes** |
 | `vcd-linux-x86_64` | ubuntu-24.04 | TUI (musl, static) | **yes** |
-| `vimcode-macos-arm64.tar.gz`, `vcd-macos-arm64.tar.gz` | macos-latest | GTK4 via Homebrew / TUI | no — `RELEASE_MACOS` unset |
-| `vcd-windows-x86_64.exe` | windows-latest | TUI | no — `RELEASE_WINDOWS` unset |
+| `vimcode-macos-arm64.tar.gz`, `vcd-macos-arm64.tar.gz` | macos-latest | GTK4 via Homebrew / TUI | **yes** — `RELEASE_MACOS=true` |
+| `vcd-windows-x86_64.exe` | windows-latest | TUI | **yes** — `RELEASE_WINDOWS=true` |
 | `vimcode.flatpak` | ubuntu-24.04 | GTK4 | no — `RELEASE_FLATPAK` unset, and **broken**, see §2.2 |
 
 Each non-Linux job carries `if: ${{ vars.<NAME> == 'true' }}`, so an unset repo

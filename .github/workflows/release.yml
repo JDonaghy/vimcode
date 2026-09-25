@@ -127,10 +127,39 @@ jobs:
 
           > GUI binary requires GTK 4.10+. Ubuntu 22.04 ships GTK 4.6 which is too old; Ubuntu 24.04+ recommended.
 
-          <!-- macOS / Windows / Flatpak install sections live in git history
-               (pre-v0.11.0 revisions of this file). Restore them here when the
-               matching RELEASE_MACOS / RELEASE_WINDOWS / RELEASE_FLATPAK repo
-               variable is turned on, so the notes match the attached assets. -->
+          ### macOS (Apple Silicon)
+
+          **Option A — Homebrew (recommended)**
+          ```
+          brew tap JDonaghy/vimcode
+          brew install vimcode    # GTK4 GUI + TUI
+          # or
+          brew install vcd        # TUI only (no GTK4 dependency)
+          ```
+
+          **Option B — direct download**
+          Download `vimcode-macos-arm64.tar.gz` (GUI) or `vcd-macos-arm64.tar.gz` (TUI only), extract, and run:
+          ```
+          tar xzf vcd-macos-arm64.tar.gz
+          xattr -d com.apple.quarantine vcd   # binaries are ad-hoc signed, not notarized
+          ./vcd
+          ```
+          > The macOS GUI binary is the GTK4 build and requires GTK4 via Homebrew: `brew install gtk4`
+
+          ### Windows
+
+          **TUI-only binary (no installer needed)**
+          Download `vcd-windows-x86_64.exe`, place anywhere on your PATH, and run:
+          ```
+          vcd-windows-x86_64.exe
+          ```
+          Or rename to `vcd.exe` for convenience. Works in Windows Terminal, PowerShell, and cmd.exe.
+
+          > No Windows GUI binary is published yet — Windows users get `vcd`, the TUI.
+
+          <!-- Flatpak install section lives in git history (pre-v0.11.0
+               revisions of this file). Restore it when RELEASE_FLATPAK is
+               turned on (#975), so the notes match the attached assets. -->
         prerelease: false
         make_latest: true
         files: |

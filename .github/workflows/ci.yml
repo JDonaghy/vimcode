@@ -240,3 +240,38 @@ jobs:
           echo "::error::macos::mac_driver_tests ran zero tests — src/macos/ may have compiled but its own suite never executed. This is the #645 vacuous-green trap, not a pass."
           exit 1
         fi
+
+  # The release ships `vcd-windows-x86_64.exe` (release.yml's `build-windows`
+  # job), but no other job compiles for Windows at all — without this, the
+  # first Windows build a change ever saw was the release run itself, after
+  # the Linux release had already been published. Build-only: the same
+  # command release.yml uses, so a red here means a red release.
+  build-windows-tui:
+    name: Build (Windows TUI, vcd.exe)
+    runs-on: windows-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Cache cargo registry
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+        key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+    - name: Cache cargo build
+      uses: actions/cache@v4
+      with:
+        path: target
+        key: ${{ runner.os }}-cargo-build-target-windows-${{ hashFiles('**/Cargo.lock') }}
+
+    - name: Build vcd.exe (release, no GTK)
+      run: cargo build --release --bin vcd --no-default-features
+
+    - name: Smoke --version
+      run: target\release\vcd.exe --version

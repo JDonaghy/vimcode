@@ -55,7 +55,14 @@ pub fn run(file_path: Option<PathBuf>) {
     // an opt-in env var either — there is no way to guess a *correct*
     // display, only a hardcoded one, so an opt-in would just move the same
     // wrong guess behind a flag.)
-    if std::env::var_os("WAYLAND_DISPLAY").is_none() && std::env::var_os("DISPLAY").is_none() {
+    //
+    // Only on platforms where GTK actually talks to X11/Wayland: on macOS
+    // (quartz) and Windows (win32) there is no display variable to set, so
+    // this guard would refuse to start a perfectly good GUI build.
+    if no_display_configured(
+        std::env::var_os("WAYLAND_DISPLAY").is_some(),
+        std::env::var_os("DISPLAY").is_some(),
+    ) {
         eprintln!(
             "vimcode: no display found (neither DISPLAY nor WAYLAND_DISPLAY is set).\n\
              The GTK backend needs a running X11 or Wayland session. Set one of\n\
@@ -135,6 +142,37 @@ pub(crate) fn build_shell_config(app: &App) -> quadraui::ShellConfig {
 // `render_content` for where the minimap-inset decision needs to move
 // (quadraui's `gtk::editor::draw_editor`, mirroring TUI's inline
 // scrollbar column) and the quadraui issue that needs filing first.
+
+/// True when GTK needs an X11/Wayland display and none is configured.
+/// Always false on macOS and Windows, whose GTK backends (quartz, win32)
+/// don't use `DISPLAY` / `WAYLAND_DISPLAY` at all.
+fn no_display_configured(has_wayland: bool, has_x11: bool) -> bool {
+    cfg!(not(any(target_os = "macos", target_os = "windows"))) && !has_wayland && !has_x11
+}
+
+#[cfg(test)]
+mod no_display_guard_tests {
+    use super::no_display_configured;
+
+    #[test]
+    fn either_display_variable_satisfies_the_guard() {
+        assert!(!no_display_configured(true, false));
+        assert!(!no_display_configured(false, true));
+        assert!(!no_display_configured(true, true));
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    #[test]
+    fn no_display_variable_trips_the_guard_on_x11_wayland_platforms() {
+        assert!(no_display_configured(false, false));
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    #[test]
+    fn guard_never_trips_where_gtk_has_a_native_backend() {
+        assert!(!no_display_configured(false, false));
+    }
+}
 
 #[cfg(test)]
 mod editor_scrollbar_geometry_tests {
