@@ -496,33 +496,32 @@ mod tests {
 
     // ── OpenReview (#525) ────────────────────────────────────────────────
 
+    /// Builds on [`install_mock_provider`] (manifest/`extension_state`/
+    /// `ext_registry` wiring) rather than duplicating it (review nit,
+    /// #525), layering on the one thing `OpenReview` needs that a plain
+    /// board provider doesn't: an `actions["OpenReview"]` entry, plus
+    /// swapping the mock client's response from "board refresh" JSON to
+    /// "review-action" JSON for the `OpenReview` tests that follow.
     fn install_mock_provider_with_review_action(
         engine: &mut Engine,
         model: BoardModel,
         review_client_response: Result<serde_json::Value, crate::core::tool_client::ToolError>,
     ) {
-        let mut manifest = ExtensionManifest {
-            name: "mock-board".to_string(),
-            ..Default::default()
-        };
+        install_mock_provider(engine, model.clone());
+        let registry = engine
+            .ext_registry
+            .as_mut()
+            .expect("install_mock_provider populates the registry");
         let mut actions = std::collections::HashMap::new();
         actions.insert(
             "OpenReview".to_string(),
             vec!["mock-review".to_string(), "{id}".to_string()],
         );
-        manifest.board = Some(BoardProviderConfig {
-            refresh_command: vec!["mock-provider".to_string()],
-            poll_interval_secs: 30,
-            actions,
-        });
-        engine
-            .extension_state
-            .installed
-            .push(crate::core::session::InstalledExtension {
-                name: manifest.name.clone(),
-                version: String::new(),
-            });
-        engine.ext_registry = Some(vec![manifest]);
+        registry[0]
+            .board
+            .as_mut()
+            .expect("install_mock_provider populates a [board] provider")
+            .actions = actions;
         engine.board_model = Some(model);
         engine.set_board_client_for_test(MockToolClient(review_client_response));
     }

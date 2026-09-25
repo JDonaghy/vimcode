@@ -1,5 +1,48 @@
 # VimCode Project State
 
+**Last updated:** September 24, 2026 (#525 review fixes, iteration 1).
+Addressed the review's blocking + non-blocking findings on top of the
+Track A Phase 2 work below:
+
+- **Blocking — driver-tier black-box test.** New
+  `board_review_key_paints_branch_diff_via_shell_app` in
+  `src/tui_main/shell_app.rs` (`#[cfg(test)]`, `TuiDriver` via
+  `driver_with_shell`) drives the real end-to-end path a user triggers:
+  types `R` on a selected board card with a mock `[board]` provider's
+  `"OpenReview"` action configured, against a **real temp git repo** with
+  a `base` commit and a `feature` branch, and asserts the reviewed
+  branch's new file name is painted on the rendered screen — not on
+  `Engine::change_review` being `Some`. RED-verified by temporarily
+  disabling the `R` key match in `dispatch_board_key_unified` and
+  confirming the test fails, then restoring it. This is the one touch to
+  `src/tui_main/` the original PR said it made none of — it is test-only,
+  the shared change-review rendering itself is still #955's, and no new
+  per-backend diff-drawing code was added.
+- **Non-blocking — flag-smuggling guard.** `git::changed_files_between`
+  now rejects a `base`/`head` starting with `-` before joining them into
+  the single `base...head` positional git argv token, since both values
+  originate from an external provider's JSON. New
+  `test_changed_files_between_rejects_flag_like_revisions`.
+- **Non-blocking — "no changes" vs. "git failure".**
+  `changed_files_between` now returns `Option<Vec<String>>`: `None` for
+  any git failure (unknown ref, no repo, or the flag-smuggling guard
+  above), `Some(vec![])` for a genuine empty diff. `Engine::
+  open_branch_review` reports a distinct "could not diff ... check the
+  branch/base names the provider returned" message for the `None` case
+  instead of reusing the "no changes between X and Y" message a
+  misconfigured provider would otherwise share with a real no-op review.
+  Existing `test_changed_files_between_unknown_ref_is_empty_not_error`
+  renamed/updated to assert `None`.
+- **Nit — test helper duplication.** `board_ops.rs`'s
+  `install_mock_provider_with_review_action` now builds on
+  `install_mock_provider` (layering the `OpenReview` action + response
+  swap) instead of re-deriving the manifest/`extension_state`/
+  `ext_registry` wiring from scratch.
+
+`cargo build`/`clippy -D warnings`/`fmt` clean on both feature lanes;
+`board_ops::`/`review_ops::`/`git::tests::test_changed_files_between*`/the
+new shell_app driver test/`no_coord_vocabulary_in_core` all pass.
+
 **Last updated:** September 24, 2026 (#525, Track A Phase 2 — in-editor
 diff review of a work branch, consuming the change-review surface #955
 built rather than building a second one). `BoardAction::OpenReview` on a

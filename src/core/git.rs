@@ -1609,7 +1609,7 @@ mod tests {
             .unwrap();
         let base = current_branch(&dir).unwrap();
 
-        let mut files = changed_files_between(&dir, &base, "feature");
+        let mut files = changed_files_between(&dir, &base, "feature").expect("valid refs diff");
         files.sort();
         assert_eq!(
             files,
@@ -1618,7 +1618,7 @@ mod tests {
     }
 
     #[test]
-    fn test_changed_files_between_unknown_ref_is_empty_not_error() {
+    fn test_changed_files_between_unknown_ref_is_none_not_an_empty_diff() {
         let dir = std::env::temp_dir().join("vimcode_changed_files_between_bad_ref");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -1627,7 +1627,29 @@ mod tests {
             .current_dir(&dir)
             .output()
             .unwrap();
-        assert!(changed_files_between(&dir, "nope-base", "nope-head").is_empty());
+        assert!(
+            changed_files_between(&dir, "nope-base", "nope-head").is_none(),
+            "an unresolvable ref is a git failure, distinct from a real empty diff"
+        );
+    }
+
+    /// Review non-blocking finding (#525): `base`/`head` come straight from
+    /// an external provider's JSON with no shell involved, but a value
+    /// starting with `-` could still be parsed by git as a flag rather than
+    /// a revision when joined into `base...head`. Guard rejects it before
+    /// it ever reaches git's argv.
+    #[test]
+    fn test_changed_files_between_rejects_flag_like_revisions() {
+        let dir = std::env::temp_dir().join("vimcode_changed_files_between_flag_smuggle");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        git_command()
+            .args(["init"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        assert!(changed_files_between(&dir, "--output=/tmp/pwned", "HEAD").is_none());
+        assert!(changed_files_between(&dir, "HEAD", "--output=/tmp/pwned").is_none());
     }
 
     // ── normalize_remote_url ────────────────────────────────────────────────
@@ -2427,20 +2449,36 @@ pub fn diff_against_ref(dir: &Path, ref_spec: &str) -> Option<String> {
 /// meantime that `head` never saw. Both `base`/`head` must already be
 /// resolvable in the local repository (already pulled/checked out) — this
 /// is worktree-local, no fetch (#525's stated scope; the remote/ssh case
-/// is #530). Empty on any git failure (no repo, unknown ref, …) rather
-/// than erroring, matching this module's other "no git = no data"
-/// primitives.
-pub fn changed_files_between(dir: &Path, base: &str, head: &str) -> Vec<String> {
+/// is #530).
+///
+/// Returns `None` on any git failure — no repo, an unknown ref, or a
+/// `base`/`head` that looks like a flag (see below) — and `Some(vec![])`
+/// for a real, successful diff that just happens to contain no changes.
+/// Callers that only cared about "were there any changes" used to conflate
+/// the two (both were an empty `Vec`); keeping them apart lets
+/// `Engine::open_branch_review` report "no changes between X and Y"
+/// only when that's actually true, rather than also for a misconfigured
+/// provider's bogus branch name (review non-blocking finding, #525).
+///
+/// `base`/`head` typically arrive from an external board provider's JSON
+/// (`BranchReviewTarget`, #522's seam) and are joined into a single
+/// `base...head` positional argument below with no shell involved — so
+/// this isn't classic injection, but a value starting with `-` could still
+/// be parsed by git as a flag rather than a revision ("flag-smuggling").
+/// Reject that case up front rather than let it reach git's argv.
+pub fn changed_files_between(dir: &Path, base: &str, head: &str) -> Option<Vec<String>> {
+    if base.starts_with('-') || head.starts_with('-') {
+        return None;
+    }
     let spec = format!("{base}...{head}");
-    match run_git(dir, &["diff", "--name-only", &spec]) {
-        Some(output) => output
+    run_git(dir, &["diff", "--name-only", &spec]).map(|output| {
+        output
             .lines()
             .map(str::trim)
             .filter(|l| !l.is_empty())
             .map(str::to_string)
-            .collect(),
-        None => Vec::new(),
-    }
+            .collect()
+    })
 }
 
 /// Return detailed log entries for a specific file.

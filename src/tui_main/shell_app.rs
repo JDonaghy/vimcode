@@ -14862,6 +14862,110 @@ mod tests {
         );
     }
 
+    /// #525 review-requested driver coverage: pressing `R` on a selected
+    /// board card with a `[board]` provider's `"OpenReview"` action
+    /// configured resolves a **real local git branch** to a diff and opens
+    /// it as the shared change-review surface (#955) — asserted on the
+    /// *rendered* screen, not on `Engine::change_review` being `Some`
+    /// (#587/#592's lesson: state populated is not evidence of paint).
+    /// Drives the real key path exactly the way a user would trigger it:
+    /// `R` -> `TuiShellApp::handle` -> `render::dispatch_sidebar_panel_key`
+    /// -> `Engine::dispatch_board_key_unified` ->
+    /// `Engine::apply_board_action(OpenReview)` -> the mock provider's
+    /// `"OpenReview"` command -> `Engine::open_branch_review` -> a real
+    /// `git diff --name-only` against a temp repo ->
+    /// `Engine::open_change_review`.
+    ///
+    /// RED verified: before `apply_board_action` handled
+    /// `BoardAction::OpenReview` (and before the host-level `R` key was
+    /// wired into `dispatch_board_key_unified`), pressing `R` here left the
+    /// Board panel on screen with no diff ever painted — this test failed
+    /// exactly that way (screen missing the reviewed file's name) against
+    /// the pre-#525 code.
+    #[test]
+    fn board_review_key_paints_branch_diff_via_shell_app() {
+        let dir = std::env::temp_dir().join(format!(
+            "board-review-tui-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&dir)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&["init"]);
+        git(&["config", "user.email", "t@t.com"]);
+        git(&["config", "user.name", "T"]);
+        std::fs::write(dir.join("base.txt"), "base\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-m", "base"]);
+        let base = crate::core::git::current_branch(&dir).unwrap();
+        git(&["checkout", "-b", "feature"]);
+        std::fs::write(dir.join("new_from_branch.rs"), "fn reviewed() {}\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-m", "feature work"]);
+        git(&["checkout", &base]);
+
+        let mut app = TuiShellApp::new(None);
+        install_mock_board_provider(&mut app.engine);
+        {
+            let registry = app
+                .engine
+                .ext_registry
+                .as_mut()
+                .expect("install_mock_board_provider populates the registry");
+            let mut actions = std::collections::HashMap::new();
+            actions.insert(
+                "OpenReview".to_string(),
+                vec!["mock-review".to_string(), "{id}".to_string()],
+            );
+            registry[0].board.as_mut().unwrap().actions = actions;
+        }
+        app.engine.board_model = Some(mock_board_model());
+        app.engine.workspace_root = Some(dir.clone());
+        app.engine
+            .set_board_client_for_test(crate::core::tool_client::MockToolClient(Ok(
+                serde_json::json!({"branch": "feature", "base": base}),
+            )));
+        app.engine
+            .app_shell
+            .show_panel(&quadraui::WidgetId::new(PANEL_BOARD));
+        app.engine.board_has_focus = true;
+        app.sidebar.has_focus = true;
+        assert_eq!(
+            render::route_focus_key(&app.engine, app.sidebar.has_focus),
+            render::FocusKeyRoute::Board,
+            "precondition: the Board panel must own the keyboard"
+        );
+
+        let mut driver = driver_with_shell(app, config(), 80, 24);
+        driver.type_char('R');
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("new_from_branch.rs"),
+            "pressing R on the selected card should resolve the card to a \
+             branch and paint a real multi-file diff for it via the \
+             shared change-review surface, not just set a status message; \
+             screen:\n{screen}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// AI: typing after focusing the panel must land in the `ChatController`
     /// (#819) input box and grow across multiple visual lines on `Enter` —
     /// the "multi-line growing input box" this panel's own doc comment
