@@ -4952,6 +4952,52 @@ mod sidebar_panel_clicks {
         );
     }
 
+    /// #1392: the debug sidebar's Run/Stop action button is painted through
+    /// `SidebarPanelBody::render_with`'s `SidebarPanelChrome::StatusBars`
+    /// (quadraui#1061) and routed via the `status_bar_hit_regions` that call
+    /// returns — not a separately re-derived `action_rect` the way it used
+    /// to be (`App::route_debug_sidebar_event`'s old doc comment) — so paint
+    /// and click can't disagree. Asserted on rendered text
+    /// (`screen_contains`/`find`), not on an engine flag: a fake active
+    /// session (no real `dap_manager`) paints "Stop"; clicking it must run
+    /// `Engine::handle_dap_sidebar_action_click`'s stop branch and repaint
+    /// "Start Debugging" in its place.
+    ///
+    /// Verified RED by temporarily skipping the
+    /// `engine.dap_sidebar_action_hits.replace(...)` call in
+    /// `App::paint_sidebar_panel_rung`'s `PANEL_DEBUG` arm: the click then
+    /// has no hit regions to match, `screen_contains("Start Debugging")`
+    /// fails, and this test fails with it.
+    #[test]
+    fn debug_panel_run_stop_click_routes_from_status_bar_hit_regions() {
+        let mut h = panel_harness(PANEL_DEBUG);
+        h.engine.borrow_mut().dap_session_active = true;
+        h.driver.render();
+
+        assert!(
+            h.driver.screen_contains("Stop"),
+            "precondition: an active, unstopped debug session must paint a \
+             \"Stop\" action label"
+        );
+        let (x, y) = h.driver.find("Stop").unwrap_or_else(|| {
+            panic!(
+                "could not find the \"Stop\" action label; painted texts: {:?}",
+                h.driver.painted_texts()
+            )
+        });
+
+        h.driver.click(x, y);
+
+        assert!(
+            h.driver.screen_contains("Start Debugging"),
+            "clicking the debug sidebar's action row must route through \
+             SidebarPanelBodyLayout::status_bar_hit_regions to \
+             Engine::handle_dap_sidebar_action_click, which stops the \
+             (faked) active session and repaints \"Start Debugging\" in \
+             its place"
+        );
+    }
+
     /// An editor text-selection drag that wanders over the sidebar must still
     /// finalise in the editor: only a press that a panel *claimed* captures the
     /// rest of the gesture. Guards the `sidebar_pointer_captured` follow-through

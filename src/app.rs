@@ -865,10 +865,6 @@ pub(crate) struct App {
     /// `route_sc_sidebar_event` resolves presses against this so the click and
     /// paint derivations cannot drift (#544).
     pub(crate) cached_sc_bands: Cell<Option<render::ScSidebarBands>>,
-    /// Debug-sidebar action-button row rect as last painted. The hit regions in
-    /// `engine.dap_sidebar_action_hits` are relative to this rect's origin, so
-    /// the router needs it to translate an absolute press (#544).
-    pub(crate) cached_dap_action_rect: Cell<Option<quadraui::Rect>>,
     /// Per-group tab-drop geometry (absolute pixel bounds) computed each frame in
     /// `render_content`. Both the drag overlay (same frame) and the drag hit-test
     /// in `handle_mouse_drag_msg` (next mouse-move) read this, so the drop-zone
@@ -1848,7 +1844,6 @@ impl App {
             cached_frame_hit_map: Rc::new(RefCell::new(None)),
             sidebar_pointer_captured: Cell::new(false),
             cached_sc_bands: Cell::new(None),
-            cached_dap_action_rect: Cell::new(None),
             cached_tab_bar_zones: Rc::new(RefCell::new(HashMap::new())),
             cached_drop_ctx: Rc::new(RefCell::new(render::TabDropCtx::default())),
             cached_explorer_metrics: Rc::new(Cell::new((16.0, 8.0))),
@@ -3486,26 +3481,36 @@ impl App {
                 engine.search_sidebar_system.borrow().render(backend, q_sb);
             }
             PANEL_DEBUG => {
-                let (title_bar, action_bar) =
-                    render::debug_sidebar_chrome_to_status_bars(&screen.debug_sidebar, theme);
-                let title_rect = quadraui::Rect::new(q_sb.x, q_sb.y, q_sb.width, lh as f32);
-                let action_rect =
-                    quadraui::Rect::new(q_sb.x, q_sb.y + lh as f32, q_sb.width, lh as f32);
-                let body_y = q_sb.y + 2.0 * lh as f32;
-                let body_h = (q_sb.height - 2.0 * lh as f32).max(0.0);
-                let body_rect = quadraui::Rect::new(q_sb.x, body_y, q_sb.width, body_h);
-                let _ = backend.draw_status_bar(title_rect, &title_bar, None, None);
-                let hits = backend.draw_status_bar(action_rect, &action_bar, None, None);
-                engine.dap_sidebar_action_hits.replace(Some(hits));
-                // `hits` are relative to `action_rect`'s origin; the click
-                // router needs the rect to translate into that space (#544).
-                self.cached_dap_action_rect.set(Some(action_rect));
-                engine.dap_sidebar_body_rect.set(body_rect);
-                render::populate_dap_sidebar_system(engine);
+                // #1392: composed through `SidebarPanelBody::render_with`
+                // (quadraui#1059) with `SidebarPanelChrome::StatusBars`
+                // (quadraui#1061, `render::debug_sidebar_chrome`) instead of
+                // slicing `q_sb` into a title row + action row by hand and
+                // calling `Backend::draw_status_bar` on each directly. The
+                // returned layout's `status_bar_hit_regions` are already in
+                // `q_sb`'s own absolute pixel space, so they're stored
+                // straight onto `engine.dap_sidebar_action_hits` for
+                // `route_debug_sidebar_event` to read — no more separately
+                // cached `action_rect` to translate a press into (that was
+                // a second, independently-derived copy of the same
+                // geometry the paint used, which is exactly what let paint
+                // and click disagree). TUI's `render_debug_sidebar` builds
+                // the identical chrome through the same helper.
+                let panel = render::SidebarPanelBody {
+                    background: None,
+                    chrome: render::debug_sidebar_chrome(&screen.debug_sidebar, theme),
+                    scrollbar_gutter: None,
+                };
+                let layout = panel.render_with(backend, q_sb, |backend, body_rect| {
+                    engine.dap_sidebar_body_rect.set(body_rect);
+                    render::populate_dap_sidebar_system(engine);
+                    engine
+                        .dap_sidebar_system
+                        .borrow()
+                        .render(backend, body_rect);
+                });
                 engine
-                    .dap_sidebar_system
-                    .borrow()
-                    .render(backend, body_rect);
+                    .dap_sidebar_action_hits
+                    .replace(layout.status_bar_hit_regions);
             }
             PANEL_GIT => {
                 // #1390: composed through `SidebarPanelBody::render_with`
@@ -6557,14 +6562,15 @@ impl App {
 
     /// Sidebar routing for the Debug panel (#544/#754).
     ///
-    /// `render_content` stacks two chrome rows above the body: a title bar and
-    /// an action-button bar whose `StatusBarLayout` it stashes in
-    /// `engine.dap_sidebar_action_hits`. Those hit regions are **bar-relative**
-    /// (`StatusBar::layout` lays out from `0,0`; `quadraui::gtk::draw_status_bar`
-    /// returns them verbatim), so the press has to be translated into the
-    /// action row's own space before hit-testing
-    /// ([`render::dap_sidebar_action_click_at`]). Everything below goes to
-    /// the shared `SidebarSystem` at the body rect it painted into
+    /// `render_content` paints the title + action-button chrome through
+    /// `SidebarPanelBody::render_with`'s `StatusBars` variant and stashes its
+    /// `status_bar_hit_regions` in `engine.dap_sidebar_action_hits`, already
+    /// in `pos`'s own absolute pixel space — no per-backend translation step
+    /// (#1392; before quadraui#1061 the hits were bar-relative and had to be
+    /// translated via a separately cached `action_rect`, two independently
+    /// derived values for the same geometry). `dap_sidebar_action_click_at`
+    /// takes `pos` directly. Everything below the chrome goes to the shared
+    /// `SidebarSystem` at the body rect it painted into
     /// ([`render::dispatch_dap_sidebar_body_event`]) — the same two shared
     /// functions TUI calls for this panel.
     fn route_debug_sidebar_event(
@@ -6573,7 +6579,6 @@ impl App {
         pos: quadraui::Point,
         starts_interaction: bool,
     ) -> bool {
-        let action_rect = self.cached_dap_action_rect.get();
         let body_rect = self.engine.borrow().dap_sidebar_body_rect.get();
         if body_rect.width <= 0.0 {
             return false;
@@ -6584,9 +6589,7 @@ impl App {
         }
         // Chrome band (title + action row) — above the body rect.
         if starts_interaction && pos.y < body_rect.y {
-            if let Some(ar) = action_rect {
-                render::dap_sidebar_action_click_at(&mut engine, pos.x - ar.x, pos.y - ar.y);
-            }
+            render::dap_sidebar_action_click_at(&mut engine, pos);
             // Claimed either way: the press landed on this panel's own chrome,
             // so it must not leak through to the editor beneath (#637's rule
             // for the TUI twin of this intercept).

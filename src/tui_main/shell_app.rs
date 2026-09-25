@@ -14025,7 +14025,7 @@ mod tests {
         assert!(
             before.contains("DEBUG"),
             "precondition: the Debug panel must be open and painted before \
-             the keypress (`debug_sidebar_chrome_to_status_bars`'s title row \
+             the keypress (`render::debug_sidebar_chrome`'s title row \
              always contains the literal \"DEBUG\"); screen:\n{before}"
         );
 
@@ -14046,6 +14046,59 @@ mod tests {
              move to and activate the Source Control slot, painting SOURCE \
              CONTROL — this only happens if 'h' actually worked; \
              screen:\n{after}"
+        );
+    }
+
+    /// #1392: the debug sidebar's Run/Stop action button is painted through
+    /// `SidebarPanelBody::render_with`'s `SidebarPanelChrome::StatusBars`
+    /// (quadraui#1061) and routed via `mouse::handle_mouse`'s
+    /// `dap_sidebar_action_click_at` call, which reads the
+    /// `status_bar_hit_regions` that `render_with` returned — the same
+    /// geometry that was painted, not a separately re-derived rect. Drives
+    /// the real `driver_with_shell` mouse pipeline end to end (backend
+    /// translation → `ShellAdapter::handle` → `TuiShellApp::handle` →
+    /// `mouse::handle_mouse`) and asserts on rendered screen text, not an
+    /// engine flag: a fake active session (no real `dap_manager`) paints
+    /// "Stop"; clicking it must run
+    /// `Engine::handle_dap_sidebar_action_click`'s stop branch and repaint
+    /// "Start Debugging" in its place.
+    ///
+    /// Verified RED by temporarily skipping the
+    /// `engine.dap_sidebar_action_hits.replace(...)` call in
+    /// `panels::render_debug_sidebar`: the click then has no hit regions to
+    /// match, `screen.contains("Start Debugging")` fails, and this test
+    /// fails with it.
+    #[test]
+    fn debug_sidebar_run_stop_click_routes_from_status_bar_hit_regions_via_shell_app() {
+        let mut app = TuiShellApp::new(None);
+        ensure_panel_active(&mut app.engine, PANEL_DEBUG);
+        app.engine.dap_session_active = true;
+
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        let before = driver.screen();
+        assert!(
+            before.contains("Stop"),
+            "precondition: an active, unstopped debug session must paint a \
+             \"Stop\" action label; screen:\n{before}"
+        );
+
+        let (x, y) = driver.find("Stop").unwrap_or_else(|| {
+            panic!(
+                "could not find the \"Stop\" action label on screen:\n{}",
+                driver.screen()
+            )
+        });
+        driver.click(x, y);
+        driver.render();
+
+        let after = driver.screen();
+        assert!(
+            after.contains("Start Debugging"),
+            "clicking the debug sidebar's action row must route through \
+             SidebarPanelBodyLayout::status_bar_hit_regions to \
+             Engine::handle_dap_sidebar_action_click, which stops the \
+             (faked) active session and repaints \"Start Debugging\" in its \
+             place; screen:\n{after}"
         );
     }
 
