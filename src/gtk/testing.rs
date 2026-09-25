@@ -4050,14 +4050,13 @@ mod sidebar_panel_clicks {
         h.driver.render();
 
         // The mock client runs synchronously on a background thread but the
-        // channel send still has to be observed; poll until it lands —
-        // mirrors `board_ops.rs`'s own `wait_for_board_action` test helper.
-        let mut tries = 0;
-        while !h.engine.borrow_mut().poll_board_action() {
-            tries += 1;
-            assert!(tries < 1000, "board action never completed");
-            std::thread::yield_now();
-        }
+        // channel send still has to be observed; wait until it lands — same
+        // deadline-bounded helper `board_ops.rs`'s own test waits use, rather
+        // than a `yield_now` spin that expires before the thread is scheduled
+        // on a loaded machine.
+        crate::core::engine::wait_for_provider_command("board action", || {
+            h.engine.borrow_mut().poll_board_action()
+        });
         h.driver.render();
 
         assert!(

@@ -5906,6 +5906,11 @@ pub(crate) fn diff_state_from_hunks(
 mod accessors;
 mod acp_ops;
 mod board_ops;
+/// Re-exported so the GTK black-box harness's board test can share the one
+/// deadline-bounded wait for a backgrounded provider command instead of
+/// growing its own (flaky) copy.
+#[cfg(test)]
+pub(crate) use board_ops::wait_for_provider_command;
 mod buffers;
 mod dap_ops;
 pub use dap_ops::DEBUG_BUTTON_IDS;
