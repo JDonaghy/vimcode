@@ -351,6 +351,20 @@ impl Engine {
     ) -> EngineAction {
         match tag {
             "swap_recovery" => self.process_swap_dialog_action(action),
+            "confirm_board_action" => {
+                // #523: a provider-declared action the provider marked
+                // `confirm` — `Engine::run_board_action_by_name` stashed
+                // the already-resolved argv/label here rather than
+                // dispatching immediately.
+                if action == "yes" {
+                    if let Some(pending) = self.pending_board_action.take() {
+                        self.dispatch_board_action_command(pending.argv, pending.label);
+                    }
+                } else {
+                    self.pending_board_action = None;
+                }
+                EngineAction::None
+            }
             "confirm_move" => {
                 if action == "yes" {
                     if let Some((src, dest)) = self.pending_move.take() {

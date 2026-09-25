@@ -7742,6 +7742,23 @@ pub fn route_board_click(engine: &mut Engine, pos: quadraui::Point, is_double_cl
     }
 }
 
+/// Resolve a right-click at `pos` (board-native units, same convention as
+/// [`route_board_click`]) against the cached [`quadraui::BoardLayout`] to
+/// the card it landed on, if any (#523). A column-header or empty-space
+/// right-click isn't a context-menu trigger. Callers convert `pos` to the
+/// cell units `Engine::open_board_context_menu` expects — mirroring
+/// `App::handle_tab_right_click`/`handle_editor_right_click`'s own
+/// pixel→cell conversion — and are responsible for actually opening the
+/// menu; this function only resolves *which card*, the same "paint caches,
+/// click reads" split [`route_board_click`] uses.
+pub fn board_right_click_card(engine: &Engine, pos: quadraui::Point) -> Option<quadraui::WidgetId> {
+    let layout = engine.board_layout.borrow();
+    match layout.as_ref()?.hit_test(pos.x, pos.y) {
+        quadraui::BoardHit::Card(id) => Some(id),
+        quadraui::BoardHit::ColumnHeader(_) | quadraui::BoardHit::Empty => None,
+    }
+}
+
 /// A one-line status banner for the Board panel — "no provider configured",
 /// "fetching…", or the last fetch error (see [`BoardData::status`]). Shared
 /// by both backends so a status message can't drift in wording or style.

@@ -6629,7 +6629,7 @@ impl App {
         true
     }
 
-    /// Sidebar routing for the Board panel (#521).
+    /// Sidebar routing for the Board panel (#521, right-click added #523).
     ///
     /// `render::route_board_click` resolves the press against the
     /// `quadraui::BoardLayout` `paint_sidebar_panel_rung`'s `PANEL_BOARD`
@@ -6637,6 +6637,13 @@ impl App {
     /// contract as `Engine::ext_panel_tree_layout`. Consumed
     /// unconditionally like every other panel arm here, per
     /// [`Self::route_sc_sidebar_event`]'s neighbouring doc.
+    ///
+    /// The right-click arm mirrors `handle_tab_right_click`/
+    /// `handle_editor_right_click`'s own pixel→cell conversion —
+    /// `Engine::open_board_context_menu`'s `x`/`y` are cell coordinates,
+    /// same convention every other `open_*_context_menu` uses, so the
+    /// conversion happens here rather than inside `render.rs` (which has no
+    /// notion of GTK's pixel metrics).
     fn route_board_sidebar_event(
         &mut self,
         event: &quadraui::UiEvent,
@@ -6656,6 +6663,18 @@ impl App {
                 ..
             } => {
                 render::route_board_click(&mut engine, pos, false);
+            }
+            quadraui::UiEvent::MouseDown {
+                button: quadraui::MouseButton::Right,
+                ..
+            } => {
+                if let Some(card_id) = render::board_right_click_card(&engine, pos) {
+                    let cw = self.cached_char_width.max(1.0);
+                    let lh = self.cached_line_height.max(1.0);
+                    let cx = (pos.x as f64 / cw) as u16;
+                    let cy = (pos.y as f64 / lh) as u16;
+                    engine.open_board_context_menu(card_id, cx, cy);
+                }
             }
             _ => {}
         }

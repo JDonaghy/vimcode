@@ -195,6 +195,17 @@ pub struct Settings {
     #[serde(default)]
     pub format_on_save: bool,
 
+    /// Opt-in freshness (#523): periodically run the Board panel's
+    /// provider-declared `tick_command` (`BoardProviderConfig`,
+    /// `crate::core::extensions`) so a daemon-less provider's pipeline
+    /// doesn't stall just because vimcode is the only client with the
+    /// board open. No vim precedent, so no `:set` abbreviation — toggle
+    /// via the Settings sidebar or `:set board_tick_enabled=true`.
+    /// **Default off** — a passive viewer must not silently dispatch
+    /// metered work.
+    #[serde(default)]
+    pub board_tick_enabled: bool,
+
     /// Number of lines kept in the integrated terminal's scrollback history.
     /// Increase for commands that produce very long output. Default: 5000.
     #[serde(default = "default_terminal_scrollback_lines")]
@@ -1487,6 +1498,7 @@ impl Default for Settings {
             shift_width: default_shift_width(),
             lsp_enabled: default_lsp_enabled(),
             format_on_save: false,
+            board_tick_enabled: false,
             lsp_servers: Vec::new(),
             language_map: std::collections::HashMap::new(),
             terminal_scrollback_lines: default_terminal_scrollback_lines(),
@@ -3386,6 +3398,7 @@ impl Settings {
             "splitright" => self.splitright.to_string(),
             "lsp_enabled" => self.lsp_enabled.to_string(),
             "format_on_save" => self.format_on_save.to_string(),
+            "board_tick_enabled" => self.board_tick_enabled.to_string(),
             "terminal_scrollback_lines" => self.terminal_scrollback_lines.to_string(),
             "plugins_enabled" => self.plugins_enabled.to_string(),
             "ai_provider" => self.ai_provider.clone(),
@@ -3515,6 +3528,7 @@ impl Settings {
             "splitright" => self.splitright = value == "true",
             "lsp_enabled" => self.lsp_enabled = value == "true",
             "format_on_save" => self.format_on_save = value == "true",
+            "board_tick_enabled" => self.board_tick_enabled = value == "true",
             "terminal_scrollback_lines" => {
                 self.terminal_scrollback_lines = value
                     .parse()
@@ -3998,6 +4012,16 @@ pub static SETTING_DEFS: &[SettingDef] = &[
         category: "Workspace",
         setting_type: SettingType::Bool,
     },
+    SettingDef {
+        key: "board_tick_enabled",
+        label: "Board Auto-Tick",
+        description: "Periodically run the Board panel's provider-declared \
+                       tick command so its pipeline advances even when \
+                       vimcode is the only client with the board open \
+                       (off by default — this can dispatch metered work)",
+        category: "Workspace",
+        setting_type: SettingType::Bool,
+    },
     // ── LSP ──────────────────────────────────────────────────────────────────
     SettingDef {
         key: "lsp_enabled",
@@ -4466,6 +4490,24 @@ mod tests {
         assert!(SETTING_DEFS.iter().any(|d| d.key == "undolevels"));
         assert!(SETTING_DEFS.iter().any(|d| d.key == "undofile"));
         assert!(SETTING_DEFS.iter().any(|d| d.key == "undodir"));
+    }
+
+    /// #523's opt-in freshness setting: default off, round-trips through
+    /// `get_value_str`/`set_value_str` (the Settings sidebar's contract,
+    /// `explorer_visible_on_startup`'s sibling — no vim abbreviation to
+    /// exercise here since there's no vim precedent for it), and appears in
+    /// `SETTING_DEFS` so the sidebar actually lists it.
+    #[test]
+    fn board_tick_enabled_defaults_off_and_round_trips_via_settings_ui() {
+        let mut s = Settings::default();
+        assert!(!s.board_tick_enabled);
+        assert_eq!(s.get_value_str("board_tick_enabled"), "false");
+
+        s.set_value_str("board_tick_enabled", "true").unwrap();
+        assert!(s.board_tick_enabled);
+        assert_eq!(s.get_value_str("board_tick_enabled"), "true");
+
+        assert!(SETTING_DEFS.iter().any(|d| d.key == "board_tick_enabled"));
     }
 
     #[test]
