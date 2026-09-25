@@ -18646,6 +18646,11 @@ pub fn paint_sidebar_panel_chrome(
             } => {
                 backend.draw_settings_chrome(chrome_rect, header, query, placeholder, *active);
             }
+            // quadraui#1061 (bump #1388) added `Search`/`StatusBars` to this
+            // `#[non_exhaustive]` enum. Neither is constructed by vimcode yet
+            // — adopting them is #1242/#1243's job, not this pin bump's — so
+            // this arm exists only to keep the match exhaustive.
+            _ => {}
         }
     }
     layout
