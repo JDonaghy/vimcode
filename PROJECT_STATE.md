@@ -47,17 +47,62 @@ payload sent to `write_command` and `write_follow_up` via
 `RecordingToolClient`, a new-document-flow test asserting the empty-`{id}`
 substitution and no follow-up call, and a `board_ops.rs` test proving
 `OpenIssue` actually opens a buffer (not just a state flag) when a
-document provider is installed. No driver-tier (`TuiDriver`/`GtkDriver`)
-test — this reuses the existing generic buffer/tab/`:w` rendering path
-with no new paint or click surface (same precedent as the keymaps/
-registries scratch buffers, neither of which has one either); the
-scenario this issue's acceptance bar cares about (open → edit → `:w`
-round-trips through a mock provider) is exercised end-to-end at the
-engine level instead. `cargo build`/`clippy -D warnings`/`fmt` clean on
-both feature lanes. Out of scope (per the issue): the coordinator
-extension bundle itself (`:CoordRefine`/`:CoordReview` command names,
-`coord` argv, the `status:refining -> ready` semantics) and #523's
-provider-dispatch board actions.
+document provider is installed.
+
+**Review fix-up (iteration 1):** the original "no driver-tier test — this
+reuses the existing generic buffer/tab/`:w` rendering path with no new
+paint or click surface" justification was wrong to treat as an exemption:
+"reuses existing rendering machinery" isn't "internal-only", and writing
+the actual driver test surfaced two real, previously-undetected bugs it
+would have caught immediately:
+- `quadraui::BoardModel::handle_key` matches the literal `"Enter"`, but
+  both backends' own key-name convention (`engine_key_from_ui`/
+  `map_gtk_key_name`) emits `"Return"`/`"KP_Enter"` for that key — so a
+  real Enter keypress on a selected board card has *never* triggered
+  `OpenIssue` on either backend. Fixed in `Engine::dispatch_board_key_
+  unified` (host-side translation, not a quadraui change).
+- TUI's `handle_focus_owner_key` (`shell_app.rs`) had no `FocusKeyRoute::
+  Board` arm at all — every other panel route has one, but Board's was
+  missing since #521, so *any* keyboard navigation on the Board panel
+  (j/k/h/l/g/G/Enter) fell through to the Explorer-fallback key dispatch
+  on TUI specifically (GTK was fine — its key routing already calls the
+  shared `render::dispatch_sidebar_panel_key` unconditionally for every
+  route). Fixed by adding the missing arm, reusing the same shared
+  function GTK already calls — no new per-backend logic.
+
+New driver-tier coverage added: `tui_main::shell_app::tests::
+board_open_issue_paints_document_buffer_tab_via_shell_app` (a real `Enter`
+keypress through `TuiDriver`, asserting the seeded title paints) and
+`gtk::testing::sidebar_panel_clicks::board_double_click_opens_issue_as_a_
+document_buffer` (a real double-click through `GtkDriver`, same
+assertion) — both installing a `[document]` provider on the same mock
+manifest the existing `[board]` provider tests already use (#522: one
+manifest can declare both), so both backends' `OpenIssue` -> new-tab path
+is now exercised end-to-end through the real event-dispatch pipeline, not
+just at the engine level.
+
+Also addressed from review (non-blocking): (1) the create-path
+`ToolClient::run_with_stdin` now returns the provider's stdout (was
+discarded) and `push_tool_document` opportunistically parses a
+provider-echoed `{"id": "..."}` back out of it — `save_tool_document_
+buffer` binds the buffer to that id on a successful create, so a *second*
+`:w` on the same still-open buffer updates the now-existing document
+instead of silently re-running "create" with an empty id again; (2)
+`open_tool_document_buffer` now switches to an already-open buffer/tab for
+the same document id instead of always opening a new one (mirrors
+`open_keymaps_editor`'s precedent), closing the "two buffers racing to
+`:w` the same id" risk; (3) a doc comment now flags `parse_tool_document_
+buffer`'s `<!--`-prefix detection as unambiguous only for buffers this
+module itself produced; (4) `save_tool_document_buffer`'s doc now flags
+the blocking-write tradeoff forward for a real (non-mock, network-backed)
+provider.
+
+`cargo build`/`clippy -D warnings`/`fmt` clean on both feature lanes (GUI
+build compiles `src/gtk/` too, exercising the new `GtkDriver` test). Out
+of scope (per the issue): the coordinator extension bundle itself
+(`:CoordRefine`/`:CoordReview` command names, `coord` argv, the
+`status:refining -> ready` semantics) and #523's provider-dispatch board
+actions.
 
 **Last updated:** September 24, 2026 (#955, ACP-4 — tool-call rendering
 plus a source-agnostic change-review surface, on top of ACP-1's #952

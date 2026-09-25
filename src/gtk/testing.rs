@@ -3863,6 +3863,70 @@ mod sidebar_panel_clicks {
         );
     }
 
+    /// #524 Track A Phase 1 (review-requested driver coverage): double-
+    /// clicking a board card with a `[document]` provider configured opens
+    /// an editable markdown buffer in a new tab — asserted on the
+    /// *rasterised* screen (a new tab bar entry, the seeded title painted),
+    /// not on `Engine::tool_document`/buffer state being populated
+    /// (#587/#592's lesson). Mirrors
+    /// `board_panel_click_selects_the_clicked_card`'s real-layout,
+    /// no-coordinator-anywhere pattern, with a `[document]` provider layered
+    /// onto the same mock extension manifest a `[board]` provider already
+    /// installed (#522: one manifest can declare both).
+    #[test]
+    fn board_double_click_opens_issue_as_a_document_buffer() {
+        let mut engine = Engine::new();
+        engine.settings.use_nerd_fonts = Some(false);
+        install_mock_board_provider(&mut engine);
+        if let Some(registry) = engine.ext_registry.as_mut() {
+            registry[0].document = Some(crate::core::extensions::DocumentProviderConfig {
+                read_command: vec!["mock".to_string(), "show".to_string(), "{id}".to_string()],
+                write_command: vec!["mock".to_string(), "write".to_string(), "{id}".to_string()],
+                write_follow_up: vec![],
+            });
+        }
+        engine.board_model = Some(mock_board_model());
+        engine.set_document_client_for_test(crate::core::tool_client::MockToolClient(Ok(
+            serde_json::json!({
+                "title": "Improve board host, in full",
+                "body": "Full body seeded from the mock provider.\n",
+            }),
+        )));
+        engine
+            .app_shell
+            .show_panel(&quadraui::WidgetId::new(PANEL_BOARD));
+
+        let mut h = harness(engine, 1400, 900);
+        let layout = h
+            .engine
+            .borrow()
+            .board_layout
+            .borrow()
+            .clone()
+            .expect("draw_board must have cached a layout for click hit-testing");
+        let card = layout.columns[0]
+            .cards
+            .iter()
+            .find(|c| c.id.as_str() == "card:1")
+            .expect("the seeded card must have a resolved layout");
+        let cx = card.bounds.x + card.bounds.width / 2.0;
+        let cy = card.bounds.y + card.bounds.height / 2.0;
+
+        h.driver.dispatch(quadraui::UiEvent::DoubleClick {
+            widget: None,
+            position: Point::new(cx, cy),
+        });
+        h.driver.render();
+
+        assert!(
+            h.driver.screen_contains("Improve board host, in full"),
+            "double-clicking the card should paint a new tab with the \
+             seeded document title, not just set a status message; \
+             painted: {:?}",
+            h.driver.painted_texts()
+        );
+    }
+
     /// Settings: a click on a category row must expand/collapse it.
     ///
     /// The pre-fix path reached the since-retired `Msg::SettingsClick` arm, whose geometry was read

@@ -82,6 +82,48 @@ impl Engine {
         doc: ToolDocument,
         provider: &DocumentProviderConfig,
     ) {
+        // If this document (by id) is already open in a buffer, switch to
+        // it rather than opening a second tab bound to the same id — two
+        // buffers racing to `:w` the same document would be "last save
+        // wins, first buffer's edits silently lost" (review follow-up,
+        // #524). Same precedent as `open_keymaps_editor`. Only applies to a
+        // real id: `new_tool_document`'s blank buffer (`id: None`) has
+        // nothing yet to deduplicate against — every blank buffer is
+        // legitimately a fresh, not-yet-created document.
+        if let Some(id) = &id {
+            let existing_buf_id = self.buffer_manager.iter().find_map(|(buf_id, state)| {
+                state
+                    .tool_document
+                    .as_ref()
+                    .is_some_and(|binding| binding.id.as_deref() == Some(id.as_str()))
+                    .then_some(*buf_id)
+            });
+            if let Some(buf_id) = existing_buf_id {
+                let tab_idx = self
+                    .active_group()
+                    .tabs
+                    .iter()
+                    .enumerate()
+                    .find(|(_, tab)| {
+                        self.windows
+                            .get(&tab.active_window)
+                            .is_some_and(|w| w.buffer_id == buf_id)
+                    })
+                    .map(|(i, _)| i);
+                if let Some(idx) = tab_idx {
+                    self.active_group_mut().active_tab = idx;
+                } else {
+                    // Buffer exists but not shown in this group — point the
+                    // current window at it.
+                    self.active_window_mut().buffer_id = buf_id;
+                    self.view_mut().cursor.line = 0;
+                    self.view_mut().cursor.col = 0;
+                }
+                self.message = "Edit and :w to save.".to_string();
+                return;
+            }
+        }
+
         let content = render_tool_document_buffer(&doc);
         let buf_id = self.buffer_manager.create();
         if let Some(state) = self.buffer_manager.get_mut(buf_id) {
@@ -116,6 +158,14 @@ impl Engine {
     /// **and** the document already existed (follow-ups are a lifecycle
     /// transition on an existing document — the create path has nothing to
     /// transition from).
+    ///
+    /// **Blocking**, like [`Self::open_tool_document`] — a deliberate
+    /// tradeoff that mirrors the keymaps/registries scratch-buffer save
+    /// precedent, but worth flagging forward: a real network-backed write
+    /// command (unlike a local mock) could visibly freeze the editor for
+    /// however long the round-trip takes. A future non-blocking write path
+    /// (mirroring `board_refresh`'s background-thread + `mpsc` pattern) is
+    /// out of scope here.
     pub(crate) fn save_tool_document_buffer(&mut self) -> Result<(), String> {
         let binding = self
             .active_buffer_state()
@@ -132,8 +182,13 @@ impl Engine {
             .iter()
             .map(|a| a.replace("{id}", binding.id.as_deref().unwrap_or("")))
             .collect();
-        tool_client::push_tool_document(self.document_client.as_ref(), &write_argv, &title, &body)
-            .map_err(|e| e.user_message())?;
+        let assigned_id = tool_client::push_tool_document(
+            self.document_client.as_ref(),
+            &write_argv,
+            &title,
+            &body,
+        )
+        .map_err(|e| e.user_message())?;
 
         if let Some(id) = &binding.id {
             if !binding.write_follow_up.is_empty() {
@@ -147,6 +202,23 @@ impl Engine {
                 // shouldn't be reported as "the save failed" — the
                 // document itself is safely pushed either way.
                 let _ = self.document_client.run(&follow_argv);
+            }
+        }
+
+        // Create path (`binding.id` was `None`): if the provider echoed an
+        // id back on stdout, bind this buffer to it now, so a *second* `:w`
+        // on the still-open buffer updates the just-created document
+        // instead of silently re-running "create" with an empty id again
+        // (review follow-up, #524). A provider that echoed nothing leaves
+        // the buffer unbound, exactly as before this existed.
+        if binding.id.is_none() {
+            if let Some(id) = assigned_id {
+                let scratch_name = format!("[Document {id}]");
+                let state = self.active_buffer_state_mut();
+                if let Some(tool_document) = state.tool_document.as_mut() {
+                    tool_document.id = Some(id);
+                }
+                state.scratch_name = Some(scratch_name);
             }
         }
 
@@ -183,6 +255,13 @@ fn render_tool_document_buffer(doc: &ToolDocument) -> String {
 /// line) and body (everything after it, minus one leading blank line) back
 /// out of edited buffer text, skipping a leading metadata comment if
 /// present. Never round-trips labels/status.
+///
+/// Edge case: any first line starting with `<!--` is treated as *the*
+/// metadata header and dropped, even if the provider's body itself
+/// legitimately opened with an HTML comment the user typed — the metadata
+/// comment [`render_tool_document_buffer`] emits is always exactly one
+/// line, so this is unambiguous for buffers this module itself produced,
+/// but would eat a user-authored leading `<!-- ... -->` line too.
 fn parse_tool_document_buffer(text: &str) -> (String, String) {
     let mut lines = text.lines().peekable();
     if lines
@@ -407,6 +486,56 @@ mod tests {
         assert_eq!(sent["body"], "Brand new body.\n");
     }
 
+    /// Review follow-up (#524): if the write command echoes a
+    /// provider-assigned id back on stdout, the create path binds the
+    /// still-open buffer to it — so a *second* `:w` updates the
+    /// now-existing document (a real write-command argv, not the create
+    /// path's empty-id argv again) instead of silently duplicating it.
+    #[test]
+    fn new_document_flow_binds_the_buffer_to_a_provider_assigned_id_after_create() {
+        let mut engine = Engine::new_for_test();
+        install_mock_provider(&mut engine, fixture_provider());
+        engine.new_tool_document().expect("blank buffer opens");
+        engine.active_buffer_state_mut().buffer.content =
+            ropey::Rope::from_str("# Fresh issue\n\nBrand new body.\n");
+
+        engine.set_document_client_for_test(MockToolClient(Ok(serde_json::json!({ "id": "99" }))));
+        engine
+            .save()
+            .expect(":w should create via the write command");
+
+        assert_eq!(
+            engine
+                .active_buffer_state()
+                .tool_document
+                .as_ref()
+                .unwrap()
+                .id,
+            Some("99".to_string()),
+            "the buffer must be bound to the provider-assigned id after create"
+        );
+
+        // Second `:w`: now that the buffer is bound, this must be an
+        // *update* — the write command's `{id}` substituted with "99", not
+        // another empty-id create.
+        let recorder = RecordingToolClient::default();
+        engine.set_document_client_for_test(recorder.clone());
+        engine
+            .save()
+            .expect(":w should update the now-bound document");
+        let calls = recorder.calls();
+        assert_eq!(
+            calls.len(),
+            2,
+            "write, then the follow-up (id is now known)"
+        );
+        assert_eq!(
+            calls[0].argv,
+            vec!["mock".to_string(), "write".to_string(), "99".to_string()],
+            "the second save must target the created document's id, not create again"
+        );
+    }
+
     #[test]
     fn save_propagates_write_failure_and_never_runs_follow_up() {
         let mut engine = Engine::new_for_test();
@@ -438,5 +567,58 @@ mod tests {
         assert!(engine.active_buffer_state().tool_document.is_none());
         let err = engine.save().unwrap_err();
         assert_eq!(err, "No file name");
+    }
+
+    /// Review follow-up (#524): opening the same document id a second time
+    /// must switch to the already-open buffer/tab, not open a duplicate —
+    /// mirrors `open_keymaps_editor`'s precedent. Otherwise two buffers
+    /// bound to the same id could race on `:w` (last save wins, first
+    /// buffer's edits silently lost).
+    #[test]
+    fn opening_the_same_document_id_twice_switches_to_the_existing_tab() {
+        let mut engine = Engine::new_for_test();
+        install_mock_provider(&mut engine, fixture_provider());
+        engine.set_document_client_for_test(MockToolClient(Ok(serde_json::json!({
+            "title": "Briefing readability",
+            "body": "Original body.\n",
+        }))));
+
+        engine
+            .open_tool_document("42")
+            .expect("first open succeeds");
+        let tab_count_after_first_open = engine.active_group().tabs.len();
+        let buf_id_after_first_open = engine.active_window().buffer_id;
+
+        // Switch away to a different tab (a plain scratch buffer), so
+        // reopening the same id has to navigate back rather than trivially
+        // already being the active tab.
+        let other_buf = engine.buffer_manager.create();
+        let window_id = engine.new_window_id();
+        engine.windows.insert(
+            window_id,
+            crate::core::window::Window::new(window_id, other_buf),
+        );
+        let tab_id = engine.new_tab_id();
+        engine
+            .active_group_mut()
+            .tabs
+            .push(crate::core::tab::Tab::new(tab_id, window_id));
+        engine.active_group_mut().active_tab = engine.active_group().tabs.len() - 1;
+
+        engine
+            .open_tool_document("42")
+            .expect("second open succeeds");
+
+        assert_eq!(
+            engine.active_group().tabs.len(),
+            tab_count_after_first_open + 1,
+            "no new document tab should be created for an id already open \
+             (the one extra tab is the unrelated scratch buffer switched to above)"
+        );
+        assert_eq!(
+            engine.active_window().buffer_id,
+            buf_id_after_first_open,
+            "reopening the same id must switch back to its existing buffer"
+        );
     }
 }
