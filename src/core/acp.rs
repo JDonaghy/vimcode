@@ -378,87 +378,35 @@ pub fn session_update_chunk(update: &serde_json::Value) -> Option<(AcpChunkKind,
 // (#956, ACP-5)
 // ---------------------------------------------------------------------------
 
-/// Status of one `plan` entry, per the ACP v1 schema's `status` field.
-/// Unknown/missing values default to [`Self::Pending`] — never
-/// [`Self::Completed`], since defaulting a plan step toward "already done"
-/// on malformed input would hide unfinished work from the checklist rather
-/// than merely under-describing it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AcpPlanEntryStatus {
-    Pending,
-    InProgress,
-    Completed,
-}
-
-/// One entry in an agent's task-plan breakdown. Deliberately source-agnostic
-/// (no ACP-specific fields beyond what the wire sends) — #956's note for
-/// #529 is that a future remote-worker plan preview reuses this
-/// exact shape with a different feeder, so nothing here should assume ACP
-/// is the only producer.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AcpPlanEntry {
-    pub content: String,
-    pub status: AcpPlanEntryStatus,
-}
+/// The plan model itself is source-agnostic and lives in
+/// [`crate::core::plan`] (#529, Track A Phase 4) — a future Board/remote-
+/// worker plan preview reuses the exact same [`PlanEntry`]/
+/// [`PlanEntryStatus`]/`plan_to_checklist_text` with a completely
+/// different feeder, so nothing ACP-specific belongs in the model itself.
+/// Re-exported here under their original names so every existing ACP call
+/// site (`Engine::acp_plan`, `render::populate_ai_chat_controller`) is
+/// unaffected by the move.
+pub use crate::core::plan::{
+    plan_to_checklist_text, PlanEntry as AcpPlanEntry, PlanEntryStatus as AcpPlanEntryStatus,
+};
 
 /// Parse a `session/update`'s `plan` variant: `{"sessionUpdate": "plan",
 /// "entries": [{"content", "status"}]}`. Returns `None` for a non-`plan`
-/// update (including a malformed one with no `entries` array at all — not
-/// the same as a *valid* empty plan, which is `Some(vec![])` and clears
-/// whatever was rendered before).
+/// update. The envelope check (`sessionUpdate == "plan"`) is ACP's own —
+/// entry parsing itself is [`crate::core::plan::parse_plan_entries`], which
+/// knows nothing about this envelope and is reused as-is by any other
+/// plan-preview producer.
 ///
 /// **Every call is a full replacement, never a delta** — see
 /// `Engine::acp_plan`'s doc. Treating consecutive `plan` updates as
 /// append-only is the single most common way to get this variant wrong
 /// per #956's own scope note; nothing in this function accumulates state,
 /// by construction, since it takes no previous plan as input.
-///
-/// An entry missing `content` is dropped rather than rendered as a blank
-/// checklist row; a missing/unrecognized `status` defaults to `Pending`.
 pub fn parse_plan_update(update: &serde_json::Value) -> Option<Vec<AcpPlanEntry>> {
     if update.get("sessionUpdate").and_then(|v| v.as_str()) != Some("plan") {
         return None;
     }
-    let entries = update.get("entries").and_then(|v| v.as_array())?;
-    Some(
-        entries
-            .iter()
-            .filter_map(|e| {
-                let content = e.get("content")?.as_str()?.to_string();
-                let status = match e.get("status").and_then(|v| v.as_str()) {
-                    Some("in_progress") => AcpPlanEntryStatus::InProgress,
-                    Some("completed") => AcpPlanEntryStatus::Completed,
-                    _ => AcpPlanEntryStatus::Pending,
-                };
-                Some(AcpPlanEntry { content, status })
-            })
-            .collect(),
-    )
-}
-
-/// Render a plan as a plain-text checklist for the AI panel transcript
-/// (`render::populate_ai_chat_controller`). Unicode checkbox glyphs
-/// (`\u{2610}`/`\u{2611}`) rather than Markdown `- [ ]`/`- [x]` syntax,
-/// since the transcript's plain `StyledText` path (not
-/// `ChatController::push_turn_markdown`'s list-aware renderer) is what
-/// every other turn in this panel already uses — see
-/// `populate_ai_chat_controller`'s doc for why staying on that one path
-/// matters.
-pub fn plan_to_checklist_text(entries: &[AcpPlanEntry]) -> String {
-    let mut out = String::from("Plan:\n");
-    for e in entries {
-        let glyph = match e.status {
-            AcpPlanEntryStatus::Completed => "\u{2611}",
-            _ => "\u{2610}",
-        };
-        let suffix = match e.status {
-            AcpPlanEntryStatus::InProgress => " (in progress)",
-            _ => "",
-        };
-        out.push_str(&format!("{glyph} {}{suffix}\n", e.content));
-    }
-    out.pop(); // drop the trailing newline
-    out
+    crate::core::plan::parse_plan_entries(update)
 }
 
 /// One slash command the agent declared via `available_commands_update`.
