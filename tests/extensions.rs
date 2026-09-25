@@ -922,10 +922,34 @@ fn ext_install_sets_install_context_for_lsp() {
     e.pending_install_context = None;
 }
 
-// ── Auto-hint on file open ─────────────────────────────────────────────────────
+// ── Auto-offer on file open ───────────────────────────────────────────────────
+//
+// #1397 moved the "recommended extension isn't installed" offer off the
+// status line (where any later `Engine::message` write silently ate it
+// before the user looked) and onto an actionable, sticky toast. These
+// tests therefore read the offer back through the **render layer**
+// (`render::build_toast_stack` — the exact struct both the TUI and GTK
+// backends hand to `draw_toast_stack`), not through `Engine::toasts`:
+// a toast sitting in engine state that never makes it into a paintable
+// stack must still fail here. Full painted-pixel coverage of the offer —
+// title, `N` hint, action-button click, × dismiss — lives in the
+// `TuiDriver` tests in `src/tui_main/shell_app.rs` and the `GtkDriver`
+// tests in `src/gtk/testing.rs`.
+
+/// The install-offer toast currently in the *rendered* toast stack, as
+/// `(title, body, action_button_label)`. `None` when nothing is offering
+/// an install — either no toast at all, or only plain (action-less)
+/// toasts such as the LSP-failure notice.
+fn install_offer_toast(e: &vimcode_core::Engine) -> Option<(String, String, String)> {
+    let stack = vimcode_core::render::build_toast_stack(e)?;
+    stack
+        .toasts
+        .into_iter()
+        .find_map(|t| Some((t.title, t.body, t.action?.label)))
+}
 
 #[test]
-fn auto_hint_shown_for_uninstalled_extension_on_file_open() {
+fn auto_offer_toast_shown_for_uninstalled_extension_on_file_open() {
     let mut e = engine_with_registry("");
     assert!(!e.extension_state.is_installed("csharp"));
     assert!(!e.extension_state.is_dismissed("csharp"));
@@ -935,15 +959,26 @@ fn auto_hint_shown_for_uninstalled_extension_on_file_open() {
     e.open_file_in_tab(&path);
     let _ = std::fs::remove_file(&path);
 
+    let (title, body, label) = install_offer_toast(&e).unwrap_or_else(|| {
+        panic!(
+            "expected an install-offer toast for uninstalled csharp; \
+             message was {:?}",
+            e.message
+        )
+    });
     assert!(
-        e.message.contains("ExtInstall") || e.message.contains("csharp"),
-        "expected extension hint for uninstalled csharp: {}",
-        e.message
+        title.contains("C# Language Support"),
+        "offer title should name the extension: {title}"
+    );
+    assert_eq!(label, "Install", "offer needs an Install action button");
+    assert!(
+        body.contains(":ExtInstall csharp") && body.contains('N'),
+        "offer body should document the keyboard equivalents: {body}"
     );
 }
 
 #[test]
-fn auto_hint_not_shown_when_extension_dismissed() {
+fn auto_offer_toast_not_shown_when_extension_dismissed() {
     let mut e = engine_with_registry("");
     e.extension_state.mark_dismissed("csharp");
 
@@ -952,15 +987,15 @@ fn auto_hint_not_shown_when_extension_dismissed() {
     e.open_file_in_tab(&path);
     let _ = std::fs::remove_file(&path);
 
-    assert!(
-        !e.message.contains("No csharp extension"),
-        "hint should not appear when csharp is dismissed: {}",
-        e.message
+    assert_eq!(
+        install_offer_toast(&e),
+        None,
+        "offer should not appear when csharp is dismissed"
     );
 }
 
 #[test]
-fn auto_hint_not_shown_when_extension_installed() {
+fn auto_offer_toast_not_shown_when_extension_installed() {
     let mut e = engine_with_registry("");
     e.extension_state.mark_installed("csharp");
 
@@ -969,15 +1004,15 @@ fn auto_hint_not_shown_when_extension_installed() {
     e.open_file_in_tab(&path);
     let _ = std::fs::remove_file(&path);
 
-    assert!(
-        !e.message.contains("No csharp extension"),
-        "hint should not appear when csharp is installed: {}",
-        e.message
+    assert_eq!(
+        install_offer_toast(&e),
+        None,
+        "offer should not appear when csharp is installed"
     );
 }
 
 #[test]
-fn auto_hint_not_shown_twice_for_same_extension() {
+fn auto_offer_toast_not_shown_twice_for_same_extension() {
     let mut e = engine_with_registry("");
 
     let path1 = std::env::temp_dir().join("vimcode_smoke_hint_04a.cs");
@@ -986,22 +1021,51 @@ fn auto_hint_not_shown_twice_for_same_extension() {
     std::fs::write(&path2, "// b\n").ok();
 
     e.open_file_in_tab(&path1);
-    let first_msg = e.message.clone();
+    let first = install_offer_toast(&e);
+    // Dismissing (×) the first offer is what a user who ignored it does;
+    // the second open must not bring it back.
+    e.toasts.clear();
     e.open_file_in_tab(&path2);
-    let second_msg = e.message.clone();
+    let second = install_offer_toast(&e);
 
     let _ = std::fs::remove_file(&path1);
     let _ = std::fs::remove_file(&path2);
 
-    // First open should have triggered the hint
+    // First open should have triggered the offer
     assert!(
-        first_msg.contains("ExtInstall") || first_msg.contains("csharp"),
-        "first open should show hint: {first_msg}"
+        first.is_some(),
+        "first open should show the install offer; message was {:?}",
+        e.message
     );
-    // Second open of same language must NOT re-show the same hint
-    assert!(
-        !second_msg.contains("No csharp extension"),
-        "second open should not re-prompt for csharp: {second_msg}"
+    // Second open of same language must NOT re-offer
+    assert_eq!(second, None, "second open should not re-prompt for csharp");
+}
+
+/// #1397: the offer must survive `prune_toasts` — a 5s auto-expiry would
+/// silently revert an unanswered offer to "never asked", with nothing on
+/// screen to show the user was ever asked.
+#[test]
+fn auto_offer_toast_is_sticky_and_survives_pruning() {
+    let mut e = engine_with_registry("");
+
+    let path = std::env::temp_dir().join("vimcode_smoke_hint_05.cs");
+    std::fs::write(&path, "// test\n").ok();
+    e.open_file_in_tab(&path);
+    let _ = std::fs::remove_file(&path);
+
+    let before = install_offer_toast(&e);
+    assert!(before.is_some(), "precondition: offer must be showing");
+
+    // Backdate the toast well past TOAST_LIFETIME, then prune.
+    for t in e.toasts.iter_mut() {
+        t.created_at = std::time::Instant::now() - std::time::Duration::from_secs(600);
+    }
+    e.prune_toasts();
+
+    assert_eq!(
+        install_offer_toast(&e),
+        before,
+        "the install offer is sticky — pruning must not drop it"
     );
 }
 
