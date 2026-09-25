@@ -95,6 +95,26 @@ parity-matrix mapping of `assign`/`test`/`pr`/`merge`/`backlog` to real
 `coord` argv) — this ships the generic dispatch mechanism only, provable
 end-to-end with a mock provider.
 
+Rebased onto #525/#528/#530 (Track A Phases 2/3/5 landed on `develop` while
+this branch was open and rewrote `board_ops.rs` around the same
+`"OpenReview"` action name). Both features survive, with one deliberate
+precedence rule now pinned by tests: **`"OpenReview"` is the one
+provider-declared action that does *not* go through #523's generic
+fire-and-forget dispatcher.** Its command's stdout is a review *target* to
+resolve into a local diff (`Engine::open_review_card` ->
+`fetch_branch_review_target` -> `open_branch_review`), so routing it through
+`run_board_action_by_name` would silently downgrade "open the review" to
+"print that JSON on the status line". For the same reason the host's `R`
+keybinding is checked *before* provider-declared stage keybindings, so a
+provider cannot rebind `R` out from under the review. #525's
+`action_argv(name, id)` helper folded into #523's richer
+`action_by_name(name)` + `BoardActionDef::resolve_argv(id)` (the `actions`
+field is a `Vec<BoardActionDef>` now, not a `HashMap<String, Vec<String>>`).
+RED-verified: reinstating the generic dispatch for `OpenReview` turns
+`board_review_key_paints_branch_diff_via_shell_app` (driver-tier),
+`apply_open_review_resolves_a_target_instead_of_dispatching_the_action` and
+two of #525's engine tests red; restored, all green.
+
 **Last updated:** September 24, 2026 (#530, Track A Phase 5 — the fleet
 review seat). "vimcode-over-ssh" needs **no vimcode-side ssh/transport
 code at all** — the moat is that vimcode already works correctly when it
